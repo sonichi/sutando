@@ -3216,6 +3216,73 @@ class Hooks(unittest.TestCase):
         self.assertIsNone(gw._ATTEMPTS.get(tid).get("claims"), "and no new one is taken while the serve is held")
         del fake
 
+    def disposed_unpublished(self, tid, body, fault):
+        """Served, acked as generation 1; its result claimed at its pin, then disposed of unpublished."""
+        fake = self.served_acked(tid)
+        self.core_writes(tid, body)
+        inflight = {tid}
+        with fault:
+            gw._post_ready_results(inflight)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "the drain disposed of it")
+        self.assertIsNone(gw.read_item(gw._delivery_core().backend.root, tid), "nothing was published")
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("claims"), None, "its claim ended with it")
+        return fake, inflight
+
+    def switches(self, tid, fake, inflight):
+        inflight.add(tid)
+        self.reserved(tid, inflight)
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "the newer generation is not held")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2")
+
+    def test_a_result_refused_attribution_ends_its_claim_and_never_holds_a_newer_generation(self):
+        tid = "task-unpublished-attribution"
+        fake, inflight = self.disposed_unpublished(
+            tid, "the answer", mock.patch.object(gw, "_attribution", return_value=("", True)))
+        self.assertTrue(list((gw.RESULTS_DIR / "undelivered").glob(f"{tid}*")), "quarantined")
+        self.switches(tid, fake, inflight)
+
+    def test_a_dedup_requeue_ends_the_originals_claim_without_waiting_on_the_re_ask(self):
+        tid = "task-unpublished-requeue"
+        fake, inflight = self.disposed_unpublished(
+            tid, "[deduped: task-holder-x]",
+            mock.patch.object(gw, "_dedup_plan", return_value=("requeue", f"{tid}-reask", "")))
+        self.switches(tid, fake, inflight)
+
+    def test_a_dedup_report_refused_attribution_ends_its_claim(self):
+        tid = "task-unpublished-report"
+        with mock.patch.object(gw, "_owner_mention_disposition", return_value=""):
+            fake, inflight = self.disposed_unpublished(
+                tid, "[deduped: task-holder-y]",
+                mock.patch.multiple(gw, _dedup_plan=mock.Mock(return_value=("report", "ask again", "")),
+                                    _attribution=mock.Mock(return_value=("", True))))
+        self.switches(tid, fake, inflight)
+
+    def test_any_drain_exit_that_disposes_of_a_result_unpublished_ends_its_claim(self):
+        tid = "task-unpublished-any"
+
+        def disposes(t, rfile, *_a):
+            rfile.rename(gw.RESULTS_DIR / f".{t}.elsewhere")
+            disposal.pin_path(gw.RESULTS_DIR, t).unlink(missing_ok=True)
+            return False
+        disposal = gw.disposal
+        fake, inflight = self.disposed_unpublished(tid, "the answer",
+                                                   mock.patch.object(gw, "_deliver_ready", side_effect=disposes))
+        self.switches(tid, fake, inflight)
+
+    def test_a_claim_left_open_by_a_crash_is_ended_by_the_reconcile_only_once_its_file_is_gone(self):
+        tid = "task-unpublished-crash"
+        self.served_acked(tid)
+        self.core_writes(tid, "the answer")
+        self.assertIsNotNone(gw._pin_and_claim(tid)[0])
+        self.assertFalse(gw._reconcile_earlier_run(tid), "its file is still there: it may be about to send")
+        self.assertEqual(len(gw._ATTEMPTS.get(tid)["claims"]), 1)
+        gw.disposal.pin_path(gw.RESULTS_DIR, tid).unlink()
+        self.assertFalse(gw._reconcile_earlier_run(tid), "its pin is gone, its file is not")
+        (gw.RESULTS_DIR / f"{tid}.txt").unlink()
+        self.assertTrue(gw._reconcile_earlier_run(tid), "gone and never in the outbox: nothing was sent")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("claims"))
+
     def test_a_pin_that_cannot_be_made_or_finds_no_file_is_retried(self):
         tid = "task-pin-fails"
         self.served_acked(tid)

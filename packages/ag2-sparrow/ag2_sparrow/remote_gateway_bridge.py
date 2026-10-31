@@ -4217,16 +4217,18 @@ def _reconcile_earlier_run(wire_tid: str) -> bool:
         rec = _ATTEMPTS.entry(wire_tid)
         if not isinstance(rec, dict) or any(c.get("kind") == "cancel-ack" for c in (rec.get("claims") or {}).values()):
             return False
+    if not _end_unpublished_claims(wire_tid):
+        return False                            # claimed, its file still there, not yet in the outbox
+    rec = _ATTEMPTS.entry(wire_tid)
+    if not isinstance(rec, dict):
+        return False
     root = _delivery_core().backend.root
     for op, c in (rec.get("claims") or {}).items():
         if c.get("kind") != "result":
             continue
-        run_item = _run_item(c.get("run") or "")
-        items = [i for i in dict.fromkeys((run_item if isinstance(run_item, str) else None, wire_tid,
-                                           f"{wire_tid}.lease-close")) if i]
-        published = [i for i in items if ((read_item(root, i) or {}).get("lifecycle") or {}).get("op") == op]
+        published = _claim_published(wire_tid, op, c)
         if not published:
-            return False                        # claimed and not yet in the outbox: it may be about to send
+            return False
         for item in published:
             record = read_item(root, item) or {}
             if record.get("status") in ("DELIVERED", "PARKED"):
@@ -4238,6 +4240,33 @@ def _reconcile_earlier_run(wire_tid: str) -> bool:
                 _log(f"task {wire_tid}: its earlier run's result could not be checked ({diagnostics.describe(e)})")
                 return False
     return True
+
+
+def _claim_published(wire_tid: str, op: str, claim: dict) -> "list[str]":
+    """The outbox items a result claim's operation reached."""
+    root = _delivery_core().backend.root
+    run_item = _run_item(claim.get("run") or "")
+    items = [i for i in dict.fromkeys((run_item if isinstance(run_item, str) else None, wire_tid,
+                                       f"{wire_tid}.lease-close")) if i]
+    return [i for i in items if ((read_item(root, i) or {}).get("lifecycle") or {}).get("op") == op]
+
+
+def _end_unpublished_claims(wire_tid: str) -> bool:
+    """End every result claim whose file the drain has disposed of without publishing it: nothing was
+    sent. Files are read before the outbox, which a publish writes before the file goes. False while one
+    still has its file and no item: its delivery may be under way."""
+    with _ATTEMPTS.transition(wire_tid) as t:
+        if not isinstance(t.rec, dict):
+            return False
+        open_ = True
+        for c in t.claims("result"):
+            tid = str((c.get("data") or {}).get("tid") or "")
+            if tid and (os.path.lexists(RESULTS_DIR / f"{tid}.txt")
+                        or os.path.lexists(disposal.pin_path(RESULTS_DIR, tid))):
+                open_ = open_ and bool(_claim_published(wire_tid, c["op"], c))
+            elif not _claim_published(wire_tid, c["op"], c):
+                open_ = t.release_claim(c) and open_
+        return open_
 
 
 def _stop_run(t, run: "str | None", why: str) -> bool:
@@ -8789,6 +8818,10 @@ def _delivery_worker(tid: str, rfile: Path, raw: str, generation, inflight: "set
     except Exception as e:  # noqa: BLE001 — one result's failure never stops another's
         _log(f"result {tid}: delivery error (isolated): {diagnostics.describe(e)}")
     finally:
+        try:
+            _end_unpublished_claims(_broker_tid(tid))
+        except Exception as e:  # noqa: BLE001 — a claim left open is ended by the next reconcile
+            _log(f"result {tid}: its claim could not be ended yet ({diagnostics.describe(e)})")
         with _DELIVERING_MUTEX:
             _DELIVERING.discard(tid)
 
