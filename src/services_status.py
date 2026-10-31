@@ -55,7 +55,7 @@ from pathlib import Path
 # a status file written to the wrong tree is invisible to every post-M0 reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
-from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict, status_path as _lane_status_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 STATE_DIR = WORKSPACE / "state"
@@ -74,9 +74,8 @@ GATEWAY_STATUS_TTL_S = 180.0
 
 
 def gateway_status_path() -> Path:
-    """The primary connection's sidecar under STATE_DIR."""
-    from connections import primary_sidecar_name
-    return STATE_DIR / primary_sidecar_name(STATE_DIR)
+    """The desktop's active lane's sidecar under STATE_DIR when it exists, else the primary connection's."""
+    return _lane_status_path(STATE_DIR)
 
 
 def _host_label() -> str:
@@ -280,8 +279,8 @@ def service_registry() -> list[dict]:
     return [
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
-        # Reads the primary connection's sidecar; the pgrep fallback is identity-blind,
-        # so a live named secondary can still mask a dead primary once the sidecar is stale.
+        # Reads the active lane's sidecar, else the primary connection's; the pgrep fallback is
+        # identity-blind, so a live named secondary can still mask a dead primary once the sidecar is stale.
         {"id": "gateway", "name": "AG2 Gateway",
          "probe": ("gateway", gateway_status_path(), r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",

@@ -90,6 +90,7 @@ from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
+    status_path as _gateway_lane_status_path,
     safe_num as _gateway_num,
     verdict_from_record as _gateway_verdict_from_record,
 )
@@ -6994,9 +6995,9 @@ def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
 
 
 def _gateway_primary_sidecar() -> Path:
-    """The primary connection's status sidecar; the unsuffixed one when no row is primary."""
-    import connections  # noqa: PLC0415
-    return Path(status_read_path(connections.primary_sidecar_name(WORKSPACE_DIR / "state"), WORKSPACE_DIR))
+    """The desktop's active lane's sidecar when it exists, else the primary connection's: the
+    unsuffixed one, read legacy-aware, when no row is primary."""
+    return Path(status_read_path(_gateway_lane_status_path(WORKSPACE_DIR / "state").name, WORKSPACE_DIR))
 
 
 def _gateway_where() -> str:
