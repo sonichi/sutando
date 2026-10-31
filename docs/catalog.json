@@ -11,7 +11,7 @@
    ],
    "status": "canonical",
    "canonical_for": "documentation navigation and lifecycle metadata",
-   "last_verified": "2026-07-22"
+   "last_verified": "2026-10-27"
   },
   "docs/access-control.md": {
    "title": "Channel access control (moved from CLAUDE.md)",
@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-09-18"
+   "last_verified": "2026-10-27"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -227,6 +227,18 @@
    "status": "active",
    "canonical_for": "the 30-day reader-fallback policy after sutando-migrate commit and its cleanup step",
    "last_verified": "2026-08-17"
+  },
+  "docs/platform-support.md": {
+   "title": "Windows and macOS capability support",
+   "audience": [
+    "users",
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "platform capability support, verification evidence and Windows parity backlog",
+   "last_verified": "2026-10-27"
   },
   "docs/pointer-teacher-design.md": {
    "title": "Pointer Teacher design",

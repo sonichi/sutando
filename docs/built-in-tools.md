@@ -2,6 +2,10 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+Platform scope and verification evidence live in the [Windows/macOS support
+matrix](platform-support.md). An available tool name alone does not establish
+that its desktop backend, dependencies, or permissions work on the current host.
+
 **Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
 connector tools, first:
 - `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`

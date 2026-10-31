@@ -14,6 +14,8 @@ Machine-readable ownership and lifecycle metadata lives in
   resolver APIs.
 - [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
 - [Use built-in tools](built-in-tools.md) — authoritative capability catalog.
+- [Windows and macOS support](platform-support.md) — capability limits, native
+  verification evidence, and the Windows parity backlog.
 - [External runtime dependencies](runtime-dependencies.md) — what must be
   installed, what only a feature needs, and what to vendor when embedding.
 

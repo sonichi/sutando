@@ -182,6 +182,11 @@ First run needs Accessibility granted in System Settings → Privacy & Security.
 
 ## Windows support
 
+See the maintained [Windows/macOS capability matrix](docs/platform-support.md)
+for source support, native verification results, known gaps, and the parity roadmap.
+The overview below describes implemented paths; it is not a claim that every
+capability has a current Windows end-to-end test.
+
 Sutando started life on macOS and most of its app-automation surface — AppleScript-driven Chrome/QuickTime control, Cmd+Ctrl+F fullscreen, the Sutando menu-bar Swift app — has no portable Windows equivalent. The core Sutando loop nevertheless runs on Windows; what's there is the headless agent: voice, screen capture, clipboard, notifications, the task bridge, the dashboard, and the messaging bridges.
 
 **Works on Windows:**
