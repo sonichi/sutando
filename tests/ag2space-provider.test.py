@@ -107,6 +107,13 @@ def main() -> int:
     check("timeout -> Indeterminate", isinstance(r, ProviderIndeterminate))
     r, _ = outcome_of(json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0))
     check("non-JSON 2xx body -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
+    r, _ = outcome_of(ValueError("unknown url type: 'htps'"))
+    check("a non-decode ValueError (e.g. a bad URL) -> Indeterminate, labelled as a request error",
+          isinstance(r, ProviderIndeterminate) and "request error" in str(r)
+          and "unreadable 2xx" not in str(r), repr(r))
+    r, _ = outcome_of(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"))
+    check("an undecodable 2xx body -> Indeterminate, labelled unreadable",
+          isinstance(r, ProviderIndeterminate) and "unreadable 2xx" in str(r), repr(r))
     for shape in (["ok"], "ok", 1):
         r, _ = outcome_of(shape)
         check(f"non-mapping 2xx {shape!r} -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
