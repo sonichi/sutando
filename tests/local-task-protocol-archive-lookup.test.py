@@ -140,6 +140,92 @@ root = build([f"archive/2026-05/{F}", f"archive/2026-06/{F}", f"archive/2026-07/
 check("months are searched in ascending order",
       ltp.find_archived_task(root, TID) == root / "archive" / "2026-05" / F)
 
+# Month discovery is cached per archive-root mtime (#5879): unchanged roots
+# are not re-scanned, new month dirs are seen next call, failures not cached.
+root = build([f"archive/2026-07/{F}"])
+ltp.find_archived_task(root, TID)          # prove the uncached path first
+
+scans = 0
+_real_scandir = ltp.os.scandir
+
+
+def _counting_scandir(path):
+    global scans
+    if str(path).endswith("archive"):
+        scans += 1
+    return _real_scandir(path)
+
+
+ltp.os.scandir = _counting_scandir
+ltp._MONTH_DIRS_CACHE.clear()               # count from a cold cache
+try:
+    for _ in range(5):
+        got = ltp.find_archived_task(root, TID)
+    check("an unchanged archive root is scanned exactly once across repeated lookups",
+          scans == 1, f"scans={scans}")
+    check("cached lookups still resolve the file", got == root / "archive" / "2026-07" / F, str(got))
+    (root / "archive" / "2026-08").mkdir()
+    got = ltp.find_archived_task(root, TID)
+    check("a newly created month dir invalidates the cache on the next call",
+          scans == 2, f"scans={scans}")
+finally:
+    ltp.os.scandir = _real_scandir
+
+# A root that could not be read must not leave a "no months" answer cached:
+# once it becomes readable, the next call sees the partition.
+#
+# Two failures stand between the caller and that guarantee, and only one of them
+# is reachable through the permission bits:
+#
+#   stat()   -> raises  -> no cache key exists to compare against
+#   scandir() -> raises -> answered as "no months", and nothing is stored
+#
+# Both are asked below in the form that actually reproduces here, rather than
+# through a chmod: `0o300` (no read, keeps search) makes `os.scandir` fail for
+# everyone, but running as root drops the DAC read check on the directory, so
+# the same fixture that should report no-months reports `2026-05` instead — the
+# chmod version passes as root for the wrong reason and fails as a normal user.
+# The stat failure is the one non-root CI hits through `Path.exists()` in
+# `newest_archived`, which re-raises EACCES rather than returning False.
+root = build([f"archive/2026-05/{F}"])
+archive_root = root / "archive"
+
+real_scandir = ltp.os.scandir
+real_stat = Path.stat
+
+
+def denied_permission(*_a, **_kw):
+    raise PermissionError(13, "Permission denied")
+
+
+def lookups_that_break() -> dict[str, object]:
+    """The answers a caller gets while the root is unreadable."""
+    answers: dict[str, object] = {}
+    ltp._MONTH_DIRS_CACHE.clear()
+    ltp.os.scandir = denied_permission
+    Path.stat = denied_permission
+    try:
+        answers["find"] = ltp.find_archived_task(root, TID)
+        answers["partition"] = ltp._month_partitions(archive_root)
+        answers["cached"] = str(archive_root) in ltp._MONTH_DIRS_CACHE
+    finally:
+        ltp.os.scandir = real_scandir
+        Path.stat = real_stat
+    return answers
+
+
+answers = lookups_that_break()
+check("an unreadable root is answered as no-months, not an error",
+      answers["partition"] == [], str(answers["partition"]))
+check("an unreadable root finds nothing rather than raising",
+      answers["find"] is None, str(answers["find"]))
+check("the failed reads left nothing cached", answers["cached"] is False)
+
+check("readable again, the same root reports its month and finds the file",
+      ltp._month_partitions(archive_root) == ["2026-05"]
+      and ltp.find_archived_task(root, TID) == archive_root / "2026-05" / F,
+      str(ltp.find_archived_task(root, TID)))
+
 if failures:
     print(f"\n{len(failures)} failure(s): {failures}")
     sys.exit(1)

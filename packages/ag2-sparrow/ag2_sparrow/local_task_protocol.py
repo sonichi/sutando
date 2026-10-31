@@ -805,11 +805,64 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
     return next(iter_result_candidates(results_dir, task_id), None)
 
 
+# Month-dir discovery is cached against the archive root's own mtime.
+_MONTH_DIRS_CACHE: dict[str, tuple[int, list[str]]] = {}
+_MONTH_DIRS_CACHE_MAX = 128
+
+
+def _month_partitions(archive_root: Path) -> list[str]:
+    """Ascending month-dir names under `archive_root`, cached per mtime.
+
+    The month list is derived data that changes only when the archive root's
+    own contents change, but discovering it costs a full root scandir — and
+    find_archived_task runs per candidate inside pollers (the Discord bridge
+    re-examines up to 25 orphaned results every second through
+    orphan_result_routes). Re-discovering the months on every call put that
+    scandir on the hot path: on a fixture sized like a long-lived host
+    (50k flat entries + 24 month dirs) the rediscovery was ~94% of every
+    orphan-scan tick — pure interpreter time re-matching month names that had
+    not changed, while the bridge busy-looped at ~100% of one core.
+
+    Entries are keyed by the root's st_mtime_ns so a hit can never go stale:
+    creating, removing or renaming anything directly under the root —
+    including a new YYYY-MM/ partition — bumps that mtime (filesystem mtime
+    granularity bounds the guarantee to per-timestamp, not per-call). A
+    scandir that FAILS is never cached, so "missing/unreadable archive is no
+    months" stays true call-to-call exactly as before the cache.
+
+    Dictionary ops are GIL-atomic; the worst races are a duplicate scan or a
+    briefly superseded entry, and every caller re-examines its candidates on
+    a later poll anyway.
+    """
+    mtime_ns = None
+    try:
+        mtime_ns = archive_root.stat().st_mtime_ns
+        hit = _MONTH_DIRS_CACHE.get(str(archive_root))
+        if hit is not None and hit[0] == mtime_ns:
+            return hit[1]
+    except OSError:
+        pass               # unstatable root: no cached answer; the scan decides
+    try:
+        with os.scandir(archive_root) as entries:
+            months = sorted(e.name for e in entries
+                            if _MONTH_DIR_RE.match(e.name) and e.is_dir())
+    except (OSError, ValueError):
+        return []          # missing/unreadable archive is "no months", not an error
+    if mtime_ns is not None:
+        if len(_MONTH_DIRS_CACHE) >= _MONTH_DIRS_CACHE_MAX:
+            _MONTH_DIRS_CACHE.clear()
+        _MONTH_DIRS_CACHE[str(archive_root)] = (mtime_ns, months)
+    return months
+
+
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
     malformed ids rather than globbing with them (traversal gate).
+
+    The month scan is cached against the archive root's mtime — see
+    `_month_partitions`.
 
     The month scan uses `os.scandir` and filters on the NAME before asking
     whether the entry is a directory. The archive root holds one file per
@@ -837,12 +890,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
         return None
     dirs = [tasks_dir, tasks_dir / "processed", tasks_dir / "archive"]
     archive_root = tasks_dir / "archive"
-    try:
-        with os.scandir(archive_root) as entries:
-            months = sorted(e.name for e in entries
-                            if _MONTH_DIR_RE.match(e.name) and e.is_dir())
-    except (OSError, ValueError):
-        months = []          # missing/unreadable archive is "no months", not an error
+    months = _month_partitions(archive_root)
     dirs.extend(archive_root / m for m in months)
     for d in dirs:
         # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST
