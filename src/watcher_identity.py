@@ -42,6 +42,27 @@ def as_pid(tok) -> Optional[int]:
         return None
 
 
+def proc_cwd(pid) -> Optional[str]:
+    """Working directory of `pid`, or None when it cannot be read.
+
+    Only ever a RESOLVER for a relative script operand -- never the ownership
+    signal itself, which is the conflation an earlier revision was rejected for.
+    """
+    try:  # linux: the symlink is authoritative
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:  # noqa: BLE001 -- not linux, gone, or not permitted
+        pass
+    try:  # darwin: lsof is the only non-privileged reader
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001 -- absent, slow, or denied
+        return None
+    for line in out.split("\n"):
+        if line.startswith("n"):
+            return line[1:] or None
+    return None
+
+
 def proc_argv_vector(pid) -> Optional[List[str]]:
     """Real argv of `pid` as a LIST, or None when no authoritative read exists.
 
@@ -124,6 +145,58 @@ def is_watcher_argv(argv: str, pid=None, argv_vector: Optional[Callable] = None)
     return classify_argv(argv, pid, argv_vector).watcher
 
 
+def watcher_script_path(argv: str, pid=None, argv_vector: Optional[Callable] = None) -> Optional[str]:
+    """The script path this watcher EXECUTED, or None when argv cannot prove it.
+
+    The executed path is the ownership signal: the script derives its repo from
+    `$0`, and callers launch it by absolute path from an unrelated cwd.
+    """
+    read = argv_vector if argv_vector is not None else proc_argv_vector
+    vec = read(pid) if pid is not None else None
+    if vec is not None and len(vec) >= 2:
+        if (vec[0].rsplit("/", 1)[-1] in WATCHER_SHELLS
+                and not vec[1].startswith("-")
+                and os.path.basename(vec[1]) == WATCHER_SCRIPT_NAME):
+            return vec[1]
+        return None
+    parts = argv.split()
+    # Only the two-token form is authoritative: past it, a spaced pathname and a
+    # script-plus-arguments are the same string.
+    if len(parts) == 2 and parts[0].rsplit("/", 1)[-1] in WATCHER_SHELLS:
+        if os.path.basename(parts[1]) == WATCHER_SCRIPT_NAME:
+            return parts[1]
+    return None
+
+
+def watcher_repo(argv: str, pid=None, argv_vector: Optional[Callable] = None,
+                 cwd: Optional[str] = None) -> Optional[str]:
+    """The repo owning this watcher, from its executed script, or None if unprovable.
+
+    `cwd` resolves a RELATIVE script operand and nothing else — an absolute path
+    means cwd is irrelevant, which is where inferring ownership from cwd broke.
+    """
+    script = watcher_script_path(argv, pid, argv_vector)
+    if not script:
+        return None
+    if not os.path.isabs(script):
+        if not cwd:
+            return None
+        script = os.path.join(cwd, script)
+    # <repo>/src/watch-tasks-stream.sh -> <repo>
+    parent = os.path.dirname(os.path.normpath(script))
+    return os.path.dirname(parent) or None
+
+
+def owns_watcher(argv: str, repo: str, pid=None, argv_vector: Optional[Callable] = None,
+                 cwd: Optional[str] = None) -> Optional[bool]:
+    """True/False/None — None means argv could not prove ownership either way, and
+    an unprovable owner must never be treated as a foreign one."""
+    got = watcher_repo(argv, pid, argv_vector, cwd)
+    if got is None or not repo:
+        return None
+    return os.path.normpath(got) == os.path.normpath(repo)
+
+
 class Inspection(NamedTuple):
     """`observed` False: `ps` proved nothing (failed, timed out, non-zero, empty),
     and `watcher` is then None -- an unobserved process is not a proven non-watcher."""
@@ -178,8 +251,25 @@ def ps_watcher_index(ps_output: str, is_watcher: Optional[Callable] = None) -> t
     return parent, live
 
 
-def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable] = None) -> dict:
+def foreign_root(argv: str, repo: str, pid=None, argv_vector: Optional[Callable] = None,
+                 cwd_of: Optional[Callable] = None) -> bool:
+    """True only when this root is PROVABLY another checkout's.
+
+    Unprovable is not foreign: a tree we cannot attribute is kept, because
+    missing a live watcher starts a second one and every task runs twice, while
+    keeping a foreign one costs a redundant skip.
+    """
+    cwd = cwd_of(pid) if (cwd_of is not None and pid is not None) else None
+    return owns_watcher(argv, repo, pid, argv_vector, cwd) is False
+
+
+def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable] = None,
+                  repo: Optional[str] = None, argv_vector: Optional[Callable] = None,
+                  cwd_of: Optional[Callable] = None) -> dict:
     """Map root PID -> set of PIDs for each distinct watcher TREE running.
+
+    `repo`: drop trees whose ROOT provably belongs to another checkout, by the
+    script it executed. Omitted, nothing is filtered and the result is unchanged.
 
     Each watcher is several processes (a shell wrapper, the script, a subshell),
     so counting matching lines overcounts. A "root" is a match whose parent is
@@ -205,7 +295,18 @@ def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable
             seen.add(root)
             root = parent[root]
         trees.setdefault(root, set()).add(pid)
-    return trees
+    if not repo:
+        return trees
+    # The SAME snapshot, re-read for argv: a second `ps` could disagree about a
+    # process that exited between them, which is what the index's note warns of.
+    argv_of = {}
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 3:
+            argv_of[parts[0]] = parts[2]
+    return {root: members for root, members in trees.items()
+            if not foreign_root(argv_of.get(root, ""), repo, as_pid(root),
+                                argv_vector, cwd_of)}
 
 
 def watcher_role(operands: Optional[List[str]]) -> Optional[str]:
