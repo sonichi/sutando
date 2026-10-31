@@ -66,14 +66,42 @@ class RequeueTransition(unittest.TestCase):
             outbox.requeue_item(root, ITEM, reset_attempts=True)
             self.assertEqual(outbox.attempts_for(root, ITEM), 0)
 
-    def _window_exhausted(self, root: Path) -> None:
-        """A timed-lane item that used its whole retry window and was parked for it."""
+    def _window_exhausted(self, root: Path, failures: int = 5,
+                          reason: str = "retry-window-exhausted") -> None:
+        """A timed-lane item whose retry window closed, parked after `failures` failed sends."""
         t0 = time.time() - 2000
         outbox._write_item(root, ITEM, {
-            "item_id": ITEM, "attempts": 5, "status": "QUEUED", "reason": None,
+            "item_id": ITEM, "attempts": failures, "status": "QUEUED", "reason": None,
             "retry": {"started_at": t0, "deadline": t0 + 600, "next_attempt_at": t0 + 590,
-                      "failures": 5, "min_attempts": 5, "initial_delay_s": 2.0, "max_delay_s": 30.0}})
-        outbox.park_item(root, ITEM, "retry-window-exhausted")
+                      "failures": failures, "min_attempts": 5, "initial_delay_s": 2.0,
+                      "max_delay_s": 30.0}})
+        outbox.park_item(root, ITEM, reason)
+
+    def _sends_until_parked(self, root: Path) -> int:
+        """Sends a requeued item is offered, each one failing, before it parks again. The clock
+        steps past max_delay_s (30 s) between sends, so every scheduled retry comes due."""
+        sends, now = 0, time.time() + 1
+        while True:
+            with outbox._item_lock(root, ITEM):
+                if not outbox.retry_ready_locked(root, ITEM, outbox.RetrySchedule(), now):
+                    break
+                sends += 1
+                outbox.retry_failed_locked(root, ITEM, now)
+            now += 60
+            self.assertLess(sends, 50, "a requeued item must park again")
+        return sends
+
+    def test_a_plain_requeue_keeps_the_budget_an_item_had_left(self):
+        # Parked for another reason before its budget ran out (e.g. outcome-unknown), a plain
+        # requeue must not cut the sends it still had down to one.
+        for failures, sends in ((0, 5), (1, 4), (4, 1), (5, 1), (7, 1)):
+            with self.subTest(failures=failures), TemporaryDirectory() as td:
+                root = Path(td)
+                self._window_exhausted(root, failures=failures, reason="outcome-unknown")
+                outbox.requeue_item(root, ITEM)
+                self.assertEqual(self._sends_until_parked(root), sends)
+                rec = outbox.read_item(root, ITEM)
+                self.assertEqual((rec["status"], rec["reason"]), ("PARKED", "retry-window-exhausted"))
 
     def _ready(self, root: Path) -> bool:
         with outbox._item_lock(root, ITEM):
