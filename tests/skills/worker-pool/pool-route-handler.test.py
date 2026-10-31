@@ -502,11 +502,14 @@ class TestPickerAppliedAtTheEdge(Base):
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
         self.assertIsNone(self.bindings(), "a signed task-last file applied a pin")
 
-    def test_a_team_pin_is_not_applied(self):
+    def test_a_team_pin_is_not_applied_and_is_refused_visibly(self):
+        # Answered at the edge (rc 0, its own result), so the core does not take it too.
         self.roster(bindings={})
         t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)", tier="team")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         self.assertIsNone(self.bindings())
+        self.assertIn("Only this agent's owner",
+                      (self.ws / "results" / "task-1.txt").read_text())
 
     def test_a_pin_to_an_unknown_worker_is_reported_not_fatal(self):
         import contextlib
