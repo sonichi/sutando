@@ -130,6 +130,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
+            "src/cron_ownership.py",
             # cli_wedge imports sutando_platform; without it every classify
             # dies on import and the gate reads every pane as unreadable.
             "src/cli_wedge.py",
