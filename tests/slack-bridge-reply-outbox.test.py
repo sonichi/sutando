@@ -74,7 +74,7 @@ class _Resp:
 
 
 class ReplyOutboxTest(unittest.TestCase):
-    def _one_pass(self, td: str, post, prepare=None, patch=None):
+    def _one_pass(self, td: str, post, prepare=None, patch=None, tier="owner"):
         results, tasks = Path(td) / "results", Path(td) / "tasks"
         (results / "archive").mkdir(parents=True)
         (tasks / "archive").mkdir(parents=True)
@@ -101,7 +101,7 @@ class ReplyOutboxTest(unittest.TestCase):
         sb.pending_replies.clear()
         sb.pending_replies[TID] = {"channel": "D0TEST", "thread_ts": None,
                                    "submitted_at": sb.time.time(),
-                                   "access_tier": "owner"}
+                                   "access_tier": tier}
 
         def _sleep(_s):
             raise _Stop()
@@ -138,6 +138,27 @@ class ReplyOutboxTest(unittest.TestCase):
             r = self._one_pass(td, lambda: _Resp(), prepare)
             self.assertEqual(len(r["calls"]), 0, "no re-send after restart")
             self.assertTrue(r["archived"] and not r["live"], "archive finished")
+
+    def test_an_owner_skip_after_channel_posts_nothing_anywhere(self):
+        # The owner's redirect-plus-skip is a skip, not "[no-send]..." posted into the room.
+        with tempfile.TemporaryDirectory() as td:
+            body = "[channel: C0OTHERROOM]\n[no-send]\nhandled in the other room"
+            r = self._one_pass(td, lambda: _Resp(),
+                               lambda results: (results / f"{TID}.txt").write_text(body))
+            self.assertEqual(r["calls"], [], "nothing is posted, to the origin or to the room")
+            self.assertTrue(r["archived"] and not r["live"], "the pair is archived as a skip")
+            self.assertFalse(r["pending"])
+
+    def test_a_team_dm_only_skip_after_channel_closes_silently_and_is_journaled(self):
+        # [dm-only] drops the redirect, so the guard delivers it; the close must leave a record.
+        import policy.egress.result as guard
+        with tempfile.TemporaryDirectory() as td:
+            body = "[dm-only]\n[channel: C0OTHERROOM]\n[no-send]\nhandled elsewhere"
+            r = self._one_pass(td, lambda: _Resp(),
+                               lambda results: (results / f"{TID}.txt").write_text(body), tier="team")
+            self.assertEqual(r["calls"], [], "nothing is posted")
+            self.assertTrue(guard.suppressed_record_path(Path(td) / "state", TID).is_file(),
+                            "the silent close has its suppressed-team-results record")
 
     def test_parked_pair_is_archived_without_send(self):
         with tempfile.TemporaryDirectory() as td:

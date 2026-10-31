@@ -175,6 +175,25 @@ def main() -> int:
               reason_j == "suppression record unwritable",
               f"j) write {label} -> notice stands, got {got_j[:32]!r}/{reason_j!r}")
 
+    # k) A bridge whose delivery verdict reads a skip after [channel:] journals on that
+    #    verdict: [dm-only] drops the redirect, so the guard delivers the body unchanged.
+    dm_only = "[dm-only]\n[channel: C0SHARED]\n[no-send]\nhandled elsewhere"
+    for flag, journaled in ((True, True), (False, False)):
+        state_k = pathlib.Path(tempfile.mkdtemp(prefix="tg-k-"))
+        got_k, reason_k = guard.guard_result_for_tier(
+            dm_only, "team", REPO, secret_filter=_clean,
+            suppress_journal=(state_k, "task-k"), skip_after_channel=flag)
+        check(got_k == dm_only and reason_k is None,
+              f"k) flag={flag}: the guard's own verdict is unchanged, got {got_k[:30]!r}/{reason_k!r}")
+        check(guard.suppressed_record_path(state_k, "task-k").is_file() is journaled,
+              f"k) flag={flag}: journaled={journaled}")
+    leak_k = pathlib.Path(tempfile.mkdtemp(prefix="tg-k-leak-"))
+    got_kl, reason_kl = guard.guard_result_for_tier(
+        "[channel: C0SHARED]\n[no-send]\nsecret", "team", REPO, secret_filter=_clean,
+        suppress_journal=(leak_k, "task-kl"), skip_after_channel=True)
+    check(reason_kl is not None and "secret" not in got_kl,
+          f"k) a non-owner redirect-plus-skip is still withheld, got {got_kl[:40]!r}/{reason_kl!r}")
+
     # h) Removed, not orphaned: an unused minter is one import from returning.
     check(not hasattr(guard, "suppression_stub_for_tier"),
           "h) suppression_stub_for_tier is gone from the module")

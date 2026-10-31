@@ -86,7 +86,7 @@ class TheVendoredCopyAgrees(unittest.TestCase):
         src_line = (REPO / "src" / "policy" / "egress" / "result.py").read_text()
         vend_line = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
                      / "team_result_guard.py").read_text()
-        needle = "tier != TIER_UNREADABLE and is_suppression_only(body)"
+        needle = "tier != TIER_UNREADABLE and is_suppression_only(body"
         self.assertIn(needle, src_line, "src/ lost the exclusion")
         self.assertIn(needle, vend_line, "the vendored copy lost the exclusion")
 

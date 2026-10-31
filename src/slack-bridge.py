@@ -94,6 +94,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
+
+# The one marker verdict every delivery decision here reads on the guarded body; the
+# guard's suppression journal reads it too, so whatever is closed silently is recorded.
+DELIVERY_SKIP_AFTER_CHANNEL = True
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
@@ -590,7 +594,8 @@ def _guard_reply(task_id: str, target, reply_text: str) -> str:
     A route without a tier re-reads it from the task file; no task file guards as guest."""
     tier = resolve_route_tier((target or {}).get("access_tier"), TASKS_DIR, task_id)
     safe, withheld = guard_result_for_tier(reply_text, tier, REPO,
-                                           suppress_journal=(STATE_DIR, task_id))
+                                           suppress_journal=(STATE_DIR, task_id),
+                                           skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     if withheld:
         print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
     return safe
@@ -1496,7 +1501,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
         # file, re-claim it, and loop forever.
         return True  # pragma: no cover — see above; no caller reaches this
 
-    parsed = parse_markers(text)
+    parsed = parse_markers(text, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     clean_text = parsed.body
 
     # [channel:] redirect — for cross-channel posting (e.g., reply to a DM
@@ -1748,7 +1753,7 @@ def result_watcher():
                 # the prior startswith trio but routed through one source of
                 # truth so future skip markers added in result_markers.py
                 # automatically apply here.
-                _skip_parsed = parse_markers(reply_text)
+                _skip_parsed = parse_markers(reply_text, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
                     if _skip_action.value == "deduped":

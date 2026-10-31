@@ -449,7 +449,7 @@ def structural() -> list:
     # Ordering is the requirement: a scan that runs after the router has read a
     # redirect or an attachment path has already lost.
     call = bridge.find("guard_result_for_tier(reply_text")
-    markers = bridge.find("_parsed = parse_markers(reply_text)")
+    markers = bridge.find("_parsed = parse_markers(reply_text")
     if call < 0:
         fails.append("discord-bridge must call guard_result_for_tier on the reply body")
     elif markers < 0:

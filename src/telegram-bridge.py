@@ -58,6 +58,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
+
+# The one marker verdict every delivery decision here reads on the guarded body; the
+# guard's suppression journal reads it too, so whatever is closed silently is recorded.
+DELIVERY_SKIP_AFTER_CHANNEL = True
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
@@ -407,7 +411,7 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     is idempotent on an already-stripped body, so the task path — which passes
     ``parsed.body`` and sends its own attachments — yields zero actions here and
     cannot double-send."""
-    parsed = parse_markers(text)
+    parsed = parse_markers(text, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     files = [a.value for a in parsed.actions if a.kind == "attach"]
     clean_text = parsed.body
     # Fence-aware chunks via the shared chunker — naive [i:i+4000] slicing tore
@@ -1170,7 +1174,7 @@ def main():  # pragma: no cover
                 # sends attached files, and silently drops [channel:] redirects
                 # (no concept in Telegram). Pass parsed.body so NO marker ever
                 # leaks as literal text in the user's DM (#1381).
-                parsed = parse_markers(reply_text)
+                parsed = parse_markers(reply_text, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
                 if any(a.kind == "skip" for a in parsed.actions):
                     _sk = next(a for a in parsed.actions if a.kind == "skip")
                     if _sk.value == "deduped":
