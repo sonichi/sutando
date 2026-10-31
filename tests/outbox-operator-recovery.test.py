@@ -6,6 +6,7 @@ Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
 import contextlib
 import hashlib
+import io
 import json
 import os
 import sys
@@ -33,9 +34,10 @@ ITEM = "task-abc"
 OTHER = "task-def"
 
 
-def _parked(root: Path, item_id: str = ITEM, attempts: int = 5) -> None:
+def _parked(root: Path, item_id: str = ITEM, attempts: int = 5, payload: str = "the reply") -> None:
+    # A gateway record stores its result as the payload; payload="" is a body-external lane.
     outbox._write_item(root, item_id, {"item_id": item_id, "attempts": attempts,
-                                       "status": "QUEUED", "reason": None})
+                                       "status": "QUEUED", "reason": None, "payload": payload})
     outbox.park_item(root, item_id, "max-attempts")
 
 
@@ -224,6 +226,61 @@ class IdempotencyKeyChanges(unittest.TestCase):
         """Pre-existing behaviour for any backend that tracks no re-sends."""
         from ag2_sparrow.delivery_core.core import _resend_epoch
         self.assertEqual(_resend_epoch(object(), ITEM), 0)
+
+
+class BodyExternalLane(unittest.TestCase):
+    """The Slack and Discord reply legs publish an empty payload and keep the body in
+    results/. On a terminal park the bridge archives that body and drops the reply's
+    target, so a requeue that reports success leaves the item QUEUED with nothing to
+    send, forever. It must refuse before changing anything, and say where the body is."""
+
+    def _lane(self, td):
+        results = Path(td) / "results"
+        root = results / ".outbox-slack-results"
+        _parked(root, ITEM, payload="")
+        return results, root
+
+    def test_a_parked_reply_whose_body_was_archived_is_refused_and_left_parked(self):
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            archived = results / "archive" / "2026-10" / f"{ITEM}.txt"
+            archived.parent.mkdir(parents=True)
+            archived.write_text("the reply", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = outbox_cli.main(["--root", str(root), "--json", "requeue", ITEM])
+            self.assertEqual(rc, 5)
+            rec = json.loads(out.getvalue())
+            self.assertEqual(rec["result"], "refused")
+            self.assertIn(str(archived), rec["error"])
+            self.assertIn("re-send it manually", rec["error"])
+            self.assertEqual(outbox.read_item(root, ITEM)["status"], "PARKED", "nothing changed")
+
+    def test_a_live_or_quarantined_body_still_requeues(self):
+        for where in ("live", "quarantined"):
+            with self.subTest(where=where), TemporaryDirectory() as td:
+                results, root = self._lane(td)
+                live = results / f"{ITEM}.txt"
+                live.write_text("the reply", encoding="utf-8")
+                if where == "quarantined":
+                    uq.place(live, results, ITEM, when=1700000000)
+                self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 0)
+                self.assertEqual(outbox.read_item(root, ITEM)["status"], "QUEUED")
+
+    def test_an_id_that_is_not_a_task_id_is_not_judged(self):
+        # A proactive file's id is `name#mtime`; its body is filed under the name alone.
+        with TemporaryDirectory() as td:
+            root = Path(td) / "results" / ".outbox-discord-proactive"
+            item = "proactive-1.txt#1700000000000000000"
+            _parked(root, item, payload="")
+            self.assertIsNone(outbox_cli.body_gone(root, item))
+            self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", item]), 0)
+
+    def test_control_a_gateway_record_with_its_payload_is_never_judged_gone(self):
+        with TemporaryDirectory() as td:
+            root = Path(td) / "results" / ".outbox"
+            _parked(root, ITEM)
+            self.assertIsNone(outbox_cli.body_gone(root, ITEM))
 
 
 class CliSurface(unittest.TestCase):
