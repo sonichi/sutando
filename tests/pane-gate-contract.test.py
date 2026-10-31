@@ -58,6 +58,23 @@ def state(text, runtime):
     return pg.classify_pane(text, pg.ADAPTERS[runtime]).state
 
 
+class PersonOnlyGates(unittest.TestCase):
+    CODEX_TRUST = ("  Trust this folder? Codex can read, edit, and run files here.\n"
+                   "\u203a 1. Trust and continue\n  2. Quit\n\n  enter continue \u00b7 esc quit\n")
+
+    def test_codex_folder_trust_wording_is_folder_trust(self):
+        v = pg.classify_pane(self.CODEX_TRUST, pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "folder-trust"))
+        self.assertTrue(pg.waits_for_a_person(v))
+
+    def test_only_person_only_dialogs_wait_for_a_person(self):
+        for kind, _, dialog in BROAD_SIGNATURES:
+            v = pg.classify_pane(dialog, pg.CLAUDE)
+            self.assertEqual(pg.waits_for_a_person(v), kind in pg.PERSON_ONLY_GATES, kind)
+        self.assertFalse(pg.waits_for_a_person(pg.classify_pane(CODEX_PICKER, pg.CODEX)))
+        self.assertFalse(pg.waits_for_a_person(pg.classify_pane(CLAUDE_IDLE, pg.CLAUDE)))
+
+
 class GateEvidence(unittest.TestCase):
     def test_completed_recap_requires_completion_context(self):
         recap = "※ recap: if you typed X, press Enter there to send it."
@@ -295,6 +312,25 @@ class CodexClassification(unittest.TestCase):
         capture = f"{CODEX_IDLE}Login successful. Press Enter to continue\u2026\n"
         v = pg.classify_pane(capture, pg.CODEX)
         self.assertEqual((v.state, v.reason), ("busy", "press-enter"))
+
+
+class QuotedDialogAboveTheTurnIsTranscript(unittest.TestCase):
+    """Tool output quoting a dialog sits above the turn's spinner; only rows below it are live."""
+    QUOTED = ("  ⎿  │ ❯ 1. Yes                                          │\n"
+              "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+              "✻ Perambulating… (1m 46s · esc to interrupt)\n")
+
+    def test_a_working_turn_with_a_draft_is_not_held_by_quoted_output(self):
+        v = pg.classify_pane(f"{self.QUOTED}❯ half typed\n{FOOTER}\n", pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "working"))
+
+    def test_a_live_dialog_below_the_spinner_still_holds_the_pane(self):
+        live = "Select an option:\n❯ 1. main.py\n  2. util.py\n  Enter to select · Esc to cancel\n"
+        v = pg.classify_pane(self.QUOTED + live, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+
+    def test_live_tail_keeps_everything_without_a_turn_row(self):
+        self.assertEqual(pg.live_tail(["a", "b"]), ["a", "b"])
 
 
 class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
@@ -927,6 +963,7 @@ class EndToEndThroughTheRealScript(unittest.TestCase):
         shim = self.bin / "tmux"
         shim.write_text(
             "#!/usr/bin/env bash\n"
+            f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
             "printf '%s\\n' \"$*\" >> \"$TMUX_LOG\"\n"
             "case \" $* \" in\n"
             "  *' capture-pane '*)\n"
@@ -1395,6 +1432,62 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
         with mock.patch.object(pg, "resolve_workspace", side_effect=RuntimeError("no config")):
             v = pg.classify_pane(self.PANE, pg.CLAUDE, None, self.socket, self.session)
         self.assertEqual(v.reason, "quota-limit")
+
+
+class AUsageLimitBannerTheSeatHasOutrun(unittest.TestCase):
+    """The CLI's "Usage limit reached · … / Continuing automatically at …" banner is its own
+    gate kind, and a turn that finishes after it was first seen makes it stale."""
+
+    PANE = ("✻ Churned for 27s · done 1:55 PM\n"
+            "──────── seat-1 ─\n❯ \n────────\n"
+            "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+            "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n"
+            "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
+    LATER = PANE.replace("done 1:55 PM\n", "done 1:55 PM\n✻ Brewed for 22s · done 1:58 PM\n")
+
+    def test_the_banner_is_a_named_gate_not_unlisted(self):
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "usage-limit"))
+
+    def test_a_banner_only_pane_reads_as_main_did(self):
+        # Not a cli_wedge banner: an idle pane under it is not held for the notifier.
+        pane = ("──────── seat-1 ─\n❯ \n────────\n"
+                "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
+        v = pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual(v.state, "idle-ready")
+        self.assertFalse(pg.blocks_dispatch(v, pg.CLAUDE))
+        self.assertIsNone(pg.frame_abnormal(pane))
+
+    def test_the_full_banner_still_refuses_input(self):
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, "/nonexistent-ws")
+        self.assertFalse(pg.accepts_input(v))
+
+    def test_a_turn_finished_after_first_sight_makes_it_stale(self):
+        abn = pg.limit_banner(self.LATER)
+        self.assertEqual(abn.kind, "provider-limit")
+        base = pg.limit_baseline(self.PANE)
+        self.assertTrue(pg.limit_is_stale(abn, "/nonexistent-ws", None, None,
+                                          capture=self.LATER, baseline=base))
+        self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None,
+                                           capture=self.PANE, baseline=base))
+        self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None))
+
+class SharedLimitStepUnknownQueueHolds(unittest.TestCase):
+    """limit_step: only a queue read as empty (False) outruns a banner; unknown holds."""
+
+    PANE = ("\u276f task-1\n\u23bf You've hit your usage limit \u00b7 resets 3pm\n"
+            "\u273b Cooked for 1s\n\n\u2500\u2500\u2500\u2500\n\u276f \n\u2500\u2500\u2500\u2500\n"
+            "  Usage limit reached \u00b7 resets 3pm\n")
+
+    def step(self, owes):
+        return pg.limit_step(self.PANE, None, "/nonexistent-ws", owes_work=owes)[0]
+
+    def test_empty_queue_outruns_but_unknown_and_owed_hold(self):
+        self.assertTrue(self.step(False))
+        self.assertFalse(self.step(None))
+        self.assertFalse(self.step(True))
+
 
 if __name__ == "__main__":
     unittest.main()

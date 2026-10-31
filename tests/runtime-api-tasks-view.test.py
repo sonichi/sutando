@@ -10,15 +10,24 @@ cancel is the documented CANCEL_INSTRUCTION signal, never a file deletion.
 Run: python3 tests/runtime-api-tasks-view.test.py
 Exit: 0 on pass, 1 on fail.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import concurrent.futures
 import contextlib
+import itertools
 import json
+import os
 import queue
 import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -282,8 +291,13 @@ class TasksViewTests(unittest.TestCase):
         self.assertIsNone(self.view.details("task-ghost"))
 
     def test_list_tasks_enumerates_live_only(self):
+        first_body = "first   request\twith\n  multiple\u2003spaces"
+        second_body = "second " + "界" * 200
         a = self.view.submit("first")["taskId"]
-        b = self.view.submit("second")["taskId"]
+        first_file = self._task_file(a)
+        first_file.write_text(first_file.read_text().replace(
+            "task: first\n", f"task: {first_body}\n"))
+        b = self.view.submit(second_body)["taskId"]
         # claimed task still listed (as in_progress); done task drops off
         (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-core-1.txt")
         c = self.view.submit("third")["taskId"]
@@ -291,16 +305,89 @@ class TasksViewTests(unittest.TestCase):
         (self.results / f"{c}.txt").write_text("done")
         out = self.view.list_tasks()
         by_id = {t["taskId"]: t for t in out["tasks"]}
+        self.assertEqual(set(by_id), {a, b, c})
         self.assertEqual(by_id[a]["state"], "in_progress")
         self.assertEqual(by_id[b]["state"], "pending")
         self.assertEqual(by_id[c]["state"], "done")  # file still live until archived
         self.assertEqual(by_id[b]["source"], "runtime-api")
+        self.assertEqual(by_id[a]["preview"], "first request with multiple spaces")
+        self.assertEqual(by_id[b]["preview"], "second " + "界" * 153)
+        self.assertEqual(len(by_id[b]["preview"]), 160)
+        self.assertEqual(by_id[c]["preview"], "third")
+        self.assertEqual(self.view.details(a)["task"], first_body)
+        self.assertEqual(self.view.details(b)["task"], second_body)
         self.assertNotIn("truncated", out)
+        filtered = self.view.list_tasks(unfinished_only=True)
+        self.assertEqual(filtered, {"tasks": [t for t in out["tasks"]
+                                              if t["taskId"] != c]})
+
+    def test_unfinished_order_limit_and_truncation_count_eligible_rows(self):
+        self.results.mkdir()
+        eligible = []
+        all_ids = []
+        for index in range(7):
+            tid = self.view.submit(f"work {index}")["taskId"]
+            all_ids.append(tid)
+            stamp = 1000 + index / 10
+            os.utime(self._task_file(tid), (stamp, stamp))
+            if index % 2 == 0:
+                (self.results / f"{tid}.txt").write_text("done")
+            else:
+                eligible.insert(0, tid)
+        for limit in (0, 1, 2, 3, 4, 200):
+            with self.subTest(limit=limit):
+                got = self.view.list_tasks(limit=limit, unfinished_only=True)
+                self.assertEqual([row["taskId"] for row in got["tasks"]],
+                                 eligible[:limit])
+                self.assertEqual({row["state"] for row in got["tasks"]},
+                                 {"pending"} if limit else set())
+                self.assertEqual(got.get("truncated", False), len(eligible) > limit)
+                if limit >= len(eligible):
+                    self.assertNotIn("truncated", got)
+        default = self.view.list_tasks(limit=2)
+        self.assertEqual(default, self.view.list_tasks(limit=2, unfinished_only=False))
+        self.assertEqual([row["taskId"] for row in default["tasks"]], all_ids[::-1][:2])
+        self.assertEqual(default["tasks"][0]["state"], "done")
+        self.assertTrue(default["truncated"])
+
+    def test_unfinished_all_completed_is_empty_without_truncation(self):
+        self.results.mkdir()
+        for i in range(3):
+            tid = self.view.submit(f"done {i}")["taskId"]
+            (self.results / f"{tid}.txt").write_text("ready")
+        for limit in (0, 1, 3):
+            self.assertEqual(self.view.list_tasks(limit=limit, unfinished_only=True),
+                             {"tasks": []})
+
+    def test_unfinished_preserves_unready_results_and_human_waiting_states(self):
+        self.results.mkdir()
+        expected = {}
+        for body in (None, "", " \t\n", b"torn \xe4\xb8"):
+            tid = self.view.submit("awaiting result")["taskId"]
+            if body is not None:
+                (self.results / f"{tid}.txt").write_bytes(
+                    body if isinstance(body, bytes) else body.encode())
+            expected[tid] = "pending"
+        pending = {}
+        self.view.hitl_lookup = lambda tid: pending.get(tid, [])
+        for kind, state in (("elicitation", "waiting_for_input"),
+                            ("approval", "waiting_for_approval"),
+                            ("human_action", "waiting_for_human_action")):
+            tid = self.view.submit("awaiting human")["taskId"]
+            pending[tid] = [kind]
+            expected[tid] = state
+        got = self.view.list_tasks(unfinished_only=True)
+        self.assertEqual({row["taskId"]: row["state"] for row in got["tasks"]}, expected)
+        self.assertNotIn("truncated", got)
+        for tid in expected:
+            (self.results / f"{tid}.txt").write_text("ready")
+        self.assertEqual(self.view.list_tasks(unfinished_only=True), {"tasks": []})
 
     def test_list_tasks_disappearing_during_metadata_access(self):
         real_stat = Path.stat
-        for mode in ("control", "claim", "archive"):
-            with self.subTest(mode=mode):
+        for mode, unfinished in itertools.product(("control", "claim", "archive"),
+                                                  (False, True)):
+            with self.subTest(mode=mode, unfinished=unfinished):
                 victim_id = self.view.submit("being processed")["taskId"]
                 queued_id = self.view.submit("still queued")["taskId"]
                 victim = self._task_file(victim_id)
@@ -317,7 +404,7 @@ class TasksViewTests(unittest.TestCase):
                     return real_stat(path, *args, **kwargs)
 
                 with unittest.mock.patch.object(Path, "stat", checked_stat):
-                    rows = self.view.list_tasks()["tasks"]
+                    rows = self.view.list_tasks(unfinished_only=unfinished)["tasks"]
                 ids = {row["taskId"] for row in rows}
                 self.assertTrue(mutated)
                 self.assertIn(queued_id, ids)
@@ -384,15 +471,18 @@ class TasksViewTests(unittest.TestCase):
                 unittest.mock.patch.object(self.view, "status", return_value={"state": "pending"}):
             rows = self.view.list_tasks(limit=1)
         self.assertEqual([row["taskId"] for row in rows["tasks"]], [newer])
+        self.assertNotIn("preview", rows["tasks"][0])
         self.assertTrue(rows["truncated"])
         self.assertEqual(seen, {self._task_file(older), self._task_file(newer)})
         rows = self.view.list_tasks()
         self.assertEqual([row["taskId"] for row in rows["tasks"]], [older])
+        self.assertEqual(rows["tasks"][0]["preview"], "older")
         self.assertNotIn("truncated", rows)
 
     def test_list_tasks_empty_dir(self):
         view = TasksView(self.tasks / "nope", self.results, "@me:x")
         self.assertEqual(view.list_tasks(), {"tasks": []})
+        self.assertEqual(view.list_tasks(unfinished_only=True), {"tasks": []})
 
     def test_cancel_writes_cancel_instruction_signal(self):
         tid = self.view.submit("long job")["taskId"]
@@ -811,6 +901,42 @@ class DispatchTests(unittest.TestCase):
             self._No(), self._No(), "@me:x", executors={},
             tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
 
+    def test_list_unfinished_boolean_delegation_and_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._dispatcher(Path(tmp))
+            for params, expected in (({}, False), ({"unfinishedOnly": False}, False),
+                                     ({"unfinishedOnly": True}, True)):
+                with self.subTest(params=params), unittest.mock.patch.object(
+                        d.tasks, "list_tasks", return_value={"tasks": []}) as listing:
+                    self.assertEqual(asyncio.run(d.handle("task.list", params)),
+                                     {"tasks": []})
+                    listing.assert_called_once_with(unfinished_only=expected)
+
+    def test_list_rejects_non_boolean_unfinished_without_read_or_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            d = self._dispatcher(base)
+            tid = d.tasks.submit("keep this request")["taskId"]
+            d.tasks.results_dir.mkdir()
+            (d.tasks.results_dir / f"{tid}.txt").write_text("ready")
+
+            def snapshot():
+                return {str(p.relative_to(base)): (p.read_bytes(), p.stat().st_ino,
+                                                   p.stat().st_mtime_ns)
+                        for p in base.rglob("*") if p.is_file()}
+
+            before = snapshot()
+            for value in (None, 0, 1, -1, 0.0, "", "true", "false", [], [True], {},
+                          {"unfinishedOnly": True}):
+                with self.subTest(value=value), unittest.mock.patch.object(
+                        d.tasks, "list_tasks") as listing:
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(d.handle("task.list", {"unfinishedOnly": value}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertIn("boolean", str(raised.exception))
+                    listing.assert_not_called()
+                    self.assertEqual(snapshot(), before)
+
     def _list_with_process_mutation(self, mode, boundary, acknowledgment="done"):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1058,9 +1184,10 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertIsNone(self.view.details(self.FOREIGN))
 
     def test_foreign_task_is_not_enumerated(self):
-        listed = self.view.list_tasks()["tasks"]
-        self.assertEqual([e["taskId"] for e in listed], [],
-                         f"another source's task leaked into task.list: {listed}")
+        for unfinished in (False, True):
+            listed = self.view.list_tasks(unfinished_only=unfinished)["tasks"]
+            self.assertEqual([e["taskId"] for e in listed], [],
+                             f"another source's task leaked into task.list: {listed}")
 
     def test_foreign_task_cannot_be_cancelled(self):
         out = self.view.cancel(self.FOREIGN)
@@ -1130,6 +1257,109 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertIn(tid, [e["taskId"] for e in self.view.list_tasks()["tasks"]])
 
 
+class ResultOrderingTests(unittest.TestCase):
+    SECOND = 1_800_000_000
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.results = Path(tmp.name) / "results"
+        self.results.mkdir()
+        self.view = TasksView(Path(tmp.name) / "tasks", self.results, "@me:x")
+        self.ascending = []
+        for name, fraction in (("mu", 100_000_000), ("alpha", 500_000_000),
+                               ("zeta", 900_000_000)):
+            path = self.results / f"task-rtapi-{name}.txt"
+            path.write_text(f"{name} answer")
+            ns = self.SECOND * 1_000_000_000 + fraction
+            os.utime(path, ns=(ns, ns))
+            self.ascending.append(path)
+        observed = [p.stat().st_mtime_ns for p in self.ascending]
+        self.assertEqual(observed, sorted(set(observed)))
+        self.assertEqual({n // 1_000_000_000 for n in observed}, {self.SECOND})
+
+    def test_same_second_order_is_independent_of_enumeration_and_filename(self):
+        for name, body in (("task-rtapi-blank", " \n\t"),
+                           ("task-foreign", "foreign answer")):
+            path = self.results / f"{name}.txt"
+            path.write_text(body)
+            os.utime(path, (self.SECOND + 1, self.SECOND + 1))
+        real_glob = Path.glob
+        blank = self.results / "task-rtapi-blank.txt"
+        for order in itertools.permutations(self.ascending):
+            with self.subTest(order=[p.name for p in order]):
+                def ordered_glob(directory, pattern):
+                    matches = list(real_glob(directory, pattern))
+                    if directory == self.results:
+                        self.assertEqual(set(matches), {blank, *order})
+                        return iter([blank, *order])
+                    return iter(matches)
+
+                with unittest.mock.patch.object(Path, "glob", ordered_glob):
+                    self.assertEqual(self.view.get_result(), {
+                        "taskId": "task-rtapi-zeta", "result": "zeta answer",
+                        "latest": True})
+                    listed = self.view.list_results()["results"]
+                    self.assertEqual([r["taskId"] for r in listed],
+                                     [p.stem for p in reversed(self.ascending)])
+                    for result in listed:
+                        self.assertIs(type(result["ts"]), int)
+                        self.assertEqual(result["ts"], self.SECOND)
+                    self.assertEqual(self.view.list_results(limit=1), {
+                        "results": listed[:1], "truncated": True})
+                self.assertEqual(self.view.get_result("task-rtapi-mu"), {
+                    "taskId": "task-rtapi-mu", "result": "mu answer"})
+                self.assertIsNone(self.view.get_result("task-foreign"))
+
+    def test_equal_precise_mtimes_preserve_enumeration_order(self):
+        ns = self.SECOND * 1_000_000_000 + 500_000_000
+        for path in self.ascending:
+            os.utime(path, ns=(ns, ns))
+        for order in itertools.permutations(self.ascending):
+            with self.subTest(order=[p.name for p in order]), \
+                    unittest.mock.patch.object(Path, "glob", return_value=order):
+                self.assertEqual(self.view._result_files(),
+                                 [(p, self.SECOND) for p in order])
+
+    def test_full_stat_precision_and_single_cached_stat(self):
+        real_stat = Path.stat
+        metadata = {
+            path: types.SimpleNamespace(
+                st_mode=path.stat().st_mode, st_mtime=self.SECOND + 0.5,
+                st_mtime_ns=self.SECOND * 1_000_000_000 + 500_000_000 + i)
+            for i, path in enumerate(self.ascending)
+        }
+        directory = self.results / "task-rtapi-directory.txt"
+        directory.mkdir()
+        for read in (self.view._result_files, self.view.list_results,
+                     self.view.get_result):
+            with self.subTest(read=read.__name__):
+                calls = dict.fromkeys([*self.ascending, directory], 0)
+
+                def counted_stat(path, *args, **kwargs):
+                    if path in calls:
+                        calls[path] += 1
+                    if path in metadata:
+                        return metadata[path]
+                    return real_stat(path, *args, **kwargs)
+
+                with unittest.mock.patch.object(Path, "stat", counted_stat), \
+                        unittest.mock.patch.object(Path, "glob",
+                                                   return_value=[directory, *self.ascending]):
+                    got = read()
+                self.assertEqual(calls, dict.fromkeys(calls, 1))
+                if read == self.view._result_files:
+                    self.assertEqual(got, [(p, self.SECOND)
+                                          for p in reversed(self.ascending)])
+                elif read == self.view.list_results:
+                    self.assertEqual(got["results"], [
+                        {"taskId": p.stem, "ts": self.SECOND,
+                         "preview": p.read_text()}
+                        for p in reversed(self.ascending)])
+                else:
+                    self.assertEqual(got["taskId"], "task-rtapi-zeta")
+
+
 class ArchivalRaceTests(unittest.TestCase):
     """Archival unlinks a live result name. Enumeration and listing must
     absorb that; a raise here reached asyncio.gather and ended the daemon."""
@@ -1168,6 +1398,7 @@ class ArchivalRaceTests(unittest.TestCase):
     def test_archived_after_the_ready_read_still_returns_the_answer(self):
         import tasks_view as tv_mod
         real_read = tv_mod.read_ready_result
+        os.utime(self.f, ns=(1_800_000_000_900_000_000,) * 2)
 
         def read_then_archive(f):
             body = real_read(f)
@@ -1179,6 +1410,8 @@ class ArchivalRaceTests(unittest.TestCase):
             got = self.view.list_results()["results"]
         self.assertEqual([e["taskId"] for e in got], ["task-rtapi-race"])
         self.assertIsInstance(got[0]["ts"], int)
+        self.assertEqual(got[0]["ts"], 1_800_000_000)
+        self.assertEqual(got[0]["preview"], "READY BODY")
 
 
 class TasksViewAssignedIdTests(unittest.TestCase):
@@ -1206,8 +1439,10 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         self._write("task-rtapi-C1.claimed-core-2.txt", "task-rtapi-C1")
         self._write("task-rtapi-A1.assigned-core-2.txt", "task-rtapi-A1")
 
-        listed = sorted(e["taskId"] for e in self.view.list_tasks()["tasks"])
-        self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
+        for unfinished in (False, True):
+            listed = sorted(e["taskId"] for e in self.view.list_tasks(
+                unfinished_only=unfinished)["tasks"])
+            self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
 
     def test_a_name_the_grammar_rejects_is_skipped_not_emitted_as_null(self):
         # A missing id suffix is filesystem-portable and matches the glob, but
@@ -1231,6 +1466,7 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         got = self.view.get_result(listed[0])
         self.assertIsNotNone(got, "a listed id must resolve to its result")
         self.assertEqual(got["result"], "the answer")
+        self.assertEqual(self.view.list_tasks(unfinished_only=True), {"tasks": []})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

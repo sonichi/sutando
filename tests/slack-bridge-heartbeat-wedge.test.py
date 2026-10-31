@@ -9,6 +9,12 @@ structure assertions, plus a behavioral test that exec's the real
 `_socket_connected` source with its production filename and line numbers
 against fake handlers. Run: python3 tests/slack-bridge-heartbeat-wedge.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import re
 import types
 from pathlib import Path

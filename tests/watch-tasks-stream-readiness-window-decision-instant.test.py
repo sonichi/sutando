@@ -38,6 +38,8 @@ from readiness_window_helpers import (  # noqa: E402
     pump, stop, wait_ready,
 )
 from clean_watcher_env import clean_env  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -82,11 +84,11 @@ def scenario(config_first: bool):
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    p = subprocess.Popen(
+    p = popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, start_new_session=True)
+        text=True)
     out: list[str] = []
     try:
         # The probe is written first and fswatch's 2 s delay holds it back, so the
@@ -214,11 +216,11 @@ def scenario_config_changes_between_swept_items():
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    p = subprocess.Popen(
+    p = popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, start_new_session=True)
+        text=True)
     out: list[str] = []
     try:
         os.set_blocking(p.stdout.fileno(), False)
@@ -305,11 +307,11 @@ def scenario_same_second_equal_size_replacements():
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    p = subprocess.Popen(
+    p = popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, start_new_session=True)
+        text=True)
     out: list[str] = []
     stub = None
     try:
@@ -430,11 +432,11 @@ def scenario_replacement_between_parse_and_stamp():
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    p = subprocess.Popen(
+    p = popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, start_new_session=True)
+        text=True)
     out: list[str] = []
     try:
         os.set_blocking(p.stdout.fileno(), False)

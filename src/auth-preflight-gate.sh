@@ -67,7 +67,7 @@ _host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)"
 if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # ask-owner records the question (room database, else the workspace outbox) and
   # queues the owner's DM itself; it exits 0 after any failure and prints why.
-  python3 "$REPO/scripts/ask-owner.py" "BOOT ABORTED — CLI login required ($_host)" \
+  python3 "$REPO/scripts/ask-owner.py" "Startup stopped on $_host: the CLI needs a login. Log in now? (remedy in the details)" \
     --context "auth-preflight-gate stopped startup before services launched. Remedy: $_remedy" \
     --urgency durable --workspace "$_ws" \
     || echo "  auth-preflight-gate: the pending question could not be recorded (reason above)." >&2

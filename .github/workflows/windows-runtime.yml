@@ -11,6 +11,8 @@ on:
     - cron: '37 8 * * *'
   workflow_dispatch: {}
 
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
@@ -132,6 +134,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'windows-workspace-encoding.test.ps1 failed' }
           pwsh -NoProfile -File tests/windows-startup.test.ps1
           if ($LASTEXITCODE -ne 0) { throw 'windows-startup.test.ps1 failed' }
+          pwsh -NoProfile -File tests/windows-launch-hooks.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'windows-launch-hooks.test.ps1 failed' }
           pwsh -NoProfile -File tests/windows-restart.test.ps1
           if ($LASTEXITCODE -ne 0) { throw 'windows-restart.test.ps1 failed' }
           .\node_modules\.bin\tsx.cmd --test --test-force-exit tests/platform-windows-io.test.ts
@@ -213,6 +217,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'health-check-stale-proactive-backlog.test.py failed' }
           python tests/health-check-memory-dir-override.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'health-check-memory-dir-override.test.py failed' }
+          python tests/launch-hooks.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'launch-hooks.test.py failed' }
           python tests/core-heartbeat.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'core-heartbeat.test.py failed' }
           python tests/core-lineage-concurrent-writers.test.py
@@ -225,6 +231,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'file-lock.test.py failed' }
+          python tests/holder-lock.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'holder-lock.test.py failed' }
           python tests/outbox-windows.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'outbox-windows.test.py failed' }
           python tests/proactive-recovery-process-probe.test.py

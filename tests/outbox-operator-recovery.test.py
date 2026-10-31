@@ -15,6 +15,11 @@ import unittest.mock as um
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "packages" / "ag2-sparrow"))
@@ -709,14 +714,15 @@ class OutboxReaderEdges(unittest.TestCase):
             self.assertIsNone(outbox.read_item(root, "ghost"))
             self.assertEqual(outbox.list_items(root), [])
 
-    def test_a_corrupt_record_is_skipped_not_fatal(self):
+    def test_a_corrupt_record_is_listed_parked_not_skipped_or_fatal(self):
         with TemporaryDirectory() as td:
             root = Path(td)
             _parked(root)
             (outbox._items_dir(root) / "torn.json").write_text("{not json",
                                                               encoding="utf-8")
             got = outbox.list_items(root)
-            self.assertEqual([r["item_id"] for r in got], [ITEM])
+            self.assertEqual([(r.get("item_id"), r.get("file"), r["reason"]) for r in got],
+                             [(ITEM, None, "max-attempts"), (None, "torn.json", outbox.UNREADABLE_ITEM)])
 
     def test_a_non_integer_epoch_reads_as_zero(self):
         with TemporaryDirectory() as td:
@@ -762,7 +768,7 @@ class EntryPointImportsInThePackage(unittest.TestCase):
 
     def _run(self, code: str, pkg_parent: str):
         import subprocess
-        env = dict(os.environ, PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
+        env = hermetic_env(PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
         return subprocess.run([sys.executable, "-c", code], env=env,
                               capture_output=True, text=True, cwd=tempfile.gettempdir())
 

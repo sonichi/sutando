@@ -178,6 +178,8 @@ KNOWN_HEADER_KEYS = (
     # them, and the guard defangs forged body copies of the same names.
     "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # The relay's judgement of a voice task: quick or long; the core dispatches on it.
+    "lane",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -249,6 +251,28 @@ def valid_task_id(tid: str) -> bool:
     intentionally stricter than the archive lookup gate.
     """
     return bool(TASK_ID_RE.match(tid or ""))
+
+
+# A named gateway instance prefixes its broker's id: `task-<instance>~<broker id>`.
+INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+# The gateway's wire grammar for a broker task id (`task-<hex>`, `ask-<hex>`, `sc-ask-<hex>`, …).
+BROKER_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def valid_broker_id(tid) -> bool:
+    """A task id as the gateway sends it on the wire: never `.` or `..`, which name directories."""
+    return isinstance(tid, str) and BROKER_ID_RE.fullmatch(tid) is not None and tid not in (".", "..")
+
+
+def valid_local_task_id(tid) -> bool:
+    """A live task id, or one a named gateway instance owns (`task-<instance>~<broker id>`)."""
+    if not isinstance(tid, str):
+        return False
+    if valid_task_id(tid):
+        return True
+    inst, sep, broker = tid[len("task-"):].partition("~")
+    return (tid.startswith("task-") and bool(sep) and INSTANCE_ID_RE.fullmatch(inst) is not None
+            and valid_broker_id(broker))
 
 
 def valid_archive_lookup_id(tid: str) -> bool:
@@ -337,6 +361,17 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
                 return None, text
             reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
     return (reply, rest) if reply is not None else (None, text)
+
+
+def reply_action_text(text: str) -> str:
+    """The answer after broker context and the leading Matrix reply quote."""
+    body = split_reply_context(text)[1].lstrip()
+    # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not (line.startswith(("> ", ">\t")) or line.rstrip("\r") == ">"):
+            return "\n".join(lines[i:]).strip()
+    return ""
 
 
 def parse_task_headers(text: str) -> TaskHeaders:
@@ -712,10 +747,9 @@ def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]
                 if not name.endswith(".txt"):
                     continue
                 stem = name[:-4]
-                if stem in wanted:
-                    if e.is_file():
-                        out[stem].append(directory / name)
-                    continue
+                # One file can be one id's exact result AND another queued id's epoch re-archive.
+                if stem in wanted and e.is_file():
+                    out[stem].append(directory / name)
                 if epoch_forms:
                     cut = stem.rfind("-")
                     if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():

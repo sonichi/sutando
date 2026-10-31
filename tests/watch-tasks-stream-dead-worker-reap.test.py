@@ -21,6 +21,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -115,10 +118,10 @@ class Harness:
             env["SUTANDO_HANDLER_RUN_TIMEOUT"] = self.handler_timeout
         # The watched dir is $1, NOT an env var — passing it as one would fall
         # through to the resolver and watch the REAL workspace.
-        self.proc = subprocess.Popen(
+        self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
+            stderr=subprocess.DEVNULL)
 
     def deliver(self, name: str) -> None:
         p = self.task(name)

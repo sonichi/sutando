@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # helpers live in the core; repo root is parents[3] from this directory
@@ -39,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.task_dispatch import find_ready_result  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
                          RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
                          require_recipient, workers_root)
@@ -185,11 +186,81 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
         # Decide under the lock accept/release rename under; the flag check above is
         # not synchronized with mark_done, and a flag landing late only retires a finish.
         with arbitration(workspace, recipient) as dfd:
-            name = find_in(dfd, task_id)
-            if name is not None:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(name, dir_fd=dfd)
+            _withdraw_locked(workspace, recipient, task_id, dfd)
     return pend
+
+
+def _withdraw_locked(workspace, recipient: str, task_id: str, dfd: int) -> None:
+    """Drop this recipient's hold on `task_id`: its `.pending` record and its sentinel.
+    The caller holds the folder's `arbitration` (`dfd`)."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pending_flag(workspace, recipient, task_id))
+    name = find_in(dfd, task_id)
+    if name is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=dfd)
+
+
+# What a worker still owes: delivered and unanswered, accepted or not.
+OWED_RESIDUE = ("pending", "died-mid-work")
+
+
+def hand_off_to_core(workspace: Path, recipient: str) -> dict:
+    """The owner's hand-off: every task `recipient` still owes goes back to the core.
+
+    For each owed task the sentinel, the `.pending` record and the attribution are
+    withdrawn together, so a replay no longer follows the committed delivery and the
+    core's queue (tasks/ minus held work) counts it as unprocessed. A task with a
+    ready result is never moved: that reply is delivered as the worker's and the core
+    does not run it again. The caller must have retired the worker in the roster first
+    (the fence `pool_router.deliver_one` re-checks) and confirmed its session gone.
+    Returns {"handed_off": [...], "kept": {task_id: residue state}}.
+    """
+    ws = Path(workspace)
+    require_recipient(recipient)
+    out = {"handed_off": [], "kept": {}}
+    # A pass that began before the fence can still land one sentinel; the lock-held
+    # listing at the end of each pass is authoritative, so repeat until it is empty.
+    while True:
+        left = _hand_off_pass(ws, recipient, out)
+        if not left:
+            return out
+
+
+def _owed_names(dfd: int) -> set:
+    names = set()
+    for name in os.listdir(dfd):
+        got = parse_sentinel(name)
+        if got is not None:
+            names.add(got[0])
+    return names
+
+
+def _hand_off_pass(ws: Path, recipient: str, out: dict) -> set:
+    """One locked pass; returns task ids sentinel'd here that this pass did not decide."""
+    import pool_attribution
+    import pool_router
+
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
+                       if is_regular_file(p)} - set(out["kept"]))
+    # Same order as reconcile_interrupted: task locks, then the folder lock.
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        try:
+            owners = {task_id: pool_router.committed_recipient(ws, task_id) for task_id in task_ids}
+        except pool_router.RouterRefused as e:
+            raise OSError(str(e)) from e
+        with arbitration(ws, recipient) as dfd:
+            for task_id in task_ids:
+                state = _residue_state(ws, recipient, task_id, find_in(dfd, task_id))
+                if owners[task_id] != recipient or state not in OWED_RESIDUE:
+                    out["kept"][task_id] = state if owners[task_id] == recipient else "not-owned"
+                    continue
+                _withdraw_locked(ws, recipient, task_id, dfd)
+                pool_attribution.revoke(ws, task_id, recipient)
+                out["handed_off"].append(task_id)
+            return _owed_names(dfd) - set(out["kept"]) - set(task_ids)
 
 
 def writer_path() -> Path:
@@ -360,34 +431,73 @@ def release(sentinel: Path) -> Path:
     return dst
 
 
-def residue(workspace: Path, recipient: str, task_id: str) -> str:
-    """What a crash left behind, read without a journal.
+def reconcile_interrupted(workspace: Path, recipient: str) -> list[str]:
+    """Re-offer unfinished accepted work to its owner after confirmed session absence."""
+    import pool_router
 
-    One name per state, each mapped by `sweep` to exactly one action.
-    """
     ws = Path(workspace)
-    # The shared readiness contract, not existence: an empty or whitespace-only
-    # file is a placeholder still being written, and must not suppress recovery.
-    has_result = read_ready_result(result_path(ws, task_id)) is not None
-    # Through the predicate, not is_file(): that FOLLOWS a symlink, and this
-    # verdict is what `sweep` deletes on, so a planted link would retire real work.
-    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
-    sentinel = find(ws, recipient, task_id)
-    payload = payload_path(ws, task_id).is_file()
+    released = []
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient)
+                       if is_regular_file(p)})
+    # Keep router assignments stable through the transition: task locks precede
+    # folder locks, and holders must finish before this folder is locked.
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        try:
+            owners = {task_id: pool_router.committed_recipient(ws, task_id)
+                      for task_id in task_ids}
+        except pool_router.RouterRefused as e:
+            raise OSError(str(e)) from e
+        with arbitration(ws, recipient) as dfd:
+            for task_id in task_ids:
+                if owners[task_id] != recipient:
+                    continue
+                name = find_in(dfd, task_id)
+                if _residue_state(ws, recipient, task_id, name) != "died-mid-work":
+                    continue
+                try:
+                    os.rename(name, task_id + PENDING_SUFFIX, src_dir_fd=dfd, dst_dir_fd=dfd)
+                except FileNotFoundError:
+                    continue
+                released.append(task_id)
+    return released
 
+
+def classify_residue(has_flag: bool, has_result: bool, sentinel_name: Optional[str],
+                     payload: bool, archived: bool) -> str:
+    """Pure delivery classification shared by boot sweeps and dead-session recovery."""
     # The flag is terminal on its own: the bridge drains the result file on
     # delivery, so after a drain the flag is the only durable evidence left.
     if has_flag:
         return "finished"
     if has_result:
         return "completed"
-    if sentinel is None:
-        if payload and not archived_payload(ws, task_id).is_file():
+    if sentinel_name is None:
+        if payload and not archived:
             return "undelivered"
         return "clean"
     if not payload:
         return "stale-sentinel"
-    return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "pending"
+    return "died-mid-work" if parse_sentinel(sentinel_name)[1] else "pending"
+
+
+def _residue_state(ws: Path, recipient: str, task_id: str, sentinel_name: Optional[str]) -> str:
+    return classify_residue(
+        is_done_flag(done_flag(ws, recipient, task_id)),
+        find_ready_result(results_dir(ws), task_id) is not None,
+        sentinel_name, payload_path(ws, task_id).is_file(),
+        archived_payload(ws, task_id).is_file())
+
+
+def residue(workspace: Path, recipient: str, task_id: str) -> str:
+    """What a crash left behind, read without a journal.
+
+    One name per state, each mapped by `sweep` to exactly one action.
+    """
+    ws = Path(workspace)
+    sentinel = find(ws, recipient, task_id)
+    return _residue_state(ws, recipient, task_id, sentinel.name if sentinel else None)
 
 
 def prune_spent(workspace: Path, recipient: str) -> dict:
@@ -422,7 +532,7 @@ def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
     queue: either the payload is gone, or a result the core can find remains."""
     if not payload_path(ws, task_id).is_file():
         return True
-    if read_ready_result(result_path(ws, task_id)) is not None:
+    if find_ready_result(results_dir(ws), task_id) is not None:
         return True
     return archived_payload(ws, task_id).is_file()
 

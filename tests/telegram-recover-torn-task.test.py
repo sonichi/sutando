@@ -7,6 +7,12 @@ _gather_pending_task_ids, out of main()'s tick loop, and out of a bare
 `main()` — one torn file exits the bridge. And recovery runs immediately after
 the crash that produced the tear, so it is the likeliest caller to meet one.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

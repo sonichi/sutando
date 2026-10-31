@@ -86,7 +86,7 @@ class SpawnRetained(SpawnRefused):
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, **kw)
+    return subprocess.run(argv, **{"capture_output": True, "text": True, **kw})
 
 
 def per_instance_sentinel_supported(repo, runner=_run) -> bool:
@@ -130,7 +130,9 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
     """
     socket = socket or default_socket()
     try:
-        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
+        # Captured whatever the runner: absence is read from stderr, so a bare runner reads "unknown".
+        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"],
+                   capture_output=True, text=True)
     except Exception as e:                                   # noqa: BLE001
         return "unknown", f"tmux could not be run: {e}"
     rc = getattr(r, "returncode", None)
@@ -322,9 +324,13 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         raise SpawnRefused(
             f"no worker in this workspace has session {resume!r} in its lineage; "
             "refusing rather than resuming a conversation into a stranger's record")
-    if resumed_id and not runtime:
-        runtime = next((row.get("runtime") for row in wi.sessions(workspace, resumed_id)
-                        if row.get("session_id") == resume), None)
+    if resumed_id:
+        session = next((row for row in wi.sessions(workspace, resumed_id)
+                        if row.get("session_id") == resume), {})
+        if not runtime:
+            runtime = session.get("runtime")
+        if not cwd:
+            cwd = (session.get("transcript") or {}).get("cwd", "")
     runtime = resolve_runtime(repo, runtime, runner)
     if runtime == "codex" and resume:
         raise SpawnRefused("Codex cannot resume without a recorded CLI session id")

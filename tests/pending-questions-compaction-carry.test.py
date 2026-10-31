@@ -9,6 +9,11 @@ tells the core to file any it carried.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
@@ -47,7 +52,7 @@ def _hold(ws: Path, ask_id: str, question: str) -> None:
 
 
 def _run(argv, env=None):
-    e = {k: v for k, v in os.environ.items() if k not in ("SUTANDO_CORE_SESSION", "SUTANDO_INSTANCE_ID")}
+    e = {k: v for k, v in isolated_child_env().items() if k not in ("SUTANDO_CORE_SESSION", "SUTANDO_INSTANCE_ID")}
     e.update(env or {})
     return subprocess.run([sys.executable, *argv], capture_output=True, text=True, env=e, timeout=120)
 
@@ -195,7 +200,7 @@ class CompactionHook(unittest.TestCase):
     def run_hook(self, payload, env):
         return _run([str(HOOK)], env) if payload is None else subprocess.run(
             [sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True,
-            env={**{k: v for k, v in os.environ.items()
+            env={**{k: v for k, v in isolated_child_env().items()
                     if k not in ("SUTANDO_CORE_SESSION", "SUTANDO_INSTANCE_ID")}, **env}, timeout=30)
 
     def test_precompact_tells_the_summarizer_to_leave_owner_questions_out(self):
@@ -220,7 +225,7 @@ class CompactionHook(unittest.TestCase):
             r = self.run_hook(payload, env)
             self.assertEqual((r.returncode, r.stdout), (0, ""), (payload, env))
         r = subprocess.run([sys.executable, str(HOOK)], input="not json", capture_output=True, text=True,
-                           env={**os.environ, **CORE}, timeout=30)
+                           env={**isolated_child_env(), **CORE}, timeout=30)
         self.assertEqual((r.returncode, r.stdout), (0, ""))
 
     def test_the_skill_declares_both_hooks(self):

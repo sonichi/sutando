@@ -12,6 +12,11 @@ Run: python3 tests/discord-bridge-delivery-failure-visible.test.py
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import importlib.util
 import json

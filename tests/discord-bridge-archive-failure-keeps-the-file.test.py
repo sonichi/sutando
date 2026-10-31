@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """A failed archive must not destroy the task, nor silently re-enter the queue.
 Quarantine must not overwrite an earlier one, and callers must honour False."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 from pathlib import Path
 import ast
 import os

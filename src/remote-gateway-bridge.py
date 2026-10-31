@@ -237,16 +237,12 @@ def _voice_room_owner() -> str:
     bad_at = _VOICE_OWNER["bad_at"]
     if bad_at is not None and 0 <= now - bad_at < VOICE_OWNER_RETRY_S:
         return ""
-    identity = _reenroll_identity()  # noqa: F821
     try:
-        answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+        owner = _registry_owner(timeout=10)[0]  # noqa: F821
     except Exception as e:  # noqa: BLE001
         _voice_owner_read_failed(e)
-        answer = None
-    agents = answer.get("agents") if isinstance(answer, dict) else None
-    row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
-    owner = str((row or {}).get("owner") or "")
-    if not (owner.startswith("@") and ":" in owner):
+        owner = ""
+    if not owner:
         _VOICE_OWNER.update(mxid="", bad_at=now)
         return ""
     _VOICE_OWNER.update(mxid=owner, at=now, bad_at=None)
@@ -338,10 +334,116 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
         return False  # racing consumer already claimed it
 
 
+def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
+    """Ask the owner to re-invite the agent; detached, --unless-open dedupes the row; a failed launch raises."""
+    import subprocess
+    try:
+        subprocess.Popen(
+            [sys.executable, str(_REPO / "scripts" / "ask-owner.py"),
+             "Your DM with me was upgraded to a new room I'm not in. "
+             "Please invite me there and repoint my DM.", "--unless-open"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        _log(f"owner-DM upgrade: ask-owner did not start ({e})")  # noqa: F821
+        raise
+
+
+def _ag2space_proactive_dispatch_gate(task_id: str):
+    """Right before a message about a task is sent: why it must not be, or None."""
+    from proactive_dispatch_gate import dispatch_veto
+    return dispatch_veto(task_id, WS)
+
+
+def _ag2space_worker_holder(workspace, task_id: str):
+    """The worker holding the task, through the unanswered-tasks probe's delegation to worker-pool."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("unanswered_tasks_probe", _REPO / "scripts" / "unanswered-tasks.py")
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    return probe._holder(workspace, task_id)
+
+
+def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
+    """Right before a task's initial ack is sent: why a pickup, the card or a progress notice now covers it, or None."""
+    from proactive_dispatch_gate import initial_ack_veto
+    return initial_ack_veto(task_id, item_id, WS, _ag2space_worker_holder)
+
+
+def _lane_dedupe_gate(task: dict):
+    """A message another of this install's lanes queued, or one the lane its owner names will answer;
+    seats are other agents, never asked."""
+    import lane_dedupe
+    try:
+        from connections import event_owner_lanes
+        owners = event_owner_lanes(task, WS)
+    except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
+        _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
+        owners = []
+    mode = _INTAKE_MODE  # noqa: F821
+    deadline = mode["deadline"]
+    wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+    except lane_dedupe.OwnerPending:
+        return INTAKE_DEFER  # noqa: F821
+
+
+def _intake_gate(task: dict):
+    """A task from before this connection was added (its row's `not_before`), else the lane dedupe."""
+    from connections import NOT_BEFORE_ENV, backlog_reason
+    return backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _lane_dedupe_gate(task)
+
+
+_STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
+
+
+def _legacy_keeps_proactive_room() -> bool:
+    from connections import legacy_keeps_proactive_room
+    return legacy_keeps_proactive_room(WS)
+
+
+def _legacy_stand_down():
+    from connections import legacy_parked
+    return "the legacy connection is parked; unpark it to resume" if legacy_parked(WS) else None
+
+
+def _owns_unaddressed() -> bool:
+    from connections import owns_unaddressed
+    return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+def _status_ack_gate(environ=None):
+    """The initial-ack dispatch gate only while status-ack is enabled; off, or unreadable, it is
+    not installed, so no status-ack code runs on any proactive send."""
+    try:
+        from skill_config import enabled
+        on = enabled("STATUS_ACK_ENABLED", _STATUS_ACK_MANIFEST, environ)
+    except Exception:  # noqa: BLE001 - a switch that cannot be read is off
+        return None
+    return _ag2space_proactive_ack_gate if on else None
+
+
+def _ag2space_proactive_route_gate(task_id: str, room: str, thread_root):
+    """Right before a message about a task is sent: why its room and thread are not the task's own, or None."""
+    from proactive_dispatch_gate import route_veto
+    return route_veto(task_id, room, thread_root, WS)
+
+
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
+OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
+PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
+PROACTIVE_ACK_GATE = _status_ack_gate()
+PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
+TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
+PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
+OWNS_UNADDRESSED = _owns_unaddressed
+STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
+                   and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

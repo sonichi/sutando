@@ -570,6 +570,100 @@ class GateCapabilitySkipIsAnnounced(unittest.TestCase):
         self.assertIn("gate capability NOT CHECKED", buf.getvalue())
 
 
+
+class AskWithoutPrUrlMustNameItsRepo(unittest.TestCase):
+    """A patch reviewed before it is a PR still lives in a repo the reviewer may not see."""
+
+    def _run(self, argv_extra, caps=None, message="patch in room context"):
+        m = _load()
+        seen = []
+        m.gate_capability = lambda repo, login: (seen.append(repo),
+                                                 (caps or {}).get(login, (True, "write")))[1]
+        m._github_login = lambda name, roster: (name, "stubbed")
+        m.load_roster = lambda: {"a": {"stand": "@a:x", "room": "!r"},
+                                 "b": {"stand": "@b:x", "room": "!r"}}
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        ok = json.dumps({"ok": True, "event_id": "$e"})
+        self.sent = []
+        m.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: (
+            self.sent.append(a), type("R", (), {"stdout": ok, "stderr": "",
+                                                "returncode": 0})())[1]),
+            "TimeoutExpired": Exception})
+        m.record_asks = lambda *a, **k: 1
+        m._stale_repeat_ask = lambda *a, **k: (False, "")
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "a,b", "--kind", "ask",
+                "--message", message, *argv_extra]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = m.main()
+        return rc, buf.getvalue(), seen
+
+    def test_a_send_with_no_url_and_no_repo_is_refused(self):
+        rc, err, seen = self._run(["--send"])
+        self.assertEqual(rc, 7)
+        self.assertIn("pass --repo OWNER/NAME", err)
+        self.assertEqual(seen, [])
+        self.assertNotIn("gate capability NOT CHECKED", err,
+                         "the refusal replaces the warning on this path")
+
+    def test_repo_flag_checks_access_and_drops_a_non_collaborator(self):
+        rc, err, seen = self._run(["--send", "--repo", "o/private"],
+                                  caps={"a": (False, "not a collaborator")})
+        self.assertEqual(seen, ["o/private", "o/private"])
+        self.assertIn("CANNOT GATE 'a': not a collaborator on o/private", err)
+        self.assertNotEqual(rc, 0)
+        self.assertFalse([c for c in self.sent if "@a:x" in str(c)],
+                         "the non-collaborator must receive no send")
+
+    def test_a_pr_url_in_the_message_wins_over_the_repo_flag(self):
+        rc, err, seen = self._run(["--repo", "o/other"],
+                                  message="see https://github.com/o/r/pull/7")
+        self.assertEqual(seen, ["o/r", "o/r"])
+
+    def test_no_repo_reason_lets_a_repo_free_ask_through_the_gate(self):
+        rc, err, seen = self._run(["--send", "--no-repo", "design question, no code"])
+        self.assertNotIn("pass --repo OWNER/NAME", err)
+        self.assertEqual(seen, [])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.sent), 2, "the explicit bypass must still send")
+
+    def test_a_malformed_repo_flag_is_refused_before_any_probe_or_send(self):
+        # A leading hyphen never gets here: argparse reads it as an option (rc 2).
+        for bad in ("private", "o/private/extra", "o-/private", "o/", "/private"):
+            rc, err, seen = self._run(["--send", "--repo", bad])
+            self.assertEqual(rc, 7, bad)
+            self.assertIn("is not OWNER/NAME", err)
+            self.assertEqual(seen, [], bad)
+            self.assertEqual(self.sent, [], bad)
+
+    def test_a_repo_flag_whose_probe_cannot_answer_refuses_rather_than_sends(self):
+        rc, err, seen = self._run(["--send", "--repo", "o/private"],
+                                  caps={"a": (None, "unverified (gh rc=1)")})
+        self.assertEqual(rc, 7)
+        self.assertIn("REFUSED: --repo o/private: gate capability unverified (gh rc=1)", err)
+        # --no-repo alongside --repo still probes and refuses; the advice must say so.
+        self.assertIn("drop --repo and pass --no-repo", err)
+        self.assertEqual(self.sent, [], "an unchecked send is not a checked one")
+
+    def test_a_valid_repo_flag_with_a_confirmed_probe_sends(self):
+        rc, err, seen = self._run(["--send", "--repo", "o/private"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seen, ["o/private", "o/private"])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_CONTROL_an_unanswerable_probe_on_a_pr_url_still_only_warns(self):
+        rc, err, seen = self._run(["--send"], caps={"a": (None, "unverified (gh rc=1)")},
+                                  message="see https://github.com/o/r/pull/7")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("sending, but this is not a confirmation", err)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_plan_mode_only_announces_the_skip(self):
+        rc, err, seen = self._run([])
+        self.assertIn("gate capability NOT CHECKED", err)
+        self.assertNotIn("REFUSED: pass --repo", err)
+
 class ProbeFailureDefaultsAreDeliberate(unittest.TestCase):
     """Every probe here can fail, and the three defaults disagree on purpose.
 

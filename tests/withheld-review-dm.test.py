@@ -7,6 +7,11 @@ import pathlib
 import sys
 import tempfile
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
@@ -44,6 +49,8 @@ with tempfile.TemporaryDirectory() as td:
         if (method, path) == ("GET", "/v1/agents"):
             return {"agents": [{"id": "@agent:ag2.space", "owner": "@owner:ag2.space",
                                 "owner_dm_room": "!owner-dm:ag2.space"}]}
+        if path == "/v1/room" and payload.get("op") == "members":
+            return {"members": [{"user_id": "@agent:ag2.space"}, {"user_id": "@owner:ag2.space"}]}
         if path == "/v1/room" and payload.get("op") == "create":
             return {"ok": True, "room_id": "!owner-dm:ag2.space"}
         if path == "/v1/room" and payload.get("op") == "message":
@@ -76,7 +83,7 @@ with tempfile.TemporaryDirectory() as td:
     check(record["status"] == "awaiting_owner" and record["dm_event_id"] == "$review-2",
           "review must bind to the delivered DM event")
     dm_posts = [p for m, u, p in calls
-                if u == "/v1/room" and p.get("room_id") == "!owner-dm:ag2.space"]
+                if u == "/v1/room" and p.get("op") == "message" and p.get("room_id") == "!owner-dm:ag2.space"]
     candidate_dm, decision_dm = dm_posts
     check("sensitive candidate" in candidate_dm["body"]
           and candidate_dm["mentions"] == [],
@@ -181,8 +188,10 @@ with tempfile.TemporaryDirectory() as td:
     bridge._retry_review_control_results()
     bridge._req = fake_req
     control_posts = [p for _m, u, p in calls if u == "/v1/results"]
+    # Every result carries the voice-outcome contract (docs/remote-gateway-protocol.md).
     check(not control_path.exists() and control_posts[-1] == {
-        "id": "decision-no", "body": "[no-send]"},
+        "id": "decision-no", "body": "[no-send]",
+        "capabilities": ["voice-outcome-v1"], "dm_only": False},
         "the owner decision is consumed without becoming an ordinary agent task")
 
     guard.materialize_withheld_verdict(

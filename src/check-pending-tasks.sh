@@ -339,6 +339,13 @@ if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
   esac
 fi
 
+# A worker owes messages only for its own deliveries, judged above: a turn with none
+# owed (a watcher re-arm, a restart) has nobody waiting, so no message is due.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo '{}'
+  exit 0
+fi
+
 # Only a real Stop event may move the turn boundary; a hand run (no Stop payload,
 # stdin at EOF) reports the same decision and records nothing.
 COMMIT=()

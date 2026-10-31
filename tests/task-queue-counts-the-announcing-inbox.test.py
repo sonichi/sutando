@@ -103,6 +103,9 @@ class Counts(unittest.TestCase):
         self.assertEqual(self._cli("waiting", "--task-file", task_file, "--inbox", str(self.ws / "tasks")), (0, "3"))
         snap = json.loads((self.ws / "state" / "task-queue.json").read_text())
         self.assertEqual(snap["depth"], 4)
+        before = (self.ws / "state" / "task-queue.json").read_bytes()
+        self.assertEqual(self._cli("waiting", "--task-file", task_file, "--inbox", str(self.inbox)), (0, "1"))
+        self.assertEqual((self.ws / "state" / "task-queue.json").read_bytes(), before)
         (self.ws / "state" / "task-queue.json").unlink()
         self.assertEqual(self._cli("waiting", "--task-file", task_file), (0, "3"))
         self.assertTrue((self.ws / "state" / "task-queue.json").exists())
@@ -110,6 +113,26 @@ class Counts(unittest.TestCase):
         r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", task_file, "--inbox", str(self.inbox)],
                            capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "1"))
+
+    def test_both_core_cli_forms_exclude_answered_tasks_and_refresh_the_snapshot(self):
+        ws = self.ws / "core"
+        tasks = ws / "tasks"; tasks.mkdir(parents=True)
+        results = ws / "results"; results.mkdir()
+        for tid in ("task-done", "task-open"):
+            _task(tasks / f"{tid}.txt", tid)
+        answer = results / "task-done.txt"
+        for body, waiting, depth in ((" \n", "1", 2), ("done\n", "0", 1)):
+            answer.write_text(body)
+            for inbox_args in ((), ("--inbox", str(tasks))):
+                with self.subTest(body=body, inbox_args=inbox_args):
+                    argv = ("waiting", "--task-file", str(tasks / "task-open.txt"), *inbox_args)
+                    self.assertEqual(self._cli(*argv), (0, waiting))
+                    r = subprocess.run([sys.executable, str(TQ), *argv], capture_output=True, text=True, timeout=10)
+                    self.assertEqual((r.returncode, r.stdout.strip(), r.stderr), (0, waiting, ""))
+                    snap = json.loads((ws / "state" / "task-queue.json").read_text())
+                    self.assertEqual(snap["depth"], depth)
+                    expected = {"task-open"} if depth == 1 else {"task-done", "task-open"}
+                    self.assertEqual({t["id"] for t in snap["pending"]}, expected)
 
 
 class ResolvedOncePerCall(unittest.TestCase):
@@ -158,7 +181,17 @@ class ResolvedOncePerCall(unittest.TestCase):
         per_id = {n for n in names if self.td.has_ready_result(r, n)}
         self.assertEqual(batch, per_id)
         self.assertEqual(sorted(batch), sorted(f"{t}.txt" for t in list(layouts) + ["task-placeholder"]))
-        self.assertEqual(sorted(t["id"] for t in tq.pending(self.ws, self.inbox)), ["task-blank", "task-open"])
+        before = {p: p.read_bytes() for p in self.ws.rglob("*.txt")}
+        for inbox in (None, self.inbox):
+            with self.subTest(inbox=inbox):
+                self.assertEqual(sorted(t["id"] for t in tq.pending(self.ws, inbox)), ["task-blank", "task-open"])
+                for tid in list(layouts) + ["task-placeholder"]:
+                    self.assertEqual(tq.position(self.ws, tid, inbox), {"depth": 2, "position": 0})
+                self.assertEqual(tq.waiting(self.ws, "task-open", inbox), 1)
+        snap = json.loads(tq.write_snapshot(self.ws).read_text())
+        self.assertEqual(snap["depth"], 2)
+        self.assertEqual(sorted(t["id"] for t in snap["pending"]), ["task-blank", "task-open"])
+        self.assertEqual({p: p.read_bytes() for p in self.ws.rglob("*.txt")}, before)
 
     def test_directory_listings_do_not_grow_with_the_inbox(self):
         r = self.ws / "results"
@@ -173,10 +206,12 @@ class ResolvedOncePerCall(unittest.TestCase):
         def counting_scandir(path=".", *a, **k):
             calls.append(str(path))
             return real_scandir(path, *a, **k)
-        with unittest.mock.patch("os.scandir", counting_scandir):
-            self.assertEqual([t["id"] for t in tq.pending(self.ws, self.inbox)], ["task-open"])
-        # live results, archive/, its month dirs (1), the base for retention dirs (1), and the inbox itself.
-        self.assertLessEqual(len(calls), 8, calls)
+        for inbox in (None, self.inbox):
+            with self.subTest(inbox=inbox), unittest.mock.patch("os.scandir", counting_scandir):
+                calls.clear()
+                self.assertEqual([t["id"] for t in tq.pending(self.ws, inbox)], ["task-open"])
+                # live results, archive/, its month dirs (1), the base for retention dirs (1), and the inbox itself.
+                self.assertLessEqual(len(calls), 8, calls)
 
 
 class EmitPassesTheInbox(unittest.TestCase):
@@ -212,6 +247,13 @@ class EmitPassesTheInbox(unittest.TestCase):
             r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(r.stdout, "QUEUE: 2 pending after this\nEND\n", r.stderr)
             self.assertEqual(json.loads((ws / "state" / "task-queue.json").read_text())["depth"], 3)
+            (ws / "results").mkdir()
+            for tid in ("task-core-a", "task-core-b"):
+                (ws / "results" / f"{tid}.txt").write_text("done\n")
+            r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual((r.returncode, r.stdout), (0, "END\n"), r.stderr)
+            snap = json.loads((ws / "state" / "task-queue.json").read_text())
+            self.assertEqual((snap["depth"], [t["id"] for t in snap["pending"]]), (1, ["task-mine"]))
 
 
 if __name__ == "__main__":

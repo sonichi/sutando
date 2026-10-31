@@ -564,7 +564,7 @@ def render_skill_prelude(
             f"message, reconstruct the room thread — `python3 "
             f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
             f"reports no gateway configured, load the channel env first: `set -a; . "
-            f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a`) — and read it "
+            f"\"$(bash scripts/channel-env.sh {_cdir_q} --room {_chan_q})\"; set +a`) — and read it "
             "back (everyone's messages including your own prior replies) until this "
             "message stands on its own, then answer from the reconstructed thread, "
             "NOT from memory. Do this every time; do NOT skip it because the message "
