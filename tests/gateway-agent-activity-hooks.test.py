@@ -3304,6 +3304,98 @@ class Hooks(unittest.TestCase):
                 self.assertEqual((rec["run"], rec["pending_serve"]["lease"]), (tid, "L2"))
                 self.assertEqual([c["kind"] for c in rec["claims"].values()].count("result"), 1, "its claim is kept")
 
+    def paused_before_publish(self, tid):
+        """Served, acked as generation 1; its result pinned and claimed by a worker paused before its
+        publish; then served again under L2."""
+        fake = self.served_acked(tid)
+        self.core_writes(tid, "generation 1's answer")
+        old = time.time() - 5
+        os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+        raw, generation = gw._pin_and_claim(tid)
+        inflight = {tid}
+        self.reserved(tid, inflight)
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+        return fake, inflight, raw, generation
+
+    def held_three_times(self, tid):
+        acks = [gw._post_task_ack(tid, durable=True, lease_id="L2") for _ in range(3)]
+        self.assertEqual(acks, [False, False, False], "not known to be unsent: L2 waits")
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["run"], rec["execution_generation"], rec["pending_serve"]["lease"]), (tid, 1, "L2"))
+        self.assertEqual([c["kind"] for c in rec["claims"].values()].count("result"), 1, "its claim is kept")
+        self.assertTrue(any(f"task {tid}: result claim" in m and "newer generation waits" in m for m in self.logs),
+                        "the hold is logged with what unsticks it")
+
+    def test_an_unreadable_reply_keeps_its_claim_and_the_paused_send_posts_before_any_switch(self):
+        for fault in ("unreadable", "unstattable"):
+            with self.subTest(fault=fault):
+                tid = f"task-unreadable-{fault}"
+                fake, inflight, raw, generation = self.paused_before_publish(tid)
+                names = {str(gw.RESULTS_DIR / f"{tid}.txt"), str(gw.disposal.pin_path(gw.RESULTS_DIR, tid))}
+                real_lstat = os.lstat
+                if fault == "unreadable":
+                    os.chmod(gw.RESULTS_DIR / f"{tid}.txt", 0)
+                    stuck = contextlib.nullcontext()
+                else:
+                    stuck = mock.patch.object(gw.os, "lstat", side_effect=lambda p, *a, **k: (
+                        (_ for _ in ()).throw(PermissionError(13, "denied")) if str(p) in names
+                        else real_lstat(p, *a, **k)))
+                with stuck:
+                    self.held_three_times(tid)
+                os.chmod(gw.RESULTS_DIR / f"{tid}.txt", 0o644)
+                gw._deliver_ready(tid, gw.RESULTS_DIR / f"{tid}.txt", raw, generation, inflight)
+                self.assertEqual(fake.posted("/v1/results"), [], "the paused send resumes into the hold: nothing posts")
+                self.assertNotIn("result", [c["kind"] for c in (gw._ATTEMPTS.get(tid).get("claims") or {}).values()],
+                                 "and nothing was sent, so its result claim goes")
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "settled: the switch follows")
+                gw._post_ready_results(inflight)
+                self.assertEqual(fake.posted("/v1/results"), [], "generation 1's reply is never posted after it")
+                self.answered_by_its_own_run(fake, tid, inflight)
+
+    def test_an_unreadable_outbox_item_keeps_its_claim_until_the_operator_clears_it(self):
+        tid = "task-unreadable-item"
+        fake, inflight, _, _ = self.paused_before_publish(tid)
+        op = next(iter(gw._ATTEMPTS.get(tid)["claims"]))
+        root = gw._delivery_core().backend.root
+        gw._delivery_core().backend.publish(tid, b"{}", lifecycle={"op": op})
+        item = sys.modules[gw.read_item.__module__]._item_path(root, tid)
+        item.write_text("{not json")
+        gw.disposal.pin_path(gw.RESULTS_DIR, tid).unlink()
+        (gw.RESULTS_DIR / f"{tid}.txt").unlink()
+        self.held_three_times(tid)
+        item.unlink()                           # the operator's removal: read as no item
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        self.answered_by_its_own_run(fake, tid, inflight)
+
+    def test_a_name_or_item_that_cannot_be_read_is_never_taken_as_absent(self):
+        tid = "task-cannot-tell"
+        fake = self.served_acked(tid)
+        name = gw.RESULTS_DIR / f"{tid}.txt"
+        real_lstat = os.lstat
+        unknown = mock.patch.object(gw.os, "lstat", side_effect=lambda p, *a, **k: (
+            (_ for _ in ()).throw(PermissionError(13, "denied")) if str(p).startswith(str(gw.RESULTS_DIR / tid))
+            or str(p).startswith(str(gw.RESULTS_DIR / f".{tid}")) else real_lstat(p, *a, **k)))
+        self.assertIs(gw._on_disk(name), False)
+        with unknown:
+            self.assertIsNone(gw._on_disk(name))
+            self.assertTrue(gw._run_id_used(tid), "a run id that cannot be told is never reused")
+            with txn(tid) as t:
+                self.assertFalse(gw._stop_run(t, tid, "test"), "nor stopped as unanswered")
+                t.put(owed_close={"gen": 1, "why": "closed"})
+                gw._withdraw_closed(t, "closed")
+                self.assertTrue(t.rec.get("owed_close"), "its close stays owed")
+                t.put(stop_ctl="task-ctl-x", stop_requested=True)
+            self.assertIsNone(gw._ctl_written(f"{tid}-ctl"), "a control task that cannot be told is neither written nor cleared")
+            self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "nothing was withdrawn")
+        root = gw._delivery_core().backend.root
+        gw._delivery_core().backend.publish(tid, b"{}")
+        with mock.patch.object(gw, "read_item", side_effect=PermissionError(13, "denied")):
+            self.assertEqual(gw._outbox_record(root, tid), gw.task_attempts.UNKNOWN)
+        sys.modules[gw.read_item.__module__]._item_path(root, tid).write_text("{not json")
+        self.assertEqual(gw._outbox_record(root, tid), gw.task_attempts.UNKNOWN)
+        self.assertFalse(gw._result_disposed(tid))
+        del fake
+
     def test_a_different_reply_at_the_name_does_not_keep_a_disposed_replys_claim(self):
         tid = "task-other-reply"
         self.served_acked(tid)

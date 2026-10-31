@@ -4227,11 +4227,13 @@ def _reconcile_earlier_run(wire_tid: str) -> bool:
         if c.get("kind") != "result":
             continue
         published = _claim_published(wire_tid, op, c)
-        if not published:
+        if not published or published == task_attempts.UNKNOWN:
             return False
         for item in published:
-            record = read_item(root, item) or {}
-            if record.get("status") in ("DELIVERED", "PARKED"):
+            record = _outbox_record(root, item)
+            if record == task_attempts.UNKNOWN:
+                return False
+            if (record or {}).get("status") in ("DELIVERED", "PARKED"):
                 continue
             try:
                 if not withdraw_unsent(root, item, lambda _payload: True):
@@ -4242,21 +4244,56 @@ def _reconcile_earlier_run(wire_tid: str) -> bool:
     return True
 
 
-def _claim_published(wire_tid: str, op: str, claim: dict) -> "list[str]":
-    """The outbox items a result claim's operation reached."""
+def _on_disk(path: Path) -> "bool | None":
+    """Whether a name exists: None when it cannot be told, which no caller may read as absent."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return None
+    return True
+
+
+def _outbox_record(root, item_id: str):
+    """An outbox item's record, None when there is none, UNKNOWN when it exists and cannot be read."""
+    try:
+        record = read_item(root, item_id)
+    except OSError:
+        return task_attempts.UNKNOWN
+    return task_attempts.UNKNOWN if isinstance(record, dict) and record.get("unreadable") else record
+
+
+def _claim_published(wire_tid: str, op: str, claim: dict):
+    """The outbox items a result claim's operation reached; UNKNOWN when any candidate cannot be read."""
     root = _delivery_core().backend.root
     run_item = _run_item(claim.get("run") or "")
-    items = [i for i in dict.fromkeys((run_item if isinstance(run_item, str) else None, wire_tid,
-                                       f"{wire_tid}.lease-close")) if i]
-    return [i for i in items if ((read_item(root, i) or {}).get("lifecycle") or {}).get("op") == op]
+    if run_item == task_attempts.UNKNOWN:
+        return task_attempts.UNKNOWN
+    published = []
+    for item in dict.fromkeys(i for i in (run_item, wire_tid, f"{wire_tid}.lease-close") if i):
+        record = _outbox_record(root, item)
+        if record == task_attempts.UNKNOWN:
+            return task_attempts.UNKNOWN
+        if ((record or {}).get("lifecycle") or {}).get("op") == op:
+            published.append(item)
+    return published
 
 
-def _claimed_copy_present(tid: str, claim: dict) -> bool:
-    """Whether the exact reply a result claim was taken for is still at its name or its pin."""
-    paths = (RESULTS_DIR / f"{tid}.txt", disposal.pin_path(RESULTS_DIR, tid))
-    if not claim.get("file"):
-        return any(os.path.lexists(p) for p in paths)
-    return any(_live_source(p, tuple(claim["file"])) is not None for p in paths)
+def _claimed_copy_present(tid: str, claim: dict) -> "bool | None":
+    """Whether the exact reply a result claim was taken for is still at its name or its pin, by the
+    identity the claim recorded; None when either name cannot be told."""
+    file = claim.get("file")
+    present = False
+    for path in (RESULTS_DIR / f"{tid}.txt", disposal.pin_path(RESULTS_DIR, tid)):
+        try:
+            st = os.lstat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return None
+        present = present or not file or [st.st_dev, st.st_ino, st.st_mtime_ns] == list(file)[:3]
+    return present
 
 
 def _end_unpublished_claims(wire_tid: str) -> bool:
@@ -4269,9 +4306,20 @@ def _end_unpublished_claims(wire_tid: str) -> bool:
         open_ = True
         for c in t.claims("result"):
             tid = str((c.get("data") or {}).get("tid") or "")
-            if not tid or _claimed_copy_present(tid, c):
-                open_ = open_ and bool(_claim_published(wire_tid, c["op"], c))
-            elif not _claim_published(wire_tid, c["op"], c):
+            copy = _claimed_copy_present(tid, c) if tid else True
+            published = _claim_published(wire_tid, c["op"], c)
+            if copy is None or published == task_attempts.UNKNOWN:
+                _log_backoff((wire_tid, "claim-unknown"), f"task {wire_tid}: result claim {c['op']} is kept — "
+                             f"its {'reply' if copy is None else 'outbox item'} cannot be read; a newer "
+                             "generation waits until read access is restored or the operator removes it")
+                open_ = False
+            elif copy:
+                if not published:
+                    _log_backoff((wire_tid, "claim-unsent"), f"task {wire_tid}: result claim {c['op']} is kept — "
+                                 "its reply is still at its name, unsent; a newer generation waits until it is "
+                                 "delivered or, if it cannot be read, moved to results/undelivered/")
+                open_ = open_ and bool(published)
+            elif not published:
                 open_ = t.release_claim(c) and open_
         return open_
 
@@ -4280,7 +4328,10 @@ def _stop_run(t, run: "str | None", why: str) -> bool:
     """Stop a run a newer generation replaces: its untaken task file is withdrawn; once the core has
     taken it, a cancel naming that run asks the core to stop it. Its result, whenever it comes, has no
     live run and is quarantined. False when neither could be done."""
-    if not run or os.path.lexists(RESULTS_DIR / f"{run}.txt") or _own_copy_exists(run):
+    answered = _on_disk(RESULTS_DIR / f"{run}.txt") if run else True
+    if answered is None:
+        return False                            # its result cannot be told: stopped next pass
+    if answered or _own_copy_exists(run):
         return True
     activity = task_attempts.last_activity(_STATE, run)
     for path in [TASKS_DIR / f"{run}.txt", *TASKS_DIR.glob(f"{glob.escape(run)}.assigned-*")]:
@@ -4386,12 +4437,13 @@ def _queue_cancel_instruction(tid: str, reason: str, ctl: "str | None" = None) -
     return ctl
 
 
-def _ctl_written(ctl: str) -> bool:
+def _ctl_written(ctl: str) -> "bool | None":
     """The control task is queued, taken, answered, archived or withdrawn: writing it again would
-    repeat it."""
-    return (_task_pending(ctl) or _archived_task_file(ctl) is not None
-            or os.path.lexists(TASKS_DIR / f".{ctl}.withdrawn")
-            or os.path.lexists(RESULTS_DIR / f"{ctl}.txt") or _delivered_copy_exists(ctl))
+    repeat it. None when a name cannot be told: neither written nor cleared this pass."""
+    marks = [_on_disk(TASKS_DIR / f".{ctl}.withdrawn"), _on_disk(RESULTS_DIR / f"{ctl}.txt")]
+    if True in marks or _task_pending(ctl) or _archived_task_file(ctl) is not None or _delivered_copy_exists(ctl):
+        return True
+    return None if None in marks else False
 
 
 def _run_tid(wire_tid: str, rec) -> str:
@@ -4497,11 +4549,12 @@ def _settle_current(t) -> None:
     owed = rec.get("owed_ctl")
     if due(owed) and isinstance(owed.get("id"), str):
         ctl = owed["id"]
-        if _ctl_written(ctl) or _queue_cancel_instruction(tid, str(owed.get("reason")), ctl):
+        written = _ctl_written(ctl)
+        if written or written is False and _queue_cancel_instruction(tid, str(owed.get("reason")), ctl):
             t.put(owed_ctl=None)
     lost = rec.get("dispatch_lost")
     body = lost.get("body") if due(lost) else None
-    if isinstance(body, str) and not (os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid)):
+    if isinstance(body, str) and _on_disk(RESULTS_DIR / f"{tid}.txt") is False and not _own_copy_exists(tid):
         # The file is named in the record before it is published: only it is ever this failure.
         written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body, claim=lambda identity: t.put(
             dispatch_lost={**lost, "file": identity}))
@@ -4584,7 +4637,10 @@ def _withdraw_closed(t, why: str) -> None:
     core is asked to stop. Its result is settled by the fence either way, never posted. Its
     `owed_close` marker goes only when that is done, or with the cancel it becomes."""
     tid = _run_tid(t.wire, t.rec)
-    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid):
+    answered = _on_disk(RESULTS_DIR / f"{tid}.txt")
+    if answered is None:
+        return                                  # cannot be told: its marker stays for the next pass
+    if answered or _own_copy_exists(tid):
         t.put(owed_close=None)
         return
     queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{glob.escape(tid)}.assigned-*")]
@@ -4670,7 +4726,7 @@ def _watch_dispatch(t) -> None:
     then went quiet for STALLED_S with no result. Its beats stop; the failure is posted."""
     tid = _run_tid(t.wire, t.rec)
     pending = _task_pending(tid)
-    answered = os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid)
+    answered = _on_disk(RESULTS_DIR / f"{tid}.txt") is not False or _own_copy_exists(tid)
     activity = task_attempts.last_activity(_STATE, tid)
     if t.dispatch_lost_due(pending or answered, activity):
         _fail_unanswered(t, tid, DISPATCH_LOST_RESULT, "its task file left the queue unanswered, "
@@ -4720,7 +4776,7 @@ def _resolve_stop(t) -> None:
     if not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
         return                                  # the core has not reached the control task yet
     tid = _run_tid(t.wire, rec)
-    if os.path.lexists(RESULTS_DIR / f"{tid}.txt"):
+    if _on_disk(RESULTS_DIR / f"{tid}.txt") is not False:
         return                                  # delivery rules: a reply posts, nothing to send stops
     t.stop_outcome(stopped=not _own_copy_exists(tid))
 
@@ -4733,7 +4789,7 @@ def _own_copy_exists(tid: str) -> bool:
     if not item:
         return _delivered_copy_exists(tid)
     root = getattr(_delivery_core().backend, "root", None)
-    return root is not None and read_item(root, item) is not None
+    return root is not None and _outbox_record(root, item) is not None
 
 
 def _close_stale_turns(inflight: "set[str]") -> None:
@@ -5766,7 +5822,7 @@ def _run_id_used(local: str) -> bool:
     """Whether anything of a local id is on disk: queued, staged, archived, answered or delivered.
     A run id that is never reused is checked against all of them."""
     return (_task_pending(local) or local in (_load_held() or {}) or _archived_task_file(local) is not None
-            or os.path.lexists(RESULTS_DIR / f"{local}.txt") or _delivered_copy_exists(local))
+            or _on_disk(RESULTS_DIR / f"{local}.txt") is not False or _delivered_copy_exists(local))
 
 
 def _earlier_run_settling(t, first: str, episode) -> bool:
@@ -5777,8 +5833,8 @@ def _earlier_run_settling(t, first: str, episode) -> bool:
         return False
     tid = (rec or {}).get("run") if isinstance(rec, dict) else None
     tid = tid or t.last_run(first) or first
-    return (tid in _RETIRING or os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _task_pending(tid)
-            or tid in _SETTLE_PENDING or os.path.lexists(disposal.pin_path(RESULTS_DIR, tid)))
+    return (tid in _RETIRING or _on_disk(RESULTS_DIR / f"{tid}.txt") is not False or _task_pending(tid)
+            or tid in _SETTLE_PENDING or _on_disk(disposal.pin_path(RESULTS_DIR, tid)) is not False)
 
 
 def _mark_published(tid: str) -> None:
@@ -6970,7 +7026,10 @@ def _run_holds_result(tid: str, rfile: Path) -> "bool | None":
         return True
     if mapping is None and not isinstance(_ATTEMPTS.entry(_broker_tid(tid)), dict):
         return True
-    if not os.path.lexists(rfile):
+    at_name = _on_disk(rfile)
+    if at_name is None:
+        return None
+    if not at_name:
         return True                             # nothing at the name: the settle path decides
     _, generation = _read_ready_generation(rfile)
     why = ("its run was closed before this result was written" if mapping is not None
@@ -6987,13 +7046,14 @@ def _result_disposed(tid: str) -> bool:
     if woken_item:
         # The first attempt's copies are archived under this id; only the woken item decides.
         root = getattr(_delivery_core().backend, "root", None)
-        return root is not None and (read_item(root, woken_item) or {}).get("status") == "DELIVERED"
+        record = _outbox_record(root, woken_item) if root is not None else None
+        return isinstance(record, dict) and record.get("status") == "DELIVERED"
     if _delivered_copy_exists(tid) or undelivered_quarantine.find_quarantined(RESULTS_DIR, tid):
         return True
     root = getattr(_delivery_core().backend, "root", None)
     delivery = _delivery_tid(tid)
-    return (root is not None and delivery == tid
-            and (read_item(root, _broker_tid(delivery)) or {}).get("status") == "DELIVERED")
+    record = _outbox_record(root, _broker_tid(delivery)) if root is not None and delivery == tid else None
+    return isinstance(record, dict) and record.get("status") == "DELIVERED"
 
 
 def _open_wake_unsettled(tid: str) -> bool:
@@ -7004,7 +7064,8 @@ def _open_wake_unsettled(tid: str) -> bool:
     if not item:
         return False
     root = getattr(_delivery_core().backend, "root", None)
-    return root is None or (read_item(root, item) or {}).get("status") != "DELIVERED"
+    record = _outbox_record(root, item) if root is not None else None
+    return not (isinstance(record, dict) and record.get("status") == "DELIVERED")
 
 
 def _settle_task(tid: str, inflight: "set[str] | None" = None) -> bool:
