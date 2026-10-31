@@ -1219,7 +1219,14 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({}, {"ok": True, "pid": 4}), ("pending", None))
         self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}), ("failed", "no_token"))
         self.assertEqual(C.derive_state({"connected": True}, {"ok": True}), ("connected", None))
-        self.assertEqual(C.derive_state({"connected": False, "error": "timed out"}, {}), ("disconnected", None))
+        self.assertEqual(C.derive_state({"connected": False, "error": "timed out", "last_ok_ts": 9}, {}),
+                         ("disconnected", None))
+        starting = {"connected": False, "error": "starting — not yet connected", "last_ok_ts": None}
+        self.assertEqual(C.derive_state(starting, {"ok": True}), ("pending", None),
+                         "a live bridge that has never polled is starting, not disconnected")
+        self.assertEqual(C.derive_state(starting, {"ok": True}, writer_alive=False), ("disconnected", None),
+                         "one whose writer is gone is not starting")
+        self.assertEqual(C.derive_state({**starting, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "reenroll": {"pending": True}}, {}),
                          ("failed", "auth_rejected"))
