@@ -14,10 +14,17 @@ import base64
 import os
 import tempfile
 
-from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
-                    quote, HTTPError, URLError)
+from _gateway import (HTTP_TIMEOUT, gate_allows, load_gate, gateway, http_request,
+                    degrade_reason, quote, HTTPError, URLError)
 
 MAX_BYTES = 25 * 1024 * 1024
+# Slowest upload we still wait out: a MAX_BYTES file (~33 MB as base64 JSON) gets ~130 s.
+UPLOAD_FLOOR_BYTES_PER_SEC = 256 * 1024
+
+
+def upload_timeout(n_bytes):
+    """Socket timeout for sending `n_bytes`: HTTP_TIMEOUT, stretched to the upload floor."""
+    return max(HTTP_TIMEOUT, n_bytes / UPLOAD_FLOOR_BYTES_PER_SEC)
 
 
 def _result(ok, *, path=None, ref=None, room_id=None, reason=None, bytes_=None):
@@ -132,7 +139,7 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
                           "caption": caption}).encode()
     url = f"{base}/v1/rooms/{quote(room_id)}/media"
     try:
-        http_request("POST", url, headers, data=payload)
+        http_request("POST", url, headers, data=payload, timeout=upload_timeout(len(payload)))
     except HTTPError as e:
         return _result(False, room_id=room_id, path=path, reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:

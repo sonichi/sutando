@@ -247,16 +247,19 @@ def gateway(room_id=None):
     return creds.base_url, headers
 
 
-def http_request(method, url, headers=None, data=None, max_bytes=None):
+def http_request(method, url, headers=None, data=None, max_bytes=None, timeout=None):
     """Raw request → (status, body_bytes, response_headers). Raises on HTTP error.
 
     When `max_bytes` is set, the body read is BOUNDED to `max_bytes + 1` so a
     hostile/buggy peer can't OOM us before a higher-layer size cap applies —
     reading one extra byte lets the caller detect overflow without buffering the
     whole (possibly multi-GB) response.
+
+    `timeout` overrides HTTP_TIMEOUT for a caller whose request body is large
+    enough that sending it alone can outlast 15 s (an upload).
     """
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT if timeout is None else timeout) as resp:
         if max_bytes is not None:
             # Content-Length up-front: if the peer DECLARES an oversize body,
             # don't allocate it at all. Otherwise read at most max_bytes+1 so an
