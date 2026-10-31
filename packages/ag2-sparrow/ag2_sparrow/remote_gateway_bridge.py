@@ -1077,7 +1077,9 @@ def _publish_review(path: Path, record: dict) -> bool:
         return False
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
-    body = _released_review_body(str(record.get("withheld_body") or ""))
+    raw = record.get("withheld_body")
+    # Only a string is a body: str() of a list or an int would publish its repr.
+    body = _released_review_body(raw) if isinstance(raw, str) else ""
     if not room.startswith("!") or not body:
         return _record_publish_failure(path, record, version, "invalid origin/body")
     core, item_id = _withheld_outbox(), f"{record['review_id']}.{claim}"
