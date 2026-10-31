@@ -13,6 +13,7 @@
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
 #   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
 #   bash scripts/sutando-config.sh bootstrap     # mkdir -p the canonical subdirs in the resolved workspace
+#   bash scripts/sutando-config.sh desktop-data-root # print the desktop app's macOS data folder
 #
 # `bootstrap` is the idempotent setup step for the in-repo workspace introduced
 # in M0 (PR #1395). startup.sh runs this transitively via init.sh --auto, but
@@ -48,8 +49,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$(resolve_python "$REPO_ROOT")"
 
 # Demand Python LAZILY, at the point of use. Requiring it up front was wrong:
-# 8 of this script's subcommands are pure shell (app-node-dir, node-bin,
-# tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir)
+# 9 of this script's subcommands are pure shell (desktop-data-root, app-node-dir,
+# node-bin, tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir)
 # and answering them needs no interpreter — yet an eager
 # `require_python … || exit 1` failed them too. src/startup.sh:57 asks for
 # `app-node-dir` under `set -e`, so on a Darwin/no-CLT host that eager demand
@@ -66,6 +67,27 @@ py() {
     PY="$(require_python "$REPO_ROOT" "resolve Sutando configuration")" || exit 1
   fi
   "$PY" "$@"
+}
+
+# Mirrors src/desktop_data_root.py; tests/desktop-data-root-contract.test.py pins the two.
+# The desktop ships its own rule beside this checkout; the built-in copy is the fallback.
+desktop_data_root() {
+  local base="$HOME/Library/Application Support" shipped="$REPO_ROOT/../app-support.sh" out=""
+  if [ -n "${SUTANDO_APP_SUPPORT:-}" ]; then
+    printf '%s' "$SUTANDO_APP_SUPPORT"
+    return
+  fi
+  if [ -f "$shipped" ]; then
+    out="$(. "$shipped" >/dev/null 2>&1 && declare -F ag2_app_support_dir >/dev/null && ag2_app_support_dir "$HOME")" || out=""
+    case "$out" in *$'\n'*) out="" ;; esac
+  fi
+  if [ -n "$out" ]; then
+    printf '%s' "$out"
+  elif [ -e "$base/.space.ag2.desktop.ready" ] || [ -f "$base/space.ag2.desktop/.copied-from-space.ag2.app" ] || [ ! -d "$base/space.ag2.app" ]; then
+    printf '%s' "$base/space.ag2.desktop"
+  else
+    printf '%s' "$base/space.ag2.app"
+  fi
 }
 
 cmd="${1:-workspace}"
@@ -360,11 +382,17 @@ print(_host_label(), end='')
 "
     ;;
 
+  desktop-data-root)
+    # The desktop app's macOS data folder: $SUTANDO_APP_SUPPORT, else the desktop's
+    # shipped ../app-support.sh rule, else the built-in copy of it.
+    desktop_data_root
+    ;;
+
   app-node-dir)
     # The bundled app runtime's node bin dir (Sutando.app ships a private node
     # for hosts with no homebrew/nvm/volta). CONFIG-RESOLVED, not hardcoded:
     # override via $SUTANDO_APP_NODE_DIR; default = the app-support engine path.
-    printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
+    printf '%s' "${SUTANDO_APP_NODE_DIR:-$(desktop_data_root)/engine/runtime/node/bin}"
     ;;
 
   python-bin)
@@ -442,7 +470,7 @@ print(_host_label(), end='')
         exit 1
       fi
     else
-      _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
+      _app_node="${SUTANDO_APP_NODE_DIR:-$(desktop_data_root)/engine/runtime/node/bin}/node"
       if [ -x "$_app_node" ]; then
         printf '%s' "$_app_node"
       else
@@ -522,13 +550,13 @@ print(_host_label(), end='')
     # start-cli, health-check) and the daemon/CLI can never disagree on the path.
     # Resolution order (must match rundir.py.run_dir()):
     #   1. SUTANDO_RUN_DIR                                   explicit override
-    #   2. darwin: ~/Library/Application Support/space.ag2.app/run   (Desktop root)
+    #   2. darwin: <desktop-data-root>/run                   (Desktop root)
     #   3. $XDG_RUNTIME_DIR/sutando                          Linux/systemd per-user
     #   4. ~/.sutando/run                                    portable fallback
     if [ -n "${SUTANDO_RUN_DIR:-}" ]; then
       printf '%s' "$SUTANDO_RUN_DIR"
     elif [ "$(uname -s)" = "Darwin" ]; then
-      printf '%s' "$HOME/Library/Application Support/space.ag2.app/run"
+      printf '%s/run' "$(desktop_data_root)"
     elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
       printf '%s' "$XDG_RUNTIME_DIR/sutando"
     else

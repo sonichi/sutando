@@ -4,7 +4,7 @@ daemon and CLI share. Pins the documented resolution order on every branch
 (in-process, so the coverage recorder sees the module the E2E daemon
 subprocess hides):
 
-  SUTANDO_RUN_DIR > darwin app-support run dir > $XDG_RUNTIME_DIR/sutando >
+  SUTANDO_RUN_DIR > darwin desktop-data-root run dir > $XDG_RUNTIME_DIR/sutando >
   ~/.sutando/run;  socket = SUTANDO_RUNTIME_SOCKET or
   <run_dir>/<(agent, instance) key>/runtime.sock (legacy flat socket honored
   only for the undeclared actor)
@@ -38,7 +38,7 @@ def _clear():
     # assertion has to clear both halves — not just the run dir.
     for k in ("SUTANDO_RUN_DIR", "SUTANDO_RUNTIME_SOCKET", "XDG_RUNTIME_DIR",
               "SUTANDO_RUNTIME_STATE", "SUTANDO_AGENT_ID", "AGENT_MXID",
-              "AGENT_ID", "SUTANDO_INSTANCE_ID"):
+              "AGENT_ID", "SUTANDO_INSTANCE_ID", "SUTANDO_APP_SUPPORT"):
         os.environ.pop(k, None)
 
 
@@ -46,7 +46,7 @@ def main() -> int:
     saved = {k: os.environ.get(k) for k in
              ("SUTANDO_RUN_DIR", "SUTANDO_RUNTIME_SOCKET", "XDG_RUNTIME_DIR",
               "SUTANDO_RUNTIME_STATE", "SUTANDO_AGENT_ID", "AGENT_MXID",
-              "AGENT_ID", "SUTANDO_INSTANCE_ID")}
+              "AGENT_ID", "SUTANDO_INSTANCE_ID", "SUTANDO_APP_SUPPORT")}
     try:
         # 1. explicit override always wins, on any platform
         _clear()
@@ -54,12 +54,15 @@ def main() -> int:
         check(rd.run_dir() == Path("/tmp/rt-override"),
               "SUTANDO_RUN_DIR override wins")
 
-        # 2. darwin default
+        # 2. darwin default: the desktop data root's run dir
         _clear()
         rd.sys.platform = "darwin"
-        check(rd.run_dir() == Path.home() / "Library" / "Application Support"
-              / "space.ag2.app" / "run",
-              "darwin → app-support run dir")
+        check(rd.run_dir() == rd.desktop_data_root() / "run",
+              "darwin → desktop data root run dir")
+        os.environ["SUTANDO_APP_SUPPORT"] = "/tmp/app-root"
+        check(rd.run_dir() == Path("/tmp/app-root") / "run",
+              "darwin + SUTANDO_APP_SUPPORT → its run dir")
+        os.environ.pop("SUTANDO_APP_SUPPORT", None)
 
         # 3. linux + XDG_RUNTIME_DIR
         rd.sys.platform = "linux"
