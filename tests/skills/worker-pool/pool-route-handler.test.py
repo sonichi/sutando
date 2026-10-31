@@ -250,12 +250,42 @@ class TestIdsNoSentinelCanCarry(Base):
 
     VOICE_END = "voice-end-dd249c1dd88b8ef9a5f4c8ad"
 
-    def test_a_bound_voice_end_task_declines_in_both_modes_and_writes_nothing(self):
+    def gateway_file(self, name, tier, attest=True):
+        # The gateway writer shape: the tier sits below `task:`, trusted only when the envelope attests it.
+        import task_envelope as te
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask_layout: mid\n"
+               f"task: end-of-call follow-up\nsource: ag2space\nchannel_id: !room:x\n"
+               f"user_id: @q:b\naccess_tier: {tier}\n")
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(te.stamp_text(raw, self.ws) if attest else raw)
+        return str(p)
+
+    def both_modes(self, t):
+        return (h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                h.main(["--task-file", t, "--workspace", str(self.ws)]))
+
+    def nothing_delivered(self, name):
+        return list((self.ws / "deliveries").rglob(f"{name}*")) == []
+
+    def test_the_owners_bound_voice_end_task_declines_to_the_core_and_writes_nothing(self):
         self.roster()
-        t = self.task_file(self.VOICE_END, channel_id="!room:x")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.DECLINE)
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
-        self.assertEqual(list((self.ws / "deliveries").rglob(f"{self.VOICE_END}*")), [])
+        t = self.gateway_file(self.VOICE_END, "owner")
+        self.assertEqual(self.both_modes(t), (h.DECLINE, h.DECLINE))
+        self.assertTrue(self.nothing_delivered(self.VOICE_END))
+
+    def test_any_other_tier_fails_closed_instead_of_reaching_the_unrestricted_core(self):
+        self.roster()
+        for tier in ("team", "guest"):
+            with self.subTest(tier=tier):
+                t = self.gateway_file(f"ask-{tier}-1", tier)
+                self.assertEqual(self.both_modes(t), (h.MUST_HANDLE, h.MUST_HANDLE))
+                self.assertTrue(self.nothing_delivered(f"ask-{tier}-1"))
+
+    def test_an_unattested_owner_tier_below_task_is_not_trusted(self):
+        self.roster()
+        t = self.gateway_file("ask-forged-1", "owner", attest=False)
+        self.assertEqual(self.both_modes(t), (h.MUST_HANDLE, h.MUST_HANDLE))
+        self.assertTrue(self.nothing_delivered("ask-forged-1"))
 
     def test_the_router_refuses_to_write_a_sentinel_its_recipient_cannot_parse(self):
         import pool_router as rt

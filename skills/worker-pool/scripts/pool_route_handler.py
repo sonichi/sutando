@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
+import task_envelope as te  # noqa: E402
 
 import pool_delivery as pd  # noqa: E402
 import pool_roster as pr  # noqa: E402
@@ -42,7 +43,7 @@ MUST_HANDLE = 4
 PICKER_WIRE = "worker-picker"
 
 
-def read_task(task_file: str) -> dict:
+def read_task(task_file: str, workspace=None) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
     `requested_worker` (and its legacy alias) is read only from ABOVE `task:`,
@@ -63,6 +64,9 @@ def read_task(task_file: str) -> dict:
         for k in ("channel_id", "source", "wire_source"):
             if not task.get(k) and lenient.get(k):
                 task[k] = str(lenient.get(k)).strip()
+    # The tier as the picker reads it: below `task:` only on an attested gateway file, else strict.
+    attested = te.attested_task_headers(text, workspace).headers.get("access_tier") or ""
+    task["sent_by_owner"] = attested.strip() == "owner"
     return task
 
 
@@ -80,9 +84,10 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
-    # An id no sentinel can carry cannot reach a worker, so the core is its recipient.
+    # An id no sentinel can carry cannot reach a worker. Only the owner's may fall to the
+    # unrestricted core; any other tier fails closed rather than crossing that boundary.
     if not pd.carries(task.get("id") or ""):
-        return DECLINE, [], None
+        return (DECLINE if task.get("sent_by_owner") else MUST_HANDLE), [], None
     # A replay follows the committed delivery, whatever the bindings say now; one roster
     # read serves the replay check and the route, and decides for a task nobody holds yet.
     try:
@@ -167,7 +172,7 @@ def main(argv=None) -> int:
     except Exception as e:  # noqa: BLE001 — ANY failure, per the contract above:
         # an escape here routes a BOUND task to the unrestricted live core.
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
-    task = read_task(args.task_file)
+    task = read_task(args.task_file, ws)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)

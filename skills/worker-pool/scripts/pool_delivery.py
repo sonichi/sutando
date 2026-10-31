@@ -162,7 +162,7 @@ def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Pa
     record is never demoted, so a late `pending` cannot reopen retired work.
     """
     require_recipient(recipient)
-    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+    if not carries(task_id):
         raise ValueError(f"not a task id: {task_id!r}")
     done = done_flag(workspace, recipient, task_id)
     pend = pending_flag(workspace, recipient, task_id)
@@ -184,7 +184,7 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     fallback that fires twice is harmless.
     """
     require_recipient(recipient)
-    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+    if not carries(task_id):
         raise ValueError(f"not a task id: {task_id!r}")
     pend = pending_flag(workspace, recipient, task_id)
     with contextlib.suppress(FileNotFoundError):
