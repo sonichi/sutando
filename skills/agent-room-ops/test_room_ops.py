@@ -287,7 +287,7 @@ class MediaTests(EnvCase):
         self.assertEqual(base64.b64decode(sent["content_b64"]), b"IMG")
 
     def test_send_large_file_gets_an_upload_sized_timeout(self):
-        # #5714: a 23.7 MB upload timed out at the fixed 15 s HTTP_TIMEOUT.
+        # A 23.7 MB upload timed out at the fixed 15 s HTTP_TIMEOUT.
         os.environ["RELAY_URL"] = "https://r"
         large = os.path.join(self.tmp, "large.mp4")
         open(large, "wb").write(b"x" * (20 * 1024 * 1024))
