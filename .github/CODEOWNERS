@@ -27,21 +27,23 @@
 # top-2 by commit volume in every top-level area checked (src, skills, docs,
 # tests, scripts, .github, hooks, packages); @sonichi is top-2 in 7 of 8 (3rd
 # in hooks/, behind @qingyun-wu and Rui Wang).
-* @sonichi @qingyun-wu
+# Widened 2026-10-24 (owner: 'add more codeowners'): a single available code owner
+# had become the merge bottleneck. Review counts, last 30 days: see PR body.
+* @sonichi @qingyun-wu @keweichen @liususan091219 @marklysze
 
 # Core: both dominant authors, and docs/architecture-boundaries.md already flags
 # core as eventually needing dedicated code owners. Placed right after the `*`
 # fallback (not last) because CODEOWNERS is last-match-wins: a broad /src/ line
 # at the end of the file would override every more-specific /src/... entry below.
-/src/ @sonichi @qingyun-wu
-/tests/ @sonichi @qingyun-wu @liususan091219
+/src/ @sonichi @qingyun-wu @keweichen @liususan091219 @marklysze
+/tests/ @sonichi @qingyun-wu @liususan091219 @keweichen @marklysze
 
 # Clear per-area leader over the full history (90-day leader in parentheses where it differs).
 /skills/agent-room-ops/    @qingyun-wu @marklysze   # owner-assigned 2026-10-02
 /skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits; Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi owner-assigned
 /skills/task-progress/     @qingyun-wu
 /skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu @yixuan-ag2   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun); Yixuan added for the 3.8 voice-default work
-/packages/                 @qingyun-wu @sonichi
+/packages/                 @qingyun-wu @sonichi @keweichen @liususan091219 @marklysze
 /packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ @qingyun-wu @sonichi  # Meta Hatch adapter; owner-assigned (Chi) at creation, no history yet
 
 # Susan: areas she leads or co-leads over the full history.
@@ -82,3 +84,6 @@
 /tests/agent-room-ops-*    @qingyun-wu @marklysze
 /tests/room-ops-*          @qingyun-wu @marklysze
 /tests/room_ops_*          @qingyun-wu @marklysze
+
+# Ownership and CI workflows stay with the two original owners while the code areas above widen.
+/.github/                  @sonichi @qingyun-wu
