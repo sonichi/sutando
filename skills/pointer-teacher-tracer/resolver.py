@@ -60,7 +60,7 @@ prompt = (
 body = json.dumps({
     "contents": [{"parts": [{"text": prompt},
                             {"inlineData": {"mimeType": "image/jpeg", "data": b64}}]}],
-    "generationConfig": {"temperature": 0, "maxOutputTokens": 1200,
+    "generationConfig": {"maxOutputTokens": 1200,
                          "thinkingConfig": {"thinkingBudget": 0}},
 }).encode()
 url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
