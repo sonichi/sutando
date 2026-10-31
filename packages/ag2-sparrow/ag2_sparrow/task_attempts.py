@@ -215,7 +215,7 @@ class TaskAttempts:
         fd, tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w") as fh:
-                fh.write(json.dumps(data, sort_keys=True))
+                fh.write(json.dumps(data))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
@@ -997,9 +997,9 @@ class Transition:
             episode = (r or {}).get("wake_episode")
             if episode:
                 wakes = data.setdefault("wakes", {})
-                seen = [e for e in wakes.get(self.wire, []) if e != episode]
+                seen = [e for e in wakes.pop(self.wire, []) if e != episode]
                 wakes[self.wire] = (seen + [episode])[-WAKE_EPISODES_KEPT:]
-                _bound(wakes)
+                _bound(wakes, keep={self.wire, *(data.get("tasks") or {})})
             if isinstance((r or {}).get("pending_serve"), dict):
                 # A serve held for its generation outlives the run: its ack still decides.
                 return {**r, "finished": True, "claims": None, "turn_id": None, "owed_close": None,

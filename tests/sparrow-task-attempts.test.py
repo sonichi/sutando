@@ -455,6 +455,21 @@ class Attempts(unittest.TestCase):
         self.assertEqual(a.worker_id(), first, "acks and results agree")
         self.assertTrue(any("worker id was not saved" in m for m in self.logs))
 
+    def test_the_oldest_settled_wakes_are_forgotten_first_and_a_task_just_settled_never(self):
+        a = self.mk(turn_context=True)
+
+        def settle(tid, episode):
+            self.assertIsNotNone(call(a, tid, "open_wake", {"blocker_episode_id": episode}, tid))
+            ack(a, tid, {**_ack(1), "task_id": tid})
+            call(a, tid, "finish")
+        with unittest.mock.patch.object(task_attempts, "RUNS_KEPT", 2):
+            for tid, episode in (("tsk_A", "ep1"), ("tsk_B", "ep1"), ("tsk_A", "ep2"), ("tsk_C", "ep1")):
+                settle(tid, episode)
+        self.assertIsNone(call(a, "tsk_A", "open_wake", {"blocker_episode_id": "ep2"}, "tsk_A"),
+                          "settled most recently but one: still remembered")
+        self.assertIsNotNone(call(a, "tsk_B", "open_wake", {"blocker_episode_id": "ep1"}, "tsk_B"),
+                             "positive control: the oldest is the one forgotten")
+
     def test_a_wake_episode_runs_once_as_its_own_run_with_its_own_item(self):
         a = self.mk(turn_context=True)
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
