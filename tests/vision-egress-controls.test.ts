@@ -154,6 +154,31 @@ describe('P7 D7.4 vision egress controls', () => {
 		assert.equal(sent.length, 0);
 	});
 
+	it('a new session stops its predecessor push stream and clears its deferred frame', () => {
+		const { session: first } = fakeSession();
+		const { session: next, sent: nextSent } = fakeSession();
+		setVisionSession(first);
+		setVisionSpeechEvidence(() => ({ active: true }));
+		startStreaming('browser', undefined, 'push');
+		assert.equal(submitFrame(frameBuf(1)).deferred, true);
+		assert.equal(getVisionEgressStats().slotOccupied, true);
+
+		setVisionSpeechEvidence(null);
+		setVisionSession(next);
+		assert.equal(getVisionEgressStats().slotOccupied, false);
+		assert.equal(submitFrame(frameBuf(2)).ok, false);
+		assert.equal(nextSent.length, 0);
+	});
+
+	it('setting the same session does not stop its push stream', () => {
+		const { session, sent } = fakeSession();
+		setVisionSession(session);
+		startStreaming('browser', undefined, 'push');
+		setVisionSession(session);
+		assert.equal(submitFrame(frameBuf(1)).ok, true);
+		assert.equal(sent.length, 1);
+	});
+
 	it('wire-byte accounting: an over-burst base64 frame is rejected rather than deferred forever', () => {
 		const { session, sent } = fakeSession();
 		setVisionSession(session);
