@@ -487,8 +487,8 @@ def _public_address(ip: str) -> bool:
 
 
 def _gateway_port(url: str) -> Optional[int]:
-    """The gateway URL's port (443 when absent); None when the URL carries userinfo, a port
-    outside 1..65535, or a port that is not a number, all of which refuse the token."""
+    """The gateway URL's port (443 when absent, 80 for http); None when the URL carries userinfo,
+    a port outside 1..65535, or a port that is not a number, all of which refuse the token."""
     try:
         parts = urllib.parse.urlsplit(url)
         if parts.username is not None or parts.password is not None or "@" in parts.netloc:
@@ -497,13 +497,14 @@ def _gateway_port(url: str) -> Optional[int]:
     except ValueError:
         return None
     if port is None:
-        return 443
+        return 80 if parts.scheme.lower() == "http" else 443
     return port if 1 <= port <= 65535 else None
 
 
-def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
+def vetted_address(host: str, port: int, getaddrinfo=None, *, allow_private: bool = False) -> Optional[str]:
     """Resolve `host` once; the first address when every answer is public, '' when any is not,
-    None when the name does not resolve. The caller pins the connection to the address it got."""
+    None when the name does not resolve. The caller pins the connection to the address it got.
+    `allow_private` (a declared local server only) skips the public-address rule."""
     getaddrinfo = getaddrinfo or DEFAULT_GETADDRINFO or socket.getaddrinfo
     try:
         infos = getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -512,7 +513,7 @@ def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
     addresses = [str(info[4][0]) for info in infos if info and info[4]]
     if not addresses:
         return None
-    if not all(_public_address(ip) for ip in addresses):
+    if not allow_private and not all(_public_address(ip) for ip in addresses):
         return ""
     return addresses[0]
 
@@ -540,11 +541,17 @@ def _fetch_whoami(gateway_url: str, token: str, address: str, *, connect=None) -
     return _fetch_json(gateway_url, token, address, "/v1/whoami", connect=connect)
 
 
+def _connect_plain(address: str, port: int, host: str, timeout: float):
+    """Plain TCP to the address: only for a gateway the owner declared local (`allow_local`)."""
+    return socket.create_connection((address, port), timeout=timeout)
+
+
 def _fetch_json(gateway_url: str, token: str, address: str, path: str, *, connect=None) -> dict:
     parts = urllib.parse.urlsplit(gateway_url)
     host = parts.hostname or ""
-    port = parts.port or 443
-    sock = (connect or _connect)(address, port, host, PROBE_TIMEOUT_S)
+    plain = parts.scheme.lower() == "http"
+    port = parts.port or (80 if plain else 443)
+    sock = (connect or (_connect_plain if plain else _connect))(address, port, host, PROBE_TIMEOUT_S)
     conn = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_S)
     conn.sock = sock  # the transport is the pinned one; connect() is never reached
     try:
@@ -592,6 +599,28 @@ def resolve_server(host: str, resolver=None) -> str:
     return server
 
 
+def local_server_for(host: str, config=None) -> str:
+    """The server of a `core.dotspace.instances` entry that names `host` as its gateway_host
+    and sets `allow_local: true`; '' for every other host. Only such an entry, written by the
+    owner for a self-hosted homeserver on this machine or their own network (#3165), lets a
+    gateway be plain http, a single-label name such as localhost, or a private, loopback or
+    shared address; nothing a token or a server says can turn it on."""
+    try:
+        import dotspace  # type: ignore
+        entries = dotspace._config_entries(config)
+        host_only = dotspace._host_only
+    except Exception:  # noqa: BLE001 - without the resolver there is no declared local server
+        return ""
+    want = (host or "").strip().lower().rstrip(".")
+    for e in entries:
+        if e.get("allow_local") is not True:
+            continue
+        gateway = str(e.get("gateway_host") or e.get("server") or "").strip().lower().rstrip(".")
+        if want and want in (gateway, host_only(gateway)):
+            return host_only(str(e.get("server") or ""))
+    return ""
+
+
 def gateway_host_ok(host: str) -> bool:
     """Whether a gateway host may be probed at all: a multi-label server name under no reserved
     suffix, never an IP literal, by the resolver's own rules; the addresses are vetted after."""
@@ -632,15 +661,19 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     if not url:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
     host = server_of_token(token)
+    local = local_server_for(host)
     port = _gateway_port(url)
-    if not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
+    if local:
+        if not url.lower().startswith(("https://", "http://")) or port is None:
+            raise InvalidToken("invalid_gateway")
+    elif not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
         raise InvalidToken("invalid_gateway")
-    registered = resolve_server(host, resolver)
+    registered = local or resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
            "verified": False, "authenticated": None, "error": None}
     out.update({k: None for k in IDENTITY_FIELDS})
-    address = vetted_address(host, port, getaddrinfo)
+    address = vetted_address(host, port, getaddrinfo, allow_private=bool(local))
     if address == "":
         raise InvalidToken("invalid_gateway")
     if address is None:

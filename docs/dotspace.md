@@ -61,6 +61,15 @@ instance is a config entry.
    explicit `dotspace_for(server)` with the real fetch still reads its well-known, only to
    fill the fields the entry leaves unset.
 
+   **A self-hosted homeserver** (ag2space-backend `deploy/selfhost`, #3165) on this machine or the
+   owner's own network is added with `"allow_local": true` on its entry, e.g.
+   `{"server": "localhost", "gateway_host": "localhost", "allow_local": true}` for a laptop
+   bundle at `http://localhost`. For that exact gateway host only, a connect code may be plain
+   http, name a single-label host, or resolve to a loopback, private or shared address
+   (`connections.local_server_for`). The probe and its identity check are otherwise unchanged:
+   the gateway's agent listing or `whoami` must still name an agent of the declared server.
+   Nothing a token or a server says can turn this on.
+
    **Sutando Cloud is undecided** (per DotSpace or shared), so the s.space defaults carry no
    `cloud_origin`: `cloud_origin_for("s.space")` is `""` and callers fall back to the shared
    production Cloud, `PRODUCTION_CLOUD_ORIGIN` (`https://sutando.s.space`) — a constant, so

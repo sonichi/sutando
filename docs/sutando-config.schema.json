@@ -47,7 +47,9 @@
                   "gateway_host": {"type": "string", "description": "The sparrow gateway / relay host, e.g. chat.ag2.space."},
                   "cloud_origin": {"type": "string", "description": "This instance's Sutando Cloud origin, e.g. https://sutando.ag2.space; empty when it has none."},
                   "link_via": {"type": "string", "description": "matrix.to ?via= server; defaults to server."},
-                  "prefer_ipv4": {"type": "boolean", "default": true}
+                  "prefer_ipv4": {"type": "boolean", "default": true},
+                  "mcp_url": {"type": "string", "description": "This instance's hosted MCP endpoint, e.g. https://mcp.s.space/mcp."},
+                  "allow_local": {"type": "boolean", "default": false, "description": "A self-hosted homeserver on this machine or the owner's own network: a connect code for gateway_host (or server) may then be plain http, name a single-label host such as localhost, or resolve to a loopback, private or shared address. Only this entry turns that on; nothing a token or a server says can."}
                 }
               }
             }

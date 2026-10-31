@@ -331,6 +331,90 @@ class Preview(unittest.TestCase):
             srv.server_close()
         self.assertEqual(cm.exception.code, 302)
 
+class DeclaredLocalServer(unittest.TestCase):
+    """A self-hosted homeserver on this machine or the owner's own network (#3165): only a
+    `core.dotspace.instances` entry with `allow_local: true` for that exact gateway host lets a
+    token be plain http, name localhost or a private address. Nothing else changes."""
+
+    ENTRY = {"server": "localhost", "gateway_host": "localhost", "allow_local": True}
+
+    def section(self, *entries):
+        return unittest.mock.patch.object(dotspace, "_loaded_section", lambda: {"instances": list(entries)})
+
+    def listing(self, mxid):
+        seen = []
+        def fetch(url, token, address):
+            seen.append((url, address)); return {"agents": [{"id": mxid}]}
+        return fetch, seen
+
+    def resolving_to(self, ip):
+        return lambda host, port, **kw: [(2, 1, 6, "", (ip, port))]
+
+    def test_a_declared_local_server_is_probed_over_http_and_verified(self):
+        fetch, seen = self.listing("@alice-laptop.agent:localhost")
+        with self.section(self.ENTRY):
+            p = C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        self.assertEqual((p["server"], p["server_source"], p["verified"], p["agent_mxid"]),
+                         ("localhost", "identity", True, "@alice-laptop.agent:localhost"))
+        self.assertEqual(seen, [("http://localhost/relay", "127.0.0.1")])
+
+    def test_a_declared_lan_server_may_resolve_to_a_private_address(self):
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        entry = {"server": "chat.home.example", "allow_local": True}
+        with self.section(entry):
+            p = C.preview_connection("https://chat.home.example/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("192.168.1.20"))
+        self.assertEqual((p["server"], p["verified"]), ("chat.home.example", True))
+
+    def test_without_the_entry_nothing_changes(self):
+        for entries in ((), ({**self.ENTRY, "allow_local": False},), ({**self.ENTRY, "allow_local": "true"},),
+                        ({"server": "localhost", "gateway_host": "other-host", "allow_local": True},)):
+            with self.section(*entries), self.assertRaises(C.InvalidToken, msg=entries) as cm:
+                C.preview_connection("http://localhost/relay|s", fetch=lambda *a: self.fail("probed"),
+                                     getaddrinfo=lambda *a, **k: self.fail("resolved"))
+            self.assertEqual(str(cm.exception), "invalid_gateway")
+        with self.section(), self.assertRaises(C.InvalidToken):
+            C.preview_connection("https://chat.home.example/relay|s", fetch=lambda *a: self.fail("probed"),
+                                 getaddrinfo=self.resolving_to("192.168.1.20"))
+
+    def test_the_entry_names_one_host_and_the_listing_still_only_confirms(self):
+        with self.section(self.ENTRY):
+            self.assertEqual(C.local_server_for("localhost"), "localhost")
+            self.assertEqual(C.local_server_for("LOCALHOST."), "localhost")
+            self.assertEqual(C.local_server_for("127.0.0.1"), "")
+            self.assertEqual(C.local_server_for("evil.example"), "")
+            # A gateway on the declared host still has to name an agent of the declared server.
+            fetch, _ = self.listing("@mallory:evil.example")
+            p = C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertEqual((p["verified"], p["agent_mxid"]), (False, None))
+            # A URL that is neither http nor https, or a bad port, is still refused.
+            with self.assertRaises(C.InvalidToken):
+                C.preview_connection("http://localhost:99999/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertEqual(C.local_server_for("localhost"), "")
+
+    def test_an_http_gateway_defaults_to_port_80_and_is_fetched_without_tls(self):
+        self.assertEqual(C._gateway_port("http://localhost/relay"), 80)
+        self.assertEqual(C._gateway_port("https://localhost/relay"), 443)
+        calls = []
+        class Sock:
+            def makefile(self, *a, **k):
+                import io
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            def sendall(self, data): calls.append(("sent", data[:4]))
+            def close(self): pass
+        def connect(address, port, host, timeout):
+            calls.append((address, port, host)); return Sock()
+        self.assertEqual(C._fetch_json("http://localhost/relay", "http://localhost/relay|s", "127.0.0.1",
+                                       "/v1/whoami", connect=connect), {})
+        self.assertEqual(calls[0], ("127.0.0.1", 80, "localhost"))
+        with unittest.mock.patch.object(C.socket, "create_connection", lambda addr, timeout: ("plain", addr)):
+            self.assertEqual(C._connect_plain("127.0.0.1", 80, "localhost", 1.0), ("plain", ("127.0.0.1", 80)))
+
+
 class AddConnection(Base):
     def test_add_writes_row_and_stores_secret_only_in_vault(self):
         row, created = self.add()
