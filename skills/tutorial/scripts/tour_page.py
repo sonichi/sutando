@@ -2,14 +2,16 @@
 
 The steps come from a feature list, `feature-list.json` beside this skill's scripts (or one passed
 in): `{schema_version, revision, steps[{id, title, body[what, how], surface, screenshot, since_release,
-paste?, runtime?, watches?}], reviewed_at?}`, the owner-step shape AG2 Space's backend serves. `parse_list` validates it and
+paste?, runtime?, watches?, link?}], reviewed_at?}`, the owner-step shape AG2 Space's backend serves. `parse_list` validates it and
 `render_page(name, core, ..., features, media)` renders it; the page records the list's `revision` in
 its ownership meta tag, so a later run can tell whether its list is newer. Each screenshot is an
-asset reference `{asset, fallback_file, alt}`: when `media` maps the asset name to the room's
-`mxc://` URI (room media, uploaded with room.media.upload) the image points there, else the
-fallback file under assets/ is inlined as a data: URI. Pure: rendering depends on nothing but its
-arguments. No external URL appears anywhere in the page (the HTML surface's sandbox may block
-them), so every graphic is inline SVG and every image room media or a data: URI. Progress is kept
+asset reference `{asset, hd_file?, fallback_file, alt, caption?}`: `hd_file` is the full-resolution capture
+publish uploads to the room's media (room.media.upload); when `media` maps the asset name to that
+`mxc://` URI the image points there, else the small fallback file under assets/ is inlined as a
+data: URI. Pure: rendering depends on nothing but its
+arguments. No external resource is loaded (the HTML surface's sandbox may block them), so every
+graphic is inline SVG and every image room media or a data: URI; the one outbound URL is a step's
+optional app-store `link`, a plain anchor to an allowlisted store page. Progress is kept
 in the page runtime's `window.artifact.state` under a per-viewer key; when the runtime names no
 viewer it uses this browser's localStorage, then memory, and every storage access is guarded.
 """
@@ -30,14 +32,21 @@ PAGE_TITLE = "Getting started"
 NAME_MAX = 64
 CORES = ("claude", "codex", "unknown")
 CONNECT_PROMPT = "Connect my Google Calendar."
-IMPORT_PROMPT = "Import my Claude Code history."
 SCHEMA_VERSION = 1
 LIST_PATH = Path(__file__).resolve().parent.parent / "feature-list.json"  # lint-workspace-resolution: allow-repo-root
 # A revision ends in the list's date and a sequence number, so two revisions order by (date, n).
 REVISION = re.compile(r"^tutorial\.(\d{4}-\d{2}-\d{2})\.(\d+)$")
 STEP_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 ASSET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-FALLBACK_FILE = re.compile(r"^assets/([a-z0-9][a-z0-9-]*\.jpg)$")
+# A step's only outbound link: an app's page in the App Store or Google Play, nothing else.
+STORE_LINK = re.compile(r"^https://(?:apps\.apple\.com/[a-z]{2}/app/[a-z0-9-]{1,64}/id\d{6,12}"
+                        r"|play\.google\.com/store/apps/details\?id=[A-Za-z0-9_.]{3,128})$")
+CAPTION_MAX = 32
+LINK_TEXT_MAX = 48
+FALLBACK_FILE = re.compile(r"^assets/([a-z0-9][a-z0-9-]*\.(?:jpg|png))$")
+HD_FILE = re.compile(r"^assets/([a-z0-9][a-z0-9-]*\.png)$")
+HD_MAX_BYTES = 25 * 1024 * 1024  # what room.media.upload takes
+MIME = {".jpg": "image/jpeg", ".png": "image/png"}
 # Room media as room-commons' room_pdf.py accepts it from room.media.upload.
 MXC = re.compile(r"^mxc://[A-Za-z0-9][A-Za-z0-9.-]{0,253}(?::\d{1,5})?/[A-Za-z0-9_-]{1,255}$")
 RELEASE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -55,10 +64,13 @@ PAGE_MAX_BYTES = 300_000
 
 class Shot(NamedTuple):
     """One screenshot: the room-media asset name, the assets/ file inlined when the room has no
-    such media, and the alt text."""
+    such media, the alt text, and the full-resolution PNG uploaded as that media (None: never
+    uploaded, always inlined)."""
     asset: str
     file: str
     alt: str
+    hd: Optional[str] = None
+    caption: Optional[str] = None
 
 
 class Section(NamedTuple):
@@ -74,6 +86,7 @@ class Section(NamedTuple):
     runtime: Optional[str] = None
     since_release: str = ""
     watches: Tuple[str, ...] = ()
+    link: Optional[Tuple[str, str]] = None
 
 
 class FeatureList(NamedTuple):
@@ -93,21 +106,16 @@ WHERE = {"dm": "your DM", "room": "a room"}
 ASSETS = Path(__file__).resolve().parent.parent / "assets"  # lint-workspace-resolution: allow-repo-root
 
 
-# (light, dark) per section; each passes WCAG AA (4.5:1) as text on that theme's card colour.
 CARD = ("#ffffff", "#202225")
-ACCENTS = {
-    "dm": ("#4a5a70", "#b3c2d6"),
-    "rooms": ("#1f5fcc", "#7aa7ff"),
-    "commons": ("#0b7a5c", "#4fd1a5"),
-    "teamwork": ("#7a3fc8", "#b98cff"),
-    "calls": ("#b8341e", "#ff8a73"),
-    "agents": ("#8f5600", "#f2b24c"),
-    "apps": ("#0a6f91", "#5cc8ee"),
-    "activity": ("#b0286c", "#ff7ab8"),
-    "mobile": ("#3e4dc9", "#98a4ff"),
-    "import": ("#566410", "#c3d65a"),
-}
-DEFAULT_ACCENT = ("#4a5a70", "#b3c2d6")  # a step the list adds before this module has art for it
+INK = "#1c1b1c"
+# The brand gradients (name, in, out), cycled over the steps in order. The icon glyph is ink on the
+# gradient, so it stays legible in both themes; the "out" shade is the card's top border.
+BRAND = (("orange", "#f9a75c", "#f26a21"), ("yellow", "#f0e24a", "#ea931f"), ("pink", "#f8cbfb", "#f38c64"))
+
+
+def accent(index: int) -> str:
+    """The brand gradient a step's card and icon use: orange, yellow, pink, then again."""
+    return BRAND[index % len(BRAND)][0]
 
 _S = 'fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"'
 ICONS = {
@@ -139,23 +147,20 @@ ICONS = {
                 f'<circle cx="46" cy="16" r="9" fill="currentColor"/>',
     "mobile": f'<rect {_S} x="18" y="4" width="28" height="56" rx="6"/><path {_S} d="M28 52h8"/>'
               f'<path {_S} d="M24 16h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-9l-5 4v-4h-2a2 2 0 0 1-2-2V18a2 2 0 0 1 2-2z"/>',
-    "import": f'<path {_S} d="M6 22a4 4 0 0 1 4-4h12l5 5h27a4 4 0 0 1 4 4v24a4 4 0 0 1-4 4H10a4 4 0 0 1-4-4z"/>'
-              f'<path {_S} d="M32 4v26M24 22l8 8 8-8"/>',
+    "phone": f'<rect {_S} x="18" y="4" width="28" height="56" rx="6"/><path {_S} d="M28 52h8"/>'
+                  f'<path {_S} d="M32 14v22M24 28l8 8 8-8"/>',
 }
 DEFAULT_ICON = f'<path {_S} d="M32 6l6 16 16 6-16 6-6 16-6-16-16-6 16-6z"/>'
 
+# The AG2 Space client's own Sutando avatar (its second built-in variant), as the client renders it.
 HERO = (
-    '<svg class="hero-art" viewBox="0 0 200 120" aria-hidden="true" focusable="false">'
-    '<circle cx="100" cy="60" r="56" fill="var(--hero-ring)"/>'
-    f'<g style="color:var(--a-rooms)"><circle {_S} cx="66" cy="46" r="12"/>'
-    f'<path {_S} d="M44 92c3-18 41-18 44 0"/></g>'
-    f'<g style="color:var(--a-teamwork)"><rect {_S} x="114" y="36" width="34" height="28" rx="8"/>'
-    '<circle cx="124" cy="50" r="3" fill="currentColor"/><circle cx="138" cy="50" r="3" fill="currentColor"/>'
-    f'<path {_S} d="M131 36v-8"/><circle cx="131" cy="25" r="3" fill="currentColor"/>'
-    f'<path {_S} d="M112 92c2-16 36-16 38 0"/><path {_S} d="M150 60l10-8"/></g>'
-    f'<g style="color:var(--a-agents)"><path {_S} d="M92 26l3-7 3 7 7 3-7 3-3 7-3-7-7-3z"/></g>'
-    f'<g style="color:var(--a-activity)"><path {_S} d="M168 26l2-4 2 4 4 2-4 2-2 4-2-4-4-2z"/></g>'
-    '</svg>'
+    '<svg class="hero-art" viewBox="0 0 36 36" fill="none" aria-hidden="true" focusable="false">'
+    '<rect width="36" height="36" fill="#f0e345"/>'
+    '<rect x="0" y="0" width="36" height="36" transform="translate(-5 -5) rotate(49 18 18) scale(1.1)" '
+    'fill="#f9a358" rx="36"/><g transform="translate(-1 -2) rotate(-9 18 18)">'
+    '<path d="M15 20c2 1 4 1 6 0" stroke="#100f0e" fill="none" stroke-linecap="round"/>'
+    '<rect x="10" y="14" width="1.5" height="2" rx="1" stroke="none" fill="#100f0e"/>'
+    '<rect x="24" y="14" width="1.5" height="2" rx="1" stroke="none" fill="#100f0e"/></g></svg>'
 )
 
 
@@ -233,18 +238,30 @@ def _step(raw: object, n: int, assets: Path) -> Section:
     for i, shot in enumerate(shots if isinstance(shots, list) else [] if shots is None else [shots]):
         at = f"{where} screenshot[{i}]"
         if not isinstance(shot, dict):
-            raise ValueError(f"{at}: must be an object with asset, fallback_file and alt")
+            raise ValueError(f"{at}: must be an object with asset, fallback_file and alt (hd_file optional)")
         asset, fallback, alt = shot.get("asset"), shot.get("fallback_file"), shot.get("alt")
         if not isinstance(asset, str) or not ASSET_NAME.match(asset):
             raise ValueError(f"{at}: asset must be a bare lowercase name, got {asset!r}")
         m = FALLBACK_FILE.match(fallback) if isinstance(fallback, str) else None
         if not m:
-            raise ValueError(f"{at}: fallback_file must be assets/<name>.jpg, got {fallback!r}")
+            raise ValueError(f"{at}: fallback_file must be assets/<name>.jpg or .png, got {fallback!r}")
         if not isinstance(alt, str) or not alt.strip():
             raise ValueError(f"{at}: alt text is required")
         if not (assets / m.group(1)).is_file():
             raise ValueError(f"{at}: {fallback} is not under {assets}")
-        images.append(Shot(asset, m.group(1), alt))
+        hd = shot.get("hd_file")
+        h = HD_FILE.match(hd) if isinstance(hd, str) else None
+        if hd is not None and not h:
+            raise ValueError(f"{at}: hd_file must be assets/<name>.png, got {hd!r}")
+        if h and not (assets / h.group(1)).is_file():
+            raise ValueError(f"{at}: {hd} is not under {assets}")
+        caption = shot.get("caption")
+        if caption is not None and (not isinstance(caption, str) or not caption.strip()
+                                    or len(caption) > CAPTION_MAX):
+            raise ValueError(f"{at}: caption must be 1-{CAPTION_MAX} characters, got {caption!r}")
+        if caption is not None:
+            _no_tags(caption, f"{at} caption")
+        images.append(Shot(asset, m.group(1), alt, h.group(1) if h else None, caption))
     since = raw.get("since_release")
     if not isinstance(since, str) or not RELEASE.match(since):
         raise ValueError(f"{where}: since_release must be YYYY-MM-DD, got {since!r}")
@@ -255,7 +272,17 @@ def _step(raw: object, n: int, assets: Path) -> Section:
     if not isinstance(watches, list) or len(watches) > WATCHES_MAX or not all(
             isinstance(w, str) and WATCH.match(w) for w in watches):
         raise ValueError(f"{where}: watches must list at most {WATCHES_MAX} repo-relative paths, got {watches!r}")
-    return Section(sid, title, what, how, paste, surface, tuple(images), runtime, since, tuple(watches))
+    link = raw.get("link")
+    if link is not None:
+        href, text = (link.get("href"), link.get("text")) if isinstance(link, dict) else (None, None)
+        if set(link if isinstance(link, dict) else ()) != {"href", "text"} or not isinstance(href, str) \
+                or not STORE_LINK.match(href):
+            raise ValueError(f"{where}: link must be {{href, text}} with an App Store or Google Play "
+                             f"app page as href, got {link!r}")
+        if not isinstance(text, str) or not text.strip() or len(text) > LINK_TEXT_MAX:
+            raise ValueError(f"{where}: link text must be 1-{LINK_TEXT_MAX} characters, got {text!r}")
+        link = (href, _no_tags(text, f"{where} link text"))
+    return Section(sid, title, what, how, paste, surface, tuple(images), runtime, since, tuple(watches), link)
 
 
 def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
@@ -339,13 +366,26 @@ def asset_names(features: FeatureList) -> Tuple[str, ...]:
     return tuple(shot.asset for s in features.steps for shot in s.images)
 
 
+def hd_files(features: FeatureList) -> Dict[str, str]:
+    """{asset name: its full-resolution file under assets/} for the screenshots that have one."""
+    return {shot.asset: shot.hd for s in features.steps for shot in s.images if shot.hd}
+
+
+def media_uri(value: object) -> Optional[str]:
+    """The mxc URI of one media-map value: a bare URI (--media) or an upload record {mxc, sha256};
+    None when it is neither or the URI is malformed."""
+    uri = value.get("mxc") if isinstance(value, dict) else value
+    return uri if isinstance(uri, str) and MXC.match(uri) else None
+
+
 def clean_media(raw: object, features: Optional[FeatureList] = None) -> Dict[str, str]:
     """{asset name: mxc URI} from `raw`: only names the list refers to, only well-formed `mxc://`
-    URIs. Anything else is dropped, so that asset keeps its inlined fallback."""
+    URIs (bare, or an upload record's `mxc`). Anything else is dropped, so that asset keeps its
+    inlined fallback."""
     if not isinstance(raw, dict):
         return {}
     names = asset_names(features or FEATURES)
-    return {k: v for k, v in raw.items() if k in names and isinstance(v, str) and MXC.match(v)}
+    return {k: media_uri(v) for k, v in raw.items() if k in names and media_uri(v)}
 
 
 def prompt_slots(features: FeatureList) -> Tuple[str, ...]:
@@ -356,7 +396,7 @@ def prompt_slots(features: FeatureList) -> Tuple[str, ...]:
 
 def sections_for(core: str, features: Optional[FeatureList] = None) -> List[Section]:
     """The page's sections: every step of the list that names no runtime, plus those naming this
-    core (the Claude Code import step only on a Claude Code core)."""
+    core."""
     if core not in CORES:
         raise ValueError(f"core must be one of {', '.join(CORES)}, got {core!r}")
     return [s for s in (features or FEATURES).steps if s.runtime in (None, core)]
@@ -376,7 +416,8 @@ def contrast(a: str, b: str) -> float:
 
 
 def _data_uri(filename: str) -> str:
-    return "data:image/jpeg;base64," + base64.b64encode((ASSETS / filename).read_bytes()).decode("ascii")
+    mime = MIME[Path(filename).suffix]
+    return f"data:{mime};base64," + base64.b64encode((ASSETS / filename).read_bytes()).decode("ascii")
 
 
 def _prompt(key: str, prompt: str, where: Optional[str]) -> str:
@@ -390,9 +431,21 @@ def _prompt(key: str, prompt: str, where: Optional[str]) -> str:
 def _shots(images: Tuple[Shot, ...], media: Dict[str, str]) -> str:
     if not images:
         return ""
-    figs = "".join(f'<img src="{media.get(shot.asset) or _data_uri(shot.file)}" '
-                   f'alt="{html.escape(shot.alt, quote=True)}" loading="lazy">' for shot in images)
-    return f'<div class="shots">{figs}</div>'
+    figs = []
+    for shot in images:
+        img = (f'<img src="{media.get(shot.asset) or _data_uri(shot.file)}" '
+               f'alt="{html.escape(shot.alt, quote=True)}" loading="lazy">')
+        figs.append(f'<figure class="shot-{shot.asset}">{img}<figcaption>{shot.caption}</figcaption></figure>'
+                    if shot.caption else img)
+    return f'<div class="shots">{"".join(figs)}</div>'
+
+
+def _link(link: Optional[Tuple[str, str]]) -> str:
+    if not link:
+        return ""
+    href, text = link
+    return (f'<p class="store"><a href="{html.escape(href, quote=True)}" target="_blank" '
+            f'rel="noopener noreferrer">{text}</a></p>')
 
 
 def clean_prompts(raw: object, slots: Optional[Tuple[str, ...]] = None) -> Dict[str, str]:
@@ -433,15 +486,16 @@ def role_labels(roles: object) -> List[str]:
     return list(out.values())[:ROLES_MAX]
 
 
-def _section(sec: Section, first: bool, who: str, prompts: Dict[str, str], media: Dict[str, str]) -> str:
+def _section(sec: Section, index: int, who: str, prompts: Dict[str, str], media: Dict[str, str]) -> str:
     prompt = _prompt(sec.id, prompts.get(sec.id, sec.prompt), sec.where) if sec.prompt else ""
     icon = ICONS.get(sec.id, DEFAULT_ICON)
+    tone = accent(index)
     return (
-        f'<section class="sec card{" cur" if first else ""}" id="s-{sec.id}" data-id="{sec.id}" '
-        f'aria-labelledby="h-{sec.id}" style="--accent:var(--a-{sec.id})">'
+        f'<section class="sec card{" cur" if index == 0 else ""}" id="s-{sec.id}" data-id="{sec.id}" '
+        f'aria-labelledby="h-{sec.id}" style="--accent-in:var(--{tone}-in);--accent-out:var(--{tone}-out)">'
         f'<div class="icon" aria-hidden="true"><svg viewBox="0 0 64 64" focusable="false">{icon}</svg></div>'
         f'<div class="body"><h2 id="h-{sec.id}">{sec.title.format(name=who)}</h2>'
-        f'<p>{sec.what.format(name=who)}</p><p class="how">{sec.how.format(name=who)}</p>{prompt}'
+        f'<p>{sec.what.format(name=who)}</p><p class="how">{sec.how.format(name=who)}</p>{_link(sec.link)}{prompt}'
         f'{_shots(sec.images, media)}'
         f'<label class="done"><input type="checkbox" data-done="{sec.id}" disabled> Mark done</label>'
         '</div></section>'
@@ -450,97 +504,119 @@ def _section(sec: Section, first: bool, who: str, prompts: Dict[str, str], media
 
 def _finale(who: str, prompts: Dict[str, str]) -> str:
     return (
-        '<section class="card finale" id="finale" aria-labelledby="h-finale" hidden '
-        'style="--accent:var(--brand)"><div class="body">'
-        f'<h2 id="h-finale" tabindex="-1">You&rsquo;re set &mdash; ask {who} anything</h2>'
+        '<section class="card finale" id="finale" aria-labelledby="h-finale" hidden>'
+        '<div class="body">'
+        f'<h2 id="h-finale" tabindex="-1">You&rsquo;re set. Ask {who} anything</h2>'
         f'<p class="how">That was the whole tour. Start with something real:</p>'
         f'{_prompt("finale", prompts.get("finale", FINALE_PROMPT), "dm")}</div></section>'
     )
 
 
-def _palette(extra: Tuple[str, ...] = ()) -> tuple:
-    """The accent variables: one per known step, then `extra` (step ids without their own accent)
-    on the default accent."""
-    light = "".join(f"--a-{k}:{v[0]};" for k, v in ACCENTS.items())
-    light += "".join(f"--a-{k}:{DEFAULT_ACCENT[0]};" for k in extra)
-    dark = ("--bg:#151618; --fg:#ececec; --muted:#a9adb3; --card:#202225; --line:#34373b; --brand:#7aa7ff; "
-            "--code:#2b2d31; --hero-ring:#1d2433; --track:#34373b; "
-            + "".join(f"--a-{k}:{v[1]};" for k, v in ACCENTS.items())
-            + "".join(f"--a-{k}:{DEFAULT_ACCENT[1]};" for k in extra))
-    return light, dark
+DARK = ("--bg:#151618; --fg:#ececec; --muted:#a9adb3; --card:#202225; --line:#34373b; --brand:#f9a75c; "
+        "--code:#2b2d31; --hero-ring:#2d2520; --track:#34373b; --pill-bg:#ececec; --pill-fg:#1c1b1c; "
+        "--shadow:0 0 0 1px #34373b; --orb-alpha:.28; --label:#ececec;")
 
 
 STYLE = """<style>
-:root { color-scheme: light dark; --bg:#f7f6f3; --fg:#1d1d1f; --muted:#5a5e63; --card:#ffffff; --line:#e3e1dc;
-  --brand:#1f5fcc; --code:#f2f1ee; --hero-ring:#eaf0fb; --track:#e6e4df; %(light)s }
+:root { color-scheme: light dark; --bg:#f4f4f4; --fg:#1c1b1c; --muted:#5f5a56; --card:#ffffff; --line:#e2dfdb;
+  --brand:#c2520f; --code:#f4f4f4; --hero-ring:#fdeee0; --track:#e6e3df;
+  --ink:#1c1b1c; --orange-in:#f9a75c; --orange-out:#f26a21; --yellow-in:#f0e24a; --yellow-out:#ea931f;
+  --pink-in:#f8cbfb; --pink-out:#f38c64; --pill-bg:var(--ink); --pill-fg:#ffffff;
+  --shadow:0 1px 2px rgba(28,27,28,.04), 0 12px 32px rgba(28,27,28,.06); --orb-alpha:.5; --label:#000000;
+  --sans:"Haas Recast", "Haas Recast Dense", "Haas Recast Open", "Avenir Next", "Helvetica Neue", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  --display:"Avantt", "Avantt SemiBold", "Avenir Next", "Helvetica Neue", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) { %(darkvars)s }
 }
 :root[data-theme="dark"] { color-scheme: dark; %(darkvars)s }
 :root[data-theme="light"] { color-scheme: light; }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
-.hero { display:flex; gap:16px; align-items:center; margin-bottom:16px; }
-.hero-art { width:160px; flex:none; }
-h1 { font-size:28px; line-height:1.2; margin:0 0 6px; }
-h2 { font-size:19px; margin:0 0 4px; }
+body { margin:0; background:var(--bg); color:var(--fg); font:400 16px/1.55 var(--sans); -webkit-text-size-adjust:100%%; overflow-x:hidden; }
+main { max-width:780px; margin:0 auto; padding:28px 16px 56px; }
+.hero { position:relative; isolation:isolate; overflow:hidden; display:flex; gap:20px; align-items:center; margin-bottom:20px;
+  background:var(--card); border-radius:26px; padding:28px 24px; box-shadow:var(--shadow); }
+.hero::before, .hero::after { content:""; position:absolute; z-index:-1; border-radius:50%%; pointer-events:none; opacity:var(--orb-alpha);
+  animation:drift 16s ease-in-out infinite alternate; }
+.hero::before { width:220px; height:320px; right:-120px; top:-170px; transform:rotate(36deg); opacity:1;
+  background:radial-gradient(closest-side, var(--orange-in) 42%%, var(--orange-out) 100%%); }
+.hero::after { width:130px; height:190px; right:70px; bottom:-160px; transform:rotate(40deg); animation-duration:19s; animation-delay:-7s;
+  background:radial-gradient(closest-side, var(--pink-in) 40%%, var(--pink-out) 100%%); }
+.hero > div { position:relative; }
+.hero-art { width:120px; height:120px; flex:none; position:relative; border-radius:50%%; overflow:hidden; }
+h1 { font:600 clamp(30px, 5vw, 46px)/1.02 var(--display); letter-spacing:-.03em; margin:0 0 10px; }
+h2 { font:600 22px/1.2 var(--display); letter-spacing:-.02em; margin:0 0 6px; }
 p { margin:0 0 6px; }
 .lead, .how { color:var(--muted); }
-.roles { font-size:14px; font-weight:600; color:var(--brand); margin:6px 0 0; }
+.lead { font-size:17px; line-height:1.5; max-width:34em; }
+.roles { display:inline-block; font-size:13px; font-weight:500; letter-spacing:.02em; color:var(--fg); margin:10px 0 0;
+  padding:5px 12px; border-radius:999px; border:1px solid var(--line); background:var(--bg); }
 .progress { margin:4px 0 16px; }
-.progress-label { font-size:14px; color:var(--muted); margin-bottom:4px; }
-.bar { height:8px; border-radius:99px; background:var(--track); overflow:hidden; }
-.bar > span { display:block; height:100%%; width:0; background:var(--brand); border-radius:99px; transition:width .3s ease; }
+.progress-label, .step-title { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.progress-label { margin-bottom:6px; }
+.bar { height:8px; border-radius:999px; background:var(--track); overflow:hidden; }
+.bar > span { display:block; height:100%%; width:0; border-radius:999px; transition:width .3s ease;
+  background:linear-gradient(90deg, var(--yellow-out), var(--orange-out)); }
 .controls { display:none; }
-.js .controls { display:flex; flex-wrap:wrap; gap:10px 8px; align-items:center; margin:0 0 12px; }
+.js .controls { display:flex; flex-wrap:wrap; gap:10px 8px; align-items:center; margin:0 0 14px; }
 .dots { display:flex; flex-wrap:wrap; gap:6px; flex-basis:100%%; }
 #all { margin-left:auto; }
-#all[aria-pressed="true"] { background:var(--brand); color:var(--card); }
-.dot { width:28px; height:28px; padding:0; border-radius:50%%; font-size:12px; border:2px solid var(--line); color:var(--muted); background:var(--card); }
-.dot[aria-current="step"] { border-color:var(--brand); color:var(--fg); }
-.dot.is-done { background:var(--brand); border-color:var(--brand); color:var(--card); }
+#all[aria-pressed="true"] { background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); color:var(--ink); }
+.dot { width:30px; height:30px; padding:0; border-radius:50%%; font-size:12px; border:1px solid var(--line); color:var(--muted); background:var(--card); }
+.dot:hover:not(:disabled) { background:var(--card); color:var(--fg); border-color:var(--fg); }
+.dot[aria-current="step"] { border:2px solid var(--fg); color:var(--fg); }
+.dot.is-done, .dot.is-done:hover:not(:disabled) { background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); border-color:transparent; color:var(--ink); }
 .card[hidden] { display:none; }
-.card { background:var(--card); border:1px solid var(--line); border-top:4px solid var(--accent); border-radius:12px; padding:16px; margin:0 0 12px; display:flex; gap:16px; }
-.icon { flex:none; width:72px; height:72px; border-radius:16px; color:var(--accent); position:relative; display:grid; place-items:center; }
-.icon::before { content:""; position:absolute; inset:0; border-radius:inherit; background:currentColor; opacity:.12; }
-.icon svg { width:52px; height:52px; position:relative; }
+.card { background:var(--card); border:1px solid transparent; border-top:4px solid var(--accent-out, var(--brand)); border-radius:26px; padding:24px; margin:0 0 14px; display:flex; gap:20px; box-shadow:var(--shadow); }
+.icon { flex:none; width:72px; height:72px; border-radius:20px; color:var(--ink); position:relative; display:grid; place-items:center;
+  background:radial-gradient(closest-side, var(--accent-in) 70%%, var(--accent-out) 130%%); }
+.icon svg { width:50px; height:50px; position:relative; }
 .body { min-width:0; flex:1; }
-.step-title { flex-basis:100%%; margin:0; font-weight:600; }
-.pos { font-weight:400; color:var(--muted); margin-left:6px; font-size:14px; }
+.step-title { flex-basis:100%%; margin:2px 0 0; font-weight:500; }
+.step-title #step-title { color:var(--fg); }
+.pos { font-weight:400; color:var(--muted); margin-left:8px; }
 .progress, .done { display:none; }
 .js .progress { display:block; }
 .js main[data-mode="all"] .step-title { display:none; }
-.paste { font-size:13px; color:var(--muted); margin:4px 0 0; }
-.shots { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:flex-start; }
-.shots img { max-width:100%%; height:auto; border:1px solid var(--line); border-radius:8px; }
-.finale { border-top-color:var(--brand); }
-.finale h2 { font-size:21px; }
-.prompt { display:flex; gap:8px; align-items:center; margin-top:8px; }
-code { flex:1; min-width:0; background:var(--code); border-radius:6px; padding:6px 8px; font-size:14px; overflow-wrap:anywhere; user-select:all; }
-button { flex:none; border:1px solid var(--brand); color:var(--brand); background:transparent; border-radius:8px; padding:6px 12px; font:inherit; font-size:14px; cursor:pointer; }
-button:hover:not(:disabled) { background:var(--brand); color:var(--card); }
-button:disabled { opacity:.45; cursor:default; }
-button:focus-visible, input:focus-visible { outline:3px solid var(--brand); outline-offset:2px; }
-.copy { border-color:var(--accent); color:var(--accent); }
-.copy:hover { background:var(--accent); color:var(--card); }
-.js .done { display:inline-flex; gap:8px; align-items:center; margin-top:10px; font-size:14px; cursor:pointer; }
-.done input { width:18px; height:18px; accent-color:var(--accent); }
+.paste { font-size:13px; color:var(--muted); margin:6px 0 0; }
+.shots { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; align-items:flex-start; }
+.shots img { max-width:100%%; height:auto; border-radius:16px; box-shadow:0 0 0 1px rgba(28,27,28,.08), 0 6px 18px rgba(28,27,28,.06); }
+#s-phone .shots img { width:96px; border-radius:22px; }
+.shots figure { margin:0; display:flex; flex-direction:column; align-items:center; gap:6px; }
+.shots figcaption { color:var(--label); font-size:13px; font-weight:500; line-height:1.2; text-align:center; }
+#s-phone .shot-app-store-qr img { width:132px; border-radius:10px; }
+.store { margin:8px 0 0; }
+.store a { color:var(--brand); font-weight:500; text-underline-offset:3px; }
+.finale { position:relative; isolation:isolate; overflow:hidden; border-top-color:var(--brand); }
+.finale::before { content:""; position:absolute; z-index:-1; width:200px; height:280px; right:-60px; top:-120px; transform:rotate(38deg);
+  border-radius:50%%; opacity:var(--orb-alpha); background:radial-gradient(closest-side, var(--yellow-in) 52%%, var(--yellow-out) 100%%); }
+.finale h2 { font-size:clamp(24px, 4vw, 32px); letter-spacing:-.03em; }
+.prompt { display:flex; gap:8px; align-items:center; margin-top:12px; }
+code { flex:1; min-width:0; background:var(--code); border:1px solid var(--line); border-radius:14px; padding:10px 14px; font-size:14px; overflow-wrap:anywhere; user-select:all; }
+button { flex:none; border:0; color:var(--pill-fg); background:var(--pill-bg); border-radius:999px; padding:9px 18px; font:inherit; font-size:14px; letter-spacing:.01em; cursor:pointer; transition:filter .2s ease; }
+button:hover:not(:disabled) { filter:brightness(1.15); }
+button:disabled { opacity:.35; cursor:default; }
+button:focus-visible, input:focus-visible { outline:2px solid var(--fg); outline-offset:2px; }
+#next, .copy { color:var(--ink); background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); }
+#next:hover:not(:disabled), .copy:hover:not(:disabled) { filter:brightness(1.05) saturate(1.1); }
+.js .done { display:inline-flex; gap:8px; align-items:center; margin-top:14px; font-size:14px; cursor:pointer; }
+.done input { width:18px; height:18px; accent-color:var(--orange-out); }
 .js main[data-mode="step"] .sec { display:none; }
 .js main[data-mode="step"] .sec.cur { display:flex; animation:enter .22s ease-out; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 .done input:disabled { opacity:.5; }
 @keyframes enter { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+@keyframes drift { 0%% { translate:-5%% 4%%; scale:1; } 50%% { translate:3%% -3%%; scale:1.07; } 100%% { translate:6%% 3%%; scale:.97; } }
 @media (prefers-reduced-motion: reduce) {
   .js main[data-mode="step"] .sec.cur { animation:none; }
   .bar > span { transition:none; }
+  .hero::before, .hero::after { animation:none; }
 }
 @media (max-width: 520px) {
-  .hero { flex-direction:column; align-items:flex-start; }
-  .hero-art { width:120px; }
-  .card { flex-direction:column; gap:10px; }
-  .icon { width:56px; height:56px; }
-  .icon svg { width:40px; height:40px; }
+  .hero { flex-direction:column; align-items:flex-start; padding:22px 18px; }
+  .hero-art { width:88px; height:88px; }
+  .card { flex-direction:column; gap:12px; padding:20px 18px; border-radius:22px; }
+  .icon { width:56px; height:56px; border-radius:16px; }
+  .icon svg { width:38px; height:38px; }
 }
 </style>"""
 
@@ -783,17 +859,17 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
+    lead = (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
+            if audience == "dm" else "A quick tour. Try one thing in each part.")
     secs = sections_for(core, features)
-    body = "".join(_section(s, i == 0, who, prompts, media) for i, s in enumerate(secs))
-    light, dark = _palette(tuple(s.id for s in features.steps if s.id not in ACCENTS))
+    body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
     page = (
         f"{PAGE_HEAD}"
         f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
-        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'darkvars': dark}}</head><body>"
+        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'darkvars': DARK}}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
-        f"<p class=\"lead\">A short tour of s.space. Each part has one thing to try; Copy puts "
-        f"a prompt on your clipboard to paste into a chat with {who}.</p>{picked}</div></header>"
+        f"<p class=\"lead\">{lead}</p>{picked}</div></header>"
         "<div class=\"progress\"><div class=\"progress-label\" id=\"progress-label\" aria-hidden=\"true\">"
         f"0 of {len(secs)} done</div>"
         f"<div class=\"bar\" id=\"progress-bar\" role=\"progressbar\" aria-label=\"Tour progress\" "

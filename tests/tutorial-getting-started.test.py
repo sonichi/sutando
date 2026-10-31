@@ -87,9 +87,11 @@ STUB = textwrap.dedent('''
 
 
 TOUR = ["Your DM", "Rooms", "Commons", "Connect other agents", "Teamwork", "Calls & voice",
-        "Connect your apps", "Activity & notices", "Mobile"]
-FINALE = "You\u2019re set \u2014 ask Blue anything"
-IMPORT = "Import your Claude Code history"
+        "Connect your apps", "Activity & notices", "Get the mobile app", "Mobile"]
+FINALE = "You\u2019re set. Ask Blue anything"
+# The stub room-commons has no room_media.py: every full-resolution capture stays inlined.
+NO_MEDIA_SUPPORT = {"uploaded": [], "skipped": [], "fallback": list(gs.tour_page.hd_files(gs.tour_page.FEATURES)),
+                    "reason": "this room-commons has no room media support (room_media.py)"}
 
 
 class Page(HTMLParser):
@@ -125,20 +127,20 @@ def steps(page):
 
 
 class RenderTest(unittest.TestCase):
-    def test_tour_has_all_nine_sections_in_order(self):
+    def test_tour_has_all_ten_sections_in_order(self):
         for core in gs.CORES:
-            self.assertEqual(steps(gs.render_page("Blue", core))[:9], TOUR)
+            self.assertEqual(steps(gs.render_page("Blue", core))[:10], TOUR)
         self.assertLess(TOUR.index("Connect other agents"), TOUR.index("Teamwork"))
 
-    def test_import_section_only_on_a_claude_core(self):
-        claude = parse(gs.render_page("Blue", "claude"))
-        self.assertEqual(steps(gs.render_page("Blue", "claude")), TOUR + [IMPORT])
-        self.assertIn(gs.IMPORT_PROMPT, claude.buttons)
-        for core in ("codex", "unknown"):
-            page = parse(gs.render_page("Blue", core))
-            self.assertEqual(steps(gs.render_page("Blue", core)), TOUR)
-            self.assertNotIn(gs.IMPORT_PROMPT, page.buttons)
-            self.assertNotIn("Claude Code", gs.render_page("Blue", core))
+    def test_no_core_gets_a_claude_code_import_section(self):
+        for core in gs.CORES:
+            page = gs.render_page("Blue", core)
+            self.assertEqual(steps(page), TOUR)
+            self.assertNotIn("Import your Claude Code history", page)
+            self.assertNotIn("Import my Claude Code history", page)
+            self.assertNotIn('id="s-import"', page)
+            self.assertNotIn("Claude Code", page)
+        self.assertFalse(hasattr(gs, "IMPORT_PROMPT"))
 
     def test_unknown_core_value_is_refused(self):
         with self.assertRaises(ValueError):
@@ -149,7 +151,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual([b for b in parse(page).buttons if b],
                          [gs.tour_page.FINALE_PROMPT] + [s.prompt for s in gs.SECTIONS if s.prompt])
         self.assertIn(gs.CONNECT_PROMPT, parse(page).buttons)
-        self.assertIn("Settings &rarr; Integrations", page)
+        self.assertIn("Settings &rarr; Apps &rarr; Connected apps", page)
         self.assertIn("navigator.clipboard", page)
         self.assertIn("prefers-color-scheme: dark", page)
 
@@ -161,10 +163,10 @@ class RenderTest(unittest.TestCase):
 
     def test_every_prompt_says_where_to_paste_it(self):
         where = {s.id: s.where for s in gs.sections_for("claude") if s.prompt}
-        self.assertEqual(where, {"dm": "dm", "commons": "room", "teamwork": "room", "apps": "dm", "import": "dm"})
+        self.assertEqual(where, {"dm": "dm", "commons": "room", "teamwork": "room", "apps": "dm"})
         page = gs.render_page("Blue", "claude")
         self.assertEqual(page.count('<p class="paste">Paste in: a room</p>'), 2)
-        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 4)  # dm, apps, import, finale
+        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 3)  # dm, apps, finale
 
     def test_closing_card_is_hidden_until_everything_is_done(self):
         page = gs.render_page("Blue", "claude")
@@ -176,18 +178,17 @@ class RenderTest(unittest.TestCase):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")
         self.assertIn('<p class="step-title"><span id="step-title">Your DM</span>'
-                      '<span class="pos" id="step-pos" aria-hidden="true">1/9</span></p>', page)
+                      '<span class="pos" id="step-pos" aria-hidden="true">1/10</span></p>', page)
         self.assertNotRegex(page, r'id="step-title"[^>]*aria-live')  # announced once, by heading focus
         self.assertIn("stepPos.textContent = (cur + 1) + '/' + ids.length", gs.tour_page.SCRIPT)
         self.assertIn("stepTitle.textContent = titles[cur]", gs.tour_page.SCRIPT)
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or Muse (by Meta)", by["agents"].how)
+        self.assertIn("Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok), Muse (by Meta), or Other", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
-        self.assertTrue(by["import"].what.startswith("If you use Claude Code"))
-        self.assertIn("local Claude Code history", by["import"].what)
+        self.assertNotIn("import", by)
         self.assertIn("headphone icon in the room header", by["calls"].how)
         self.assertIn("Bring an agent?", by["calls"].how)
         self.assertIn("+ at the top of the room list", by["rooms"].how)
@@ -198,13 +199,13 @@ class RenderTest(unittest.TestCase):
         self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
         self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
                       by["activity"].how)
-        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"),
-                      by["apps"].images)
+        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings \u2192 Apps \u2192 Connected apps",
+                       "settings-integrations.png", None), by["apps"].images)
 
     def test_room_audience_says_your_agent(self):
         room = gs.render_page("Blue", "claude", "room")
         self.assertIn("<h1>Getting started with your agent</h1>", room)
-        self.assertIn("ask your agent anything", room)
+        self.assertIn("Ask your agent anything", room)
         self.assertNotIn("Blue", re.sub(r'src="data:[^"]*"', "", room))
         dm = gs.render_page("Blue", "claude", "dm")
         self.assertIn("<h1>Getting started with Blue</h1>", dm)
@@ -221,12 +222,21 @@ class RenderTest(unittest.TestCase):
     def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
         self.assertNotIn("Codex", agents.what + agents.how)
-        self.assertNotIn("Claude", agents.what + agents.how)
+        self.assertNotIn("Claude Code", agents.what + agents.how)  # Claude the app is one "Other" pick
 
     def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))
         self.assertNotEqual(gs.render_page("Kai"), gs.render_page("Mo"))
-        self.assertNotEqual(gs.render_page("Kai", "claude"), gs.render_page("Kai", "codex"))
+        # No bundled step names a runtime, so the core alone changes nothing; a list step that names
+        # one still shows on that core only.
+        self.assertEqual(gs.render_page("Kai", "claude"), gs.render_page("Kai", "codex"))
+        extra = gs.tour_page.Section("extra", "Extra", "What it is.", "Try it.", "Do the extra thing.", "dm",
+                                     runtime="claude")
+        features = gs.tour_page.FeatureList(gs.tour_page.FEATURES.revision, gs.tour_page.FEATURES.steps + (extra,))
+        claude = gs.render_page("Kai", "claude", features=features)
+        self.assertNotEqual(claude, gs.render_page("Kai", "codex", features=features))
+        self.assertIn("Do the extra thing.", claude)
+        self.assertNotIn("Do the extra thing.", gs.render_page("Kai", "codex", features=features))
 
     def test_name_is_escaped_everywhere(self):
         page = gs.render_page('<img src=x onerror="alert(1)">', "claude")
@@ -311,12 +321,17 @@ class InteractiveTest(unittest.TestCase):
     def test_an_svg_per_section_and_a_hero(self):
         self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 10)
         self.assertIn('class="hero-art"', self.page)
-        self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for("claude")})
+        for core in gs.CORES:
+            self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for(core)})
 
     def test_no_external_urls(self):
         for core in gs.CORES:
             page = gs.render_page("Blue", core)
-            bare = re.sub(r'src="data:image/jpeg;base64,[A-Za-z0-9+/=]+"', 'src=""', page)
+            bare = re.sub(r'src="data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+"', 'src=""', page)
+            # The phone step's App Store anchor is the one outbound URL: a link, never a resource.
+            store = re.findall(r'<a href="([^"]*)"', bare)
+            self.assertEqual(store, ["https://apps.apple.com/us/app/s-space/id6788541784"])
+            bare = bare.replace(f'href="{store[0]}"', 'href=""')
             self.assertNotRegex(bare, r"(?i)\b(?:https?:)?//[a-z0-9]")
             self.assertNotRegex(bare, r"(?i)<(?:link|iframe|object|embed)\b|url\(")
             self.assertEqual(re.findall(r'\bsrc="([^"]*)"', bare), [""] * bare.count("<img "))
@@ -345,11 +360,26 @@ class InteractiveTest(unittest.TestCase):
         self.assertNotIn("art.state.set('gs-done'", script)
         self.assertIn("typeof v.then === 'function'", script)
 
-    def test_accent_palette_meets_aa_on_cards_in_both_themes(self):
+    def test_step_accents_cycle_the_brand_palette_and_the_glyph_stays_legible(self):
         tp = gs.tour_page
-        for sid, (light, dark) in tp.ACCENTS.items():
-            self.assertGreaterEqual(tp.contrast(light, tp.CARD[0]), 4.5, sid)
-            self.assertGreaterEqual(tp.contrast(dark, tp.CARD[1]), 4.5, sid)
+        self.assertEqual(tp.BRAND, (("orange", "#f9a75c", "#f26a21"), ("yellow", "#f0e24a", "#ea931f"),
+                                    ("pink", "#f8cbfb", "#f38c64")))
+        for name, inner, outer in tp.BRAND:
+            self.assertIn(f"--{name}-in:{inner};", self.page)
+            self.assertIn(f"--{name}-out:{outer};", self.page)
+            for shade in (inner, outer):  # the ink glyph on either end of the gradient, in both themes
+                self.assertGreaterEqual(tp.contrast(tp.INK, shade), 4.5, (name, shade))
+        tones = re.findall(r'style="--accent-in:var\(--([a-z]+)-in\);--accent-out:var\(--\1-out\)"', self.page)
+        self.assertEqual(tones, [tp.BRAND[i % 3][0] for i in range(len(TOUR))])
+        self.assertNotIn("--a-", self.page)
+        self.assertIn("color:var(--ink); position:relative; display:grid; place-items:center;\n"
+                      "  background:radial-gradient(closest-side, var(--accent-in) 70%, var(--accent-out) 130%); }",
+                      self.page)
+
+    def test_the_hero_oval_is_the_solid_brand_orange(self):
+        self.assertIn("transform:rotate(36deg); opacity:1;\n"
+                      "  background:radial-gradient(closest-side, var(--orange-in) 42%, var(--orange-out) 100%); }",
+                      self.page)
 
     def test_page_scripts_parse(self):
         node = shutil.which("node")
@@ -690,22 +720,24 @@ class AssetTest(unittest.TestCase):
     def test_every_step_image_exists_and_is_small(self):
         tp = gs.tour_page
         used = {shot.file for s in tp.sections_for("claude") for shot in s.images}
-        files = {p.name: p.stat().st_size for p in tp.ASSETS.glob("*.jpg")}
-        self.assertEqual(used, set(files))
+        files = {name: (tp.ASSETS / name).stat().st_size for name in used}  # the inlined fallbacks
+        hd = {shot.hd for s in tp.sections_for("claude") for shot in s.images if shot.hd}
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        self.assertEqual(used | hd, on_disk)
         self.assertTrue(all(size <= 60_000 for size in files.values()), files)
         self.assertLessEqual(sum(files.values()), 500_000)
         for s in tp.sections_for("claude"):
             for shot in s.images:
                 self.assertTrue(shot.alt.strip(), shot.file)
-                self.assertEqual(shot.asset, shot.file[:-4])  # today's asset names are the file stems
+                self.assertEqual(shot.asset, Path(shot.file).stem)  # today's asset names are the file stems
 
     def test_each_step_with_an_image_renders_it_inline(self):
         page = gs.render_page("Blue", "claude")
         for s in gs.tour_page.sections_for("claude"):
             block = page[page.index(f'id="s-{s.id}"'):]
             block = block[:block.index("</section>")]
-            self.assertEqual(block.count('<img src="data:image/jpeg;base64,'), len(s.images), s.id)
-        for sid in ("rooms", "commons", "teamwork", "calls", "apps", "activity", "mobile"):
+            self.assertEqual(len(re.findall(r'<img src="data:image/(?:jpeg|png);base64,', block)), len(s.images), s.id)
+        for sid in ("rooms", "commons", "teamwork", "calls", "apps", "activity", "phone", "mobile"):
             self.assertTrue([s for s in gs.SECTIONS if s.id == sid][0].images, sid)
 
     def test_rendered_page_size_is_bounded(self):
@@ -835,9 +867,11 @@ class MainTest(unittest.TestCase):
                                  "--owner", "@owner:example.test", "--room-commons", str(self.stub),
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out), {"ok": True, "action": "created", "kind": "html-p1",
-                                           "summoned": True, "name": "Blue", "list": "file",
-                                           "revision": gs.tour_page.FEATURES.revision, "media": []})
+        got = json.loads(out)
+        self.assertEqual(got.pop("upload"), NO_MEDIA_SUPPORT)
+        self.assertEqual(got, {"ok": True, "action": "created", "kind": "html-p1",
+                               "summoned": True, "name": "Blue", "list": "file",
+                               "revision": gs.tour_page.FEATURES.revision, "media": []})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
@@ -1017,13 +1051,14 @@ class PersonalTest(unittest.TestCase):
 
     def test_invalid_entries_fall_back_per_slot(self):
         bad = {"dm": "see https://example.test", "commons": "x" * (gs.tour_page.PROMPT_MAX + 1),
-               "teamwork": "line one\nline two", "apps": 42, "import": "<b>bold</b>", "finale": "   ",
-               "unknown-slot": "ignored", "mobile": "not a prompt slot"}
+               "teamwork": "line one\nline two", "apps": 42, "finale": "   ",
+               "unknown-slot": "ignored", "mobile": "not a prompt slot", "import": "a removed slot"}
         self.assertEqual(gs.tour_page.clean_prompts(bad), {})
         self.assertEqual(gs.render_page("Blue", "claude", prompts=bad), gs.render_page("Blue", "claude"))
         self.assertEqual(gs.tour_page.clean_prompts({"dm": " ok ", "apps": "www.example.test",
                                                      "commons": "Read example.com for me"}), {"dm": "ok"})
         self.assertEqual(gs.tour_page.clean_prompts(["dm", "x"]), {})
+        self.assertEqual(gs.tour_page.clean_prompts({"dm": "<b>bold</b>"}), {})
 
     def test_the_slot_decides_where_to_paste_not_the_text(self):
         page = gs.render_page("Blue", "codex", prompts={"commons": "Ask in your DM: plan my week."})
@@ -1284,6 +1319,7 @@ class PublishTest(unittest.TestCase):
 
     def test_first_run_creates_writes_and_summons(self):
         out = self.publish(owner="@chi:ag2.space")
+        self.assertEqual(out.pop("upload"), NO_MEDIA_SUPPORT)
         self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True,
                                "revision": gs.tour_page.FEATURES.revision, "media": []})
         room = self.room()
@@ -1294,7 +1330,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(gs.read_marker(parts[0]), (self.ME, gs.tour_page.FEATURES.revision))
         self.assertTrue(gs.page_digest_ok(self.page()))  # the tag's digest covers the whole page
         self.assertEqual([c[0] for c in room["calls"]],
-                         ["pages", "create", "read", "read", "append", "read", "summon"])
+                         ["pages", "create", "read", "read"] + ["append", "read"] * (len(parts) - 1) + ["summon"])
         appended = [c for c in room["calls"] if c[0] == "append"]
         self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in appended))
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
@@ -1318,10 +1354,10 @@ class PublishTest(unittest.TestCase):
     def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()
         before = len(self.room()["calls"])
-        old, new = self.page(), self.page(core="claude")
+        old, new = self.page(), self.page(name="Kai")
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
         with mock.patch.object(gs, "one_call", return_value=False):  # above the one-call budget
-            out = self.publish(core="claude")
+            out = self.publish(name="Kai")
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
         replaces = [c for c in calls if c[0] == "replace"]
@@ -1376,11 +1412,12 @@ class PublishTest(unittest.TestCase):
         self.assertEqual([c[0] for c in self.room()["calls"]], ["replace"])
         self.assertEqual(self.room()["pages"]["html-p1"], "<p>new</p>")
 
-    def test_core_change_rewrites_the_same_page(self):
+    def test_core_change_alone_leaves_the_page_unchanged(self):
+        # No bundled step names a runtime, so a Claude Code core renders the same page as Codex.
         self.publish()
         out = self.publish(core="claude")
-        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
-        self.assertIn(gs.IMPORT_PROMPT, self.room()["pages"]["html-p1"])
+        self.assertEqual((out["action"], out["kind"]), ("unchanged", "html-p1"))
+        self.assertNotIn("Import my Claude Code history", self.room()["pages"]["html-p1"])
 
     def test_removed_page_is_created_again(self):
         self.publish()

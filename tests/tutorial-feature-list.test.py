@@ -7,8 +7,10 @@ list is older, `--list` swaps the list without any network call by default, and 
 keep the page publishable hold."""
 from __future__ import annotations
 
+import base64
 import contextlib
 import email.message
+import hashlib
 import importlib.util
 import io
 import json
@@ -32,88 +34,82 @@ base_spec.loader.exec_module(base)  # isolates the environment and loads getting
 gs, tp = base.gs, base.gs.tour_page
 Section = tp.Section
 
-# --- fixture: the sections as tour_page.py hard-coded them before the list existed ---------------
+# --- fixture: the bundled list's sections as Section literals, rendered without the list -------
+APP_STORE = "https://apps.apple.com/us/app/s-space/id6788541784"
 OLD_SECTIONS = [
     Section("dm", "Your DM",
-            "Your DM with {name} is where you ask for things for yourself. What you ask for "
-            "yourself (research, mail, calendar) comes back in your DM, never in a room.",
-            "Ask {name} in your DM:",
+            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
+            "Open {name} under Your agents at the top of the sidebar and ask:",
             "What can you do for me today?", "dm"),
     Section("rooms", "Rooms",
             "Humans and agents talk in the same chat.",
-            "Press + at the top of the room list and choose Room. Then open the room menu "
-            "(&#8942;), choose Invite, and add {name}.",
-            images=(("room-list-add.jpg", "The + button at the top of the room list"),
-                    ("new-room-dialog.jpg", "The New Chat Room dialog"),
-                    ("room-menu-invite.jpg", "The room menu, with Invite"))),
+            "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}.",
+            images=(("room-list-add-room.jpg", "Press + in the room list, then Room"), ("new-room-dialog.jpg", "The New Chat Room dialog, with your agent under AI stands you own"), ("room-menu-invite.jpg", "The room menu, with Invite"))),
     Section("commons", "Commons",
-            "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them "
-            "with the Commons icon in the room header.",
+            "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
             "Ask {name} in a room:",
             "Make a plan for our team offsite in Commons.", "room",
-            (("room-header-commons.jpg", "The room header; Commons is the second icon"),
-             ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Sheet and Database"))),
+            (("room-header-commons.jpg", "The Commons button at the right of the room header"), ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"))),
     Section("agents", "Connect other agents",
             "Bring agents from the apps you already use into your rooms.",
-            "Press + at the top of the room list, choose Agent, then Use an agent from another app, "
-            "and pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or "
-            "Muse (by Meta)."),
+            "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok), Muse (by Meta), or Other for Claude, Cursor and more. Then connect it inside that app and sign in.",
+            images=(("room-list-add.jpg", "The + menu at the top of the room list, with Agent"),
+                    ("add-agent-dialog.jpg", "Add an agent, with Use an agent from another app"), ("which-agent.jpg", "Which agent? Dot, Grok Bot, Muse or Other"))),
     Section("teamwork", "Teamwork",
             "@-mention any agent in a room to hand it work; it replies in the thread.",
-            "In a room with another agent, type @ and ask {name}:",
-            "Research the three best note-taking apps for a small team, then ask another agent "
-            "in this room to review your answer.", "room",
-            (("composer-mention.jpg", "The @ button in the message composer"),)),
+            "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:",
+            "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer.", "room",
+            (("mention-list.jpg", "Typing @ in the message box opens the Mentions list"),)),
     Section("calls", "Calls &amp; voice",
             "Talk live with {name} in your DM, or with people in any room.",
-            "Press the headphone icon in the room header (Start call). In your DM, {name} answers; "
-            "in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;.",
+            "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;.",
             images=(("room-header-call.jpg", "The headphone icon in the room header"),)),
     Section("apps", "Connect your apps",
             "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
-            "Press the plug icon in your user card (bottom left) to open Settings &rarr; "
-            "Integrations, or ask {name} and a Connect button appears:",
+            "Click your avatar at the bottom left and choose Apps to open Settings &rarr; Apps &rarr; Connected apps, or ask {name} and a Connect button appears:",
             tp.CONNECT_PROMPT, "dm",
-            (("user-card-plug.jpg", "The plug icon in your user card"),
-             ("settings-integrations.jpg", "Settings → Apps → Integrations"))),
+            (("settings-integrations.jpg", "Settings → Apps → Connected apps"),)),
     Section("activity", "Activity &amp; notices",
-            "The bell at the top of the room list and each room's Activity tab show what needs "
-            "you and what your agents are working on. The unread badge follows each room's "
-            "notification setting.",
-            "Try it: open a room's Activity tab while an agent works on something you asked for, "
-            "then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords.",
+            "The bell at the top of the room list and each room's Activity tab show what needs you and what your agents are working on. The unread badge follows each room's notification setting.",
+            "Try it: open a room's Activity tab while an agent works on something you asked for, then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords.",
             images=(("room-list-top.jpg", "The bell at the top of the room list"),)),
+    Section("phone", "Get the mobile app",
+            "Take your rooms and agents with you: first, put the app on your phone.",
+            "On your phone, search &ldquo;s.space&rdquo; in the App Store (by AG2AI, Inc), or scan this code with your phone&rsquo;s camera. Install the app with this icon and open it. You pair it with this computer in the next step.",
+            images=(("app-icon.png", "The S app icon", "S"),
+                    ("app-store-qr.png", "QR code that opens the app in the App Store", "Scan with your phone")),
+            link=(APP_STORE, "Open in the App Store")),
     Section("mobile", "Mobile",
             "The same rooms and agents on your phone.",
-            "Pair it in Settings &rarr; Mobile pairing.",
-            images=(("mobile-pairing.jpg", "Settings: Mobile pairing"),)),
+            "Click your avatar at the bottom left to open your account menu (User, Agent, Apps, Appearance, Mobile pairing, Notifications, Plan &amp; usage), choose Mobile pairing, press Enable, and scan the code with the mobile app on your phone.",
+            images=(("mobile-pairing.jpg", "Settings: Mobile pairing, with Enable"),)),
 ]
-OLD_IMPORT_SECTION = Section(
-    "import", "Import your Claude Code history",
-    "If you use Claude Code, {name} can read your local Claude Code history and bring what you "
-    "worked on into its memory. You see a digest first; nothing is kept until you say so.",
-    "Ask {name}:",
-    tp.IMPORT_PROMPT, "dm",
-)
 
 
 def as_shots(sec):
-    """The old (file, alt) pairs as asset references: the asset name is the file's stem, the file
-    its fallback. This adapter is the only difference between the fixture and the list."""
-    return sec._replace(images=tuple(tp.Shot(f[:-4], f, alt) for f, alt in sec.images))
+    """The old (file, alt[, caption]) tuples as asset references: the asset name is the file's stem,
+    the file its fallback, and a .jpg capture's full-resolution upload the same stem's .png. This
+    adapter is the only difference between the fixture and the list."""
+    return sec._replace(images=tuple(tp.Shot(f[:-4], f, alt, f"{f[:-4]}.png" if f.endswith(".jpg") else None, *cap)
+                                     for f, alt, *cap in sec.images))
 
 
-# The old module appended the import section on a Claude core; the list says so with `runtime`.
-OLD_LIST = tp.FeatureList(tp.FEATURES.revision,
-                          tuple(as_shots(s) for s in OLD_SECTIONS) + (OLD_IMPORT_SECTION._replace(runtime="claude"),))
+# The Claude Code history import step was removed from the list; no core gets an extra section.
+OLD_LIST = tp.FeatureList(tp.FEATURES.revision, tuple(as_shots(s) for s in OLD_SECTIONS))
 MXC_OF = {name: f"mxc://ag2.example/{i:02d}{name.replace('-', '')}" for i, name in enumerate(tp.asset_names(tp.FEATURES))}
 
 # The rendered content each shipped revision was cut with. A change to a rendered field fails
 # test_a_rendered_change_needs_a_revision_bump until `revision` is bumped and its key added here.
 RENDERED_AT = {
     "tutorial.2026-10-23.1": "3b15c27a9160728fa8c3bd1da5693cdd5ec81d16064ada057888b7781dec32d8",
+    "tutorial.2026-10-30.1": "feaeabb8abeb90bb7a4a2281ffbe192c34790451801894534722b2418895e640",
+    "tutorial.2026-10-30.2": "d9bdd6471f4f04ada5480794703267b9efdbd9b5e9f79530c6512a489bc0c253",
+    "tutorial.2026-10-30.3": "07d495fd4a218c09e081cd67fd5c631724c5f41d50cd74ce37afee73cefdfdfd",
+    "tutorial.2026-10-30.4": "55431cb1c85d31762782b40551f258d560876f1817ffe87ce338a2b251846f02",
+    "tutorial.2026-10-30.5": "cc82abc3094ed9f03a298c412f19b5cdf38f1253da042ee978dcea7ce0a6d122",
+    "tutorial.2026-10-30.6": "a699783d9c31d1cd9fbd73efa3738a4f4fbdfabbf9757d7cf5ba4b1067aab5d6",
 }
-STEP_IDS = ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "mobile", "import"]
+STEP_IDS = ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "phone", "mobile"]
 ASSET_CAP = 60_000
 PAGE_CAP = 300_000
 
@@ -197,33 +193,38 @@ class LosslessTest(unittest.TestCase):
 
     def test_the_bundled_list_carries_todays_steps(self):
         self.assertEqual([s.id for s in tp.FEATURES.steps], STEP_IDS)
-        self.assertEqual([s.id for s in tp.SECTIONS], STEP_IDS[:-1])
-        by = {s.id: s for s in tp.FEATURES.steps}
-        self.assertEqual(by["import"].runtime, "claude")
-        self.assertTrue(all(s.runtime is None for s in tp.FEATURES.steps if s.id != "import"))
-        self.assertEqual({s.since_release for s in tp.FEATURES.steps}, {"2026-10-15"})
-        self.assertEqual(tp.PROMPT_SLOTS, ("dm", "commons", "teamwork", "apps", "import", "finale"))
-        self.assertEqual([s.id for s in tp.sections_for("codex")], STEP_IDS[:-1])
-        self.assertEqual([s.id for s in tp.sections_for("claude")], STEP_IDS)
+        self.assertEqual([s.id for s in tp.SECTIONS], STEP_IDS)
+        self.assertNotIn("import", [s.id for s in tp.FEATURES.steps])
+        self.assertTrue(all(s.runtime is None for s in tp.FEATURES.steps))
+        self.assertEqual({s.since_release for s in tp.FEATURES.steps}, {"2026-10-15", "2026-10-30"})
+        self.assertEqual(tp.PROMPT_SLOTS, ("dm", "commons", "teamwork", "apps", "finale"))
+        for core in tp.CORES:
+            self.assertEqual([s.id for s in tp.sections_for(core)], STEP_IDS)
         raw = json.loads(tp.LIST_PATH.read_text(encoding="utf-8"))
         self.assertEqual(raw["schema_version"], tp.SCHEMA_VERSION)
         self.assertEqual(raw["revision"], tp.FEATURES.revision)
         self.assertEqual(set(raw["steps"][0]), {"id", "title", "body", "surface", "screenshot",
                                                  "since_release", "paste"})
         shots = [shot for s in raw["steps"] if s["screenshot"] for shot in s["screenshot"]]
-        self.assertEqual(len(shots), 11)
+        self.assertEqual(len(shots), 15)
         for shot in shots:
-            self.assertEqual(set(shot), {"asset", "fallback_file", "alt"})
-            self.assertEqual(shot["fallback_file"], f"assets/{shot['asset']}.jpg")  # today's names: the stems
+            if shot["asset"] in ("app-icon", "app-store-qr"):  # small enough to inline everywhere: never uploaded
+                self.assertEqual(set(shot), {"asset", "fallback_file", "alt", "caption"})
+                self.assertEqual(shot["fallback_file"], f"assets/{shot['asset']}.png")
+                continue
+            self.assertEqual(set(shot), {"asset", "hd_file", "fallback_file", "alt"})
+            self.assertEqual((shot["hd_file"], shot["fallback_file"]),
+                             (f"assets/{shot['asset']}.png", f"assets/{shot['asset']}.jpg"))  # the stems
+        self.assertEqual(len(tp.hd_files(tp.FEATURES)), 13)
 
     def test_sections_match_field_for_field(self):
         for old, new in zip(OLD_LIST.steps, tp.FEATURES.steps):
-            self.assertEqual((old.id, old.title, old.what, old.how, old.prompt, old.images),
-                             (new.id, new.title, new.what, new.how, new.prompt, new.images))
+            self.assertEqual((old.id, old.title, old.what, old.how, old.prompt, old.images, old.link),
+                             (new.id, new.title, new.what, new.how, new.prompt, new.images, new.link))
             if old.prompt:
                 self.assertEqual(old.where, new.where)  # the paste hint's surface
         for sec in OLD_SECTIONS:
-            self.assertEqual([(f, alt) for f, alt in sec.images], [(s.file, s.alt) for s in as_shots(sec).images])
+            self.assertEqual([(f, alt) for f, alt, *_ in sec.images], [(s.file, s.alt) for s in as_shots(sec).images])
 
 
 class ListTest(unittest.TestCase):
@@ -237,6 +238,26 @@ class ListTest(unittest.TestCase):
         served = good_list(kind="tutorial", vendor=None, etag="x")
         self.assertEqual(tp.parse_list(served), tp.FEATURES)
         self.assertEqual(tp.load_list(), tp.FEATURES)
+
+    def test_a_step_link_is_only_an_app_store_page(self):
+        app = "https://apps.apple.com/us/app/s-space/id6788541784"
+        play = "https://play.google.com/store/apps/details?id=ai.ag2.space"
+        for href in (app, play):
+            got = tp.parse_list(with_step(link={"href": href, "text": "Get it"})).steps[0].link
+            self.assertEqual(got, (href, "Get it"))
+        for href in ("https://x.test/app", "http://apps.apple.com/us/app/s-space/id6788541784",
+                     "https://apps.apple.com.evil.test/us/app/x/id123456",
+                     app + "?x=1", "javascript:alert(1)", "https://play.google.com/store/apps/details?id=a\"b"):
+            self.refuse(with_step(link={"href": href, "text": "Get it"}), "link")
+        self.refuse(with_step(link={"href": app}), "link")
+        self.refuse(with_step(link={"href": app, "text": "a", "extra": 1}), "link")
+        self.refuse(with_step(link={"href": app, "text": ""}), "link text")
+        self.refuse(with_step(link={"href": app, "text": "<i>x</i>"}), "link text")
+        self.refuse(with_step(link=app), "link")
+        page = tp.render_page("Blue", "claude")
+        self.assertEqual(page.count('<a href='), 1)
+        self.assertIn(f'<a href="{app}" target="_blank" rel="noopener noreferrer">Open in the App Store</a>', page)
+        self.assertIn('<figcaption>S</figcaption>', page)
 
     def test_each_malformed_shape_is_refused_by_name(self):
         self.refuse([], "JSON object")
@@ -264,9 +285,20 @@ class ListTest(unittest.TestCase):
         self.refuse(with_step(screenshot=[{**shot, "fallback_file": "room-list-add.jpg"}]), "assets/<name>.jpg")
         self.refuse(with_step(screenshot=[{**shot, "fallback_file": "assets/nope.jpg"}]), "nope.jpg")
         self.refuse(with_step(screenshot=[{"asset": "x", "fallback_file": "assets/room-list-add.jpg"}]), "alt")
+        self.refuse(with_step(screenshot=[{**shot, "hd_file": "assets/room-list-add.jpg"}]), "hd_file", "<name>.png")
+        self.refuse(with_step(screenshot=[{**shot, "hd_file": "../room-list-add.png"}]), "hd_file")
+        self.refuse(with_step(screenshot=[{**shot, "hd_file": 7}]), "hd_file")
+        self.refuse(with_step(screenshot=[{**shot, "hd_file": "assets/nope.png"}]), "nope.png")
+        ok = tp.parse_list(with_step(screenshot=[{**shot, "hd_file": "assets/room-list-add.png"}]))
+        self.assertEqual(ok.steps[0].images, (tp.Shot("x", "room-list-add.jpg", "a", "room-list-add.png"),))
         self.refuse(with_step(screenshot=[{**shot, "asset": "Room List"}]), "asset must be")
         self.refuse(with_step(screenshot=[{**shot, "asset": "room-list-add"}]), "duplicate asset", "room-list-add")
         self.refuse(with_step(screenshot=["room-list-add.jpg"]), "object with asset")
+        self.refuse(with_step(screenshot=[{**shot, "caption": ""}]), "caption")
+        self.refuse(with_step(screenshot=[{**shot, "caption": "x" * (tp.CAPTION_MAX + 1)}]), "caption")
+        self.refuse(with_step(screenshot=[{**shot, "caption": "<b>S</b>"}]), "caption", "'<'")
+        ok = tp.parse_list(with_step(screenshot=[{**shot, "caption": "S"}]))
+        self.assertEqual(ok.steps[0].images[0].caption, "S")
         self.refuse(with_step(screenshot="room-list-add.jpg"), "object with asset")
         self.refuse(with_step(since_release="Oct 2026"), "since_release")
         self.refuse(with_step(runtime="gemini"), "runtime")
@@ -360,13 +392,12 @@ class ListTest(unittest.TestCase):
                               features=features)
         self.assertIn('id="s-marketplace"', page)
         self.assertIn(tp.DEFAULT_ICON, page)
-        self.assertIn(f"--a-marketplace:{tp.DEFAULT_ACCENT[0]};", page)
-        self.assertIn(f"--a-marketplace:{tp.DEFAULT_ACCENT[1]};", page)
+        # Accents follow the step's position, so a new step needs no art of its own: second is yellow.
+        self.assertIn('id="s-marketplace" data-id="marketplace" aria-labelledby="h-marketplace" '
+                      'style="--accent-in:var(--yellow-in);--accent-out:var(--yellow-out)"', page)
         self.assertIn("Show me the Marketplace.", page)
         self.assertEqual(base.steps(page)[1], "Marketplace")
-        self.assertGreaterEqual(tp.contrast(tp.DEFAULT_ACCENT[0], tp.CARD[0]), 4.5)
-        self.assertGreaterEqual(tp.contrast(tp.DEFAULT_ACCENT[1], tp.CARD[1]), 4.5)
-        self.assertNotIn("--a-marketplace", tp.render_page("Blue", "codex"))
+        self.assertNotIn('id="s-marketplace"', tp.render_page("Blue", "codex"))
 
     def test_an_unreadable_file_is_a_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,20 +440,21 @@ class MediaTest(unittest.TestCase):
                                                                          "commons-surfaces"})
         self.assertEqual(tp.clean_media(["x"]), {})
         self.assertEqual(tp.clean_media(None), {})
-        self.assertEqual(len(tp.asset_names(tp.FEATURES)), 11)
+        self.assertEqual(len(tp.asset_names(tp.FEATURES)), 15)
 
     def test_a_mapped_asset_points_at_the_rooms_media_and_the_rest_stay_inlined(self):
         page = tp.render_page("Blue", "codex", media={"room-list-add": MXC_OF["room-list-add"]})
-        self.assertIn(f'<img src="{MXC_OF["room-list-add"]}" alt="The + button at the top of the room list" '
+        self.assertIn(f'<img src="{MXC_OF["room-list-add"]}" alt="The + menu at the top of the room list, with Agent" '
                       'loading="lazy">', page)
-        self.assertEqual(page.count('<img src="data:image/jpeg;base64,'), 10)
+        self.assertEqual(page.count('<img src="data:image/jpeg;base64,'), 12)
+        self.assertEqual(page.count('<img src="data:image/png;base64,'), 2)
         self.assertEqual(page.count('<img src="mxc://'), 1)
 
     def test_a_fully_mapped_page_shrinks_to_text(self):
         for core in tp.CORES:
             page = tp.render_page("Blue", core, "dm", "@kai.agent:example.test", media=MXC_OF)
             self.assertNotIn("data:image", page)
-            self.assertEqual(page.count('<img src="mxc://'), 11)
+            self.assertEqual(page.count('<img src="mxc://'), 15)
             self.assertLess(len(page.encode("utf-8")), 40_000, core)
 
     def test_without_media_the_page_is_the_fallback_page(self):
@@ -462,12 +494,24 @@ class MarkerTest(unittest.TestCase):
 
 class SizeTest(unittest.TestCase):
     def test_every_fallback_file_is_under_the_per_asset_cap(self):
-        files = {p.name: p.stat().st_size for p in tp.ASSETS.glob("*.jpg")}
+        used = {shot.file for s in tp.FEATURES.steps for shot in s.images}
+        files = {name: (tp.ASSETS / name).stat().st_size for name in used}
         self.assertTrue(files)
         over = {f: n for f, n in files.items() if n > ASSET_CAP}
         self.assertEqual(over, {})
-        used = {shot.file for s in tp.FEATURES.steps for shot in s.images}
-        self.assertEqual(used, set(files))
+        hd = set(tp.hd_files(tp.FEATURES).values())
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        self.assertEqual(used | hd, on_disk)  # every asset file is a fallback or an upload, none stray
+        self.assertFalse(used & hd)
+
+    def test_every_hd_file_is_a_png_room_media_takes(self):
+        hd = tp.hd_files(tp.FEATURES)
+        self.assertEqual(len(hd), 13)
+        for asset, name in hd.items():
+            data = (tp.ASSETS / name).read_bytes()
+            self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"), name)
+            self.assertLess(len(data), 25 * 1024 * 1024, name)
+            self.assertEqual(name, f"{asset}.png")
 
     def test_every_page_variant_is_under_the_page_cap(self):
         long_prompts = {slot: "x" * tp.PROMPT_MAX for slot in tp.PROMPT_SLOTS}
@@ -693,7 +737,7 @@ class ListOverrideTest(_Cli):
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["media"]), (0, "created", ["room-list-add"]))
         self.assertIn(f'<img src="{MXC_OF["room-list-add"]}"', self.page_text())
-        self.assertEqual(self.page_text().count("data:image/jpeg"), 10)
+        self.assertEqual(self.page_text().count("data:image/jpeg"), 12)
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
         self.assertEqual(entry["media"], {"room-list-add": MXC_OF["room-list-add"]})
         code, out, _ = self.publish()  # the room keeps its media map
@@ -923,7 +967,7 @@ class IfNewerTest(_Cli):
         newer = self.write_list("tutorial.2026-11-01.1")
         target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
                                 tp.load_list(newer))
-        self.assertEqual(len(gs.chunks(target)), 2)  # the default-size page: one replace, one append
+        self.assertEqual(len(gs.chunks(target)), 3)  # the default-size page: one replace, two appends
         for at in self.BOUNDARIES:
             with self.subTest(at=at):
                 mine, journaled, left = self.fail_at(at, newer, prompts)
@@ -1367,7 +1411,7 @@ class IfNewerTest(_Cli):
         opener.assert_not_called()
 
     SMALL = (131_071, 2_000_000)  # a call budget that holds no 214 KB text
-    SPLIT = (250_000, 400_000)  # the page fits an argument, but not beside the whole new page
+    SPLIT = (275_000, 400_000)  # the page fits an argument, but not beside the whole new page
 
     def test_a_default_size_page_refreshes_under_linuxs_exec_limit(self):
         code, out, _ = self.publish()
@@ -1578,6 +1622,229 @@ class IfNewerTest(_Cli):
         self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-01.1"))
         out = gs.publish(commons, marker, "Kai", core="codex", agent=self.ME, features=other, if_newer=True)
         self.assertEqual(out["action"], "unchanged")
+
+
+class FakeMedia:
+    """room_media.Media as publish uses it: an encryption check and an idempotent upload (the same
+    operation id answers the same mxc, as the server replays it)."""
+
+    def __init__(self, encrypted=False, fail=(), bad=()):
+        self.encrypted, self.fail, self.bad = encrypted, set(fail), set(bad)
+        self.uploads, self.checks = [], 0
+
+    def require_plain_room(self, room):
+        self.checks += 1
+        if self.encrypted is None:
+            raise RuntimeError("could not tell whether this room is encrypted")
+        if self.encrypted:
+            raise RuntimeError("this room is end-to-end encrypted")
+
+    def upload(self, room, data, filename, mime, operation_id):
+        asset = filename[:-4]
+        self.uploads.append((room, asset, mime, operation_id, hashlib.sha256(data).hexdigest()))
+        if asset in self.fail:
+            raise RuntimeError("room.media.upload failed: UPSTREAM_UNAVAILABLE")
+        if asset in self.bad:
+            return "mxc://not a uri"
+        return "mxc://ag2.example/" + operation_id[-24:]
+
+
+class UploadTest(_Cli):
+    """publish uploads each full-resolution capture to the room's media and points the page there;
+    whatever cannot go up is inlined from its small fallback, image by image."""
+
+    HD = tp.hd_files(tp.FEATURES)
+    maxDiff = None
+
+    def with_media(self, fake):
+        patcher = mock.patch.object(gs.Commons, "media", lambda commons: fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fake
+
+    def entry(self):
+        return gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+
+    def test_every_capture_goes_up_and_the_page_is_text(self):
+        fake = self.with_media(FakeMedia())
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"]), (0, "created"))
+        self.assertEqual(got["upload"], {"uploaded": list(self.HD), "skipped": [], "fallback": [], "reason": None})
+        self.assertEqual(got["media"], sorted(self.HD))
+        page = self.page_text()
+        # The text page (under 40 KB, as test_a_fully_mapped_page_shrinks_to_text pins) plus the
+        # inlined app icon, about 18 KB of base64.
+        icon = sum(len(base64.b64encode((tp.ASSETS / f).read_bytes())) for f in ("app-icon.png", "app-store-qr.png"))
+        self.assertLess(len(page.encode("utf-8")) - icon, 40_000)
+        self.assertLess(len(page.encode("utf-8")), 60_000)
+        self.assertEqual(page.count('<img src="mxc://'), 13)
+        self.assertNotIn("data:image/jpeg", page)
+        self.assertEqual(page.count('<img src="data:image/png;base64,'), 2)  # the app icon and QR stay inline
+        self.assertEqual(fake.checks, 1)
+        for room, asset, mime, op, digest in fake.uploads:
+            self.assertEqual((room, mime), (self.ROOM, "image/png"))
+            self.assertEqual(digest, hashlib.sha256((tp.ASSETS / self.HD[asset]).read_bytes()).hexdigest())
+            self.assertEqual(op, gs.media_op_id(self.ROOM, asset, digest))
+            self.assertEqual(self.entry()["media"][asset], {"mxc": "mxc://ag2.example/" + op[-24:], "sha256": digest})
+        self.assertEqual(len({op for _, _, _, op, _ in fake.uploads}), 13)
+        self.assertNotEqual(gs.media_op_id("!other:example.test", "room-list-add", "0" * 64),
+                            gs.media_op_id(self.ROOM, "room-list-add", "0" * 64))
+
+    def test_a_second_run_uploads_nothing_and_a_changed_hash_goes_up_again(self):
+        fake = self.with_media(FakeMedia())
+        self.publish()
+        page, first = self.page_text(), list(fake.uploads)
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["upload"]["uploaded"]), (0, "unchanged", []))
+        self.assertEqual(got["upload"]["skipped"], list(self.HD))
+        self.assertEqual((fake.uploads, fake.checks, self.page_text()), (first, 1, page))
+        # A capture whose bytes no longer match the record goes up again, with the same op id per bytes.
+        media = self.entry()["media"]
+        media["which-agent"] = {**media["which-agent"], "sha256": "0" * 64}
+        self.record(media=media)
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["upload"]["uploaded"]), (0, ["which-agent"]))
+        self.assertEqual(fake.uploads[-1][3], [u for u in first if u[1] == "which-agent"][0][3])
+        self.assertEqual(self.entry()["media"]["which-agent"]["sha256"],
+                         hashlib.sha256((tp.ASSETS / "which-agent.png").read_bytes()).hexdigest())
+
+    def test_an_encrypted_room_gets_the_fallback_page(self):
+        for encrypted in (True, None):  # encrypted, or encryption unreadable: nothing goes up
+            with self.subTest(encrypted=encrypted):
+                (self.tmp / "room.json").unlink(missing_ok=True)
+                gs.marker_path(self.tmp / "ws").unlink(missing_ok=True)
+                fake = FakeMedia(encrypted=encrypted)
+                with mock.patch.object(gs.Commons, "media", lambda commons: fake):
+                    code, out, _ = self.publish()
+                got = json.loads(out)
+                self.assertEqual((code, got["action"], got["media"], fake.uploads), (0, "created", [], []))
+                self.assertEqual(got["upload"]["fallback"], list(self.HD))
+                self.assertIn("encrypted", got["upload"]["reason"])
+                page = self.page_text()
+                self.assertEqual(page, tp.render_page("Blue", "codex", "dm", self.ME))
+                self.assertLess(len(page.encode("utf-8")), PAGE_CAP)
+                self.assertNotIn("mxc://", page)
+                self.assertNotIn("media", self.entry())
+
+    def test_one_failed_upload_inlines_only_that_image(self):
+        self.with_media(FakeMedia(fail={"commons-surfaces"}))
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"]), (0, "created"))
+        self.assertEqual(got["upload"]["fallback"], ["commons-surfaces"])
+        self.assertIn("commons-surfaces: room.media.upload failed", got["upload"]["reason"])
+        self.assertEqual(len(got["upload"]["uploaded"]), 12)
+        page = self.page_text()
+        self.assertEqual(page.count('<img src="mxc://'), 12)
+        self.assertEqual(page.count('<img src="data:image/jpeg;base64,'), 1)
+        self.assertIn('<img src="data:image/jpeg;base64,' + base64.b64encode(
+            (tp.ASSETS / "commons-surfaces.jpg").read_bytes()).decode("ascii"), page)
+        self.assertNotIn("commons-surfaces", self.entry()["media"])
+
+    def test_a_malformed_mxc_is_never_rendered_or_recorded(self):
+        self.with_media(FakeMedia(bad={"mention-list"}))
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual(got["upload"]["fallback"], ["mention-list"])
+        self.assertIn("no well-formed mxc", got["upload"]["reason"])
+        self.assertNotIn("mxc://not a uri", self.page_text())
+        self.assertNotIn("mention-list", self.entry()["media"])
+        # A record or a --media value with a bad URI is dropped the same way.
+        self.assertEqual(tp.clean_media({"mention-list": {"mxc": "https://ag2.example/x", "sha256": "0" * 64},
+                                         "which-agent": {"sha256": "0" * 64},
+                                         "room-list-top": {"mxc": MXC_OF["room-list-top"], "sha256": "0" * 64}}),
+                         {"room-list-top": MXC_OF["room-list-top"]})
+
+    def test_a_kept_page_keeps_the_media_record(self):
+        fake = self.with_media(FakeMedia())
+        real = gs.Commons.create_page
+
+        def answered_with_theirs(commons, title, body, operation_id):
+            kind = real(commons, title, body, operation_id)
+            db = json.loads((self.tmp / "room.json").read_text())
+            db["pages"][kind] = "<p>OWNER NOTES</p>"  # the op id answered a page someone else wrote
+            (self.tmp / "room.json").write_text(json.dumps(db))
+            return kind
+        with mock.patch.object(gs.Commons, "create_page", answered_with_theirs):
+            code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+        entry, uploaded = self.entry(), len(fake.uploads)
+        self.assertEqual((entry["foreign"], sorted(entry["media"])), (True, sorted(self.HD)))
+        code, out, _ = self.publish()  # still theirs, and nothing goes up a second time
+        self.assertEqual((code, json.loads(out)["action"], len(fake.uploads)), (0, "kept", uploaded))
+        self.assertEqual(sorted(self.entry()["media"]), sorted(self.HD))
+
+    def test_a_run_that_writes_no_page_uploads_nothing(self):
+        fake = self.with_media(FakeMedia())
+        marker = gs.marker_path(self.tmp / "ws")
+        # A creation whose create never answered, met by a refresh: the explicit publish's to finish.
+        page = tp.render_page("Blue", "codex", "dm", self.ME)
+        gs.save_marker(marker, {self.ROOM: {"state": "creating", "operation_id": "op-2", "target": page, "before": "",
+                                            "source": gs.content_hash(""), "hash": gs.content_hash(page), "done": 0,
+                                            "mode": "fill", "kind": None}})
+        code, out, _ = self.publish("--if-newer")
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["reason"]), (0, "skipped", "creation pending"))
+        self.assertEqual((fake.uploads, fake.checks), ([], 0))
+        marker.unlink()
+        self.publish("--no-upload")
+        mine = self.page_text()
+        # Too large for one call: refused as before, and before anything went up.
+        with mock.patch.object(gs, "call_budget", return_value=(1_000, 2_000)):
+            code, out, _ = self.publish("--name", "Kai")
+        got = json.loads(out)
+        self.assertEqual((code, got["ok"], self.page_text()), (4, False, mine))
+        self.assertIn("left as is, not rewritten in pieces", got["reason"])
+        self.assertEqual((fake.uploads, fake.checks), ([], 0))
+        # Edited by the owner since: kept, and nothing goes up for a page that is not rewritten.
+        db = json.loads((self.tmp / "room.json").read_text())
+        db["pages"]["html-p1"] = theirs = mine + "<p>OWNER NOTES</p>"
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        code, out, _ = self.publish("--name", "Kai")
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], self.page_text()), (0, "kept", theirs))
+        self.assertEqual((fake.uploads, fake.checks), ([], 0))
+        # The same run on the page as written uploads, then rewrites.
+        db["pages"]["html-p1"] = mine
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        code, out, _ = self.publish("--name", "Kai")
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], len(got["upload"]["uploaded"])), (0, "updated", 13))
+        self.assertEqual(self.page_text().count('<img src="mxc://'), 13)
+
+    def test_no_upload_and_explicit_media(self):
+        fake = self.with_media(FakeMedia())
+        code, out, _ = self.publish("--no-upload")
+        got = json.loads(out)
+        self.assertEqual((code, fake.uploads, fake.checks, got["upload"]["reason"]), (0, [], 0, "--no-upload"))
+        self.assertEqual(self.page_text(), tp.render_page("Blue", "codex", "dm", self.ME))
+        # --media wins over an upload, and stays the room's mapping on later runs.
+        explicit = self.tmp / "media.json"
+        explicit.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
+        code, out, _ = self.publish("--media", str(explicit))
+        got = json.loads(out)
+        self.assertEqual((code, got["action"]), (0, "updated"))
+        self.assertNotIn("room-list-add", [u[1] for u in fake.uploads])
+        self.assertEqual(len(fake.uploads), 12)
+        self.assertIn(f'<img src="{MXC_OF["room-list-add"]}"', self.page_text())
+        self.assertEqual(self.entry()["media"]["room-list-add"], MXC_OF["room-list-add"])
+        code, out, _ = self.publish()
+        self.assertEqual((json.loads(out)["action"], len(fake.uploads)), ("unchanged", 12))
+
+    def test_room_media_loads_beside_room_commons_on_its_actions_client(self):
+        (self.tmp / "room_media.py").write_text(
+            "class Media:\n    def __init__(self, actions=None):\n        self.actions = actions\n")
+        commons = gs.Commons(self.stub, self.ROOM, actions=lambda: self.door)
+        self.assertIs(commons.media().actions, self.door)
+        self.assertIs(commons.media(), commons.media())
+        bare = Path(tempfile.mkdtemp(prefix="tutorial-nomedia-"))
+        self.addCleanup(shutil.rmtree, bare, ignore_errors=True)
+        with self.assertRaisesRegex(gs.PublishError, "room_media.py"):
+            gs.Commons(bare / "room_commons.py", self.ROOM).media()
 
 
 class DocTest(unittest.TestCase):
