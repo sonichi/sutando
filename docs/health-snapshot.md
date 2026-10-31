@@ -193,7 +193,7 @@ value gains `"superseded_by": "observation"`. Two rules:
 
 - A completed model request disproves an earlier claim. When the record has `last_success_at`, a
   `supervisor` or `cli_wedge` opinion is dropped if it is abnormal, its reason is one of
-  `needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `api-error`,
+  `needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `usage-limit`, `api-error`,
   `network-error`, and its claim time (`since`, else the source's mtime) is older than
   `last_success_at`.
 - A `cli_wedge` `retry-loop` needs a model request in flight, so it is dropped when the record's
@@ -210,7 +210,22 @@ has no incarnation record, so for it only the session match and the lease apply.
 failure does not age: a seat whose last request failed stays abnormal, its lease renewed, until a
 request completes or the observer stops.
 
-Seats with no observer (the Codex runtime, an older engine, the observer disabled) have no record:
+**Codex core.** `src/agent/codex/cli/codex-observer.mjs`, started by the Codex launcher in its own
+`<session>-observer` tmux session, writes the core's record. It finds the rollout file the core's
+Codex process holds open (`lsof` over the pane's process tree). It needs exactly one top-level
+rollout and none it cannot classify; otherwise it keeps its target for one discovery, then writes no
+record. It follows that file: `task_started` reads `requesting · moving`, a tool call `tool`. A model output
+(an assistant message, reasoning or a tool call) stamps `last_success_at` and `healthy`;
+`token_count` does not, since Codex writes one from running totals before a usage-limit failure.
+`task_complete` reads `idle`, or, when it carries an `error`, `failed · idle · abnormal` with
+`codex_error_info` mapped to `needs-login` (`unauthorized`), `quota-limit`
+(`usage_limit_exceeded`, `session_budget_exceeded`) or `api-error` (anything else). A failure stands
+until a later model output. The record does not see a stall: a turn that writes nothing for an hour
+still reads `moving`, and stalls stay with the screen-derived sources. It does not use the
+app-server daemon: a core launched with `--search` does not register there. It exits when the core
+session is gone on two discoveries in a row.
+
+Seats with no observer (Codex pool workers, an older engine, the observer disabled) have no record:
 their verdicts and the `summary` view are exactly what the other sources say, and `full` only gains
 an empty `observation` source.
 
@@ -221,7 +236,7 @@ an empty `observation` source.
 | `offline` | beat | no beat for 90 s: the session is gone or its beat writer stopped |
 | `suspended` | `state/pool-suspended` | the app quit took this worker down; condition stays `unknown` and it never alerts |
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
-| `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
+| `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, `usage-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |
 | `hung` | supervisor | the session is there but the self-report stopped advancing, and the pane shows neither the idle footer nor a turn in flight that changed since the last poll |
 | `crashed` | supervisor | the supervisor found no session |
@@ -264,7 +279,7 @@ and the self-report is idle. Result: `alive: true` (fresh heartbeat), `idle · h
 - **Moving can lag** by up to 120 s for a task that never writes a result, and by up to 90 s from
   a stale `running` self-report.
 
-## Reaching AG2 Space
+## Reaching s.space
 
 The gateway bridge computes this snapshot in-process, so a Mac or cloud Sutando without agent-api
 still reports. It sends the core's `alive`/`motion`/`condition`/`reason`/`since` on the heartbeat

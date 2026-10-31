@@ -31,6 +31,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "restart-voice-agent.sh"
@@ -75,7 +77,7 @@ def spawn_dummy(entry=None):
     args = [PY, "-c", "import time; time.sleep(120)"]
     if entry is not None:
         args.append(str(entry))
-    return subprocess.Popen(args, start_new_session=True)
+    return popen_bound(args)
 
 
 class Lab:

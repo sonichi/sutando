@@ -81,7 +81,7 @@ class TestRequirement(unittest.TestCase):
         for gate, state in (("login", "blocked-human"), (None, "logged-out")):
             r = req(gate, LOGIN if gate else None, state=state)
             self.assertEqual(r.kind, "auth")
-            self.assertEqual(r.title, "Claude needs to be reconnected")
+            self.assertEqual(r.title, "Claude needs you to sign in again")
             self.assertEqual([a.kind for a in r.actions], ["authenticate", "open_terminal"])
             self.assertIsNone(G.keys_for(clicked(r, "authenticate"), LOGIN if gate else None, state))
 
@@ -112,6 +112,26 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(req("permission", PERM).guard, req("permission", PERM).guard)
         self.assertNotEqual(req("permission", PERM).guard, req("permission", PERM, session="t").guard)
         self.assertNotEqual(req("permission", PERM).guard, req("permission", SELECT).guard)
+
+    def test_the_guard_ignores_the_pane_repainting_around_the_dialog(self):
+        framed = "  ─────────\n" + PERM
+        for chrome in ("⏺ Running sleep 5 … · 3s\n", "Sutando: thinking [-]\n  ⎿  Churned for 9s\n"):
+            self.assertEqual(req("permission", chrome + framed).guard, req("permission", framed).guard)
+        self.assertEqual(req("permission", framed + "\n  ⏵⏵ bypass permissions on · 1 monitor").guard,
+                         req("permission", framed).guard)
+        self.assertEqual(req("permission", PERM_CARET_ON_NO).guard, req("permission", PERM).guard)
+
+    def test_everything_inside_the_dialog_still_keys_it(self):
+        edit = ("  ─────────\n  Edit file\n  ╭──────╮\n  │ - a = 1 │\n  │ + a = {} │\n  ╰──────╯\n"
+                "  Do you want to make this edit to a.py?\n  ❯ 1. Yes\n    2. No\n")
+        self.assertNotEqual(req("permission", edit.format(2)).guard, req("permission", edit.format(3)).guard)
+
+    def test_a_numbered_list_above_a_press_enter_gate_does_not_key_it(self):
+        for plan in ("Plan:\n 1. migrate db\n 2. deploy\n", "Pick one:\n ❯ 1. migrate db\n   2. deploy\n"):
+            run = req("press-enter", plan + "Press Enter to run migration\n")
+            delete = plan + "Press Enter to delete backups\n"
+            self.assertNotEqual(run.guard, req("press-enter", delete).guard)
+            self.assertIsNone(G.keys_for(clicked(run, "continue"), delete, "blocked-human"))
 
 
 class TestKeys(unittest.TestCase):
@@ -199,6 +219,21 @@ class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
 
     def test_the_allowlist_is_the_only_way_in(self):
         self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
+
+
+class TestNoCaretKeepsTheBlockedCard(unittest.TestCase):
+    """Without a caret keys_for can never answer, so the card must not offer a button."""
+
+    def test_options_without_a_caret_get_no_buttons(self):
+        flat = PERM.replace("  ❯ 1. Yes", "    1. Yes")
+        r = req("permission", flat)
+        self.assertEqual(r.kind, G.FALLBACK_KIND)
+        self.assertEqual([a.id for a in r.actions], ["open_terminal"])
+        self.assertEqual(r.message, FALLBACK)
+
+    def test_a_dashed_rule_is_frame_not_question(self):
+        dashed = "  " + "╌" * 40 + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No"
+        self.assertEqual(G.question(dashed, "d"), "Do you want to proceed?")
 
 
 if __name__ == "__main__":

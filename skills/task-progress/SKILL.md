@@ -1,6 +1,6 @@
 # task-progress
 
-Sends mid-task progress updates to the channel a task came from (Slack, Discord, Telegram, or an AG2 Space room).
+Sends mid-task progress updates to the channel a task came from (Slack, Discord, Telegram, or an s.space room).
 
 ## Critical rule — if you notify, notify BEFORE any work begins
 
@@ -76,12 +76,16 @@ annoying than silence for 2 minutes on a research task.
 ## How to use
 
 **Pass `--task-file <path>`.** It derives `--source`, `--channel-id`/`--chat-id`,
-`--thread-root` (from `thread_root:`, else `source_message_id:`) and `--thread-ts` (from Slack's
-`reply_thread_ts:`) straight from that task file's own headers, so there is nothing left to
-extract or remember by hand — including the thread, the field most often dropped. A task
+`--thread-root` (from `thread_root:` only — threading is a decision the ask already made,
+not this script's default), `--reply-to` (from `source_message_id:`, the asking message —
+never `reply_to_event:`, the post the sender quoted; cites the ask without nesting it in a
+thread the user never started) and `--thread-ts` (from Slack's `reply_thread_ts:`) straight
+from that task file's own headers, so there is nothing left to extract or remember by hand.
+When the ask was already in a thread, both fields are sent together: `thread_root` nests the
+post, `reply_to` is its citation fallback for a client that doesn't render threads. A task
 sends when its source is `slack`/`discord`/`telegram`, or — for ANY other source, known or
 not — when its channel is a valid Matrix room id: strict `!opaque:server`, or a server-less
-room v12 id (e.g. AG2 Space, or a docked voice task). Everything else — undocked `voice`
+room v12 id (e.g. s.space, or a docked voice task). Everything else — undocked `voice`
 (`local-voice`), `chat`, `cron`, `runtime-api`, `onboarding-wizard`, any non-room channel —
 sends nothing and exits 3 (no delivery path; not a failure of the task), whatever channel
 config exists. Accepted trade-off: gateway provider labels are install-configured, so routing
@@ -106,9 +110,9 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --message "Done with the research — writing up the summary now."
 ```
 
-Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--thread-ts` given
-explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
-checkpoint unthreaded on purpose, pass `--thread-root ''`).
+Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--reply-to` / `--thread-ts`
+given explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
+checkpoint with no citation at all, pass `--reply-to ''`).
 
 ### When there is no task file to point at
 
@@ -122,7 +126,10 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 ```
 
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
-For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` to post the update in that thread. Single-quote the id: it starts with `$`, which double quotes would expand. An empty value posts unthreaded.
+For s.space, pass the task's own `thread_root:` via `--thread-root '<event id>'` only when
+the ask was already in a thread; otherwise pass `--reply-to '<source_message_id>'` to cite it
+in the main timeline instead. Single-quote the id: it starts with `$`, which double quotes
+would expand. An empty value opts out of that relation.
 
 ### Field mapping from task files
 
@@ -136,11 +143,13 @@ For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` t
 | ag2space  | `channel_id:`       | `--channel-id`  |
 
 Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`.
-Optional for AG2 Space threading: `thread_root:` (falls back to `source_message_id:`, the asking message — never `reply_to_event:`, the post the sender quoted) → `--thread-root`.
+Optional for s.space: `thread_root:` → `--thread-root` (only when the ask was already in a
+thread); `source_message_id:` (the asking message — never `reply_to_event:`, the post the
+sender quoted) → `--reply-to`, sent regardless so the update always cites what it's about.
 
-### AG2 Space rooms
+### s.space rooms
 
-A task with `source: ag2space` is a message in an AG2 Space room (its `channel_id`, `!room:server`).
+A task with `source: ag2space` is a message in an s.space room (its `channel_id`, `!room:server`).
 The same script posts the update in that room:
 
 ```bash
@@ -151,7 +160,7 @@ python3 skills/task-progress/scripts/notify.py \
 
 Any `--source` other than slack/discord/telegram is sent through the remote gateway
 (`channels/<source>/.env` under `$CLAUDE_CONFIG_DIR`, `REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`), the
-transport the AG2 Space task bridge itself uses. The room the task came from is the only room this
+transport the s.space task bridge itself uses. The room the task came from is the only room this
 posts to; a queue position ("Got it, right after the one I'm on." / "Got it, N in line before this
 one.") is one line, in that task's own conversation.
 
@@ -200,7 +209,7 @@ conversation before you pay or submit.
   public page or a listing; `step.py` says on stderr when a picture was a fresh load.
 
 The text line follows the same rule as notify.py (280 chars, 4 lines); the image goes
-through the gateway's room media route, so this works for AG2 Space rooms (any gateway
+through the gateway's room media route, so this works for s.space rooms (any gateway
 `--source`), and Slack/Discord/Telegram get the text line only. Screenshots must sit in
 `src/browser.mjs`'s screenshot dir (`$SUTANDO_SCREENSHOT_DIR`, default
 `<tmpdir>/sutando-screenshots`) or under the `[file:]` allowlist (`results/`,

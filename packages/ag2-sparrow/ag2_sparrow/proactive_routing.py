@@ -29,6 +29,7 @@ duplicate to every configured bridge.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -106,6 +107,41 @@ def proactive_filename(ts, channel: "str | None" = None) -> str:
     if channel not in PROACTIVE_DESTINATIONS:
         raise ValueError(f"unknown proactive destination {channel!r}")
     return f"proactive-{ts}.to-{channel}.txt"
+
+
+# A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
+# [.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
+_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
+
+
+def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
+    """Typed constructor for a proactive message about `task_id`; the reader is about_task()."""
+    name = proactive_filename(ts, channel).replace("proactive-", f"proactive-about-{task_id}--", 1)
+    if about_task(name) != task_id:
+        raise ValueError(f"not a task id and timestamp: {task_id!r}, {ts!r}")
+    return name
+
+
+#: The gateway's proactive outbox, under results/: its items are the delivery receipts.
+PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
+
+
+def proactive_item_id(stem: str, body: str) -> str:
+    """One outbox item per file name and body: a new body under a delivered name is a new send.
+    The room and thread are left out, since they are re-resolved on every pass."""
+    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+
+
+def about_task(name) -> "str | None":
+    """The task a proactive message is about, or None for any other proactive name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return m.group(1) if m else None
+
+
+def about_task_ts(name) -> "int | None":
+    """The `<ts>` a proactive message about a task was named with, or None for any other name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return int(m.group(2)) if m else None
 
 
 def proactive_destination(name) -> "str | None":
@@ -223,6 +259,22 @@ def body_claimable_by(body, this_channel: str) -> bool:
     """
     kind = body_target_channel(body)
     return kind is None or kind == this_channel
+
+
+def should_claim_proactive_peeked(name, body, state_file_path: Path,
+                                  this_channel: str) -> bool:
+    """Pre-claim decision for an activity-routed bridge, given the peeked body.
+
+    A body addressed to ANOTHER bridge is never claimed, whatever the tag or
+    activity routing says: a claim renames it out of the glob that bridge polls,
+    so claim-then-release every pass starves it (#5368). Otherwise the filename
+    tag / activity routing decides, and a body addressed to this bridge claims.
+    """
+    if not body_claimable_by(body, this_channel):
+        return False
+    if should_claim_proactive_file(name, state_file_path, this_channel):
+        return True
+    return body_target_channel(body) == this_channel
 
 
 def redirect_target_is_foreign(target, this_channel: str) -> bool:

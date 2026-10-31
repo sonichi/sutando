@@ -58,6 +58,7 @@ import { envOrVault } from '../../../src/vault-secret.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
+import { HEADER_KEY_ALTERNATION } from '../../../src/header_keys.js';
 
 import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
@@ -69,7 +70,7 @@ import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '
 import { buildPhoneInstructions } from './phone-agent-config.js';
 import { syncTwilioWebhook } from './twilio-webhook-sync.js';
 import { RespawnScheduler, drainMayExit, healthPayload, isDrainBlocked } from './server-lifecycle.js';
-import { wirePhoneUpstreamRecovery, type PhoneRecoverySession } from './upstream-recovery-wiring.js';
+import { phoneUpstreamRecovery, watchPhoneUpstream } from './upstream-recovery-wiring.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -153,7 +154,7 @@ const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
 // template is copied into place so the operator has a file to edit. If the
 // copy fails (or the template is gone), loadVoiceConfig falls back to its
 // built-in defaults (schema: src/voice-config.ts). Phone ships with the
-// package default 2.5+search:true.
+// package default 3.8 Live + search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const PHONE_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'phone-conversation.json');
@@ -212,20 +213,8 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (52 keys) — injection-guard-sweep
-// asserts this regex covers every py key. reply_chain_ids added with PR #2310.
-const _CONF_HEADER_RE = new RegExp(
-	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
-	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
-	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
-	'author_name|author_id|' +
-	'chat_id|thread_ts|reply_thread_ts|reply_to_event|reply_to_me|reply_to_sender|addressed_to|callSid|caller|from|' +
-	'thread_root|source_room_id|channel_kind|' +
-	'receiving_instance|' +
-	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout)\\s*:',
-	'i',
-);
+// Generated from local_task_protocol.KNOWN_HEADER_KEYS -- regenerate via gen-header-keys.py.
+const _CONF_HEADER_RE = new RegExp(`^(?:${HEADER_KEY_ALTERNATION})\\s*:`, 'i');
 const _CONF_FENCE_RE = /^={3,}/;
 // Fold every str.splitlines() separator to '\n' so the guard's line-set
 // matches the reader's (else \v \f \x1c-\x1e \x85 LS PS smuggle a forged line).
@@ -781,9 +770,9 @@ async function createCallSession(params: {
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: 'Aoede' },
-		// A lost upstream parks in UPSTREAM_LOST (CLOSED is terminal in 0.4); the
-		// wirePhoneUpstreamRecovery below redials it with recoverUpstream().
+		// A lost upstream parks in UPSTREAM_LOST; bodhi redials it while the call is live.
 		upstreamLossPolicy: 'hold',
+		upstreamRecovery: phoneUpstreamRecovery(callSession, activeCalls),
 		// Greet the caller once: a re-attach after a turn has completed is silent.
 		reattachGreeting: 'until-first-turn',
 		hooks: {
@@ -932,15 +921,10 @@ async function createCallSession(params: {
 	// The Twilio stream is this session's client: attaching starts Gemini and greets once.
 	session.notifyClientConnected();
 
-	// bodhi retries a transport close on the resumption handle; once parked, only recoverUpstream()
-	// redials, holding greeting and injected context until the caller speaks again.
-	wirePhoneUpstreamRecovery({
-		session: session as unknown as PhoneRecoverySession,
-		callSession,
-		activeCalls,
-		onActivated: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
+	watchPhoneUpstream({
+		eventBus: session.eventBus,
+		onRecovered: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
 		log: (msg) => console.log(`${ts()} ${msg}`),
-		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
 	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded

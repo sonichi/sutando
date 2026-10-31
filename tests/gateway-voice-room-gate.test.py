@@ -20,6 +20,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _SRC = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py"
 AGENT = "@agent:example.org"
 OWNER = "@owner:example.org"
@@ -55,7 +60,7 @@ class FakeGateway:
         self.owner = OWNER
         self.posts = []
 
-    def req(self, method, path, payload=None, timeout=None):
+    def req(self, method, path, payload=None, timeout=None, **_kw):
         self.calls.append((method, path, payload))
         if path == "/v1/agents":
             return {"agents": [{"id": AGENT, "owner": self.owner, "owner_dm_room": DM_ROOM}]}
@@ -119,6 +124,16 @@ class LoaderVoiceRoomTests(_LoaderFixture):
         self.mod._voice_owner_clock = lambda: now[0]
         self.mod._VOICE_OWNER.update(mxid="", at=0.0, bad_at=None)
         return now
+
+    def test_owner_read_goes_through_the_shared_registry_parse(self):
+        """No local identity: no registry read, never the owner of a row keyed by ""."""
+        self._clock()
+        self.mod._reenroll_identity = lambda: ""
+        self.gw.req = lambda *a, **k: (self.gw.calls.append(a[:2]) or
+                                       {"agents": [{"id": "", "owner": "@other:example.org"}]})
+        self.mod._req = self.gw.req
+        self.assertEqual(self.mod._voice_room_owner(), "")
+        self.assertEqual(self._agents_reads(), 0)
 
     def test_owner_is_read_once_per_ttl_and_only_when_well_formed(self):
         now = self._clock()
@@ -289,7 +304,17 @@ class DrainRoomGateTests(_LoaderFixture):
             elif handback_fails and Path(dest).name == target.name:
                 raise PermissionError(1, "Operation not permitted", str(dest))
             return real_rename(path, dest)
-        return mock.patch.object(Path, "rename", rename)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(Path, "rename", rename))
+        if handback_fails:  # the drain hands a claim back through the no-replace rename
+            real_noreplace = self.mod.undelivered_quarantine.rename_noreplace
+
+            def noreplace(src, dst, *a, **k):
+                if Path(dst).name == target.name:
+                    raise PermissionError(1, "Operation not permitted", str(dst))
+                return real_noreplace(src, dst, *a, **k)
+            stack.enter_context(mock.patch.object(self.mod.undelivered_quarantine, "rename_noreplace", noreplace))
+        return stack
 
     def test_partial_peek_complete_claim_forged_room_is_never_delivered(self):
         partial = self._result("proactive-result-task-20-20.to-ag2space.txt", "[channel: !forged:ex")
@@ -320,8 +345,10 @@ class DrainRoomGateTests(_LoaderFixture):
         with self._completing_rename(partial, f"[channel: {FORGED_ROOM}]\nforged room body", handback_fails=True):
             self.mod._post_proactive()
         self.assertEqual(self.gw.posts, [])
-        self.assertEqual(self._names(), [f"proactive-result-task-26-26.to-ag2space.sending.{os.getpid()}"],
-                         "left under its claim for orphan recovery, not delivered and not eaten")
+        names = self._names()
+        self.assertEqual(len(names), 1, names)
+        self.assertTrue(names[0].startswith(f"proactive-result-task-26-26.to-ag2space.sending.{os.getpid()}."),
+                        "left under its own claim for orphan recovery, not delivered and not eaten")
 
     def test_verified_room_is_delivered_and_a_stale_failure_mark_is_dropped(self):
         ok = self._result("proactive-result-task-22-22.to-ag2space.txt", f"[channel: {OK_ROOM}]\nverified room body")
@@ -345,7 +372,8 @@ class DrainRoomGateTests(_LoaderFixture):
         self.assertEqual(self._names(), [tagged.name], "not claimed: no .sending, nothing archived")
         failed = [line for line in self.logs if f"proactive {tagged.name} held: room gate failed" in line]
         self.assertEqual(len(failed), 1, self.logs)
-        self.assertIn("verifier down", failed[0])
+        self.assertIn("room gate failed (RuntimeError at ", failed[0])
+        self.assertNotIn("verifier down", failed[0], "the exception's text never reaches the log")
 
     def test_gate_raising_after_the_claim_hands_the_result_back(self):
         tagged = self._result("proactive-result-task-24-24.to-ag2space.txt", f"[channel: {OK_ROOM}]\nroom body")

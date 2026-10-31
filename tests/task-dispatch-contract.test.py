@@ -24,12 +24,14 @@ Run: python3 tests/task-dispatch-contract.test.py
 """
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import subprocess
 import os
 import sys
 import tempfile
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -42,6 +44,7 @@ from delivery.task_dispatch import (  # noqa: E402
     clear_inflight, inflight_is_live, mark_inflight,
     mark_partial_paste, partial_paste_leftover,
     _main,
+    _INBOX_PRIORITY_LIMIT,
     find_ready_result,
     find_ready_result_for_filename,
     has_ready_result,
@@ -55,6 +58,7 @@ from delivery.task_dispatch import (  # noqa: E402
 
 CLI = REPO / "src" / "delivery" / "task_dispatch.py"
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
+RESOLVER_HELPER = str(REPO / "src/inbox-resolve.sh")
 TASK = "task-probe"
 F = f"{TASK}.txt"
 
@@ -591,6 +595,152 @@ class PendingCandidatesTest(unittest.TestCase):
                 list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-real.txt"])
 
 
+class PendingCandidatesBatchTest(unittest.TestCase):
+    """pending_candidates resolves readiness for the whole queue at once: the same verdict as
+    has_ready_result per task, at a fixed number of archive listings however long the queue."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tasks_dir = Path(self.tmp.name) / "tasks"
+        self.results_dir = Path(self.tmp.name) / "results"
+        self.tasks_dir.mkdir()
+        (self.results_dir / "archive" / "2026-09").mkdir(parents=True)
+
+    def _queue_every_fixture(self):
+        """One task per single-state and mixed fixture, all sharing one results tree."""
+        expected = {}
+        cases = [(n, [] if e is None else [e], n in EXPECTED_READY) for n, e in RESULT_FIXTURES.items()]
+        cases += [(n, entries, ready) for n, (entries, ready, _) in MIXED_FIXTURES.items()]
+        for i, (_, entries, ready) in enumerate(cases):
+            tid = f"task-fx{i:02d}"
+            (self.tasks_dir / f"{tid}.txt").write_text("priority: normal\ntask: x\n")
+            _populate(self.results_dir, [(rel.replace(TASK, tid), body) for rel, body in entries])
+            expected[f"{tid}.txt"] = ready
+        return expected
+
+    def test_same_verdict_as_has_ready_result_on_every_fixture(self):
+        expected = self._queue_every_fixture()
+        got = set(pending_candidates(self.tasks_dir, self.results_dir))
+        for name, ready in expected.items():
+            with self.subTest(task=name):
+                self.assertEqual(has_ready_result(self.results_dir, name), ready)
+                self.assertEqual(name not in got, ready)
+
+    def test_one_archived_file_satisfies_an_exact_id_and_its_epoch_base_id(self):
+        names = ["task-a.txt", "task-a-1700000000.txt"]
+        for layout in ("archive", "archive/2026-09", "archive-2026-09-20"):
+            with self.subTest(layout=layout):
+                for p in self.results_dir.rglob("*.txt"):
+                    p.unlink()
+                for name in names:
+                    (self.tasks_dir / name).write_text("priority: normal\ntask: fixture\n")
+                _write(self.results_dir / layout / names[1])
+                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, True])
+                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
+
+    def test_overlapping_ids_match_has_ready_result_in_every_layout(self):
+        ids = ["task-o", "task-o-1700000000", "task-o-1700000000-1800000000", "task-o-x"]
+        layouts = ["", "archive/", "archive/2026-09/", "archive-2026-09-20/"]
+        bodies = {"ready": "done\n", "blank": WS}
+        for layout in layouts:
+            for archived in ids:
+                for kind, body in bodies.items():
+                    with self.subTest(layout=layout, archived=archived, body=kind):
+                        for p in [*self.tasks_dir.iterdir(), *self.results_dir.rglob("*.txt")]:
+                            p.unlink()
+                        for tid in ids:
+                            (self.tasks_dir / f"{tid}.txt").write_text("priority: normal\ntask: x\n")
+                        _write(self.results_dir / f"{layout}{archived}.txt", body)
+                        want = [f"{t}.txt" for t in ids if not has_ready_result(self.results_dir, f"{t}.txt")]
+                        self.assertEqual(sorted(pending_candidates(self.tasks_dir, self.results_dir)), sorted(want))
+
+    def _archive_listings(self, n_tasks):
+        for i in range(n_tasks):
+            (self.tasks_dir / f"task-q{i:03d}.txt").write_text("priority: normal\ntask: x\n")
+        archive = os.fspath(self.results_dir / "archive")
+        real, seen = os.scandir, []
+
+        def counting(path="."):
+            if os.fspath(path) == archive:
+                seen.append(path)
+            return real(path)
+
+        with mock.patch("os.scandir", side_effect=counting):
+            got = list(pending_candidates(self.tasks_dir, self.results_dir))
+        self.assertEqual(len(got), n_tasks)
+        return len(seen)
+
+    def test_archive_listings_do_not_grow_with_the_queue(self):
+        one = self._archive_listings(1)
+        self.assertLessEqual(one, 2)
+        self.assertEqual(self._archive_listings(40), one)
+
+
+class InboxResolverTemporaryOutputTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.output_dir = self.root / "resolver tmp [private]"
+        self.output_dir.mkdir()
+        self.entry = _write(self.root / "entry.txt", "")
+        self.payload = _write(self.root / "payload.txt", "priority: urgent\ntask: x\n")
+        self.observation = self.root / "observation.json"
+        self.resolver = self.root / "resolver"
+        self.env = {**os.environ, "TMPDIR": str(self.output_dir) + "/",
+                    "SUTANDO_INBOX_RESOLVER": str(self.resolver),
+                    "SUTANDO_INBOX_RESOLVER_TIMEOUT": "5"}
+
+    def write_resolver(self, outcome):
+        self.resolver.write_text(
+            "#!/usr/bin/env python3\nimport json, os, signal, sys, time\nfrom pathlib import Path\n"
+            "output = os.fstat(1)\n"
+            f"matches = [str(p) for p in Path({str(self.output_dir)!r}).iterdir()\n"
+            "           if (p.stat().st_dev, p.stat().st_ino) == (output.st_dev, output.st_ino)]\n"
+            f"Path({str(self.observation)!r}).write_text(json.dumps(\n"
+            "    {'paths': matches, 'mode': output.st_mode & 0o777, 'pid': os.getpid()}))\n"
+            + outcome + "\n")
+        self.resolver.chmod(0o755)
+
+    def resolve(self):
+        return subprocess.run(
+            ["bash", str(REPO / "src/inbox-resolve.sh"), str(self.entry), str(self.root)],
+            env=self.env, capture_output=True, text=True, timeout=12)
+
+    def test_output_uses_private_tmpdir_and_is_removed_on_every_outcome(self):
+        outcomes = (
+            ("success", f"print({str(self.payload)!r})", 0, str(self.payload) + "\n"),
+            ("missing", "sys.exit(3)", 4, ""),
+            ("refused", "sys.exit(1)", 3, ""),
+            ("invalid", "print('relative.txt')", 3, ""),
+            ("timeout", "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(30)", 3, ""),
+        )
+        for name, outcome, status, stdout in outcomes:
+            with self.subTest(outcome=name):
+                self.write_resolver(outcome)
+                result = self.resolve()
+                self.assertEqual((result.returncode, result.stdout), (status, stdout), result.stderr)
+                observed = json.loads(self.observation.read_text())
+                self.assertEqual(len(observed["paths"]), 1, observed)
+                self.assertEqual(observed["mode"], 0o600)
+                self.assertEqual(list(self.output_dir.iterdir()), [])
+                self.assertEqual(self.entry.read_bytes(), b"")
+                self.assertEqual(self.payload.read_bytes(), b"priority: urgent\ntask: x\n")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(observed["pid"], 0)
+
+    def test_allocation_failure_is_transient_and_does_not_run_resolver(self):
+        self.write_resolver("sys.exit(3)")
+        self.env["TMPDIR"] = str(self.output_dir / "unavailable")
+        result = self.resolve()
+        self.assertEqual((result.returncode, result.stdout), (3, ""), result.stderr)
+        self.assertFalse(self.observation.exists(), "allocation failed before resolver execution")
+        self.assertEqual(list(self.output_dir.iterdir()), [])
+        self.assertTrue(self.entry.exists())
+        self.assertEqual(self.payload.read_bytes(), b"priority: urgent\ntask: x\n")
+
+
 class MainDispatchTest(unittest.TestCase):
     """In-process `_main` calls: the bash callers' whole contract, visible to coverage."""
 
@@ -655,6 +805,203 @@ class MainDispatchTest(unittest.TestCase):
         rc, _, err = self._run("sort-by-priority", str(self.tasks_dir), "extra")
         self.assertEqual(rc, 2)
         self.assertIn("usage:", err)
+
+    def _resolver(self, body):
+        path = Path(self.tmp.name) / "resolve entry"
+        path.write_text("#!/usr/bin/env python3\nimport os, sys\n" + body)
+        path.chmod(0o755)
+        return str(path)
+
+    def test_resolved_sort_reads_payload_but_returns_original_entry_fifo(self):
+        workspace = Path(self.tmp.name) / "workspace with spaces"
+        workspace.mkdir()
+        for i, priority in enumerate(("low", "urgent", "normal", "urgent")):
+            entry = _write(self.tasks_dir / f"entry-{i}.txt", "")
+            payload = _write(workspace / (entry.name + " "), f"priority: {priority}\ntask: x\n")
+            os.utime(entry, (100 + i, 100 + i))
+            os.utime(payload, (200 - i, 200 - i))
+        resolver = self._resolver(
+            "assert sys.argv[2] == '--workspace'\n"
+            "print(os.path.join(sys.argv[3], os.path.basename(sys.argv[1]) + ' '))\n")
+        with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+            rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
+                                     "--resolve-inbox", str(workspace), RESOLVER_HELPER)
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(out.splitlines(), [f"entry-{i}.txt" for i in (1, 3, 2, 0)])
+            self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir))[1].splitlines(),
+                             [f"entry-{i}.txt" for i in range(4)])
+
+    def test_unresolved_entries_default_to_normal_and_do_not_disappear(self):
+        entry = _write(self.tasks_dir / "entry.txt", "priority: urgent\n")
+        normal = _write(self.tasks_dir / "normal.txt", "priority: normal\ntask: x\n")
+        os.utime(normal, (100, 100))
+        os.utime(entry, (200, 200))
+        for answer in ("sys.exit(3)", "sys.exit(1)", "print('relative.txt')",
+                       "print('/no/such/payload')", "print('banner\\n' + sys.argv[1])"):
+            with self.subTest(answer=answer):
+                resolver = self._resolver(
+                    "if os.path.basename(sys.argv[1]) == 'normal.txt':\n"
+                    "    print(sys.argv[1]); sys.exit(0)\n" + answer + "\n")
+                with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                    rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
+                                             "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
+                self.assertEqual((rc, out, err), (0, "normal.txt\nentry.txt\n", ""))
+
+    def test_priority_resolution_attempt_is_reused_once_with_its_error(self):
+        entry = _write(self.tasks_dir / "entry.txt", "")
+        cache = Path(self.tmp.name) / "attempts"
+        cache.mkdir()
+        for outcome in ("print(sys.argv[1])", "sys.exit(1)", "sys.exit(3)"):
+            with self.subTest(outcome=outcome):
+                resolver = self._resolver(outcome + "\n")
+                with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                    self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                              "--resolve-inbox", self.tmp.name, RESOLVER_HELPER,
+                                              "--resolution-cache", str(cache)), (0, "entry.txt\n", ""))
+                rc, out, err = self._run("reuse-inbox-resolution", str(cache), str(entry))
+                self.assertEqual(rc, 0 if outcome.startswith("print") else 3 if "(1)" in outcome else 4)
+                if rc == 0:
+                    self.assertEqual((out, err), (str(entry) + "\n", ""))
+                else:
+                    self.assertIn("rc=1" if rc == 3 else "rc=3", err)
+                    self.assertEqual(out, "")
+                self.assertEqual(self._run("reuse-inbox-resolution", str(cache), str(entry)), (5, "", ""))
+
+    def test_priority_resolution_is_invalidated_by_entry_or_payload_change(self):
+        entry = _write(self.tasks_dir / "entry.txt", "")
+        payload = _write(Path(self.tmp.name) / "payload.txt", "priority: urgent\ntask: x\n")
+        cache = Path(self.tmp.name) / "attempts"
+        cache.mkdir()
+        resolver = self._resolver(f"print({str(payload)!r})\n")
+        for changed in (entry, payload):
+            for mutation in ("replace", "write", "remove", "symlink"):
+                with self.subTest(changed=changed, mutation=mutation):
+                    for path in (entry, payload):
+                        if path.is_symlink():
+                            path.unlink()
+                    entry.write_text("")
+                    payload.write_text("priority: urgent\ntask: x\n")
+                    with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                        self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                                  "--resolve-inbox", self.tmp.name, RESOLVER_HELPER,
+                                                  "--resolution-cache", str(cache))[0], 0)
+                    if mutation == "replace":
+                        other = changed.with_suffix(".replacement")
+                        other.write_bytes(changed.read_bytes())
+                        other.replace(changed)
+                    elif mutation == "write":
+                        changed.write_text("changed\n")
+                    elif mutation == "remove":
+                        changed.unlink()
+                    else:
+                        other = changed.with_suffix(".original")
+                        changed.replace(other)
+                        changed.symlink_to(other)
+                    self.assertEqual(self._run("reuse-inbox-resolution", str(cache), str(entry)), (5, "", ""))
+
+    def test_resolver_unavailable_keeps_every_entry(self):
+        _write(self.tasks_dir / "entry.txt", "")
+        with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER="/no/such/resolver"):
+            self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                      "--resolve-inbox", self.tmp.name, RESOLVER_HELPER), (0, "entry.txt\n", ""))
+            with mock.patch("delivery.task_dispatch.subprocess.run", side_effect=OSError):
+                self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                          "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)[1], "entry.txt\n")
+
+    def test_resolved_sort_without_injected_resolver_is_the_core_sort(self):
+        _write(self.tasks_dir / "low.txt", "priority: low\ntask: x\n")
+        _write(self.tasks_dir / "urgent.txt", "priority: urgent\ntask: x\n")
+        with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=""):
+            self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                      "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)[1], "urgent.txt\nlow.txt\n")
+
+    def test_resolved_sort_bounds_and_reaps_a_term_resistant_resolver(self):
+        _write(self.tasks_dir / "entry.txt", "")
+        pidfile = Path(self.tmp.name) / "resolver.pid"
+        resolver = self._resolver(
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n")
+        start = time.monotonic()
+        # Use the production budget so interpreter startup can install the TERM handler.
+        with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver,
+                             SUTANDO_INBOX_RESOLVER_TIMEOUT="5"):
+            self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                      "--resolve-inbox", self.tmp.name, RESOLVER_HELPER), (0, "entry.txt\n", ""))
+        self.assertLess(time.monotonic() - start, 10)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pidfile.read_text()), 0)
+
+    def test_resolved_sort_rejects_incomplete_or_unknown_options(self):
+        for rest in (("--resolve-inbox",), ("--resolve-inbox", ""),
+                     ("--resolve-inbox", self.tmp.name), ("--resolve-inbox", self.tmp.name, ""),
+                     ("--wrong", self.tmp.name, RESOLVER_HELPER),
+                     ("--resolve-inbox", self.tmp.name, RESOLVER_HELPER, "extra")):
+            with self.subTest(rest=rest):
+                self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir), *rest)[0], 2)
+
+    def test_thousand_entry_sort_bounds_lookup_and_preserves_fifo_fallback(self):
+        calls = Path(self.tmp.name) / "calls"
+        payloads = Path(self.tmp.name) / "payloads"
+        entries = []
+        for i in range(1000):
+            entry = _write(self.tasks_dir / f"entry-{999 - i:04d}.txt", "priority: urgent\n")
+            os.utime(entry, (100 + i, 100 + i))
+            priority = "low" if i == 0 else "urgent" if i in (1, 999) else "normal"
+            _write(payloads / entry.name, f"priority: {priority}\ntask: x\n")
+            entries.append(entry)
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                  for p in [*entries, *payloads.iterdir()]}
+        for refused in (False, True):
+            calls.write_text("")
+            resolver = self._resolver(
+                f"with open({str(calls)!r}, 'a') as out: out.write(sys.argv[1] + '\\n')\n"
+                + ("sys.exit(1)\n" if refused else
+                   f"print(os.path.join({str(payloads)!r}, os.path.basename(sys.argv[1])))\n"))
+            start = time.monotonic()
+            with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
+                                         "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
+            elapsed = time.monotonic() - start
+            seen = calls.read_text().splitlines()
+            self.assertLess(elapsed, 15, "fixed budget including process launch and cleanup")
+            self.assertGreaterEqual(len(seen), 2)
+            self.assertLessEqual(len(seen), _INBOX_PRIORITY_LIMIT)
+            self.assertEqual(seen, list(map(str, entries[:len(seen)])))
+            expected = entries if refused else [entries[1], *entries[2:], entries[0]]
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(out.splitlines(), [p.name for p in expected])
+            self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                                      for p in before})
+
+    def test_thousand_entry_sort_has_one_deadline_for_hung_resolvers(self):
+        entries = []
+        for i in range(1000):
+            entry = _write(self.tasks_dir / f"entry-{i:04d}.txt", "")
+            os.utime(entry, (100 + i, 100 + i))
+            entries.append(entry)
+        calls = Path(self.tmp.name) / "calls"
+        resolver = self._resolver(
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"with open({str(calls)!r}, 'a') as out: out.write(str(os.getpid()) + '\\n')\n"
+            "time.sleep(60)\n")
+        start = time.monotonic()
+        with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver,
+                             SUTANDO_INBOX_RESOLVER_TIMEOUT="120"):
+            rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
+                                     "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(out.splitlines(), [p.name for p in entries])
+        pids = calls.read_text().splitlines()
+        self.assertEqual(len(pids), 1, "the timeout consumes the shared lookup budget")
+        for pid in pids:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid), 0)
+        self.assertEqual(sorted(self.tasks_dir.iterdir()), entries)
+        self.assertFalse(any(p.read_bytes() for p in entries))
 
     def test_priority_tier_prints_the_parsed_tier(self):
         f = self.tasks_dir / "task-a.txt"

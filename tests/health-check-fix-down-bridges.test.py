@@ -42,6 +42,11 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 # Load src/health-check.py as `health_check` (filename has a hyphen, can't
@@ -391,7 +396,7 @@ def case_h_launch_parity_failsafe_skips() -> list[str]:
     ]
     # discord: no capable interpreter (None). slack: interpreter fine but env
     # has no token — and ensure the ambient env doesn't carry one either.
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    clean_env = hermetic_env()
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", side_effect=lambda n: None if n == "discord-bridge" else "python3"), \
@@ -822,7 +827,7 @@ def case_t_resolve_down_bridge_action() -> list[str]:
     assertion pass for the wrong reason on a machine that sets it explicitly."""
     fails = []
     import sutando_config
-    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    env = hermetic_env()
     with mock.patch.object(sutando_config, "load_config", lambda *a, **k: {}):
         with mock.patch.dict(os.environ, env, clear=True):
             if sutando_config.resolve_down_bridge_action() != "alert":
@@ -837,7 +842,7 @@ def case_t_resolve_down_bridge_action() -> list[str]:
 
     # The stubs above cover the missing-key fallback, a state no install is in:
     # sutando.config.json sets the key, so only an unstubbed read sees what ships.
-    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    env = hermetic_env()
     with mock.patch.dict(os.environ, env, clear=True):
         shipped = sutando_config.resolve_down_bridge_action(REPO)
         if shipped != "alert":
@@ -887,13 +892,12 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
     if plan == "REAL":
         plan_patch = mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/local/bin/python3-probed")
         env_patch = mock.patch.object(hc, "_load_channel_env", return_value=channel_env or {})
-        ambient = ambient_env if ambient_env is not None else {
-            k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+        ambient = ambient_env if ambient_env is not None else hermetic_env()
         os_patch = mock.patch.dict(hc.os.environ, ambient, clear=True)
     else:
         plan_patch = mock.patch.object(hc, "_bridge_launch_plan", return_value=plan)
         env_patch = mock.patch.object(hc, "_load_channel_env", return_value={})
-        os_patch = mock.patch.dict(hc.os.environ, dict(os.environ), clear=True)
+        os_patch = mock.patch.dict(hc.os.environ, hermetic_env(), clear=True)
 
     captured = io.StringIO()
     with tempfile.TemporaryDirectory() as td:
@@ -920,7 +924,7 @@ def case_o_stale_restart_uses_launch_plan() -> list[str]:
     channel env), never bare sys.executable."""
     fails = []
     checks = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
-    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
+    plan = ("/usr/local/bin/python3-probed", hermetic_env())
     out, spawned, killed = _run_main_fix_with_stale(checks, plan)
     if "slack-bridge: restarted (stale code)" not in out:
         fails.append(f"o) missing 'restarted (stale code)' line; got: {out!r}")
@@ -953,7 +957,7 @@ def case_q_down_path_requires_both_slack_tokens() -> list[str]:
     slack restart (the bridge treats empty strings as missing)."""
     fails = []
     checks = [check("slack-bridge", "warn", "configured but not running")]
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    clean_env = hermetic_env()
     for label, env in (("absent", {"SLACK_BOT_TOKEN": "xoxb-only"}),
                        ("empty", {"SLACK_BOT_TOKEN": "xoxb-ok", "SLACK_APP_TOKEN": ""})):
         spawned = []
@@ -996,7 +1000,7 @@ def case_s_vault_only_slack_tokens_launchable() -> list[str]:
     """Vault-only slack install (tokens only in the Keychain vault, injected
     here) must yield a launchable plan with no secrets embedded in the env."""
     fails = []
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    clean_env = hermetic_env()
     fake_vault = {"SLACK_BOT_TOKEN": "xoxb-vault-secret", "SLACK_APP_TOKEN": "xapp-vault-secret"}
     with mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/fake/python3-probed"), \
          mock.patch.object(hc, "_load_channel_env", return_value={}), \
@@ -1069,7 +1073,7 @@ def case_u_resolved_bare_python3_policy() -> list[str]:
     """_resolved_bare_python3 walks startup.sh's order ($SUTANDO_PY, bundled,
     PATH) and refuses a system-bin python3 unless the developer tools exist."""
     fails = []
-    clean_env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+    clean_env = hermetic_env()
     system_stub = os.path.join("/usr", "bin", "python3")  # assembled: literal is review-flagged
     with tempfile.TemporaryDirectory() as td:
         fake_repo = Path(td) / "repo"

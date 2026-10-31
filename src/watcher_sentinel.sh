@@ -117,6 +117,20 @@ sentinel_pid_wrote_file() {
   return 0
 }
 
+# True when <pid_file> names a live task watcher other than <self>; an undecidable
+# pid counts as one, so a standby never takes the readiness a session watcher needs.
+sentinel_held_by_other_watcher() {
+  local pid_file="$1" self="$2" py="$3" holder here verdict
+  holder="$(tr -d '[:space:]' 2>/dev/null < "$pid_file")"
+  case "$holder" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$holder" != "$self" ] || return 1
+  kill -0 "$holder" 2>/dev/null || return 1
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  verdict="$("$py" "$here/watcher_identity.py" "$holder" 2>/dev/null | head -1)"
+  case "$verdict" in not-watcher|dead) return 1 ;; esac
+  return 0
+}
+
 # Remove <pid_file> only if it still names <expected_pid>, without a window in
 # which a newly stamped sentinel can be destroyed.
 #

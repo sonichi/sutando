@@ -192,6 +192,9 @@ def main(argv=None) -> int:
         # as an optional decline and hand the task to the unrestricted core.
         print(f"pool_route_handler: delivery failed: {e}", file=sys.stderr)
         return MUST_HANDLE
+    if out.get("fenced") and not (out.get("delivered") or out.get("already")):
+        # Retired after this pass read the roster: nothing was written, so the core takes it.
+        return DECLINE
     settled = set(out.get("delivered") or []) | set(out.get("already") or [])
     # Judge settlement by the targets the route COMMITTED to, not the probe's
     # snapshot: a commit that landed between the two is not a missing delivery.

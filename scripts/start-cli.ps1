@@ -87,6 +87,15 @@ $claudeArgs = @(
     '/proactive-loop'
 )
 
+# Every launch starts the installed skills' launch hooks (src/launch_hooks.py), as start-cli.sh does;
+# the helper detaches each hook and returns within its discovery bound, and a failure never stops the launch.
+try {
+    . (Join-Path $PSScriptRoot 'python-binary.ps1')
+    & (Resolve-SutandoPython) (Join-Path $REPO 'src/launch_hooks.py')
+} catch {
+    Write-Host "  ~ launch hooks not started: $($_.Exception.Message)"
+}
+
 if ($NoWindow) {
     # Foreground: replace the current shell with claude (TTY needed for interactive prompts).
     Write-Host "Launching sutando-core in this window. Press Ctrl+C to exit."

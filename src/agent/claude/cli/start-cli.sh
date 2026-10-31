@@ -31,6 +31,8 @@ unset _self_dir
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/core-runtime-record.sh"
+. "$REPO/src/agent/core-window.sh"
 # Named check before sourcing: an unexplained "No such file or directory" from
 # a bare `.` here reads as a broken launcher, not a fixture/checkout missing
 # this file's own sibling — a real trap for a scratch-repo test fixture.
@@ -145,6 +147,9 @@ resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# Ceiling on one foreground Bash call: when it is reached Claude Code moves the
+# command to the background and the turn continues. A caller-set value wins.
+ENV_ARGS+=(-e "BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS:-120000}")
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
 # dead port omits, caller preset wins) against the REAL ENV_ARGS under
@@ -240,12 +245,7 @@ release_orchestrator_lock() {
   return 0
 }
 log_restart_attempt() {
-  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  [ -n "$ws" ] || return 0
-  mkdir -p "$ws/logs" 2>/dev/null || true
-  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
-    >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
+  sutando_restart_attempt_log "$REPO" "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1"
 }
 # Enforces the HAZARD above; the decision and its message are shared with
 # the codex launcher, this adapter keeps only its own attempt logging.
@@ -508,6 +508,7 @@ ensure_core_monitor() {
 # runs under it. Re-running the script is idempotent: we attach/no-op instead
 # of spawning a second core (→ duplicate task consumers).
 if claude_named_session_running; then
+  record_confirmed_core_runtime claude "$PY"
   apply_claude_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
   ensure_core_heartbeat
@@ -536,10 +537,17 @@ fi
 # claude seen here is either still dying (the SIGKILL escalation above should
 # have reaped it) or one a competing launcher spawned in the race window.
 # Reusing it would defeat the restart and re-introduce the false-success path.
+#
+# On a private socket an orphan cannot be told from another install's core, and
+# adopting one leaves this socket with no server; launch fresh, kill nothing.
 if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
-  echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
-  echo "To recycle it cleanly: bash $0 --restart"
-  exit 0
+  if claude_private_socket_in_use; then
+    echo "  ⚠ $SESSION claude pid(s) $(claude_named_pids | tr '\n' ' ')running outside $TMUX_SOCKET — not reusing; starting a session on this socket." >&2
+  else
+    echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
+    echo "To recycle it cleanly: bash $0 --restart"
+    exit 0
+  fi
 fi
 
 if claude_named_tmux_session_exists; then
@@ -560,8 +568,7 @@ if claude_named_tmux_session_exists; then
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
   # (review-caught: attach/Console then shows the gateway, not the healed core).
-  healed_idx="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION:0" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
-    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
+  healed_idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
     || healed_idx=""
   if [ -z "$healed_idx" ]; then
     # No window at all: a watcher left from the dead core would type into a sibling.
@@ -580,6 +587,7 @@ if claude_named_tmux_session_exists; then
     sleep 0.2
   done
   if claude_named_session_running; then
+    record_confirmed_core_runtime claude "$PY"
     clear_shutdown_sentinel
     CORE_WINDOW="$healed_idx"
     ensure_task_notifier
@@ -672,6 +680,7 @@ if [ -t 1 ]; then
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  record_confirmed_core_runtime claude "$PY"
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
@@ -689,6 +698,7 @@ else
   fi
   # Verified live above, so this is the first point at which clearing the
   # intentional-stop gate cannot open intake with nothing serving.
+  record_confirmed_core_runtime claude "$PY"
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor

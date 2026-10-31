@@ -2,6 +2,11 @@
 """Tests for health-check durable schedule ownership and heartbeat."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -19,10 +24,31 @@ SPEC.loader.exec_module(health)
 
 
 class CronRunnerHealthTest(unittest.TestCase):
-    def _workspace(self, root: Path, entries: list[dict]) -> Path:
+    def test_codex_hourly_success_does_not_hide_a_missing_main_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = self._workspace(Path(td), [
+                {"name": "hourly", "cron": "0 * * * *", "execution": "codex-task", "prompt": "report"},
+            ], include_loop=False)
+            check = health.check_cron_runner(workspace, "test-host", "codex")
+            self.assertNotEqual(check["status"], "ok", check)
+            self.assertIn("main-loop", check["detail"])
+
+    def test_cron_runner_delegates_required_loop_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = self._workspace(Path(td), [])
+            with mock.patch.object(health, "main_loop_problem", return_value="missing main-loop") as policy:
+                result = health.check_cron_runner(workspace, "test-host", "codex")
+                self.assertEqual(result["status"], "down")
+                policy.assert_called_once()
+                self.assertEqual(policy.call_args.args[1], "codex")
+
+    def _workspace(self, root: Path, entries: list[dict], *, include_loop=True) -> Path:
         workspace = root / "workspace"
         config = workspace / "hosts" / "test-host" / "crons.json"
         config.parent.mkdir(parents=True)
+        if include_loop and not any(e.get("name") == "main-loop" for e in entries):
+            entries = [*entries, {"name": "main-loop", "cron": "*/5 * * * *",
+                                   "prompt_skill": "proactive-loop"}]
         config.write_text(json.dumps(entries))
         return workspace
 
@@ -75,15 +101,15 @@ class CronRunnerHealthTest(unittest.TestCase):
             self.assertEqual(fresh["status"], "ok")
             self.assertIn("1 durable schedule(s)", fresh["detail"])
 
-    def test_missing_invalid_and_owner_exempt_configs_are_healthy(self):
+    def test_missing_invalid_and_owner_exempt_configs_do_not_hide_missing_loop(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             workspace = root / "workspace"
             missing = health.check_cron_runner(
                 workspace, "test-host", runtime="codex"
             )
-            self.assertEqual(missing["status"], "ok")
-            self.assertIn("no schedules", missing["detail"])
+            self.assertEqual(missing["status"], "down")
+            self.assertIn("main-loop", missing["detail"])
 
             config = workspace / "hosts" / "test-host" / "crons.json"
             config.parent.mkdir(parents=True)
@@ -109,8 +135,8 @@ class CronRunnerHealthTest(unittest.TestCase):
             exempt = health.check_cron_runner(
                 workspace, "test-host", runtime="codex"
             )
-            self.assertEqual(exempt["status"], "ok")
-            self.assertIn("no launchd-owned", exempt["detail"])
+            self.assertEqual(exempt["status"], "down")
+            self.assertIn("main-loop", exempt["detail"])
 
     def test_loaded_runner_reports_missing_or_unreadable_state(self):
         with tempfile.TemporaryDirectory() as td:

@@ -49,8 +49,9 @@ WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 ENV_ARGS=(-e SUTANDO_CORE_SESSION= -e SUTANDO_CORE_RUNTIME=codex
           -e SUTANDO_TASK_EVENT_HANDLER= -e SUTANDO_WORKER_RUNTIME=codex
           -e "SUTANDO_TMUX_SOCKET=$SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION"
-          -e "PATH=$PATH" -e "SUTANDO_PY=$WORKER_PY")
-for forwarded in SUTANDO_INSTANCE_ID SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR \
+          -e "PATH=$PATH" -e "SUTANDO_PY=$WORKER_PY"
+          -e SUTANDO_CORE_ID= -e SUTANDO_CORE_POOL_SIZE= -e SUTANDO_WORKER_SEAT=)
+for forwarded in SUTANDO_INSTANCE_ID SUTANDO_WORKER_ID SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR \
                  SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER \
                  SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT \
                  SUTANDO_DEFAULT_WORKSPACE; do
@@ -92,7 +93,9 @@ fi
 
 BOOT_PROMPT="You are Sutando worker $SUTANDO_INSTANCE_ID. The pool delivers tasks to your inbox. Do not run core startup, register schedules, start a watcher, or write core status. Handle only a delivered task prompt, read its named payload, and write the answer to its named result file. Reply Worker ready, then wait."
 CODEX_ARGS=(-C "$WORKING_DIR" --add-dir "$HOME" --sandbox danger-full-access
-            --ask-for-approval never --search --no-alt-screen)
+            --ask-for-approval never --search --no-alt-screen
+            # Headless like the core: an interactive startup update menu would block it.
+            -c check_for_update_on_startup=false)
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
   codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"
 for i in 1 2 3 4 5 6 7 8 9 10; do
