@@ -342,6 +342,9 @@ class _Clock:
     def time(self):
         return self.t
 
+    def monotonic(self):
+        return self.t
+
     def sleep(self, s):
         self.left -= 1
         if self.left <= 0:

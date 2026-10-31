@@ -759,16 +759,28 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         states = self._watch([_TURN_A, _TURN_A_TICKED, _TURN_A_TICKED], [0.0, frozen - 1, frozen + 1])
         self.assertEqual(states, ["running", "running", "hung"])
 
-    def _watch(self, frames, clock):
+    def test_a_wall_clock_jump_forward_does_not_freeze_a_quiet_turn(self):
+        # Three real seconds, but the wall clock jumped forward 600s: still in flight.
+        states = self._watch([_TURN_A, _TURN_A_TICKED], [0.0, 3.0], wall=[1000.0, 1603.0])
+        self.assertEqual(states, ["running", "running"])
+
+    def test_a_wall_clock_jump_back_does_not_hide_a_frozen_turn(self):
+        # Past the bound in real time, with the wall clock set back 600s: frozen.
+        still = _mod.FROZEN_TURN_S + 1
+        states = self._watch([_TURN_A, _TURN_A_TICKED], [0.0, still], wall=[1000.0, 1000.0 + still - 600])
+        self.assertEqual(states, ["running", "hung"])
+
+    def _watch(self, frames, clock, wall=None):
         import sys
         import tempfile
         from unittest.mock import patch
         out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
         panes, states, times = iter(frames), [], iter(clock)
-        now = [0.0]
+        walls = iter(wall if wall is not None else clock)
+        now, wall_now = [0.0], [0.0]
 
         def _capture(_s, _sess):
-            now[0] = next(times)
+            now[0], wall_now[0] = next(times), next(walls)
             return next(panes)
 
         class _RH:
@@ -791,7 +803,8 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "session_runtime", lambda *a: None), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
-                patch.object(_mod.time, "time", lambda: now[0]), \
+                patch.object(_mod.time, "monotonic", lambda: now[0]), \
+                patch.object(_mod.time, "time", lambda: wall_now[0]), \
                 patch.object(_mod.time, "sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
             main()

@@ -493,7 +493,8 @@ def _turn_moving(pane, prev_pane, still_s=None):
 
 def still_step(pane, prev, now):
     """((frame id, unchanged since), seconds unchanged) after one capture; `prev` is the last
-    call's pair, None at start. A missing capture is no frame, so its age is None."""
+    call's pair, None at start. `now` is a monotonic clock, so a wall-clock jump moves no age.
+    A missing capture is no frame, so its age is None."""
     if not pane:
         return None, None
     fid = cli_wedge.state_id(pane)
@@ -998,7 +999,7 @@ def main():
         last_runtime = runtime
         limit_stale, banner_baseline = limit_step(pane, banner_baseline, workspace, a.socket, a.session,
                                                    owes_work=owes_work(a.seat, workspace))
-        still, still_s = still_step(pane, still, time.time())
+        still, still_s = still_step(pane, still, time.monotonic())
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
