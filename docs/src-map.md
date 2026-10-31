@@ -222,8 +222,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
 - **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans these and more; consumers and their roots are listed in skills/MANIFEST.md).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
-- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
+- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs, @mentions and replies in threads the bot started or was @-mentioned in via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
+- **`slack_bot_threads.py`** — Slack channel thread replies addressed to the bot — companion to `slack-bridge.py`.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
