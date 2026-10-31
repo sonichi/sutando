@@ -4224,9 +4224,12 @@ def _reconcile_earlier_run(wire_tid: str) -> bool:
         run_item = _run_item(c.get("run") or "")
         items = [i for i in dict.fromkeys((run_item if isinstance(run_item, str) else None, wire_tid,
                                            f"{wire_tid}.lease-close")) if i]
-        for item in items:
+        published = [i for i in items if ((read_item(root, i) or {}).get("lifecycle") or {}).get("op") == op]
+        if not published:
+            return False                        # claimed and not yet in the outbox: it may be about to send
+        for item in published:
             record = read_item(root, item) or {}
-            if (record.get("lifecycle") or {}).get("op") != op or record.get("status") in ("DELIVERED", "PARKED"):
+            if record.get("status") in ("DELIVERED", "PARKED"):
                 continue
             try:
                 if not withdraw_unsent(root, item, lambda _payload: True):
@@ -4411,6 +4414,16 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
             _drop_reserve(wire_tid)
 
 
+def _inflight_add(inflight: "set[str]", tid: str) -> None:
+    with _INFLIGHT_MUTEX:                       # result workers and the poll loop share the set
+        inflight.add(tid)
+
+
+def _inflight_discard(inflight: "set[str]", tid: str) -> None:
+    with _INFLIGHT_MUTEX:
+        inflight.discard(tid)
+
+
 def _hold_in_flight(inflight: "set[str]", tids: "set[str]") -> bool:
     """Add `tids` to the in-flight set only once a write holding them has committed."""
     with _INFLIGHT_MUTEX:
@@ -4568,6 +4581,8 @@ def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
                              < task_attempts.TASK_HEARTBEAT_INTERVAL_S):
         return
     _last_task_beat_at = time.time()
+    if _ATTEMPTS.unowned() and _ATTEMPTS.take_ownership():
+        _log("attempt ledger: ownership taken — attempts are recorded and served again")
     _settle_ledger(inflight)
     wire = {_broker_tid(t) for t in inflight}
     for wire_tid in sorted(wire):
@@ -5630,7 +5645,7 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
                                  "settling here — left unacked until the broker serves it again")
                     return None
                 replay = isinstance(t.rec, dict) and bool(episode) and t.rec.get("wake_episode") == episode
-                opened = t.open_wake(wake, first)
+                opened = t.open_wake(wake, first, used=_run_id_used)
                 if (opened and replay and t.run_published(opened[1]) and not _task_pending(opened[1])
                         and opened[1] not in (_load_held() or {})):
                     opened = None               # its run has left the queue: a replay publishes nothing
@@ -5676,7 +5691,8 @@ def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str,
     pending = rec.get("pending_serve") if isinstance(rec.get("pending_serve"), dict) else {}
     if pending.get("lease") == lease:
         return rec["run"], None, True           # the same held serve, delivered again
-    cand = pending.get("run") or t.new_run(first, current=False)
+    # A newer generation's answer rides its run's own outbox item, never the earlier run's.
+    cand = pending.get("run") or t.new_run(first, item=f"{t.wire}.run-{{n}}", current=False, used=_run_id_used)
     if cand is None:
         _log_backoff((first, "unrecorded"), f"task {first}: its re-serve could not be recorded "
                      "— left unacked for a re-serve")
@@ -5699,15 +5715,22 @@ def _serve_run(t, first: str) -> "str | None":
     rec = t.rec
     if rec is task_attempts.UNKNOWN:
         return None
-    cur = (rec or {}).get("run") or t.last_run(first)
+    cur = (rec or {}).get("run") or t.last_run(first) or (first if _run_id_used(first) else None)
     if cur is None:
-        return t.new_run(first)
+        return t.new_run(first, used=_run_id_used)
     if (not t.run_published(cur) or _task_pending(cur) or cur in (_load_held() or {})
             or _archived_task_file(cur) is not None or _delivered_copy_exists(cur)):
         if (rec or {}).get("run") != cur and not t.put(run=cur):
             return None
         return cur
-    return t.new_run(first)
+    return t.new_run(first, used=_run_id_used)
+
+
+def _run_id_used(local: str) -> bool:
+    """Whether anything of a local id is on disk: queued, staged, archived, answered or delivered.
+    A run id that is never reused is checked against all of them."""
+    return (_task_pending(local) or local in (_load_held() or {}) or _archived_task_file(local) is not None
+            or os.path.lexists(RESULTS_DIR / f"{local}.txt") or _delivered_copy_exists(local))
 
 
 def _earlier_run_settling(t, first: str, episode) -> bool:
@@ -6965,7 +6988,7 @@ def _settle_task_locked(tid: str, inflight: "set[str] | None") -> bool:
         return False
     _settled(tid)
     if inflight is not None:
-        inflight.discard(tid)
+        _inflight_discard(inflight, tid)
     _forget_task_room(tid)
     aliases = _load_dedup_aliases() or {}
     if _delivery_tid(tid) == tid and not any(v == tid for k, v in aliases.items() if k != tid):
@@ -7896,7 +7919,7 @@ def _pin_and_claim(tid: str) -> "tuple[str | None, ResultIdentity | None]":
     holds now, so the bytes and the attempt are bound before any effect of the delivery."""
     with _ATTEMPTS.transition(_broker_tid(tid)) as t:
         raw, generation = _pinned_result(tid)
-        if raw is not None and isinstance(t.rec, dict):
+        if raw is not None and isinstance(t.rec, dict) and not t.rec.get("pending_serve"):
             t.claim("result", sole=True, file=list(generation) if generation else None,
                     data={"digest": task_attempts.digest(raw), "tid": tid})
         return raw, generation
@@ -8342,6 +8365,11 @@ def _rule_result(tid: str, broker_tid: str, body: str, no_send: bool, pinned: bo
             return _Ruling("hold", why="its pinned reply was withdrawn — not published")
         hold = t.result_hold()
         if hold:
+            if isinstance(rec, dict) and rec.get("pending_serve"):
+                # Nothing is sent while a held serve decides the generation: its claim is let go.
+                for c in t.claims("result"):
+                    if (c.get("data") or {}).get("tid") == tid:
+                        t.release_claim(c)
             return _Ruling("hold", why=hold)
         stopped = t.stop_by_result(body, no_send)
         if stopped is False:
@@ -8834,7 +8862,7 @@ def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[s
     if skip and skip.value == "deduped":
         action, payload, room = _dedup_plan(tid, skip.extra, inflight)
         if action == "wait":
-            inflight.add(payload)
+            _inflight_add(inflight, payload)
             changed = True
             _log(f"dedup {tid} waiting for holder {payload} gateway acceptance")
             return changed
@@ -8874,7 +8902,7 @@ def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[s
             with _retiring(tid):  # the archive and the id's retirement are one step to a wake
                 if not _archive_result(rfile, tid, generation):
                     return changed
-                inflight.discard(tid)
+                _inflight_discard(inflight, tid)
                 _forget_task_room(tid)
                 # A requeue carries the SAME delivery forward under a fresh local
                 # id, so only a retired delivery gives up its media mode.
@@ -8885,7 +8913,7 @@ def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[s
                     _forget_relay_counts(_broker_tid(_delivery), tid)
                 _forget_dedup_alias(tid)
                 if action == "requeue":
-                    inflight.add(payload)
+                    _inflight_add(inflight, payload)
                 changed = True
             return changed
     if skip:
@@ -8916,7 +8944,7 @@ def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[s
             # Retire the provenance WITH the result, never at read: this line is
             # only reached once the lease-closing POST has actually succeeded.
             _REDELIVERED.discard(tid)
-            inflight.discard(tid)
+            _inflight_discard(inflight, tid)
             _forget_task_room(tid)
             _forget_task_media(tid)
             # After the archive, so a re-run of an accepted fold still names its holder.
@@ -9004,7 +9032,7 @@ def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[s
     with _retiring(tid):  # the archive and the id's retirement are one step to a wake
         if not _archive_result(rfile, tid, generation):
             return changed
-        inflight.discard(tid)
+        _inflight_discard(inflight, tid)
         _forget_task_room(tid)
         _forget_task_media(tid)
         _forget_ack_first(_wire)

@@ -364,6 +364,25 @@ class Ledger(unittest.TestCase):
         imports = {a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
         self.assertFalse({"urllib.request", "http.client", "socket"} & imports)
 
+    def test_the_lock_table_holds_only_tasks_in_use(self):
+        a = self.mk()
+        for i in range(50):
+            with a.transition(f"tsk_{i}") as t:
+                t.put(x=i)
+        self.assertEqual(a._locks, {}, "no lock is kept for a task no thread is in")
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with a.transition("tsk_live"):
+                held.set()
+                release.wait(5)
+        th = threading.Thread(target=hold)
+        th.start()
+        self.assertTrue(held.wait(5))
+        self.assertEqual(list(a._locks), ["tsk_live"], "positive control: the one in use is kept")
+        release.set()
+        th.join(5)
+
     # ── runs ─────────────────────────────────────────────────────────────
     def test_a_run_id_is_injective_and_parsed_by_one_owner(self):
         cases = [("task-abc", 1, "task-abc"), ("task-abc", 2, "task-abc~~2"), ("task-foo.a2", 1, "task-foo.a2"),
@@ -408,6 +427,29 @@ class Ledger(unittest.TestCase):
         self.assertIsNone(a.run_of("task-other"))
         with a.transition("tsk_B") as t:
             self.assertFalse(t.mark_published("task-A~~3"), "a run is published only by its own task")
+
+    def test_a_run_id_is_never_reused_after_the_counters_are_trimmed(self):
+        a = self.mk()
+        on_disk = {"task-T", "task-T~~2"}
+        with unittest.mock.patch.object(task_attempts, "RUNS_KEPT", 3):
+            with a.transition("tsk_T") as t:
+                self.assertEqual(t.new_run("task-T", used=on_disk.__contains__), "task-T~~3",
+                                 "an id with anything on disk is skipped, the bare one included")
+            with a.transition("tsk_live") as t:
+                live = t.new_run("task-live")
+            for i in range(6):                          # finished tasks push the counters out
+                with a.transition(f"tsk_{i}") as t:
+                    t.new_run(f"task-{i}")
+                    t.forget()
+            seqs = json.loads(a.path.read_text())["seqs"]
+            self.assertIn("tsk_live", seqs, "a task the ledger holds keeps its counter")
+            self.assertNotIn("tsk_0", seqs, "positive control: a finished task's counter is trimmed")
+            with a.transition("tsk_live") as t:
+                self.assertEqual(t.new_run("task-live"), "task-live~~2", "never the live run's own id")
+            with a.transition("tsk_0") as t:
+                self.assertEqual(t.new_run("task-0", used={"task-0"}.__contains__), "task-0~~2",
+                                 "a trimmed task's first id is on disk, so it is not handed out again")
+        del live
 
 
 if __name__ == "__main__":

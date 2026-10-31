@@ -1790,14 +1790,16 @@ class Hooks(unittest.TestCase):
                 self.assertTrue(reached.wait(5))
                 if race.startswith("withdrawn"):
                     self.assertEqual(gw._write_task(_task(tid, lease_id="L2")), (tid, True))
-                    self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
-                    self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2")
+                    self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L2"),
+                                     "the earlier run's claimed result may still be sent: the switch waits")
                 else:
                     tmp = gw.RESULTS_DIR / f".{tid}.core"
                     tmp.write_text("the core's answer")
                     os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")
                 release.set()
                 drain.join(10)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "held, it let go: the switch goes")
+                self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2")
                 mock.patch.object(gw, "_relay_result", side_effect=None).stop()
                 mock.patch.stopall()
                 mock.patch.object(gw, "_log", self.logs.append).start()
@@ -2339,8 +2341,10 @@ class Hooks(unittest.TestCase):
         posts = [(p["execution_generation"], p.get("status")) for p in fake.posted("/v1/results") if p["id"] == tid]
         self.assertIn(posts, ([], [(1, "failed")]), "only under the generation it was ruled for, or withdrawn")
         rec = gw._ATTEMPTS.get(tid)
-        self.assertEqual((rec.get("execution_generation"), rec.get("lease_id")), (2, "L2"), "the newer serve stands")
-        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "generation 2's task stays queued")
+        self.assertEqual((rec.get("execution_generation"), rec.get("lease_id"), rec.get("run")), (2, "L2", f"{tid}~~2"),
+                         "the newer serve stands, as its own run")
+        gw._post_task_beats({tid}, force=True)
+        self.assertTrue((gw.TASKS_DIR / f"{tid}~~2.txt").exists(), "generation 2's run is queued")
 
     def test_a_pin_that_cannot_be_released_holds_its_id_until_it_is(self):
         tid = "task-pin-stuck"
@@ -2726,17 +2730,46 @@ class Hooks(unittest.TestCase):
                 drain = threading.Thread(target=gw._post_ready_results, args=(inflight,))
                 drain.start()
                 self.assertTrue(reached.wait(5))
-                self.assertTrue(self.serve_newer_now(tid), "the newer serve never waits for the send")
+                served = threading.Thread(target=gw._write_task, args=(_task(tid, lease_id="L2"),))
+                served.start()
+                served.join(3)
+                self.assertFalse(served.is_alive(), "the newer serve never waits for the send: it is held")
+                acked = []
+                acker = threading.Thread(target=lambda: acked.append(
+                    gw._post_task_ack(tid, durable=True, lease_id="L2")))
+                acker.start()
+                acker.join(3)
+                self.assertFalse(acker.is_alive(), "nor does its ack: it records nothing while the send may be under way")
+                if boundary == "claim":
+                    self.assertEqual(acked, [False], "a claimed send not yet in the outbox may still go: the switch waits")
                 release.set()
                 drain.join(10)
                 self.unpatched()
                 self.use(fake)
+                if gw._ATTEMPTS.get(tid).get("pending_serve"):
+                    self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "settled: the switch goes")
                 rec = self.assert_settled_once(fake, tid)
                 self.assertEqual((rec["execution_generation"], rec["lease_id"]), (2, "L2"), "generation 2 stands")
-                self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "its task stays queued for it")
                 self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "only the delivered result is retired")
-                self.assertIn(tid, inflight)
                 self.assertFalse(agent_turn.is_closed(gw._STATE, rec["turn_id"]), "generation 2's turn is open")
+                self.answered_by_its_own_run(fake, tid, inflight)
+
+    def answered_by_its_own_run(self, fake, tid, inflight):
+        """Generation 2's run is published and its own answer posts under generation 2, on its own item."""
+        run = f"{tid}~~2"
+        gw._post_task_beats(inflight, force=True)
+        self.assertTrue((gw.TASKS_DIR / f"{run}.txt").exists(), "generation 2's run is published")
+        self.core_writes(run, "generation 2's answer")
+        old = time.time() - 5
+        os.utime(gw.RESULTS_DIR / f"{run}.txt", (old, old))
+        gw._post_ready_results(inflight)
+        posts = [(p["execution_generation"], p["body"]) for p in fake.posted("/v1/results") if p["id"] == tid]
+        self.assertEqual(posts[-1], (2, "generation 2's answer"), "generation 2's own answer is posted")
+        self.assertEqual([p for p in posts if p[0] == 1], posts[:1], "generation 1 posted at most once")
+        self.assertEqual(list((gw.RESULTS_DIR / "undelivered").glob(f"{run}*")), [], "never quarantined")
+        root = gw._delivery_core().backend.root
+        self.assertEqual((gw.read_item(root, f"{tid}.run-2") or {}).get("status"), "DELIVERED", "its own item")
+        self.assertEqual(gw._ATTEMPTS.get(tid), {})
 
     def crash_after_acceptance(self, tid):
         """The drain dies after the broker accepted the result, before its commit; then a restart."""
@@ -2776,7 +2809,7 @@ class Hooks(unittest.TestCase):
                 rec = self.assert_settled_once(fake, tid)
                 if event == "newer serve":
                     self.assertEqual((rec["execution_generation"], rec["lease_id"]), (2, "L2"))
-                    self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists())
+                    self.answered_by_its_own_run(fake, tid, inflight)
                 else:
                     self.assertEqual(rec, {}, "settled once after the restart")
                     self.assertNotIn(tid, inflight)
@@ -3000,10 +3033,22 @@ class Hooks(unittest.TestCase):
                  if (agent_turn.read_turn_context(p) or {}).get("task_id") == tid]
         self.assertEqual(len(turns), 1, "one turn, opened once")
 
+    def test_a_ledger_not_owned_at_start_is_taken_on_the_next_pass(self):
+        epoch = gw._ATTEMPTS.epoch
+        self.addCleanup(lambda: gw._ATTEMPTS.epoch is None and gw._ATTEMPTS.take_ownership())
+        gw._ATTEMPTS.epoch = None                       # the start's take failed
+        with txn("task-unowned") as t:
+            self.assertFalse(t.put(x=1), "nothing is written while it is not owned")
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True}}))
+        gw._post_task_beats(set(), force=True)
+        self.assertEqual(gw._ATTEMPTS.epoch, epoch + 1, "the next pass takes it")
+        with txn("task-unowned") as t:
+            self.assertTrue(t.put(x=1))
+
     # ── enforcement: one writer, provider calls with no transition held ──
     READERS = {"transition", "entry", "records", "owing", "holds", "beating", "wake_item", "run_item", "run_of",
                "ack_fields", "worker_id", "broker_names_leases", "report_superseded", "sweep",
-               "close_finished_turns", "beat_snapshot", "now", "take_ownership", "task_beat_disabled"}
+               "close_finished_turns", "beat_snapshot", "now", "take_ownership", "task_beat_disabled", "unowned"}
 
     def attempts_misuse(self, src):
         """Every `_ATTEMPTS.<name>` the bridge source uses that is not a reader or the transition."""

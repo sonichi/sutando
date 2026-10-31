@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
 
 TID = "task-aa1"
+WOKEN = f"{TID}~~2"          # a wake runs as the task's next local run
 FLAGS = {"REMOTE_TASK_LIFECYCLE_V2": "1", "REMOTE_TASK_TURN_CONTEXT": "1"}
 
 
@@ -134,14 +135,14 @@ class Lifecycle(unittest.TestCase):
 
         proc = self.bridges.start()
         self.relay.queue.append(_task(wake=self.WAKE, lease_id="lease-2"))
-        task_file = self.bridges.ws / "tasks" / f"{TID}.txt"
+        task_file = self.bridges.ws / "tasks" / f"{WOKEN}.txt"
         self.bridges.wait_for(task_file.exists, proc, "the woken task queued")
         self.bridges.wait_for(lambda: len(self._turn_files()) == 1, proc, "the wake's turn file")
         turn = self._turn_files()[0]
         self.assertNotEqual(turn.stem, first_turn, "a new turn")
         self.assertTrue(turn.stem.startswith(f"{TID}_g1_"), "at the same generation")
 
-        (self.bridges.ws / "results" / f"{TID}.txt").write_text("Done: went with yes.")
+        (self.bridges.ws / "results" / f"{WOKEN}.txt").write_text("Done: went with yes.")
         self.bridges.wait_for(lambda: len(self.relay.results) == 2, proc, "the woken result")
         final = self.relay.results[1]
         self.assertEqual((final["body"], final["status"], final["execution_generation"]),
@@ -162,7 +163,7 @@ class Lifecycle(unittest.TestCase):
         proc = self.bridges.start()
         self._ask_and_wait(proc)
         self.relay.queue.append(_task(wake=self.WAKE, lease_id="lease-2"))
-        task_file = self.bridges.ws / "tasks" / f"{TID}.txt"
+        task_file = self.bridges.ws / "tasks" / f"{WOKEN}.txt"
         self.bridges.wait_for(task_file.exists, proc, "the woken task queued")
         text = task_file.read_text()
         body = next(line for line in text.splitlines() if line.startswith("task: "))

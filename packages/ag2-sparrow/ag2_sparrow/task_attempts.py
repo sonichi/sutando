@@ -189,7 +189,7 @@ class TaskAttempts:
         self.epoch: "int | None" = None
         self.revoked = False
         self._leaf = threading.Lock()
-        self._locks: "dict[str, threading.RLock]" = {}
+        self._locks: "dict[str, list]" = {}
         self._locks_mutex = threading.Lock()
 
     def report_superseded(self) -> None:
@@ -259,6 +259,10 @@ class TaskAttempts:
                      f"{(data.get('owner') or {}).get('epoch')}, ours {self.epoch}) — no further attempt work here")
             if self.on_revoked is not None:
                 self.on_revoked()
+
+    def unowned(self) -> bool:
+        """Never owned by this process yet, and not revoked: ownership may still be taken."""
+        return self.epoch is None and not self.revoked
 
     def take_ownership(self) -> bool:
         """Become the ledger's one writer: a new epoch, which revokes any earlier process's."""
@@ -379,9 +383,20 @@ class TaskAttempts:
         return {"worker_id": self.worker_id(), "protocol_version": PROTOCOL_VERSION}
 
     # ── the per-task transition ──────────────────────────────────────────
-    def _task_lock(self, wire_tid: str) -> threading.RLock:
+    @contextlib.contextmanager
+    def _task_lock(self, wire_tid: str):
+        """The task's lock, kept in the table only while a thread uses it."""
         with self._locks_mutex:
-            return self._locks.setdefault(wire_tid, threading.RLock())
+            entry = self._locks.setdefault(wire_tid, [threading.RLock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._locks_mutex:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    self._locks.pop(wire_tid, None)
 
     @contextlib.contextmanager
     def transition(self, wire_tid: str):
@@ -399,8 +414,7 @@ class TaskAttempts:
             raise LockOrder(f"transition of {wire_tid} opened inside {_HELD.tids[0]}'s")
         if self.revoked:
             raise Revoked(f"{self.path.name} is owned by another bridge")
-        lock = self._task_lock(wire_tid)
-        with lock:
+        with self._task_lock(wire_tid):
             txn = Transition(self, wire_tid)
             open_[wire_tid] = txn
             _HELD.tids.append(wire_tid)
@@ -540,18 +554,26 @@ class Transition:
 
     # ── runs ─────────────────────────────────────────────────────────────
     def new_run(self, first_run: str, item: "str | None" = None, current: bool = True,
-                **fields) -> "str | None":
+                used: Callable[[str], bool] = lambda _local: False, **fields) -> "str | None":
         """Allocate and save the next local run id of this task (the bare `first_run` the first time),
-        never one used before; `item` is a woken run's own outbox item. Not `current`: allocated for a
-        re-serve still waiting for its generation, and the record keeps its run. None when not saved."""
+        never one used before: one `used` finds anywhere on disk is skipped. `item` is the run's own
+        outbox item, `{n}` its number. Not `current`: allocated for a re-serve still waiting for its
+        generation, and the record keeps its run. None when not saved."""
         def edit(data, rec):
             seqs = data.setdefault("seqs", {})
             seq = int(seqs.get(self.wire) or 0) + 1
+            if seq == 1 and isinstance(rec, dict) and rec.get("run"):
+                seq = 2                         # a counter lost with the record's run still live: never the bare id
             local = local_task_protocol.run_task_id(first_run, seq)
+            while used(local) or local in (data.get("runs") or {}):
+                seq += 1
+                local = local_task_protocol.run_task_id(first_run, seq)
             seqs[self.wire] = seq
             runs = data.setdefault("runs", {})
-            runs[local] = {"task": self.wire, "seq": seq, "published": False, "item": item}
-            _bound(seqs), _bound(runs)
+            runs[local] = {"task": self.wire, "seq": seq, "published": False,
+                           "item": item.format(n=seq) if item else None}
+            live = set(data.get("tasks") or {})
+            _bound(seqs, keep=live), _bound(runs, keep=live, task_of=lambda r: (r or {}).get("task"))
             made.append(local)
             return {**(rec or {}), **fields, "run": local} if current else (rec or {})
         made: list = []
@@ -602,7 +624,8 @@ class Transition:
         data = self.owner._read() or {}
         seq = ((data.get("runs") or {}).get(rec["run"]) or {}).get("seq")
         newest = ((data.get("runs") or {}).get(pending.get("run")) or {}).get("seq")
-        no_newer = type(seq) is int and type(newest) is int and newest == seq + 1 == (data.get("seqs") or {}).get(self.wire)
+        no_newer = (type(seq) is int and type(newest) is int and seq < newest
+                    and newest == (data.get("seqs") or {}).get(self.wire))
         return (same and quiet and no_newer and pending.get("source") == rec.get("source_event_id")
                 and pending.get("wake") == rec.get("wake_episode"))
 
@@ -794,8 +817,9 @@ class Transition:
         return isinstance(rec, dict) and _beat_token(rec) == token
 
     def dispatch_lost_due(self, live: bool, last_activity: "float | None") -> bool:
-        """True once this attempt has had no live dispatch (no task file, result or claim) and no
-        turn activity for DISPATCH_LOST_S: the core will never answer it, so beats must not hold it."""
+        """True once this attempt has had no live dispatch (`live`: its task file queued or its result
+        written) and no turn activity for DISPATCH_LOST_S: the core will never answer it, so beats must
+        not hold it."""
         rec = self.rec
         if not isinstance(rec, dict) or not _beats(rec):
             return False
@@ -995,7 +1019,8 @@ class Transition:
             return UNKNOWN
         return episode in ((data.get("wakes") or {}).get(self.wire) or [])
 
-    def open_wake(self, wake, first_run: str) -> "tuple[str, str] | None":
+    def open_wake(self, wake, first_run: str, used: Callable[[str], bool] = lambda _local: False
+                  ) -> "tuple[str, str] | None":
         """(episode, local run id) when this node has not run the wake yet: a new run, saved before
         anything is published, bound to whichever generation its own ack names. The same episode
         replayed while it runs gets its own run back. None when it cannot be saved."""
@@ -1018,7 +1043,7 @@ class Transition:
         if rec.get("wake_episode") == episode:
             return (episode, rec["run"]) if rec.get("run") else None
         # A new wake is a new run and a new turn: nothing of the earlier run's lease or turn carries over.
-        run = self.new_run(first_run, item=f"{self.wire}.wake-{episode}", wake_episode=episode, turn_id=None,
+        run = self.new_run(first_run, item=f"{self.wire}.wake-{episode}", used=used, wake_episode=episode, turn_id=None,
                            issued_at=None, execution_generation=None, fenced=None, published_at=None,
                            hold_reported=None, pending_serve=None)
         if run is None:
@@ -1180,9 +1205,16 @@ def _without(claims, op: str) -> "dict | None":
     return rest or None
 
 
-def _bound(d: dict) -> None:
-    for k in list(d)[:max(0, len(d) - RUNS_KEPT)]:
+def _bound(d: dict, keep=(), task_of: "Callable | None" = None) -> None:
+    """Drop the oldest entries past RUNS_KEPT, never one for a task the ledger still holds."""
+    excess = len(d) - RUNS_KEPT
+    for k in list(d):
+        if excess <= 0:
+            break
+        if (task_of(d[k]) if task_of else k) in keep:
+            continue
         d.pop(k)
+        excess -= 1
 
 
 def owns_result(rec, identity) -> bool:
