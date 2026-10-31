@@ -933,6 +933,111 @@ class CoreContract(unittest.TestCase):
         self.assertIn("never verified", self.lines[0])
 
 
+class DeliveryPin(unittest.TestCase):
+    """`pin` holds the reply one delivery works on; `unpin` ends it once that reply left its name."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.results = Path(self.tmp.name) / "results"
+        self.results.mkdir()
+        self.lines: list[str] = []
+
+    def publish(self, body, stem="task-a"):
+        tmp = self.results / f".{stem}.tmp"
+        tmp.write_text(body)
+        os.replace(tmp, self.results / f"{stem}.txt")
+
+    def test_a_reply_published_after_the_pin_never_changes_what_is_pinned(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        self.publish("second")
+        self.assertEqual(disposal.pin(self.results, "task-a"), pinned, "one pin per delivery")
+        self.assertEqual(pinned.read_text(), "first")
+        self.assertEqual(pinned, disposal.pin_path(self.results, "task-a"))
+        self.assertEqual(list(self.results.glob("*.txt")), [self.results / "task-a.txt"],
+                         "no result-shaped name for a drain to read")
+
+    def test_nothing_at_the_name_pins_nothing(self):
+        with self.assertRaises(FileNotFoundError):
+            disposal.pin(self.results, "task-a")
+        self.assertFalse(disposal.pin_path(self.results, "task-a").exists())
+
+    def test_the_pin_ends_only_once_its_reply_has_left_its_name(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        generation = identity_of(pinned)[1]
+        self.assertTrue(disposal.unpin(self.results, "task-a", generation, self.lines.append))
+        self.assertTrue(pinned.exists(), "still at its name: kept for its disposal")
+        (self.results / "task-a.txt").unlink()
+        self.assertTrue(disposal.unpin(self.results, "task-a", generation, self.lines.append))
+        self.assertFalse(pinned.exists())
+
+    def test_a_pin_on_another_reply_is_not_ended(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        self.publish("second")
+        for other in (identity_of(self.results / "task-a.txt")[1], identity_of(pinned)[1]._replace(digest="0" * 64)):
+            self.assertTrue(disposal.unpin(self.results, "task-a", other, self.lines.append))
+            self.assertEqual(pinned.read_text(), "first")
+
+    def test_a_replaced_reply_is_dropped_or_kept_in_the_quarantine(self):
+        for keep in (False, True):
+            with self.subTest(keep=keep):
+                self.publish("first")
+                pinned = disposal.pin(self.results, "task-a")
+                generation = identity_of(pinned)[1]
+                self.publish("second")
+                self.assertTrue(disposal.unpin(self.results, "task-a", generation, self.lines.append, keep=keep))
+                self.assertFalse(pinned.exists())
+                kept = [p.read_text() for p in undelivered_quarantine.find_quarantined(self.results, "task-a")]
+                self.assertEqual(kept, ["first"] if keep else [])
+                self.assertEqual((self.results / "task-a.txt").read_text(), "second", "the newer reply stays live")
+
+    def test_disposing_of_a_generation_ends_its_pin(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        generation = identity_of(pinned)[1]
+        archive = self.results / "archive"
+        archive.mkdir()
+        done = disposal.retire_generation(self.results, self.results / "task-a.txt", generation,
+                                          self.lines.append, archive, ["task-a-1.txt"])
+        self.assertTrue(done.retired)
+        self.assertFalse(pinned.exists())
+        self.assertFalse(disposal.pinned(self.results, "task-a", generation))
+
+    def test_a_quarantine_of_a_replaced_generation_keeps_the_pinned_reply(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        generation = identity_of(pinned)[1]
+        self.publish("second")
+        with self.assertRaises(disposal.GenerationReplaced):
+            disposal.quarantine_generation(self.results, self.results / "task-a.txt", generation, self.lines.append)
+        self.assertFalse(pinned.exists())
+        self.assertEqual([p.read_text() for p in undelivered_quarantine.find_quarantined(self.results, "task-a")],
+                         ["first"])
+        self.assertEqual((self.results / "task-a.txt").read_text(), "second")
+
+    def test_a_pin_that_cannot_be_read_counts_as_held(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        generation = identity_of(pinned)[1]
+        with unittest.mock.patch.object(disposal, "identity_of", side_effect=PermissionError("denied")):
+            self.assertTrue(disposal.pinned(self.results, "task-a", generation))
+        self.assertFalse(disposal.pinned(self.results, "task-b", generation))
+
+    def test_a_pin_that_cannot_be_checked_is_reported_as_kept(self):
+        self.publish("first")
+        pinned = disposal.pin(self.results, "task-a")
+        generation = identity_of(pinned)[1]
+        with unittest.mock.patch.object(disposal, "identity_of", side_effect=PermissionError("denied")):
+            self.assertFalse(disposal.unpin(self.results, "task-a", generation, self.lines.append))
+        self.assertTrue(pinned.exists())
+        (self.results / "task-a.txt").unlink()
+        with unittest.mock.patch.object(disposal.os, "unlink", side_effect=PermissionError("denied")):
+            self.assertFalse(disposal.unpin(self.results, "task-a", generation, self.lines.append))
+        self.assertTrue(pinned.exists())
+
+
 class RetirementOutcome(unittest.TestCase):
     """`retire_generation` names how it ended; only PLACED and SOURCE_GONE are
     the requested disposition."""
@@ -1176,7 +1281,7 @@ class BridgeDelegates(unittest.TestCase):
               "_write_owner_activity", "refresh_routing", "_durable_write", "_write_task",
               "_append_log_file", "_archive_task_file", "_archive_resolved_review",
               "_retry_review_control_results", "_post_proactive", "_recover_orphan_proactive",
-              "_retire_proactive", "_send_proactive", "_drop_staged", "_withdraw_stale_cancel",
+              "_retire_proactive", "_send_proactive", "_drop_staged", "_retract_generation",
               "_withdraw_closed"}
 
     def movers(self):

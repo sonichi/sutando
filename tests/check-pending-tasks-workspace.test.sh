@@ -143,6 +143,27 @@ case "$OUT" in
 esac
 rm -f "$WS/tasks/$PROBE" "$WS/results/$PROBE"
 
+# 3b. A wake rewrites the task file after the first turn's result was archived:
+# that older result answered the earlier turn, so the new one still blocks.
+mkdir -p "$WS/results/archive/2026-10"
+printf 'asked\n' > "$WS/results/archive/2026-10/$PROBE"
+touch -t 202601010000 "$WS/results/archive/2026-10/$PROBE"
+printf 'id: probe\nwake_episode: e1\ntask: resumed\n' > "$WS/tasks/$PROBE"
+OUT="$(bash "$HOOK" 2>&1)"
+case "$OUT" in
+  *'"decision":"block"'*) ok "an earlier turn's archived result does not answer a newer wake turn" ;;
+  *) bad "an earlier turn's archived result does not answer a newer wake turn" "got: ${OUT:0:120}" ;;
+esac
+# ...any other task file is answered by that result, however old, as before.
+printf 'id: probe\ntask: resumed\n' > "$WS/tasks/$PROBE"
+record_delivery
+OUT="$(bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "an older archived result still answers a task file that is not a wake turn" ;;
+  *) bad "an older archived result still answers a task file that is not a wake turn" "got: ${OUT:0:120}" ;;
+esac
+rm -rf "$WS/tasks/$PROBE" "$WS/results/archive"
+
 # 4. THE DIRECTION CASE. A file in the legacy <repo>/tasks/ must NOT block.
 if [ "$(_real "$LEGACY_DIR")" = "$(_real "$WS/tasks")" ]; then
   printf '  skip legacy dir IS the resolved queue here; direction is not decidable\n'

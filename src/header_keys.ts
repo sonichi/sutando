@@ -34,6 +34,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'callSid',
 	'caller',
 	'lane',
+	'wake_episode',
 	'thread_root',
 	'source_room_id',
 	'channel_kind',

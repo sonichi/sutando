@@ -417,8 +417,24 @@ Sutando checkout around it sends neither field.
   ago) is only logged: absence is not a terminal status, so it is fenced only when its beat or ack
   answers with one. Server tasks this node does not hold are written to
   `state/relay-outstanding-tasks.json`.
-- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is left unacked, whether or not this node saw its first
-  attempt: running it without its answer, or closing it as a redelivery, would lose the answer.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is never closed as a redelivery, and never
+  run without its answer. Without turn context, for an `ack_first` wake, or for an episode already run
+  here, it is left unacked, whether or not this node saw its first attempt. With the flag off it is an
+  ordinary task, as before.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, each serve records its `lease_id` with the attempt, and an ack's
+  answer (accepted, `not leased`, or a fencing refusal) or a beat's error acts on the attempt only
+  while it still holds that serve; an answer about an earlier serve changes nothing. An attempt
+  awaiting a newer serve's ack does not beat.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, the result drain first pins the file it will deliver as a hard
+  link under `results/.delivering/`, and every step of that delivery (attachments, Stop, settle,
+  publish) uses the pinned bytes. A reply written at the result's name after that is a new result;
+  one that arrives after the task's lease closed is kept in `results/undelivered/` for review. A
+  task id is not retired while its pin is held, so the results directory must support hard links.
+  When a newer generation is acked, an earlier generation's failure result that was published but
+  never sent is taken back from the outbox; an ack that finds it sending is retried.
+- The attempt ledger is `state/relay-task-attempts-v2.json`. The `relay-task-attempts.json` an
+  earlier bridge wrote is not read or upgraded; start logs that it is ignored, and attempts in
+  flight across that upgrade are not resumed.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
@@ -436,6 +452,21 @@ unknown: neither terminal nor suspended, so only the same-text check applies to 
 proxy could not bind but that name the task, written since it was published, count as the turn's.
 A journal line that does not parse makes the journal unreadable (`failed` + `no_send`), except an
 unterminated last line younger than 30 s, an append in progress, which defers the result.
+
+Each task file then carries one writer-owned line telling the agent to ask a question that blocks
+it with `room.question.ask` on its exact `task_id`, to send anything the room should read with
+`room.message.send` before asking, and that its result file is never posted while the question is
+open (`waiting_input` + `no_send`). A wake (the same task re-served with
+`wake.resolved_blockers` after the answer) runs once per `blocker_episode_id`
+(`state/relay-wake-episodes.json`): it is queued again under the same id, with each answer appended
+to the task's line as quoted room data, and it is acked at the same generation into a new turn.
+Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt's delivered record
+neither blocks nor stands in for it. A wake served while an earlier attempt of the same id is still settling here
+(its result unarchived, its task still queued, or its id still to retire) is left unacked until
+the broker serves it again, so the earlier attempt's settle can never retire the wake. Every
+branch that archives a result and retires its id does both as one step under the same lock. The
+recovery judgement that a result was already disposed of is made inside that step too, and a
+settle never archives a task whose open wake has not delivered its own result.
 
 ### `GET /v1/setup` *(optional)*
 

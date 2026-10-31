@@ -1074,6 +1074,26 @@ def park_item(root: Path, item_id: str, reason: str = "") -> None:
     _write_item(Path(root), item_id, d)
 
 
+def withdraw_unsent(root: Path, item_id: str, matches: Callable[[str], bool]) -> bool:
+    """Withdraw a published item whose payload `matches` and that never left: ready or queued, with no
+    delivery claim, dispatch mark or receipt. True when no such payload is left to send (withdrawn,
+    absent, refused, already delivered, or another payload); False while a send of it may be under way."""
+    root = Path(root)
+    with _item_lock(root, item_id):
+        if not _item_path(root, item_id).exists():
+            return True
+        d = _read_item(root, item_id)
+        if d.get("unreadable") or not matches(str(d.get("payload") or "")):
+            return not d.get("unreadable")
+        if d.get("status") in ("PARKED", "DELIVERED"):
+            return True                             # refused, or already out: nothing left to take back
+        if (d.get("status") not in ("READY", "QUEUED") or dispatch_unsettled(d)
+                or read_delivery_claim(root, item_id) is not None):
+            return False
+        _item_path(root, item_id).unlink()
+        return True
+
+
 def resend_epoch_for(root: Path, item_id: str) -> int:
     """The item's re-send generation. 0 until an operator requeues it.
 

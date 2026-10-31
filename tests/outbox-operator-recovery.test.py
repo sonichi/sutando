@@ -626,6 +626,51 @@ class DeliveredBodyDiffers(unittest.TestCase):
         self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())
 
 
+class WithdrawUnsent(unittest.TestCase):
+    """A publication taken back before it left; never one that may be sending or is out."""
+    def item(self, root, status="READY", **extra):
+        outbox._write_item(root, ITEM, {"item_id": ITEM, "attempts": 0, "status": status,
+                                        "payload": '{"id": "x"}', **extra})
+
+    def test_an_unsent_matching_item_is_withdrawn(self):
+        for status in ("READY", "QUEUED"):
+            with self.subTest(status=status), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, status)
+                self.assertTrue(outbox.withdraw_unsent(root, ITEM, lambda p: '"x"' in p))
+                self.assertIsNone(outbox.read_item(root, ITEM))
+
+    def test_another_payload_absent_refused_or_delivered_is_left_and_nothing_remains_to_send(self):
+        for status, matches in (("READY", False), ("PARKED", True), ("DELIVERED", True)):
+            with self.subTest(status=status, matches=matches), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, status)
+                self.assertTrue(outbox.withdraw_unsent(root, ITEM, lambda p, m=matches: m))
+                self.assertEqual(outbox.read_item(root, ITEM)["status"], status)
+        with TemporaryDirectory() as td:
+            self.assertTrue(outbox.withdraw_unsent(Path(td), ITEM, lambda p: True))
+
+    def test_one_that_may_be_sending_is_kept_and_reported(self):
+        cases = {"claimed": {}, "dispatching": {"dispatching": {"incarnation": "w", "at": 1}},
+                 "receipt": {"provider_ref": "r1"}}
+        for case, extra in cases.items():
+            with self.subTest(case=case), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, **extra)
+                if case == "claimed":
+                    self.assertTrue(outbox.acquire_delivery_claim(root, ITEM, "w"))
+                self.assertFalse(outbox.withdraw_unsent(root, ITEM, lambda p: True))
+                self.assertIsNotNone(outbox.read_item(root, ITEM))
+
+    def test_an_unreadable_record_is_never_judged(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            self.item(root)
+            outbox._item_path(root, ITEM).write_text("{torn")
+            self.assertFalse(outbox.withdraw_unsent(root, ITEM, lambda p: True))
+            self.assertTrue(outbox._item_path(root, ITEM).exists())
+
+
 class CliRenderingAndErrorPaths(unittest.TestCase):
     """The CLI's own output and refusal paths. Calling outbox directly, as the
     other tests do, leaves every line of `_emit` and both readers unrun."""
