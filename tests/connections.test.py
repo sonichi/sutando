@@ -233,8 +233,14 @@ class Preview(unittest.TestCase):
 
     def test_probe_requires_https(self):
         with self.assertRaises(C.InvalidToken) as cm:
-            C.preview_connection("http://chat.alpha-fixture.net/relay|s", fetch=lambda *a: self.fail("probed"))
+            C.preview_connection("http://chat.alpha-fixture.net/relay|s", fetch=lambda *a: self.fail("probed"),
+                                 getaddrinfo=lambda *a, **k: self.fail("resolved"))
         self.assertEqual(str(cm.exception), "invalid_gateway")
+        # An undeclared http gateway is refused before resolution, even where port 80 would apply.
+        for url in ("http://chat.alpha-fixture.net:80/relay", "http://localhost/relay", "http://127.0.0.1/relay"):
+            with self.assertRaises(C.InvalidToken, msg=url):
+                C.preview_connection(url + "|s", fetch=lambda *a: self.fail("probed"),
+                                     getaddrinfo=lambda *a, **k: self.fail("resolved"))
         self.assertEqual(C.gateway_url_of("http://chat.alpha-fixture.net/relay|s"), "http://chat.alpha-fixture.net/relay",
                          "env rows may still carry an http gateway; only the probe refuses it")
 
