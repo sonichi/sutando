@@ -3134,7 +3134,7 @@ class Hooks(unittest.TestCase):
         with txn(tid) as t:
             claim = t.claim("result", file=[1])
         root = gw._delivery_core().backend.root
-        gw._delivery_core().backend.publish(tid, b"{}", lifecycle={"op": claim["op"]})
+        self.publish_claimed(tid, claim["op"])
         with mock.patch.object(gw, "withdraw_unsent", side_effect=OSError("disk")):
             self.assertFalse(gw._reconcile_earlier_run(tid), "its item cannot be checked")
         for status in ("DELIVERED", "PARKED"):
@@ -3291,7 +3291,7 @@ class Hooks(unittest.TestCase):
                 fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
                 if stage == "in the outbox":
                     op = next(iter(gw._ATTEMPTS.get(tid)["claims"]))
-                    gw._delivery_core().backend.publish(tid, b"{}", lifecycle={"op": op})
+                    self.publish_claimed(tid, op)
                     gw.disposal.pin_path(gw.RESULTS_DIR, tid).unlink()
                     (gw.RESULTS_DIR / f"{tid}.txt").unlink()
                     sending = mock.patch.object(gw, "withdraw_unsent", return_value=False)
@@ -3303,6 +3303,67 @@ class Hooks(unittest.TestCase):
                 rec = gw._ATTEMPTS.get(tid)
                 self.assertEqual((rec["run"], rec["pending_serve"]["lease"]), (tid, "L2"))
                 self.assertEqual([c["kind"] for c in rec["claims"].values()].count("result"), 1, "its claim is kept")
+
+    def publish_claimed(self, tid, op, item=None):
+        """Publish an item as delivery does: its id recorded on the claim first."""
+        item = item or tid
+        with txn(tid) as t:
+            claim = next(c for c in t.claims("result") if c["op"] == op)
+            self.assertIsNotNone(t.note_item(claim, item))
+        gw._delivery_core().backend.publish(item, b"{}", lifecycle={"op": op})
+        return item
+
+    def test_every_item_a_claim_publishes_is_recorded_and_a_close_on_a_later_runs_item_is_settled_before_a_switch(self):
+        tid = "task-run-close"
+        fake, inflight = self.held(tid)
+        root = gw._delivery_core().backend.root
+        published, unrecorded = [], []
+        real_publish = type(gw._delivery_core().backend).publish
+
+        def spy(backend, item_id, payload, *a, lifecycle=None, **k):
+            if lifecycle:
+                claim = (gw._ATTEMPTS.get(lifecycle["task"]).get("claims") or {}).get(lifecycle["op"]) or {}
+                if item_id not in (claim.get("items") or []):
+                    unrecorded.append(item_id)
+                published.append(item_id)
+            return real_publish(backend, item_id, payload, *a, lifecycle=lifecycle, **k)
+        mock.patch.object(type(gw._delivery_core().backend), "publish", spy).start()
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        run = f"{tid}~~2"
+        gw._post_task_beats(inflight, force=True)
+        self.core_writes(run, "generation 2's answer")
+        old = time.time() - 5
+        os.utime(gw.RESULTS_DIR / f"{run}.txt", (old, old))
+        gw._post_ready_results(inflight)
+        self.assertEqual((gw.read_item(root, f"{tid}.run-2") or {}).get("status"), "DELIVERED")
+        with txn(tid) as t:                     # its attempt is held open, as a crash before the finish leaves it
+            t.put(run=run, execution_generation=2, lease_id="L2")
+        self.core_writes(run, "[no-send]")
+        os.utime(gw.RESULTS_DIR / f"{run}.txt", (old, old))
+
+        class Crash(BaseException):
+            pass
+        mock.patch.object(type(gw._delivery_core()), "deliver_one", side_effect=Crash()).start()
+        drain = threading.Thread(target=lambda: self.assertRaises(
+            Crash, gw._deliver_ready, run, gw.RESULTS_DIR / f"{run}.txt", *gw._pin_and_claim(run), inflight))
+        drain.start()
+        drain.join(10)
+        mock.patch.stopall()
+        mock.patch.object(gw, "_log", self.logs.append).start()
+        self.use(fake)
+        close = f"{tid}.run-2.lease-close"
+        self.assertEqual(published[-1], close, "a close of a delivered run item rides that item's own close")
+        self.assertIn((gw.read_item(root, close) or {}).get("status"), ("READY", "QUEUED"), "published, never sent")
+        gw.disposal.pin_path(gw.RESULTS_DIR, run).unlink()
+        (gw.RESULTS_DIR / f"{run}.txt").unlink()        # its reply retired: only the outbox item is left
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L3", source_event_id="$e")), (run, True))
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 3)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L3"))
+        self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~3")
+        self.assertIsNone(gw.read_item(root, close), "generation 2's close was taken back before the switch")
+        gw._post_task_beats(inflight, force=True)
+        self.assertTrue((gw.TASKS_DIR / f"{tid}~~3.txt").exists(), "generation 3's run is published")
+        self.assertEqual(unrecorded, [], "every item is recorded on its claim before it is published")
 
     def paused_before_publish(self, tid):
         """Served, acked as generation 1; its result pinned and claimed by a worker paused before its
@@ -3357,7 +3418,7 @@ class Hooks(unittest.TestCase):
         fake, inflight, _, _ = self.paused_before_publish(tid)
         op = next(iter(gw._ATTEMPTS.get(tid)["claims"]))
         root = gw._delivery_core().backend.root
-        gw._delivery_core().backend.publish(tid, b"{}", lifecycle={"op": op})
+        self.publish_claimed(tid, op)
         item = sys.modules[gw.read_item.__module__]._item_path(root, tid)
         item.write_text("{not json")
         gw.disposal.pin_path(gw.RESULTS_DIR, tid).unlink()

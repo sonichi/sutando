@@ -337,16 +337,22 @@ class TaskAttempts:
         rec = self.entry(wire_tid)
         if rec is UNKNOWN:
             return UNKNOWN
-        episode = (rec or {}).get("wake_episode")
-        return f"{wire_tid}.wake-{episode}" if episode else None
+        return _wake_item(wire_tid, rec)
 
     def run_item(self, local_tid: str):
-        """The outbox item of a woken run's own result, None for any other id, UNKNOWN when unreadable."""
+        """The outbox item of a run's own result, the one name every reader and the delivery use: its
+        recorded item, else the wake item of a record holding it; None for a task's own item, UNKNOWN
+        when unreadable."""
         data = self._read()
         if data is None:
             return UNKNOWN
         item = ((data.get("runs") or {}).get(local_tid) or {}).get("item")
-        return item if isinstance(item, str) else None
+        if isinstance(item, str):
+            return item
+        for wire, rec in (data.get("tasks") or {}).items():
+            if isinstance(rec, dict) and rec.get("run") == local_tid:
+                return _wake_item(wire, rec)
+        return None
 
     def result_fields(self, wire_tid: str) -> dict:
         rec = self.entry(wire_tid)
@@ -710,6 +716,19 @@ class Transition:
             return False                    # an ack answers its own serve, current or pending, only
         return (isinstance(stored, dict) and {**_thaw(stored), "op": c["op"]} == _thaw(c)
                 and all(rec.get(k) == c.get(k) for k in _token(rec)))
+
+    def note_item(self, c: Claim, item: str) -> "Claim | None":
+        """Record on the claim the outbox item its effect is about to be published as, before the publish;
+        the claim as it now stands, or None when it no longer holds."""
+        if not self.holds_claim(c):
+            return None
+        items = list(c.get("items") or [])
+        if item in items:
+            return c
+        noted = {**_thaw(c), "items": [*items, item]}
+        noted.pop("op")
+        ok, _ = self._change(lambda _d, r: {**r, "claims": {**r["claims"], c["op"]: noted}}, f"item of {c['op']}")
+        return Claim({**noted, "op": c["op"]}) if ok else None
 
     def commit_claim(self, c: Claim, **fields) -> bool:
         """Close the claim and write `fields`, only while it holds."""
@@ -1223,6 +1242,11 @@ def owns_result(rec, identity) -> bool:
     lost = rec.get("dispatch_lost")
     return (isinstance(lost, dict) and identity is not None and lost.get("file") is not None
             and list(lost["file"]) == list(identity) and lost.get("gen") == rec.get("execution_generation"))
+
+
+def _wake_item(wire_tid: str, rec) -> "str | None":
+    episode = (rec or {}).get("wake_episode")
+    return f"{wire_tid}.wake-{episode}" if episode else None
 
 
 def _owes(rec) -> bool:

@@ -4265,13 +4265,11 @@ def _outbox_record(root, item_id: str):
 
 
 def _claim_published(wire_tid: str, op: str, claim: dict):
-    """The outbox items a result claim's operation reached; UNKNOWN when any candidate cannot be read."""
+    """The outbox items a result claim's operation reached, among those the claim recorded before each
+    publish; UNKNOWN when any of them cannot be read. A claim with none recorded published nothing."""
     root = _delivery_core().backend.root
-    run_item = _run_item(claim.get("run") or "")
-    if run_item == task_attempts.UNKNOWN:
-        return task_attempts.UNKNOWN
     published = []
-    for item in dict.fromkeys(i for i in (run_item, wire_tid, f"{wire_tid}.lease-close") if i):
+    for item in claim.get("items") or ():
         record = _outbox_record(root, item)
         if record == task_attempts.UNKNOWN:
             return task_attempts.UNKNOWN
@@ -8494,8 +8492,6 @@ def _rule_result(tid: str, broker_tid: str, body: str, no_send: bool, pinned: bo
         woken_item = _run_item(tid)
         if woken_item == task_attempts.UNKNOWN:
             return _Ruling("hold", why="its run's records cannot be read")
-        episode = rec.get("wake_episode") if isinstance(rec, dict) else None
-        woken_item = woken_item or (f"{broker_tid}.wake-{episode}" if episode else None)
         if not isinstance(rec, dict):
             return _Ruling("post", None, doc, no_send, woken_item)
         ident = list(generation) if generation else None
@@ -8585,6 +8581,13 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     extra = ({"source_ready_sha256": source_digest(live)}
              if live is not None and getattr(core.backend, "records_source_digest", False) else {})
     if claim is not None and getattr(core.backend, "records_lifecycle", False):
+        with _ATTEMPTS.transition(broker_tid) as t:
+            noted = t.note_item(claim, item_id)
+        if noted is None:
+            _log_backoff((tid, "item-unrecorded"), f"result {tid}: its outbox item could not be recorded "
+                         "on its claim — not published, retried next pass")
+            return False
+        claim = noted
         extra["lifecycle"] = _lifecycle_of(broker_tid, claim)
     if item_id != broker_tid and not woken_item:
         # A wake's item is its episode's own, so a delivered one is this result: re-offered, not re-sent.
@@ -8725,9 +8728,12 @@ def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None"
     archived has nothing left to deliver: its task is settled. So is a relay
     result the broker refused for good, whose result is quarantined."""
     root = getattr(_delivery_core().backend, "root", None)
-    if root is None or os.path.lexists(rfile):
-        return False                            # something is still live at the name: keep looking
-    record = read_item(root, item_id) or {}
+    if root is None or _on_disk(rfile) is not False:
+        return False                            # something is, or may be, live at the name: keep looking
+    record = _outbox_record(root, item_id)
+    if record == task_attempts.UNKNOWN:
+        return False
+    record = record or {}
     if not _delivered_for_current_attempt(record):
         return False
     if record.get("status") == "DELIVERED":

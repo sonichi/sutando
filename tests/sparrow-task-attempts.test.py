@@ -455,6 +455,15 @@ class Attempts(unittest.TestCase):
         self.assertEqual(a.worker_id(), first, "acks and results agree")
         self.assertTrue(any("worker id was not saved" in m for m in self.logs))
 
+    def test_a_runs_item_is_one_name_for_every_reader_even_when_its_entry_is_lost(self):
+        a = self.mk(turn_context=True)
+        self.assertEqual(call(a, "tsk_A", "open_wake", {"blocker_episode_id": "ep1"}, "tsk_A"), ("ep1", "tsk_A"))
+        self.assertEqual(a.run_item("tsk_A"), "tsk_A.wake-ep1")
+        with a.transition("tsk_A") as t:
+            t._change(lambda d, r: (d.update(runs={}), r)[1], "lose the run entry")
+        self.assertEqual(a.run_item("tsk_A"), "tsk_A.wake-ep1", "the record holding the run still names it")
+        self.assertIsNone(a.run_item("tsk_B"), "any other id has the task's own item")
+
     def test_the_oldest_settled_wakes_are_forgotten_first_and_a_task_just_settled_never(self):
         a = self.mk(turn_context=True)
 
