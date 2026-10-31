@@ -205,6 +205,44 @@ class TestCoreRequestRejections(unittest.TestCase):
         self.assertEqual(c["status"], "warn", c)
         self.assertIn("counting model=claude-opus-5", c["detail"], c)
 
+    def test_a_settings_alias_counts_its_own_wire_model_rejections(self):
+        """#5177: settings.json holds the alias (`opus`) while the proxy records
+        the wire id (`claude-opus-5`); a literal `==` made `mine` empty forever,
+        so 20 of this core's own 429s reported ok."""
+        self._write([self._rej(60 * k, model="claude-opus-5") for k in range(1, 6)])
+        with unittest.mock.patch.object(self.hc, "_settings_model_pins", lambda *a, **k: [("user", "opus")]):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "fail", c)
+        self.assertIn("counting model=opus", c["detail"], c)
+        self.assertNotIn("other client", c["detail"], c)
+
+    def test_an_alias_still_excludes_another_familys_rejections(self):
+        self._write([self._rej(60 * k, model="claude-fable-5-1") for k in range(1, 6)])
+        with self._own("opus"):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("5 from other client(s) [claude-fable-5-1] not counted", c["detail"], c)
+
+    def test_a_context_tag_on_the_own_model_is_not_a_different_model(self):
+        self._write([self._rej(120, model="claude-sonnet-5")])
+        for own in ("sonnet[1m]", "claude-sonnet-5[1m]"):
+            with self.subTest(own=own), self._own(own):
+                self.assertEqual(self.hc.check_core_request_rejections()["status"], "warn")
+
+    def test_two_full_ids_of_one_family_stay_distinct(self):
+        self._write([self._rej(120, model="claude-opus-5-5")])
+        with self._own("claude-opus-4-1"):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("none for this core's model", c["detail"], c)
+
+    def test_default_alias_names_no_model_so_every_client_counts(self):
+        self._write([self._rej(120, model="claude-opus-5")])
+        with self._own("default"):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "warn", c)
+        self.assertIn("unattributed", c["detail"], c)
+
     def test_two_settings_pins_that_disagree_are_not_a_claim(self):
         """Two files naming different models is not a model this core can claim;
         guessing one would attribute every rejection to a coin flip."""
