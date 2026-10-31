@@ -33,6 +33,9 @@ Ownership is generational: the record carries `proc_start` (boot id + start time
 `outbox.process_identity` on Windows), and acquire/heartbeat/release/retain treat a
 record as their own only when pid, host AND that start time match. A same-host holder
 whose pid now names a process with another start time is gone (its pid was reused).
+On macOS the boot part is kern.bootsessionuuid, which a clock step cannot move; tokens
+written before that carried kern.boottime, which a clock step does move, so `same_start`
+matches such a token on its start time alone instead of reading a live writer as gone.
 Residual risk: a record without `proc_start` (written where it cannot be read) falls
 back to the pid rule, so a dead holder whose pid was reused reads as alive until stale.
 `read_lease` binds a record to the role, workspace and schema the caller asked for, and
@@ -75,6 +78,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import socket
 import struct
 import sys
@@ -183,8 +187,27 @@ def _darwin_sysctl(mib: list) -> bytes | None:
         return None
 
 
-# CTL_KERN, then KERN_PROC/KERN_PROC_PID, KERN_BOOTTIME and KERN_PROCARGS2 (<sys/sysctl.h>).
-_KERN, _KERN_PROC_PID, _KERN_BOOTTIME, _KERN_PROCARGS2 = 1, (14, 1), 21, 49
+def _darwin_boot_session() -> str | None:
+    """kern.bootsessionuuid on macOS: fixed for the whole boot, unlike kern.boottime, which the
+    kernel recomputes when the wall clock is stepped. None when it cannot be read."""
+    import ctypes
+    import ctypes.util
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        name, size = b"kern.bootsessionuuid", ctypes.c_size_t(0)
+        if libc.sysctlbyname(name, None, ctypes.byref(size), None, 0) != 0 or not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctlbyname(name, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        value = buf.value.decode("ascii", "replace").strip()
+        return value if value and ":" not in value else None
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+# CTL_KERN, then KERN_PROC/KERN_PROC_PID and KERN_PROCARGS2 (<sys/sysctl.h>).
+_KERN, _KERN_PROC_PID, _KERN_PROCARGS2 = 1, (14, 1), 49
 
 
 def proc_argv(pid: int) -> list[str] | None:
@@ -223,13 +246,13 @@ def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
     if _IS_WINDOWS:
         return _windows_start(_windows_identity(pid))
     if sys.platform == "darwin" and not proc.is_dir():
-        boot = _darwin_sysctl([_KERN, _KERN_BOOTTIME])
+        boot = _darwin_boot_session()
         info = _darwin_sysctl([_KERN, *_KERN_PROC_PID, pid])
-        if boot is None or info is None or len(boot) < 12 or len(info) < 12:
+        if boot is None or info is None or len(info) < 12:
             return None
-        # struct timeval {time_t; suseconds_t} opens both kern.boottime and kinfo_proc.
-        (bsec, busec), (sec, usec) = (struct.unpack_from("=qi", b) for b in (boot, info))
-        return f"darwin-{bsec}.{busec:06d}:{sec}.{usec:06d}" if sec > 0 else None
+        # struct timeval {time_t; suseconds_t} opens kinfo_proc (p_starttime).
+        sec, usec = struct.unpack_from("=qi", info)
+        return f"darwin-{boot}:{sec}.{usec:06d}" if sec > 0 else None
     try:
         boot = (proc / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
         stat = (proc / str(pid) / "stat").read_bytes()
@@ -239,6 +262,26 @@ def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
     # starttime is field 22 of stat(5); fields here start at field 3 (state).
     ticks = fields[19].decode() if len(fields) > 19 and fields[19].isdigit() else ""
     return f"{boot}:{ticks}" if boot and ticks else None
+
+
+# The boot part of a macOS token written before kern.bootsessionuuid: kern.boottime's timeval.
+_LEGACY_DARWIN_BOOT = re.compile(r"\d+\.\d{6}")
+
+
+def same_start(recorded: object, current: object) -> bool:
+    """Whether two `proc_start` tokens name the same process. A macOS token whose boot part is
+    the legacy kern.boottime (moved by any clock step) matches on its start time alone; tokens
+    that both carry kern.bootsessionuuid must match exactly."""
+    if not isinstance(recorded, str) or not isinstance(current, str) or not recorded or not current:
+        return False
+    if recorded == current:
+        return True
+    if not (recorded.startswith("darwin-") and current.startswith("darwin-")):
+        return False
+    r_boot, _, r_start = recorded[len("darwin-"):].partition(":")
+    c_boot, _, c_start = current[len("darwin-"):].partition(":")
+    legacy = bool(_LEGACY_DARWIN_BOOT.fullmatch(r_boot) or _LEGACY_DARWIN_BOOT.fullmatch(c_boot))
+    return legacy and bool(r_start) and r_start == c_start
 
 
 def _payload(role: str, workspace: Path, declares: "dict | None" = None) -> dict:
@@ -272,7 +315,7 @@ def _own_start() -> str | None:
 def _is_mine(holder: dict | None) -> bool:
     """Whether `holder` was written by this very process: pid, host and start time."""
     return bool(holder) and holder.get("pid") == os.getpid() and holder.get("host") == _host_label() \
-        and holder.get("proc_start") == _own_start()
+        and same_start(holder.get("proc_start"), _own_start())
 
 
 def _probe(pid: int) -> tuple[str, str | None]:
@@ -320,7 +363,7 @@ def _holder_is_dead(holder: dict, host: str) -> bool:
     if state == "dead":
         return True
     recorded = holder.get("proc_start")
-    return state == "alive" and isinstance(recorded, str) and bool(recorded) and start != recorded
+    return state == "alive" and isinstance(recorded, str) and bool(recorded) and not same_start(recorded, start)
 
 
 def _write_atomic(path: Path, data: dict) -> None:
@@ -464,7 +507,7 @@ def lease_process(holder: dict) -> int:
     recorded = holder.get("proc_start")
     if not isinstance(recorded, str) or not recorded:
         raise LeaseIndeterminate(f"the lease for pid {pid} records no start time")
-    return pid if current == recorded else 0
+    return pid if same_start(recorded, current) else 0
 
 
 def read_holder(role: str, workspace: Path | str | None = None) -> dict | None:

@@ -2092,7 +2092,7 @@ def _writer_gone(sidecar: Mapping[str, object]) -> bool:
     if not isinstance(started, str) or not started:
         return False
     now = workspace_lock.proc_start(pid)
-    return now is not None and now != started
+    return now is not None and not workspace_lock.same_start(started, now)
 
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
