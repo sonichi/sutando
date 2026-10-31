@@ -342,6 +342,18 @@ class RenotifyTests(unittest.TestCase):
         req.revision = 3
         self.assertIsNone(renotify.due(req, {"event_id": "$e", "revision": 2}, T0 + 7 * HOUR))
 
+    def test_the_seat_and_the_create_dedupe_name_a_device_one_way(self):
+        from hitl import schema
+        for device in (None, {}, {"id": ""}, {"id": 7}, {"id": "dev-a"}):
+            with self.subTest(device=device):
+                req = blocking()
+                req.device = device
+                self.assertEqual(renotify.seat_key(req), (req.runtime, schema.device_id(req)))
+        hitl_dir = Path(__file__).resolve().parent.parent / "src" / "hitl"
+        copies = [p.name for p in sorted(hitl_dir.glob("*.py"))
+                  if p.name != "schema.py" and '(req.device or {}).get("id")' in p.read_text(encoding="utf-8")]
+        self.assertEqual(copies, [], "derive a device id only through schema.device_id")
+
     def test_a_cancelled_card_gets_neither_reminder_nor_recovery(self):
         req = blocking()
         req.status = STATUS_CANCELLED
