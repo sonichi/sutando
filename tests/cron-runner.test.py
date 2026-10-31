@@ -452,6 +452,56 @@ def test_run_no_state_catches_up():
         check(emitted == ["daily"], "no-state first run catches up the missed daily cron")
 
 
+def test_run_entry_added_to_a_ticking_runner_baselines_instead_of_catching_up():
+    # #5316: a new entry fired a slot from before it existed; 07:30 keeps the
+    # 07:00 slot inside the lateness budget, which would otherwise drop it.
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        added = _epoch(2026, 10, 10, 7, 30)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "digest", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
+            {"name": "readiness-morning", "cron": "0 7 * * *", "prompt": "y", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"digest": added - 60}))
+        _mark_core_alive(root, added)
+        check(cr.run(now_epoch=added) == [], "a newly added entry does not fire a slot before it existed")
+        state = json.loads(cr.STATE_FILE.read_text())
+        check(state.get("readiness-morning") == added, "the new entry's baseline is the tick that first saw it")
+
+        # Its next real slot still fires.
+        tomorrow = _epoch(2026, 10, 11, 7, 0)
+        _mark_core_alive(root, tomorrow)
+        check("readiness-morning" in cr.run(now_epoch=tomorrow), "the first slot after the baseline fires")
+
+
+def test_run_shell_command_entry_added_to_a_ticking_runner_does_not_launch():
+    # shell_command entries skip the lateness budget, so any slot in the last day fired.
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            now = _epoch(2026, 10, 10, 8, 15)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "mechanical", "cron": "0 7 * * *", "shell_command": "true", "launchd": True},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                emitted = cr.run(now_epoch=now)
+            check(emitted == [], "a newly added shell job is not launched for a slot before it existed")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
 def test_run_does_not_queue_for_dead_core_and_recovers_recent_slot():
     import json
     with tempfile.TemporaryDirectory() as d:

@@ -741,6 +741,8 @@ def run(now_epoch: Optional[int] = None) -> list:
     # write-back. See _state_lock for the race this closes.
     held: list = []
     with _state_lock(STATE_FILE):
+        # A state file proves this runner has ticked here before (#5316).
+        ticked_before = STATE_FILE.exists()
         state = _load_json(STATE_FILE, {})
         for entry in crons:
             if not entry.get("launchd"):
@@ -760,14 +762,17 @@ def run(now_epoch: Optional[int] = None) -> list:
                 )
                 state[name] = now_epoch
                 continue
-            # When state is absent (first run or after reinstall), look back the
-            # full catch-up window so a daily cron missed during a restart or
-            # sleep cycle is still emitted on the next tick.
+            # No state file (first run, reinstall): look back the full catch-up
+            # window so a daily cron missed across a restart still fires.
             last = int(state.get(name, now_epoch - MAX_CATCHUP_SECONDS))
             try:
                 due_epoch = latest_due_since(expr, last, now_epoch)
             except ValueError as e:
                 print(f"cron-runner: skipping {name}: {e}", file=sys.stderr)
+                continue
+            if ticked_before and name not in state:
+                # Added since the last tick: no slot before now was ever owed.
+                state[name] = now_epoch
                 continue
             if due_epoch is not None:
                 # Direct shell jobs must stay claimable and idempotent like prompt jobs; only
