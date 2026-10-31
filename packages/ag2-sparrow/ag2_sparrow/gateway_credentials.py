@@ -42,6 +42,7 @@ import threading
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
+from json import dumps as _json_dumps
 from typing import Any, Callable, Mapping, Sequence
 
 # Canonical alias precedence (earlier wins). GATEWAY_* primary; RELAY_* and
@@ -155,22 +156,22 @@ def _utf8(s: str) -> "tuple[bytes, ...]":
 
 
 def forms(secret: str) -> "set[str]":
-    """The ways a secret can be rendered in diagnostic text: raw, escaped as repr and
-    unicode_escape render it, and percent-encoded or -decoded. Total over any str."""
+    """The ways a secret can be rendered in diagnostic text: raw, escaped as repr, unicode_escape
+    and JSON render it, and percent-encoded or -decoded. Total over any str."""
     out = set()
     for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
         out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
-                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii")}
+                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii"), _json_dumps(s)[1:-1]}
         out |= {quote(raw, safe=safe) for raw in _utf8(s) for quote in (urllib.parse.quote, urllib.parse.quote_plus)
                 for safe in ("", "/=&?#:@")}
     return {f for f in out if f}
 
 
 def _views(text: str) -> "set[str]":
-    """`text` as matched: raw, percent-decoded, systemd-unescaped and with its quotes off, so no
-    quoting or escaping in the rendered line decides whether a secret in it is seen."""
+    """`text` as matched: raw, percent-decoded, systemd- and JSON-unescaped and with its quotes
+    off, so no quoting or escaping in the rendered line decides whether a secret in it is seen."""
     texts = {text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text)}
-    texts |= {systemd_unescape(t) for t in tuple(texts)}
+    texts |= {u(t) for t in tuple(texts) for u in (systemd_unescape, json_unescape)}
     return {fold(v) for t in texts for v in (t, _unquoted(t))}
 
 
@@ -194,6 +195,25 @@ def systemd_unescape(text: str) -> str:
     """`text` with the C-style escapes systemd decodes in a unit value (\\xNN, \\NNN, \\uNNNN,
     \\UNNNNNNNN, \\s and the single-letter ones) decoded. Total over any str."""
     return _SYSTEMD_ESCAPE_RE.sub(_unescape_one, str(text))
+
+
+_JSON_ESCAPE_RE = re.compile(r"\\u([dD][89abAB][0-9A-Fa-f]{2})\\u([dD][c-fC-F][0-9A-Fa-f]{2})"
+                             r"|\\u([0-9A-Fa-f]{4})|\\([\"\\/bfnrt])")
+_JSON_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _json_unescape_one(m: "re.Match[str]") -> str:
+    if m.group(1):
+        return chr(0x10000 + ((int(m.group(1), 16) - 0xD800) << 10) + int(m.group(2), 16) - 0xDC00)
+    if m.group(3):
+        return chr(int(m.group(3), 16))
+    return _JSON_SIMPLE.get(m.group(4), m.group(4))
+
+
+def json_unescape(text: str) -> str:
+    """`text` with the escapes a JSON string holds decoded, a UTF-16 surrogate pair as the one
+    character it encodes. Total over any str."""
+    return _JSON_ESCAPE_RE.sub(_json_unescape_one, str(text))
 
 
 def _unquoted(text: str) -> str:
@@ -545,14 +565,41 @@ def sets_environment(line: str) -> bool:
                for piece in _INLINE_BREAK_RE.split(line.rstrip("\r\n")))
 
 
-def _groups(text: str) -> "list[list[str]]":
+def _open_quote(quote: str, text: str) -> str:
+    """The quote still open after reading `text` as a shell value, starting inside `quote`."""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif ch == "\\":
+            i += 1
+        elif quote:
+            quote = "" if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and i > 0 and text[i - 1] in " \t":
+            break
+        i += 1
+    return quote
+
+
+def _groups(text: str, quotes: bool = True) -> "list[list[str]]":
     """Physical lines grouped by continuation, never fewer than systemd joins: any trailing
-    backslash continues (comment lines too), and a comment inside a continuation does not end it."""
-    groups, current = [], []
+    backslash continues (comment lines too), and a comment inside a continuation does not end it.
+    With `quotes`, an assignment whose quoted value is still open continues too, to the end if unclosed."""
+    groups, current, assignment, quote = [], [], False, ""
     for line in physical_lines(text):
         body = line.rstrip("\r\n")
+        if not current:
+            m = _ASSIGNMENT_LINE_RE.match(body) if quotes else None
+            value = m.group(5).lstrip() if m else ""
+            assignment = bool(value.startswith(("'", '"')) and not sets_environment(body))
+            quote = _open_quote("", m.group(5)) if assignment else ""
+        elif assignment:
+            quote = _open_quote(quote, body)
         current.append(line)
-        if body.endswith("\\") or (_is_comment(body) and len(current) > 1):
+        if quote or body.endswith("\\") or (_is_comment(body) and len(current) > 1):
             continue
         groups.append(current)
         current = []
@@ -562,7 +609,19 @@ def _groups(text: str) -> "list[list[str]]":
 
 
 def _join(group: "list[str]") -> str:
-    kept = [line.rstrip("\r\n") for i, line in enumerate(group) if i == 0 or not _is_comment(line)]
+    # A #-leading line inside an open quote is value text, not a comment.
+    kept, quote = [], ""
+    for i, line in enumerate(group):
+        body = line.rstrip("\r\n")
+        if i == 0:
+            m = _ASSIGNMENT_LINE_RE.match(body)
+            quote = _open_quote("", m.group(5)) if m else ""
+            kept.append(body)
+            continue
+        if _is_comment(body) and not quote:
+            continue
+        quote = _open_quote(quote, body)
+        kept.append(body)
     return " ".join(p[:-1] if p.endswith("\\") and i < len(kept) - 1 else p for i, p in enumerate(kept))
 
 
@@ -684,7 +743,7 @@ def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
     written) at BARE_SECRET_MIN, and every credential shape's value at BARE_SECRET_MIN unless it is
     a plain path, so the same value under a neutral key or on another line is withheld too."""
     for text in texts:
-        for group in _groups(text):
+        for group in _groups(text) + _groups(text, quotes=False):
             joined = _join(group)
             if any(sets_environment(line) for line in group):
                 rest = joined.partition("=")[2]
@@ -693,6 +752,8 @@ def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
                 m = _ASSIGNMENT_LINE_RE.match(joined)
                 credential = m and credential_name(m.group(3))
                 words = [f"{m.group(3)}={parse_env_value(m.group(5))}"] if credential else []
+                # A multiline credential value is also registered line by line, so no piece recurs shown.
+                words += [f"{m.group(3)}={line.strip()}" for line in group[1:]] if credential else []
             for word in words:
                 key, eq, value = word.partition("=")
                 if eq:
@@ -733,6 +794,21 @@ def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) ->
         masked = _mask_line(joined, registry)
         comments = [line.rstrip("\r\n") for line in group[1:] if _is_comment(line)]
         if masked == joined and all(_mask_line(c, registry) == c for c in comments):
+            out.append("".join(group))
+        elif (len(group) > 1
+              and (assignment := _ASSIGNMENT_LINE_RE.match(group[0].rstrip("\r\n")))
+              and _open_quote("", assignment.group(5))
+              and (joined_assignment := _ASSIGNMENT_LINE_RE.match(joined))
+              and masked == (
+                  joined_assignment.group(1)
+                  + (joined_assignment.group(2) or "")
+                  + joined_assignment.group(3)
+                  + joined_assignment.group(4)
+                  + parse_env_value(joined_assignment.group(5))
+              )
+              and not credential_shaped(joined)
+              and not (registry is not None and registry.contains(joined))
+              and all(_mask_line(c, registry) == c for c in comments)):
             out.append("".join(group))
         else:
             out.append(masked + end)
