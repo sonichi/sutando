@@ -602,5 +602,61 @@ class DarwinBootSessionTest(unittest.TestCase):
         self.assertEqual(self.mod.lease_process(holder), 0)
 
 
+class DarwinBootSessionReadTest(unittest.TestCase):
+    """The kern.bootsessionuuid read, through a stand-in libc: runs on any platform."""
+
+    def setUp(self):
+        self.mod = _load()
+        self.reads = 0
+
+    def _libc(self, value=b"3F1C577F-F628-4A69-97F8-84904C4785A6", probe=0, fetch=0, size=None, raises=None):
+        import ctypes
+        test = self
+
+        class Libc:
+            def sysctlbyname(self, name, buf, sizeref, newp, newlen):
+                test.assertEqual(name, b"kern.bootsessionuuid")
+                if raises:
+                    raise raises
+                if buf is None:
+                    test.reads += 1
+                    sizeref._obj.value = len(value) + 1 if size is None else size
+                    return probe
+                ctypes.memmove(buf, value + b"\0", len(value) + 1)
+                return fetch
+        return unittest.mock.patch("ctypes.CDLL", lambda *a, **k: Libc()), \
+            unittest.mock.patch("ctypes.util.find_library", lambda name: "libc")
+
+    def _read(self, **kw):
+        cdll, find = self._libc(**kw)
+        with cdll, find:
+            return self.mod._read_darwin_boot_session()
+
+    def test_a_readable_session_is_returned(self):
+        self.assertEqual(self._read(), "3F1C577F-F628-4A69-97F8-84904C4785A6")
+
+    def test_an_unreadable_session_is_none(self):
+        self.assertIsNone(self._read(probe=-1), "the size probe failed")
+        self.assertIsNone(self._read(size=0), "an empty value")
+        self.assertIsNone(self._read(fetch=-1), "the read failed")
+        self.assertIsNone(self._read(value=b"  "), "blank")
+        self.assertIsNone(self._read(value=b"a:b"), "a ':' would split the token")
+        self.assertIsNone(self._read(raises=OSError("no libc")))
+
+    def test_the_first_good_read_is_kept_and_a_failed_one_is_retried(self):
+        self.mod._BOOT_SESSION.clear()
+        cdll, find = self._libc(probe=-1)
+        with cdll, find:
+            self.assertIsNone(self.mod._darwin_boot_session())
+            self.assertIsNone(self.mod._darwin_boot_session())
+        self.assertEqual(self.reads, 2, "a failed read is not cached")
+        cdll, find = self._libc()
+        with cdll, find:
+            first = self.mod._darwin_boot_session()
+            second = self.mod._darwin_boot_session()
+        self.assertEqual((first, second), ("3F1C577F-F628-4A69-97F8-84904C4785A6",) * 2)
+        self.assertEqual(self.reads, 3, "one more read, then the kept value")
+
+
 if __name__ == "__main__":
     unittest.main()
