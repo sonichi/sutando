@@ -343,11 +343,12 @@ credential resolver finds, the managed key included):
 python3 skills/image-generation/scripts/generate.py --prompt "A flat-design mascot, teal and cream"
 python3 skills/image-generation/scripts/generate.py --input photo.jpg --prompt "Replace the background"
 ```
-stdout is one JSON line: `{"ok": true, "path": "<workspace>/results/media/generated-<ts>.png", "model"}`
+stdout is one JSON line: `{"ok": true, "path": "<workspace>/results/media/generated-<ts>.<ext>", "model"}`
 or `{"ok": false, "error": no_key|refused|no_image|api_error, "message", "remedy"}` (exit 0 / 1 / 2).
 Deliver with `[file: <path>]` on its own line in the reply; on a failure say the skill's verbatim
 message for that error (`skills/image-generation/SKILL.md`) and stop. `--video` (Veo) needs the
-`google-genai` SDK and reports `sdk_missing` without it.
+`google-genai` SDK and reports `sdk_missing` without it. `--model gemini-3-pro-image` opts into a
+higher quality/cost image tier when that matters more than speed or price.
 
 **Activate a cloud tool** — the `marketplace` skill (below) is the activation: `install <slug> --yes`
 after the plan; a newly activated tool is usable at once through `station_find` / `station_call`.
