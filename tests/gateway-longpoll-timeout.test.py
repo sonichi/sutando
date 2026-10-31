@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Long-poll timeout grace preserves retry timing without inventing poll evidence."""
+"""Long-poll timeout grace preserves retry timing without inventing poll evidence.
+
+A held poll inside the grace is the documented empty poll, so it neither backs off
+nor logs an outage; it is still not a success, so it leaves `last_ok_ts` alone and
+its status write says the poll timed out (#5678).
+"""
 from __future__ import annotations
 
 import re
@@ -339,7 +344,7 @@ class LongPollTimeoutTest(unittest.TestCase):
 
     # ── the policy on its own ────────────────────────────────────────────
     def test_the_grace_covers_at_least_one_whole_poll_window(self):
-        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_WAIT + 10)
+        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_READ_TIMEOUT_S)
 
     def test_benign_from_zero_up_to_and_including_the_boundary(self):
         g = self.gw.POLL_TIMEOUT_GRACE_S
@@ -359,8 +364,11 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertEqual(loop.clock.slept, [], "a benign empty poll must not back off")
         self.assertNotIn("poll network error",
                          " ".join(loop.logs), "and must not log an outage")
-        self.assertIn((False, {"poll_ok_ts": None}), loop.status,
-                      "startup grace alone does not establish connectivity")
+        self.assertNotIn(True, [c for c, _ in loop.status],
+                         "startup grace alone does not establish connectivity")
+        self.assertIsNone(loop.status[-1][1].get("poll_ok_ts"), "a timeout stamped poll evidence")
+        self.assertIn("timed out", str(loop.status[-1][1].get("error")),
+                      "the iteration completes and says the poll timed out")
 
     def test_a_timeout_past_the_grace_takes_the_outage_path(self):
         grace = self.gw.POLL_TIMEOUT_GRACE_S
@@ -742,7 +750,7 @@ class RoundAccountingTest(unittest.TestCase):
         with _Loop(self.gw, poll_raises=TimeoutError("The read operation timed out"),
                    advance=1.0) as loop:
             loop.run()
-        self.assertTrue(any(m.startswith("poll read timed out after 35s inside the")
+        self.assertTrue(any(m.startswith(f"poll read timed out after {self.gw.POLL_READ_TIMEOUT_S}s inside the")
                             for m in loop.logs))
 
 

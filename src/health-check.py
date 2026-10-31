@@ -7035,7 +7035,7 @@ def _gateway_lane_label(lane: str, rows: "list[dict] | None" = None) -> str:
 GATEWAY_STATUS_MAX_AGE_S = 180.0
 # Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
 # env read, so a host that retunes POLL_WAIT moves both together.
-GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (max(float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25), 35) + 25)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,

@@ -483,6 +483,8 @@ _RELAY_ASK_PREFIX = "ask-"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+# When the last stuck-poll recovery exit ran; survives the relaunch it causes.
+STUCK_POLL_RECOVERY_FILE = _STATE / f"gateway-stuck-poll{_INST_SUFFIX}.json"
 # The heartbeat reply's pointers to the served setup; read by adapters, never by Sparrow.
 SETUP_HINT_FILE = _STATE / f"setup-hint{_INST_SUFFIX}.json"
 SETUP_HINT_FIELDS = ("setup_revision", "min_version", "target_version")
@@ -1928,10 +1930,15 @@ diagnostics.register_gateway_url(URL)
 diagnostics.register_secret(TOKEN)
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# The relay holds an empty poll 31-33 s whatever `wait` asks (#3042), so the read
+# budget covers the longer of the two plus room for TLS setup and network jitter.
+_RELAY_HOLD_CEILING_S = 35
+_POLL_READ_MARGIN_S = 25
+POLL_READ_TIMEOUT_S = max(POLL_WAIT, _RELAY_HOLD_CEILING_S) + _POLL_READ_MARGIN_S
 ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
-POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+POLL_TIMEOUT_GRACE_S = 3 * POLL_READ_TIMEOUT_S
 # Backoff alone caps at 60s and never gives up, so a relay that stays down
 # leaves a live process polling into the void. 0 disables the exit.
 POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
@@ -2832,6 +2839,11 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
+# When any request to the relay last got an answer; a stuck task poll is only
+# told apart from an outage by other requests still succeeding.
+_LAST_REQ_OK = {"at": 0.0}
+
+
 @contextlib.contextmanager
 def _gateway_call():
     """Every call that receives the gateway URL runs inside this: what it raises carries only
@@ -3004,6 +3016,7 @@ def _parse_response(resp, body: bytes):
                        "content_length": headers.get("Content-Length"),
                        "cf_ray": headers.get("CF-Ray")}
     raw = body.decode().strip()
+    _LAST_REQ_OK["at"] = time.time()
     return json.loads(raw) if raw else {}
 
 
@@ -3437,8 +3450,8 @@ _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 _POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
 _workers_pushed_identity = ""
 _workers_push_retry_at = 0.0
-# The broker wants a report at least every 60 s (rows go stale at 120 s); the push only runs
-# between polls, which take up to POLL_WAIT + 10 s, so 20 s keeps the gap under 60 s.
+# The broker wants a report at least every 60 s (rows go stale at 120 s); the push runs between
+# polls, which return in ~33 s (#3042) and at worst POLL_READ_TIMEOUT_S, inside the 120 s.
 WORKERS_REFRESH_S = 20.0
 _workers_pushed_at: "float | None" = None
 _advertisement_unavailable_logged = False
@@ -4335,6 +4348,11 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
                         **_ENGINE_COUNTS},
         }
+        if _POLL_STREAK["timeouts"]:
+            payload["consecutive_poll_timeouts"] = _POLL_STREAK["timeouts"]
+        if _POLL_STREAK["stuck_since"] is not None:
+            payload["stuck_poll"] = True
+            payload["stuck_since"] = int(_POLL_STREAK["stuck_since"])
         if _HELD_UNRESOLVED:
             # Staged relay asks the bridge can neither publish nor clear without a person.
             payload["ack_first_unresolved"] = sorted(_one_line(t)[:128] for t in _HELD_UNRESOLVED)[:20]
@@ -8326,7 +8344,7 @@ _LOCK_HB_MUTEX = threading.Lock()
 _POLL_BACKOFF_MAX_S = 60
 # Typical worst case for one pass (a queued retry backlog can exceed it): the
 # long poll at its timeout, the largest backoff and two requests, doubled.
-_LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
+_LOCK_PASS_MAX_S = 2 * (POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
 _LOOP_TICK = {"at": time.monotonic()}
 
 
@@ -8579,6 +8597,134 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+# A relay that holds every task poll past the read timeout while answering the
+# rest is a stuck session; every request already opens a new connection.
+STUCK_POLL_TIMEOUTS = 5
+# Shortest streak that can be judged stuck: N polls, each held to the read timeout.
+STUCK_POLL_DETECTION_WINDOW_S = STUCK_POLL_TIMEOUTS * POLL_READ_TIMEOUT_S
+STUCK_POLL_RECOVERY_INTERVAL_S = 600
+# A live relay answers a heartbeat at least once per pass: one held poll, one
+# back-off and one heartbeat interval. An older success says nothing about now.
+STUCK_POLL_OTHER_OK_WITHIN_S = POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + HEARTBEAT_INTERVAL
+# A restart stamp further ahead than this is a clock that moved back, not a restart.
+_STUCK_POLL_CLOCK_SKEW_S = 60
+# The stall exit's code and restart-owner gate: one relaunch contract for both exits.
+STUCK_POLL_EXIT_CODE = POLL_STALL_EXIT_CODE
+_POLL_TIMED_OUT = "poll timed out: the relay held the task poll past the read timeout"
+_POLL_STREAK = {"timeouts": 0, "since": None, "stuck_since": None, "held_logged": False,
+                "stamp_logged": False, "unrecorded_logged": False, "unowned_logged": False}
+# When this process first found the restart stamp unreadable; one hold per episode.
+_BAD_STAMP = {"seen_at": None}
+
+
+def _poll_streak_reset() -> None:
+    if _POLL_STREAK["stuck_since"] is not None:
+        _log(f"stuck relay poll cleared after {_POLL_STREAK['timeouts']} timeouts")
+    _POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False,
+                        stamp_logged=False, unrecorded_logged=False, unowned_logged=False)
+
+
+def _log_stamp_once(msg: str) -> None:
+    if not _POLL_STREAK["stamp_logged"]:
+        _POLL_STREAK["stamp_logged"] = True
+        _log(f"stuck relay poll: {msg}")
+
+
+def _write_stuck_stamp(now: float) -> bool:
+    try:
+        written = _durable_write(STUCK_POLL_RECOVERY_FILE, json.dumps({"at": int(now)}))
+    except Exception:  # noqa: BLE001 — a state write must never break the poll loop
+        return False
+    if written:
+        _BAD_STAMP["seen_at"] = None
+    return written
+
+
+def _last_stuck_recovery(now: float) -> "float | None":
+    """When the last stuck-poll restart ran, or None when none did. An unreadable
+    stamp counts as a restart when first seen, so it holds for one interval only."""
+    try:
+        at = json.loads(STUCK_POLL_RECOVERY_FILE.read_text())["at"]
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not abs(at) < float("inf"):
+            raise ValueError(f"bad stamp {at!r}")
+    except FileNotFoundError:
+        _BAD_STAMP["seen_at"] = None
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        if _BAD_STAMP["seen_at"] is None:
+            _log(f"stuck relay poll: restart stamp unreadable ({type(e).__name__}) — holding "
+                 f"the next restart for {STUCK_POLL_RECOVERY_INTERVAL_S}s")
+            _write_stuck_stamp(now)
+            _BAD_STAMP["seen_at"] = now
+        return _BAD_STAMP["seen_at"]
+    _BAD_STAMP["seen_at"] = None
+    if at > now + _STUCK_POLL_CLOCK_SKEW_S:
+        _log_stamp_once(f"restart stamp is {int(at - now)}s in the future (clock moved back) "
+                        "— ignoring it")
+        return None
+    return float(at)
+
+
+def _stuck_poll_restart_due(now: float) -> bool:
+    """Count one timed-out task poll; True when the bridge should exit and be
+    relaunched, which happens at most once per STUCK_POLL_RECOVERY_INTERVAL_S."""
+    s = _POLL_STREAK
+    if not s["timeouts"]:
+        s["since"] = now
+    s["timeouts"] += 1
+    other_ok = _LAST_REQ_OK["at"]
+    if (s["timeouts"] < STUCK_POLL_TIMEOUTS or other_ok <= s["since"]
+            or now - other_ok > STUCK_POLL_OTHER_OK_WITHIN_S):
+        s["stuck_since"] = None  # the rest stopped answering too: an outage, not a stuck poll
+        return False
+    if s["stuck_since"] is None:
+        s["stuck_since"] = now
+        _log(f"stuck relay poll: {s['timeouts']} consecutive task polls timed out while "
+             f"other requests to {_redact_url(URL)} succeed — the relay is not serving this agent")
+    if not POLL_STALL_RESTART_OWNER:
+        if not s["unowned_logged"]:
+            s["unowned_logged"] = True
+            _log("stuck relay poll: no restart owner declared (SUTANDO_BRIDGE_RESTART_OWNER "
+                 "unset) — staying up, since nothing would relaunch this lane")
+        return False
+    last = _last_stuck_recovery(now)
+    if last is not None and now - last < STUCK_POLL_RECOVERY_INTERVAL_S:
+        if not s["held_logged"]:
+            s["held_logged"] = True
+            _log(f"stuck relay poll: the last restart was {int(now - last)}s ago — next one "
+                 f"allowed in {int(STUCK_POLL_RECOVERY_INTERVAL_S - (now - last))}s")
+        return False
+    # The stamp is what bounds the restarts; unwritten, restarting could loop.
+    if not _write_stuck_stamp(now):
+        if not s["unrecorded_logged"]:
+            s["unrecorded_logged"] = True
+            _log("stuck relay poll: could not record the restart — staying up")
+        return False
+    return True
+
+
+# Set once a stuck-poll exit has begun: the loop then only waits for the outbound worker.
+_STUCK_EXIT_PENDING = False
+
+
+def _on_poll_timeout(inflight: set[str], before_exit: Callable[[], bool]) -> bool:
+    """Count one held task poll; exit for a relaunch once that makes a stuck session.
+    True while the exit waits for the outbound worker: the caller must skip the beat."""
+    global _STUCK_EXIT_PENDING
+    if not _STUCK_EXIT_PENDING:
+        if not _stuck_poll_restart_due(time.time()):
+            return False
+        _STUCK_EXIT_PENDING = True
+        _emit_gateway_status(False, error="stuck relay poll — restarting the bridge")
+    if not before_exit():
+        _log("stuck relay poll: exit held — the outbound worker is still finishing a send")
+        return True
+    _save_inflight(inflight)  # claimed tasks reload from it on start
+    _log(f"stuck relay poll: exiting {STUCK_POLL_EXIT_CODE} so {POLL_STALL_RESTART_OWNER} "
+         "relaunches the bridge")
+    sys.exit(STUCK_POLL_EXIT_CODE)
+
+
 def _poll_stalled(last_ok: float, now: float,
                   limit: float = POLL_STALL_EXIT_S) -> bool:
     """Whether the poll loop has gone `limit` seconds without a success."""
@@ -8728,11 +8874,13 @@ def main() -> None:
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
+    stop_workers = lambda: _stop_background_workers(_outbound_thread, _results_watcher)  # noqa: E731
     while True:
         _stamp_loop_progress()
         try:
-            if _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
-                    _outbound_thread, _results_watcher)):
+            if _abort_if_poll_stalled(stall_anchor, stop_workers):
+                continue
+            if _STUCK_EXIT_PENDING and _on_poll_timeout(inflight, stop_workers):
                 continue
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
@@ -8758,21 +8906,30 @@ def main() -> None:
             _RESP_META.last = None
             try:
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10)
+                            timeout=POLL_READ_TIMEOUT_S)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = time.monotonic()
+                _poll_streak_reset()
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
+                if _on_poll_timeout(inflight, stop_workers):  # may exit
+                    continue
                 if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise
-                _log(f"poll read timed out after {POLL_WAIT + 10}s inside the "
+                _log(f"poll read timed out after {POLL_READ_TIMEOUT_S}s inside the "
                      f"{POLL_TIMEOUT_GRACE_S:g}s grace — treated as an empty poll")
                 resp = {"tasks": []}
+            except _NETWORK_ERRORS:
+                # Not a held poll. HTTPError is a URLError, so a poll answered 502 ends the
+                # streak too: the relay answered the poll instead of holding it.
+                _poll_streak_reset()
+                raise
             received_at = time.monotonic()           # the dropped-ack retry budget runs from here
-            if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
+            answered = poll_grace_since != prev_ok   # a real answer, not the grace path
+            if poll_failures and answered:
                 _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
                 poll_failures = 0
             added = False
@@ -8801,7 +8958,9 @@ def main() -> None:
             # raising, so a broker without the endpoints costs one deferred log.
             _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
-            _emit_gateway_status(last_poll_ok is not None, poll_ok_ts=last_poll_ok)
+            # A timed-out poll stamps nothing: last_ok_ts stays at the last answered poll.
+            _emit_gateway_status(last_poll_ok is not None, poll_ok_ts=last_poll_ok,
+                                 error=None if answered else _POLL_TIMED_OUT)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 if _recover_auth(e.code):

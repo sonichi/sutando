@@ -2722,7 +2722,7 @@ def main() -> int:
     # bridge off (up to 60s) and flipped gateway-status.json to
     # `connected: false` while tasks were still arriving and results delivering.
     grace = rtc.POLL_TIMEOUT_GRACE_S
-    check(grace >= rtc.POLL_WAIT + 10,
+    check(grace >= rtc.POLL_READ_TIMEOUT_S,
           "poll-timeout: the grace covers at least one whole poll window")
     check(rtc._poll_timeout_is_empty(1000.0, 1000.0),
           "poll-timeout: a timeout right after a good poll reads as an empty poll")
