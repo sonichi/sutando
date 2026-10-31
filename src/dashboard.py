@@ -968,9 +968,15 @@ h1{color:#fff;border-bottom:1px solid #333;padding-bottom:10px}
 <div id="viewer" style="display:none"><a href="#" class="back" onclick="showList();return false">&larr; Back</a><div class="note-content" id="content"></div></div>
 <script>
 async function load(){const r=await fetch('/notes');const notes=await r.json();const ul=document.getElementById('list');
-ul.innerHTML=notes.map(n=>`<li><a href="#" onclick="showNote('${n.slug}');return false">${n.title}</a><span class="date">${new Date(n.modified*1000).toLocaleDateString()}</span></li>`).join('')}
+ul.replaceChildren(...notes.map(n=>{const li=document.createElement('li');const a=document.createElement('a');a.href='#';a.textContent=n.title;
+a.addEventListener('click',e=>{e.preventDefault();showNote(n.slug)});const d=document.createElement('span');d.className='date';
+d.textContent=new Date(n.modified*1000).toLocaleDateString();li.append(a,d);return li}))}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+// Only http(s), mailto and scheme-less (relative) link targets render as links.
+function safeHref(u){return /^(https?|mailto):/i.test(u)||!/^[^\\/?#]*:/.test(u)}
 function md(t){
 t=t.replace(/^---[\\s\\S]*?---\\n/,'');
+t=esc(t);
 t=t.replace(/^### (.+)$/gm,'<h3>$1</h3>');
 t=t.replace(/^## (.+)$/gm,'<h2>$1</h2>');
 t=t.replace(/^# (.+)$/gm,'<h1>$1</h1>');
@@ -980,11 +986,11 @@ t=t.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
 t=t.replace(/\\*(.+?)\\*/g,'<em>$1</em>');
 t=t.replace(/^[\\-\\*] (.+)$/gm,'<li>$1</li>');
 t=t.replace(/(<li>.*<\\/li>\\n?)+/g,'<ul>$&</ul>');
-t=t.replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>');
-t=t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,'<a href="$2">$1</a>');
+t=t.replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>');
+t=t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,(m,label,url)=>safeHref(url)?'<a href="'+url+'" rel="noopener noreferrer">'+label+'</a>':label);
 t=t.replace(/\\n\\n/g,'<br><br>');
 return t}
-async function showNote(slug){const r=await fetch('/notes/'+slug);const text=await r.text();document.getElementById('content').innerHTML=md(text);
+async function showNote(slug){const r=await fetch('/notes/'+encodeURIComponent(slug));const text=await r.text();document.getElementById('content').innerHTML=md(text);
 document.getElementById('app').style.display='none';document.getElementById('viewer').style.display='block'}
 function showList(){document.getElementById('app').style.display='block';document.getElementById('viewer').style.display='none'}
 load()
