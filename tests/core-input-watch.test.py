@@ -752,11 +752,24 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         self.assertEqual(st, "idle-ready")
 
     def test_the_watcher_carries_the_previous_capture_between_polls(self):
+        self.assertEqual(self._watch([_TURN_A, _TURN_B], [0.0, 3.0]), ["running", "running"])
+
+    def test_the_watcher_reads_hung_once_the_turn_has_stood_still_past_the_bound(self):
+        frozen = _mod.FROZEN_TURN_S
+        states = self._watch([_TURN_A, _TURN_A_TICKED, _TURN_A_TICKED], [0.0, frozen - 1, frozen + 1])
+        self.assertEqual(states, ["running", "running", "hung"])
+
+    def _watch(self, frames, clock):
         import sys
         import tempfile
         from unittest.mock import patch
         out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
-        panes, states = iter([_TURN_A, _TURN_B]), []
+        panes, states, times = iter(frames), [], iter(clock)
+        now = [0.0]
+
+        def _capture(_s, _sess):
+            now[0] = next(times)
+            return next(panes)
 
         class _RH:
             TMUX_SOCKET = SESSION = None
@@ -770,18 +783,19 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         def _sleep(_s):
             with open(out) as f:
                 states.append(json.load(f)["state"])
-            if len(states) == 2:
+            if len(states) == len(frames):
                 raise _Stop
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
-        with patch.object(_mod, "capture_styled", lambda s, sess: next(panes)), \
+        with patch.object(_mod, "capture_styled", _capture), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "session_runtime", lambda *a: None), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod.time, "time", lambda: now[0]), \
                 patch.object(_mod.time, "sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
             main()
-        self.assertEqual(states, ["hung", "running"])
+        return states
 
 
 class TestRefusedTurn(unittest.TestCase):
@@ -1217,6 +1231,45 @@ _CODEX_IDLE = f"• Done — PR #5169 updated.\n\n» Ask Codex to do anything\n\
 _CODEX_IDLE_CARET = f"• Done.\n\n› Improve documentation in @filename\n\n{_CODEX_FOOTER}"
 _CODEX_WORKING = f"• Working (3m 02s • esc to interrupt)\n\n› \n\n{_CODEX_FOOTER}"
 _CODEX_PICKER = f"  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven model\n\n{_CODEX_FOOTER}"
+
+
+# A Codex core mid-turn, three seconds apart: the model is thinking, so only the clock moved.
+_CODEX_THINKING_A = f"• Ran gh pr list --state open\n  └ #4944 feat(health): …\n\n• Working (1m 12s • esc to interrupt)\n\n› \n\n{_CODEX_FOOTER}"
+_CODEX_THINKING_B = _CODEX_THINKING_A.replace("1m 12s", "1m 15s")
+
+
+class TestAQuietTurnIsNotHung(unittest.TestCase):
+    """A core that writes no fresh core-status (a Codex core, or any long turn) read hung on the
+    first poll its turn printed nothing new, and /health showed it red while it worked (#6063)."""
+
+    def test_a_codex_turn_quiet_for_one_poll_reads_running(self):
+        st, detail, prompt, _k = compose_state(_CODEX_THINKING_B, "unknown", True,
+                                               prev_pane=_CODEX_THINKING_A, runtime="codex", still_s=3.0)
+        self.assertEqual((st, detail, prompt), ("running", "actively processing", None))
+
+    def test_a_turn_still_past_the_bound_reads_hung(self):
+        for runtime, pane, prev in (("codex", _CODEX_THINKING_B, _CODEX_THINKING_A),
+                                    (None, _TURN_A_TICKED, _TURN_A)):
+            with self.subTest(runtime=runtime):
+                st, *_ = compose_state(pane, "unknown", True, prev_pane=prev, runtime=runtime,
+                                       still_s=_mod.FROZEN_TURN_S)
+                self.assertEqual(st, "hung")
+
+    def test_a_still_pane_with_no_turn_in_flight_is_not_vouched_for(self):
+        st, *_ = compose_state(f"Running step 3...\n{_CODEX_FOOTER}", "unknown", True,
+                               runtime="codex", still_s=3.0)
+        self.assertEqual(st, "hung")
+
+    def test_still_step_counts_from_the_last_change_ignoring_the_clock(self):
+        pair, age = _mod.still_step(_CODEX_THINKING_A, None, 100.0)
+        self.assertEqual(age, 0.0)
+        pair, age = _mod.still_step(_CODEX_THINKING_B, pair, 103.0)
+        self.assertEqual(age, 3.0)
+        pair, age = _mod.still_step(_CODEX_THINKING_B.replace("1m 15s", "6m 0s"), pair, 400.0)
+        self.assertEqual(age, 300.0)
+        _pair, age = _mod.still_step(_CODEX_THINKING_B + "\n• Ran npm test", pair, 401.0)
+        self.assertEqual(age, 0.0)
+        self.assertEqual(_mod.still_step(None, pair, 402.0), (None, None))
 
 
 class TestCodexIdleIsNotHung(unittest.TestCase):

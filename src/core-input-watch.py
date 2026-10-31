@@ -404,7 +404,7 @@ def owes_work(seat, workspace):
 
 
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
-                  styled_pane: "str | None" = None, limit_stale=False):
+                  styled_pane: "str | None" = None, limit_stale=False, still_s=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -419,6 +419,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     `styled_pane` is the same capture taken WITH escapes, when the caller has one
     (see `classify()`); omitted it changes nothing else here.
     `limit_stale` (from `limit_step`) drops a limit banner the seat has outrun.
+    `still_s` is how long the normalised pane has been unchanged (see `still_step`).
     """
     if limit_stale and pane:
         pane = strip_limit_banners(pane)
@@ -465,7 +466,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         # frozen) still reads hung, preserving genuine wedge detection.
         if pane and _is_idle_ready(pane, runtime):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
-        if pane and _turn_moving(pane, prev_pane):
+        if pane and _turn_moving(pane, prev_pane, still_s):
             return "running", _BASE_TO_STATE["working"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         if process is None:  # no session observed = no wedge evidence; never RECOVER
@@ -475,11 +476,29 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     return state, detail, None, None
 
 
-def _turn_moving(pane, prev_pane):
-    """A turn in flight whose pane changed since the last poll. Clocks and spinners are
-    normalised away, so a frozen CLI whose timer still ticks is not motion."""
-    return (prev_pane is not None and cli_wedge.frame_working(pane)
-            and cli_wedge.state_id(pane) != cli_wedge.state_id(prev_pane))
+#: A turn in flight is frozen only once its pane has stood still this long: one quiet poll is a
+#: model thinking or a long command running. The same bound cli_wedge holds a static pane to.
+FROZEN_TURN_S = cli_wedge.PROVISIONAL_THRESHOLDS["static_high_conf_s"]
+
+
+def _turn_moving(pane, prev_pane, still_s=None):
+    """A turn in flight whose pane changed since the last poll, or within FROZEN_TURN_S. Clocks
+    and spinners are normalised away, so a frozen CLI whose timer still ticks is not motion."""
+    if not cli_wedge.frame_working(pane):
+        return False
+    if still_s is not None and still_s < FROZEN_TURN_S:
+        return True
+    return prev_pane is not None and cli_wedge.state_id(pane) != cli_wedge.state_id(prev_pane)
+
+
+def still_step(pane, prev, now):
+    """((frame id, unchanged since), seconds unchanged) after one capture; `prev` is the last
+    call's pair, None at start. A missing capture is no frame, so its age is None."""
+    if not pane:
+        return None, None
+    fid = cli_wedge.state_id(pane)
+    since = prev[1] if prev and prev[0] == fid else now
+    return (fid, since), now - since
 
 
 # ---- Bundled-context probes (NOT part of runtime-health's coarse health). --- #
@@ -963,6 +982,7 @@ def main():
     idle_ticks = 0
     login_since = None
     prev_pane = None
+    still = None
     banner_baseline = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
@@ -978,11 +998,12 @@ def main():
         last_runtime = runtime
         limit_stale, banner_baseline = limit_step(pane, banner_baseline, workspace, a.socket, a.session,
                                                    owes_work=owes_work(a.seat, workspace))
+        still, still_s = still_step(pane, still, time.time())
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale)
+            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 
