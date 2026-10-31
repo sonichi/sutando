@@ -78,7 +78,28 @@ DELIBERATE="$STATE_DIR/deliberate-restart"
 DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
 ALERT_STAMP="$STATE_DIR/$CHANNEL.last-alert"
 ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
-_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
+# Burst limit: the 4th notice inside the window says "repeatedly" and opens a long quiet period.
+ALERT_TIMES="$STATE_DIR/$CHANNEL.alert-times"
+ALERT_QUIET="$STATE_DIR/$CHANNEL.alert-quiet-until"
+ALERT_BURST_MAX=3
+ALERT_BURST_WINDOW_S="${SUTANDO_BRIDGE_ALERT_BURST_WINDOW_S:-3600}"
+ALERT_QUIET_S="${SUTANDO_BRIDGE_ALERT_QUIET_S:-21600}"
+# 78 == channel_auth_exit.EXIT_AUTH_REJECTED (src/channel_auth_exit.py): the provider rejected the token.
+EXIT_AUTH_REJECTED=78
+AUTH_HELD="$STATE_DIR/$CHANNEL.auth-held"
+AUTH_HOLD_POLL_S="${SUTANDO_BRIDGE_AUTH_HOLD_POLL_S:-30}"
+case "$CHANNEL" in
+  slack) AUTH_KEYS="SLACK_BOT_TOKEN or SLACK_APP_TOKEN" ;;
+  *) AUTH_KEYS="$TOKEN_VAR" ;;
+esac
+_age() { local t; t="$(head -n 1 "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
+_stamp() { local t; t="$(head -n 1 "$1" 2>/dev/null || echo 0)"; echo "${t:-0}"; }
+publish_notice() {  # $1=file tag, $2=text
+  printf '%s\n' "$2" \
+    | "$PYTHON" "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-$CHANNEL-bridge-$1-$NOW.txt" \
+    || echo "[$CHANNEL-bridge-wrapper] could not publish the $1 notice" >&2
+  osascript -e "display notification \"$2\" with title \"Sutando\"" >/dev/null 2>&1 || true
+}
 emit_restart_alert() {
   NOW="$(date +%s)"
   echo "[$CHANNEL-bridge-wrapper] previous process exited; automatically restarting" >&2
@@ -86,17 +107,52 @@ emit_restart_alert() {
     echo "[$CHANNEL-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
     return 0
   fi
+  if [ "$(_stamp "$ALERT_QUIET")" -gt "$NOW" ]; then
+    echo "[$CHANNEL-bridge-wrapper] restarting repeatedly; notices quiet until $(_stamp "$ALERT_QUIET")" >&2
+    return 0
+  fi
   if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
     echo "[$CHANNEL-bridge-wrapper] alert cooldown active; not repeating" >&2
     return 0
   fi
   echo "$NOW" > "$ALERT_STAMP"
-  printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." \
-    | "$PYTHON" "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt" \
-    || echo "[$CHANNEL-bridge-wrapper] could not publish the restart alert" >&2
-  osascript -e "display notification \"The $CHANNEL bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
+  local recent
+  recent="$(awk -v c=$(( NOW - ALERT_BURST_WINDOW_S )) '$1 > c' "$ALERT_TIMES" 2>/dev/null || true)"
+  if [ -n "$recent" ] && [ "$(printf '%s\n' "$recent" | wc -l)" -ge "$ALERT_BURST_MAX" ]; then
+    echo $(( NOW + ALERT_QUIET_S )) > "$ALERT_QUIET"
+    rm -f "$ALERT_TIMES"
+    publish_notice restarting-repeatedly \
+      "⚠️ The $CHANNEL bridge is restarting repeatedly; see logs/$CHANNEL-bridge.log. No further restart notices for $(( ALERT_QUIET_S / 3600 )) hours."
+    return 0
+  fi
+  { [ -z "$recent" ] || printf '%s\n' "$recent"; echo "$NOW"; } > "$ALERT_TIMES.tmp" && mv "$ALERT_TIMES.tmp" "$ALERT_TIMES"
+  publish_notice restarted "⚠️ The $CHANNEL bridge exited and was automatically restarted."
 }
-if [ -f "$MARKER" ]; then emit_restart_alert; fi
+# Exit 0 is no way out: KeepAlive is unconditional, so launchd would relaunch at once.
+# Hold, with no child, until a deliberate-restart stamp newer than the one this child launched under.
+hold_for_credentials() {
+  NOW="$(date +%s)"
+  echo "[$CHANNEL-bridge-wrapper] held: credential rejected ($AUTH_KEYS); vault set <KEY> <value>, then bash src/restart.sh" >&2
+  # The held file records the stamp each rejection ran under: one notice per owner restart, across relaunches.
+  if [ ! -f "$AUTH_HELD" ] || [ "$LAUNCH_STAMP" -gt "$(_stamp "$AUTH_HELD")" ]; then
+    # The launch stamp in the name keeps a retry's notice from overwriting one sent the same second.
+    publish_notice "auth-failed-r$LAUNCH_STAMP" \
+      "⚠️ The $CHANNEL bridge is stopped: the provider rejected its token ($AUTH_KEYS). Store a valid one with \`vault set <KEY> <value>\`, then restart Sutando (bash src/restart.sh); a stale token in that channel's .env wins over the vault, so clear it there too. It will not retry until then."
+  fi
+  printf '%s\n%s\n' "$LAUNCH_STAMP" "$$" > "$AUTH_HELD"
+  while [ "$STOPPING" = 0 ] && [ "$(_stamp "$DELIBERATE")" -le "$LAUNCH_STAMP" ]; do
+    sleep "$AUTH_HOLD_POLL_S" &
+    CHILD_PID=$!
+    set +e
+    wait "$CHILD_PID"
+    set -e
+    CHILD_PID=''
+  done
+  [ "$STOPPING" = 0 ] && echo "[$CHANNEL-bridge-wrapper] deliberate restart seen; retrying once" >&2
+  return 0
+}
+# A relaunch out of an auth hold is not a crash; the held notice already went out.
+if [ -f "$MARKER" ] && [ ! -f "$AUTH_HELD" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"
 
 # Remove a pre-existing bare process for this channel before exec — but ONLY one
@@ -132,6 +188,7 @@ stop_wrapper() {
 trap stop_wrapper TERM INT HUP
 RESTART_DELAY="${SUTANDO_CHANNEL_BRIDGE_RESTART_DELAY:-10}"
 while [ "$STOPPING" = 0 ]; do
+  LAUNCH_STAMP="$(_stamp "$DELIBERATE")"
   "$PYTHON" "$REPO/src/$CHANNEL-bridge.py" &
   CHILD_PID=$!
   set +e
@@ -146,7 +203,12 @@ while [ "$STOPPING" = 0 ]; do
   # Clear the marker too: launchd KeepAlive is unconditional, so exiting hands
   # the respawn back to launchd, which re-enters above and alerts off a marker
   # this run left behind.
-  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER" "$AUTH_HELD"; exit 0; }
+  if [ "$CHILD_RC" -eq "$EXIT_AUTH_REJECTED" ]; then
+    hold_for_credentials
+    continue
+  fi
+  rm -f "$AUTH_HELD"
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!

@@ -9700,6 +9700,16 @@ def _worker_hard_timeout_s() -> float:
     return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
 
 
+def _bridge_auth_held(channel: str) -> bool:
+    """True while channel-bridge-wrapper.sh holds this bridge on a rejected token (stamp: epoch, wrapper pid)."""
+    stamp = WORKSPACE_DIR / "state" / "channel-bridge-supervisor" / f"{channel}.auth-held"
+    try:
+        lines = stamp.read_text().split()
+        return len(lines) >= 2 and _pid_alive(int(lines[1]))
+    except (OSError, ValueError):
+        return False
+
+
 def _task_claim_thresholds() -> tuple[float, float]:
     """(warn, down) seconds from the handler's configured hard timeout."""
     hard = _worker_hard_timeout_s()
@@ -13286,6 +13296,10 @@ def run_all_checks() -> list[dict]:
                         "detail": "process probe failed — bridge state unknown"}
                 _apply_pin_findings(_row, _pin_verdicts(name, None))
                 checks.append(_row)
+                continue
+            if _bridge_auth_held(channel_name):
+                checks.append({"name": name, "status": "fail", "detail": (
+                    "held: credential rejected — vault set the token, then bash src/restart.sh")})
                 continue
             # This exact detail string is a contract: fix_down_bridges()
             # matches it as a PREFIX to pick restart candidates (and the

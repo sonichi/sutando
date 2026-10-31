@@ -112,6 +112,7 @@ if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from channel_auth_exit import exit_auth_rejected  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 from slack_owner import resolve_proactive_owner_id  # noqa: E402
@@ -653,8 +654,46 @@ _username_cache_lock = threading.Lock()
 _event_count = 0
 _event_count_lock = threading.Lock()
 
+_SLACK_AUTH_ERRORS = frozenset({
+    "invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"})
+
+
+def _slack_auth_error(exc: BaseException) -> bool:
+    """True when Slack answered with a credential rejection, not a transport fault."""
+    resp = getattr(exc, "response", None)
+    try:
+        code = resp.get("error") if resp is not None else None
+    except Exception:  # noqa: BLE001 — an unreadable response is simply not an auth answer
+        code = None
+    if code is None:
+        # Bolt's auth.test failure carries the response only inside its message.
+        m = re.search(r"'error': '(\w+)'", str(exc))
+        code = m.group(1) if m else None
+    return code in _SLACK_AUTH_ERRORS
+
+
+def _build_app(app_cls=App):
+    """Construct the Bolt app; its eager auth.test rejecting the bot token exits 78."""
+    try:
+        return app_cls(token=BOT_TOKEN)
+    except Exception as e:
+        if _slack_auth_error(e):
+            exit_auth_rejected("slack", "SLACK_BOT_TOKEN")
+        raise
+
+
+def _start_socket_mode(handler) -> None:
+    """Block on Socket Mode; apps.connections.open rejecting the app token exits 78."""
+    try:
+        handler.start()
+    except Exception as e:
+        if _slack_auth_error(e):
+            exit_auth_rejected("slack", "SLACK_APP_TOKEN")
+        raise
+
+
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
-app = App(token=BOT_TOKEN)
+app = _build_app()
 
 # Handler reference so the heartbeat writer can read LIVE socket state; the
 # heartbeat thread starts first, so main() wires this just before handler.start().
@@ -1936,7 +1975,7 @@ def main():  # pragma: no cover
     handler = SocketModeHandler(app, APP_TOKEN)
     global _socket_handler
     _socket_handler = handler  # let the heartbeat thread read live socket state
-    handler.start()  # blocks
+    _start_socket_mode(handler)  # blocks
 
 
 if __name__ == "__main__":
