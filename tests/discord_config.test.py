@@ -32,6 +32,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import discord_config  # noqa: E402
+import result_markers  # noqa: E402
 
 
 # ----- test plumbing ------------------------------------------------------
@@ -182,6 +183,40 @@ def test_returns_none_when_exhausted():
             discord_config.resolve_owner_id(access),
             None,
             "no config path matches → None (caller does bot-filter)",
+        )
+
+
+def test_dm_only_route():
+    """The bridge's delivery decision for the dm-only action: reroute to the
+    owner's DM, hold when no owner resolves, leave DMs and unmarked bodies alone."""
+    with workspace_env() as (_, _):
+        dm_actions = result_markers.parse_markers("[dm-only]\nprivate").actions
+        plain = result_markers.parse_markers("ordinary").actions
+        access = {"allowFrom": ["111", "222"], "tierMap": {"222": "owner"}}
+        expect_eq(
+            discord_config.dm_only_route(dm_actions, False, access, config={}),
+            (True, "222"),
+            "dm-only on a guild channel reroutes to the resolved owner",
+        )
+        expect_eq(
+            discord_config.dm_only_route(dm_actions, True, access, config={}),
+            (False, None),
+            "a source DM already satisfies dm-only — no reroute",
+        )
+        expect_eq(
+            discord_config.dm_only_route(plain, False, access, config={}),
+            (False, None),
+            "an unmarked body keeps the source channel",
+        )
+        expect_eq(
+            discord_config.dm_only_route(dm_actions, False, {"allowFrom": []}, config={}),
+            (True, None),
+            "marker present but no owner → unroutable (caller retries)",
+        )
+        expect_eq(
+            discord_config.dm_only_route(dm_actions, False, {}, config={"owner": "9"}),
+            (True, "9"),
+            "workspace owner field resolves the reroute target",
         )
 
 
@@ -340,6 +375,7 @@ def main() -> int:
         test_seed_is_idempotent,
         test_save_load_roundtrip,
         test_load_returns_empty_on_corrupt_file,
+        test_dm_only_route,
     ]
     for t in tests:
         try:

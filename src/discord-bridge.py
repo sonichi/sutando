@@ -159,8 +159,10 @@ def _is_discord_channel_id(value: str) -> bool:
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
+import policy.context.discord as discord_context_policy  # noqa: E402
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
+from channels.discord.client import validator_refusal  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from result_publish import publish_text  # noqa: E402
@@ -1007,20 +1009,8 @@ def load_channel_allowed(channel_id):
     return cfg[1]
 
 def load_channel_context_blacklist(channel_id):
-    """Context-source BLACKLIST: ids this channel must NOT pull context from, via
-    `contextNotFrom` in access.json (mirrors allowFrom's per-channel shape). Same axis-style as
-    allowFrom (who may send) but for INFORMATION FLOW (which channels' content may be pulled into
-    a reply here). Entries may be CHANNEL ids or GUILD ids (a guild id blocks every channel in
-    that guild). Returns a set of id strings (empty if unconfigured). Used to gate the
-    Discord-state prefetch so e.g. #dev can be barred from pulling a private guild's content."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        grp = data.get("groups", {}).get(str(channel_id))
-        if isinstance(grp, dict):
-            return {str(c) for c in (grp.get("contextNotFrom") or [])}
-    except Exception:
-        pass
-    return set()
+    return discord_context_policy.load_channel_context_blacklist(
+        channel_id, access_file=ACCESS_FILE)
 
 def _should_notify_owner_on_seed(sender_id, owner_ids):
     """True iff a thread auto-seed should @-mention the owner.
@@ -1609,14 +1599,25 @@ async def _prefetch_discord_state_refs(user_task_text, origin_channel_id=None):
     blocks = []
     for ref in ordered_refs:
         if _ctx_blacklist:
+            if str(ref) in _ctx_blacklist:
+                print(f"  [discord-state-prefetch] ref <#{ref}> blocked by contextNotFrom for channel {origin_channel_id} — skipping", flush=True)
+                continue
             _ref_guild = ""
             try:
                 _rc = client.get_channel(int(ref)) or await asyncio.wait_for(
                     client.fetch_channel(int(ref)), timeout=_PREFETCH_PER_REF_TIMEOUT_S)
+                if _rc is None:
+                    raise RuntimeError("channel lookup returned no channel")
                 _ref_guild = str(getattr(getattr(_rc, "guild", None), "id", "") or "")
-            except Exception:
-                _ref_guild = ""
-            if str(ref) in _ctx_blacklist or (_ref_guild and _ref_guild in _ctx_blacklist):
+            except Exception as e:
+                print(f"  [discord-state-prefetch] ref <#{ref}> could not be resolved while contextNotFrom is active: {e}; failing whole prefetch", flush=True)
+                return None
+            if not _ref_guild:
+                # An unresolved guild under an active blacklist cannot prove it is
+                # not the blocked guild — fail the prefetch rather than risk it.
+                print(f"  [discord-state-prefetch] ref <#{ref}> has no resolvable guild while contextNotFrom is active; failing whole prefetch", flush=True)
+                return None
+            if _ref_guild in _ctx_blacklist:
                 print(f"  [discord-state-prefetch] ref <#{ref}> (guild {_ref_guild or '?'}) blocked by contextNotFrom for channel {origin_channel_id} — skipping", flush=True)
                 continue
         formatted = await _fetch_discord_channel_messages(ref)
@@ -2855,6 +2856,31 @@ _NOT_ALLOWLISTED_ACK_TEXT = (
     "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
     "can't act on it. Ask the owner to add you. _(automated notice)_"
 )
+_GATEWAY_POST_VALIDATOR_UNSET = object()
+_GATEWAY_POST_VALIDATOR = _GATEWAY_POST_VALIDATOR_UNSET
+
+
+def _gateway_post_refusal(channel_id, payload) -> str | None:
+    global _GATEWAY_POST_VALIDATOR
+    if _GATEWAY_POST_VALIDATOR is _GATEWAY_POST_VALIDATOR_UNSET:
+        try:
+            from channels.discord.post_gate import resolve_validator
+            _GATEWAY_POST_VALIDATOR = resolve_validator()
+        except Exception as e:
+            return (f"validator resolution failed ({type(e).__name__}: {e}) — "
+                    "refusing the unvalidated send")
+    return validator_refusal(_GATEWAY_POST_VALIDATOR, channel_id, payload)
+
+
+def _not_allowlisted_ack_payload(reference=None) -> dict:
+    payload = {"content": _NOT_ALLOWLISTED_ACK_TEXT}
+    if reference is not None:
+        payload["message_reference"] = {
+            "message_id": str(reference.message_id),
+            "channel_id": str(reference.channel_id),
+            "fail_if_not_exists": False,
+        }
+    return payload
 
 
 def _not_allowlisted_ack_lock() -> asyncio.Lock:
@@ -2945,6 +2971,11 @@ async def _ack_not_allowlisted(
                 if message is not None
                 else None
             )
+            refusal = _gateway_post_refusal(
+                channel_id, _not_allowlisted_ack_payload(ref))
+            if refusal is not None:
+                print(f"  [not-allowlisted-ack] refused by post-gate: {refusal}", flush=True)
+                return
             try:
                 await channel.send(_NOT_ALLOWLISTED_ACK_TEXT, reference=ref)
             except Exception as e:
@@ -2958,6 +2989,11 @@ async def _ack_not_allowlisted(
                     "retrying without reference",
                     flush=True,
                 )
+                refusal = _gateway_post_refusal(
+                    channel_id, _not_allowlisted_ack_payload())
+                if refusal is not None:
+                    print(f"  [not-allowlisted-ack] retry refused by post-gate: {refusal}", flush=True)
+                    return
                 await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
             _not_allowlisted_ack_at[cooldown_key] = now
             persisted[cooldown_key] = now
@@ -3528,7 +3564,7 @@ async def _handle_discord_message(message, force=False):
                 channel_authorized = True
         else:
             # Channel not configured — fall back to global allowlist
-            if allowed and sender_id not in allowed:
+            if (allowed or policy != "pairing") and sender_id not in allowed:
                 print(f"  [skip] @{username} not in global allowlist", flush=True)
                 if bot_mentioned or role_mentioned:
                     await _ack_not_allowlisted(
@@ -5071,6 +5107,28 @@ async def poll_results():
                     # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
                         reply_to_id = source_message_anchor
+
+                    # [dm-only] delivers to the owner's DM; unroutable releases
+                    # the claim for retry rather than post to the source.
+                    try:
+                        _dm_access = json.loads(ACCESS_FILE.read_text())
+                    except Exception:
+                        _dm_access = {}
+                    _dm_reroute, _dm_owner = discord_config.dm_only_route(
+                        _parsed.actions, isinstance(channel, discord.DMChannel), _dm_access)
+                    if _dm_reroute:
+                        _dm_target = None
+                        if _dm_owner is not None:
+                            try:
+                                _dm_target = await (await client.fetch_user(int(_dm_owner))).create_dm()
+                            except Exception as e:
+                                print(f"  [dm-only] owner DM resolution failed for {task_id}: {e}", flush=True)
+                        if _dm_target is None:
+                            _drd.failed(RESULTS_DIR, _send_tok)
+                            print(f"  [dm-only] no owner DM for {task_id} — kept for retry", flush=True)
+                            continue
+                        channel = _dm_target
+                        reply_to_id = None
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different

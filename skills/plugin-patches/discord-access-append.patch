@@ -118,8 +118,8 @@
  
  ### `group rm-allow <channelId> <senderId>` (optional: extra IDs)
  
- Symmetric inverse of `group append`. Remove one or more sender IDs from an
- existing group's `allowFrom` without touching the rest of the entry.
+ Symmetric inverse of `group append`. Remove sender IDs while preserving a
+ non-empty per-channel `allowFrom` list.
  
 -1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user;
 -   nothing to do.

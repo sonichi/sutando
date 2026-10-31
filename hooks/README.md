@@ -24,7 +24,7 @@ the hook is present, and the guard is still not armed. Resolve the dir first:
 ```bash
 CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 mkdir -p "$CFG/hooks"
-cp hooks/context-source-guard.py "$CFG/hooks/"
+cp hooks/context-source-guard.py hooks/_shell_scan.py "$CFG/hooks/"
 # register under BOTH the Bash and Read PreToolUse matchers:
 CFG="$CFG" python3 - <<'PY'
 import json, os, shlex
@@ -365,7 +365,7 @@ correction written into the build log between the two occurrences.
 ```bash
 CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 mkdir -p "$CFG/hooks"
-cp hooks/release-target-guard.py "$CFG/hooks/"
+cp hooks/release-target-guard.py hooks/_shell_scan.py "$CFG/hooks/"
 ```
 
 Register it under the `Bash` PreToolUse matcher exactly as the guards above do

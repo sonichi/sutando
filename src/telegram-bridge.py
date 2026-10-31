@@ -266,6 +266,27 @@ def _resolve_proactive_owner_id(env_override: str | None, access_data: dict) -> 
     return str(allow_list[0])
 
 
+def _reply_destination(chat_id, parsed, access_data: dict, env_override: str | None):
+    if not any(action.kind == "dm-only" for action in parsed.actions):
+        return chat_id
+    try:
+        is_private = int(chat_id) > 0
+    except (TypeError, ValueError, OverflowError):
+        is_private = False
+    if is_private:
+        return chat_id
+    owner_id = _resolve_proactive_owner_id(env_override, access_data)
+    if owner_id is None:
+        return None
+    try:
+        return int(owner_id)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+_DM_ONLY_UNROUTABLE_LOGGED: set[str] = set()
+
+
 def tofu_onboard(sender_id, username):
     """First-time auto-onboard: write access.json with this sender as owner.
 
@@ -305,6 +326,45 @@ def api(method, **params):
         body = e.read().decode()
         print(f"API error {e.code}: {body}")
         return {"ok": False}
+
+_PENDING_NOTICES_FILE = REPO / "state" / "telegram-pending-notices.json"
+# A refused notice is retried at most this often; the file is rewritten only when it changes.
+_NOTICE_RETRY_DELAY = 30
+
+
+def _load_pending_notices():
+    try:
+        return {str(k): v for k, v in json.loads(_PENDING_NOTICES_FILE.read_text()).items()}
+    except Exception:
+        return {}
+
+
+def _save_pending_notices(pending_notices):
+    try:
+        _PENDING_NOTICES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _PENDING_NOTICES_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pending_notices))
+        os.replace(tmp, _PENDING_NOTICES_FILE)
+    except Exception:
+        pass
+
+
+def _send_redirect_notice(pending_notices, task_id, chat_id):
+    """Post the group redirect notice; queue task_id when refused or raised."""
+    try:
+        notice = api("sendMessage", chat_id=chat_id,
+                     text="Sent you the reply in a private chat.")
+    except Exception:
+        notice = None
+    if (notice or {}).get("ok"):
+        if pending_notices.pop(task_id, None) is not None:
+            _save_pending_notices(pending_notices)
+        return True
+    if pending_notices.get(task_id) != chat_id:
+        pending_notices[task_id] = chat_id
+        _save_pending_notices(pending_notices)
+    return False
+
 
 INBOX_DIR = REPO / "telegram-inbox"
 INBOX_DIR.mkdir(exist_ok=True)
@@ -759,6 +819,8 @@ def main():  # pragma: no cover
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
+    pending_notices = _load_pending_notices()  # task_id -> group chat_id owed a redirect notice
+    _notice_retry_at = {}
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
@@ -1155,6 +1217,14 @@ def main():  # pragma: no cover
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
 
+        _notice_now = time.time()
+        for _task_id, _chat_id in list(pending_notices.items()):
+            if _notice_now < _notice_retry_at.get(_task_id, 0):
+                continue
+            _notice_retry_at[_task_id] = _notice_now + _NOTICE_RETRY_DELAY
+            if _send_redirect_notice(pending_notices, _task_id, _chat_id):
+                _notice_retry_at.pop(_task_id, None)
+
         # Check for results to send back (includes any orphaned-by-restart
         # routing recovered from the task files themselves — see
         # _gather_pending_task_ids for why this must run every tick).
@@ -1164,7 +1234,8 @@ def main():  # pragma: no cover
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
                     continue
-                chat_id = pending_replies.pop(task_id)
+                origin_chat_id = pending_replies.pop(task_id)
+                chat_id = origin_chat_id
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
                 # sends attached files, and silently drops [channel:] redirects
@@ -1174,9 +1245,9 @@ def main():  # pragma: no cover
                 if any(a.kind == "skip" for a in parsed.actions):
                     _sk = next(a for a in parsed.actions if a.kind == "skip")
                     if _sk.value == "deduped":
-                        _rq, _disp = _dedup_recover(task_id, _sk.extra, chat_id)
+                        _rq, _disp = _dedup_recover(task_id, _sk.extra, origin_chat_id)
                         if _rq:
-                            pending_replies[_rq] = chat_id
+                            pending_replies[_rq] = origin_chat_id
                         if _disp == "retain":
                             print(f"  [dedup] report not delivered for {task_id} "
                                   f"— keeping for retry", flush=True)
@@ -1187,6 +1258,20 @@ def main():  # pragma: no cover
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+                env_override = (config_get_env_first("SUTANDO_DM_OWNER_ID", "") or "").strip()
+                try:
+                    access_data = json.loads(ACCESS_FILE.read_text())
+                except Exception:
+                    access_data = {}
+                destination = _reply_destination(
+                    origin_chat_id, parsed, access_data, env_override)
+                if destination is None:
+                    pending_replies[task_id] = origin_chat_id
+                    if task_id not in _DM_ONLY_UNROUTABLE_LOGGED:
+                        _DM_ONLY_UNROUTABLE_LOGGED.add(task_id)
+                        print(f"[Telegram] no private destination for {task_id}; keeping for retry", flush=True)
+                    continue
+                chat_id = destination
                 # Bound before the try: a raise below must not leave the archive
                 # gate reading an unassigned name.
                 delivered_ok = False
@@ -1232,10 +1317,14 @@ def main():  # pragma: no cover
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
                 if not delivered_ok:
-                    # Restore the route popped above, or a retry has no chat_id.
-                    pending_replies[task_id] = chat_id
+                    pending_replies[task_id] = origin_chat_id
                     print(f"[Telegram] reply refused, keeping {task_id} for retry", flush=True)
                     continue
+                if destination != origin_chat_id:
+                    # api() returns ok=False on HTTP errors instead of raising, so a
+                    # refused notice stays queued as its own retry entry.
+                    if not _send_redirect_notice(pending_notices, task_id, origin_chat_id):
+                        print(f"[Telegram] group notice for {task_id} refused; kept for retry", flush=True)
                 _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
