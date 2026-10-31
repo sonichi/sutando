@@ -397,6 +397,42 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     return "".join(block)
 
 
+def composer_has_line_break(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[bool]:
+    """Whether the composer's rows show a typed line break; None with no <glyph> line.
+
+    The CLI wraps one logical line greedily, so a soft-wrapped row is one the next row's
+    first word did not fit on. A blank row inside the box, or a row that word would have
+    fit on (against the widest row seen), is a hard newline. A break the next word could
+    not have fitted beside is indistinguishable from a wrap and reads as False.
+    """
+    lines = capture.splitlines()
+    start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _prompt_glyph(lines[i], adapter) is not None:
+            start = i
+            break
+    if start is None:
+        return None
+    block = lines[start:]
+    end = len(block)
+    for i in range(1, len(block)):
+        row = block[i]
+        if row.strip() and (BORDER_LINE.match(row) or adapter.idle_ready.search(row) or TIP_ROW.search(row)):
+            end = i
+            break
+    rows = [r.rstrip() for r in block[:end]]
+    if end == len(block):
+        while len(rows) > 1 and not rows[-1].strip():
+            rows.pop()
+    if any(not r.strip() for r in rows[1:]):
+        return True
+    width = max(len(r) for r in rows)
+    for row, nxt in zip(rows, rows[1:]):
+        if len(row) + 1 + len(nxt.split()[0]) <= width:
+            return True
+    return False
+
+
 def composer_frame_visible(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[bool]:
     """Whether the CLI's frame below the composer (its closing rule, the idle footer) is
     on screen; None with no <glyph> line. False = the box is cut by the screen bottom, so
@@ -753,6 +789,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     cf = sub.add_parser("composer-frame")
     cf.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    cb = sub.add_parser("composer-line-break")
+    cb.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp = sub.add_parser("healthy")
     hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
@@ -817,6 +855,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             return EXIT_UNSAFE
         print(text)
         return 0
+    if a.cmd == "composer-line-break":
+        broken = composer_has_line_break(_read_stdin(), adapter)
+        if broken is None:
+            print("pane_gate: no prompt line found — line breaks unknown", file=sys.stderr)
+            return EXIT_UNSAFE
+        print("yes" if broken else "no")
+        return 0 if broken else 1
     if a.cmd == "composer-frame":
         seen = composer_frame_visible(_read_stdin(), adapter)
         if seen is None:

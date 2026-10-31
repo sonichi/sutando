@@ -32,6 +32,8 @@ SOCK="$WORK/tmux.sock"
 STUB="$WORK/stub-notifier.sh"
 cat > "$STUB" <<'EOS'
 #!/bin/bash
+# The supervisor's one-shot after a stand-down; recorded, so scenario 2 can see it ran.
+if [ "${1:-}" = "--clear-staged" ]; then echo ran >> "$SUTANDO_STUB_MARKER.clear-staged"; exit 0; fi
 echo "$$" > "$SUTANDO_STUB_MARKER"
 trap 'rm -f "$SUTANDO_STUB_MARKER"; exit 0' TERM
 while true; do sleep 1; done
@@ -115,6 +117,12 @@ if wait_for_absent "$MARK1" 100; then
   echo "  PASS: scenario 2 -- notifier disarmed once the session-role watcher for its own inbox appeared"
 else
   echo "  FAIL: scenario 2 -- notifier still running after a same-inbox session watcher appeared"
+  fail=1
+fi
+if wait_for "$MARK1.clear-staged" 50; then
+  echo "  PASS: scenario 2 -- the stand-down ran the notifier's --clear-staged"
+else
+  echo "  FAIL: scenario 2 -- the stand-down never ran the notifier's --clear-staged"
   fail=1
 fi
 
