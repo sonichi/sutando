@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The cron-runner installer's post-install self-test must read the SAME
-`hosts/<label>/crons.json` the runner reads (#5165).
+`hosts/<label>/crons.json` the runner reads.
 
 The runner resolves the label through `_host_label()` (SUTANDO_HOST_LABEL >
 scutil LocalHostName > short hostname). The self-test used a bare
