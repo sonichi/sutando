@@ -342,6 +342,14 @@ class RenotifyTests(unittest.TestCase):
         req.revision = 3
         self.assertIsNone(renotify.due(req, {"event_id": "$e", "revision": 2}, T0 + 7 * HOUR))
 
+    def test_reminders_come_from_the_seat_plan_never_from_due(self):
+        # due() answers recovery only; plan() owns the seat's one reminder clock.
+        req = blocking()
+        ledger = {"event_id": "$e", "revision": req.revision, "notified_at": T0, "reminders": 0}
+        self.assertIsNone(renotify.due(req, ledger, T0 + 7 * HOUR))
+        self.assertEqual([n.notice for n in renotify.plan([(req, ledger)], T0 + 7 * HOUR)],
+                         [renotify.REMINDER])
+
     def test_a_cancelled_card_gets_neither_reminder_nor_recovery(self):
         req = blocking()
         req.status = STATUS_CANCELLED
