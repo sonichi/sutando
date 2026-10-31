@@ -5817,10 +5817,14 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["detail"] = f"{len(ledger)} ledger entr(y/ies) but none carry a parsable ts"
         return check
 
+    from quota_availability import models_match  # src/ is on sys.path
     own = _own_core_model()
+    # `default` names no model, so no rejection could ever be attributed to it.
+    if own and own.strip().lower() == "default":
+        own = None
     if own:
-        mine = [p for p in dated if p[0].get("model") == own]
-        others = [p for p in dated if p[0].get("model") != own]
+        mine = [p for p in dated if models_match(own, p[0].get("model"))]
+        others = [p for p in dated if not models_match(own, p[0].get("model"))]
         attribution = f"counting model={own}"
     else:
         mine, others = dated, []
