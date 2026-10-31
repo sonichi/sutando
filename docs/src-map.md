@@ -175,6 +175,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`progress_route.py`** — Where a task-progress update may be delivered: one provider-neutral verdict.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
+- **`public_write_privacy.py`** — What may not appear in text published where outsiders can read it.
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
 - **`quota_availability.py`** — Shared authority for whether Claude quota telemetry is usable.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.

@@ -23,5 +23,6 @@ Format: `- Brief description of what changed. ([#NNN])`
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
 
 ## Security
+- privacy: new `hooks/public-write-privacy-guard.py` (PreToolUse on Bash, auto-registered for the core, every worker and their subagents) refuses a `gh` PR / issue / release / `gh api` write to a non-private repo whose text names a private repo, room, person or agent from the host's `<workspace>/state/privacy/public-denylist.txt`, or carries a home-directory path, a Matrix room ID or an MXID, naming the term and its category. It fails closed on a body it cannot read. `scripts/seed-public-denylist.py` seeds the list from the host's private repos, rooms and rosters; the list never enters the repo. **Migration:** run `python3 scripts/seed-public-denylist.py` once per host. Until then the gate still refuses home paths, MXIDs and room IDs, skips the private-term list, and warns on stderr with that instruction.
 
 <!-- security fixes go here -->
