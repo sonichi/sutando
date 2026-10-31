@@ -221,6 +221,16 @@ router. A set is declared by a binding, never by a header. **Bindings hold until
 the owner changes them**; nothing is learned or decayed, which is why no affinity
 table exists.
 
+**Voice.** A voice `work` call routes like a typed message: docked in a room, the
+task carries that room as `channel_id`, so the room's binding applies; with no
+room it goes to the core. "Ask Pro-dev to …" passes the name as the tool's
+`worker`; this skill's voice hook resolves it (`resolve_worker_name.py`, case and
+spacing ignored) to an id written as `requested_worker`. A name that resolves to
+no one, or to several, is told to the user and nothing is written: unlike an
+envelope from a bridge, a spoken name is checked before it becomes a task. The
+session-end task carries the docked room's `channel_id` only, so it reaches the
+same worker without its result being posted to the room.
+
 ## Where the router runs
 
 A role with a contract, not a process count — perhaps fifty lines of deterministic

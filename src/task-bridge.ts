@@ -386,6 +386,34 @@ export function setVoiceTaskOriginResolver(resolver: VoiceTaskOriginResolver | n
 	_voiceTaskOriginResolver = resolver;
 }
 
+/** A worker name said aloud, as the installed roster reads it: the recipient id, or what to tell the user. */
+export type VoiceWorkerVerdict = { ok: true; worker: string } | { ok: false; message: string };
+export type VoiceWorkerResolver = (spoken: string) => VoiceWorkerVerdict | Promise<VoiceWorkerVerdict>;
+
+let _voiceWorkerResolver: VoiceWorkerResolver | null = null;
+// One header token: the value is written verbatim as `requested_worker:`.
+const REQUESTED_WORKER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
+export function setVoiceWorkerResolver(resolver: VoiceWorkerResolver | null): void {
+	_voiceWorkerResolver = resolver;
+}
+
+/** A named worker through the injected resolver. With none installed, or a verdict that is not one
+ *  header token, the name is refused: an unrecognised name is never sent to the core instead. */
+export async function resolveVoiceWorker(spoken: string): Promise<VoiceWorkerVerdict> {
+	if (!_voiceWorkerResolver) {
+		return { ok: false, message: `No workers are set up here, so there is no worker called "${spoken}". Nothing was sent: tell the user.` };
+	}
+	try {
+		const verdict = await _voiceWorkerResolver(spoken);
+		if (verdict?.ok === true && REQUESTED_WORKER_RE.test(verdict.worker)) return verdict;
+		if (verdict?.ok === false && typeof verdict.message === 'string' && verdict.message) return verdict;
+	} catch (e) {
+		console.error(`${ts()} [TaskBridge] worker resolver failed for ${JSON.stringify(spoken)}:`, e);
+	}
+	return { ok: false, message: `Could not check the worker name "${spoken}". Nothing was sent: tell the user.` };
+}
+
 /** The origin a voice task was written with: remembered from the write, else rebuilt
  *  from its header by the adapter's resolver. Null for a task with no origin. */
 export function voiceTaskOrigin(taskId: string): VoiceSessionOrigin | null {
@@ -911,7 +939,7 @@ export function _forwardOfflineThenArchive(
 
 /** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
  *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
-export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane): string {
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane, requestedWorker: string | null = null): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
@@ -925,8 +953,10 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	];
 	for (const [key, value] of Object.entries(origin?.headers ?? {})) {
 		if (!_HEADER_KEYS.includes(key) || typeof value !== 'string') continue;
+		if (key === 'requested_worker' && requestedWorker) continue;
 		lines.push(`${key}: ${value.replace(/[\r\n]+/g, ' ')}`);
 	}
+	if (requestedWorker && REQUESTED_WORKER_RE.test(requestedWorker)) lines.push(`requested_worker: ${requestedWorker}`);
 	// The relay's check judged it quick (one lookup, command or short generation) or long (building, writing,
 	// research): the core does a quick one at once and gives a long one to a subagent, so neither waits on the other.
 	if (lane) lines.push(`lane: ${lane}`);
@@ -934,11 +964,19 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
-/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
-export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
+/** The routing part of a call's origin: its target as `channel_id`, so a room's bound worker gets the task.
+ *  The adapter's headers are left out: without them no room origin is rebuilt for the result. */
+export function _routingOnlyOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSessionOrigin | null {
+	const usable = _usableOrigin(origin);
+	return usable ? { channel: usable.channel, target: usable.target } : null;
+}
+
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority.
+ *  `origin` is the room the call was docked in, if any: the task routes like a typed message there. */
+export async function submitVoiceSessionEndTask(summary: string, transcript: string, origin: VoiceSessionOrigin | null = null): Promise<string> {
 	const taskId = `task-${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, _routingOnlyOrigin(origin)).replace('priority: urgent', 'priority: low');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
 	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
 	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
@@ -951,6 +989,21 @@ export function _rememberTaskOrigin(taskId: string, origin: VoiceSessionOrigin |
 	_taskOrigins.set(taskId, origin);
 	// Bounded: only recent tasks can still answer.
 	if (_taskOrigins.size > 200) _taskOrigins.delete(_taskOrigins.keys().next().value as string);
+}
+
+/** The origin a call ended in: the live one, else the one bound when its client left (the
+ *  disconnect releases it before the hang-up grace runs out). A reconnect starts over. */
+export function createCallOriginLatch(live: () => VoiceSessionOrigin | null) {
+	let atLeave: VoiceSessionOrigin | null = null;
+	return {
+		clientConnected(): void { atLeave = null; },
+		clientLeaving(): void { atLeave = live(); },
+		take(): VoiceSessionOrigin | null {
+			const origin = live() ?? atLeave;
+			atLeave = null;
+			return origin;
+		},
+	};
 }
 
 const CLAIM_LEDGERS = 'remote-task-inflight';
@@ -1116,6 +1169,13 @@ export const workTool: ToolDefinition = {
 				'"the day before yesterday", "this week"), never with a calendar date added: your date can be a day off, ' +
 				'and the core turns them into dates in the owner\'s time zone.'
 			),
+		worker: z
+			.string()
+			.optional()
+			.describe(
+				'Only when the user names a worker to do it ("ask Pro-dev to …"): that name as said, ' +
+				'e.g. "pro-dev". Omit otherwise; the task then goes where a message typed here would.'
+			),
 		replaces: z
 			.string()
 			.optional()
@@ -1148,10 +1208,11 @@ export const workTool: ToolDefinition = {
 	execution: 'background',
 	behavior: 'NON_BLOCKING',
 	async execute(args) {
-		const { task, timeout_minutes, dm_on_timeout } = args as {
+		const { task, timeout_minutes, dm_on_timeout, worker } = args as {
 			task: string;
 			timeout_minutes?: number;
 			dm_on_timeout?: boolean;
+			worker?: string;
 		};
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
@@ -1164,6 +1225,14 @@ export const workTool: ToolDefinition = {
 
 		// Read before the first await, unless the relay agent captured it when the call began.
 		const { origin, turns, recentAtAsk } = (args as { [WORK_ORIGIN]?: WorkOrigin })[WORK_ORIGIN] ?? captureWorkOrigin();
+
+		let requestedWorker: string | null = null;
+		const spokenWorker = typeof worker === 'string' ? worker.trim() : '';
+		if (spokenWorker) {
+			const verdict = await resolveVoiceWorker(spokenWorker);
+			if (!verdict.ok) return { status: 'rejected', message: verdict.message };
+			requestedWorker = verdict.worker;
+		}
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
@@ -1291,7 +1360,7 @@ export const workTool: ToolDefinition = {
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =
-				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
+				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane, requestedWorker) +
 				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {

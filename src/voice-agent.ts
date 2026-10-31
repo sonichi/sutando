@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText, setVoiceWorkerResolver, createCallOriginLatch } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -1044,13 +1044,14 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
 
-	// When the user hangs up, the core gets a task about that call.
+	// When the user hangs up, the core gets a task about that call, routed by the room it ended in.
+	const callOrigin = createCallOriginLatch(getVoiceSessionOrigin);
 	const callEnd = createCallEndReporter({
 		sessionId: SESSION_ID,
 		items: () => sessionRef?.conversationContext.items ?? [],
 		onEnded: async (ended) => {
 			const { summary, transcript } = sessionEndTask(ended);
-			await submitVoiceSessionEndTask(summary, transcript);
+			await submitVoiceSessionEndTask(summary, transcript, callOrigin.take());
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
@@ -1105,8 +1106,12 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		},
 		// Frames the core does not own are offered to optional skills' handlers.
 		onClientCommand: (message) => clientFrames.dispatch(message),
-		onClientConnected: () => callEnd.clientConnected(),
+		onClientConnected: () => {
+			callOrigin.clientConnected();
+			callEnd.clientConnected();
+		},
 		onClientDisconnected: () => {
+			callOrigin.clientLeaving();
 			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
@@ -1601,6 +1606,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		setVoiceSessionOrigin,
 		getVoiceSessionOrigin,
 		setVoiceTaskOriginResolver,
+		setVoiceWorkerResolver,
 		onUserSpoke: (handler) => { userSpokeHandlers.push(handler); },
 	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
