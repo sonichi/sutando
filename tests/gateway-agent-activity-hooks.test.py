@@ -3045,6 +3045,243 @@ class Hooks(unittest.TestCase):
         with txn("task-unowned") as t:
             self.assertTrue(t.put(x=1))
 
+    # ── round 14: every way a held serve's ack, the switch and its reconcile can fail ──
+    def held(self, tid, gen_answer=2):
+        """Served and acked as generation 1 under L1, then served again under L2 and held."""
+        fake = self.served_acked(tid)
+        inflight = {tid}
+        self.reserved(tid, inflight)
+        fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, gen_answer)
+        return fake, inflight
+
+    def test_a_held_serves_ack_refused_ends_it_and_only_a_task_wide_answer_fences_the_run(self):
+        for code, fenced in (("stale_execution_generation", None), ("task_cancelled", "cancel_confirmed")):
+            with self.subTest(code=code):
+                tid = f"task-held-refused-{code.split('_')[0]}"
+                fake, _ = self.held(tid)
+                fake.answers[f"/v1/tasks/{tid}/ack"] = _http(409, {"error_code": code})
+                self.assertTrue(gw._record_pending_acks([(tid, True, "L2")]))
+                self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertEqual((rec.get("pending_serve"), rec["run"], rec.get("fenced")), (None, tid, fenced))
+                self.assertFalse(gw._reserve_path(tid).exists())
+                self.assertNotIn(tid, gw._load_pending_acks())
+
+    def test_a_held_serves_ack_that_cannot_be_read_or_no_longer_holds_moves_nothing(self):
+        tid = "task-held-unread"
+        self.held(tid)
+        with txn(tid) as t:
+            claim = t.claim("ack", serve="L2")
+        with mock.patch.object(gw.task_attempts.Transition, "rec", new_callable=mock.PropertyMock,
+                               return_value=gw.task_attempts.UNKNOWN):
+            self.assertEqual(gw._decide_held_serve(tid, claim, _ack(tid, 2), 2, True), "unrecorded")
+        with txn(tid) as t:
+            t.release_claim(claim)
+        self.assertEqual(gw._decide_held_serve(tid, claim, _ack(tid, 2), 2, True), "stale")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["pending_serve"]["lease"], "L2", "still held")
+
+    def test_a_switch_that_cannot_stop_the_earlier_run_or_be_saved_waits(self):
+        for fault in ("stop", "switch"):
+            with self.subTest(fault=fault):
+                tid = f"task-switch-fails-{fault}"
+                self.held(tid)
+                (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.claimed-core1")
+                self.addCleanup(lambda t=tid: (gw.TASKS_DIR / f"{t}.claimed-core1").unlink(missing_ok=True))
+                stuck = (self.no_ctl_write() if fault == "stop"
+                         else failing_commit("the switch to run"))
+                with stuck:
+                    self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertEqual((rec["run"], rec["pending_serve"]["lease"]), (tid, "L2"), "nothing switched")
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "the retry switches")
+                self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2")
+
+    def test_a_held_serve_whose_saved_task_is_lost_fails_its_generation_rather_than_run_nothing(self):
+        tid = "task-held-lost"
+        fake, inflight = self.held(tid)
+        gw._reserve_path(tid).write_text("{not json")
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        run = f"{tid}~~2"
+        self.assertEqual(gw._ATTEMPTS.get(tid)["owed_publish"], run)
+        gw._post_task_beats(inflight, force=True)
+        self.assertFalse((gw.TASKS_DIR / f"{run}.txt").exists(), "nothing to publish")
+        self.assertEqual((gw.RESULTS_DIR / f"{run}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("owed_publish"))
+        del fake
+
+    def test_an_owed_run_that_cannot_be_published_yet_is_retried(self):
+        tid = "task-owed-publish-retry"
+        _, inflight = self.held(tid)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        with mock.patch.object(gw, "_write_task", return_value=None):
+            gw._post_task_beats(inflight, force=True)
+        self.assertEqual(gw._ATTEMPTS.get(tid)["owed_publish"], f"{tid}~~2", "still owed")
+        gw._post_task_beats(inflight, force=True)
+        self.assertTrue((gw.TASKS_DIR / f"{tid}~~2.txt").exists())
+
+    def test_the_reconcile_sends_the_earlier_runs_cancel_ack_first_and_reads_its_items(self):
+        tid = "task-reconcile-cancel-ack"
+        fake, _ = self.held(tid)
+        with txn(tid) as t:
+            t.put(stop_confirmed=True, cancel_requested_generation=1)
+            gw._want_cancel_ack(t)
+        fake.answers[f"/v1/tasks/{tid}/cancel-ack"] = OSError("down")
+        self.assertFalse(gw._reconcile_earlier_run(tid), "its cancel-ack may not have landed")
+        fake.answers[f"/v1/tasks/{tid}/cancel-ack"] = {"ok": True}
+        self.assertTrue(gw._reconcile_earlier_run(tid))
+        self.assertFalse(gw._reconcile_earlier_run("task-never-recorded"), "no record: nothing to settle against")
+        with txn(tid) as t:
+            claim = t.claim("result", file=[1])
+        root = gw._delivery_core().backend.root
+        gw._delivery_core().backend.publish(tid, b"{}", lifecycle={"op": claim["op"]})
+        with mock.patch.object(gw, "withdraw_unsent", side_effect=OSError("disk")):
+            self.assertFalse(gw._reconcile_earlier_run(tid), "its item cannot be checked")
+        for status in ("DELIVERED", "PARKED"):
+            with mock.patch.object(gw, "read_item", return_value={"lifecycle": {"op": claim["op"]}, "status": status}):
+                self.assertTrue(gw._reconcile_earlier_run(tid), f"{status} is final")
+        self.assertTrue(gw._reconcile_earlier_run(tid), "unsent: taken back")
+        self.assertIsNone(gw.read_item(root, tid))
+
+    def test_stopping_an_earlier_run_withdraws_stops_or_reports_why_it_could_not(self):
+        tid = "task-stop-run"
+        self.served_acked(tid)
+        with txn(tid) as t:
+            with mock.patch.object(gw.Path, "unlink", side_effect=PermissionError("denied")):
+                self.assertFalse(gw._stop_run(t, tid, "test"), "an untaken file that cannot be withdrawn")
+            (gw.TASKS_DIR / f"{tid}.txt").unlink()
+            self.assertTrue(gw._stop_run(t, tid, "test"), "never taken and gone: nothing runs")
+            self.assertTrue(gw._stop_run(t, None, "test"))
+        self.assertTrue(any("could not be withdrawn" in m for m in self.logs))
+
+    def test_a_held_serve_delivered_again_or_not_recordable_is_left_for_the_broker(self):
+        tid = "task-held-again"
+        self.held(tid)
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True), "the same held serve")
+        self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), [f"{tid}.txt"], "nothing published")
+        other = "task-held-unrecordable"
+        self.served_acked(other)
+        with failing_commit("a new run"):
+            self.assertIsNone(gw._write_task(_task(other, lease_id="L2")), "its run cannot be allocated")
+        with mock.patch.object(gw, "_durable_write", return_value=False):
+            self.assertIsNone(gw._write_task(_task(other, lease_id="L2")), "its task cannot be saved")
+        self.assertIsNone(gw._ATTEMPTS.get(other).get("pending_serve"))
+
+    def test_acks_that_cannot_be_claimed_or_settled_keep_their_pending_ack(self):
+        tid = "task-ack-unclaimable"
+        pending: list = []
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1"), set(), pending))
+        self.assertTrue(gw._record_pending_acks(pending))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(404, {"error": "not leased to you"})}))
+        with failing_commit("claim ack-"):
+            self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+            self.assertEqual(gw._post_ack_first(tid, "L1"), "retry")
+        self.assertEqual(fake.posted("/ack"), [], "nothing is sent unclaimed")
+        with failing_commit("awaiting_ack"):
+            self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+        self.assertIn(tid, gw._load_pending_acks(), "the wait could not be ended: the ack is kept")
+        self.assertEqual(gw._post_ack_first(tid, "L9"), "stale", "an ack_first for a serve not held here")
+
+    def test_a_ruling_holds_whatever_it_cannot_read_bind_or_record(self):
+        tid = "task-ruling-holds"
+        fake = self.served_acked(tid)
+        self.core_writes(tid, "the answer")
+        raw, generation = gw._pin_and_claim(tid)
+        with mock.patch.object(gw, "_run_item", return_value=gw.task_attempts.UNKNOWN):
+            self.assertEqual(gw._rule_result(tid, tid, raw, False, True, generation).why, "its run's records cannot be read")
+        with mock.patch.object(gw, "_pin_holds", return_value=False):
+            self.assertIn("withdrawn", gw._rule_result(tid, tid, raw, False, True, generation).why)
+        with mock.patch.object(gw.task_attempts.Transition, "stop_by_result", return_value=False):
+            self.assertIn("could not be recorded", gw._rule_result(tid, tid, raw, False, True, generation).why)
+        with txn(tid) as t:
+            for c in t.claims("result"):
+                t.release_claim(c)
+        self.assertIn("moved on", gw._rule_result(tid, tid, raw, False, True, generation).why)
+        with failing_commit("claim result-"):
+            self.assertIn("could not be claimed", gw._rule_result(tid, tid, raw, False, False, generation).why)
+        with mock.patch.object(gw.task_attempts.Transition, "rec", new_callable=mock.PropertyMock,
+                               return_value=gw.task_attempts.UNKNOWN):
+            self.assertIn("cannot be read", gw._rule_result(tid, tid, raw, False, True, generation).why)
+        del fake
+
+    def test_a_ruling_held_for_a_pending_serve_lets_its_claim_go(self):
+        tid = "task-ruling-pending"
+        fake = self.served_acked(tid)
+        self.core_writes(tid, "the answer")
+        raw, generation = gw._pin_and_claim(tid)
+        self.assertEqual([c["kind"] for c in gw._ATTEMPTS.get(tid)["claims"].values()], ["result"])
+        self.reserved(tid, {tid})
+        self.assertIn("re-serve waits", gw._rule_result(tid, tid, raw, False, True, generation).why)
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("claims"), "nothing was sent: the claim goes, so the switch can")
+        self.assertEqual(gw._pin_and_claim(tid)[0], raw)
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("claims"), "and no new one is taken while the serve is held")
+        del fake
+
+    def test_a_pin_that_cannot_be_made_or_finds_no_file_is_retried(self):
+        tid = "task-pin-fails"
+        self.served_acked(tid)
+        self.core_writes(tid, "the answer")
+        with mock.patch.object(gw.disposal, "pin", side_effect=FileNotFoundError()):
+            self.assertEqual(gw._pin_and_claim(tid), (None, None))
+        with mock.patch.object(gw.disposal, "pin", side_effect=PermissionError("denied")):
+            self.assertEqual(gw._pin_and_claim(tid), (None, None))
+        self.assertTrue(any("not pinned" in m for m in self.logs))
+        self.assertIsNotNone(gw._pin_and_claim(tid)[0])
+
+    def test_a_delivery_for_another_attempt_is_kept_and_settles_nothing_of_the_current_one(self):
+        tid = "task-delivered-elsewhere"
+        self.served_acked(tid)
+        with txn(tid) as t:
+            claim = t.claim("result", file=[1])
+        record = {"lifecycle": {"op": "result-other", "task": tid, "run": "elsewhere", "execution_generation": 9}}
+        self.assertEqual(gw._committed(tid, tid, claim, record), "kept")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("claims"), "its claim is let go")
+        self.assertFalse(gw._delivered_for_current_attempt(record), "the current attempt is another")
+        self.assertTrue(gw._delivered_for_current_attempt({"lifecycle": {**record["lifecycle"], "run": tid,
+                                                                        "execution_generation": 1}}))
+        with mock.patch.object(gw._ATTEMPTS, "entry", return_value=gw.task_attempts.UNKNOWN):
+            self.assertFalse(gw._delivered_for_current_attempt(record), "unknown settles nothing")
+        self.assertTrue(gw._delivered_for_current_attempt({}), "an item with no claim is the outbox's own")
+
+    def test_a_closed_run_holds_nothing_in_flight_and_a_result_worker_isolates_its_failure(self):
+        tid = "task-closed-run"
+        _, inflight = self.held(tid)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        self.assertFalse(gw._broker_holds(tid), "the earlier run's id holds nothing")
+        self.assertTrue(gw._broker_holds(f"{tid}~~2"))
+        with mock.patch.object(gw, "_deliver_ready", side_effect=RuntimeError("boom")):
+            gw._delivery_worker(tid, gw.RESULTS_DIR / f"{tid}.txt", "x", None, inflight)
+        self.assertTrue(any("delivery error (isolated)" in m for m in self.logs))
+        self.assertFalse(gw._delivering(tid))
+
+    def test_the_idempotency_key_rides_the_real_request(self):
+        seen = {}
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+            def getheader(self, *_a):
+                return "application/json"
+            headers = {}
+
+        def urlopen(req, timeout=None):
+            seen.update(req.header_items())
+            return Resp()
+        with mock.patch.object(gw.urllib.request, "urlopen", side_effect=urlopen):
+            try:
+                gw._req("POST", "/v1/tasks/task-key/ack", {"id": "task-key"}, operation_id="ack-0123")
+            except Exception:  # noqa: BLE001 — only the request it built is under test
+                pass
+        self.assertEqual(seen.get("Idempotency-key"), "ack-0123")
+
     # ── enforcement: one writer, provider calls with no transition held ──
     READERS = {"transition", "entry", "records", "owing", "holds", "beating", "wake_item", "run_item", "run_of",
                "ack_fields", "worker_id", "broker_names_leases", "report_superseded", "sweep",

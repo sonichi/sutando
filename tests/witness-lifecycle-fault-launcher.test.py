@@ -112,6 +112,37 @@ class Launcher(unittest.TestCase):
         self.assertEqual([e["event"] for e in self.events()], ["matched", "released", "FAIL: matched more than once"])
         self.assertEqual(len([c for c in broker.calls if c[1] == "/v1/results"]), 4, "every call went through")
 
+    def test_the_crash_fault_records_the_brokers_real_answer_then_exits_before_the_commit(self):
+        tid = "task-launcher-crash"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1"), set(), []))
+        rule = launcher.Rule("ack", tid, "L1", None, None)
+        self.install(tid, rule, fault="crash")
+        with mock.patch.object(launcher.os, "_exit", side_effect=SystemExit(9)):
+            with self.assertRaises(SystemExit):
+                gw._post_task_ack(tid, durable=True, lease_id="L1")
+        crashed = self.events()[-1]
+        self.assertEqual(crashed["answer"]["execution_generation"], 1, "the broker's own answer is on record")
+        self.assertIn("killing the bridge before its commit", crashed["event"])
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("execution_generation"), "nothing was committed")
+        self.assertEqual([c["kind"] for c in gw._ATTEMPTS.get(tid)["claims"].values()], ["ack"], "its claim is open")
+
+    def test_a_call_whose_claim_is_not_on_the_ledger_or_is_ambiguous_passes_through(self):
+        rule = launcher.Rule("result", "task-a", "*", 1, None)
+        two = {"claims": {"r1": {"kind": "result", "execution_generation": 1},
+                          "r2": {"kind": "result", "execution_generation": 1}}}
+        self.assertIsNone(rule.match("POST", "/v1/results", {"id": "task-a", "execution_generation": 1}, None, two))
+        self.assertIsNone(rule.match("GET", "/v1/results", {"id": "task-a"}, None, two))
+
+    def test_the_loader_is_loaded_as_the_script_would_be_and_a_stall_needs_its_sentinel(self):
+        loader = Path(tempfile.mkdtemp()) / "remote-gateway-bridge.py"
+        loader.write_text("RUNTIME_IDENTITY = {'entrypoint': __file__}\nRAN_MAIN = __name__ == '__main__'\n")
+        with mock.patch.object(launcher, "LOADER", loader):
+            mod = launcher.load_bridge()
+        self.assertEqual((mod.RUNTIME_IDENTITY["entrypoint"], mod.RAN_MAIN), (str(loader), False),
+                         "its script tail is not run by the load")
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            launcher.main(["--fault", "stall", "--kind", "ack", "--task", "t", "--report", str(self.report)])
+
     def test_main_starts_the_loader_and_writes_its_identity_first(self):
         impl = Path(gw.__file__)
         ran = []

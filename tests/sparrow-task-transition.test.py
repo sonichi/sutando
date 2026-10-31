@@ -409,6 +409,7 @@ class Ledger(unittest.TestCase):
         self.assertEqual(gateway_instance.broker_tid("task-abc~~2", ""), "task-abc")
         self.assertTrue(gateway_instance.owns("task-abc~~2", ""), "a primary's later run is still its own")
         self.assertFalse(gateway_instance.owns("task-dev~x~~2", ""))
+        self.assertEqual(gateway_instance.broker_tid("task-a~~1", ""), "task-a~~1", "a malformed run is left as it is")
 
     def test_runs_are_allocated_before_publication_and_never_reused(self):
         a = self.mk()
