@@ -187,9 +187,22 @@ def _darwin_sysctl(mib: list) -> bytes | None:
         return None
 
 
+_BOOT_SESSION: list = []
+
+
 def _darwin_boot_session() -> str | None:
     """kern.bootsessionuuid on macOS: fixed for the whole boot, unlike kern.boottime, which the
-    kernel recomputes when the wall clock is stepped. None when it cannot be read."""
+    kernel recomputes when the wall clock is stepped. None when it cannot be read. A value read
+    once is kept: no process outlives its boot."""
+    if not _BOOT_SESSION:
+        value = _read_darwin_boot_session()
+        if value is None:
+            return None
+        _BOOT_SESSION.append(value)
+    return _BOOT_SESSION[0]
+
+
+def _read_darwin_boot_session() -> str | None:
     import ctypes
     import ctypes.util
     try:
