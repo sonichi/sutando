@@ -16,8 +16,10 @@ else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
 # ONE canonical workspace root for everything workspace-owned (receipts,
-# claims): a separate task inbox must never redefine it.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+# claims), derived by the watcher's own rule so both name the same tree.
+# shellcheck source=../../../tasks-dir-resolve.sh
+source "$REPO/src/tasks-dir-resolve.sh"
+WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR; only
 # staged_prompt_is_ambiguous() still reads it, to disambiguate a staged prompt.
