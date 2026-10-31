@@ -105,6 +105,29 @@ def main() -> int:
     check("URLError -> Indeterminate", isinstance(r, ProviderIndeterminate))
     r, _ = outcome_of(TimeoutError("t"))
     check("timeout -> Indeterminate", isinstance(r, ProviderIndeterminate))
+    r, _ = outcome_of(json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0))
+    check("non-JSON 2xx body -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
+    for shape in (["ok"], "ok", 1):
+        r, _ = outcome_of(shape)
+        check(f"non-mapping 2xx {shape!r} -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
+
+    # A malformed first 2xx must release the claim, so a later pass can still deliver.
+    with tempfile.TemporaryDirectory() as td:
+        bad = json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0)
+        gw = ScriptedGateway(bad, bad, {"ok": True, "duplicate": True})
+        core = DeliveryCore(DesignAClaimBackend(Path(td)),
+                            AG2SpaceResultProvider(gw),
+                            policy=RetryPolicy(max_attempts=10), worker="w")
+        core.backend.publish("task-X", ENVELOPE)
+        try:
+            res = core.deliver_one("task-X", ENVELOPE)
+            check("malformed 2xx twice completes NOT_DELIVERED (retryable)",
+                  res.outcome is DeliveryOutcome.NOT_DELIVERED, repr(res))
+        except Exception as e:  # noqa: BLE001 - escaping here is the defect
+            check("malformed 2xx twice completes NOT_DELIVERED (retryable)", False, repr(e))
+        res = core.deliver_one("task-X", ENVELOPE)
+        check("the next pass re-claims it, not NOT_CLAIMED, and the dedup answer confirms",
+              res.outcome is DeliveryOutcome.CONFIRMED, repr(res))
 
     # -- the optional thread field (docs/remote-gateway-protocol.md) -------
     from ag2_sparrow.delivery_core import provider_ag2space as pa

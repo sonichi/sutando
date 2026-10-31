@@ -145,6 +145,11 @@ class AG2SpaceResultProvider:
             # after-send; the idempotent re-send resolves the ambiguity.
             raise ProviderIndeterminate(
                 f"transport failure for {item_id}: {e}") from e
+        except ValueError as e:
+            # A 2xx whose body is not JSON may still be a recorded result: re-send, never strand.
+            raise ProviderIndeterminate(f"unreadable 2xx answer for {item_id}: {e}") from e
+        if not isinstance(resp, dict):
+            raise ProviderIndeterminate(f"non-mapping 2xx answer for {item_id}: {str(resp)[:200]}")
         # A 2xx is the broker RECORDING the result, not its Matrix send; only an
         # explicit decline envelope on it is a refusal.
         if resp.get("ok") is False or resp.get("error") or resp.get("errcode"):
