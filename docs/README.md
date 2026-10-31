@@ -52,6 +52,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Black-box benchmarks](benchmarking.md)
   - [Comprehensive benchmark: revision `3a73e03`, 2026-08-24](benchmark-reports/2026-08-24-3a73e03.md)
 - [Voice-agent test framework](voice-agent-test-framework.md)
+- [Browser voice connection and bearer handling](voice-connection.md)
 
 ## Reference
 

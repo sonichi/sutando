@@ -57,6 +57,7 @@ import type { ProtocolFailure } from '../src/voice-error-classifier.ts';
 
 const REPO_ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const FAKE_KEY = 'AIza-fake-key-for-agent-state-protocol-tests';
+const API_TOKEN = 'agent-state-protocol-owner-token';
 const UPSTREAM_ENUM = ['live', 'idle', 'connecting', 'backoff', 'failed'];
 
 // ---------------------------------------------------------------------------
@@ -568,6 +569,7 @@ function spawnAgent(ws: string, port: number, visionPort: number, extraEnv: Reco
 			...process.env,
 			SUTANDO_WORKSPACE: ws,
 			SUTANDO_TEST_MODE: '1',
+			SUTANDO_API_TOKEN: API_TOKEN,
 			GEMINI_VOICE_API_KEY: FAKE_KEY,
 			PORT: String(port),
 			VISION_CONTROL_PORT: String(visionPort),
@@ -598,7 +600,7 @@ async function connectClient(port: number, timeoutMs: number): Promise<WebSocket
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		try {
-			const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
+			const ws = new WebSocket(`ws://127.0.0.1:${port}/`, { headers: { Authorization: `Bearer ${API_TOKEN}` } });
 			await new Promise<void>((resolve, reject) => {
 				ws.addEventListener('open', () => resolve(), { once: true });
 				ws.addEventListener('error', () => reject(new Error('connect failed')), { once: true });

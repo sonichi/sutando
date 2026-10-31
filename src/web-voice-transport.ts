@@ -205,6 +205,8 @@ export const CLOSE_CODE_CLIENT_BUSY = 4409;
  * Decoded as its own terminal status (`'superseded'`), not a connect failure.
  */
 export const CLOSE_CODE_SUPERSEDED_BY_TAKEOVER = 4410;
+export const CLOSE_CODE_UNAUTHORIZED = 4401;
+export const CLOSE_CODE_ORIGIN_NOT_ALLOWED = 4403;
 
 /**
  * Why a connect attempt failed, as one closed discriminated union (R12):
@@ -228,6 +230,7 @@ export const CLOSE_CODE_SUPERSEDED_BY_TAKEOVER = 4410;
  *                      another real client is attached (W5). Surfaces show
  *                      "voice is in use elsewhere" with a take-over
  *                      affordance (`?takeover=1` on the next connect).
+ *   'not-authorized' — server rejected the owner credential or Origin (4401/4403).
  */
 export type VoiceConnectFailureKind =
   | 'timeout'
@@ -237,7 +240,8 @@ export type VoiceConnectFailureKind =
   | 'mic-other'
   | 'agent-failed'
   | 'service-down'
-  | 'client-busy';
+  | 'client-busy'
+  | 'not-authorized';
 
 export interface VoiceConnectFailure {
   kind: VoiceConnectFailureKind;
@@ -265,6 +269,7 @@ export const VOICE_FAILURE_REMEDIATION: Record<VoiceConnectFailureKind, string> 
   'agent-failed': 'Open voice setup to check the voice service.',
   'service-down': 'Restart the voice service from voice setup.',
   'client-busy': 'Voice is in use on another surface. Close it there, or take over the call here.',
+  'not-authorized': 'Open this core from its local web client and reconnect.',
 };
 
 /**
@@ -1293,6 +1298,20 @@ export class VoiceTransport {
     }
     this.teardownAudio();
     const close: VoiceCloseInfo = { code, reason };
+    if (code === CLOSE_CODE_UNAUTHORIZED || code === CLOSE_CODE_ORIGIN_NOT_ALLOWED) {
+      const detail = 'Voice connection refused: not authorized for this core';
+      this.terminal = true;
+      this.attemptActive = false;
+      this.ws = null;
+      this.status('error', detail, close);
+      this.emitFailure({
+        kind: 'not-authorized',
+        detail,
+        remediation: VOICE_FAILURE_REMEDIATION['not-authorized'],
+        close,
+      });
+      return;
+    }
     if (code === CLOSE_CODE_CLIENT_BUSY) {
       // W5: another real client is attached — surfaces render "voice is in
       // use elsewhere" with a take-over affordance.

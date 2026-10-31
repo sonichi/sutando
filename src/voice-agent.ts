@@ -22,9 +22,8 @@
  *                          $SUTANDO_WORKSPACE is no longer honored for resolution.
  *                          Stores tasks/, results/, state/, logs/, conversation.log.
  *   PORT                — WebSocket port (default: 9900)
- *   HOST                — Bind address (default: 127.0.0.1 loopback; the voice WS
- *                          has no auth. Set 0.0.0.0 only for a trusted deployment;
- *                          LAN reach normally goes through the opt-in /ws proxy.)
+ *   HOST                — Bind address (default: 127.0.0.1; voice WS requires the
+ *                          local API bearer; LAN reach normally uses the /ws proxy.)
  */
 
 import 'dotenv/config';
@@ -44,6 +43,7 @@ import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY, restoreAfterFreshConnection } from './meeting-dictation.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
+import { installVoiceConnectionGate, localApiToken } from './local-api-gate.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -152,10 +152,8 @@ assertGeminiKey(
 );
 
 const PORT = Number(process.env.PORT) || 9900;
-// Loopback by default: the voice WS has no auth, so it must NOT be reachable
-// from the LAN out of the box. LAN reach is an explicit opt-in via the
-// web-client /ws proxy (SUTANDO_LAN_SHARE), never a direct bind to this port.
-// Set HOST=0.0.0.0 explicitly only for a trusted deployment that needs it.
+// Voice WS connections require the local API bearer; loopback remains the default bind.
+// LAN reach normally uses the web-client /ws proxy, which supplies that bearer.
 const HOST = process.env.HOST || '127.0.0.1';
 
 // Per-user runtime state lives under the resolved workspace (post-v0.8
@@ -1226,6 +1224,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		},
 	});
 
+	installVoiceConnectionGate(session, () => localApiToken(WORKSPACE_DIR));
 	sessionRef = session;
 	meetingDictation = attachMeetingDictation({
 		session: session as any,

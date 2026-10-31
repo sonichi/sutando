@@ -1367,6 +1367,22 @@ describe('close-code decoding (Step 18 — W5 client-busy 4409 + superseded 4410
 			'terminal latch: no closed overwrite',
 		);
 	});
+
+	it('4401/4403 → terminal owner-authorization refusal without reconnect status', async () => {
+		for (const code of [4401, 4403]) {
+			const h = harness();
+			const s = await goLive(h);
+			s.serverClose(code, code === 4401 ? 'unauthorized' : 'origin not allowed');
+			const last = h.statuses[h.statuses.length - 1];
+			assert.equal(last.status, 'error');
+			assert.equal(last.detail, 'Voice connection refused: not authorized for this core');
+			assert.equal(last.close?.code, code);
+			assert.equal(h.failures.length, 1);
+			assert.equal(h.failures[0].kind, 'not-authorized');
+			assert.equal(h.failures[0].detail, last.detail);
+			assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'authorization refusal stays terminal');
+		}
+	});
 });
 
 describe('pre-open failures (Step 18 / Z6 — the browser-observable kind is connect-error)', () => {
@@ -1548,6 +1564,7 @@ describe('transport public API additions (Steps 15/16/18)', () => {
 			'agent-failed',
 			'service-down',
 			'client-busy',
+			'not-authorized',
 		];
 		assert.deepEqual(Object.keys(VOICE_FAILURE_REMEDIATION).sort(), [...kinds].sort());
 		for (const k of kinds) {

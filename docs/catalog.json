@@ -13,6 +13,16 @@
    "canonical_for": "documentation navigation and lifecycle metadata",
    "last_verified": "2026-07-22"
   },
+  "docs/voice-connection.md": {
+   "title": "Browser voice connection and bearer handling",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "canonical",
+   "canonical_for": "browser voice connection, local bearer token delivery, and loopback WebSocket authentication",
+   "last_verified": "2026-10-26"
+  },
   "docs/access-control.md": {
    "title": "Channel access control (moved from CLAUDE.md)",
    "audience": [

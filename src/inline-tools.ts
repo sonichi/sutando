@@ -23,6 +23,7 @@ import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
+import { verifyCaptureArtifact } from './capture-artifact.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
 import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findVoiceTask, noteVoiceTaskCancelled, voiceTaskStore, isVoiceSubmittedTask, voiceTaskRows, type VoiceTaskRow } from './task-bridge.js';
@@ -332,18 +333,20 @@ export const captureScreenTool: ToolDefinition = {
 			const res = await fetch(`http://localhost:7845/capture${query}`, _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 			const data = await res.json() as { status: string; path?: string; all_paths?: string[]; displays?: number; error?: string };
 			if (data.status === 'ok' && data.path) {
+				const capturePath = verifyCaptureArtifact(data.path);
+				const capturePaths = data.all_paths?.map(path => verifyCaptureArtifact(path));
 				const label = data.displays && data.displays > 1
 					? ` (${data.displays} displays)`
 					: display ? ` display ${display}` : '';
-				console.log(`${ts()} [Screen] Captured${label}: ${data.path}`);
+				console.log(`${ts()} [Screen] Captured${label}: ${capturePath}`);
 				if (data.all_paths && data.all_paths.length > 1) {
-					return { status: 'captured', paths: data.all_paths, displays: data.displays, note: 'Multiple displays captured. Each path is a separate screen.' };
+					return { status: 'captured', paths: capturePaths, displays: data.displays, note: 'Multiple displays captured. Each path is a separate screen.' };
 				}
-				return { status: 'captured', path: data.path };
+				return { status: 'captured', path: capturePath };
 			}
 			return { status: 'failed', error: data.error || 'unknown error' };
-		} catch {
-			return { status: 'failed', error: 'Screen capture server not running' };
+		} catch (error) {
+			return { status: 'failed', error: error instanceof Error ? error.message : 'Screen capture server not running' };
 		}
 	},
 };

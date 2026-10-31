@@ -18,6 +18,8 @@ Calling it again while push mode is already on just sends another frame
 import mimetypes
 import os
 from sutando_config import config_get
+from local_api_gate import local_api_token
+from workspace_default import resolve_workspace
 import urllib.request
 import urllib.error
 
@@ -32,10 +34,14 @@ MIN_FRAME_BYTES = 2048
 
 
 def _post(path: str, body: bytes, content_type: str, timeout: float = 3.0) -> tuple[int, bytes]:
+    try:
+        token = local_api_token(resolve_workspace(), os.environ.get("SUTANDO_API_TOKEN", ""))
+    except Exception:
+        return 0, b""
     req = urllib.request.Request(
         f"{VISION_BASE}{path}",
         data=body,
-        headers={"Content-Type": content_type},
+        headers={"Content-Type": content_type, "Authorization": f"Bearer {token}"},
         method="POST",
     )
     try:

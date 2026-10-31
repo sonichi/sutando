@@ -27,6 +27,7 @@ import ipaddress
 import os
 import secrets
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -105,12 +106,27 @@ def local_api_token(workspace: Path, configured: str = "") -> str:
     if configured:
         return configured
     path = status_read_path(LOCAL_API_TOKEN_NAME, Path(workspace))
+    empty_file_identity = None
     try:
-        value = path.read_text(encoding="utf-8").strip()
-        if value:
-            return value
+        with path.open("r", encoding="utf-8") as handle:
+            value = handle.read().strip()
+            if value:
+                return value
+            file_stat = os.fstat(handle.fileno())
+            empty_file_identity = (file_stat.st_dev, file_stat.st_ino)
     except OSError:
         pass
+    if empty_file_identity:
+        try:
+            current = path.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == empty_file_identity:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
     value = secrets.token_urlsafe(32)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -118,13 +134,33 @@ def local_api_token(workspace: Path, configured: str = "") -> str:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(value + "\n")
-        os.replace(tmp, path)
+        try:
+            os.link(tmp, path)
+        except OSError as error:
+            try:
+                path.stat()
+            except OSError:
+                raise error
     finally:
         try:
             os.unlink(tmp)
         except FileNotFoundError:
             pass
-    return value
+    return _read_published_token(path)
+
+
+def _read_published_token(path: Path) -> str:
+    last_error = None
+    for attempt in range(8):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError as error:
+            last_error = error
+        if attempt < 7:
+            time.sleep(0.005)
+    raise RuntimeError("local API token publication did not complete") from last_error
 
 
 def bearer_matches(authorization: str, expected: str) -> bool:

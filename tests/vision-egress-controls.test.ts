@@ -247,10 +247,15 @@ describe('P7 D7.4 vision egress controls', () => {
 		const srv = startVisionControlServer(0);
 		await new Promise<void>((r) => (srv.listening ? r() : srv.once('listening', () => r())));
 		const port = (srv.address() as AddressInfo).port;
+		const previousToken = process.env.SUTANDO_API_TOKEN;
+		process.env.SUTANDO_API_TOKEN = 'vision-egress-test-token';
 		try {
 			const res = await fetch(`http://127.0.0.1:${port}/vision/frame`, {
 				method: 'POST',
-				headers: { 'Content-Type': 'image/jpeg' },
+				headers: {
+					'Content-Type': 'image/jpeg',
+					Authorization: 'Bearer vision-egress-test-token',
+				},
 				body: frameBuf(1),
 			});
 			assert.equal(res.status, 409, 'a frame after a stop is rejected');
@@ -259,6 +264,8 @@ describe('P7 D7.4 vision egress controls', () => {
 				'the 409 must name the terminal stop, or the client re-arms past it');
 		} finally {
 			stopVisionControlServer();
+			if (previousToken === undefined) delete process.env.SUTANDO_API_TOKEN;
+			else process.env.SUTANDO_API_TOKEN = previousToken;
 		}
 	});
 

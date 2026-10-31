@@ -56,6 +56,16 @@ describe('voice-connect-resolver', () => {
 		assert.ok(seen[0].includes('localhost'), 'probes local first (order preserved)');
 	});
 
+	it('uses state-only probes for voice endpoints and leaves relay probes unchanged', async () => {
+		const seen: string[] = [];
+		await resolveVoiceEndpoint(defaultCandidates({ tailnetHost: 'core.ts.net', relayWsUrl: 'wss://relay/x' }), {
+			probe: async (url) => { seen.push(url); return false; },
+		});
+		assert.equal(seen[0], 'ws://localhost:9900/?probe=1');
+		assert.equal(seen[1], 'ws://core.ts.net:8080/ws?probe=1');
+		assert.equal(seen[2], 'wss://relay/x');
+	});
+
 	it('picks local (Tier 0) when reachable — best wins', async () => {
 		const ep = await resolveVoiceEndpoint(defaultCandidates({ cloudUrl: 'wss://c' }), {
 			probe: async () => true, // everything reachable → first (local) wins
