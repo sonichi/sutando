@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock as um
 from pathlib import Path
@@ -64,6 +65,42 @@ class RequeueTransition(unittest.TestCase):
             outbox.park_item(root, ITEM, "max-attempts")
             outbox.requeue_item(root, ITEM, reset_attempts=True)
             self.assertEqual(outbox.attempts_for(root, ITEM), 0)
+
+    def _window_exhausted(self, root: Path) -> None:
+        """A timed-lane item that used its whole retry window and was parked for it."""
+        t0 = time.time() - 2000
+        outbox._write_item(root, ITEM, {
+            "item_id": ITEM, "attempts": 5, "status": "QUEUED", "reason": None,
+            "retry": {"started_at": t0, "deadline": t0 + 600, "next_attempt_at": t0 + 590,
+                      "failures": 5, "min_attempts": 5, "initial_delay_s": 2.0, "max_delay_s": 30.0}})
+        outbox.park_item(root, ITEM, "retry-window-exhausted")
+
+    def _ready(self, root: Path) -> bool:
+        with outbox._item_lock(root, ITEM):
+            return outbox.retry_ready_locked(root, ITEM, outbox.RetrySchedule(),
+                                             time.time() + 1)
+
+    def test_a_plain_requeue_of_an_exhausted_window_gets_exactly_one_try(self):
+        # It re-parked as retry-window-exhausted before any send, so the recovery did nothing.
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            self._window_exhausted(root)
+            outbox.requeue_item(root, ITEM)
+            self.assertTrue(self._ready(root), "the requeued item must be offered for one send")
+            self.assertEqual(outbox.read_item(root, ITEM)["status"], "QUEUED")
+            with outbox._item_lock(root, ITEM):
+                outbox.retry_failed_locked(root, ITEM, time.time() + 1)
+            self.assertFalse(self._ready(root), "one more failure parks it again")
+            rec = outbox.read_item(root, ITEM)
+            self.assertEqual((rec["status"], rec["reason"]), ("PARKED", "retry-window-exhausted"))
+
+    def test_reset_attempts_still_restarts_the_whole_window(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            self._window_exhausted(root)
+            outbox.requeue_item(root, ITEM, reset_attempts=True)
+            self.assertNotIn("retry", outbox.read_item(root, ITEM))
+            self.assertTrue(self._ready(root))
 
     def test_repeated_requeue_is_idempotent(self):
         """The second call must not re-bump the epoch: a queued item is not a

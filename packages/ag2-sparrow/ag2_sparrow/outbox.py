@@ -1245,6 +1245,10 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if reset_attempts:
             d["attempts"] = 0
             d.pop("retry", None)
+        elif isinstance(d.get("retry"), dict) and isinstance(d["retry"].get("failures"), int):
+            # One more try, as documented above: a closed window would re-park before any send.
+            d["retry"]["min_attempts"] = d["retry"]["failures"] + 1
+            d["retry"]["next_attempt_at"] = max(d["retry"].get("started_at", 0), time.time())
         d.pop("dispatching", None)  # the operator's resend is deliberate
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
