@@ -259,6 +259,8 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
     task_id = task.get("id")
     if not task_id:
         raise RouterRefused("task has no id")
+    if not pd.carries(task_id):
+        raise RouterRefused(f"{task_id}: no delivery sentinel can carry this id; refusing to write one")
 
     # One per-task lock around the whole decision; the commit is resolved before
     # the roster is needed, so a replay finishes it even if the roster is gone.

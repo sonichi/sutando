@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
 
+import pool_delivery as pd  # noqa: E402
 import pool_roster as pr  # noqa: E402
 import worker_picker_commands as wpc  # noqa: E402
 
@@ -78,6 +79,9 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # Two writer generations: the lane-authority writer stamps wire_source,
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
+        return DECLINE, [], None
+    # An id no sentinel can carry cannot reach a worker, so the core is its recipient.
+    if not pd.carries(task.get("id") or ""):
         return DECLINE, [], None
     # A replay follows the committed delivery, whatever the bindings say now; one roster
     # read serves the replay check and the route, and decides for a task nobody holds yet.

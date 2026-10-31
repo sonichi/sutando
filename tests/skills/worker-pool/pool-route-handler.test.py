@@ -216,12 +216,12 @@ class TestClassification(Base):
 
 
 class TestPickerCommandsStayWithTheController(Base):
-    def _picker_file(self, wire=True):
+    def _picker_file(self, wire=True, name="worker-pin-1"):
         # Shaped like the gateway's file: wire_source sits BELOW task:, where
         # the strict parse never looks.
-        p = self.ws / "tasks" / "worker-pin-1.txt"
+        p = self.ws / "tasks" / f"{name}.txt"
         tail = "\nsource: ag2space\nwire_source: worker-picker\n" if wire else "\nsource: ag2space\n"
-        p.write_text("id: worker-pin-1\nreceiving_instance: @me:ag2.space\nchannel_id: !room:x\n"
+        p.write_text(f"id: {name}\nreceiving_instance: @me:ag2.space\nchannel_id: !room:x\n"
                      "task: Pin room !room:x to w (worker picker)" + tail)
         return str(p)
 
@@ -238,8 +238,45 @@ class TestPickerCommandsStayWithTheController(Base):
         self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.DECLINE)
 
     def test_the_same_room_without_the_picker_mark_still_routes(self):
+        # A task-* id: `worker-pin-1` is no id a worker's sentinel can carry (#5638).
         self.roster()
-        self.assertEqual(h.main(["--task-file", self._picker_file(wire=False), "--workspace", str(self.ws), "--probe"]), 0)
+        f = self._picker_file(wire=False, name="task-pin-1")
+        self.assertEqual(h.main(["--task-file", f, "--workspace", str(self.ws), "--probe"]), 0)
+
+
+class TestIdsNoSentinelCanCarry(Base):
+    """#5638: `voice-end-<hex>` was delivered to a bound worker, whose resolver
+    rejects the sentinel, while the core's holder check still read it as held."""
+
+    VOICE_END = "voice-end-dd249c1dd88b8ef9a5f4c8ad"
+
+    def test_a_bound_voice_end_task_declines_in_both_modes_and_writes_nothing(self):
+        self.roster()
+        t = self.task_file(self.VOICE_END, channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), h.DECLINE)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertEqual(list((self.ws / "deliveries").rglob(f"{self.VOICE_END}*")), [])
+
+    def test_the_router_refuses_to_write_a_sentinel_its_recipient_cannot_parse(self):
+        import pool_router as rt
+        self.roster()
+        self.task_file(self.VOICE_END, channel_id="!room:x")
+        with self.assertRaises(rt.RouterRefused):
+            rt.route(self.ws, {"id": self.VOICE_END, "channel_id": "!room:x"})
+        self.assertEqual(list((self.ws / "deliveries").rglob(f"{self.VOICE_END}*")), [])
+
+    def test_carries_agrees_with_parse_sentinel(self):
+        import pool_delivery as pd
+        for tid, ok in (("task-1", True), ("task-inst~abc", True), (self.VOICE_END, False),
+                        ("worker-pin-1", False), ("", False)):
+            with self.subTest(tid=tid):
+                self.assertIs(pd.carries(tid), ok)
+
+    def test_control_the_same_task_with_a_task_id_is_delivered(self):
+        self.roster()
+        t = self.task_file("task-dd249c1dd88b8ef9a5f4c8ad", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "deliveries" / W / "task-dd249c1dd88b8ef9a5f4c8ad.txt").exists())
 
 
 class TestIntentionLayer(Base):
