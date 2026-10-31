@@ -276,7 +276,7 @@ class MediaTests(EnvCase):
         os.environ["RELAY_URL"] = "https://r"
         cap = {}
 
-        def fake(method, url, headers=None, data=None):
+        def fake(method, url, headers=None, data=None, timeout=None):
             cap["data"] = data
             return 200, b"{}", {}
 
@@ -285,6 +285,26 @@ class MediaTests(EnvCase):
         self.assertTrue(res["ok"])
         sent = json.loads(cap["data"])
         self.assertEqual(base64.b64decode(sent["content_b64"]), b"IMG")
+
+    def test_send_large_file_gets_an_upload_sized_timeout(self):
+        # A 23.7 MB upload timed out at the fixed 15 s HTTP_TIMEOUT.
+        os.environ["RELAY_URL"] = "https://r"
+        large = os.path.join(self.tmp, "large.mp4")
+        open(large, "wb").write(b"x" * (20 * 1024 * 1024))
+        cap = {}
+
+        def fake(method, url, headers=None, data=None, timeout=None):
+            cap["timeout"], cap["sent"] = timeout, len(data)
+            return 200, b"{}", {}
+
+        with mock.patch.object(md, "http_request", side_effect=fake):
+            self.assertTrue(md.send_media(ROOM, large, HS, gate=None)["ok"])
+        self.assertEqual(cap["timeout"], cap["sent"] / md.UPLOAD_FLOOR_BYTES_PER_SEC)
+        self.assertGreater(cap["timeout"], 100)
+
+    def test_upload_timeout_never_drops_below_http_timeout(self):
+        self.assertEqual(md.upload_timeout(0), md.HTTP_TIMEOUT)
+        self.assertEqual(md.upload_timeout(1024), md.HTTP_TIMEOUT)
 
 
 # ----- react ----- #
