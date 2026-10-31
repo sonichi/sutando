@@ -431,7 +431,7 @@ Sutando checkout around it sends neither field.
   nothing re-runs. If it names a newer generation, the earlier run is stopped (its untaken task file
   withdrawn, else a cancel naming that run), every effect it claimed is settled first under its
   own operation id (one claimed and not yet in the outbox, or still sending, makes the switch
-  wait; a claim whose result file is gone and never reached the outbox sent nothing and is ended,
+  wait; a claim whose exact reply is gone from its name and pin and never reached the outbox sent nothing and is ended,
   whichever drain exit disposed of the file), and the generation gets a new run of its own, published from the held serve. Its result
   goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
   An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.

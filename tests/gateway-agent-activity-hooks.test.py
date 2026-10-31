@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import contextlib
 import os
 import sys
 import textwrap
@@ -2765,7 +2766,7 @@ class Hooks(unittest.TestCase):
         gw._post_ready_results(inflight)
         posts = [(p["execution_generation"], p["body"]) for p in fake.posted("/v1/results") if p["id"] == tid]
         self.assertEqual(posts[-1], (2, "generation 2's answer"), "generation 2's own answer is posted")
-        self.assertEqual([p for p in posts if p[0] == 1], posts[:1], "generation 1 posted at most once")
+        self.assertLessEqual(len([p for p in posts if p[0] == 1]), 1, "generation 1 posted at most once")
         self.assertEqual(list((gw.RESULTS_DIR / "undelivered").glob(f"{run}*")), [], "never quarantined")
         root = gw._delivery_core().backend.root
         self.assertEqual((gw.read_item(root, f"{tid}.run-2") or {}).get("status"), "DELIVERED", "its own item")
@@ -3229,11 +3230,19 @@ class Hooks(unittest.TestCase):
         return fake, inflight
 
     def switches(self, tid, fake, inflight):
+        """Served again under L2: its ack, retried up to three times, switches to generation 2, whose
+        run is published and whose own answer posts; no claim is left behind."""
         inflight.add(tid)
         self.reserved(tid, inflight)
         fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
-        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "the newer generation is not held")
+        acks = []
+        for _ in range(3):
+            acks.append(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+            if acks[-1]:
+                break
+        self.assertEqual(acks, [True], "the newer generation is not held")
         self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2")
+        self.answered_by_its_own_run(fake, tid, inflight)
 
     def test_a_result_refused_attribution_ends_its_claim_and_never_holds_a_newer_generation(self):
         tid = "task-unpublished-attribution"
@@ -3269,6 +3278,42 @@ class Hooks(unittest.TestCase):
         fake, inflight = self.disposed_unpublished(tid, "the answer",
                                                    mock.patch.object(gw, "_deliver_ready", side_effect=disposes))
         self.switches(tid, fake, inflight)
+
+    def test_a_send_really_in_progress_still_holds_the_newer_generation(self):
+        for stage in ("pinned", "in the outbox"):
+            with self.subTest(stage=stage):
+                tid = f"task-in-progress-{stage.split()[-1]}"
+                fake = self.served_acked(tid)
+                self.core_writes(tid, "generation 1's answer")
+                self.assertIsNotNone(gw._pin_and_claim(tid)[0])
+                inflight = {tid}
+                self.reserved(tid, inflight)
+                fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+                if stage == "in the outbox":
+                    op = next(iter(gw._ATTEMPTS.get(tid)["claims"]))
+                    gw._delivery_core().backend.publish(tid, b"{}", lifecycle={"op": op})
+                    gw.disposal.pin_path(gw.RESULTS_DIR, tid).unlink()
+                    (gw.RESULTS_DIR / f"{tid}.txt").unlink()
+                    sending = mock.patch.object(gw, "withdraw_unsent", return_value=False)
+                else:
+                    sending = contextlib.nullcontext()
+                with sending:
+                    acks = [gw._post_task_ack(tid, durable=True, lease_id="L2") for _ in range(3)]
+                self.assertEqual(acks, [False, False, False], "its send may be under way: L2 waits")
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertEqual((rec["run"], rec["pending_serve"]["lease"]), (tid, "L2"))
+                self.assertEqual([c["kind"] for c in rec["claims"].values()].count("result"), 1, "its claim is kept")
+
+    def test_a_different_reply_at_the_name_does_not_keep_a_disposed_replys_claim(self):
+        tid = "task-other-reply"
+        self.served_acked(tid)
+        self.core_writes(tid, "the first reply")
+        self.assertIsNotNone(gw._pin_and_claim(tid)[0])
+        gw.disposal.pin_path(gw.RESULTS_DIR, tid).unlink()
+        (gw.RESULTS_DIR / f"{tid}.txt").unlink()
+        self.core_writes(tid, "a later reply")
+        self.assertTrue(gw._end_unpublished_claims(tid), "the claimed reply itself is gone, unpublished")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("claims"))
 
     def test_a_claim_left_open_by_a_crash_is_ended_by_the_reconcile_only_once_its_file_is_gone(self):
         tid = "task-unpublished-crash"

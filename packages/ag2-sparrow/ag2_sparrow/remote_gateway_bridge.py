@@ -4251,18 +4251,25 @@ def _claim_published(wire_tid: str, op: str, claim: dict) -> "list[str]":
     return [i for i in items if ((read_item(root, i) or {}).get("lifecycle") or {}).get("op") == op]
 
 
+def _claimed_copy_present(tid: str, claim: dict) -> bool:
+    """Whether the exact reply a result claim was taken for is still at its name or its pin."""
+    paths = (RESULTS_DIR / f"{tid}.txt", disposal.pin_path(RESULTS_DIR, tid))
+    if not claim.get("file"):
+        return any(os.path.lexists(p) for p in paths)
+    return any(_live_source(p, tuple(claim["file"])) is not None for p in paths)
+
+
 def _end_unpublished_claims(wire_tid: str) -> bool:
-    """End every result claim whose file the drain has disposed of without publishing it: nothing was
-    sent. Files are read before the outbox, which a publish writes before the file goes. False while one
-    still has its file and no item: its delivery may be under way."""
+    """End every result claim whose exact reply the drain has durably disposed of without publishing it:
+    nothing was sent. Files are read before the outbox, which a publish writes before the file goes.
+    False while one's reply is still there with no item: its delivery may be under way."""
     with _ATTEMPTS.transition(wire_tid) as t:
         if not isinstance(t.rec, dict):
             return False
         open_ = True
         for c in t.claims("result"):
             tid = str((c.get("data") or {}).get("tid") or "")
-            if tid and (os.path.lexists(RESULTS_DIR / f"{tid}.txt")
-                        or os.path.lexists(disposal.pin_path(RESULTS_DIR, tid))):
+            if not tid or _claimed_copy_present(tid, c):
                 open_ = open_ and bool(_claim_published(wire_tid, c["op"], c))
             elif not _claim_published(wire_tid, c["op"], c):
                 open_ = t.release_claim(c) and open_
