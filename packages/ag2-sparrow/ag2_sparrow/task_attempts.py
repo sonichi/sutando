@@ -21,7 +21,6 @@ import contextlib
 import hashlib
 from datetime import datetime
 import json
-import math
 import os
 import re
 import secrets
@@ -33,6 +32,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import agent_turn, file_lock, local_task_protocol
+from .safe_number import finite
 from .result_ready import identity_of
 
 TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
@@ -1473,7 +1473,7 @@ def _state(q, tasks: dict) -> str:
     if (type(q) is not dict or set(q) - {"holder", "since", "answered", "expires"} or {"holder", "answered"} <= set(q)
             or ("since" in q and ("holder" not in q or type(q["since"]) not in (int, float)))):
         raise _Refused
-    if "expires" in q and (type(q["expires"]) not in (int, float) or not math.isfinite(q["expires"])):
+    if "expires" in q and finite(q["expires"]) is None:
         raise _Refused
     if "answered" in q:
         if q["answered"] is not True and not (type(q["answered"]) is str and q["answered"] == ANSWERED_UNKNOWN):
@@ -1490,14 +1490,12 @@ def _state(q, tasks: dict) -> str:
 def _expiry(question) -> "float | None":
     """The question's `expires_at` as epoch seconds; None when absent or unreadable."""
     v = question.get("expires_at") if isinstance(question, dict) else None
-    if type(v) in (int, float):
-        return float(v) if math.isfinite(v) else None
     if type(v) is str:
         try:
-            return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-        except ValueError:
+            return finite(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+        except (ValueError, OverflowError, OSError):
             return None
-    return None
+    return finite(v)
 
 
 def _forgettable(q: dict, now: float) -> bool:
@@ -1505,7 +1503,7 @@ def _forgettable(q: dict, now: float) -> bool:
     forgotten on local time: a clock ahead of the broker's would hand it to a second task."""
     if "holder" in q:
         return False
-    expires = q.get("expires")
+    expires = finite(q.get("expires"))
     return (expires is not None and now > expires + QUESTION_EXPIRY_GRACE_S) or not set(q) - {"expires"}
 
 

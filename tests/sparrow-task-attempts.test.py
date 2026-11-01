@@ -936,6 +936,17 @@ class AnsweredOnce(unittest.TestCase):
                 a._commit(lambda d: d.setdefault("questions", {}).__setitem__("rq_1", entry), why="test")
                 self.assertEqual(call(a, "tsk_B", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
 
+    def test_a_number_too_large_for_a_float_never_makes_a_task_unqueueable(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_H")
+        self.assertIn(self.RULE, call(a, "tsk_H", "answer_rule", {"question_id": "q_huge", "expires_at": 10 ** 400}),
+                      "an unreadable expiry is no expiry: offered, never a crash")
+        self.assertNotIn("expires", a._read()["questions"]["q_huge"])
+        a._commit(lambda d: d["questions"].__setitem__("q_bad", {"expires": 10 ** 400}), why="test")
+        self.served(a, "tsk_I")
+        self.assertEqual(call(a, "tsk_I", "answer_rule", {"question_id": "q_other"}), task_attempts.ANSWER_UNRECORDED_NOTE,
+                         "a damaged entry is refused like any other, never raised")
+
     def test_a_clock_jumped_past_expiry_never_hands_a_live_hold_to_another_task(self):
         a = self.mk(turn_context=True)
         q1 = {"question_id": "q1", "expires_at": 1000}
