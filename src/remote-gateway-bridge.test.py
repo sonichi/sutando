@@ -876,6 +876,8 @@ def main() -> int:
           "no file defines the token -> resolver FAILS instead of naming a tokenless file")
     check(sk.rstrip().splitlines()[-1].startswith("2. Process"),
           "skill block is the file tail (appended after access_tier)")
+    check("to end it with no reply, write `[no-send]` as the result" in sk.rstrip().splitlines()[-1],
+          "the task file says how to end a task with no reply")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
     check(tiers_sk == ["access_tier: owner"], "exactly one access_tier line, owner")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")

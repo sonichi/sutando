@@ -5052,6 +5052,48 @@ class Reply(Base):
         self.assertIn("nothing posted", r.stdout)
         self.assertEqual(self.result_file.read_text(), "[no-send]\n")
 
+    def no_reply(self, *args):
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["no-reply", *args], self.env())
+
+    def test_no_reply_settles_only_once_sparrow_recorded_it(self):
+        sent = []
+
+        def settled(body):
+            sent.append(body)
+            outbox.record_delivered(self.outbox, self.TID)
+            self.result_file.unlink()
+        self.sparrow(settled)
+        r = self.no_reply(str(self.result_file), "--reason", " thanks,\n just an ack ",
+                          "--wait", "10")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"settled: {self.TID}.txt, nothing posted", r.stdout)
+        self.assertEqual(sent, ["[no-send] thanks, just an ack\n"])
+
+    def test_no_reply_unconfirmed_is_not_reported_as_settled(self):
+        r = self.no_reply(str(self.result_file), "--wait", "0.3")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("do not report it as settled", r.stderr)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+        self.assertEqual(stat.S_IMODE(self.result_file.stat().st_mode), 0o600)
+
+    def test_no_reply_parked_is_not_settled(self):
+        self.sparrow(lambda _body: outbox.park_item(self.outbox, self.TID, "gateway refused"))
+        r = self.no_reply(str(self.result_file), "--wait", "10")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NOT settled", r.stderr)
+
+    def test_no_reply_after_a_reply_writes_nothing(self):
+        self.assertEqual(self.reply(str(self.result_file), "--body", "hi", "--wait", "0").returncode, 3)
+        r = self.no_reply(str(self.result_file), "--wait", "0")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.result_file.read_text(), "hi")
+
+    def test_no_reply_refuses_an_overlong_reason(self):
+        r = self.no_reply(str(self.result_file), "--reason", "x" * 201)
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse(self.result_file.exists())
+
     def test_refuses_every_delivery_marker(self):
         for body in ("[REPLIED]\n", "[no-send]", "   \n",
                      # the bypass: a skip behind a redirect is still a skip at delivery

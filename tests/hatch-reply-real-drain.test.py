@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""`ag2-sparrow-hatch reply` reports posted only when Sparrow's real drain sent it.
+"""`ag2-sparrow-hatch reply` reports posted, and `no-reply` settled, only when Sparrow's real drain
+sent it.
 
 The worker's command writes the result file and waits; the bridge's own
 `_post_ready_results` drains it through the delivery core to a stand-in gateway.
@@ -80,7 +81,7 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
             'access_tier: owner\ntask: what is 2+2?\n')
         gw._record_task_room(self.tid, '!r:ag2.space')
 
-    def reply(self, body):
+    def reply(self, body, *cmd):
         env = hermetic_env()
         env.update(HOME=str(self.home), PYTHONPATH=str(PKG),
                    AGENT_CONNECT_RESULT_DIR=str(self.results),
@@ -88,17 +89,18 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
                    AGENT_CONNECT_STATE_DIR=str(self.home / 'state'),
                    GATEWAY_INSTANCE=self.instance)
         proc = subprocess.Popen(
-            [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', 'reply',
+            [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', *(cmd or ('reply',)),
              str(self.results / f'{self.tid}.txt'), '--wait', '20'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=str(self.home))
         done = {}
+        self.inflight = {self.tid}
         waiter = threading.Thread(target=lambda: done.update(
             out=proc.communicate(input=body, timeout=30)))
         waiter.start()
         while waiter.is_alive():
             if (self.results / f'{self.tid}.txt').exists():
-                gw._post_ready_results({self.tid})
+                gw._post_ready_results(self.inflight)
             time.sleep(0.05)
         waiter.join()
         out, err = done['out']
@@ -127,6 +129,24 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertIn('NOT posted', err)
         self.assertNotIn('posted:', out)
         self.assertEqual(len(self.server.calls), 1)
+
+    def test_no_reply_posts_nothing_and_settles_the_task(self):
+        self.start()
+        rc, out, err = self.reply('', 'no-reply', '--reason', 'an acknowledgement')
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
+        self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls],
+                         [('[no-send]', True)])
+        self.assertEqual(self.inflight, set())
+        self.assertFalse((self.results / f'{self.tid}.txt').exists())
+        self.assertEqual(outbox.item_status(self.results / '.outbox', TID), 'DELIVERED')
+
+    def test_no_reply_is_not_settled_when_the_gateway_refused_it(self):
+        self.start(refuse=True)
+        rc, out, err = self.reply('', 'no-reply')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('NOT settled', err)
+        self.assertEqual(self.inflight, {self.tid})
 
     def test_a_skip_behind_a_redirect_is_refused_before_anything_is_sent(self):
         self.start()
