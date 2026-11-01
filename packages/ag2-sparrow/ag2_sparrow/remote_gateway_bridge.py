@@ -4382,7 +4382,7 @@ def _stop_run(t, run: "str | None", why: str) -> bool:
         return True                             # never taken and gone: nothing runs
     ctl = _queue_cancel_instruction(run, why)
     if ctl:
-        _log(f"task {run}: {why} — the core is asked to stop it")
+        _log(f"task {run}: {why} — its turn is asked to stop")
     return ctl is not None
 
 
