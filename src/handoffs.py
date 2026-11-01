@@ -12,8 +12,9 @@ A handoff is recorded where the work is given away, as a `handoff` record in the
     message  the activity hook, on a SendMessage ask         `handoffs.py close` (the reply's turn)
              carrying an Interaction-Id
 
-A close is claimed by unlinking the index file: only the process whose unlink succeeds writes the
-`handoff_closed` record, so concurrent readers never close twice and nobody waits on a lock. Any
+A close is claimed by creating its marker (`closed/<handoff id>`, O_CREAT|O_EXCL: exactly one winner,
+unlike an unlink): only the winner writes the `handoff_closed` record and removes the index, so
+concurrent readers never close twice and nobody waits on a lock. Index files are written whole. Any
 handoff older than MAX_OPEN_S closes as a timeout, and `delegated_status` returns the deadline so a
 parked parent's blocker can carry the same expiry. Only `holds: yes` handoffs keep the parent open.
 
@@ -76,6 +77,21 @@ def _index_dir(workspace, parent_task_id: str) -> Path:
     return Path(workspace) / INDEX / _safe_name(parent_task_id)
 
 
+def _closed_marker(workspace, handoff_id: str) -> Path:
+    return Path(workspace) / INDEX / "closed" / _safe_name(handoff_id)
+
+
+def _write_whole(path: Path, text: str) -> None:
+    """Write `text` to `path` through a temp file in the same directory, so no reader sees half of it."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def _child_key(workspace, path: str, child_ref: str) -> Path:
     return Path(workspace) / INDEX / "by-child" / f"{path}-{_safe_name(child_ref)}"
 
@@ -94,25 +110,29 @@ def open_handoff(workspace, parent_task_id: str, path: str, child_ref: str, dele
             return None
         d = _index_dir(workspace, parent_task_id)
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{hid}.json").write_text(json.dumps(rec))
+        _write_whole(d / f"{hid}.json", json.dumps(rec))
         key = _child_key(workspace, path, child_ref)
         key.parent.mkdir(parents=True, exist_ok=True)
-        key.write_text(json.dumps({"handoff_id": hid, "parent_task_id": parent_task_id}))
+        _write_whole(key, json.dumps({"handoff_id": hid, "parent_task_id": parent_task_id}))
         return hid
     except Exception:  # noqa: BLE001 - bookkeeping beside the work
         return None
 
 
 def _claim_close(workspace, rec: dict, outcome: str) -> bool:
-    """Close one handoff once: the unlink of its index file is the claim; the winner records it."""
+    """Close one handoff once: creating its marker is the claim; the winner records it."""
+    marker = _closed_marker(workspace, rec["handoff_id"])
     try:
-        os.unlink(_index_dir(workspace, rec["parent_task_id"]) / f"{rec['handoff_id']}.json")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
     except OSError:
-        return False  # another reader closed it first, or it was never indexed
-    try:
-        os.unlink(_child_key(workspace, rec["path"], rec["child_ref"]))
-    except OSError:
-        pass
+        return False  # another reader closed it first, or the marker cannot be made
+    for f in (_index_dir(workspace, rec["parent_task_id"]) / f"{rec['handoff_id']}.json",
+              _child_key(workspace, rec["path"], rec["child_ref"])):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
     return cl.record("handoff_closed", {"handoff_id": rec["handoff_id"], "outcome": outcome},
                      workspace=workspace) is not None
 
@@ -125,6 +145,8 @@ def _indexed(workspace, parent_task_id: str) -> list:
     except OSError:
         return out
     for n in names:
+        if n.startswith(".") or _closed_marker(workspace, n[:-5]).exists():
+            continue  # a temp file being written, or a handoff already claimed closed
         try:
             out.append(json.loads((d / n).read_text()))
         except (OSError, ValueError):
@@ -136,7 +158,7 @@ def close_handoff(workspace, handoff_id: str, outcome: str = "done") -> bool:
     """Close by id (the CLI's `close`): finds its index file under any parent."""
     root = Path(workspace) / INDEX
     try:
-        parents = [p for p in root.iterdir() if p.is_dir() and p.name != "by-child"]
+        parents = [p for p in root.iterdir() if p.is_dir() and p.name not in ("by-child", "closed")]
     except OSError:
         return False
     for p in parents:

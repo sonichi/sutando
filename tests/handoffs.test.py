@@ -119,6 +119,29 @@ class Lifecycle(unittest.TestCase):
         closes = [r for r in cl.read(workspace=self.ws) if r["kind"] == "handoff_closed"]
         self.assertEqual(len(closes), 1)
 
+    def test_the_claim_has_one_winner_even_when_unlink_succeeds_twice(self):
+        """APFS was measured letting more than one unlink of the same file succeed; the claim no
+        longer rests on unlink, so two claimants racing on one handoff still record one close."""
+        hid = ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
+        rec = ho._indexed(self.ws, PARENT)[0]
+        with patch.object(ho.os, "unlink", lambda *a, **k: None):  # every unlink "succeeds"
+            wins = [ho._claim_close(self.ws, rec, "done") for _ in range(3)]
+        self.assertEqual(wins, [True, False, False])
+        closes = [r for r in cl.read(workspace=self.ws) if r["kind"] == "handoff_closed"]
+        self.assertEqual([c["handoff_id"] for c in closes], [hid])
+        self.assertEqual(ho.open_handoffs(self.ws, PARENT), [], "a claimed handoff is closed to readers")
+
+    def test_index_files_are_written_whole(self):
+        replaced = []
+        real = ho.os.replace
+        with patch.object(ho.os, "replace", lambda a, b: (replaced.append(Path(b).name), real(a, b))):
+            ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
+        self.assertEqual(len(replaced), 2, "the index and the child key both land by replace")
+        with patch.object(ho.os, "replace", side_effect=OSError("disk full")):
+            self.assertIsNone(ho.open_handoff(self.ws, PARENT, "pool", "task-other-child-1", "worker-a", holds=True))
+        leftovers = [p.name for p in (self.ws / ho.INDEX).rglob(".*.tmp")]
+        self.assertEqual(leftovers, [], "a failed write leaves no temp file")
+
     def test_a_handoff_out_too_long_times_out(self):
         ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
         self.assertEqual(ho.open_handoffs(self.ws, PARENT, now=time.time() + ho.MAX_OPEN_S + 60), [])
