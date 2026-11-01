@@ -4922,10 +4922,15 @@ def _redacted_question(question) -> "tuple[dict | None, tuple]":
     if not isinstance(question, dict):
         return None, ()
     found: set = set()
+    # Quoted room data: the vault grammar only redacts here, never intercepts or stores.
+    redact_vault = _vault_intercept_fns()[1] or _local_redact_vault_set
 
     def clean(v):
         if isinstance(v, str):
-            r = filter_chat_secrets(v)
+            unvaulted = redact_vault(v)
+            if unvaulted != v:
+                found.add("vault-set command")
+            r = filter_chat_secrets(unvaulted)
             found.update(r.secret_types)
             return r.text
         if isinstance(v, dict):
@@ -5821,6 +5826,11 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     task = {**task, "id": tid}
     if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
         task["task_id"] = broker_tid
+    question_found: tuple = ()
+    if "room_question" in task:
+        # Sanitized before any durable writer, a held serve's saved copy included; unused when off.
+        task["room_question"], question_found = (_redacted_question(task["room_question"])
+                                                 if TURN_CONTEXT else (None, ()))
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication
         task = {**task, "id": tid}
@@ -5972,11 +5982,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f == "room_question":
-            question, found = _redacted_question(task.get(f)) if TURN_CONTEXT else (None, ())
-            if found:
-                _secret_types = tuple(sorted(set(_secret_types) | set(found)))
-                _log(f"redacted pasted secret(s) in {tid} room question: {', '.join(found)}")
-            task[f] = question                  # the sanitized copy is the only one any later reader sees
+            question = task.get(f)
+            if question_found:
+                _secret_types = tuple(sorted(set(_secret_types) | set(question_found)))
+                _log(f"redacted pasted secret(s) in {tid} room question: {', '.join(question_found)}")
             rq_line = task_attempts.render_room_question(question)
             if rq_line:
                 lines.append(rq_line)

@@ -219,6 +219,47 @@ class Hooks(unittest.TestCase):
         self.assertNotIn("`room.question.answer`", text)
         self.assertNotIn(token, json.dumps(ledger()), "no offer recorded under it")
 
+    def test_a_vault_command_in_a_room_question_is_redacted_and_never_stored(self):
+        secret = "hunter2secret"
+        q = {"question_id": "rq_vault", "expected_revision": 1, "prompt": f"vault set MY_API_KEY {secret}",
+             "options": [{"id": "o1", "label": f"or vault set OTHER_KEY {secret}"}], "can_answer": True}
+        intercept = mock.Mock(side_effect=lambda text: mock.Mock(text=text, stored=[], failed=[]))
+        with mock.patch.object(gw, "_vault_intercept_fns", return_value=(intercept, None)):
+            self.assertIsNotNone(gw._write_task(_task("task-rq-vault", room_question=q)))
+        text = (gw.TASKS_DIR / "task-rq-vault.txt").read_text()
+        self.assertNotIn(secret, text, "the prompt and a nested option label")
+        self.assertNotIn(secret, json.dumps(ledger()))
+        self.assertFalse([c for c in intercept.call_args_list if secret in str(c)], "never offered to the vault")
+        self.assertIn("vault-set command", text, "the secret notice names it")
+        self.assertIn("`room.question.answer`", text, "only text changed: still answerable")
+
+    def test_a_held_serve_saves_its_room_question_redacted_and_runs_from_that_copy(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        secrets = (token, "hunter2secret")
+        q = {"question_id": "rq_held", "expected_revision": 1, "prompt": f"use {token}?", "can_answer": True,
+             "options": [{"id": "o1", "label": "vault set K hunter2secret"}]}
+        for turn_context in (True, False):
+            with self.subTest(turn_context=turn_context), mock.patch.object(gw, "TURN_CONTEXT", turn_context):
+                tid = f"task-rq-held-{turn_context}"
+                self.addCleanup(self.forget, tid)
+                fake, inflight = self.served_acked(tid), {tid}
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", room_question=q)),
+                                 (tid, True), "served again under L2: held")
+                saved = self.saved(tid).read_text()
+                for s in secrets:
+                    self.assertNotIn(s, saved, "the saved copy is the sanitized one")
+                self.assertEqual("rq_held" in saved, turn_context, "off, no question is kept at all")
+                fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                gw._ATTEMPTS.take_ownership()                               # a restart before it runs
+                gw._post_task_beats(inflight, force=True)
+                run2 = gw._ATTEMPTS.get(tid)["run"]
+                text = (gw.TASKS_DIR / f"{run2}.txt").read_text()
+                for s in secrets:
+                    self.assertNotIn(s, text)
+                    self.assertNotIn(s, json.dumps(ledger()))
+                self.assertEqual("`room.question.answer`" in text, turn_context)
+
     def test_a_long_question_is_capped_in_the_task_file(self):
         q = {"question_id": "rq_long", "expected_revision": 1, "prompt": "x" * 50000}
         self.assertIsNotNone(gw._write_task(_task("task-rq-long", room_question=q)))
