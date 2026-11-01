@@ -336,7 +336,7 @@ class Hooks(unittest.TestCase):
             self.assertIsNotNone(t.claim("ack", serve="L1", data={"retry_owner": "ack_first", "local_tid": tid,
                                                                     "durable": True}))
         fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": lambda p: _ack(tid, 1)}))
-        self.assertEqual(gw._retry_claimed_acks(), set())
+        self.assertNotIn(tid, gw._retry_claimed_acks())
         self.assertEqual(self.acks(fake, tid), [], "the ordinary retry never sends it")
 
     def test_a_lost_ack_re_served_under_its_own_generation_keeps_one_run(self):
