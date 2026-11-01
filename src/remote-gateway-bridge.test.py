@@ -1777,6 +1777,22 @@ def main() -> int:
     check(isinstance(_st, dict) and _st.get("phase") == "Running tests" and _st.get("summary") == "Running tests",
           f"the host's status is the Basic fields only, never the step text ({_st})")
     _sidecar.unlink()
+    import connections as _conn
+    _saved_conn = (_conn.unaddressed_owner, _conn.owns_unaddressed, rtc._log)
+    _handoff_logs: list = []
+    _conn.unaddressed_owner = lambda ws=None: ({"instance": ""}, {"instance": "s-lane"})
+    _conn.owns_unaddressed = lambda inst, ws=None: inst == ""
+    rtc._log = _handoff_logs.append
+    try:
+        check(rtc._owns_unaddressed() is (rtc.GATEWAY_INSTANCE == ""), "the host answers from the handed-off owner")
+        rtc._owns_unaddressed()
+        check(len(_handoff_logs) == 2 and "lane s-lane has no owner DM, so lane primary delivers them" in _handoff_logs[0],
+              f"a handoff of unaddressed messages is logged, backed off ({_handoff_logs[:1]})")
+        _conn.unaddressed_owner = lambda ws=None: ({"instance": "s-lane"}, None)
+        _handoff_logs.clear(); rtc._owns_unaddressed()
+        check(_handoff_logs == [], "no handoff, no log line")
+    finally:
+        _conn.unaddressed_owner, _conn.owns_unaddressed, rtc._log = _saved_conn
     _saved_owns = rtc.OWNS_UNADDRESSED
     rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True  # the record made this lane the primary
     n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1h.txt").write_text("nudge for the new primary\n")

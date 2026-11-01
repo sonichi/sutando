@@ -411,7 +411,12 @@ def _legacy_stand_down():
 
 
 def _owns_unaddressed() -> bool:
-    from connections import owns_unaddressed
+    from connections import owns_unaddressed, unaddressed_owner
+    owner, handed_from = unaddressed_owner(WS)  # noqa: F821
+    if handed_from is not None and owner is not None:
+        _log_backoff(("unaddressed-handoff", handed_from["instance"], owner["instance"]),  # noqa: F821
+                     f"unaddressed owner messages: lane {handed_from['instance'] or 'primary'} has no owner DM, "
+                     f"so lane {owner['instance'] or 'primary'} delivers them")
     return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
 
 
@@ -469,6 +474,16 @@ TASK_STATUS = _ag2space_task_status
 TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed
+
+
+def _ag2space_lane_server() -> str:
+    """The homeserver this lane's connection row names: a secondary lane's relay answer on another
+    server is refused."""
+    from connections import lane_server
+    return lane_server(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+LANE_SERVER = _ag2space_lane_server
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
