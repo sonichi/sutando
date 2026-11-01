@@ -966,3 +966,29 @@ The s.space dashboard already classifies `error` as unhealthy, so this
 requires updating Sutando's health checker and restarting its gateway bridge;
 no dashboard schema change is needed. Reporting starts after the first health
 check completes and follows the installed check cadence.
+
+### Local task origin correlation
+
+Tasks with `source_message_id` also carry an `origin_message_ids:` header
+(comma-separated message IDs). The gateway seeds it before `task:`; the shared
+local serializer, Discord and Telegram writers do the same. Sources without a
+message ID omit the header. `source_message_id` remains unchanged.
+
+When shared dedup recovery accepts `[deduped: X]` (including an answer pending
+provider acceptance), `src/task_origins.py` merges the holder and folded task's
+origins into `state/task-origins/X.json`. Rejected folds do not contribute.
+This sidecar leaves task files and their signed envelopes untouched. One writer
+locks per task, reads and merges, fsyncs a unique temporary file, then atomically
+replaces the record. Retries are idempotent; concurrent processes share the lock.
+
+Records keep the first 128 unique IDs, each at most 512 characters, with no
+whitespace, control characters or commas. Excess IDs are dropped; this is a
+bounded correlation window, not an exhaustive audit trail. Missing or malformed
+records read as empty. Write failures are logged by dedup recovery and do not
+change delivery behavior. There is no migration or new configuration; rollback
+leaves sidecars inert. Sidecar retention follows workspace retention.
+
+New activity rows expose `task.origins` when IDs are available, merging the
+header with the latest sidecar at append time; `task.event` keeps its original
+meaning. Existing activity rows are not rewritten. Clients that ignore the new
+field retain their current behavior.

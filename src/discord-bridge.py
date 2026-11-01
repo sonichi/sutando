@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import weakref
+from task_origins import origin_header
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -4284,6 +4285,7 @@ async def _handle_discord_message(message, force=False):
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"
             f"source_message_id: {message.id}\n"
+            f"{origin_header(str(message.id))}"
             # Same namespace as the addressee in the body (`<@id>`), so a non-addressed core
             # can tell. Must stay above `task:` — later lines parse as untrusted body.
             f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"

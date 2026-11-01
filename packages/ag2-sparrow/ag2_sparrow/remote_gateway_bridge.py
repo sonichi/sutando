@@ -5626,6 +5626,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.
+            from .task_origins import origin_header
+            seed = origin_header(_one_line(task.get("source_message_id") or ""))
+            if seed:
+                lines.append(seed.rstrip("\n"))
             if woken:
                 lines.append(f"wake_episode: {_one_line(woken)}")
             if collaborator_enabled:

@@ -170,7 +170,7 @@ def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tu
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
     "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
-    "channel_id", "priority", "interaction_type", "source_message_id",
+    "channel_id", "priority", "interaction_type", "source_message_id", "origin_message_ids",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
     "author_id", "chat_id",
@@ -993,6 +993,16 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
     Header values must be single-line — a newline in a value could forge a
     header, so it raises instead of writing a corrupt file.
     """
+    headers = list(headers)
+    if not any(k == "origin_message_ids" for k, _ in headers):
+        try:
+            from .task_origins import origin_header
+        except ImportError:
+            from task_origins import origin_header
+        source = next((v for k, v in headers if k == "source_message_id"), "")
+        seeded = origin_header(source)
+        if seeded:
+            headers.append(("origin_message_ids", seeded.partition(": ")[2].strip()))
     lines = []
     for key, value in headers:
         if key == "task":

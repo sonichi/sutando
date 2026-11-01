@@ -41,6 +41,7 @@ MAP = {
     # the gateway delegates, tests/gateway-disposal-delegation.test.py pins it
     "src/delivery/disposal.py": "result_disposal.py",
     "src/dedup_recovery.py": "dedup_recovery.py",
+    "src/task_origins.py": "task_origins.py",
     "src/file_lock.py": "file_lock.py",
     # one-process exclusion per work root (flock + holder record); builds on file_lock
     "src/holder_lock.py": "holder_lock.py",

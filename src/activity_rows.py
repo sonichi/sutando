@@ -15,6 +15,7 @@ import os
 import time
 from pathlib import Path
 
+from task_origins import normalize_origins, origins_from_text, read_origins
 from file_lock import locked_file
 from workspace_default import resolve_workspace
 
@@ -191,6 +192,12 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
     if room:
         rec["room"] = room
     if task:
+        task = dict(task)
+        origins = normalize_origins([
+            task.get("event", ""), *task.get("origins", []),
+            *read_origins((workspace or resolve_workspace()) / "state", task.get("id", ""))])
+        if origins:
+            task["origins"] = origins
         rec["task"] = task
     if done:
         rec["done"] = True
@@ -295,8 +302,9 @@ def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
 
 def task_from_file(path: Path) -> tuple[dict, str | None]:
     """({id, from, text}, room) read from a task file's headers; text is the first task: line."""
+    text = path.read_text(encoding="utf-8", errors="replace")
     fields: dict = {}
-    for l in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for l in text.splitlines():
         k, _, v = l.partition(":")
         if k in ("id", "user_id", "task", "channel_id", "source_message_id") and k not in fields:
             fields[k] = v.strip()
@@ -307,4 +315,7 @@ def task_from_file(path: Path) -> tuple[dict, str | None]:
         task["text"] = fields["task"][:TEXT_MAX]
     if fields.get("source_message_id"):
         task["event"] = fields["source_message_id"]  # the client mounts the card under this message
+    origins = origins_from_text(text)
+    if origins:
+        task["origins"] = origins
     return task, fields.get("channel_id") or None

@@ -59,6 +59,7 @@ class TaskActivityState:
     seq: int = 0  # last runtime-event sequence applied, across sessions
     emitted: int = 0
     message_event_id: str | None = None
+    origins: list[str] | None = None
     room: str | None = None
     sender: str | None = None
     text: str | None = None
@@ -84,6 +85,7 @@ class LifecycleTransition:
     ts: float | None = None
     reason: str = ""
     message_event_id: str | None = None
+    origins: list[str] | None = None
     room: str | None = None
     sender: str | None = None
     text: str | None = None
@@ -117,6 +119,8 @@ def _task_dict(state: TaskActivityState) -> dict:
         t["text"] = state.text
     if state.message_event_id:
         t["event"] = state.message_event_id
+    if state.origins:
+        t["origins"] = state.origins
     if state.into:
         t["into"] = state.into
     return t
@@ -189,7 +193,7 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
             return state, rows
         if item.to_phase == "QUEUED":
             state.applied.append("queued")
-        for f in ("message_event_id", "room", "sender", "text", "worker", "into"):
+        for f in ("message_event_id", "origins", "room", "sender", "text", "worker", "into"):
             v = getattr(item, f)
             if v:
                 setattr(state, f, v)
@@ -275,7 +279,7 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
             if p.exists():
                 into = task_from_file(p)[0].get("event")
                 break
-    return LifecycleTransition(task["id"], to_phase, reason=reason, message_event_id=task.get("event"),
+    return LifecycleTransition(task["id"], to_phase, reason=reason, message_event_id=task.get("event"), origins=task.get("origins"),
                                room=room, sender=task.get("from"), text=task.get("text"), worker=worker, into=into, ts=ts,
                                queue=queue)
 

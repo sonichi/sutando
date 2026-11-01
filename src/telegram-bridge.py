@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from task_origins import origin_header
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -918,7 +919,7 @@ def main():  # pragma: no cover
                 parent_line = ""
                 _src_mid = msg.get("message_id")
                 if _src_mid is not None:
-                    src_line = f"source_message_id: {_src_mid}\n"
+                    src_line = f"source_message_id: {_src_mid}\n" + origin_header(str(_src_mid))
                 _rep = msg.get("reply_to_message")
                 if _rep:
                     _rep_user = (

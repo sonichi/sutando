@@ -14,6 +14,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'priority',
 	'interaction_type',
 	'source_message_id',
+	'origin_message_ids',
 	'channel_name',
 	'guild_name',
 	'attempts',
