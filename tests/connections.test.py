@@ -402,6 +402,74 @@ class DeclaredLocalServer(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
             self.assertEqual(C.local_server_for("localhost"), "")
 
+    def test_a_declared_local_server_resolves_only_to_loopback_private_or_shared_addresses(self):
+        """allow_local admits this machine and the owner's own network, never any address."""
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        entry = {"server": "chat.home.example", "allow_local": True}
+        with self.section(entry):
+            for ip in ("127.0.0.1", "::1", "10.1.2.3", "172.16.0.9", "192.168.1.20", "100.64.0.1",
+                       "fd00::1", "::ffff:192.168.1.20"):
+                p = C.preview_connection("https://chat.home.example/relay|s", fetch=fetch,
+                                         getaddrinfo=self.resolving_to(ip))
+                self.assertTrue(p["verified"], ip)
+            for ip in ("169.254.169.254", "fe80::1", "0.0.0.0", "::", "8.8.8.8", "2001:4860::8888",
+                       "224.0.0.1", "240.0.0.1", "::ffff:169.254.169.254", "203.0.113.5"):
+                with self.assertRaises(C.InvalidToken, msg=ip) as cm:
+                    C.preview_connection("https://chat.home.example/relay|s",
+                                         fetch=lambda *a: self.fail(f"probed {ip}"),
+                                         getaddrinfo=self.resolving_to(ip))
+                self.assertEqual(str(cm.exception), "invalid_gateway")
+
+    def test_plain_http_only_to_loopback(self):
+        """The bearer rides every poll in cleartext over http: only to this machine itself."""
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        with self.section({"server": "chat.home.example", "allow_local": True}):
+            for ip in ("192.168.1.20", "10.0.0.5", "100.64.0.1", "fd00::1"):
+                with self.assertRaises(C.InvalidToken, msg=ip):
+                    C.preview_connection("http://chat.home.example/relay|s",
+                                         fetch=lambda *a: self.fail(f"cleartext to {ip}"),
+                                         getaddrinfo=self.resolving_to(ip))
+            p = C.preview_connection("http://chat.home.example/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+
+    def test_an_entry_that_names_a_port_covers_that_port_only(self):
+        fetch, seen = self.listing("@alice.agent:localhost")
+        with self.section({"server": "localhost", "gateway_host": "localhost:8008", "allow_local": True}):
+            p = C.preview_connection("http://localhost:8008/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+            for url in ("http://localhost:22/relay", "http://localhost/relay", "https://localhost/relay"):
+                with self.assertRaises(C.InvalidToken, msg=url):
+                    C.preview_connection(url + "|s", fetch=lambda *a: self.fail(f"probed {url}"),
+                                         getaddrinfo=lambda *a, **k: self.fail(f"resolved {url}"))
+        with self.section(self.ENTRY):  # no port named: every port on the host
+            p = C.preview_connection("http://localhost:8008/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+
+    def test_userinfo_and_other_schemes_are_refused_on_the_local_path(self):
+        with self.section(self.ENTRY):
+            for url in ("http://evil@localhost/relay", "http://u:p@localhost/relay", "http://localhost@evil.example/relay",
+                        "ws://localhost/relay", "ftp://localhost/relay", "http://ｌocalhost/relay"):
+                with self.assertRaises(C.InvalidToken, msg=url):
+                    C.preview_connection(url + "|s", fetch=lambda *a: self.fail(f"probed {url}"),
+                                         getaddrinfo=lambda *a, **k: self.fail(f"resolved {url}"))
+
+    def test_an_ipv6_host_header_is_bracketed(self):
+        sent = []
+        class Sock:
+            def makefile(self, *a, **k):
+                import io
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            def sendall(self, data): sent.append(data)
+            def close(self): pass
+        C._fetch_json("http://[::1]:8008/relay", "t|s", "::1", "/v1/whoami", connect=lambda *a: Sock())
+        C._fetch_json("http://[::1]/relay", "t|s", "::1", "/v1/whoami", connect=lambda *a: Sock())
+        heads = b"".join(sent)
+        self.assertIn(b"Host: [::1]:8008\r\n", heads)
+        self.assertIn(b"Host: [::1]\r\n", heads)
+
     def test_an_http_gateway_defaults_to_port_80_and_is_fetched_without_tls(self):
         self.assertEqual(C._gateway_port("http://localhost/relay"), 80)
         self.assertEqual(C._gateway_port("https://localhost/relay"), 443)
