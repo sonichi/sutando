@@ -27,7 +27,7 @@ from typing import Callable
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from file_lock import locked_file
-from local_task_protocol import valid_local_task_id
+from local_task_protocol import parse_task_headers, valid_local_task_id
 from task_queue import position as queue_position
 from workspace_default import resolve_workspace
 
@@ -274,6 +274,24 @@ def cancel_target(task_text: str | None) -> str | None:
     return tid if tid and ("~" not in tid or valid_local_task_id(tid)) else None
 
 
+# Who may stop a task: the bridge's own control writer, and the owner's local voice session.
+STOP_SOURCES = frozenset({"relay-control", "voice"})
+
+
+def trusted_cancel_target(text: str | None, filename: str | None = None) -> str | None:
+    """The task a stop instruction names, only when the file itself is one a stop may come from:
+    headers above `task:` (which no body can forge) at owner tier from a stop source, its id the
+    file's own, and its task line the instruction. None for anything else."""
+    parsed = parse_task_headers(text or "")
+    h = parsed.headers
+    if (h.get("access_tier") or "").strip() != "owner" or (h.get("source") or "").strip() not in STOP_SOURCES:
+        return None
+    if filename is not None and (h.get("id") or "").strip() != Path(filename).name.removesuffix(".txt"):
+        return None
+    task = (parsed.body or "").lstrip()
+    return cancel_target(task.split("\n", 1)[0]) if task.startswith("CANCEL_INSTRUCTION:") else None
+
+
 def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", into_task: str | None = None,
                          worker: str | None = None, ws: Path | None = None, ts: float | None = None) -> LifecycleTransition:
     task, room = task_from_file(task_file)
@@ -389,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--into-task"); t.add_argument("--worker"); t.add_argument("--workspace")
     t.add_argument("--ts", type=float, default=None, help="when this transition happened (epoch); default now")
     s = sub.add_parser("stop-requested"); s.add_argument("--task-id", required=True); s.add_argument("--workspace")
+    c = sub.add_parser("stop-target"); c.add_argument("--task-file", required=True); c.add_argument("--workspace")
     e = sub.add_parser("event"); e.add_argument("task_id"); e.add_argument("kind", choices=EVENT_KINDS)
     e.add_argument("--session", required=True); e.add_argument("--seq", type=int, required=True)
     e.add_argument("--text", default=""); e.add_argument("--workspace")
@@ -408,6 +427,15 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 return 0
             state = store.apply(item)
+        elif a.cmd == "stop-target":
+            try:
+                text = Path(a.task_file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return 0
+            target = trusted_cancel_target(text, a.task_file)
+            if target:
+                print(target)
+            return 0
         elif a.cmd == "stop-requested":
             if "~" in a.task_id and not valid_local_task_id(a.task_id):
                 print(f"not a task id: {a.task_id!r}", file=sys.stderr)

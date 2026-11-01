@@ -57,12 +57,13 @@ fi
 # standby watcher announces nothing for a worker inbox.
 for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
          SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT \
-         SUTANDO_TASK_EVENT_HANDLER SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL \
-         SUTANDO_STOP_INTERRUPT; do
+         SUTANDO_TASK_EVENT_HANDLER SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL; do
   if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ] \
      && [ "$v" = SUTANDO_TASK_EVENT_HANDLER ]; then continue; fi
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
 done
+# Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 CMD=(tmux -S "$SOCK" new-session -d -s "$SUP_SESSION" "${ENV_ARGS[@]}" bash "$SUPERVISOR")
 
 if [ "${1:-}" = "--print-command" ]; then
@@ -71,8 +72,9 @@ if [ "${1:-}" = "--print-command" ]; then
 fi
 if tmux -S "$SOCK" has-session -t "=$SUP_SESSION" 2>/dev/null; then
   # The stop handler reads the switch in this watcher's environment: a change replaces it.
-  have="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STOP_INTERRUPT 2>/dev/null | sed -n 's/^SUTANDO_STOP_INTERRUPT=//p')"
-  if [ "$have" = "${SUTANDO_STOP_INTERRUPT:-}" ]; then
+  # Only an exact session value counts: one the session never set may come from the server's global env.
+  have="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STOP_INTERRUPT 2>/dev/null)"
+  if [ "$have" = "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" ]; then
     echo "worker-watcher-supervisor: $SUP_SESSION already running"
     exit 0
   fi

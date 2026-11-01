@@ -23,7 +23,6 @@ from file_lock import locked_file  # noqa: E402
 UNKNOWN = "<unknown>"
 PANE_OPTION = "@sutando_turn"
 TURNS_KEPT = 64
-INPUT_MAX = 2000
 PANE_TIMEOUT_S = 3
 PROMPT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # A Monitor notification wraps each watcher event in <event>…</event>, its lines inside.
@@ -78,8 +77,9 @@ def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
             # A turn whose prompt no hook saw: its tasks are unknown, never "none".
             turn = {"tasks": None, "started": None, "ended": None, "dialog": None}
         if event == "PermissionRequest":
-            inp = json.dumps(payload.get("tool_input"), ensure_ascii=False, default=str)[:INPUT_MAX]
-            turn["dialog"] = {"tool": payload.get("tool_name"), "input": inp, "at": now}
+            # Only that a dialog is open: its tool input may carry secrets and nothing reads it.
+            tool = payload.get("tool_name")
+            turn["dialog"] = {"tool": tool if type(tool) is str else None, "at": now}
         elif event in ("PreToolUse", "PostToolUse"):
             turn["dialog"] = None
         elif event == "Stop":
@@ -89,7 +89,8 @@ def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
         for old in sorted(turns, key=lambda k: turns[k].get("seen") or 0)[:-TURNS_KEPT]:
             del turns[old]
         tmp = f.with_name(f".{f.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data))
         os.replace(tmp, f)
 
 

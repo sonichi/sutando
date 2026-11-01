@@ -51,13 +51,12 @@ def read_task(task_file: str) -> dict:
     """
     text = Path(task_file).read_text(encoding="utf-8", errors="replace")
     task: dict = {"id": Path(task_file).stem}
+    # A stop from a trusted source must reach whoever holds the task it names; anything else is a task.
+    stop_of = activity_bus.trusted_cancel_target(text, task_file)
+    if stop_of:
+        task["stop_of"] = stop_of
     for line in text.splitlines():
         if line.startswith("task:"):
-            # A stop instruction is the whole task: it must reach whoever holds the task it names.
-            if line[5:].lstrip().startswith("CANCEL_INSTRUCTION:"):
-                stop_of = activity_bus.cancel_target(line)
-                if stop_of:
-                    task["stop_of"] = stop_of
             break
         key, _, value = line.partition(":")
         if _ and key.strip() in ("id", "channel_id", "source", "requested_worker",

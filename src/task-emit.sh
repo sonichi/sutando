@@ -38,12 +38,13 @@ activity_cancel_target() {
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local bus="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/activity_bus.py"
 	[ -f "$bus" ] || return 0
-	# The bus and the stop handlers refuse a lane id (task-<instance>~<broker id>) the shared rule rejects.
-	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._~-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._~-]+$' | head -1)"
-	[ -n "$target" ] || return 0
-	# A skill's stop handler (src/stop_hooks.py) may take the stop and rule it; else it is cancelled at once.
+	grep -q 'CANCEL_INSTRUCTION' "$task_file" 2>/dev/null || return 0
+	# Only a stop from a trusted source (activity_bus.trusted_cancel_target) names a task; a skill's stop
+	# handler (src/stop_hooks.py) may take it and rule it, else it is cancelled at once.
 	local py="${SUTANDO_PY_BIN:-python3}" hooks="$(dirname "$bus")/stop_hooks.py"
-	( if "$py" "$hooks" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" --control-file "$task_file" >/dev/null; then
+	( target="$("$py" "$bus" stop-target --task-file "$task_file" 2>/dev/null)"
+	[ -n "$target" ] || exit 0
+	if "$py" "$hooks" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" --control-file "$task_file" >/dev/null; then
 		"$py" "$bus" stop-requested --task-id "$target" >/dev/null 2>&1
 	else
 		"$py" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1

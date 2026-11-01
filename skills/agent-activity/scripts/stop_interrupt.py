@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -33,7 +34,7 @@ from typing import Callable
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import turns
-from activity_bus import ActivityStore, LifecycleTransition
+from activity_bus import ActivityStore, LifecycleTransition, trusted_cancel_target
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
@@ -50,6 +51,7 @@ CONFIRM_MAX_S = 3600.0
 MARKER_DIR = ("state", "stop-interrupts")
 RULING = ".ruling.json"
 ENABLE_KEY = "SUTANDO_STOP_INTERRUPT"
+_CONTROL_ID = re.compile(r"task-ctl-[0-9]+-[0-9a-f]{6}(-[A-Za-z0-9_-]{1,64})?")
 MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
 CONFIG_SH = Path(__file__).resolve().parents[3] / "scripts" / "sutando-config.sh"
 
@@ -273,12 +275,19 @@ def open_ruling(workspace: Path, target: str, control_id: str, now: float | None
     os.replace(tmp, d / f"{target}{RULING}")
 
 
+def valid_control_id(control) -> bool:
+    """A control task's id: a local task id, or the bridge's `task-ctl-…` (an instance's name may
+    carry `_`); either way one whose result can be looked up."""
+    return type(control) is str and (valid_local_task_id(control) or bool(_CONTROL_ID.fullmatch(control)))
+
+
 def _valid_ruling(rec, f: Path) -> bool:
     """Exactly the record open_ruling writes, under its own task's name."""
     return (type(rec) is dict and set(rec) == {"target", "control", "at"}
             and type(rec["target"]) is str and valid_local_task_id(rec["target"])
-            and type(rec["control"]) is str and valid_local_task_id(rec["control"])
-            and type(rec["at"]) in (int, float) and f.name == f"{rec['target']}{RULING}")
+            and valid_control_id(rec["control"])
+            and type(rec["at"]) in (int, float) and math.isfinite(rec["at"])
+            and f.name == f"{rec['target']}{RULING}")
 
 
 def rule(workspace: Path, rec: dict, now: float,
@@ -356,11 +365,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not enabled() or not valid_local_task_id(a.target):
         return 1
+    control = Path(a.control_file)
     try:
-        open_ruling(workspace, a.target, task_from_file(Path(a.control_file))[0]["id"])
-    except (OSError, KeyError, ValueError) as e:
+        trusted = trusted_cancel_target(control.read_text(encoding="utf-8", errors="replace"), control.name)
+    except OSError as e:
         print(f"stop-interrupt: {a.target}: not taken ({e})", file=sys.stderr)
         return 1
+    if trusted != a.target or not valid_control_id(control.stem):
+        print(f"stop-interrupt: {a.target}: not taken (not a stop from a trusted source)", file=sys.stderr)
+        return 1
+    open_ruling(workspace, a.target, control.stem)
     subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *(argv or sys.argv[1:]), "--work",
                       "--workspace", str(workspace)], start_new_session=True, stdin=subprocess.DEVNULL)
     return 0

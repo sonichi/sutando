@@ -333,7 +333,8 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
-  [ -n "${SUTANDO_STOP_INTERRUPT:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=$SUTANDO_STOP_INTERRUPT")
+  # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")

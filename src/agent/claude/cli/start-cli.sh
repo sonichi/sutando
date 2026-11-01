@@ -424,7 +424,8 @@ ensure_task_notifier() {
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
-  [ -n "${SUTANDO_STOP_INTERRUPT:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=$SUTANDO_STOP_INTERRUPT")
+  # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_WINDOW=${CORE_WINDOW:-0}")
   [ -n "$CORE_PANE" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_PANE=$CORE_PANE")

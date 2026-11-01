@@ -73,6 +73,7 @@ grep -q "started sutando-worker-w-abc123-watcher" "$WORK/c.out" && r=0 || r=1; c
 
 # (d) supervisor already up: nothing more is started.
 printf '%s\n' "sutando-worker-w-abc123" "sutando-worker-w-abc123-watcher" > "$WORK/live"
+echo "SUTANDO_STOP_INTERRUPT=" > "$WORK/supenv"
 bash "$ENSURE" >"$WORK/d.out" 2>"$WORK/d.err"; rc=$?
 check "(d) supervisor already up -> exit 0" "$rc"
 grep -q "already running" "$WORK/d.out" && r=0 || r=1; check "(d) ...saying so" "$r"
@@ -115,6 +116,10 @@ SUTANDO_STOP_INTERRUPT=1 bash "$ENSURE" >"$WORK/g2.out" 2>"$WORK/g2.err"
 grep -q "already running" "$WORK/g2.out" && [ ! -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) the same switch -> left running" "$r"
 bash "$ENSURE" >"$WORK/g3.out" 2>"$WORK/g3.err"
 [ -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) switch unset (rollback) -> replaced" "$r"
+grep -qx "SUTANDO_STOP_INTERRUPT=" "$WORK/new-session.log" && r=0 || r=1; check "(g) ...with an explicit empty value, never the server's global" "$r"
+rm -f "$WORK/kill.log"; echo "-SUTANDO_STOP_INTERRUPT" > "$WORK/supenv"
+bash "$ENSURE" >"$WORK/g4.out" 2>"$WORK/g4.err"
+[ -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) a watcher the session never set it for is replaced" "$r"
 rm -f "$WORK/supenv"
 
 if [ "$fail" = 0 ]; then echo "  ok  one supervisor per worker inbox, idempotent"; else echo "  FAILED"; fi

@@ -131,6 +131,18 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
             self.assertNotEqual(created_before, self.h.watcher_created(), f"switch {wanted!r}: a new watcher")
             self.assertEqual("SUTANDO_STOP_INTERRUPT=1" in env, wanted == "1", "and it carries the switch, or not")
 
+    def test_a_stale_server_global_switch_never_reaches_a_watcher_launched_without_it(self):
+        self.h.tm("set-environment", "-g", "SUTANDO_STOP_INTERRUPT", "1")
+        self.h.tm("kill-session", "-t", "=sutando-core-watcher")
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        out = self.h.td / "effective.env"
+        self.h.tm("new-window", "-d", "-t", "=sutando-core-watcher", f"printenv SUTANDO_STOP_INTERRUPT > {out}; echo done >> {out}")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "done" not in (out.read_text() if out.exists() else ""):
+            time.sleep(0.1)
+        self.assertEqual(out.read_text().splitlines()[0], "", "the session's explicit empty value wins over the global 1")
+
     def test_restart_tears_the_watcher_down_with_the_core(self):
         created_before = self.h.watcher_created()
         time.sleep(1.1)
