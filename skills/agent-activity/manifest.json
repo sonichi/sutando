@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "owner": "github:sonichi/sutando",
   "stability": "experimental",
-  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering. Config: AGENT_DISPLAY_NAME names the agent in the first row (env override > this manifest > 'Your agent'). PHASE_MODEL (off|vertex, default off) refines the phase word and writes a status line with Gemini on PHASE_MODEL_PROJECT; the only network use, and only when on (src/phase_line.py).",
+  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering. Config: AGENT_DISPLAY_NAME names the agent in the first row (env override > this manifest > 'Your agent'). PHASE_MODEL (off|vertex, default off) refines the phase word and writes a status line with Gemini on PHASE_MODEL_PROJECT; the only network use, and only when on (scripts/phase_line.py).",
   "permissions": {
     "network": true,
     "filesystem": "read-write",

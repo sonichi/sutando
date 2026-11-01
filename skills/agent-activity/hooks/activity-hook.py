@@ -350,6 +350,9 @@ def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subpr
 def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> None:
     """The phase sidecar's rules record (and, when switched on, the detached model call); never raises."""
     try:
+        scripts = str(Path(__file__).resolve().parents[1] / "scripts")  # lint-workspace-resolution: allow-repo-root (sibling skill scripts, not a data root)
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
         import phase_line
         phase_line.on_step(ws, task_id, tool, inp, line)
     except Exception:  # noqa: BLE001 - the live status must never break a tool call
