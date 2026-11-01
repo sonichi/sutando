@@ -84,10 +84,6 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
-    # An id no sentinel can carry cannot reach a worker. Only the owner's may fall to the
-    # unrestricted core; any other tier fails closed rather than crossing that boundary.
-    if not pd.carries(task.get("id") or ""):
-        return (DECLINE if task.get("sent_by_owner") else MUST_HANDLE), [], None
     # A replay follows the committed delivery, whatever the bindings say now; one roster
     # read serves the replay check and the route, and decides for a task nobody holds yet.
     try:
@@ -101,7 +97,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE, [], None
     if committed is not None and committed != pr.CORE:
-        return 0, [committed], roster
+        return _to_worker(task, [committed], roster)
     if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
@@ -120,7 +116,16 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
-    return 0, targets, roster
+    return _to_worker(task, targets, roster)
+
+
+def _to_worker(task: dict, targets: list, roster: dict | None) -> tuple[int, list, dict | None]:
+    """A task bound for a worker: accepted, unless its id is one no sentinel can carry. Then only
+    the owner's falls to the unrestricted core; any other tier fails closed rather than crossing
+    that boundary. A task no worker would get keeps its route, whatever its tier."""
+    if pd.carries(task.get("id") or ""):
+        return 0, targets, roster
+    return (DECLINE if task.get("sent_by_owner") else MUST_HANDLE), [], None
 
 
 def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":

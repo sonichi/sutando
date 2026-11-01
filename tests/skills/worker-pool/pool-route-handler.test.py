@@ -250,11 +250,11 @@ class TestIdsNoSentinelCanCarry(Base):
 
     VOICE_END = "voice-end-dd249c1dd88b8ef9a5f4c8ad"
 
-    def gateway_file(self, name, tier, attest=True):
+    def gateway_file(self, name, tier, attest=True, room="!room:x"):
         # The gateway writer shape: the tier sits below `task:`, trusted only when the envelope attests it.
         import task_envelope as te
         raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask_layout: mid\n"
-               f"task: end-of-call follow-up\nsource: ag2space\nchannel_id: !room:x\n"
+               f"task: end-of-call follow-up\nsource: ag2space\nchannel_id: {room}\n"
                f"user_id: @q:b\naccess_tier: {tier}\n")
         p = self.ws / "tasks" / f"{name}.txt"
         p.write_text(te.stamp_text(raw, self.ws) if attest else raw)
@@ -280,6 +280,20 @@ class TestIdsNoSentinelCanCarry(Base):
                 t = self.gateway_file(f"ask-{tier}-1", tier)
                 self.assertEqual(self.both_modes(t), (h.MUST_HANDLE, h.MUST_HANDLE))
                 self.assertTrue(self.nothing_delivered(f"ask-{tier}-1"))
+
+    def test_a_task_no_worker_would_get_keeps_mains_decline_whatever_its_tier(self):
+        # Team-tier ask-* ids are real (the voice lane writes them): a room no worker is bound to is the core's.
+        self.roster()
+        for tier, attest in (("team", True), ("guest", True), ("owner", True), ("owner", False)):
+            with self.subTest(tier=tier, attest=attest):
+                name = f"ask-{tier}-{'a' if attest else 'u'}-2"
+                t = self.gateway_file(name, tier, attest=attest, room="!other:x")
+                self.assertEqual(self.both_modes(t), (h.DECLINE, h.DECLINE))
+                self.assertTrue(self.nothing_delivered(name))
+
+    def test_with_no_pool_every_tier_still_declines(self):
+        t = self.gateway_file("ask-team-3", "team")
+        self.assertEqual(self.both_modes(t), (h.DECLINE, h.DECLINE))
 
     def test_an_unattested_owner_tier_below_task_is_not_trusted(self):
         self.roster()
