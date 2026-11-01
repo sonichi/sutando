@@ -135,6 +135,22 @@ def rebinding_safe_host(host: str, allowed_hosts: str = "") -> bool:
     return h in {_authority_host(x) for x in (allowed_hosts or "").split(",") if x.strip()}
 
 
+def lan_bind_refusal(bind: str, token: str) -> Optional[str]:
+    """None when the agent API may listen on `bind`; else the startup error. A loopback bind
+    needs nothing; any other (a LAN address, a hostname, 0.0.0.0, ::) needs SUTANDO_API_TOKEN,
+    since without it every route answers any device that can reach the port."""
+    host = (bind or "").strip().strip("[]").lower()
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback or token:
+        return None
+    return (f"agent-api: refusing to listen on {bind or '(all interfaces)'} without SUTANDO_API_TOKEN: "
+            "every route would be open to any device on the network. Set SUTANDO_API_TOKEN (in .env) "
+            "to serve the LAN with a token, or set AGENT_API_BIND=127.0.0.1 to stay local.")
+
+
 def local_api_token(workspace: Path, configured: str = "") -> str:
     """The bearer the privileged loopback routes require: `configured` (SUTANDO_API_TOKEN)
     when set, else the per-install secret under state/, minted once."""

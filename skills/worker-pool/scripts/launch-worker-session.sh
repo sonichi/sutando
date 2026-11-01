@@ -83,6 +83,8 @@ ENV_ARGS+=(-e SUTANDO_CORE_ID= -e SUTANDO_CORE_POOL_SIZE= -e SUTANDO_WORKER_SEAT
 # answers go. Derived in-session they become deliveries/results, which no
 # bridge drains.
 [ -n "${SUTANDO_INBOX_KIND:-}" ] && ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+# Always set, empty included: an omitted one inherits the tmux server's global env.
+ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 # Third half of that seam: without the resolver a worker reads the sentinel
 # itself, so an unforwarded one is the zero-byte read, not a missing option.

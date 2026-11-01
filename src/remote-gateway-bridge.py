@@ -397,6 +397,7 @@ def _intake_gate(task: dict):
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
+_AGENT_ACTIVITY_MANIFEST = _REPO / "skills" / "agent-activity" / "manifest.json"
 
 
 def _legacy_keeps_proactive_room() -> bool:
@@ -412,6 +413,15 @@ def _legacy_stand_down():
 def _owns_unaddressed() -> bool:
     from connections import owns_unaddressed
     return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+def _stop_interrupt_enabled(environ=None) -> bool:
+    """The agent-activity skill's Stop interrupt switch; off when it cannot be read."""
+    try:
+        from skill_config import enabled
+        return enabled("SUTANDO_STOP_INTERRUPT", _AGENT_ACTIVITY_MANIFEST, environ)
+    except Exception:  # noqa: BLE001 - a switch that cannot be read is off
+        return False
 
 
 def _status_ack_gate(environ=None):
@@ -438,6 +448,7 @@ PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
+STOP_INTERRUPT = _stop_interrupt_enabled()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 from skill_config import enabled as _skill_enabled
 TASK_STEP_PUBLICATION_ENABLED = lambda: _skill_enabled(
