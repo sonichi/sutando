@@ -165,8 +165,9 @@ class HealthReportTests(unittest.TestCase):
         (self.state / 'core-status.json').unlink()
         for status in ('down', 'ok'):
             self.publish(status)
-            self.assertNotIn('status', self.heartbeat())
-            self.assertNotIn('step', self.heartbeat())
+            payload = self.heartbeat()
+            self.assertEqual(payload['status'], 'unknown')
+            self.assertEqual(payload['step'], 'Core liveness unavailable')
 
     def test_warnings_are_not_failures(self):
         self.publish('warn')
