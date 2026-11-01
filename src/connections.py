@@ -1377,15 +1377,49 @@ def legacy_parked(workspace: Optional[Path] = None) -> bool:
 
 def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     """Whether the bridge running as `instance` owns unaddressed proactive messages and the owner's
-    cards: the primary row's bridge, under its slug or a launch-key alias. With no named primary, or
-    an unreadable record, the legacy unsuffixed bridge owns them, as before any row existed."""
-    try:
-        primary = next((r for r in _read(record_path(workspace)) if r["primary"]), None)
-    except (SchemaError, OSError):
-        primary = None
-    if primary is None or not primary["instance"]:
+    cards: the lane `unaddressed_owner` names, under its slug or a launch-key alias."""
+    owner, _from = unaddressed_owner(workspace)
+    if owner is None:
         return not instance
-    return bool(instance) and instance in [primary["instance"]] + alias_instances(primary)
+    if not owner["instance"]:
+        return not instance
+    return bool(instance) and instance in [owner["instance"]] + alias_instances(owner)
+
+
+def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge has a checked owner DM on disk (state/owner-routing<suffix>.json: a
+    private room, bound to the row's agent when the row names one). Every lane reads it alike."""
+    inst = str(row.get("instance") or "")
+    path = _workspace(workspace) / "state" / f"owner-routing{'.' + inst if inst else ''}.json"
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict) or not rec.get("owner_dm") or rec.get("private") is not True:
+        return False
+    agent = str(row.get("agent_mxid") or "")
+    return not agent or rec.get("identity") == agent
+
+
+def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
+    """(the row whose bridge owns unaddressed messages, the designated row it was handed from or None).
+    Designated: the primary row; with no named primary the legacy unsuffixed row. A designated lane
+    with no owner DM can only hold them, so they go to the first enabled lane that has one (the
+    unsuffixed primary first, then by name); with none anywhere the designated lane keeps them.
+    (None, None) when the record is unreadable or names no primary: the legacy bridge, as before."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None, None
+    designated = next((r for r in rows if r["primary"]), None)
+    if designated is None:
+        return None, None
+    if _has_owner_dm(designated, workspace):
+        return designated, None
+    live = [r for r in rows if r is not designated and not r.get("disabled") and not r.get("parked")]
+    live.sort(key=lambda r: (bool(r["instance"]), str(r["instance"])))
+    taker = next((r for r in live if _has_owner_dm(r, workspace)), None)
+    return (taker, designated) if taker is not None else (designated, None)
 
 
 def _names_mxid(text: str, mxid: str) -> bool:

@@ -410,7 +410,12 @@ def _legacy_stand_down():
 
 
 def _owns_unaddressed() -> bool:
-    from connections import owns_unaddressed
+    from connections import owns_unaddressed, unaddressed_owner
+    owner, handed_from = unaddressed_owner(WS)  # noqa: F821
+    if handed_from is not None and owner is not None:
+        _log_backoff(("unaddressed-handoff", handed_from["instance"], owner["instance"]),  # noqa: F821
+                     f"unaddressed owner messages: lane {handed_from['instance'] or 'primary'} has no owner DM, "
+                     f"so lane {owner['instance'] or 'primary'} delivers them")
     return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
 
 

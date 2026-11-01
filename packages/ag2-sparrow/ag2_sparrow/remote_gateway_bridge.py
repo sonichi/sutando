@@ -2406,7 +2406,20 @@ def _reenroll_identity() -> str:
     per-host identity enrolment wrote to state/auth/ag2space.json; a launcher's
     pin (agent_identity.PINNED_KEY) leaves only its AGENT_MXID. Re-read per
     call, so an identity that appears mid-episode takes effect without a restart."""
-    return agent_identity.resolve(_STATE, _config_from_channel_env)
+    return agent_identity.resolve(_STATE, _config_from_channel_env, instance=GATEWAY_INSTANCE,
+                                  whoami=_lane_whoami if GATEWAY_INSTANCE else None)
+
+
+def _lane_whoami() -> str:
+    """This lane's agent id as its own relay knows its credential (GET /v1/whoami, side-effect free);
+    '' when the relay cannot say. A secondary lane is never the host's primary agent."""
+    try:
+        out = _req("GET", "/v1/whoami", timeout=5)
+    except Exception as e:  # noqa: BLE001 - unknown, and said so by the caller
+        _log_backoff(("lane-whoami", type(e).__name__), f"lane {GATEWAY_INSTANCE}: whoami failed ({diagnostics.describe(e)})")
+        return ""
+    v = out.get("agent_mxid") if isinstance(out, dict) else None
+    return v.strip() if isinstance(v, str) else ""
 
 
 def _reenroll_claim() -> None:
@@ -7557,7 +7570,16 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if route == "send" and peek_room is not None and GATEWAY_INSTANCE and not _own_homeserver():
+            _log_backoff(("proactive-lane-unknown", f.name),
+                         f"proactive {f.name} held: lane {GATEWAY_INSTANCE}'s own identity is unknown, so it "
+                         "cannot tell which rooms it serves (no lane record, relay whoami gave none)")
+            continue
         if route == "send" and peek_room is not None and not _room_is_deliverable_here(peek_room):
+            _log_backoff(("proactive-other-lane", f.name),
+                         f"proactive {f.name} left for another lane: its room is on "
+                         f"{peek_room.split(':', 1)[1] if ':' in peek_room else '?'}, "
+                         f"this lane is {_own_homeserver() or '?'}")
             continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
