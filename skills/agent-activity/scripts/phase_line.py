@@ -197,6 +197,21 @@ def model_on() -> bool:
     return setting("PHASE_MODEL", "off").lower() == "vertex" and bool(setting("PHASE_MODEL_PROJECT"))
 
 
+# What a connected-account step may be called anywhere it is shown beyond this machine: the kind
+# of account only, never what was in it.
+_ACCOUNT_KINDS = (("mail", re.compile(r"gmail|outlook|mail", re.I)), ("calendar", re.compile(r"cal", re.I)),
+                  ("contacts", re.compile(r"contact|people", re.I)),
+                  ("files", re.compile(r"drive|docs|sheets|dropbox|notion|onedrive", re.I)),
+                  ("messages", re.compile(r"slack|teams|discord|telegram|whatsapp", re.I)))
+ACCOUNT_LINES = {"mail": "Checking your email", "calendar": "Looking at your calendar",
+                 "contacts": "Looking at your contacts", "files": "Looking at your files",
+                 "messages": "Checking your messages", "app": "Using a connected app"}
+
+
+def account_kind(tool_name: str) -> str:
+    return next((k for k, rx in _ACCOUNT_KINDS if rx.search(tool_name or "")), "app")
+
+
 def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | None", spawn=None) -> str:
     """The hook's one call per bound tool call: the rules record now, the model detached and debounced.
     A task's first record says so (`first`), and a connected-account step leaves a `.private` marker
@@ -210,6 +225,7 @@ def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | No
         _prune(seen.parent)
     if _PRIVATE_TOOL.match(tool_name or ""):
         rec["private"] = True
+        rec["account"] = account_kind(tool_name)
         _touch(_marker(workspace, task_id, "private"))  # unwritten: prompt_for's other checks fail closed
     if not write(workspace, rec) and first:
         with contextlib.suppress(OSError):
@@ -637,7 +653,7 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
     if delegated:
         since = min((handoffs._epoch(h.get("at")) for h in handoffs.open_handoffs(workspace, task_id, now=now)),
                     default=now)
-        return {"phase": "Delegated", "line": delegated["line"], "since": since}
+        return {"phase": "Delegated", "line": delegated["line"], "since": since, "waiting": {"reason": "delegated"}}
     st = latest(workspace, task_id)
     if st is not None:
         rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
@@ -656,18 +672,62 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
             since = now
         busy = (active is not None and active != task_id) or (active is None and _recent_other_task(workspace, task_id, now))
         if busy:
-            return {"phase": "Waiting", "line": "Waiting: working on another request", "since": since}
+            return {"phase": "Waiting", "line": "Waiting: working on another request", "since": since,
+                    "waiting": {"reason": "busy"}}
         ahead = int(pos["position"]) - 1
-        return {"phase": "Waiting", "line": f"Queued · {ahead} ahead" if ahead else "Queued · next", "since": since}
+        return {"phase": "Waiting", "line": f"Queued · {ahead} ahead" if ahead else "Queued · next", "since": since,
+                "waiting": {"reason": "queued", "position": int(pos["position"])}}
     picked = _picked_up_at(workspace, task_id, now)
     if picked is not None:
         return {"phase": "Understanding the request", "line": "Reading the request", "since": picked}
     return None
 
 
+def published_status(workspace, task_id: str, *, share_line: bool = True, **kw) -> "dict | None":
+    """What the agent publishes to the server ledger: phase, summary, since and, for a waiting task,
+    `waiting` {reason, position?}. With `share_line` (the owner's share_live_status, on by default)
+    the summary is the detail line as `shareable_line` lets it leave; off, it is the phase word or the
+    fixed waiting line ("Queued · next"), never a step's text. The publisher adds the task's source
+    message itself. None when `status_for` says nothing."""
+    st = status_for(workspace, task_id, **kw)
+    if st is None:
+        return None
+    waiting = st.get("waiting")
+    out = {"phase": st["phase"], "summary": st["phase"], "since": st["since"]}
+    if waiting:
+        out["waiting"] = dict(waiting)
+        if waiting["reason"] in ("queued", "busy"):
+            out["summary"] = st["line"]
+    if share_line:
+        out["summary"] = shareable_line(workspace, task_id, st)
+    return out
+
+
+def shareable_line(workspace, task_id: str, status: "dict | None" = None) -> "str | None":
+    """The local detail line as it may leave this machine, for an opt-in share: a connected-account
+    task gets only its account kind ("Checking your email"); any other line passes only when nothing
+    in it needed masking and it passes the allowlist and the name check; otherwise the phase word."""
+    st = status if status is not None else status_for(workspace, task_id)
+    if st is None:
+        return None
+    recs = records(workspace, task_id)
+    private = [r for r in recs if r.get("private")]
+    if private or _marker(workspace, task_id, "private").exists():
+        kind = private[-1].get("account") if private else None
+        return ACCOUNT_LINES.get(kind or "app", ACCOUNT_LINES["app"])
+    line = str(st.get("line") or "")
+    if (st.get("waiting") or {}).get("reason") in ("queued", "busy"):
+        return line  # our own fixed text, naming nothing
+    _goal, people = _task_context(workspace, task_id)
+    red = Redactor(people)
+    if not line or red(line) != line or not allowed(line) or validate_line(line, line, people=people) is None:
+        return st["phase"]
+    return line
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Phase word and status line for a task's live status.")
-    ap.add_argument("cmd", choices=("enrich", "latest", "status"))
+    ap.add_argument("cmd", choices=("enrich", "latest", "status", "published"))
     ap.add_argument("--task", required=True)
     ap.add_argument("--workspace")
     a = ap.parse_args(argv)
@@ -679,7 +739,8 @@ def main(argv=None) -> int:
     if a.cmd == "enrich":
         enrich(ws, a.task)
         return 0
-    print(json.dumps(status_for(ws, a.task) if a.cmd == "status" else latest(ws, a.task)))
+    show = {"status": status_for, "published": published_status, "latest": latest}[a.cmd]
+    print(json.dumps(show(ws, a.task)))
     return 0
 
 

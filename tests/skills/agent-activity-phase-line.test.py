@@ -462,7 +462,8 @@ class WhyNotMoving(unittest.TestCase):
                               "_epoch": staticmethod(lambda at: 1793491200.0)})
         with patch.dict(sys.modules, {"handoffs": fake}):
             st = pl.status_for(self.ws, "task-d")
-        self.assertEqual(st, {"phase": "Delegated", "line": "Delegated: a worker", "since": 1793491200.0})
+        self.assertEqual(st, {"phase": "Delegated", "line": "Delegated: a worker", "since": 1793491200.0,
+                              "waiting": {"reason": "delegated"}})
 
     def test_picked_up_without_a_step_reads_the_request_and_finished_shows_nothing(self):
         idx = Path(self.ws) / "state" / "agent-activity.index.json"
@@ -512,6 +513,110 @@ class WhyNotMoving(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             pl.main(["status", "--task", "task-r", "--workspace", self.ws])
         self.assertEqual(json.loads(out.getvalue())["line"], "Wait for CI")
+
+
+class Published(unittest.TestCase):
+    """The server ledger gets the Basic fields only: the phase word or a fixed waiting line, never step text."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+        (Path(self.ws) / "tasks").mkdir(parents=True)
+
+    def _pending(self, tid, at):
+        p = Path(self.ws) / "tasks" / f"{tid}.txt"
+        p.write_text(f"id: {tid}\ntimestamp: 2026-11-01T00:00:00Z\ntask: hi\n")
+        os.utime(p, (at, at))
+
+    def test_a_running_task_publishes_its_phase_word_not_its_step(self):
+        _rules(self.ws, "task-r", "Running tests", step="Run the suite for Alice's mail import")
+        pl.write(self.ws, {"task_id": "task-r", "for_seq": pl.latest(self.ws, "task-r")["seq"], "phase": "Running tests",
+                           "phase_source": "model", "line": "Testing the mail import", "line_source": "model"})
+        out = pl.published_status(self.ws, "task-r", share_line=False)
+        self.assertEqual((out["phase"], out["summary"]), ("Running tests", "Running tests"))
+        self.assertEqual(set(out), {"phase", "summary", "since"})
+        self.assertNotIn("mail", json.dumps(out))
+
+    def test_waiting_tasks_publish_the_fixed_waiting_line_and_fields(self):
+        t0 = time.time() - 600
+        self._pending("task-q1", t0)
+        self._pending("task-q2", t0 + 1)
+        for share in (True, False):
+            out = pl.published_status(self.ws, "task-q2", share_line=share)
+            self.assertEqual((out["summary"], out["waiting"]), ("Queued · 1 ahead", {"reason": "queued", "position": 2}))
+        _rules(self.ws, "task-busy", "Running tests", step="Run the secret-project suite")
+        out = pl.published_status(self.ws, "task-q1")
+        self.assertEqual((out["summary"], out["waiting"]), ("Waiting: working on another request", {"reason": "busy"}))
+        self.assertNotIn("secret", json.dumps(out))
+
+    def test_a_delegated_task_publishes_no_delegate_name(self):
+        fake = type("H", (), {"delegated_status": staticmethod(lambda ws, tid, now=None: {"line": "Delegated: Engine 2"}),
+                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "2026-11-01T00:00:00Z"}]),
+                              "_epoch": staticmethod(lambda at: 1793491200.0)})
+        with patch.dict(sys.modules, {"handoffs": fake}):
+            outs = [pl.published_status(self.ws, "task-d", share_line=share) for share in (True, False)]
+        for out in outs:
+            self.assertEqual(out, {"phase": "Delegated", "summary": "Delegated", "since": 1793491200.0,
+                                   "waiting": {"reason": "delegated"}})
+
+    def test_sharing_on_publishes_the_scrubbed_line(self):
+        _task(self.ws, "task-s")
+        pl.on_step(self.ws, "task-s", "Bash", {}, "Run the tests again", spawn=lambda *a: None)
+        self.assertEqual(pl.published_status(self.ws, "task-s")["summary"], "Run the tests again")
+        _task(self.ws, "task-m")
+        pl.on_step(self.ws, "task-m", "mcp__claude_ai_Gmail__search", {}, "Search mail from Dana", spawn=lambda *a: None)
+        self.assertEqual(pl.published_status(self.ws, "task-m")["summary"], "Checking your email")
+
+    def test_nothing_for_a_finished_task_and_the_cli(self):
+        self.assertIsNone(pl.published_status(self.ws, "task-unknown"))
+        _rules(self.ws, "task-r", "Reading files")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pl.main(["published", "--task", "task-r", "--workspace", self.ws])
+        self.assertEqual(json.loads(buf.getvalue())["summary"], "Reading files")
+
+
+class Shareable(unittest.TestCase):
+    """The opt-in share of the detail line: an account kind for connected-account tasks, the phase
+    word whenever anything in the line would need masking."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+
+    def _step(self, tid, tool, step, goal="Sort out the release"):
+        _task(self.ws, tid, goal=goal)
+        pl.on_step(self.ws, tid, tool, {}, step, spawn=lambda *a: None)
+        return pl.shareable_line(self.ws, tid)
+
+    def test_connected_account_steps_say_only_the_kind_of_account(self):
+        self.assertEqual(self._step("task-m", "mcp__claude_ai_Gmail__search", "Search mail from Dana about the offer"),
+                         "Checking your email")
+        self.assertEqual(self._step("task-c", "mcp__claude_ai_Google_Calendar__list_events", "List Friday with Dana"),
+                         "Looking at your calendar")
+        pl.on_step(self.ws, "task-m", "Read", {}, "Read the offer letter", spawn=lambda *a: None)
+        self.assertEqual(pl.shareable_line(self.ws, "task-m"), "Checking your email", "the whole task stays private")
+        self.assertEqual(pl.account_kind("mcp__sutando-station__composio_exec"), "app")
+        self.assertEqual(pl.account_kind("mcp__claude_ai_Notion__search"), "files")
+
+    def test_an_evicted_private_record_still_shares_no_detail(self):
+        _task(self.ws, "task-e")
+        pl._marker_dir(self.ws).mkdir(parents=True, exist_ok=True)
+        pl._marker(self.ws, "task-e", "private").write_text("")
+        _rules(self.ws, "task-e", "Reading files", step="Read the offer letter")
+        self.assertEqual(pl.shareable_line(self.ws, "task-e"), "Using a connected app")
+
+    def test_a_name_an_email_or_a_token_falls_back_to_the_phase_word(self):
+        for tid, step in (("task-n", "Ask Dana to review"), ("task-k", "Reply to alice about it"),
+                          ("task-x", "Mail bob@example.com the notes"), ("task-t", "Use ghp_abcdefghijklmnop1234 now")):
+            self.assertEqual(self._step(tid, "Bash", step), "Running a command", step)
+
+    def test_a_plain_line_and_the_fixed_lines_pass(self):
+        self.assertEqual(self._step("task-p", "Bash", "Run the tests again"), "Run the tests again")
+        self.assertIsNone(pl.shareable_line(self.ws, "task-none"))
+        self.assertEqual(pl.shareable_line(self.ws, "task-none", {"phase": "Waiting", "line": "Queued · next",
+                                                                    "waiting": {"reason": "queued", "position": 1}}),
+                         "Queued · next")
+        self.assertEqual(pl.shareable_line(self.ws, "task-none", {"phase": "Delegated", "line": "Delegated: Engine 2",
+                                                                    "waiting": {"reason": "delegated"}}), "Delegated")
 
 
 class PrivacyKept(unittest.TestCase):
