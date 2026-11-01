@@ -706,6 +706,60 @@ class Primary(Base):
         C.record_path(self.ws).write_text("{broken")
         self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("", "beta")], [True, False], "unreadable: legacy")
 
+    def test_unaddressed_go_to_a_lane_with_an_owner_dm(self):
+        """A designated lane with no owner DM can only hold unaddressed owner messages: they go to a
+        lane that has one, and back once the designated lane has one again."""
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        rows = {r["instance"]: r for r in json.loads(C.record_path(self.ws).read_text())["connections"]}
+        state = self.ws / "state"
+
+        def routing(inst, owner_dm="!dm:x", private=True, identity=None):
+            name = f"owner-routing{'.' + inst if inst else ''}.json"
+            ident = identity if identity is not None else rows[inst].get("agent_mxid", "")
+            (state / name).write_text(json.dumps({"identity": ident, "owner_dm": owner_dm, "private": private}))
+
+        def owners():
+            return [C.owns_unaddressed(i, self.ws) for i in ("", "beta-fixture-net")]
+
+        self.assertEqual(owners(), [False, True], "no owner DM anywhere: the designated lane keeps them")
+        self.assertEqual(C.unaddressed_owner(self.ws)[1], None)
+        routing("")
+        self.assertEqual(owners(), [False, True], "a lane whose bridge is not running never takes them")
+        ai = C._agent_identity()
+        ai.publish_lane(state, "", rows[""].get("agent_mxid") or "@a:alpha-fixture.net")
+        with unittest.mock.patch.object(ai, "LANE_FRESH_S", -1.0):
+            self.assertEqual(owners(), [False, True], "nor one whose lane record is stale")
+        self.assertEqual(owners(), [True, False], "handed to the running lane with an owner DM")
+        owner, handed_from = C.unaddressed_owner(self.ws)
+        self.assertEqual((owner["instance"], handed_from["instance"]), ("", "beta-fixture-net"))
+        routing("beta-fixture-net", private=None)
+        self.assertEqual(owners(), [True, False], "an unchecked room is not an owner DM")
+        routing("beta-fixture-net", identity="@other:elsewhere.net")
+        self.assertEqual(owners(), [True, False], "another agent's reading is not this lane's owner DM")
+        (state / "owner-routing.beta-fixture-net.json").write_text("{broken")
+        self.assertEqual(owners(), [True, False], "an unreadable reading is no owner DM")
+        routing("beta-fixture-net")
+        self.assertEqual(owners(), [False, True], "the designated lane has one again: back to it")
+        self.assertEqual(C.unaddressed_owner(self.ws)[1], None)
+        routing("beta-fixture-net", owner_dm="")
+        rec = json.loads(C.record_path(self.ws).read_text())
+        for r in rec["connections"]:
+            r["owner_mxid"] = "@owner-a:x" if r["instance"] == "beta-fixture-net" else "@owner-b:x"
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        self.assertEqual(owners(), [False, True], "a lane serving another owner never takes them")
+        for r in rec["connections"]:
+            r.pop("owner_mxid", None)
+        next(r for r in rec["connections"] if r["instance"] == "")["disabled"] = True
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        self.assertEqual(owners(), [False, True], "a disabled lane never takes them")
+        with unittest.mock.patch.object(C, "_agent_identity", side_effect=ImportError("no package")):
+            self.assertFalse(C._lane_running({"instance": ""}, self.ws), "an unknown lane state is not running")
+        self.assertEqual(C.lane_server("beta-fixture-net", self.ws), "beta-fixture.net")
+        C.record_path(self.ws).write_text("{broken")
+        self.assertEqual(C.lane_server("beta-fixture-net", self.ws), "", "an unreadable record names no server")
+
     def test_primary_in_the_plan_keeps_the_proactive_room(self):
         self.add()
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
