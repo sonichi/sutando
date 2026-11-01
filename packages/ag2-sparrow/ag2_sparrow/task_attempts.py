@@ -101,7 +101,10 @@ RERUN_RULES = {
         "something new is needed."),
 }
 
-FORMAT = 3
+# 4 adds saved-serve references (`pending_serve.reserve`, `owed_reserve`): a format-3 reader refuses the
+# ledger rather than serve their debts from a legacy task-wide file. A format-3 ledger is read and upgraded.
+FORMAT = 4
+_READS = (3, FORMAT)
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
@@ -229,7 +232,7 @@ class TaskAttempts:
             return {"format": FORMAT}
         except (OSError, ValueError):
             return None
-        if not isinstance(data, dict) or data.get("format") != FORMAT:
+        if not isinstance(data, dict) or data.get("format") not in _READS:
             return None
         return data
 
@@ -248,10 +251,12 @@ class TaskAttempts:
             raise
         agent_turn._fsync_dir(self.path.parent)
 
-    def _commit(self, apply: Callable[[dict], object], *, owner: bool = False, why: str = "") -> "tuple[bool, object]":
+    def _commit(self, apply: Callable[[dict], object], *, owner: bool = False, why: str = "",
+                write: bool = True) -> "tuple[bool, object]":
         """Run `apply` on the ledger re-read under its file lock and write the result: (saved, value).
         Refused, with nothing written, when the ledger cannot be locked, read or written, when another
-        process owns it, or when `apply` refuses."""
+        process owns it, or when `apply` refuses. Not `write`: `apply` runs as the owner, under the
+        lock, and the ledger is left as it is."""
         if not owner and (self.revoked or self.epoch is None):
             if self.epoch is None:
                 self.log(f"{self.path.name}: ownership not taken — {why or 'nothing'} not written")
@@ -269,7 +274,9 @@ class TaskAttempts:
                     value = apply(data)
                 except _Refused:
                     return False, None
-                self._write(data)
+                if write:
+                    data["format"] = FORMAT
+                    self._write(data)
                 return True, value
         except OSError as e:
             self.log(f"{self.path.name}: {why or 'a change'} not written ({e})")
@@ -313,9 +320,21 @@ class TaskAttempts:
     def records(self) -> "dict | None":
         """Every attempt (a record or UNKNOWN); None when the ledger cannot be read."""
         data = self._read()
-        if data is None:
+        tasks = _at(data, "tasks")
+        if tasks is UNKNOWN or tasks is not None and not isinstance(tasks, dict):
             return None
-        return {t: _freeze_entry(_entry_of(data, t)) for t in (data.get("tasks") or {})}
+        return {t: _freeze_entry(_entry_of(data, t)) for t in (tasks or {})}
+
+    def with_reserves(self, fn: Callable[[set], object], why: str) -> "tuple[bool, object]":
+        """Run `fn` with the id of every saved serve a record names, as the ledger's owner and under
+        its lock, so no other writer commits a reference meanwhile. Refused, `fn` never run, when not
+        the owner or when any record or reference cannot be read."""
+        def under(data):
+            ids = reserve_ids(data)
+            if ids is UNKNOWN:
+                raise _Refused
+            return fn(ids)
+        return self._commit(under, why=why, write=False)
 
     def owing(self) -> "set[str] | None":
         """Every task whose record still owes work or cannot be read; None when the ledger cannot be read."""
@@ -335,19 +354,24 @@ class TaskAttempts:
         data = self._read()
         return any(isinstance(r, dict) and _beats(r) for r in (_entry_of(data, t) for t in wire_tids))
 
-    def broker_names_leases(self) -> bool:
-        """Whether this broker has ever answered an ack with a lease generation."""
-        data = self._read()
-        return bool(data) and (data.get("contract") or {}).get("names_lease_generation") is True
+    def broker_names_leases(self):
+        """Whether this broker has ever answered an ack with a lease generation; UNKNOWN when the
+        ledger cannot be read."""
+        named = _at(self._read(), "contract", "names_lease_generation")
+        return False if named is None else named if type(named) is bool else UNKNOWN
 
     def run_of(self, local_tid: str):
         """(task, run number, live) for a local run id this node allocated, None when it has no such
         run, UNKNOWN when the ledger cannot be read. Live: it is the run its task's record holds."""
         data = self._read()
-        if data is None:
+        run = _at(data, "runs", local_tid)
+        if run is UNKNOWN or run is not None and not (isinstance(run, dict) and isinstance(run.get("task"), str)):
             return UNKNOWN
-        run = (data.get("runs") or {}).get(local_tid)
-        if not isinstance(run, dict) or not isinstance(run.get("task"), str):
+        if run is None:
+            tasks = _at(data, "tasks")
+            if tasks is UNKNOWN or tasks is not None and not isinstance(tasks, dict) or any(
+                    not isinstance(r, dict) or _names_run(r, local_tid) for r in (tasks or {}).values()):
+                return UNKNOWN                  # a record names a run whose entry is gone
             return None
         rec = _entry_of(data, run["task"])
         if rec is UNKNOWN:
@@ -362,31 +386,49 @@ class TaskAttempts:
             return UNKNOWN
         return _wake_item(wire_tid, rec)
 
+    def open_claims(self, kind: str):
+        """[(task, claim)] for every open claim of `kind`, from one read of the ledger; UNKNOWN when it
+        cannot be read. A record whose claims cannot be read is reported and skipped, never emptied."""
+        tasks = _at(self._read(), "tasks")
+        if tasks is UNKNOWN or tasks is not None and not isinstance(tasks, dict):
+            return UNKNOWN
+        out = []
+        for wire, rec in sorted((tasks or {}).items()):
+            claims = rec.get("claims") if isinstance(rec, dict) else None
+            if claims is not None and not isinstance(claims, dict):
+                self.log(f"task {wire}: its claims cannot be read — not retried")
+                continue
+            out += [(wire, Claim({**c, "op": op})) for op, c in sorted((claims or {}).items())
+                    if isinstance(c, dict) and c.get("kind") == kind]
+        return out
+
     def owed_view(self, wire_tid: str):
         """From one read of the ledger: the record, and what it keeps of the run the record's run
-        replaced (its lease, generation and whether its answer was delivered), or None when it
-        replaced none; UNKNOWN when either cannot be read."""
+        replaced (its lease, generation and whether its answer was delivered), None when it replaced
+        none, UNKNOWN when that entry is pruned or damaged; UNKNOWN alone when the record cannot be read."""
         data = self._read()
         rec = _freeze_entry(_entry_of(data, wire_tid))
         if rec is UNKNOWN:
             return UNKNOWN
         earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
-        runs = data.get("runs") or {}
-        if earlier and not isinstance(runs, dict):
-            return UNKNOWN
-        return rec, (dict(runs.get(earlier) or {}) if earlier else None)
+        if not earlier:
+            return rec, None
+        run = _at(data, "runs", earlier)
+        return rec, (dict(run) if isinstance(run, dict) else UNKNOWN)   # pruned or damaged: unknown
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its
         recorded item, else the wake item of a record holding it; None for a task's own item, UNKNOWN
         when unreadable."""
         data = self._read()
-        if data is None:
+        run, tasks = _at(data, "runs", local_tid), _at(data, "tasks")
+        if UNKNOWN in (run, tasks) or run is not None and not isinstance(run, dict) \
+                or tasks is not None and not isinstance(tasks, dict):
             return UNKNOWN
-        item = ((data.get("runs") or {}).get(local_tid) or {}).get("item")
+        item = (run or {}).get("item")
         if isinstance(item, str):
             return item
-        for wire, rec in (data.get("tasks") or {}).items():
+        for wire, rec in (tasks or {}).items():
             if isinstance(rec, dict) and rec.get("run") == local_tid:
                 return _wake_item(wire, rec)
         return None
@@ -624,14 +666,23 @@ class Transition:
         saved, _ = self._change(edit, "a new run")
         return made[0] if saved else None
 
-    def last_run(self, first_run: str) -> "str | None":
-        """The local id of the latest run allocated for this task, kept after its record is gone."""
-        seq = ((self.owner._read() or {}).get("seqs") or {}).get(self.wire)
-        return local_task_protocol.run_task_id(first_run, seq) if type(seq) is int and seq >= 1 else None
+    def last_run(self, first_run: str):
+        """The local id of the latest run allocated for this task, kept after its record is gone;
+        None when none is kept; UNKNOWN when the ledger or its counter cannot be read."""
+        seq = _at(self.owner._read(), "seqs", self.wire)
+        if seq is None or seq is UNKNOWN:
+            return seq
+        return local_task_protocol.run_task_id(first_run, seq) if type(seq) is int and seq >= 1 else UNKNOWN
 
-    def run_published(self, local: str) -> bool:
-        data = self.owner._read() or {}
-        return bool(((data.get("runs") or {}).get(local) or {}).get("published"))
+    def run_published(self, local: str):
+        """Whether the run's publication is recorded; UNKNOWN when its entry cannot be read."""
+        run = _at(self.owner._read(), "runs", local)
+        if run is None:
+            rec = self.rec
+            return UNKNOWN if rec is UNKNOWN or isinstance(rec, dict) and _names_run(rec, local) else False
+        if run is UNKNOWN:
+            return UNKNOWN
+        return run.get("published") is True if isinstance(run, dict) else UNKNOWN
 
     def mark_published(self, local: str) -> bool:
         def edit(data, rec):
@@ -648,10 +699,13 @@ class Transition:
         pending = rec.get("pending_serve") if isinstance(rec, dict) else None
         return pending.get("lease") if isinstance(pending, dict) else None
 
-    def hold_serve(self, lease: "str | None", run: str, source: "str | None", wake=None) -> bool:
+    def hold_serve(self, lease: "str | None", run: str, source: "str | None",
+                   wake_episode: "str | None" = None, reserve: "dict | None" = None) -> bool:
         """Record a serve under a new lease for a run that may already execute: the run keeps its
-        generation and nothing is published until the serve's ack names one."""
-        return self.put(pending_serve={"lease": lease, "run": run, "source": source, "wake": wake, "at": self.now()})
+        generation and nothing is published until the serve's ack names one. `reserve` names the
+        serve's own saved copy."""
+        return self.put(pending_serve={"lease": lease, "run": run, "source": source, "reserve": reserve,
+                                       "wake_episode": wake_episode, "at": self.now()})
 
     def serve_adoptable(self, gen) -> bool:
         """Whether the pending serve is the run's own generation re-served (a lost ack): the same
@@ -665,29 +719,40 @@ class Transition:
         same = gen is None or (bound == gen if type(bound) is int else gen == 1)
         quiet = not any(rec.get(k) for k in ("fenced", "stop_requested", "stop_confirmed", "dispatch_lost",
                                               "owed_close", "owed_ctl", "finished"))
-        data = self.owner._read() or {}
-        seq = ((data.get("runs") or {}).get(rec["run"]) or {}).get("seq")
-        newest = ((data.get("runs") or {}).get(pending.get("run")) or {}).get("seq")
-        no_newer = (type(seq) is int and type(newest) is int and seq < newest
-                    and newest == (data.get("seqs") or {}).get(self.wire))
-        return (same and quiet and no_newer and pending.get("source") == rec.get("source_event_id")
-                and pending.get("wake") == rec.get("wake_episode"))
+        episode = _pending_episode(pending)
+        if not (same and quiet and episode is not _LEGACY_WAKE and pending.get("source") == rec.get("source_event_id")
+                and episode == rec.get("wake_episode")):
+            return False                        # decided by the record alone
+        data = self.owner._read()
+        run, cand, last = (_at(data, "runs", rec["run"]), _at(data, "runs", pending.get("run")),
+                           _at(data, "seqs", self.wire))
+        if UNKNOWN in (run, cand, last) or not all(isinstance(r, dict) for r in (run, cand)):
+            return UNKNOWN                      # the record names both runs: an entry gone is not "no"
+        seq, newest = run.get("seq"), cand.get("seq")
+        if not all(type(n) is int for n in (seq, newest, last)):
+            return UNKNOWN
+        return seq < newest and newest == last
 
     def revive_finished(self, first_run: str, lease: "str | None",
                         used: Callable[[str], bool] = lambda _local: False):
         """A serve under a lease other than the one the task's last run finished under, or for a run
         whose details were pruned: restore that run's record, finished, so the serve is held until
-        its ack names the generation. True when restored, False when it does not apply, None when it
-        could not be saved."""
+        its ack names the generation. True when restored, False when it does not apply, UNKNOWN when
+        the ledger cannot be read, None when it could not be saved."""
         if self.rec is UNKNOWN or self.rec or not lease:
             return False
-        last = self.last_run(first_run) or (first_run if used(first_run) else None)
+        last = self.last_run(first_run)
+        if last is UNKNOWN:
+            return UNKNOWN
+        last = last or (first_run if used(first_run) else None)
         if last is None:
             return False
-        run = ((self.owner._read() or {}).get("runs") or {}).get(last)
+        run = _at(self.owner._read(), "runs", last)
+        if run is UNKNOWN or run is not None and not isinstance(run, dict):
+            return UNKNOWN
         if isinstance(run, dict) and run.get("lease") == lease:
             return False                        # the same serve redelivered
-        known = run if isinstance(run, dict) else {}
+        known = run or {}
         return self.put(run=last, lease_id=known.get("lease"), execution_generation=known.get("gen"),
                         finished=True) or None
 
@@ -698,13 +763,14 @@ class Transition:
             return self.forget()
         return self.put(pending_serve=None)
 
-    def adopt_serve(self, c: Claim, response, agent_mxid: "str | None" = None, open_turn: bool = True):
+    def adopt_serve(self, c: Claim, response, agent_mxid: "str | None" = None, open_turn: bool = True,
+                    owed: "dict | None" = None):
         """The pending serve is the run's own generation: rotate the lease onto the run, then commit
-        the ack as the run's own. One run, never re-executed."""
+        the ack as the run's own. One run, never re-executed. `owed`: work the adoption owes, in the
+        same write, so an accepted ack is never left owing nothing."""
         pending = self.rec.get("pending_serve") or {}
-        if not self.put(lease_id=pending.get("lease"), pending_serve=None):
-            return None
-        return self.record_ack(c, response, agent_mxid, open_turn)
+        return self.record_ack(c, response, agent_mxid, open_turn,
+                               extra={"lease_id": pending.get("lease"), "pending_serve": None, **(owed or {})})
 
     def switch_run(self, c: Claim, response, context: dict, agent_mxid: "str | None" = None,
                    open_turn: bool = True):
@@ -716,9 +782,7 @@ class Transition:
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if not self.holds_claim(c) or not isinstance(pending, dict) or type(gen) is not int:
             return None
-        if not self.owner.broker_names_leases():
-            self.owner._commit(lambda d: d.setdefault("contract", {}).update(names_lease_generation=True),
-                               why="the broker's lease contract")
+        episode = _pending_episode(pending)
         if rec.get("turn_id"):
             self.close_turn(rec["turn_id"])
         fields = {**context, "run": pending["run"], "lease_id": pending.get("lease"), "pending_serve": None,
@@ -727,12 +791,13 @@ class Transition:
                   "published_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None,
                   "awaiting_ack": False, "dispatch_lost": None, "owed_close": None, "owed_ctl": None,
                   "stop_ctl": None, "stop_requested": None, "stop_confirmed": None,
-                  "missing_since": None, "hold_reported": None, "wake_episode": None,
+                  "missing_since": None, "hold_reported": None,
+                  "wake_episode": episode if type(episode) is str else None,
                   "cancel_requested_generation": None, "cancel_requested_attempt": None,
-                  "owed_publish": pending["run"], "finished": None}
+                  "owed_publish": pending["run"], "owed_reserve": pending.get("reserve"), "finished": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
-        return self.rec if self._change(lambda _d, r: {**r, **fields, "claims": None},
+        return self.rec if self._change(lambda d, r: (_note_contract(d), {**r, **fields, "claims": None})[1],
                                         f"the switch to run {pending['run']}")[0] else None
 
     # ── claims ───────────────────────────────────────────────────────────
@@ -786,12 +851,17 @@ class Transition:
         ok, _ = self._change(lambda _d, r: {**r, "claims": {**r["claims"], c["op"]: noted}}, f"item of {c['op']}")
         return Claim({**noted, "op": c["op"]}) if ok else None
 
-    def commit_claim(self, c: Claim, **fields) -> bool:
-        """Close the claim and write `fields`, only while it holds."""
+    def commit_claim(self, c: Claim, *, names_leases: bool = False, **fields) -> bool:
+        """Close the claim and write `fields`, only while it holds. With `names_leases`, the broker's
+        lease contract is recorded in the same write."""
         if not self.holds_claim(c):
             return False
-        return self._change(lambda _d, r: {**r, **fields, "claims": _without(r.get("claims"), c["op"])},
-                            f"commit of {c['op']}")[0]
+
+        def edit(data, r):
+            if names_leases:
+                _note_contract(data)
+            return {**r, **fields, "claims": _without(r.get("claims"), c["op"])}
+        return self._change(edit, f"commit of {c['op']}")[0]
 
     def release_claim(self, c: Claim) -> bool:
         """Drop the claim without its effect's outcome: the effect is known not to have happened, or
@@ -821,7 +891,8 @@ class Transition:
         return self.put(**serve_context(task), awaiting_ack=True, lease_id=lease,
                         published_at=published or self.now())
 
-    def record_ack(self, c: Claim, response, agent_mxid: "str | None" = None, open_turn: bool = True):
+    def record_ack(self, c: Claim, response, agent_mxid: "str | None" = None, open_turn: bool = True,
+                   extra: "dict | None" = None):
         """Commit the ack claimed by `c`: the generation it reported, and the turn file when turn
         context is on and `open_turn`. "stale" when the claim no longer owns the attempt (another serve
         or a retirement came between); None when it could not be recorded; else the record."""
@@ -830,13 +901,10 @@ class Transition:
         if not self.holds_claim(c):
             self.release_claim(c)
             return "stale"
+        extra = extra or {}
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if type(gen) is not int or gen < 1:
-            return self.rec if self.commit_claim(c, awaiting_ack=False) else None
-        if not self.owner.broker_names_leases():
-            # Before the same-generation return, so a re-ack repairs a contract write that failed.
-            self.owner._commit(lambda d: d.setdefault("contract", {}).update(names_lease_generation=True),
-                               why="the broker's lease contract")
+            return self.rec if self.commit_claim(c, awaiting_ack=False, **extra) else None
         rec = self.rec
         if type(rec.get("execution_generation")) is int and rec["execution_generation"] != gen:
             # A run's generation never changes in place; a newer one gets a run of its own.
@@ -845,7 +913,7 @@ class Transition:
             return "generation"
         if rec.get("execution_generation") == gen and (rec.get("turn_id") or not self.owner.turn_context
                                                        or not open_turn):
-            return self.rec if self.commit_claim(c, awaiting_ack=False) else None
+            return self.rec if self.commit_claim(c, names_leases=True, awaiting_ack=False, **extra) else None
         fields = {"execution_generation": gen, "attempt": response.get("attempt"),
                   "lease_expires_at": response.get("lease_expires_at"),
                   "acked_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None,
@@ -853,7 +921,7 @@ class Transition:
                   "stop_requested": None, "stop_confirmed": None, "missing_since": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, rec, agent_mxid))
-        return self.rec if self.commit_claim(c, **fields) else None
+        return self.rec if self.commit_claim(c, names_leases=True, **fields, **extra) else None
 
     def ack_settled(self, lease: "str | None" = None) -> bool:
         """The ack of the serve under `lease` is answered without a generation (a legacy broker, or
@@ -1006,7 +1074,10 @@ class Transition:
             return None
         if self.now() - float(rec.get("published_at", 0)) < ACK_HOLD_MAX_S:
             return "its ack has not named the lease yet"
-        if self.owner.broker_names_leases():
+        names = self.owner.broker_names_leases()
+        if names is UNKNOWN:
+            return "whether this broker names leases cannot be read"
+        if names:
             if not rec.get("hold_reported"):
                 self.put(hold_reported=True)
                 self.log(f"task {self.wire}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s on a "
@@ -1099,10 +1170,10 @@ class Transition:
     # ── wake after a human answered ──────────────────────────────────────
     def wake_seen(self, episode: str):
         """Whether this node already ran the wake's episode; UNKNOWN when that cannot be read."""
-        data = self.owner._read()
-        if data is None:
+        seen = _at(self.owner._read(), "wakes", self.wire)
+        if seen is UNKNOWN or seen is not None and not isinstance(seen, list):
             return UNKNOWN
-        return episode in ((data.get("wakes") or {}).get(self.wire) or [])
+        return episode in (seen or [])
 
     def open_wake(self, wake, first_run: str, used: Callable[[str], bool] = lambda _local: False
                   ) -> "tuple[str, str] | None":
@@ -1152,6 +1223,19 @@ def serve_context(task: dict) -> dict:
             "source_kind": s("source_kind", "interaction_type")}
 
 
+# A held serve saved before episodes were stored by id: never adopted, its episode never guessed.
+_LEGACY_WAKE = "<legacy wake>"
+
+
+def _pending_episode(pending: dict):
+    """The wake episode a held serve was served for: its id, None for no wake, or _LEGACY_WAKE."""
+    if "wake_episode" in pending:
+        ep = pending["wake_episode"]
+        return ep if ep is None or type(ep) is str else _LEGACY_WAKE
+    legacy = pending.get("wake")
+    return legacy if legacy is None or type(legacy) is str else _LEGACY_WAKE
+
+
 def _close_turn(owner: TaskAttempts, turn_id: str) -> None:
     try:
         if not agent_turn.close_turn(owner.state_dir, turn_id):
@@ -1175,8 +1259,15 @@ def compare_with_server(records: "dict | None", local_wire_tids, server_tasks: l
     return {"not_listed": unlisted, "missing_locally": missing}
 
 
-def write_if_absent(path: Path, text: str, claim: "Callable[[list], bool] | None" = None
-                    ) -> "bool | None":
+def make_durable(path: Path) -> None:
+    """Sync an existing file and its directory entry; OSError when either cannot be."""
+    with open(path, "rb") as fh:
+        os.fsync(fh.fileno())
+    agent_turn._fsync_dir(path.parent)
+
+
+def write_if_absent(path: Path, text: str, claim: "Callable[[list], bool] | None" = None,
+                    mode: int = 0o644) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file already
     was (it wins). `claim` is given the file's identity before it is published, and False from it
     publishes nothing. Raises OSError on a failure, with nothing left at `path`, so a retry can write it."""
@@ -1185,7 +1276,7 @@ def write_if_absent(path: Path, text: str, claim: "Callable[[list], bool] | None
         with os.fdopen(fd, "wb") as fh:
             fh.write(text.encode("utf-8"))
             fh.flush()
-            os.fchmod(fh.fileno(), 0o644)
+            os.fchmod(fh.fileno(), mode)
             os.fsync(fh.fileno())
         if claim is not None and not claim(file_identity(Path(tmp))):
             return False
@@ -1312,6 +1403,57 @@ def owns_result(rec, identity) -> bool:
     lost = rec.get("dispatch_lost")
     return (isinstance(lost, dict) and identity is not None and lost.get("file") is not None
             and list(lost["file"]) == list(identity) and lost.get("gen") == rec.get("execution_generation"))
+
+
+def _names_run(rec: dict, local: str) -> bool:
+    """The record holds `local` as its run or as its held serve's run."""
+    pending = rec.get("pending_serve")
+    return local == rec.get("run") or isinstance(pending, dict) and local == pending.get("run")
+
+
+def reserve_ids(data):
+    """The id of every saved serve a record names; UNKNOWN when the ledger, a record, or a reference
+    in one cannot be read, so nothing is taken for unnamed."""
+    tasks = _at(data, "tasks")
+    if tasks is UNKNOWN or tasks is not None and not isinstance(tasks, dict):
+        return UNKNOWN
+    ids = set()
+    for rec in (tasks or {}).values():
+        if not isinstance(rec, dict):
+            return UNKNOWN
+        pending = rec.get("pending_serve")
+        if pending is not None and not isinstance(pending, dict):
+            return UNKNOWN
+        for ref in ((pending or {}).get("reserve"), rec.get("owed_reserve")):
+            if ref is None:
+                continue
+            if not isinstance(ref, dict) or type(ref.get("id")) is not str:
+                return UNKNOWN
+            ids.add(ref["id"])
+    return ids
+
+
+def _at(data, *keys):
+    """The ledger value at `keys`: None when absent; UNKNOWN when the ledger, or a map on the way,
+    cannot be read or is not a map. Never absence for a damaged value, never an exception."""
+    if data is None:
+        return UNKNOWN
+    cur = data
+    for k in keys:
+        if not isinstance(cur, dict):
+            return UNKNOWN
+        if k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+
+def _note_contract(data: dict) -> None:
+    """Inside a ledger write: this broker names lease generations."""
+    contract = data.setdefault("contract", {})
+    if not isinstance(contract, dict):
+        raise _Refused
+    contract["names_lease_generation"] = True
 
 
 def _wake_item(wire_tid: str, rec) -> "str | None":
