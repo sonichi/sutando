@@ -561,10 +561,12 @@ class Published(unittest.TestCase):
     def test_sharing_on_publishes_the_scrubbed_line(self):
         _task(self.ws, "task-s")
         pl.on_step(self.ws, "task-s", "Bash", {}, "Run the tests again", spawn=lambda *a: None)
-        self.assertEqual(pl.published_status(self.ws, "task-s")["summary"], "Run the tests again")
+        self.assertEqual(pl.published_status(self.ws, "task-s")["summary"], "Running a command",
+                         "sharing is off by default: the phase word")
+        self.assertEqual(pl.published_status(self.ws, "task-s", share_line=True)["summary"], "Run the tests again")
         _task(self.ws, "task-m")
         pl.on_step(self.ws, "task-m", "mcp__claude_ai_Gmail__search", {}, "Search mail from Dana", spawn=lambda *a: None)
-        self.assertEqual(pl.published_status(self.ws, "task-m")["summary"], "Checking your email")
+        self.assertEqual(pl.published_status(self.ws, "task-m", share_line=True)["summary"], "Checking your email")
 
     def test_nothing_for_a_finished_task_and_the_cli(self):
         self.assertIsNone(pl.published_status(self.ws, "task-unknown"))

@@ -683,11 +683,11 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
     return None
 
 
-def published_status(workspace, task_id: str, *, share_line: bool = True, **kw) -> "dict | None":
+def published_status(workspace, task_id: str, *, share_line: bool = False, **kw) -> "dict | None":
     """What the agent publishes to the server ledger: phase, summary, since and, for a waiting task,
-    `waiting` {reason, position?}. With `share_line` (the owner's share_live_status, on by default)
-    the summary is the detail line as `shareable_line` lets it leave; off, it is the phase word or the
-    fixed waiting line ("Queued · next"), never a step's text. The publisher adds the task's source
+    `waiting` {reason, position?}. Off (the default, and the owner's share_live_status default) the
+    summary is the phase word or the fixed waiting line ("Queued · next"), never a step's text; with
+    `share_line` it is the detail line as `shareable_line` lets it leave. The publisher adds the task's source
     message itself. None when `status_for` says nothing."""
     st = status_for(workspace, task_id, **kw)
     if st is None:
