@@ -5,7 +5,9 @@ CANCEL_INSTRUCTION is read when the turn ends).
 
 The task is "current" when the newest row the session's own hooks wrote names it and is fresh,
 or names it at any age while a terminal dialog holds the session (an open TUI requirement for it,
-or a live dialog on the pane): a turn parked on a prompt writes no rows. The pane is mid-turn when
+or a live dialog on the pane): a turn parked on a prompt writes no rows. A turn parked on its FIRST
+prompt has written none for the task at all: when the newest row closed another turn (or there is
+none) and the task is the only one in the inbox, control tasks aside, a live dialog is its. The pane is mid-turn when
 it shows Claude Code's `esc to interrupt` or that live dialog; the Escape answers the dialog, and
 the session's open TUI requirements are then expired. A task a pool worker holds
 is interrupted only by that worker's own watcher. One Escape per cancelled task, ever; each
@@ -46,6 +48,8 @@ CONFIRM_MAX_S = 3600.0
 MARKER_DIR = ("state", "stop-interrupts")
 ENABLE_ENV = "SUTANDO_STOP_INTERRUPT"
 MID_TURN_KINDS = ("working", "processing")
+CONTROL_PREFIX = "task-ctl-"
+_PENDING = re.compile(r"(task-[^/]+?)(?:\.txt|\.assigned-[^/]+|\.claimed-[^/]+)")
 UNREADABLE = "<unreadable>"                 # a result that exists but cannot be read: never "no result"
 CONFIG_SH = Path(__file__).resolve().parents[1] / "scripts" / "sutando-config.sh"
 
@@ -161,6 +165,20 @@ def _held_elsewhere(workspace: Path, tasks_dir: Path, target: str) -> bool:
         return True                         # unreadable pool state: never Escape a pane that may not be on it
 
 
+def _only_waiting(tasks_dir: Path, target: str) -> bool:
+    """Whether the target is the one task in the inbox, control tasks aside: then a turn parked with
+    no row yet, after the last turn closed, can only be its. False when the inbox cannot be read."""
+    try:
+        ids = set()
+        for p in tasks_dir.iterdir():
+            m = _PENDING.fullmatch(p.name)
+            if m and not m.group(1).startswith(CONTROL_PREFIX):
+                ids.add(m.group(1))
+    except OSError:
+        return False
+    return ids == {target}
+
+
 def _claim(workspace: Path, target: str) -> bool:
     """True the first time for this task: the marker makes the Escape at-most-once."""
     d = workspace.joinpath(*MARKER_DIR)
@@ -214,17 +232,24 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     snapshot = newest_task(workspace)
     newest, _, kind = snapshot
     current = current_task(workspace, now)
+    # No row yet for a turn parked on its first prompt: once the last turn closed, the one task waiting
+    # since then is the only one the session can be on. A row written mid-turn may still be open.
+    inferred = (newest != target and (newest is None or kind not in MID_TURN_KINDS)
+                and _only_waiting(tasks_dir, target))
     # Only a row written mid-turn says the pane may still be on T: a Stop-hook `thinking` or a `done`
     # row closes T's turn, so a later turn in the pane is not T's.
     finished = (f"its newest row ({kind}) was not written mid-turn" if newest == target and kind not in MID_TURN_KINDS
                 else "it already has its result, or one that cannot be read"
                 if _result_body(workspace / "results", target) is not None else None)
-    manager, reqs = _tui_requirements(workspace, _session()) if newest == target else (None, [])
+    named = newest == target or inferred
+    manager, reqs = _tui_requirements(workspace, _session()) if named else (None, [])
     held = _held_elsewhere(workspace, tasks_dir, target)
-    pane = _pane_target(sock, run) if newest == target and not held else None
+    pane = _pane_target(sock, run) if named and not held else None
     text = run(["tmux", "-S", sock, "capture-pane", "-p", "-J", "-t", pane]) if pane else None
     if newest == target and (reqs or live_dialog(text)):
         current = target                    # parked on a prompt: no rows are written, so age is moot
+    elif inferred and live_dialog(text):
+        current = target                    # parked on its first prompt, the only task waiting
     send, why = decide(target, current=current, held_elsewhere=held, pane_text=text, finished=finished)
     if send and (newest_task(workspace) != snapshot or _result_body(workspace / "results", target) is not None):
         # Rows or a result written while the pane was read: the turn may have moved on.

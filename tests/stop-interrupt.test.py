@@ -5,6 +5,7 @@ Run: python3 tests/stop-interrupt.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -179,6 +180,41 @@ class StopInterrupt(unittest.TestCase):
         self.assertFalse(self.run_it(tmux))
         self.assertEqual(tmux.escapes(), [])
         self.assertEqual(self.card_status(req), "pending")
+
+    def test_a_task_parked_on_its_first_prompt_is_escaped_whatever_row_came_last(self):
+        cases = {"no rows at all": [], "a stale closed control-task row": [("task-ctl-1793511857071-1", 92 * 60, "thinking")],
+                 "a fresh done row of the previous task": [("task-prev", 5, "done")],
+                 "a stale closed row of another task": [("task-other", si.FRESH_S + 600, "thinking")]}
+        for case, rows in cases.items():
+            with self.subTest(case=case):
+                self.setUp()
+                for tid, age, kind in rows:
+                    self.row(tid, age=age, kind=kind)
+                (self.tasks / "task-ctl-1793511857071-2.txt").write_text("id: task-ctl-1793511857071-2\n")
+                tmux = FakeTmux(DIALOG.split("\n", 1)[1])
+                self.assertTrue(self.run_it(tmux), "the only task waiting, parked on its first prompt")
+                self.assertEqual(len(tmux.escapes()), 1)
+                self.assertIn("a dialog in the pane holds this task", self.owner_rows()[-1]["line"])
+
+    def test_with_another_task_waiting_or_running_a_first_prompt_gets_no_key(self):
+        for case in ("another task waiting too", "another task mid-turn", "no dialog, only a spinner",
+                     "the inbox cannot be read"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.row("task-prev", age=60, kind="done")
+                pane = DIALOG.split("\n", 1)[1]
+                if case == "another task waiting too":
+                    (self.tasks / "task-t2.txt").write_text("id: task-t2\n")
+                elif case == "another task mid-turn":
+                    self.row("task-t2", age=5, kind="working")
+                elif case == "no dialog, only a spinner":
+                    pane = BUSY
+                tmux = FakeTmux(pane)
+                stuck = (mock.patch.object(Path, "iterdir", side_effect=PermissionError(13, "denied"))
+                         if case == "the inbox cannot be read" else contextlib.nullcontext())
+                with stuck:
+                    self.assertFalse(self.run_it(tmux))
+                self.assertEqual(tmux.escapes(), [])
 
     def test_a_prompt_parked_on_another_task_gets_no_key(self):
         self.row("task-other", age=si.FRESH_S + 600)
