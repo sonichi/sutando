@@ -11,8 +11,10 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +37,10 @@ def _task(tid, **extra):
 def _ack(tid, gen):
     return {"ok": True, "durable": True, "task_id": tid, "execution_generation": gen, "attempt": gen,
             "lease_expires_at": 1.0}
+
+
+def _http_error(code, body):
+    return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(json.dumps(body).encode()))
 
 
 class Broker:
@@ -181,6 +187,48 @@ class Launcher(unittest.TestCase):
         broker.lease = "L3"
         gw._req("GET", "/v1/tasks?wait=1")
         self.assertEqual(self.events()[-1]["event"], "FAIL: matched more than once", "a third lease")
+
+    def test_reclaim_goes_offline_then_posts_the_result_only_once_the_newer_serve_exists(self):
+        tid = "task-launcher-offline"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1"), set(), []))
+        with mock.patch.object(gw, "_req", Broker(tid)):
+            self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+        sent = []
+
+        def broker(method, path, payload=None, timeout=None, **k):
+            sent.append((method, path))
+            if method == "GET":
+                return {"tasks": [{"id": tid, "lease_id": broker.lease}]}
+            if path == "/v1/results":
+                raise _http_error(409, {"error_code": "stale_execution_generation"})
+            return {"ok": True}
+        broker.lease = "L1"
+        mock.patch.object(gw, "_req", broker).start()
+        sentinel = Path(tempfile.mkdtemp()) / "held"
+        sentinel.write_text("hold")
+        offline = sentinel.with_name("held.offline")
+        offline.write_text("")
+        launcher.install(gw, launcher.Rule("serve", tid, None, None, None), "reclaim", self.report, sentinel)
+        for call in (("GET", "/v1/tasks?wait=1"), ("POST", "/v1/heartbeat", {}), ("POST", "/v1/results", {"id": tid})):
+            with self.assertRaises(OSError):
+                gw._req(*call)
+        self.assertEqual(sent, [], "offline: nothing reaches the broker")
+        offline.unlink()
+        done = []
+        post = threading.Thread(target=lambda: done.append(self.assertRaises(
+            OSError, gw._req, "POST", "/v1/results", {"id": tid, "execution_generation": 1})))
+        post.start()
+        post.join(0.5)
+        self.assertTrue(post.is_alive(), "the result waits for the newer serve")
+        broker.lease = "L2"
+        self.assertEqual(gw._req("GET", "/v1/tasks?wait=1")["tasks"], [], "the newer serve is held")
+        post.join(5)
+        self.assertFalse(post.is_alive())
+        events = [e["event"] for e in self.events()]
+        self.assertEqual(events, ["offline: broker calls withheld", "online", "matched",
+                                  "result posted after the newer serve"])
+        self.assertEqual((self.events()[-1]["status"], self.events()[-1]["execution_generation"]), (409, 1))
+        self.assertIn(("POST", "/v1/results"), sent)
 
     def test_main_starts_the_loader_and_writes_its_identity_first(self):
         impl = Path(gw.__file__)

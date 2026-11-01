@@ -10,10 +10,13 @@ lease and run). The rule fires once; a second match, or none by exit, is reporte
   crash    call the real broker, record its answer (the proof it accepted), then os._exit(9)
            before the bridge sees the answer, so nothing is committed.
   stall    hold the matching call until the sentinel file is removed, then pass it through.
-  reclaim  (`--kind serve`) while the sentinel exists, leave the task out of the per-task beats so
-           the real broker reclaims its lease and moves it to a newer generation, and keep that
-           newer serve (a lease other than the first seen) from the bridge. Removing the sentinel
-           lets both through. The held serve is the one match; a third lease fails the run.
+  reclaim  (`--kind serve`) the broker re-leases an acked task only once its agent has made no
+           call for its online window, so: while `<sentinel>.offline` exists, every broker call
+           fails before it is sent (an outage, nothing spoofed). While `<sentinel>` exists, the
+           task's per-task beats are left out, the newer serve (a lease other than the one the
+           running generation holds) is kept from the bridge, and the task's result POST waits
+           until that newer serve exists, so the broker answers it as stale. Removing `<sentinel>`
+           lets everything through. The held serve is the one match; a third lease fails the run.
 
 Usage (all on the rig, at the exact head under test):
   python3 scripts/witness/lifecycle-fault-launcher.py --fault crash --kind ack --task <broker id> \\
@@ -29,12 +32,14 @@ import argparse
 import atexit
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -107,9 +112,20 @@ def install_reclaim(mod, rule: Rule, report: Path, sentinel: Path) -> None:
     """The `reclaim` fault: the task's beats are withheld and its newer serve kept back while the
     sentinel exists; every other task and call passes unchanged."""
     real = mod._req
-    seen: dict = {"first": None, "held": None, "beats": False, "released": False}
+    seen: dict = {"first": None, "held": None, "beats": False, "released": False, "withheld": 0}
+    offline = sentinel.with_name(sentinel.name + ".offline")
 
     def wrapped(method, path, payload=None, *a, **k):
+        if offline.exists():
+            with rule.lock:
+                seen["withheld"] += 1
+                first = seen["withheld"] == 1
+            if first:
+                _report(report, {"event": "offline: broker calls withheld", "path": path})
+            raise urllib.error.URLError("withheld by the witness launcher (offline)")
+        if seen["withheld"] and not seen.get("online"):
+            seen["online"] = True
+            _report(report, {"event": "online", "withheld_calls": seen["withheld"]})
         holding = sentinel.exists()
         record = mod._ATTEMPTS.entry(rule.task) if mod._ATTEMPTS is not None else None
         if seen["first"] is None and isinstance(record, dict) and record.get("lease_id"):
@@ -123,6 +139,20 @@ def install_reclaim(mod, rule: Rule, report: Path, sentinel: Path) -> None:
                 seen["beats"] = True
                 _report(report, {"event": "beats withheld", "task": rule.task})
             payload = {**payload, "tasks": kept}
+        if (holding and method == "POST" and path.split("?")[0] == KINDS["result"]
+                and isinstance(payload, dict) and payload.get("id") == rule.task):
+            while seen["held"] is None and sentinel.exists():
+                time.sleep(0.2)                 # the result goes once the newer serve exists
+            try:
+                answer = real(method, path, payload, *a, **k)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", "replace")
+                _report(report, {"event": "result posted after the newer serve", "status": e.code, "body": body,
+                                 "execution_generation": payload.get("execution_generation")})
+                raise urllib.error.HTTPError(e.url, e.code, e.msg, e.hdrs, io.BytesIO(body.encode()))
+            _report(report, {"event": "result posted after the newer serve", "status": 200, "answer": answer,
+                             "execution_generation": payload.get("execution_generation")})
+            return answer
         answer = real(method, path, payload, *a, **k)
         if method != "GET" or path.split("?")[0] != KINDS["serve"] or not isinstance(answer, dict):
             return answer
