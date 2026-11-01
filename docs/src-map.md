@@ -240,6 +240,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.
+- **`stop_hooks.py`** — Stop handlers: the scripts installed skills declare with the manifest field `on_stop_requested`, offered each Stop the task watcher reads (a CANCEL_INSTRUCTION naming a task).
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.

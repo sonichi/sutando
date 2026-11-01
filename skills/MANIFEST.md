@@ -199,8 +199,8 @@ refuses their fields on a developer-only skill. Which directories depends on the
   when set, each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/`, and sibling checkouts' `skills/`;
 - `documented_for_core` (`src/inline-tools.ts`): `<repo>/skills`, `<workspace>/skills` and
   `$SUTANDO_MEMORY_DIR/skills`;
-- `pending_questions_store` and `on_launch` (`src/skill_roots.py`): `<repo>/skills` and
-  `<workspace>/skills`;
+- `pending_questions_store`, `on_launch` and `on_stop_requested` (`src/skill_roots.py`):
+  `<repo>/skills` and `<workspace>/skills`;
 - `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`) and
   `supervised_worker` (`src/sparrowd.py`): `<repo>/skills` only.
 
@@ -227,6 +227,20 @@ the desktop app on each start, update, watchdog restart and reload); on Windows
 
 Several skills may declare one; each runs on every launch, a restart included, so a hook must be
 cheap when it has nothing to do.
+
+## Stop handler (`on_stop_requested`)
+
+`"on_stop_requested": "scripts/<handler>.py"` (or `.sh`) declares a script the task watcher offers
+each Stop it reads (a `CANCEL_INSTRUCTION` naming a task). `src/task-emit.sh` runs
+`src/stop_hooks.py`, which resolves the declarers with `skill_roots.declared_scripts` and names no
+skill. The contract:
+
+- run as `<python> <script> <task id> --tasks-dir <inbox> --control-file <control task>` (`bash`
+  for a `.sh`), in the background of the watcher's emit;
+- exit 0 takes the stop: the task gets a stop request, and the handler owns ruling it (CANCELLED,
+  or left to delivery). Any other exit, or none within 10 seconds, offers it to the next handler;
+  with none taking it, the task is CANCELLED at once;
+- a handler that takes it must return promptly and do the rest detached.
 
 ## Orphan reaper (`orphan_reaper`)
 

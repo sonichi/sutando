@@ -387,7 +387,9 @@ Sutando checkout around it sends neither field.
   going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
   one still queued whose task file the core took up (a turn row newer than the file) and then left
   with no turn activity and no result for 30 min while the core's health row reads it idle (2 h when
-  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call); a task file the core has not reached yet keeps
+  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call). With
+  `SUTANDO_STOP_INTERRUPT=1` that one also gets a `CANCEL_INSTRUCTION`, a cooperative stop: its
+  failure result is already written, so no Escape is sent for it. A task file the core has not reached yet keeps
   beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
   dropping it as completed elsewhere. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
@@ -1001,26 +1003,27 @@ It uses the same failure predicate as the local check's exit code. Warnings
 remain warnings; check names, diagnostic output, task text, and paths are not
 included in the record.
 
-The gateway overlays a recent failing report onto its next heartbeat as
-`status: error` with a failure count. This works even without a core status
-file, allowing the independent health checker to report a failed core.
-A later passing check removes the override and resumes the core's status.
-Repair attempts do not imply recovery: another completed check must verify it.
+The heartbeat's `status` and `step` describe work from `core-status.json`, subject
+to the existing liveness safeguards above: a newer graceful-stop tombstone reports
+`offline`, and a missing/stale self-report without a live beat uses the beat's
+`offline`/`idle`/`unknown` verdict. Diagnostic check failures never replace work
+fields. An idle or offline verdict omits the stale step.
 
-Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
-as the five-minute fallback. An expired report gives no opinion: the core status
-passes through exactly as with no report, so a cached failure is never refreshed
-and a host that stops running the checker is not pinned to `unknown`. Malformed,
-empty, or future-dated reports emit `status: unknown`.
-An absent report preserves legacy core-status reporting for installations
-without the health checker. A passing report alone does not invent a core
-status. If the gateway or host is down, no heartbeat can be sent; the broker's
-existing contact timeout still yields disconnected/unknown.
+Health travels separately in the existing `health` object (`alive`, `motion`,
+`condition`, `reason`, `since`) with the `worker_health.v1` capability. The
+snapshot/injected-command selection, validation and reason grammar are unchanged.
+A valid independent report with failures and age at most 35 minutes sets
+`condition: abnormal`, `reason: health-check`, and `since: checked_at`, preserving
+`alive` and `motion` from that source. Without a source, they remain null/unknown.
+Passing, stale or invalid reports leave the source row unchanged. The broker
+derives `needs_attention: false` for `health-check`; the bridge does not send a
+new attention field. A diagnostic condition change participates in the existing
+heartbeat change detection. Consumers use this structured field for diagnostic
+health; presence still receives the existing liveness override in `status`.
 
-The s.space dashboard already classifies `error` as unhealthy, so this
-requires updating Sutando's health checker and restarting its gateway bridge;
-no dashboard schema change is needed. Reporting starts after the first health
-check completes and follows the installed check cadence.
+This bridge change requires loading the updated bridge code. It does not require
+a core restart or change the broker's health schema. The broker's existing
+contact timeout still detects a disconnected bridge or host.
 
 ### Local hook activity attribution
 
@@ -1056,3 +1059,39 @@ when a task file supplies one, and the CLI rejects an explicit `--room`.
 Clients must distinguish a roomless wedge from other roomless kinds; missing
 `room` alone does not mean global. This is a writer contract, not a change to
 client rendering. No historical rows are rewritten.
+
+### Owner task step summaries (default off)
+
+`skills/agent-activity/manifest.json` declares `LEDGER_STEP_PUBLISH_ENABLED: false`.
+The Sutando adapter reads this through `skill_config.enabled` (environment override
+then manifest). Standalone Sparrow has no enablement callback and defaults off.
+When off, the bridge does not read the activity tail or start a publisher worker.
+When enabled, an optional daemon thread coalesces steps without blocking intake;
+a still-running worker is not duplicated. Empty task sets never read the log.
+
+The publisher sends `room.task.progress` through
+`POST /api/capabilities/v1/actions/execute` on the gateway's origin, authenticated
+with that connection's bearer. Arguments contain only `summary`; top-level fields
+carry `task_id`, `execution_generation`, `operation_id`, and the room. The same
+operation ID is sent as `Idempotency-Key`. Per the backend contract, this changes
+only summary and `last_reported_at`, never phase or blockers. It never uses
+`room.task.update` or a `working` transition for progress.
+
+An HTTP 404 means the Action is not deployed: log it and skip, leaving the row
+eligible for a later rate-limited retry. Other failures are logged and contained.
+Keep the switch off until the Action is live and a live owner-ledger witness has
+been captured. Enabling it does not authorize a bridge restart.
+
+The publisher selects working/thinking rows for the connection's own
+in-flight task envelopes. Missing generation/room, a different connection or
+room, ready results, terminal rows and finished/fenced/stale attempts are skipped.
+The bridge preserves served task ID and execution generation above the body;
+legacy envelopes lacking generation are unchanged and skipped. Health, notice,
+processing and projected rows are excluded. `filter_chat_secrets` redacts each
+summary before normalization and the 140-character cap.
+
+Eligible changes coalesce to the latest summary, with at most one attempt per
+ten seconds per task including failures. Failure logs contain exception types,
+not summaries or credential values. The idempotency key is stable for
+retries of a row. Timing and deduplication remain process-local. Intended owner
+ledger visibility is private step text; other room members receive only counts.
