@@ -251,6 +251,47 @@ class StopInterrupt(Base):
         self.turn()
         self.assert_no_key(NoSocket(), "no tmux socket")
 
+    def test_a_dialog_escape_expires_the_sessions_terminal_cards(self):
+        self.turn(dialog="gh pr merge 1")
+
+        class Req:
+            def __init__(self, rid, session):
+                self.id, self.subject = rid, {"source": "tui", "session": session}
+
+        class Manager:
+            expired = []
+
+            def active(self):
+                return [Req("r1", "sutando-core"), Req("r2", "other"), Req("r3", "sutando-core")]
+
+            def expire(self, rid):
+                if rid == "r3":
+                    raise OSError("store")
+                self.expired.append(rid)
+        with mock.patch("hitl.cards.manager_for", return_value=Manager(), create=True):
+            self.assertTrue(self.run_it(FakeTmux(DIALOG)))
+        self.assertEqual(Manager.expired, ["r1"], "only this session's cards, and a failed expiry is skipped")
+        self.assertIn("1 terminal prompt card(s) expired", self.logs[-1])
+        with mock.patch("hitl.cards.manager_for", side_effect=RuntimeError("no store"), create=True):
+            self.assertEqual(si._tui_requirements(self.ws, "sutando-core"), (None, []))
+
+    def test_unreadable_pool_state_a_named_pane_and_an_unwritable_row(self):
+        self.turn()
+        with mock.patch.object(si, "worker_holds", side_effect=OSError("pool")):
+            self.assert_no_key(FakeTmux(), "a pool worker holds it")
+        os.environ["SUTANDO_TMUX_PANE"] = "%7"
+        tmux = FakeTmux()
+        with mock.patch.object(si, "append_row", side_effect=OSError("disk")):
+            self.assertTrue(self.run_it(tmux))
+        self.assertEqual(tmux.escapes()[0][tmux.escapes()[0].index("-t") + 1], "%7")
+
+    def test_a_result_that_cannot_be_read_counts_as_one(self):
+        (self.ws / "results" / f"{TARGET}.txt").write_text("x")
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
+            self.assertIs(si._result_body(self.ws / "results", TARGET), si.UNREADABLE)
+        with mock.patch.object(Path, "read_text", side_effect=FileNotFoundError()):
+            self.assertIsNone(si._result_body(self.ws / "results", TARGET), "gone between the look and the read")
+
     def test_run_returns_stdout_only_on_success(self):
         self.assertEqual(si._run(["echo", "hi"]), "hi\n")
         self.assertIsNone(si._run(["false"]))
@@ -288,6 +329,8 @@ class Turns(Base):
         self.hook("UserPromptSubmit", "P1", prompt="x")
         self.assertEqual(turns.path(self.ws).read_text(), "[]")
         self.hook("UserPromptSubmit", "bad id", prompt="x")
+        turns.path(self.ws).write_text('{"turns": []}')
+        self.assertIs(turns.read(self.ws, "P1"), turns.UNKNOWN)
 
     def test_the_pane_is_stamped_at_turn_start_and_cleared_only_by_its_own_stop(self):
         calls = []
@@ -346,6 +389,20 @@ class Rulings(Base):
         (self.ws / "results" / "task-ctl-1.txt").write_text("[no-send] stopped it")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
         self.assertEqual((self.phase(), self.pending()), ("CANCELLED", []))
+
+    def test_a_stop_request_is_seen_at_once_once_and_does_not_end_the_task(self):
+        self.store.apply(activity_bus.StopRequest(TARGET))
+        self.assertEqual(activity_bus.main(["stop-requested", "--task-id", TARGET, "--workspace", str(self.ws)]), 0)
+        self.assertEqual(self.phase(), "RUNNING")
+        rows = [json.loads(l) for l in (self.ws / "state" / "agent-activity.jsonl").read_text().splitlines()]
+        stop = [r for r in rows if r["line"] == "stop requested"]
+        self.assertEqual(len(stop), 1, "once per task")
+        self.assertEqual((stop[0]["kind"], stop[0]["projection"]), ("notice", "TASK_STATUS"))
+        self.store.apply(activity_bus.LifecycleTransition("task-done", "RUNNING"))
+        self.store.apply(activity_bus.LifecycleTransition("task-done", "CANCELLED"))
+        self.store.apply(activity_bus.StopRequest("task-done"))
+        self.assertEqual(self.phase("task-done"), "CANCELLED", "a terminal phase is left alone")
+        self.assertEqual(activity_bus.main(["stop-requested", "--task-id", "task-x~../y", "--workspace", str(self.ws)]), 2)
 
     def test_any_result_for_the_task_is_a_finish_left_to_delivery(self):
         for body in ("[no-send] handled in the thread", "DONE", "  "):
@@ -406,6 +463,23 @@ class Rulings(Base):
         (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
         self.assertEqual(self.pending(), ["task-bad.ruling.json"])
+
+    def test_a_sweep_with_nothing_waiting_or_for_another_task_rules_nothing(self):
+        self.assertEqual(si.sweep(self.ws / "nowhere"), {})
+        si.open_ruling(self.ws, "task-other", "task-ctl-9", now=self.now)
+        (self.ws / "results" / "task-ctl-9.txt").write_text("ok")
+        self.assertEqual(si.sweep(self.ws, now=self.now, only=TARGET), {})
+        self.assertEqual(self.pending(), ["task-other.ruling.json"])
+
+    def test_the_detached_worker_survives_an_interrupt_that_fails(self):
+        cancel = self.tasks / "task-ctl-1.txt"
+        cancel.write_text(f"id: task-ctl-1\ntask: CANCEL_INSTRUCTION: stop processing {TARGET}\n")
+        si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
+        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        with mock.patch.object(si, "interrupt", side_effect=RuntimeError("tmux gone")):
+            self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks), "--workspace", str(self.ws),
+                                      "--control-file", str(cancel), "--work"]), 0)
+        self.assertEqual(self.phase(), "CANCELLED", "the ruling still ran")
 
     def test_confirm_polls_then_leaves_the_record_to_the_hook(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
