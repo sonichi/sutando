@@ -99,6 +99,22 @@ def loopback_origin(origin: str) -> bool:
     return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
 
 
+def cors_origin(origin: Optional[str], host: str) -> str:
+    """The Origin a read response may grant (echoed, never `*`), or "" for none: a loopback page
+    (the desktop app's tauri://localhost and http://tauri.localhost included), or a page served
+    from the same host the request addresses (the web client opened by LAN address). Any other
+    site gets no grant, so a page it serves cannot read the response."""
+    if not origin:
+        return ""
+    if loopback_origin(origin):
+        return origin
+    try:
+        origin_host = (urlparse(origin).hostname or "").lower()
+    except ValueError:
+        return ""
+    return origin if origin_host and origin_host == _authority_host(host) else ""
+
+
 def local_api_token(workspace: Path, configured: str = "") -> str:
     """The bearer the privileged loopback routes require: `configured` (SUTANDO_API_TOKEN)
     when set, else the per-install secret under state/, minted once."""
