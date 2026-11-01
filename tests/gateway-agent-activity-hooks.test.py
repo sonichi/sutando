@@ -152,6 +152,25 @@ class Hooks(unittest.TestCase):
         self.assertIsNotNone(gw._write_task(_task("task-rq3")))
         self.assertNotIn("room question", (gw.TASKS_DIR / "task-rq3.txt").read_text())
 
+    def test_only_owner_and_collaborator_tasks_get_the_answer_rule(self):
+        q = {"question_id": "rq_tier", "expected_revision": 1, "prompt": "Blue?"}
+        for tid, extra, rule in (("task-rq-guest", {"user_id": "@g:x", "access_tier": "guest"}, False),
+                                 ("task-rq-team", {"user_id": "@t:x", "access_tier": "team"}, False),
+                                 ("task-rq-collab", {"user_id": "@t:x", "access_tier": "team", "collaborator": True}, True)):
+            with self.subTest(tid=tid):
+                self.assertIsNotNone(gw._write_task(_task(tid, room_question={**q, "question_id": f"rq_{tid}"}, **extra)))
+                text = (gw.TASKS_DIR / f"{tid}.txt").read_text()
+                self.assertIn("[AG2 Space room question data", text)
+                self.assertEqual("`room.question.answer`" in text, rule)
+                self.assertEqual(f"rq_{tid}" in (ledger().get("questions") or {}), rule, "no offer without the rule")
+
+    def test_a_long_question_is_capped_in_the_task_file(self):
+        q = {"question_id": "rq_long", "expected_revision": 1, "prompt": "x" * 50000}
+        self.assertIsNotNone(gw._write_task(_task("task-rq-long", room_question=q)))
+        line = next(l for l in (gw.TASKS_DIR / "task-rq-long.txt").read_text().splitlines() if "room question data" in l)
+        self.assertLess(len(line), gw.task_attempts.QUESTION_DATA_MAX + 200)
+        self.assertIn("truncated; read it with room.question.inspect", line)
+
     def test_with_turn_context_off_a_room_question_adds_neither_data_nor_rule(self):
         q = {"question_id": "rq_off", "expected_revision": 1, "prompt": "Blue?", "can_answer": True}
         with mock.patch.object(gw, "TURN_CONTEXT", False):
@@ -585,6 +604,8 @@ class Hooks(unittest.TestCase):
                 with stuck:
                     fake = self.closed_by_beat(tid)      # the answer closed it before its result file
                 self.assertEqual(self.controls(tid), [], "never asked to stop a task its own answer closed")
+                self.assertEqual(bool(gw._ATTEMPTS.entry(tid).get("owed_close")), fault,
+                                 "an answer that cannot be told keeps the marker for the next pass")
                 self.core_writes(tid, "[no-send] answered Blue")
                 old = time.time() - 5
                 os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
@@ -592,6 +613,19 @@ class Hooks(unittest.TestCase):
                 self.assertEqual(fake.posted("/v1/results"), [], "settled, nothing posted")
                 self.assertIsNone(gw._ATTEMPTS.entry(tid), "retired")
                 self.assertTrue(ledger()["questions"][qid].get("answered"), "its answer is recorded at the settle")
+
+    def test_a_closed_question_task_the_core_has_not_taken_is_withdrawn_whatever_its_answer_reads(self):
+        for answered in (None, True):
+            with self.subTest(answered=answered):
+                tid = f"task-closed-offer-{answered}"
+                q = {"question_id": f"rq_{answered}", "expected_revision": 1, "prompt": "Blue?"}
+                self.assertTrue(gw._take_served_task(_task(tid, room_question=q), set(), []))
+                seed_ack(tid, _ack(tid, 1))
+                self.assertTrue(gw._ATTEMPTS.entry(tid).get("answer_offered"))
+                with mock.patch.object(gw.task_attempts.agent_turn, "answered_in_journal", return_value=answered):
+                    self.closed_by_beat(tid, reason="question_resolved")
+                self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "the core never runs it")
+                self.assertEqual(self.controls(tid), [])
 
     def test_a_closed_task_the_core_has_not_taken_is_withdrawn_from_the_inbox(self):
         tid = "task-closed-untaken"

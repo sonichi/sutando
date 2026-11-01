@@ -507,8 +507,12 @@ A task that asks this agent a room question (`task["room_question"]`) carries th
 `question_id`, `expected_revision`, `prompt`, `options`, `allow_free_text`, `response_mode`,
 `target_members` and `expires_at` as one line of quoted room data. Unless its `can_answer` is
 `false`, a second writer-owned line tells the agent to answer it once with `room.question.answer`
-through `room.action.execute_safe` (revision and `can_answer` from `room.question.inspect`), then
-write a `[no-send]` one-line result. An answer cannot be undone, so the rule is given only when the
+through `room.action.execute_safe`, deciding from the prompt and options `room.question.inspect`
+returns (and its revision and `can_answer`), then write a `[no-send]` one-line result. The data line
+is capped at 2,000 characters. Only `can_answer: false` withholds the rule locally; `target_members`
+and `expires_at` are left to the broker, which refuses an answer it does not permit. The rule goes
+only to owner tasks and collaborator tasks: an answer is an irreversible room write, which the guest
+and plain team tiers may not make. An answer cannot be undone, so the rule is given only when the
 offer is recorded in the attempt ledger (`questions`, by question id) and nothing says the question
 was answered or may be: one already answered here (recorded at a settle, or a succeeded
 `room.question.answer` in the journal of a task it was offered to) gets a note not to answer again;

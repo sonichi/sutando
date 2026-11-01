@@ -376,13 +376,26 @@ class AnsweredInJournal(unittest.TestCase):
                               "action": "room.message.send"})
         self.assertFalse(at.answered_in_journal(self.state, "tsk_D"), "another action is not an answer")
 
+    def test_only_a_definite_failure_reads_as_not_answered(self):
+        for i, status in enumerate(("dispatched_unknown", "accepted", "running", "timeout", "", None, 7)):
+            with self.subTest(status=status):
+                tid = f"tsk_S{i}"
+                _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": f"s{i}",
+                                      "action": "room.question.answer"},
+                         {"record_type": at.OUTCOME, "task_id": tid, "operation_id": f"s{i}",
+                          "operation_status": status})
+                self.assertIsNone(at.answered_in_journal(self.state, tid), "its answer may have been applied")
+        self.answer("tsk_F", "f1", "failed")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_F"), False)
+
     def test_a_damaged_or_unreadable_journal_is_unknown_only_for_the_task_it_names(self):
         path = at.room_actions_path(self.state)
         path.write_text('{"task_id": "tsk_A", "record\n\n{"task_id": "tsk_Z"}\n')
         self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"))
         self.assertFalse(at.answered_in_journal(self.state, "tsk_B"), "another task's damage is not its")
         path.write_text('{"task_id": "tsk_A", "record_type": "dispatch_intent"}\n{"task_id": "tsk_A", "parti')
-        self.assertFalse(at.answered_in_journal(self.state, "tsk_A"), "a fresh last line is an append in progress")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"), "an append in progress may be its answer")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_B"), "a fresh partial line of another task is not")
         with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
             self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"))
 

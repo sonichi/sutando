@@ -4684,9 +4684,6 @@ def _withdraw_closed(t, why: str) -> None:
     if answered or _own_copy_exists(tid):
         t.put(owed_close=None)
         return
-    if t.rec.get("answer_offered") and t.answered_here() is not False:
-        t.put(owed_close=None)                  # closed by its own answer, or that cannot be told: no stop
-        return
     queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{glob.escape(tid)}.assigned-*")]
     activity = task_attempts.last_activity(_STATE, tid)
     for path in queued:
@@ -4702,6 +4699,13 @@ def _withdraw_closed(t, why: str) -> None:
         _log(f"task {tid}: {why} — its untaken task file was withdrawn")
         t.put(owed_close=None)
         return
+    if t.rec.get("answer_offered"):
+        answered = t.answered_here()
+        if answered is None:
+            return                              # cannot be told: its marker stays for the next pass
+        if answered:
+            t.put(owed_close=None)              # closed by its own answer: no stop
+            return
     ctl = _new_ctl_id()
     if t.put(owed_close=None, owed_ctl={"id": ctl, "reason": why}, fence_ctl=ctl):
         _log(f"task {tid}: {why} — the core has taken it up and is asked to stop")
@@ -5733,7 +5737,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         if woken:
             lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
-        if _ATTEMPTS is not None and task_attempts.answer_in_room_rule(broker_tid, task.get("room_question")):
+        # An answer is an irreversible room write: guest and plain team tiers may not make one.
+        may_answer = sender_tier == "owner" or (sender_tier == "team" and collaborator_enabled)
+        if (_ATTEMPTS is not None and may_answer
+                and task_attempts.answer_in_room_rule(broker_tid, task.get("room_question"))):
             with _ATTEMPTS.transition(broker_tid) as t:
                 lines.append(t.answer_rule(task.get("room_question")))
     # A relay-stamped Signal task may attach from ITS OWN output directory only;

@@ -51,6 +51,8 @@ TERMINAL_PHASES = frozenset({"responded", "suppressed", "consolidated", "complet
 TERMINAL_STATUSES = frozenset({"done", "no_action", "consolidated", "failed", "cancelled"})
 TERMINAL_INTENT_STATUSES = frozenset({"done", "no_action"})
 ASYNC_STATUSES = frozenset({"accepted", "running"})
+# The only outcome that proves an answer was not applied; any other non-success leaves it unknown.
+ANSWER_FAILED_STATUSES = frozenset({"failed"})
 SUSPENDED_PHASES = frozenset({"waiting_input", "input_ready"})
 
 _ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -347,7 +349,7 @@ def answered_in_journal(state_dir: Path, task_id: str) -> "bool | None":
     """Whether any turn of this task already answered a room question: a room.question.answer intent
     the proxy tagged with this task whose outcome succeeded. Durable before the result is decided.
     None when that cannot be told: a journal that cannot be read, a damaged line naming the task, or
-    an answer sent with no outcome yet."""
+    an answer sent with no outcome, or with one other than succeeded or failed."""
     path = room_actions_path(state_dir)
     ops, ok, failed = set(), set(), set()
     for p in (path.with_name(path.name + ".1"), path):
@@ -367,17 +369,21 @@ def answered_in_journal(state_dir: Path, task_id: str) -> "bool | None":
             except ValueError:
                 rec = None
             if not isinstance(rec, dict):
+                if task_id in line:
+                    return None                 # even an append in progress may be this task's answer
                 if p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S:
                     continue                    # an append in progress
-                if task_id in line:
-                    return None
                 continue
             if rec.get("task_id") != task_id:
                 continue
             if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
                 ops.add(rec.get("operation_id"))
             elif rec.get("record_type") == OUTCOME:
-                (ok if rec.get("operation_status") == "succeeded" else failed).add(rec.get("operation_id"))
+                status = rec.get("operation_status")
+                if status == "succeeded":
+                    ok.add(rec.get("operation_id"))
+                elif status in ANSWER_FAILED_STATUSES:
+                    failed.add(rec.get("operation_id"))
     if ops & ok:
         return True
     return None if ops - failed else False

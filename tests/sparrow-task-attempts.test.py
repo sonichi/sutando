@@ -825,13 +825,71 @@ class AnsweredOnce(unittest.TestCase):
         call(a, "tsk_A", "result_decision", "[no-send]", True)
         self.assertEqual(a._read()["questions"]["rq_1"], "junk", "a damaged entry is never overwritten")
 
-    def test_the_questions_record_is_bounded(self):
+    def test_an_answer_that_cannot_be_told_at_the_settle_withholds_the_question_for_good(self):
         a = self.mk(turn_context=True)
-        with unittest.mock.patch.object(task_attempts, "QUESTIONS_KEPT", 3):
-            for i in range(5):
+        self.served(a, "tsk_U")
+        self.assertIn(self.RULE, call(a, "tsk_U", "answer_rule", self.Q))
+        self.turn(a, "tsk_U")
+        with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=None):
+            call(a, "tsk_U", "finish")
+        self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"})
+        agent_turn.room_actions_path(self.state).unlink(missing_ok=True)     # the journal rotated away
+        self.served(a, "tsk_V")
+        self.assertEqual(call(a, "tsk_V", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+
+    def test_an_answer_sent_with_no_definite_outcome_is_recorded_unknown_at_the_decision(self):
+        for status in ("dispatched_unknown", "accepted", None):
+            with self.subTest(status=status):
+                a = self.mk(turn_context=True)
+                tid, q = f"tsk_N{status}", {"question_id": f"rq_{status}"}
+                self.served(a, tid)
+                call(a, tid, "answer_rule", q)
+                turn = self.turn(a, tid)
+                with open(agent_turn.room_actions_path(self.state), "a") as fh:
+                    fh.write(json.dumps({"record_type": "dispatch_intent", "turn_id": turn, "task_id": tid, "seq": 1,
+                                         "ts": 2e9, "operation_id": f"op_{tid}", "action": "room.question.answer"}) + "\n")
+                    if status:
+                        fh.write(json.dumps({"record_type": "dispatch_outcome", "turn_id": turn, "task_id": tid,
+                                             "seq": 1, "ts": 2e9, "operation_id": f"op_{tid}",
+                                             "operation_status": status}) + "\n")
+                call(a, tid, "result_decision", "[no-send] answered", True)
+                self.assertEqual(a._read()["questions"][f"rq_{status}"], {"answered": "unknown"})
+
+    def test_a_question_entry_or_the_records_it_names_not_as_written_refuse_the_offer(self):
+        bad = ({"offers": "tsk_A"}, {"offers": [7]}, {"offers": ["bad id"]}, {"offers": ["tsk_X"]},
+               {"answered": "yes"}, {"answered": True, "extra": 1}, ["x"])
+        for entry in bad:
+            with self.subTest(entry=entry):
+                a = self.mk(turn_context=True)
+                self.served(a, "tsk_B")
+
+                def damage(data):
+                    data["questions"] = {"rq_1": entry}
+                    data.setdefault("tasks", {})["tsk_X"] = "not a record"
+                a._commit(damage, why="test")
+                self.assertEqual(call(a, "tsk_B", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+                self.assertEqual(a._read()["questions"]["rq_1"], entry, "nothing recorded over it")
+
+    def test_open_offers_are_bounded_and_never_evict_an_answer(self):
+        a = self.mk(turn_context=True)
+        with unittest.mock.patch.object(task_attempts, "QUESTIONS_KEPT", 2), \
+                unittest.mock.patch.object(task_attempts, "ANSWERED_KEPT", 2):
+            self.served(a, "tsk_ans")
+            call(a, "tsk_ans", "answer_rule", {"question_id": "q_ans"})
+            self.answer_in_journal(self.turn(a, "tsk_ans"), "tsk_ans")
+            call(a, "tsk_ans", "finish")
+            for i in range(2):
                 self.served(a, f"tsk_{i}")
-                call(a, f"tsk_{i}", "answer_rule", {"question_id": f"q{i}"})
-        self.assertEqual(list(a._read()["questions"]), ["q2", "q3", "q4"], "the oldest are forgotten first")
+                self.assertIn(self.RULE, call(a, f"tsk_{i}", "answer_rule", {"question_id": f"q{i}"}))
+            self.served(a, "tsk_2")
+            self.assertEqual(call(a, "tsk_2", "answer_rule", {"question_id": "q2"}), task_attempts.ANSWER_UNRECORDED_NOTE,
+                             "both open offers are on tasks still open: no room, so it is withheld")
+            call(a, "tsk_0", "finish")
+            self.assertIn(self.RULE, call(a, "tsk_2", "answer_rule", {"question_id": "q2"}))
+            self.assertEqual(list(a._read()["questions"]), ["q_ans", "q1", "q2"], "the oldest finished offer goes")
+            self.served(a, "tsk_9")
+            self.assertEqual(call(a, "tsk_9", "answer_rule", {"question_id": "q_ans"}), task_attempts.ANSWERED_HERE_NOTE)
+            self.assertEqual(a._read()["questions"]["q_ans"], {"answered": True}, "a small tombstone")
 
 
 class FailurePaths(unittest.TestCase):
