@@ -116,15 +116,6 @@ class Writer(unittest.TestCase):
         self.assertEqual(len(live), 25)
         self.assertEqual(sum(1 for l in live + arch if json.loads(l).get("done")), 8, "every done row survived")
 
-    def test_default_room_is_the_owners_latest_ag2space_room(self):
-        st = self.ws / "state"
-        st.mkdir()
-        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
-        self.assertEqual(card.default_room(self.ws), "!dm:s")
-        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "discord", "channel_id": "123"}))
-        self.assertIsNone(card.default_room(self.ws))
-        (st / "last-owner-activity.json").unlink()
-        self.assertIsNone(card.default_room(self.ws))
 
 
 class TaskFile(unittest.TestCase):
@@ -212,12 +203,31 @@ class WriterCli(unittest.TestCase):
             card.main(["append", "x", "--kind", "wedge", "--room", "!r:s", "--workspace", str(self.ws)])
         self.assertFalse(card.log_path(self.ws).exists())
 
-    def test_a_non_wedge_row_still_falls_back_to_the_default_room(self):
+    def test_taskless_append_never_borrows_the_owners_last_room(self):
         st = self.ws / "state"
         st.mkdir(parents=True, exist_ok=True)
         (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
-        self.assertEqual(self.run_main("append", "CI green")[1]["room"], "!dm:s")
-        self.assertNotIn("room", self.run_main("append", "blocked", "--kind", "wedge")[1])
+        for kind in ("processing", "thinking", "working", "notice", "wedge"):
+            with self.subTest(kind=kind):
+                rc, rec = self.run_main("append", "background health check", "--kind", kind)
+                self.assertEqual(rc, 0)
+                self.assertIsNone(rec.get("room"))
+                stored = json.loads(card.log_path(self.ws).read_text().splitlines()[-1])
+                self.assertNotIn("room", stored)
+        self.assertEqual(self.run_main("append", "explicit", "--room", "!explicit:s")[1]["room"], "!explicit:s")
+
+    def test_task_file_room_and_explicit_override_are_preserved(self):
+        st = self.ws / "state"
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
+        p = self.ws / "t.txt"
+        p.write_text("id: task-file\nchannel_id: !task:s\ntask: hello\n")
+        self.assertEqual(self.run_main("append", "working", "--task-file", str(p))[1]["room"], "!task:s")
+        self.assertEqual(self.run_main("append", "working", "--task-file", str(p),
+                                       "--room", "!explicit:s")[1]["room"], "!explicit:s")
+        p.write_text("id: task-file\ntask: background\n")
+        self.assertNotIn("room", self.run_main("append", "working", "--task-file", str(p))[1])
+        self.assertNotIn("room", self.run_main("done", "finished", "--task-file", str(p))[1])
 
     def test_task_file_plus_task_id_override(self):
         p = self.ws / "t.txt"
