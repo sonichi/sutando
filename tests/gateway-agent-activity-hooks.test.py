@@ -152,17 +152,19 @@ class Hooks(unittest.TestCase):
         self.assertIsNotNone(gw._write_task(_task("task-rq3")))
         self.assertNotIn("room question", (gw.TASKS_DIR / "task-rq3.txt").read_text())
 
-    def test_only_owner_and_collaborator_tasks_get_the_answer_rule(self):
+    def test_only_owner_tasks_get_the_answer_rule(self):
         q = {"question_id": "rq_tier", "expected_revision": 1, "prompt": "Blue?"}
         for tid, extra, rule in (("task-rq-owner", {}, True),
                                  ("task-rq-guest", {"user_id": "@g:x", "access_tier": "guest"}, False),
                                  ("task-rq-team", {"user_id": "@t:x", "access_tier": "team"}, False),
-                                 ("task-rq-collab", {"user_id": "@t:x", "access_tier": "team", "collaborator": True}, True)):
+                                 ("task-rq-collab", {"user_id": "@t:x", "access_tier": "team", "collaborator": True}, False)):
             with self.subTest(tid=tid):
                 self.assertIsNotNone(gw._write_task(_task(tid, room_question={**q, "question_id": f"rq_{tid}"}, **extra)))
                 text = (gw.TASKS_DIR / f"{tid}.txt").read_text()
                 self.assertIn("[AG2 Space room question data", text)
                 self.assertEqual("`room.question.answer`" in text, rule)
+                self.assertFalse(not rule and "room.question.answer" in text,
+                                 "nothing in a non-owner task asks for the irreversible write its rulebook forbids")
                 self.assertEqual(f"rq_{tid}" in (ledger().get("questions") or {}), rule, "no offer without the rule")
 
     def test_a_secret_anywhere_in_a_room_question_never_reaches_the_task_file(self):
@@ -213,7 +215,7 @@ class Hooks(unittest.TestCase):
         q = {"question_id": "rq_twice", "expected_revision": 1, "prompt": "Blue?", "can_answer": True}
         gw._write_task(_task("task-rq-t1", room_question=q))
         self.assertIn("`room.question.answer`", (gw.TASKS_DIR / "task-rq-t1.txt").read_text())
-        gw._ATTEMPTS._commit(lambda d: d["questions"]["rq_twice"].__setitem__("answered", True), why="answered")
+        gw._ATTEMPTS._commit(lambda d: d["questions"].__setitem__("rq_twice", {"answered": True}), why="answered")
         gw._write_task(_task("task-rq-t2", room_question=q))
         text = (gw.TASKS_DIR / "task-rq-t2.txt").read_text()
         self.assertIn("[AG2 Space room question data", text)

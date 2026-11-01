@@ -357,18 +357,16 @@ def _journal_signature(path: Path):
 
 
 def _journal_snapshot(path: Path) -> "list | None":
-    """(file, text, age) for the rotated and the live journal, read while neither changed; None when
-    a file cannot be read or no read was stable: a rotation mid-read must not lose an answer."""
+    """Every text read of the rotated and the live journal, once a read held still; None when a file
+    cannot be read or no read did. Earlier reads are kept: a rotation may drop what one of them saw."""
     rotated = path.with_name(path.name + ".1")
+    texts: list = []
     for _ in range(JOURNAL_SNAPSHOT_TRIES):
         try:
             before = [_journal_signature(p) for p in (rotated, path)]
-            out = []
-            for p, sig in zip((rotated, path), before):
-                if sig is not None:
-                    out.append((p, p.read_text(), time.time() - sig[2] / 1e9))
+            texts += [p.read_text() for p, sig in zip((rotated, path), before) if sig is not None]
             if [_journal_signature(p) for p in (rotated, path)] == before:
-                return out
+                return texts
         except FileNotFoundError:
             continue                            # rotated away between the look and the read
         except OSError:
@@ -376,11 +374,18 @@ def _journal_snapshot(path: Path) -> "list | None":
     return None
 
 
+CONFLICTING = "<conflicting question ids>"
+
+
 def answer_question_id(intent: dict):
-    """The question an answer intent names: top-level or in its arguments; None when it names none."""
+    """The question an answer intent names, top-level or in its arguments; None when it names none;
+    CONFLICTING when the two disagree (it may be either)."""
     args = intent.get("arguments")
-    qid = intent.get("question_id", args.get("question_id") if isinstance(args, dict) else None)
-    return qid if isinstance(qid, str) and qid else None
+    named = {q for q in (intent.get("question_id"), args.get("question_id") if type(args) is dict else None)
+             if type(q) is str and q}
+    if len(named) > 1:
+        return CONFLICTING
+    return next(iter(named), None)
 
 
 def answered_in_journal(state_dir: Path, task_id: str, question_id: str) -> "bool | None":
@@ -394,7 +399,7 @@ def answered_in_journal(state_dir: Path, task_id: str, question_id: str) -> "boo
     if snapshot is None:
         return None
     ops, unnamed, ok, failed = set(), set(), set(), set()
-    for _p, text, _age in snapshot:
+    for text in snapshot:
         lines = text.split("\n")
         for i, line in enumerate(lines):
             if not line.strip():
@@ -409,18 +414,21 @@ def answered_in_journal(state_dir: Path, task_id: str, question_id: str) -> "boo
                 continue
             if rec.get("task_id") != task_id:
                 continue
+            op = rec.get("operation_id")
             if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
+                if type(op) is not str:
+                    return None                 # an answer this reader cannot follow to its outcome
                 named = answer_question_id(rec)
-                if named is None:
-                    unnamed.add(rec.get("operation_id"))
+                if named is None or named is CONFLICTING:
+                    unnamed.add(op)
                 elif named == question_id:
-                    ops.add(rec.get("operation_id"))
-            elif rec.get("record_type") == OUTCOME:
+                    ops.add(op)
+            elif rec.get("record_type") == OUTCOME and type(op) is str:
                 status = rec.get("operation_status")
                 if status == "succeeded":
-                    ok.add(rec.get("operation_id"))
-                elif status in ANSWER_FAILED_STATUSES:
-                    failed.add(rec.get("operation_id"))
+                    ok.add(op)
+                elif type(status) is str and status in ANSWER_FAILED_STATUSES:
+                    failed.add(op)
     if ops & ok:
         return True
     return None if (ops | unnamed) - failed else False

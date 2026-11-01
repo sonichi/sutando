@@ -5768,9 +5768,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         if woken:
             lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
-        # An answer is an irreversible room write: guest and plain team tiers may not make one.
-        may_answer = sender_tier == "owner" or (sender_tier == "team" and collaborator_enabled)
-        if (_ATTEMPTS is not None and may_answer
+        # An answer is an irreversible room write, which every non-owner rulebook forbids.
+        if (_ATTEMPTS is not None and sender_tier == "owner"
                 and task_attempts.answer_in_room_rule(broker_tid, task.get("room_question"))):
             with _ATTEMPTS.transition(broker_tid) as t:
                 lines.append(t.answer_rule(task.get("room_question")))

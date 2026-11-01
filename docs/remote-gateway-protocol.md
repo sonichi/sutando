@@ -516,24 +516,32 @@ solely from the prompt, options and constraints it returns (with its `expected_r
 with `room.question.answer` through `room.action.execute_safe`, then write a `[no-send]` one-line
 result. Locally only `can_answer: false` withholds the rule; `target_members` and `expires_at` are
 left to the broker, which refuses an answer it does not permit. The rule, and the offer it records,
-go only to owner tasks and broker-attested collaborator tasks: an answer is an irreversible room
-write, which the guest and plain team tiers may not make. Those still get the data line.
+go only to owner tasks: an answer is an irreversible room write, which the guest, team and
+collaborator rulebooks all forbid. Those tasks still get the data line.
 
-An answer cannot be undone, so the rule is given only when the offer is recorded in the attempt
-ledger (`questions`, by question id) and nothing says the question was answered or may be. Evidence
-is a `room.question.answer` intent in the journal naming this task and this question (`question_id`
-at top level or in its arguments). A succeeded one means answered; only a `failed` outcome means
-not answered. Any other outcome, none yet, an answer naming no question, a damaged line naming the
-task, or a journal that cannot be read or did not hold still while read, means it cannot be told.
-- Answered here: a note not to answer again, recorded as `answered: true` as soon as it is seen.
-- Offered to another task still open: a note that it is being answered elsewhere.
-- Cannot be told, or recorded `answered: "unknown"`: a note to leave it unanswered.
+An answer cannot be undone, so the attempt ledger's `questions` map, by question id, decides who
+may answer. Each entry is exactly one of three shapes, and any entry that is not refuses every offer:
+- free `{}`: offered before, nobody holds it now;
+- held `{"holder": <task id>}`: one task may answer it;
+- closed `{"answered": true}` or `{"answered": "unknown"}`: answered, or it cannot be told; never
+  offered again.
 
-Every settle (a fenced or closed one included) records what the task's journal says: true,
-`"unknown"` (sticky; it can only become true), or that this offer settled unanswered. Entries are
-forgotten only when that can never cause a second answer: the question expired a day ago, or every
-task it was offered to settled unanswered. With none safe to forget past 2,000 entries, a new offer
-is withheld.
+Evidence is a `room.question.answer` intent in the journal naming this task and this question
+(`question_id` at top level or in its arguments; both present and different means either), joined
+to its outcome by `operation_id`. Succeeded means answered; only `failed` means not. Any other
+outcome, none yet, an answer naming no question, a damaged line naming the task, or a journal that
+did not hold still while read, means it cannot be told; what an earlier read saw is kept across
+re-reads.
+- Free, or held by this task with no answer in its journal: it is held by this task, and the rule given.
+- Answered: a note not to answer again; the entry is closed as soon as the answer is seen.
+- Held by another open task: a note that it is being answered elsewhere.
+- Closed unknown, or it cannot be told: a note to leave it unanswered.
+
+The settle fences the task's turn first, then reads the journal, so no answer of that turn can land
+after the read; a turn that cannot be fenced counts as cannot be told. It then closes the entry
+(true or unknown) or frees it. Only an offer creates an entry, within 2,000; free and expired
+(a day past `expires_at`) entries are forgotten first, and with none, the new offer is withheld. A
+settle whose entry was forgotten as expired writes nothing.
 
 A task the broker closed is withdrawn from the inbox if the core has not taken it. Once taken, and
 offered a question, its journal decides: answered, the answer is recorded and no stop is sent;

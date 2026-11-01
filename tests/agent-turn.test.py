@@ -411,6 +411,38 @@ class AnsweredInJournal(unittest.TestCase):
         with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
             self.assertIsNone(at.answered_in_journal(self.state, "tsk_R", "rq"), "never still: cannot be told")
 
+    def test_an_answer_seen_in_the_rotated_file_survives_a_rotation_that_drops_it(self):
+        self.answer("tsk_K", "k1", "succeeded")
+        live = at.room_actions_path(self.state)
+        os.replace(live, live.with_name(live.name + ".1"))     # the answer is in .1
+        live.write_text("")
+        real, done = Path.read_text, []
+
+        def rotating(path, *a, **k):
+            out = real(path, *a, **k)
+            if path == live and not done:              # after .1 was read: rotate again, dropping it
+                done.append(1)
+                os.replace(live, live.with_name(live.name + ".1"))
+                live.write_text("")
+            return out
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
+            self.assertIs(at.answered_in_journal(self.state, "tsk_K", "rq"), True, "what an earlier read saw is kept")
+
+    def test_disagreeing_question_ids_or_odd_shapes_read_as_unknown_never_raise(self):
+        _journal(self.state, {"record_type": at.INTENT, "task_id": "tsk_D", "operation_id": "d1",
+                              "action": "room.question.answer", "question_id": "rq",
+                              "arguments": {"question_id": "rq_other"}},
+                 {"record_type": at.OUTCOME, "task_id": "tsk_D", "operation_id": "d1", "operation_status": "succeeded"})
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_D", "rq"), "it may have answered either")
+        self.assertIs(at.answer_question_id({"question_id": "rq", "arguments": {"question_id": "rq"}}), "rq")
+        for i, (op, status) in enumerate((("e1", ["failed"]), ("e2", {"s": 1}), (["e3"], "failed"), ({"x": 1}, "succeeded"))):
+            with self.subTest(op=op, status=status):
+                tid = f"tsk_E{i}"
+                _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": op,
+                                      "action": "room.question.answer", "question_id": "rq"},
+                         {"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
+                self.assertIsNone(at.answered_in_journal(self.state, tid, "rq"))
+
     def test_only_a_definite_failure_reads_as_not_answered(self):
         for i, status in enumerate(("dispatched_unknown", "accepted", "running", "timeout", "", None, 7)):
             with self.subTest(status=status):

@@ -124,15 +124,14 @@ ANSWERING_ELSEWHERE_NOTE = (
     "The room question quoted above was offered to another task of this agent that is still open; "
     "do not answer it here. Write this task's result file as `[no-send]` with a one-line note that "
     "it is being answered elsewhere.")
-# Entries are forgotten only when safe (_safe_to_forget); with none safe, a new offer is withheld.
+# Only offer() creates an entry, and only within QUESTIONS_KEPT; a settle edits an existing one.
 QUESTIONS_KEPT = 2000
 QUESTION_EXPIRY_GRACE_S = 86400.0
-ANSWER_OFFERS_PER_Q = 8
 ANSWERED_UNKNOWN = "unknown"
 _QUESTION_KEYS = ("question_id", "expected_revision", "prompt", "options", "allow_free_text",
                   "response_mode", "target_members", "expires_at")
 _QUESTION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
-_OFFER_ID_RE = re.compile(r"[A-Za-z0-9._~:-]{1,160}")
+_HOLDER_ID_RE = re.compile(r"[A-Za-z0-9._~:-]{1,160}")
 QUESTION_DATA_MAX = 2000
 
 FORMAT = 3
@@ -1082,47 +1081,44 @@ class Transition:
         return agent_turn.result_file_decision(records, body, no_send=no_send, task_id=self.wire)
 
     def answer_rule(self, question) -> "str | None":
-        """The answer rule for a room question not answered here, the already-answered note for one
-        that was, the withheld note when that cannot be told or the offer cannot be recorded; None
-        when this agent may not answer. Decided and recorded in one ledger write: a crash, a
-        redelivery or another task carrying the same question sees the offer."""
+        """The answer rule for a room question nobody answered and nobody else holds, the
+        already-answered note, the elsewhere note while another open task holds it, or the withheld
+        note when that cannot be told or recorded; None when this agent may not answer. Decided and
+        recorded in one ledger write: a crash, a redelivery or another task sees the hold."""
         rule = answer_in_room_rule(self.wire, question)
         if not rule:
             return None
         qid, verdict = _question_id(question), []
+        state_dir = self.owner.state_dir
 
         def offer(data, rec):
-            questions, q = _question_entry(data, qid)
-            offers = q.get("offers", [])
-            if q.get("answered") == ANSWERED_UNKNOWN:
-                raise _Refused
-            seen = [] if q.get("answered") is True else [
-                agent_turn.answered_in_journal(self.owner.state_dir, t, qid) for t in offers]
-            if q.get("answered") is True or True in seen:
-                _mark_answer(data, qid, self.wire, True)    # seen once, recorded for good
+            questions = _questions(data)
+            q = questions.get(qid, {})
+            if q.get("answered") is True:
                 verdict.append("answered")
                 return rec
-            if None in seen:
-                raise _Refused
-            tasks = data.get("tasks") or {}
-            if any(t != self.wire and isinstance(tasks.get(t), dict) and not tasks[t].get("finished")
-                   for t in offers):
-                verdict.append("elsewhere")          # its answer may still come: never two answers
-                return rec
-            settled = [t for t in q.get("settled", []) if t != self.wire]
-            kept = [t for t in offers if t != self.wire] + [self.wire]
-            while len(kept) > ANSWER_OFFERS_PER_Q and kept[0] in settled:
-                settled.remove(kept.pop(0))          # only an offer whose journal said no is dropped
-            if len(kept) > ANSWER_OFFERS_PER_Q:
-                raise _Refused
-            q.update(offers=kept, settled=settled)
-            if not settled:
-                q.pop("settled")
-            if _expiry(question) is not None:
-                q["expires"] = _expiry(question)
+            if "answered" in q:
+                raise _Refused                  # it cannot be told whether it was answered
+            holder = q.get("holder")
+            if holder is not None:
+                seen = agent_turn.answered_in_journal(state_dir, holder, qid)
+                if seen is True:
+                    _close_or_free(data, qid, holder, True)      # seen once, recorded for good
+                    verdict.append("answered")
+                    return rec
+                if seen is None:
+                    raise _Refused
+                held = (data.get("tasks") or {}).get(holder)
+                if holder != self.wire and type(held) is dict and not held.get("finished"):
+                    verdict.append("elsewhere")  # its answer may still come: never two answers
+                    return rec
+                if holder != self.wire:
+                    raise _Refused               # a holder gone without its settle: cannot be told
+            if qid not in questions:
+                _make_room(questions, self.now())
+            expires = _expiry(question)
             questions.pop(qid, None)
-            questions[qid] = q
-            _bound_questions(questions, self.now())
+            questions[qid] = {"holder": self.wire, **({"expires": expires} if expires is not None else {})}
             verdict.append("offered")
             return {**rec, "answer_offered": qid} if isinstance(rec, dict) else rec
         saved, _ = self._change(offer, f"the offer of question {qid}")
@@ -1138,7 +1134,7 @@ class Transition:
 
         def edit(data, rec):
             if qid:
-                _mark_answer(data, qid, self.wire, True)
+                _close_or_free(data, qid, self.wire, True)
             return {**(rec or {}), **fields}
         return self._change(edit, f"the answer to question {qid}")[0]
 
@@ -1149,27 +1145,28 @@ class Transition:
         return agent_turn.answered_in_journal(self.owner.state_dir, self.wire, qid) if qid else False
 
     def _note_answered(self, rec, records) -> None:
-        """A question this task was offered and answered (a succeeded room.question.answer) is
-        recorded as answered, by question id, before the result is decided; one sent with no
-        definite outcome, or naming no question, is recorded as unknown, which withholds it from
-        every later task. An answer to another question is not this one's."""
+        """The offered question is closed before the result is decided when this turn answered it
+        (a succeeded room.question.answer naming it), or sent an answer that may be its own with no
+        definite outcome. An answer to another question is not this one's."""
         qid = rec.get("answer_offered")
-        status = {o.get("operation_id"): o.get("operation_status") for o in records.outcomes}
-        mine, unnamed = [], []
-        for i in records.intents:
-            if i.get("action") == "room.question.answer":
-                named = agent_turn.answer_question_id(i)
-                (mine if named == qid else unnamed if named is None else []).append(status.get(i.get("operation_id")))
         if not qid:
             return
-        if "succeeded" in mine:
-            mark = True
-        elif any(s not in agent_turn.ANSWER_FAILED_STATUSES for s in mine + unnamed):
-            mark = None
-        else:
-            return
-        self.owner._commit(lambda data: _mark_answer(data, qid, self.wire, mark),
-                           why=f"the answer to question {qid}")
+        status = {o.get("operation_id"): o.get("operation_status") for o in records.outcomes
+                  if type(o.get("operation_id")) is str}
+        mine, maybe = False, False
+        for i in records.intents:
+            if i.get("action") != "room.question.answer":
+                continue
+            named, op = agent_turn.answer_question_id(i), i.get("operation_id")
+            st = status.get(op) if type(op) is str else None
+            if named == qid and st == "succeeded":
+                mine = True
+            elif (named == qid or named is None or named is agent_turn.CONFLICTING) and not (
+                    type(st) is str and st in agent_turn.ANSWER_FAILED_STATUSES):
+                maybe = True
+        if mine or maybe:
+            self.owner._commit(lambda data: _close_or_free(data, qid, self.wire, True if mine else None),
+                               why=f"the answer to question {qid}")
 
     def finish(self, c: "Claim | None" = None, delivered: "bool | None" = None) -> bool:
         """The result claimed by `c` is settled: close the attempt's turn and forget the attempt. A
@@ -1194,15 +1191,22 @@ class Transition:
             self.log(f"task {self.wire}: settled, but {', '.join(waiting)} is still open — attempt kept")
             return False
 
-        answered = self.answered_here() if (rec or {}).get("answer_offered") else False
+        answered = False
+        if rec.get("answer_offered"):
+            # Fenced first, so no answer of this turn can land after the read below.
+            try:
+                fenced = not rec.get("turn_id") or agent_turn.close_turn(self.owner.state_dir, rec["turn_id"])
+            except (OSError, ValueError):
+                fenced = False
+            answered = self.answered_here() if fenced else None
 
         def edit(data, r):
             if r and r.get("answer_offered"):
                 # Every settle, a fenced one included, records what its journal says of the answer.
                 try:
-                    _mark_answer(data, r["answer_offered"], self.wire, answered)
+                    _close_or_free(data, r["answer_offered"], self.wire, answered)
                 except _Refused:
-                    pass                        # a damaged entry withholds every later offer anyway
+                    pass                        # a damaged map withholds every later offer anyway
             run = ((data.get("runs") or {}).get((r or {}).get("run")) if r else None)
             if isinstance(run, dict):
                 # What a later serve is judged against once the record is gone.
@@ -1389,35 +1393,45 @@ def ask_in_room_rule(task_id: str) -> str:
     return ASK_IN_ROOM_RULE.format(task_id=task_id)
 
 
-def _question_entry(data, qid: str) -> "tuple[dict, dict]":
-    """(questions map, a copy of qid's entry) from a ledger snapshot; _Refused when the map, the entry,
-    its offers or a record they name is not what this writer wrote."""
+def _questions(data) -> dict:
+    """The questions map, every entry checked; _Refused, before anything changes, when any entry is
+    not exactly one of the three shapes this writer makes:
+      free    {}                                   offered before, nobody holds it now
+      held    {"holder": <task id>}                one task may answer it
+      closed  {"answered": true | "unknown"}       answered, or it cannot be told: never again
+    each optionally with "expires" (epoch seconds)."""
     questions = data.setdefault("questions", {})
     tasks = data.get("tasks") or {}
-    if not isinstance(questions, dict) or not isinstance(tasks, dict):
+    if type(questions) is not dict or type(tasks) is not dict:
         raise _Refused
-    q = questions.get(qid, {})
-    if not isinstance(q, dict) or set(q) - {"offers", "answered", "settled", "expires"}:
+    for q in questions.values():
+        _state(q, tasks)
+    return questions
+
+
+def _state(q, tasks: dict) -> str:
+    if type(q) is not dict or set(q) - {"holder", "answered", "expires"} or {"holder", "answered"} <= set(q):
         raise _Refused
-    offers, settled = q.get("offers", []), q.get("settled", [])
-    if not isinstance(offers, list) or not isinstance(settled, list):
+    if "expires" in q and type(q["expires"]) not in (int, float):
         raise _Refused
-    if not all(isinstance(t, str) and _OFFER_ID_RE.fullmatch(t) and isinstance(tasks.get(t, {}), dict)
-               for t in offers) or not all(isinstance(t, str) and t in offers for t in settled):
-        raise _Refused
-    if q.get("answered", False) not in (True, False, ANSWERED_UNKNOWN):
-        raise _Refused
-    if "expires" in q and (not isinstance(q["expires"], (int, float)) or isinstance(q["expires"], bool)):
-        raise _Refused
-    return questions, dict(q)
+    if "answered" in q:
+        if q["answered"] is not True and not (type(q["answered"]) is str and q["answered"] == ANSWERED_UNKNOWN):
+            raise _Refused
+        return "closed"
+    if "holder" in q:
+        h = q["holder"]
+        if type(h) is not str or not _HOLDER_ID_RE.fullmatch(h) or type(tasks.get(h, {})) is not dict:
+            raise _Refused
+        return "held"
+    return "free"
 
 
 def _expiry(question) -> "float | None":
     """The question's `expires_at` as epoch seconds; None when absent or unreadable."""
     v = question.get("expires_at") if isinstance(question, dict) else None
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
+    if type(v) in (int, float):
         return float(v)
-    if isinstance(v, str):
+    if type(v) is str:
         try:
             return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
         except ValueError:
@@ -1425,40 +1439,35 @@ def _expiry(question) -> "float | None":
     return None
 
 
-def _safe_to_forget(q, now: float) -> bool:
-    """Forgetting it can never lead to a second answer: the broker no longer takes one, or every
-    task it was offered to finished and its journal said it did not answer."""
-    if not isinstance(q, dict):
-        return False
+def _forgettable(q: dict, now: float) -> bool:
+    """Forgetting it can never lead to a second answer: nobody holds it and nobody answered it, or
+    it expired (the broker takes no answer then)."""
     expires = q.get("expires")
-    if isinstance(expires, (int, float)) and now > expires + QUESTION_EXPIRY_GRACE_S:
-        return True
-    return q.get("answered", False) is False and set(q.get("offers") or []) <= set(q.get("settled") or [])
+    return (expires is not None and now > expires + QUESTION_EXPIRY_GRACE_S) or not set(q) - {"expires"}
 
 
-def _bound_questions(questions: dict, now: float) -> None:
-    """Past QUESTIONS_KEPT, forget the oldest entries that are safe to forget; with none left, the
-    new offer is refused and nothing changes."""
-    for k in [k for k, q in questions.items() if _safe_to_forget(q, now)]:
-        if len(questions) <= QUESTIONS_KEPT:
-            return
-        questions.pop(k)
-    if len(questions) > QUESTIONS_KEPT:
+def _make_room(questions: dict, now: float) -> None:
+    """Room for one new entry: the oldest forgettable ones go; with none, _Refused and nothing changes."""
+    excess = len(questions) + 1 - QUESTIONS_KEPT
+    victims = [k for k, q in questions.items() if _forgettable(q, now)][:max(excess, 0)]
+    if len(victims) < excess:
         raise _Refused
+    for k in victims:
+        questions.pop(k)
 
 
-def _mark_answer(data, qid: str, wire: str, answered) -> None:
-    """Record what this task's journal says of its offered question: True and unknown are final
-    (unknown may still become True); False marks only this task's offer as settled."""
-    questions, q = _question_entry(data, qid)
-    if q.get("answered") is True:
+def _close_or_free(data, qid: str, wire: str, answered) -> None:
+    """Record what `wire`'s journal says of the question it held: True or None (cannot be told)
+    close it for good; False frees it. An entry no longer there was forgotten as expired: no write."""
+    questions = _questions(data)
+    q = questions.get(qid)
+    if q is None or q.get("answered") is True:
         return
+    keep = {"expires": q["expires"]} if "expires" in q else {}
     if answered is True or answered is None:
-        keep = {"expires": q["expires"]} if "expires" in q else {}
         questions[qid] = {"answered": True if answered else ANSWERED_UNKNOWN, **keep}
-    elif q.get("answered") != ANSWERED_UNKNOWN and wire in q.get("offers", []):
-        q["settled"] = sorted(set(q.get("settled", [])) | {wire})
-        questions[qid] = q
+    elif q.get("holder") == wire:
+        questions[qid] = keep
 
 
 def _question_id(question) -> "str | None":
