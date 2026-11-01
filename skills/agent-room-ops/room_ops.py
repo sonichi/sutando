@@ -171,7 +171,8 @@ def _run(argv):
 
     p = sub.add_parser("fetch", help="fetch a shared media ref -> local path")
     p.add_argument("ref")
-    p.add_argument("--room", dest="room_id", default=None)
+    p.add_argument("--room", dest="room_id", default=None,
+                   help="required for MXC refs; otherwise taken from the gateway link room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     p = sub.add_parser("send", help="upload a local file into a room")

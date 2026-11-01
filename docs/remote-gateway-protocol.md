@@ -623,6 +623,17 @@ Credential routing is by parsed exact origin, never string matching:
 Authenticated fetches refuse redirects (a 3xx is a failure), so a
 gateway-controlled URL can never bounce a bearer to another host.
 
+The local `room_ops.py fetch` fallback accepts `mxc://server/id` with an
+explicit `--room`, or a media link under the selected gateway's
+`/v1/media/server/id` path. For a link, its single `room_id` query parameter
+supplies the room when `--room` is absent; conflicting rooms are refused.
+The room is resolved before the client gate and connection selection. Links
+are normalized to MXC refs for `/v1/media/fetch`, with `room_id` sent separately.
+Only links matching that connection's origin and base path are accepted;
+credentials are sent to the configured gateway, never to the supplied link.
+Selecting a channel environment does not supply room context for a bare MXC
+ref: without `--room`, the client reports the missing argument before HTTP.
+
 Outbound `[file: …]` markers upload through `POST /v1/rooms/<room>/media`. A
 task the server marked with a `signal` object instead uploads against its own
 lease, `POST /v1/tasks/<id>/media` with `{ "ordinal": 0..9, "filename":
