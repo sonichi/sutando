@@ -136,6 +136,11 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # agent-api resolves the workspace and injects it into this read projection.
+    "src/activity_projection.py",
+    # Dedup recovery receives the adapter's task directory; its sibling state is
+    # part of that same workspace, including when this module is vendored.
+    "src/dedup_recovery.py",
     # task_lifecycle names tasks/, results/ and state/ under a caller-given work
     # dir and is vendored where src/ (the resolver) is not importable.
     "src/task_lifecycle.py",
