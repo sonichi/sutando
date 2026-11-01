@@ -450,6 +450,9 @@ PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
 STOP_INTERRUPT = _stop_interrupt_enabled()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
+from skill_config import enabled as _skill_enabled
+TASK_STEP_PUBLICATION_ENABLED = lambda: _skill_enabled(
+    "LEDGER_STEP_PUBLISH_ENABLED", _REPO / "skills" / "agent-activity" / "manifest.json")
 TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed

@@ -10,6 +10,8 @@ export const HEADER_KEYS: readonly string[] = [
 	'picker_args',
 	'access_tier',
 	'user_id',
+	'task_id',
+	'execution_generation',
 	'channel_id',
 	'priority',
 	'interaction_type',
