@@ -917,6 +917,36 @@ class AnsweredOnce(unittest.TestCase):
                 call(a, "tsk_old", "finish")
             self.assertEqual(list(a._read()["questions"]), ["q_new"], "no tombstone outside the bound")
 
+    def test_a_swept_attempt_frees_or_closes_the_question_it_held(self):
+        for answered, want in ((False, {}), (True, {"answered": True}), (None, {"answered": "unknown"})):
+            with self.subTest(answered=answered):
+                a = self.mk(turn_context=True)
+                tid, qid = f"tsk_S{answered}", f"rq_s_{answered}"
+                self.served(a, tid)
+                self.assertIn(self.RULE, call(a, tid, "answer_rule", {"question_id": qid}))
+                self.turn(a, tid)
+                put(a, tid, awaiting_ack=False, published_at=None)
+                with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=answered):
+                    a.sweep([])
+                self.assertIsNone(a.entry(tid), "the attempt is gone")
+                self.assertEqual(a._read()["questions"][qid], want)
+                if answered is False:
+                    self.served(a, "tsk_next")
+                    self.assertIn(self.RULE, call(a, "tsk_next", "answer_rule", {"question_id": qid}),
+                                  "freed: the next task may answer it")
+
+    def test_a_settle_whose_turn_cannot_be_fenced_yet_is_retried_not_closed(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_T")
+        call(a, "tsk_T", "answer_rule", self.Q)
+        self.turn(a, "tsk_T")
+        with unittest.mock.patch.object(agent_turn, "close_turn", return_value=False):
+            self.assertIs(call(a, "tsk_T", "finish"), False, "kept: the settle runs again next pass")
+        self.assertEqual(a._read()["questions"]["rq_1"], {"holder": "tsk_T"})
+        with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=False):
+            self.assertIs(call(a, "tsk_T", "finish"), True)
+        self.assertEqual(a._read()["questions"]["rq_1"], {})
+
     def test_the_settle_fences_the_turn_before_its_last_journal_read(self):
         a = self.mk(turn_context=True)
         self.served(a, "tsk_F")
@@ -932,10 +962,10 @@ class AnsweredOnce(unittest.TestCase):
         self.served(a, "tsk_G")
         call(a, "tsk_G", "answer_rule", {"question_id": "rq_g"})
         self.turn(a, "tsk_G")
-        with unittest.mock.patch.object(agent_turn, "close_turn", return_value=False):
-            call(a, "tsk_G", "finish")
-        self.assertEqual(a._read()["questions"]["rq_g"], {"answered": "unknown"},
-                         "a turn that could not be fenced may still answer: closed for good")
+        with unittest.mock.patch.object(agent_turn, "close_turn", side_effect=OSError("disk")):
+            self.assertIs(call(a, "tsk_G", "finish"), False)
+        self.assertEqual(a._read()["questions"]["rq_g"], {"holder": "tsk_G"},
+                         "a turn that could not be fenced may still answer: held, never freed")
 
     def test_an_expired_question_may_be_forgotten_even_when_answered(self):
         a = self.mk(turn_context=True)

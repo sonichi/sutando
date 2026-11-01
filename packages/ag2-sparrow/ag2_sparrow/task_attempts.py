@@ -24,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import tempfile
 import threading
 import time
@@ -561,7 +562,7 @@ class TaskAttempts:
         for wire_tid in [t for t in (data.get("tasks") or {}) if t not in live]:
             with self.transition(wire_tid) as t:
                 if isinstance(t.rec, dict) and not _owes(t.rec) and not t.rec.get("claims"):
-                    t.forget()
+                    t.retire_question_hold()
         return closed
 
 
@@ -1142,6 +1143,36 @@ class Transition:
             return {**(rec or {}), **fields}
         return self._change(edit, f"the answer to question {qid}")[0]
 
+    def _question_verdict(self, rec) -> "tuple[bool, bool | None]":
+        """(read, answered) for the question the attempt holds: its turn fenced first, so no answer of
+        it can land after the journal read. read is False while the fence cannot be had yet."""
+        if not rec.get("answer_offered"):
+            return True, False
+        turn = rec.get("turn_id")
+        try:
+            fenced = (not turn or agent_turn.is_closed(self.owner.state_dir, turn)
+                      or agent_turn.close_turn(self.owner.state_dir, turn))
+        except (OSError, ValueError):
+            fenced = False
+        return (True, self.answered_here()) if fenced else (False, None)
+
+    def retire_question_hold(self) -> bool:
+        """Drop the attempt, closing or freeing the question it holds as its journal says, in the
+        same write; kept while its turn cannot be fenced."""
+        rec = self.rec
+        read, answered = self._question_verdict(rec)
+        if not read:
+            return False
+
+        def edit(data, r):
+            if r and r.get("answer_offered"):
+                try:
+                    _close_or_free(data, r["answer_offered"], self.wire, answered)
+                except _Refused:
+                    pass                        # a damaged map withholds every later offer anyway
+            return None
+        return self._change(edit, "the retirement")[0]
+
     def answered_here(self):
         """Whether this task's offered room question was answered in its journal: True, False, or
         None when that cannot be told."""
@@ -1195,14 +1226,10 @@ class Transition:
             self.log(f"task {self.wire}: settled, but {', '.join(waiting)} is still open — attempt kept")
             return False
 
-        answered = False
-        if rec.get("answer_offered"):
-            # Fenced first, so no answer of this turn can land after the read below.
-            try:
-                fenced = not rec.get("turn_id") or agent_turn.close_turn(self.owner.state_dir, rec["turn_id"])
-            except (OSError, ValueError):
-                fenced = False
-            answered = self.answered_here() if fenced else None
+        read, answered = self._question_verdict(rec)
+        if not read:
+            self.log(f"task {self.wire}: its turn could not be fenced yet — attempt kept, settled next pass")
+            return False
 
         def edit(data, r):
             if r and r.get("answer_offered"):
@@ -1408,9 +1435,24 @@ def _questions(data) -> dict:
     tasks = data.get("tasks") or {}
     if type(questions) is not dict or type(tasks) is not dict:
         raise _Refused
-    for q in questions.values():
-        _state(q, tasks)
+    for k, q in questions.items():
+        try:
+            _state(q, tasks)
+        except _Refused:
+            _log_damaged(k)
+            raise
     return questions
+
+
+_damaged_logged: set = set()
+
+
+def _log_damaged(qid) -> None:
+    """Once per entry: one damaged entry withholds every question until it is mended."""
+    if qid not in _damaged_logged:
+        _damaged_logged.add(qid)
+        print(f"attempt ledger: question entry {qid!r} is not one of its three shapes — every "
+              "room question is withheld until it is mended", file=sys.stderr)
 
 
 def _state(q, tasks: dict) -> str:
