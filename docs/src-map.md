@@ -70,6 +70,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.
+- **`correlation_log.py`** — One writer for task-correlation records: <workspace>/state/correlation.jsonl.
 - **`crash-only.ts`** — crash-only.ts — voice-agent fatal-path helpers (design 1d; impl plan WS1 Steps 1–2, amendments R1/R2).
 - **`credential-resolver.ts`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).

@@ -333,6 +333,26 @@ class Interactions(unittest.TestCase):
         rows = [json.loads(x) for x in self.led.read_text().splitlines()]
         self.assertEqual({row["interaction_id"] for row in rows}, set(ids), "the asks ledger carries it too")
 
+    def test_a_task_that_is_not_a_task_id_is_refused_before_anything_is_sent(self):
+        for bad in ("@chi:s.space", "!room:s.space", "Chi Wang"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self._run(["--reviewers", "rui,mark", "--send", "--task", bad,
+                                            "--message", "review https://github.com/o/r/pull/7"]), 7)
+            self.assertIn("is not a task id", err.getvalue())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self._records(), [])
+
+    def test_an_ask_without_a_task_says_so_and_records_no_task(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.dict(os.environ, {"SUTANDO_TASK_ID": "task-from-env"}):
+            self.assertEqual(self._run(["--reviewers", "rui,mark", "--send",
+                                        "--message", "review https://github.com/o/r/pull/7"]), 0)
+        self.assertIn("no --task", err.getvalue())
+        recs = self._records()
+        self.assertEqual(len(recs), 2)
+        self.assertTrue(all("task_id" not in r for r in recs), "the link is explicit; the env is not read")
+
     def test_a_notice_carries_no_id_and_records_nothing(self):
         self.assertEqual(self._run(["--reviewers", "rui,mark", "--send", "--kind", "notice",
                                     "--message", "fyi https://github.com/o/r/pull/7"]), 0)

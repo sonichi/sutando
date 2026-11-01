@@ -52,8 +52,18 @@ class Writer(unittest.TestCase):
             ("nope", GOOD, "unknown kind"),
             ("interaction", dict(GOOD, name="Chi"), "unknown fields"),
             ("interaction", {k: v for k, v in GOOD.items() if k != "object"}, "needs object"),
-            ("interaction", dict(GOOD, interaction_id="ix_short"), "ix_<12 hex>"),
-            ("interaction", dict(GOOD, task_id="has space"), "task_id is not an id"),
+            ("interaction", dict(GOOD, interaction_id="ix_short"), "interaction_id is not a valid id"),
+            ("interaction", dict(GOOD, task_id="has space"), "task_id is not a valid id"),
+            ("interaction", dict(GOOD, task_id="@chi:s.space"), "task_id is not a valid id"),
+            ("interaction", dict(GOOD, run_id="task-0123456789"), "run_id is not a valid id"),
+            ("interaction", dict(GOOD, counterpart="Chi Wang"), "counterpart is not a valid id"),
+            ("interaction", dict(GOOD, object="some prose here"), "object is not a valid id"),
+            ("interaction", dict(GOOD, room_id="the dev room"), "room_id is not a valid id"),
+            ("interaction", dict(GOOD, event_id="e1"), "event_id is not a valid id"),
+            ("interaction", dict(GOOD, channel="email"), "channel must be"),
+            ("interaction", dict(GOOD, counterpart=42), "counterpart must be a string"),
+            ("interaction", None, "fields must be a dict"),
+            (None, GOOD, "unknown kind"),
             ("interaction", dict(GOOD, counterpart="x" * 301), "too long"),
             ("interaction", dict(GOOD, object="two\nlines"), "spans lines"),
             ("interaction", dict(GOOD, counterpart_kind="robot"), "counterpart_kind must be"),
@@ -63,6 +73,9 @@ class Writer(unittest.TestCase):
             with self.assertRaises(ValueError, msg=why) as cm:
                 cl.validate(kind, fields)
             self.assertIn(why, str(cm.exception))
+        for task in ("task-s-space~task-182c2b5ce99cc9e8ae", "task-9f06cb8851db56858f",
+                     "worker-pin-1792961761921-60fb041f", "task-local-hs~worker-pin-1790398604983-fada1e1c"):
+            self.assertEqual(cl.validate("interaction", dict(GOOD, task_id=task))["task_id"], task)
         rec = cl.validate("interaction", dict(GOOD, run_id=None, event_id=""))
         self.assertNotIn("run_id", rec)
         self.assertNotIn("event_id", rec)
@@ -75,6 +88,63 @@ class Writer(unittest.TestCase):
             cl.log_path(self.ws).mkdir()          # a directory where the log should be: OSError
             self.assertIsNone(cl.record("interaction", GOOD, workspace=self.ws))
         self.assertEqual(err.getvalue().count("correlation_log: not recorded"), 1)
+
+    def test_malformed_input_and_a_missing_resolver_never_raise(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for kind, fields in ((None, GOOD), ("interaction", None), ("interaction", ["x"]),
+                                 ("interaction", dict(GOOD, counterpart=object()))):
+                self.assertIsNone(cl.record(kind, fields, workspace=self.ws))
+            orig = cl.log_path
+            cl.log_path = lambda workspace=None: (_ for _ in ()).throw(ImportError("no workspace_default"))
+            try:
+                self.assertIsNone(cl.record("interaction", GOOD))
+            finally:
+                cl.log_path = orig
+        self.assertFalse(Path(cl.log_path(self.ws)).exists())
+
+    def test_a_short_write_is_completed_not_reported_as_done(self):
+        real, calls = os.write, []
+
+        def eight_bytes_once(fd, data):
+            calls.append(len(data))
+            return real(fd, data[:8]) if len(calls) == 1 else real(fd, data)
+        cl.os.write = eight_bytes_once
+        try:
+            self.assertIsNotNone(cl.record("interaction", GOOD, workspace=self.ws))
+        finally:
+            cl.os.write = real
+        self.assertGreater(len(calls), 1)
+        self.assertIsNotNone(cl.record("interaction", GOOD, workspace=self.ws))
+        self.assertEqual(len(cl.read("interaction", workspace=self.ws)), 2)
+
+    def test_a_failed_write_is_truncated_back_and_reported(self):
+        self.assertIsNotNone(cl.record("interaction", GOOD, workspace=self.ws))
+        size = cl.log_path(self.ws).stat().st_size
+        real = os.write
+
+        def partial_then_fail(fd, data, state={"n": 0}):
+            state["n"] += 1
+            if state["n"] == 1:
+                return real(fd, data[:8])
+            raise OSError("disk full")
+        cl.os.write = partial_then_fail
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(cl.record("interaction", GOOD, workspace=self.ws))
+        finally:
+            cl.os.write = real
+        self.assertEqual(cl.log_path(self.ws).stat().st_size, size)
+        self.assertIsNotNone(cl.record("interaction", GOOD, workspace=self.ws))
+        self.assertEqual(len(cl.read("interaction", workspace=self.ws)), 2)
+
+    def test_a_partial_line_left_by_a_crash_does_not_swallow_the_next_record(self):
+        self.assertIsNotNone(cl.record("interaction", GOOD, workspace=self.ws))
+        with open(cl.log_path(self.ws), "ab") as f:
+            f.write(b'{"kind":"interaction","at":"2026')
+        self.assertIsNotNone(cl.record("interaction", GOOD, workspace=self.ws))
+        self.assertEqual(len(cl.read("interaction", workspace=self.ws)), 2)
 
     def test_rotation_keeps_one_old_file_and_read_spans_both(self):
         old = cl.MAX_BYTES
@@ -116,7 +186,8 @@ class Trailers(unittest.TestCase):
                          "Sutando-Task: task-s-space~task-1a2b3c\nSutando-Run: task-1a2b3c~2\n"
                          "Interaction-Id: ix_0123456789ab")
         self.assertEqual(cl.trailers(task_id=" task-1 "), "Sutando-Task: task-1")
-        for bad in ({"task_id": "two words"}, {"interaction_id": "ix_x"}):
+        for bad in ({"task_id": "two words"}, {"interaction_id": "ix_x"}, {"task_id": "@chi:s.space"},
+                    {"task_id": "!room:s.space"}, {"run_id": "task-1a2b3c"}, {"task_id": "Chi Wang"}):
             with self.assertRaises(ValueError):
                 cl.trailers(**bad)
 

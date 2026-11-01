@@ -699,8 +699,9 @@ def main() -> int:
                     help="deliberately re-ask the SAME reviewers after 30min")
     ap.add_argument("--no-codeowner", dest="no_codeowner", metavar="REASON", default="",
                     help="deliberately ask without a non-author CODEOWNER; requires a reason")
-    ap.add_argument("--task", default=os.environ.get("SUTANDO_TASK_ID", ""),
-                    help="the task this ask is for (its id header); recorded with the ask's interaction id")
+    ap.add_argument("--task", default="",
+                    help="the task this ask is for (its `id:` header); recorded with the ask's interaction id. "
+                         "Pass it whenever the ask is for a task: nothing infers the link")
     ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
                     help="ask (default) requests review; notice tells reviewers "
                          "something about a PR without asking for anything")
@@ -719,6 +720,11 @@ def main() -> int:
         print(f"REFUSED: --repo {a.repo!r} is not OWNER/NAME (one slash, GitHub-legal "
               "segments) — a repo GitHub cannot find checks nobody.", file=sys.stderr)
         return 7
+    if a.task:
+        log = _correlation()
+        if log is not None and not log.TASK_RE.match(a.task):
+            print(f"REFUSED: --task {a.task!r} is not a task id (the task file's `id:` header).", file=sys.stderr)
+            return 7
     a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
@@ -865,6 +871,8 @@ def main() -> int:
         argv = command_for(t, a.message)
         if ix:
             argv[4] = with_interaction_id(argv[4], ix)
+            if not a.task:
+                print("note: no --task, so this ask's interaction record names no task.", file=sys.stderr)
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue

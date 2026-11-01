@@ -10,8 +10,11 @@ record names exact ids only; nothing here infers a link.
         {kind, at, interaction_id, object, counterpart, counterpart_kind?, counterpart_scope?,
          room_id?, room_kind?, task_id?, run_id?, channel?, event_id?}
 
-`record()` never raises: correlation is bookkeeping beside the work, so a failed write returns
-None and says so once on stderr. `trailers()` renders the git trailers our commits and PRs carry.
+Identity fields are checked per field: Matrix ids for counterpart/room/event, `owner/repo#N` for
+object, the engine's task and run id shapes; a display name or prose never lands in a record or a
+trailer. `record()` never raises, whatever it is given: correlation is bookkeeping beside the work,
+so a failed or partial write returns None (said once on stderr) and leaves the file as it was.
+`trailers()` renders the git trailers our commits and PRs carry.
 
     python3 src/correlation_log.py mint
     python3 src/correlation_log.py trailers --task <task id> [--run <run id>] [--interaction <id>]
@@ -34,7 +37,19 @@ LOG_NAME = "correlation.jsonl"
 MAX_BYTES = 8 * 1024 * 1024
 FIELD_MAX = 300
 INTERACTION_RE = re.compile(r"^ix_[0-9a-f]{12}$")
-ID_RE = re.compile(r"^[A-Za-z0-9._:~#/@!$+=-]{1,200}$")
+_HOST = r"[A-Za-z0-9.-]+(?::\d{1,5})?"
+_SEG = r"[a-z0-9-]{1,100}"
+TASK_RE = re.compile(rf"^[a-z]{_SEG}(?:~{_SEG}){{0,3}}$")
+RUN_RE = re.compile(rf"^[a-z]{_SEG}(?:~{_SEG}){{0,3}}~\d{{1,9}}$")
+PATTERNS = {
+    "counterpart": re.compile(rf"^@[a-z0-9._=/+-]{{1,255}}:{_HOST}$"),
+    "room_id": re.compile(rf"^![A-Za-z0-9._~=+-]{{1,255}}:{_HOST}$"),
+    "event_id": re.compile(rf"^\$[A-Za-z0-9_+/=-]{{1,255}}(?::{_HOST})?$"),
+    "object": re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#\d{1,9}$"),
+    "interaction_id": INTERACTION_RE,
+    "task_id": TASK_RE,
+    "run_id": RUN_RE,
+}
 
 KINDS = {
     "interaction": {"required": ("interaction_id", "object", "counterpart"),
@@ -42,7 +57,7 @@ KINDS = {
                                  "task_id", "run_id", "channel", "event_id")},
 }
 ENUMS = {"counterpart_kind": ("person", "agent", "owner"), "counterpart_scope": ("internal", "external", "unknown"),
-         "room_kind": ("dm", "room", "unknown")}
+         "room_kind": ("dm", "room", "unknown"), "channel": ("room", "dm", "thread")}
 
 _warned = False
 
@@ -60,9 +75,11 @@ def mint_interaction_id() -> str:
 
 def validate(kind: str, fields: dict) -> dict:
     """The record as it will be written, or ValueError naming what is wrong."""
-    spec = KINDS.get(kind)
+    spec = KINDS.get(kind) if isinstance(kind, str) else None
     if spec is None:
         raise ValueError(f"unknown kind {kind!r}")
+    if not isinstance(fields, dict):
+        raise ValueError(f"fields must be a dict, not {type(fields).__name__}")
     unknown = set(fields) - set(spec["required"]) - set(spec["optional"])
     if unknown:
         raise ValueError(f"unknown fields for {kind}: {sorted(unknown)}")
@@ -73,19 +90,40 @@ def validate(kind: str, fields: dict) -> dict:
             if key in spec["required"]:
                 raise ValueError(f"{kind} needs {key}")
             continue
-        value = str(value)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
         if len(value) > FIELD_MAX or "\n" in value:
             raise ValueError(f"{key} is too long or spans lines")
         rec[key] = value
     for key, allowed in ENUMS.items():
         if key in rec and rec[key] not in allowed:
             raise ValueError(f"{key} must be one of {allowed}")
-    if kind == "interaction" and not INTERACTION_RE.match(rec["interaction_id"]):
-        raise ValueError("interaction_id is not ix_<12 hex>")
-    for key in ("task_id", "run_id"):
-        if key in rec and not ID_RE.match(rec[key]):
-            raise ValueError(f"{key} is not an id")
+    for key, rx in PATTERNS.items():
+        if key in rec and not rx.match(rec[key]):
+            raise ValueError(f"{key} is not a valid id for that field")
     return rec
+
+
+def _append(path: Path, line: bytes) -> None:
+    """The whole line or nothing: a short write is retried, a failed one is truncated back."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        start = os.fstat(fd).st_size
+        if start and os.pread(fd, 1, start - 1) != b"\n":
+            line = b"\n" + line  # a crash left a partial line: never merge the next record into it
+        done = 0
+        try:
+            while done < len(line):
+                n = os.write(fd, line[done:])
+                if n <= 0:
+                    raise OSError("write made no progress")
+                done += n
+            os.fsync(fd)
+        except BaseException:
+            os.ftruncate(fd, start)
+            raise
+    finally:
+        os.close(fd)
 
 
 def record(kind: str, fields: dict, *, workspace=None, path: "Path | None" = None) -> "dict | None":
@@ -98,14 +136,9 @@ def record(kind: str, fields: dict, *, workspace=None, path: "Path | None" = Non
         with locked_file(path.with_name(LOG_NAME + ".lock")):
             if path.exists() and path.stat().st_size + len(line) > MAX_BYTES:
                 os.replace(path, path.with_name(LOG_NAME + ".1"))
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            try:
-                os.write(fd, line)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            _append(path, line)
         return rec
-    except (OSError, ValueError) as e:
+    except Exception as e:  # noqa: BLE001 - the never-raise boundary, whatever the input or store
         if not _warned:
             _warned = True
             print(f"correlation_log: not recorded ({type(e).__name__}: {e})", file=sys.stderr)
@@ -135,10 +168,11 @@ def trailers(task_id: "str | None" = None, run_id: "str | None" = None,
              interaction_id: "str | None" = None) -> str:
     """Git trailer lines for a commit or PR body; empty when no id is given."""
     lines = []
-    for label, value in (("Sutando-Task", task_id), ("Sutando-Run", run_id), ("Interaction-Id", interaction_id)):
+    for label, value, rx in (("Sutando-Task", task_id, TASK_RE), ("Sutando-Run", run_id, RUN_RE),
+                             ("Interaction-Id", interaction_id, INTERACTION_RE)):
         if value:
             value = str(value).strip()
-            if not (INTERACTION_RE if label == "Interaction-Id" else ID_RE).match(value):
+            if not rx.match(value):
                 raise ValueError(f"{label}: {value!r} is not an id")
             lines.append(f"{label}: {value}")
     return "\n".join(lines)
