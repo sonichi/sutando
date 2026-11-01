@@ -261,6 +261,84 @@ class Hooks(unittest.TestCase):
         self.assertEqual((rec["run"], rec["lease_id"], rec["pending_serve"]["lease"]), (tid, "L1", "L2"))
         self.assertIn(tid, inflight)
 
+    def lost_ack(self, tid, lease="L1"):
+        """Served, its ack sent with no answer: the claim stays open. Returns the broker double and
+        the claim's operation id."""
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id=lease, source_event_id="$e"), set(), []))
+        self.assertTrue(gw._record_pending_acks([(tid, True, lease)]))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": TimeoutError("lost"), "/v1/results": {"ok": True}}))
+        self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id=lease))
+        fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p: _ack(tid, 1)
+        return fake, self.acks(fake, tid)[0][1]
+
+    def acks(self, fake, tid):
+        return [(p, op) for (_m, path, p), op in zip(fake.calls, fake.ops) if path.endswith(f"/{tid}/ack")]
+
+    def sidecars_restored(self):
+        for f in (gw.PENDING_ACK_FILE, gw._ack_lease_file()):
+            f.write_text("{}")
+
+    def test_a_lost_ack_is_resent_from_its_open_claim_whatever_happened_to_the_sidecars(self):
+        for damage in ("deleted", "corrupt", "not a map"):
+            with self.subTest(damage=damage):
+                tid = f"task-ack-sidecar-{damage.replace(' ', '-')}"
+                fake, first = self.lost_ack(tid)
+                self.addCleanup(self.sidecars_restored)
+                for f in (gw.PENDING_ACK_FILE, gw._ack_lease_file()):
+                    if damage == "deleted":
+                        f.unlink(missing_ok=True)
+                    else:
+                        f.write_text("{" if damage == "corrupt" else "[]")
+                gw._ATTEMPTS.take_ownership()              # the restarted bridge
+                sent = len(self.acks(fake, tid))
+                gw._retry_pending_acks({tid})
+                again = self.acks(fake, tid)[sent:]
+                self.assertEqual([(p.get("lease_id"), op) for p, op in again], [("L1", first)],
+                                 "once, under the same lease and operation id")
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertFalse(rec.get("awaiting_ack"))
+                self.assertFalse([c for c in (rec.get("claims") or {}).values() if c.get("kind") == "ack"])
+                self.sidecars_restored()
+
+    def test_an_unreadable_sidecar_never_lets_a_second_ack_overwrite_the_first(self):
+        first_tid, second = "task-ack-one", "task-ack-two"
+        fake, op = self.lost_ack(first_tid)
+        self.addCleanup(self.sidecars_restored)
+        before = gw.PENDING_ACK_FILE.read_text()
+        real = Path.read_text
+        lease_file = gw._ack_lease_file()
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=lambda p, *a, **k: (
+                (_ for _ in ()).throw(PermissionError(13, "denied")) if p == lease_file else real(p, *a, **k))):
+            self.assertFalse(gw._record_pending_acks([(second, True, "L9")]), "not recorded over what it cannot read")
+        self.assertEqual(gw.PENDING_ACK_FILE.read_text(), before, "the first ack's entry is untouched")
+        sent = len(self.acks(fake, first_tid))
+        gw._retry_pending_acks({first_tid})
+        self.assertEqual([o for _p, o in self.acks(fake, first_tid)[sent:]], [op], "the first ack is still recovered")
+
+    def test_a_claim_and_its_sidecar_post_once_and_an_unproved_lease_is_never_posted(self):
+        tid = "task-ack-both"
+        fake, op = self.lost_ack(tid)
+        self.addCleanup(self.sidecars_restored)
+        sent = len(self.acks(fake, tid))
+        gw._retry_pending_acks({tid})
+        self.assertEqual(len(self.acks(fake, tid)) - sent, 1, "the claim and its sidecar entry: one post")
+        orphan = "task-ack-no-lease"
+        gw.PENDING_ACK_FILE.write_text(json.dumps({orphan: True}))
+        gw._ack_lease_file().write_text("{}")
+        gw._retry_pending_acks({orphan})
+        self.assertEqual(self.acks(fake, orphan), [], "no lease to prove it by: kept, never posted as None")
+        self.assertIn(orphan, json.loads(gw.PENDING_ACK_FILE.read_text()), "and kept")
+
+    def test_an_ack_first_claim_is_left_to_the_held_task_pass(self):
+        tid = "task-ack-first-owned"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e"), set(), []))
+        with gw._ATTEMPTS.transition(tid) as t:
+            self.assertIsNotNone(t.claim("ack", serve="L1", data={"retry_owner": "ack_first", "local_tid": tid,
+                                                                    "durable": True}))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": lambda p: _ack(tid, 1)}))
+        self.assertEqual(gw._retry_claimed_acks(), set())
+        self.assertEqual(self.acks(fake, tid), [], "the ordinary retry never sends it")
+
     def test_a_lost_ack_re_served_under_its_own_generation_keeps_one_run(self):
         tid = "task-lost-ack-same-gen"
         self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e"), set(), []))
