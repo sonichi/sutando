@@ -107,9 +107,9 @@ def body_gone(root, item_id: str, results_dir=None, body_id=None) -> Optional[st
     body_id = body_id or item_id
     if (results_dir / f"{body_id}.txt").exists() or undelivered_quarantine.find_quarantined(results_dir, body_id):
         return None
-    archive = results_dir / "archive"
-    archived = sorted(archive.rglob(f"{body_id}*.txt")) if archive.is_dir() else []
-    where = f"; its archived copy is {archived[-1]}" if archived else "; no archived copy was found"
+    # The one archive locator: every layout, exact ids only (never another task's prefix match).
+    archived = local_task_protocol.find_archived_result(results_dir, body_id)
+    where = f"; its archived copy is {archived}" if archived else "; no archived copy was found"
     return f"the outbox holds no body for it and none is live or quarantined, so nothing can send it{where}"
 
 

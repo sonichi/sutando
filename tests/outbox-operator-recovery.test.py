@@ -256,6 +256,27 @@ class BodyExternalLane(unittest.TestCase):
             self.assertIn("re-send it manually", rec["error"])
             self.assertEqual(outbox.read_item(root, ITEM)["status"], "PARKED", "nothing changed")
 
+    def test_the_archived_copy_named_is_this_tasks_never_a_prefix_match(self):
+        # task-abcd's body is another conversation's: naming it would have the operator re-send it.
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            month = results / "archive" / "2026-10"
+            month.mkdir(parents=True)
+            (month / f"{ITEM}d.txt").write_text("someone else's reply", encoding="utf-8")
+            gone = outbox_cli.body_gone(root, ITEM)
+            self.assertIn("no archived copy was found", gone)
+            self.assertNotIn(f"{ITEM}d.txt", gone)
+            (month / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
+            self.assertIn(str(month / f"{ITEM}.txt"), outbox_cli.body_gone(root, ITEM))
+
+    def test_an_archived_copy_in_the_gateways_flat_layout_is_named(self):
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            (results / "archive").mkdir(parents=True)
+            flat = results / "archive" / f"{ITEM}-1730000000.txt"
+            flat.write_text("the reply", encoding="utf-8")
+            self.assertIn(str(flat), outbox_cli.body_gone(root, ITEM))
+
     def test_a_live_or_quarantined_body_still_requeues(self):
         for where in ("live", "quarantined"):
             with self.subTest(where=where), TemporaryDirectory() as td:
