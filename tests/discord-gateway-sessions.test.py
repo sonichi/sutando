@@ -142,6 +142,7 @@ class BridgeTest(unittest.TestCase):
         for name in ("discord.gateway", "discord.client"):
             log = logging.getLogger(name)
             log.handlers.clear()
+            log.filters.clear()
             log.propagate = True
         logging.getLogger().handlers[:] = [h for h in logging.getLogger().handlers
                                            if not getattr(h, "_test_root", False)]
@@ -176,6 +177,16 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("session has been invalidated", text)
         self.assertNotIn("SECRET_BODY", text + root_seen.getvalue())
         self.assertNotIn("Dispatching event", text)
+
+    def test_a_handler_already_on_the_logger_gets_no_payload(self) -> None:
+        direct_seen = io.StringIO()
+        logging.getLogger("discord.gateway").addHandler(logging.StreamHandler(direct_seen))
+        out = self.start()
+        gw = logging.getLogger("discord.gateway")
+        gw.debug("For Shard ID %s: WebSocket Event: %s", None, PAYLOAD)
+        gw.debug("Websocket closed with %s, cannot reconnect.", 4004)
+        self.assertNotIn("SECRET_BODY", direct_seen.getvalue() + out.getvalue())
+        self.assertIn("Websocket closed with 4004", direct_seen.getvalue())
 
     def test_the_templates_are_discord_py_s_own(self) -> None:
         pkg = Path(sys.modules["discord"].__file__).parent

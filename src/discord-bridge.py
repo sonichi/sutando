@@ -2763,7 +2763,8 @@ def _log_gateway_reasons(stream=None) -> None:
         log = logging.getLogger(name)
         log.setLevel(logging.DEBUG)
         log.addHandler(handler)
-        # An ancestor handler would otherwise receive the DEBUG payloads this handler refuses.
+        # On the logger, not only this handler: any handler on it or above sees only the filtered records.
+        log.addFilter(_gateway_reason_filter)
         log.propagate = False
 
 
