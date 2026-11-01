@@ -46,6 +46,8 @@ SIDECAR = "agent-activity.phase.jsonl"
 MANIFEST = HERE.parent / "manifest.json"
 DEBOUNCE_S = 5.0
 TIMEOUT_S = 2.0
+TOKEN_TTL_S = 300.0
+MARKER_KEEP_S = 7 * 86400
 WINDOW = 8
 LINE_MAX = 60
 TAIL_BYTES = 256 * 1024
@@ -196,22 +198,59 @@ def model_on() -> bool:
 
 
 def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | None", spawn=None) -> str:
-    """The hook's one call per bound tool call: the rules record now, the model detached and debounced."""
+    """The hook's one call per bound tool call: the rules record now, the model detached and debounced.
+    A task's first record says so (`first`), and a connected-account step leaves a `.private` marker
+    beside the debounce stamps, outside the sidecar's bounded tail; `prompt_for` reads both."""
     phase = rules_phase(tool_name, tool_input)
     rec = {"task_id": task_id, "seq": secrets.token_hex(6), "step": step, "phase": phase, "phase_source": "rules"}
+    seen = _marker(workspace, task_id, "seen")
+    first = not seen.exists() and _touch(seen)
+    if first:
+        rec["first"] = True
+        _prune(seen.parent)
     if _PRIVATE_TOOL.match(tool_name or ""):
         rec["private"] = True
-    write(workspace, rec)
+        _touch(_marker(workspace, task_id, "private"))  # unwritten: prompt_for's other checks fail closed
+    if not write(workspace, rec) and first:
+        with contextlib.suppress(OSError):
+            seen.unlink()  # the first record never landed: the next step is the first again
     if model_on() and _debounced(workspace, task_id):
         (spawn or _spawn)(workspace, task_id)
     return phase
 
 
+def _marker_dir(workspace) -> Path:
+    return Path(workspace) / "state" / "phase-line"
+
+
+def _marker(workspace, task_id: str, kind: str) -> Path:
+    return _marker_dir(workspace) / f"{re.sub(r'[^A-Za-z0-9._~-]', '_', task_id)}.{kind}"
+
+
+def _touch(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644))
+        return True
+    except OSError:
+        return False
+
+
+def _prune(d: Path) -> None:
+    """Drop markers, stamps and locks untouched for MARKER_KEEP_S: a task that old has left the
+    sidecar's tail, so its prompt is refused with or without them."""
+    cutoff = time.time() - MARKER_KEEP_S
+    with contextlib.suppress(OSError):
+        for p in d.iterdir():
+            with contextlib.suppress(OSError):
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+
+
 def _debounced(workspace, task_id: str) -> bool:
     """True at most once per task per DEBOUNCE_S; contention reads as not yet."""
     try:
-        d = Path(workspace) / "state" / "phase-line"
-        stamp = d / f"{re.sub(r'[^A-Za-z0-9._~-]', '_', task_id)}.last"
+        stamp = _marker(workspace, task_id, "last")
         with _try_locked(stamp.with_suffix(".lock")) as got:
             if not got:
                 return False
@@ -253,6 +292,18 @@ _CRED = re.compile(r"\b(?:(?:sk|pk|rk)-[A-Za-z0-9_-]{6,}|(?:ghp|gho|ghu|ghs|ghr|
                    r"|ya29\.[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{6,})|" + _SLACK.pattern)
 _FILTERED = re.compile(r"\[(?:REDACTED|STORED-IN-KEYCHAIN)-[^\]]*\]")
 _PLACEHOLDER = re.compile(r"<[a-z]+>|\bPR\d+\b|\bPerson\d+\b")
+# Words that may open a sentence (the goal, a step, after a full stop): imperative verbs and function
+# words, never a common given name. Any other capitalised word may be a name and is masked.
+_STARTERS = frozenset("""A About Add After Again All Also An And Any Apply Archive Are As Ask At Be Before Both Build
+But By Can Cancel Check Clean Clone Close Comment Commit Compare Configure Confirm Copy Count Could Create Debug Delete
+Deploy Diagnose Diff Disable Do Does Done Download Draft Dump Each Edit Enable Every Explain Export Extract Fetch Filter
+Find First Fix For Format From Generate Get Grep Has Have Help Here Hey Hi How If Import In Inspect Install Investigate
+Is It Its Just Keep Kill Last Let Lint List Load Locate Log Look Make Measure Merge Migrate Move My New Next No None Not
+Note Notify Now Of Ok Okay On Once Only Open Or Our Parse Please Poll Post Prepare Print Probe Prune Publish Pull Push
+Read Rebase Record Refactor Remove Rename Render Reply Request Rerun Reset Resolve Restore Retry Revert Review Run Save
+Scan Schedule Search Second Send Set Should Show So Some Sort Start Still Stop Summarize Sync Tail Tell Test Thank
+Thanks That The Then There These They This Those To Trace Track Try Update Upload Use Verify Wait Was Watch We Were
+What When Where Which While Who Why With Without Would Write Yes You Your""".split())
 # Words that may stand mid-sentence capitalised; any other is treated as a possible name.
 _TERMS = frozenset("""PR PRs CI API APIs JSON YAML README CLI SDK MCP UI UX HTTP HTTPS SQL OK ID IDs URL URLs Git GitHub
 Python TypeScript JavaScript Rust Go Node Docker Matrix Vertex Gemini Claude Codex Cloud Run Terraform macOS Linux
@@ -308,8 +359,9 @@ class Redactor:
 
 
 def _mask_names(text: str) -> str:
-    """A capitalised word that is not a known term may be a name: masked mid-sentence, and at a
-    sentence start too when it is possessive ("Alice's")."""
+    """A capitalised word that is not a known term may be a name, wherever it stands: masked, unless
+    it is a sentence starter (`_STARTERS`) at a sentence start. A line, the goal and each `[working]`
+    step each begin a sentence."""
     out = []
     for line in text.split("\n"):
         words, start = [], True
@@ -317,7 +369,7 @@ def _mask_names(text: str) -> str:
             core = tok.strip(",.;:!?()\"")
             bare = core[:-2] if core.endswith("'s") else core
             if bare and bare[0].isupper() and bare not in _TERMS and not _PLACEHOLDER.fullmatch(bare) \
-                    and (not start or core.endswith("'s")):
+                    and not (start and bare in _STARTERS):
                 tok = tok.replace(bare, "<name>", 1)
             words.append(tok)
             if tok in ("[working]", ""):
@@ -361,37 +413,71 @@ _ROLE = {"Person": "a teammate", "Peer": "an agent", "Agent": "an agent", "User"
 FALLBACK_LINE = "Working on the request"
 
 
-def validate_line(raw, prompt_text: str) -> "str | None":
-    """The model's line as it may be kept (placeholder text), or None to keep only the phase."""
+def validate_line(raw, prompt_text: str, people=()) -> "str | None":
+    """The model's line as it may be kept (placeholder text), or None to keep only the phase. No
+    capitalised word but a known term, a sentence starter or an opening verb in -ing; no person the
+    task names, in any case."""
     line = re.sub(r"\s+", " ", normalise(str(raw or ""))).strip().rstrip(".")
     line = _PERSON.sub(lambda m: _ROLE[m.group(1)], line)
     if not line or line == FALLBACK_LINE or len(line) > LINE_MAX or "<" in line or not allowed(line):
         return None
     if any(m.group(0) not in prompt_text for m in re.finditer(r"\bPR\d+\b", line)):
         return None
-    if any(w[0].isupper() and w not in _TERMS for w in re.findall(r"[A-Za-z]+", line)[1:]):
-        return None  # a capitalised word the input did not let through: possibly a name
+    for i, w in enumerate(re.findall(r"[A-Za-z]+", line)):
+        opener = i == 0 and (w in _STARTERS or (w.endswith("ing") and len(w) > 4))
+        if w[0].isupper() and w not in _TERMS and not opener:
+            return None  # a capitalised word the input did not let through: possibly a name
+    names = [k for k in Redactor(people).people if len(k) >= 3]
+    if any(re.search(rf"(?i)(?<![A-Za-z]){re.escape(n)}(?![A-Za-z])", line) for n in names):
+        return None
     return line
 
 
+_TOKEN: dict = {}
+
+
+def _access_token(fresh: bool = False) -> str:
+    """The host's gcloud access token, kept in this process's memory (never on disk) for TOKEN_TTL_S;
+    the fetch has the call's own budget. '' when gcloud cannot answer in time."""
+    now = time.monotonic()
+    if not fresh and _TOKEN.get("value") and now < _TOKEN.get("exp", 0.0):
+        return _TOKEN["value"]
+    _TOKEN.clear()
+    value = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True,
+                           timeout=TIMEOUT_S).stdout.strip()
+    if value:
+        _TOKEN.update(value=value, exp=now + TOKEN_TTL_S)
+    return value
+
+
 def gemini(project: str, model: str, system: str, user: str, timeout: float = TIMEOUT_S) -> dict:
-    """One Vertex generateContent call with the host's gcloud credentials; {} on any failure."""
+    """One Vertex generateContent call with the host's gcloud credentials; {} on any failure. A
+    rejected token is dropped and fetched once more."""
+    import urllib.error
     import urllib.request
     try:
-        token = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True,
-                               timeout=10).stdout.strip()
-        if not token:
-            return {}
         url = (f"https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/google/"
                f"models/{model}:generateContent")
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
                 "generationConfig": {"temperature": 0, "maxOutputTokens": 80, "responseMimeType": "application/json",
                                      "responseSchema": SCHEMA, "thinkingConfig": {"thinkingLevel": "minimal"}}}
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            out = json.loads(r.read())
+        def post(token: str) -> dict:
+            req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+
+        token = _access_token()
+        if not token:
+            return {}
+        try:
+            out = post(token)
+        except urllib.error.HTTPError as e:
+            token = _access_token(fresh=True) if e.code == 401 else ""
+            if not token:
+                return {}
+            out = post(token)
         return json.loads(out["candidates"][0]["content"]["parts"][0]["text"])
     except Exception:  # noqa: BLE001 - no answer is the rules answer
         return {}
@@ -442,9 +528,20 @@ def _steps(workspace, task_id: str) -> list:
     return out[-WINDOW:]
 
 
+def _sendable(workspace, task_id: str) -> bool:
+    """Whether the task's whole history is known and none of it touched a connected account: no
+    `.private` marker, a marker directory that could have held one, and its first record still in
+    sight with no private record after it. Anything unknown is not sendable."""
+    d = _marker_dir(workspace)
+    if not (d.is_dir() and os.access(d, os.W_OK)) or _marker(workspace, task_id, "private").exists():
+        return False
+    recs = records(workspace, task_id)
+    return any(r.get("first") for r in recs) and not any(r.get("private") for r in recs)
+
+
 def prompt_for(workspace, task_id: str) -> "tuple[str, Redactor] | None":
     """The outbound prompt and its redactor, or None when nothing may be sent for this task."""
-    if any(r.get("private") for r in records(workspace, task_id)):
+    if not _sendable(workspace, task_id):
         return None
     goal, people = _task_context(workspace, task_id)
     if goal is None:
@@ -475,7 +572,7 @@ def enrich(workspace, task_id: str, call=None) -> "dict | None":
         if phase is None:
             return rec
         new = {"task_id": task_id, "for_seq": now["seq"], "phase": phase, "phase_source": "model"}
-        line = validate_line(out.get("line"), prompt)
+        line = validate_line(out.get("line"), prompt, people=list(red.people))
         if line:
             new.update(line=red.restore(line), line_source="model")
         if write(workspace, new):

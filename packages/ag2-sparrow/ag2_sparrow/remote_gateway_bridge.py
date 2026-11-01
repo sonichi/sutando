@@ -357,6 +357,7 @@ from .result_publish import (is_staged_for as _is_staged_for, publish_staged as 
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from . import task_attempts
+from . import task_step_publisher
 from . import task_hold
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
@@ -2517,7 +2518,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "picker_command", "picker_args",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.
-                "source", "channel_id",
+                "source", "channel_id", "task_id", "execution_generation",
                 # Declares the task-mid shape (one-line body, writer-owned trailer) so a
                 # verified reader may trust the lines below task:. Above it: a body cannot claim it.
                 "task_layout",
@@ -2954,7 +2955,7 @@ def _read_by(resp, deadline: float) -> bytes:
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
-         deadline: "float | None" = None, operation_id: "str | None" = None):
+         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
     `deadline` (time.monotonic()), the whole request must finish by then. `operation_id` is a
     claimed effect's idempotency key, the same on every retry of it."""
@@ -2965,7 +2966,8 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
             raise TimeoutError("request deadline already passed")
     with _gateway_call():
         data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
+        base = urllib.parse.urlunsplit((*urllib.parse.urlsplit(URL)[:2], "", "", "")) if origin else URL
+        req = urllib.request.Request(f"{base}{path}", data=data, method=method)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Accept", "application/json")
         # CloudFlare bot-fight (error 1010) rejects python-urllib's default
@@ -3980,8 +3982,9 @@ def _maybe_pull_worker_labels(record) -> bool:
     return True
 
 
-# The primary app checks every 30 minutes; the fallback checks every five.
 _HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
 # A self-report older than this needs a live beat to stand: a dead core leaves its last
 # "idle" behind, while an idle core rewrites nothing, so a beating core keeps it.
 _CORE_STATUS_MAX_AGE = 60 * 60
@@ -4004,7 +4007,7 @@ def _core_stopped_at() -> float | None:
 
 
 def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
-    """Overlay independent diagnostics without exporting their private details."""
+    """Keep stale or gracefully stopped cores from advertising obsolete work."""
     status, step = _read_core_status()
     alive = core_health.get("alive") if isinstance(core_health, dict) else None
     written_at = _core_status_written_at() if status is not None else None
@@ -4019,29 +4022,23 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
         status, step = _liveness_status(alive), None
         if status is None:
             status, step = "unknown", "Core liveness unavailable"
-    if status in ("error", "offline"):
-        return status, step
+    return status, step
+
+
+def _diagnostic_health(health: "dict | None") -> "dict | None":
+    """A fresh failing independent check is a quiet structured health warning."""
     try:
         report = json.loads((_STATE / "agent-health.json").read_text())
-    except FileNotFoundError:
-        return status, step
-    except Exception:
-        return "unknown", "Health check unavailable"
-    try:
         ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
         if (report.get("version") != 1 or type(ts) not in (int, float)
-                or not 0 <= time.time() - ts
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
                 or type(total) is not int or total <= 0
-                or type(failures) is not int or not 0 <= failures <= total):
-            return "unknown", "Health check unavailable"
-        if time.time() - ts > _HEALTH_REPORT_MAX_AGE:
-            # An old report is no opinion; a host that stopped checking must not read unknown forever.
-            return status, step
-        if failures:
-            return "error", f"Health check: {failures} failing check(s)"
-    except Exception:
-        return "unknown", "Health check unavailable"
-    return status, step
+                or type(failures) is not int or not 0 < failures <= total):
+            return health
+    except (OSError, ValueError, KeyError, TypeError):
+        return health
+    row = health or {"alive": None, "motion": "unknown"}
+    return {**row, "condition": "abnormal", "reason": "health-check", "since": ts}
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
@@ -4051,17 +4048,20 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
+    _publish_task_steps(inflight)
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
+    core_health = health
+    health = _diagnostic_health(health)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    # An injected row is not the core's beat: presence status stays the core-status file's.
-    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
+    # Diagnostics stay separate; liveness still invalidates obsolete work reports.
+    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else core_health)
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -4101,6 +4101,78 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {diagnostics.describe(e)} — continuing")
         return False
+
+
+def _send_task_step(payload: dict):
+    try:
+        return _req("POST", "/api/capabilities/v1/actions/execute", payload,
+                    timeout=10, operation_id=payload["operation_id"], origin=True)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code != 404:
+            raise
+        return {"status": "not_deployed"}
+
+
+_STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)
+
+
+TASK_STEP_PUBLICATION_ENABLED = None
+_STEP_PUSH_THREAD = None
+_STEP_PUSH_LOCK = threading.Lock()
+
+
+def _publish_task_steps(inflight: set[str]) -> None:
+    global _STEP_PUSH_THREAD
+    try:
+        enabled = callable(TASK_STEP_PUBLICATION_ENABLED) and TASK_STEP_PUBLICATION_ENABLED() is True
+    except Exception:
+        enabled = False
+    if not enabled or not inflight or not _publication_permitted():
+        return
+    with _STEP_PUSH_LOCK:
+        if _STEP_PUSH_THREAD is not None and _STEP_PUSH_THREAD.is_alive():
+            return
+        _STEP_PUSH_THREAD = threading.Thread(target=_publish_task_steps_now, args=(set(inflight),),
+                                             name="task-step-publisher", daemon=True)
+        _STEP_PUSH_THREAD.start()
+
+
+def _publish_task_steps_now(inflight: set[str]) -> None:
+    try:
+        _publish_task_steps_snapshot(inflight)
+    except Exception as exc:
+        _log(f"task step publisher failed ({type(exc).__name__}); continuing")
+
+
+def _publish_task_steps_snapshot(inflight: set[str]) -> None:
+    tasks = {}
+    for tid in inflight:
+        if not gateway_instance.owns(tid, GATEWAY_INSTANCE):
+            continue
+        wire = _broker_tid(tid)
+        if not _valid_tid(wire) or (RESULTS_DIR / f"{tid}.txt").exists():
+            continue
+        if _ATTEMPTS is not None:
+            rec = _ATTEMPTS.entry(wire)
+            if (rec is task_attempts.UNKNOWN or isinstance(rec, dict) and
+                    (rec.get("finished") or rec.get("fenced") or _run_tid(wire, rec) != tid)):
+                continue
+        path = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+        if path is None:
+            continue
+        try:
+            headers = local_task_protocol.parse_task_headers(path.read_text()).headers
+            gen = int(headers.get("execution_generation", ""))
+        except (OSError, ValueError):
+            continue
+        if _ATTEMPTS is not None and isinstance(rec, dict) and rec.get("execution_generation") != gen:
+            continue
+        if headers.get("task_id") != wire or headers.get("id") != tid:
+            continue
+        tasks[tid] = {"task_id": wire, "execution_generation": gen,
+                      "room_id": headers.get("source_room_id") or headers.get("channel_id")}
+    _STEP_PUBLISHER.publish(tasks)
 
 
 def _claim_ack(wire_tid: str, lease_id: "str | None"):
@@ -5551,6 +5623,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
+        task["task_id"] = broker_tid
     woken = None
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication

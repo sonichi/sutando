@@ -54,6 +54,10 @@ def _rows(ws, tid, lines, kind="working"):
 
 
 def _rules(ws, tid, phase="Running a command", step=None, **kw):
+    """A rules record as on_step writes it: the task's first one says so, beside its marker directory."""
+    if not pl.records(ws, tid):
+        kw.setdefault("first", True)
+        pl._marker_dir(ws).mkdir(parents=True, exist_ok=True)
     pl.write(ws, dict({"task_id": tid, "seq": os.urandom(6).hex(), "step": step, "phase": phase,
                        "phase_source": "rules"}, **kw))
     return pl.latest(ws, tid)["seq"]
@@ -241,6 +245,7 @@ class Line(unittest.TestCase):
 
 class Enrich(unittest.TestCase):
     def setUp(self):
+        pl._TOKEN.clear()
         self.ws = tempfile.mkdtemp()
         _task(self.ws, "task-a")
         _rows(self.ws, "task-a", ["Fetch origin", "Fetch origin", "Rebase onto main for #3331"])
@@ -322,6 +327,7 @@ class Edges(unittest.TestCase):
     """The defensive branches: each degrades to the rules record, never raises."""
 
     def setUp(self):
+        pl._TOKEN.clear()
         self.ws = tempfile.mkdtemp()
 
     def test_unreadable_settings_and_stamps_read_as_off(self):
@@ -506,6 +512,172 @@ class WhyNotMoving(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             pl.main(["status", "--task", "task-r", "--workspace", self.ws])
         self.assertEqual(json.loads(out.getvalue())["line"], "Wait for CI")
+
+
+class PrivacyKept(unittest.TestCase):
+    """A connected-account task stays unsendable after its private record leaves the sidecar's tail,
+    and when its marker cannot be written."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+        _task(self.ws, "task-p")
+        _rows(self.ws, "task-p", ["Rebase onto main"])
+
+    def _private_step_then_busy_host(self, **patches):
+        with patch.dict(os.environ, ON):
+            pl.on_step(self.ws, "task-p", "Read", {}, None, spawn=lambda *a: None)
+            pl.on_step(self.ws, "task-p", "mcp__claude_ai_Gmail__search", {}, None, spawn=lambda *a: None)
+            for i in range(60):  # other tasks fill the shared sidecar
+                pl.on_step(self.ws, f"task-o{i}", "Read", {}, None, spawn=lambda *a: None)
+            pl.on_step(self.ws, "task-p", "Bash", {"command": "git fetch"}, "Fetch", spawn=lambda *a: None)
+
+    def test_the_flag_survives_the_tail_dropping_it(self):
+        with patch.object(pl, "TAIL_BYTES", 2048):
+            self._private_step_then_busy_host()
+            self.assertFalse(any(r.get("private") for r in pl.records(self.ws, "task-p")), "precondition: evicted")
+            self.assertIsNone(pl.prompt_for(self.ws, "task-p"))
+
+    def test_the_flag_survives_rotation(self):
+        with patch.object(pl, "SIDECAR_MAX_BYTES", 4096):
+            self._private_step_then_busy_host()
+            self.assertTrue(pl.sidecar_path(self.ws).with_name(pl.SIDECAR + ".1").exists(), "precondition: rotated")
+            self.assertIsNone(pl.prompt_for(self.ws, "task-p"))
+
+    def test_a_failed_marker_write_fails_closed(self):
+        Path(self.ws, "state").mkdir(exist_ok=True)
+        Path(self.ws, "state", "phase-line").write_text("not a directory")  # no marker can be written
+        with patch.object(pl, "TAIL_BYTES", 2048):
+            self._private_step_then_busy_host()
+            self.assertIsNone(pl.prompt_for(self.ws, "task-p"))
+
+    def test_a_task_whose_history_is_out_of_sight_is_not_sent(self):
+        with patch.object(pl, "TAIL_BYTES", 2048), patch.dict(os.environ, ON):
+            pl.on_step(self.ws, "task-p", "Read", {}, None, spawn=lambda *a: None)
+            for i in range(60):
+                pl.on_step(self.ws, f"task-o{i}", "Read", {}, None, spawn=lambda *a: None)
+            pl.on_step(self.ws, "task-p", "Read", {}, None, spawn=lambda *a: None)
+            self.assertIsNone(pl.prompt_for(self.ws, "task-p"), "its first step is out of sight: unknown, not sent")
+
+    def test_a_plain_task_in_sight_is_still_sent(self):
+        with patch.dict(os.environ, ON):
+            pl.on_step(self.ws, "task-p", "Read", {}, None, spawn=lambda *a: None)
+        self.assertIsNotNone(pl.prompt_for(self.ws, "task-p"))
+
+
+class SentenceStartNames(unittest.TestCase):
+    """An unknown name is masked wherever it stands, and a line naming anyone is refused."""
+
+    def test_prompt_boundary(self):
+        r = pl.Redactor(["alice", "Bob Smith"])
+        for text, name in (("Zelda wants the deploy fixed", "Zelda"), ("[working] Kofi reviewed the diff", "Kofi"),
+                           ("Done. Priya asked for a rerun", "Priya"), ("Ngozi: please rebase", "Ngozi"),
+                           ("alice wants it merged", "alice"), ("ping bob smith about it", "bob smith")):
+            out = r(text)
+            self.assertNotIn(name, out, text)
+        self.assertEqual(r("Please rebase PR #3, then fix the tests"), "Please rebase PR1, then fix the tests")
+
+    def test_prompt_for_masks_a_sentence_initial_name_in_goal_and_steps(self):
+        ws = tempfile.mkdtemp()
+        _task(ws, "task-n", goal="Zelda asked to rebase PR #3")
+        _rows(ws, "task-n", ["Kofi branch rebased"])
+        with patch.dict(os.environ, ON):
+            pl.on_step(ws, "task-n", "Read", {}, None, spawn=lambda *a: None)
+        prompt, _red = pl.prompt_for(ws, "task-n")
+        self.assertNotIn("Zelda", prompt)
+        self.assertNotIn("Kofi", prompt)
+
+    def test_line_boundary(self):
+        prompt = "Task goal: Rebase PR1\nRecent steps:\n[working] Fetch"
+        for bad in ("Zelda is rebasing PR1", "Kofi rebasing PR1", "Reviewing alice changes", "Asking bob smith"):
+            self.assertIsNone(pl.validate_line(bad, prompt, people=["alice", "Bob Smith"]), bad)
+        for good in ("Rebasing PR1 onto main", "Reviewing the diff", "Waiting for the tests"):
+            self.assertEqual(pl.validate_line(good, prompt, people=["alice"]), good)
+
+
+class Token(unittest.TestCase):
+    """The access token: fetched within the call's budget, kept in memory until it expires."""
+
+    def setUp(self):
+        pl._TOKEN.clear()
+
+    def _resp(self):
+        body = json.dumps({"candidates": [{"content": {"parts": [{"text": '{"phase": "Waiting", "line": "x"}'}]}}]})
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return body.encode()
+        return Resp()
+
+    def test_one_fetch_per_process_until_expiry_within_the_budget(self):
+        import urllib.request
+        tok = type("R", (), {"stdout": "tok"})()
+        with patch.object(pl.subprocess, "run", return_value=tok) as run, \
+             patch.object(urllib.request, "urlopen", side_effect=lambda *a, **k: self._resp()):
+            pl.gemini("p", "m", "s", "u")
+            pl.gemini("p", "m", "s", "u")
+            self.assertEqual(run.call_count, 1)
+            self.assertLessEqual(run.call_args.kwargs["timeout"], pl.TIMEOUT_S)
+            with patch.object(pl.time, "monotonic", return_value=time.monotonic() + pl.TOKEN_TTL_S + 1):
+                pl.gemini("p", "m", "s", "u")
+            self.assertEqual(run.call_count, 2)
+
+    def test_a_rejected_token_is_dropped_and_fetched_again_once(self):
+        import urllib.error
+        import urllib.request
+        tok = type("R", (), {"stdout": "tok"})()
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(req.headers.get("Authorization"))
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+            return self._resp()
+        with patch.object(pl.subprocess, "run", return_value=tok) as run, patch.object(urllib.request, "urlopen", urlopen):
+            self.assertEqual(pl.gemini("p", "m", "s", "u"), {"phase": "Waiting", "line": "x"})
+        self.assertEqual((run.call_count, len(calls)), (2, 2))
+
+    def test_a_rejected_token_with_no_fresh_one_and_other_http_errors_answer_empty(self):
+        import urllib.error
+        import urllib.request
+        answers = iter([type("R", (), {"stdout": "tok"})(), type("R", (), {"stdout": ""})()])
+        err = urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        with patch.object(pl.subprocess, "run", side_effect=lambda *a, **k: next(answers)), \
+             patch.object(urllib.request, "urlopen", side_effect=err):
+            self.assertEqual(pl.gemini("p", "m", "s", "u"), {})
+        pl._TOKEN.clear()
+        tok = type("R", (), {"stdout": "tok"})()
+        with patch.object(pl.subprocess, "run", return_value=tok) as run, \
+             patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError("u", 500, "x", {}, None)):
+            self.assertEqual(pl.gemini("p", "m", "s", "u"), {})
+        self.assertEqual(run.call_count, 1, "only a rejected token is fetched again")
+
+
+class Markers(unittest.TestCase):
+    def test_old_markers_are_pruned_when_a_task_starts(self):
+        ws = tempfile.mkdtemp()
+        d = pl._marker_dir(ws)
+        d.mkdir(parents=True)
+        old, kept = d / "task-old.private", d / "task-new.last"
+        old.write_text(""); kept.write_text("")
+        past = time.time() - pl.MARKER_KEEP_S - 60
+        os.utime(old, (past, past))
+        pl.on_step(ws, "task-a", "Read", {}, None, spawn=lambda *a: None)
+        self.assertEqual((old.exists(), kept.exists()), (False, True))
+        pl._prune(Path(ws) / "missing")  # an absent directory is nothing to prune
+
+    def test_a_first_record_that_did_not_land_leaves_the_next_step_first(self):
+        ws = tempfile.mkdtemp()
+        with patch.object(pl, "write", return_value=False):
+            pl.on_step(ws, "task-a", "Read", {}, None, spawn=lambda *a: None)
+        self.assertFalse(pl._marker(ws, "task-a", "seen").exists())
+        pl.on_step(ws, "task-a", "Read", {}, None, spawn=lambda *a: None)
+        self.assertTrue(pl.records(ws, "task-a")[-1].get("first"))
 
 
 class Hook(unittest.TestCase):
