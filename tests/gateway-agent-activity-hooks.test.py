@@ -3521,6 +3521,114 @@ class Hooks(unittest.TestCase):
                 text = (gw.TASKS_DIR / f"{run}.txt").read_text()
                 self.assertEqual([r for r in rules.values() if r in text], [rules[verdict]])
 
+    def one_failed_read(self, owner, name, call=1, nth=1):
+        """In the `call`-th call of `owner.name`, its `nth` ledger read fails, once; all other IO is healthy."""
+        real, real_read, state = getattr(owner, name), gw._ATTEMPTS._read, {"calls": 0}
+
+        def wrapper(obj, *a, **k):
+            state["calls"] += 1
+            if state["calls"] != call:
+                return real(obj, *a, **k)
+            reads = {"n": 0}
+
+            def read():
+                reads["n"] += 1
+                return None if reads["n"] == nth else real_read()
+            with mock.patch.object(gw._ATTEMPTS, "_read", side_effect=read):
+                return real(obj, *a, **k)
+        return mock.patch.object(owner, name, wrapper)
+
+    def test_an_unread_lease_contract_never_posts_a_result_without_its_generation(self):
+        for fault in (False, True):
+            with self.subTest(fault=fault):
+                tid = f"task-contract-{fault}"
+                self.served_acked("task-contract-known") if not fault and not ledger().get("contract") else None
+                self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1"), set(), []))
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": OSError("lost"), "/v1/results": {"ok": True}}))
+                with txn(tid) as t:
+                    t.put(published_at=time.time() - gw.task_attempts.ACK_HOLD_MAX_S - 5)
+                self.assertTrue(gw._ATTEMPTS.broker_names_leases(), "a broker known to name leases")
+                self.core_writes(tid, "the answer")
+                old = time.time() - 5
+                os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+                stuck = (self.one_failed_read(gw.task_attempts.TaskAttempts, "broker_names_leases") if fault
+                         else contextlib.nullcontext())
+                with stuck:
+                    gw._post_ready_results({tid})
+                self.assertEqual([p for p in fake.posted("/v1/results") if p["id"] == tid], [], "nothing posted")
+                self.assertTrue(gw._ATTEMPTS.get(tid)["awaiting_ack"], "still waiting for its ack")
+
+    def test_an_unread_adoption_check_never_gives_the_same_generation_a_new_run(self):
+        for fault in (False, True):
+            with self.subTest(fault=fault):
+                tid = f"task-adopt-{fault}"
+                fake, inflight = self.held(tid, gen_answer=1)
+                if fault:
+                    with self.one_failed_read(gw.task_attempts.Transition, "serve_adoptable"):
+                        self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L2"), "not decided")
+                    self.assertEqual(gw._ATTEMPTS.get(tid)["pending_serve"]["lease"], "L2", "still held")
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertEqual((rec["run"], rec["lease_id"], rec.get("owed_publish")), (tid, "L2", None),
+                                 "the same generation keeps its run; nothing is owed")
+                self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), [f"{tid}.txt"])
+                del fake, inflight
+
+    def test_an_unread_publication_never_republishes_a_wake_replay(self):
+        for fault in (False, True):
+            with self.subTest(fault=fault):
+                tid = f"task-replay-{fault}"
+                wake = {"blocker_episode_id": "e1", "resolved_blockers": []}
+                self.assertEqual(gw._write_task(_task(tid, wake=wake)), (tid, True))
+                (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+                (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+                stuck = (self.one_failed_read(gw.task_attempts.Transition, "run_published") if fault
+                         else contextlib.nullcontext())
+                with stuck:
+                    self.assertIsNone(gw._write_task(_task(tid, wake=wake)), "the core took it: not again")
+                self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), [], "nothing queued again")
+
+    def test_an_unread_run_history_never_reruns_a_delivered_generation(self):
+        for where in ("healthy", "revive last run", "revive run entry", "serve run"):
+            with self.subTest(where=where):
+                tid = f"task-history-{where.replace(' ', '-')}"
+                fake, inflight = self.stale_refused_then_served_again(tid)
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                self.answered_by_its_own_run(fake, tid, inflight)
+                stuck = {"healthy": contextlib.nullcontext(),
+                         "revive last run": self.one_failed_read(gw.task_attempts.Transition, "last_run"),
+                         "revive run entry": self.one_failed_read(gw.task_attempts.Transition, "revive_finished", nth=2),
+                         "serve run": self.one_failed_read(gw.task_attempts.Transition, "last_run", call=2)}[where]
+                with stuck:
+                    served = gw._write_task(_task(tid, lease_id="L2", source_event_id="$e"))
+                self.assertIn(served, (None, (f"{tid}~~2", True)), "left unacked, or the delivered run itself")
+                self.assertFalse(list(gw.TASKS_DIR.glob(f"{tid}~~3*")), "never a new run")
+                rec = gw._ATTEMPTS.entry(tid)
+                self.assertFalse(isinstance(rec, dict) and rec.get("owed_publish"), "nothing owed")
+                self.assertFalse(isinstance(rec, dict) and rec.get("run") == tid, "never bound to the first run")
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (f"{tid}~~2", True),
+                                 "healthy again: the same serve, already handled")
+
+    def test_a_damaged_map_in_the_ledger_is_unknown_never_absent_and_never_raises(self):
+        tid = "task-damaged-maps"
+        self.served_acked(tid)
+        for key, junk in (("runs", []), ("runs", "x"), ("seqs", 0), ("wakes", [])):
+            with self.subTest(key=key, junk=junk):
+                saved = ledger().get(key)
+                with txn(tid) as t:
+                    t._change(lambda d, r: (d.__setitem__(key, junk), r)[1], "damage")
+                with txn(tid) as t:
+                    for reader, args in (("last_run", (tid,)), ("run_published", (tid,)), ("wake_seen", ("e1",))):
+                        got = getattr(t, reader)(*args)
+                        if (key, reader) in (("runs", "run_published"), ("seqs", "last_run"), ("wakes", "wake_seen")):
+                            self.assertIs(got, gw.task_attempts.UNKNOWN, (key, reader))
+                self.assertIs(gw._ATTEMPTS.run_of(tid) if key == "runs" else gw.task_attempts.UNKNOWN,
+                              gw.task_attempts.UNKNOWN)
+                with txn(tid) as t:
+                    t._change(lambda d, r: (d.__setitem__(key, saved) if saved is not None else d.pop(key, None), r)[1],
+                              "repair")
+
     def test_the_same_lease_served_again_after_its_run_finished_is_still_a_redelivery(self):
         tid = "task-stale-then-l1"
         fake, _ = self.stale_refused_then_served_again(tid)
