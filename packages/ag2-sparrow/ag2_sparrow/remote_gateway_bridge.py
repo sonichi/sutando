@@ -3526,6 +3526,23 @@ def _core_str(v) -> str | None:
     return v[:_CORE_STEP_MAX] if v else None
 
 
+def _core_status_written_at() -> float | None:
+    """When core-status.json was last written: its `ts` stamp, else the file mtime; None
+    when neither can be read. Never raises."""
+    path = _STATE / "core-status.json"
+    try:
+        with open(path) as f:
+            ts = json.load(f).get("ts")
+        if type(ts) in (int, float) and ts == ts:
+            return float(ts)
+    except Exception:  # noqa: BLE001 — fall back to the mtime
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _read_core_status() -> tuple[str | None, str | None]:
     """Read this node's core-status.json → (status, step) for the presence layer.
     core-status is written by the proactive loop / task handlers (status =
@@ -3966,6 +3983,46 @@ def _maybe_pull_worker_labels(record) -> bool:
 _HEALTH_REPORT_MAX_AGE = 35 * 60
 
 
+# A self-report older than this needs a live beat to stand: a dead core leaves its last
+# "idle" behind, while an idle core rewrites nothing, so a beating core keeps it.
+_CORE_STATUS_MAX_AGE = 60 * 60
+
+
+def _liveness_status(alive) -> str | None:
+    """The status the core's beat alone supports: idle when it beats, offline when it
+    stopped, nothing when there is no beat to judge (a standalone sparrow, or a core
+    that has not started its heartbeat yet)."""
+    return {True: "idle", False: "offline"}.get(alive)
+
+
+def _core_stopped_at() -> float | None:
+    """mtime of this host's graceful-stop tombstone (core_heartbeat.mark_stopped), or None.
+    The next beat run deletes it, so it cannot outlive a core that came back and beat."""
+    try:
+        return (_STATE / "cores" / f"{_profile_host_id()}.stopped").stat().st_mtime
+    except OSError:
+        return None
+
+
+def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
+    """Keep stale or gracefully stopped cores from advertising obsolete work."""
+    status, step = _read_core_status()
+    alive = core_health.get("alive") if isinstance(core_health, dict) else None
+    written_at = _core_status_written_at() if status is not None else None
+    stopped_at = _core_stopped_at() if core_health is not None and alive is not True else None
+    if stopped_at is not None and (written_at is None or written_at < stopped_at):
+        # A stop newer than the self-report outranks it; a later start supersedes the stop.
+        status, step = "offline", None
+    elif core_health is not None and (written_at is None or (
+            alive is not True and time.time() - written_at > _CORE_STATUS_MAX_AGE)):
+        # A stopped core deletes its beat, so a missing beat vouches for nothing; omitting the
+        # field would leave the broker's last presence status standing.
+        status, step = _liveness_status(alive), None
+        if status is None:
+            status, step = "unknown", "Core liveness unavailable"
+    return status, step
+
+
 def _diagnostic_health(health: "dict | None") -> "dict | None":
     """A fresh failing independent check is a quiet structured health warning."""
     try:
@@ -3993,14 +4050,15 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
+    core_health = health
     health = _diagnostic_health(health)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    # Health travels only in its structured field; status/step describe the core's work.
-    _status, _step = _read_core_status()
+    # Diagnostics stay separate; liveness still invalidates obsolete work reports.
+    _status, _step = _reported_core_status(core_health)
     try:
         payload = {
             "client": "sutando-gateway-client",

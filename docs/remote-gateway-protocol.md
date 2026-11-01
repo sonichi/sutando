@@ -946,10 +946,11 @@ It uses the same failure predicate as the local check's exit code. Warnings
 remain warnings; check names, diagnostic output, task text, and paths are not
 included in the record.
 
-The heartbeat's `status` and `step` describe work from `core-status.json` only.
-Diagnostics, missing or stale liveness, and graceful-stop markers never replace
-those fields with health warnings. A missing or malformed work report omits them;
-an idle report continues to omit its stale step.
+The heartbeat's `status` and `step` describe work from `core-status.json`, subject
+to the existing liveness safeguards above: a newer graceful-stop tombstone reports
+`offline`, and a missing/stale self-report without a live beat uses the beat's
+`offline`/`idle`/`unknown` verdict. Diagnostic check failures never replace work
+fields. An idle or offline verdict omits the stale step.
 
 Health travels separately in the existing `health` object (`alive`, `motion`,
 `condition`, `reason`, `since`) with the `worker_health.v1` capability. The
@@ -960,8 +961,8 @@ A valid independent report with failures and age at most 35 minutes sets
 Passing, stale or invalid reports leave the source row unchanged. The broker
 derives `needs_attention: false` for `health-check`; the bridge does not send a
 new attention field. A diagnostic condition change participates in the existing
-heartbeat change detection. Consumers must use this structured field
-for health, rather than interpreting the work status as a liveness verdict.
+heartbeat change detection. Consumers use this structured field for diagnostic
+health; presence still receives the existing liveness override in `status`.
 
 This bridge change requires loading the updated bridge code. It does not require
 a core restart or change the broker's health schema. The broker's existing
