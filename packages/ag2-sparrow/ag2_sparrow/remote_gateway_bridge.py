@@ -4058,7 +4058,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     _last_heartbeat_at = now
     _last_core_health = health
     # Diagnostics stay separate; liveness still invalidates obsolete work reports.
-    _status, _step = _reported_core_status(core_health)
+    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else core_health)
     try:
         payload = {
             "client": "sutando-gateway-client",
