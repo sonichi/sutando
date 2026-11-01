@@ -991,8 +991,12 @@ leaves sidecars inert. Sidecar retention follows workspace retention.
 
 New activity rows expose `task.origins` when IDs are available, merging the
 header with the latest sidecar at append time; `task.event` keeps its original
-meaning. Existing activity rows are not rewritten. Clients that ignore the new
-field retain their current behavior.
+meaning. The existing loopback `/media/state/agent-activity.jsonl` route and its
+summaries, legacy archive and dated archive variants also merge sidecar origins
+at read time. Thus an accepted fold after the holder is done appears on the next
+fetch without another activity row. These projected responses use `no-store`;
+row timestamps, lifecycle fields and stored activity files remain unchanged.
+Clients that ignore the new field retain their current behavior.
 
 ### Local hook activity attribution
 

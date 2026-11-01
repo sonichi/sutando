@@ -20,6 +20,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`ack_overlap.py`** — Whether a task's initial status ack would duplicate what the room already sees about it.
 - **`activity_bus.py`** — ActivityCard is the UI projection of a durable TaskRun state machine; runtime instrumentation only enriches that state machine with observations.
 - **`activity_policy.py`** — Access tier → capabilities → audience policy → projection.
+- **`activity_projection.py`** — Read-time origin correlation for the existing local activity media projection.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
