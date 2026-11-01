@@ -823,6 +823,8 @@ class ReconnectPreflight(Base):
 
     def test_a_failed_launch_brings_the_previous_bridge_back_from_its_checkout(self):
         good, bad = self.ws / "main", self.ws / "wt"
+        (good / "src").mkdir(parents=True)
+        (good / "src" / "remote-gateway-bridge.py").write_text("")
         C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
                  spawn=self.bridge_spawn(), fetch=unreachable)
         self.assertEqual(C._launch_record("beta-fixture-net", self.ws)["repo"], str(good.resolve()))
@@ -842,6 +844,8 @@ class ReconnectPreflight(Base):
 
     def test_when_the_previous_bridge_will_not_start_either_both_failures_are_named(self):
         good = self.ws / "main"
+        (good / "src").mkdir(parents=True)
+        (good / "src" / "remote-gateway-bridge.py").write_text("")
         C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
                  spawn=self.bridge_spawn(), fetch=unreachable)
 
@@ -852,6 +856,40 @@ class ReconnectPreflight(Base):
         self.assertIn("failed too", str(cm.exception))
         self.assertEqual(C._launch_record("beta-fixture-net", self.ws).get("last_repo"), str(good.resolve()),
                          "the last good checkout survives failed records")
+
+    def test_a_failure_from_the_same_checkout_is_not_retried(self):
+        repo = self.ws / "main"
+        C.launch("beta-fixture-net", repo=repo, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            spawned.append(argv)
+            raise OSError("will not start")
+        with self.assertRaisesRegex(C.LaunchFailed, "same checkout, so it was not retried"):
+            self.reconnect(repo, spawn=spawn)
+        self.assertEqual(len(spawned), 1, "one attempt, no second run of the same code")
+
+    def test_a_previous_checkout_without_its_bridge_is_not_spawned(self):
+        good = self.ws / "gone"
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            spawned.append(argv)
+            raise OSError("will not start")
+        with self.assertRaisesRegex(C.LaunchFailed, "has no bridge any more"):
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertEqual(len(spawned), 1)
+
+    def test_a_vault_error_passes_through_unwrapped(self):
+        bridge = self.running()
+        with unittest.mock.patch.object(C, "launch_env", side_effect=C.VaultUnavailable("vault down")):
+            with self.assertRaises(C.VaultUnavailable) as cm:
+                self.reconnect(self.ws / "repo")
+        self.assertNotIsInstance(cm.exception, C.RelaunchPreflightFailed)
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid))
 
     def test_with_no_previous_bridge_the_failure_says_so(self):
         def spawn(argv, env, log_path):

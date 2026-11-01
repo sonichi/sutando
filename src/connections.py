@@ -2558,6 +2558,8 @@ def _launch_preflight(instance: str, repo: Path, environ: Mapping[str, str], wor
         answer = _launch_probe(Path(repo), env, python)
     except NoToken as e:
         raise RelaunchPreflightFailed(instance, str(e)) from None
+    except VaultUnavailable:
+        raise  # the vault's own error (HTTP 503), not this checkout's
     except (ValueError, ConnectionsError) as e:
         raise RelaunchPreflightFailed(instance, str(e)) from None
     here = str(_workspace(workspace).resolve())
@@ -2871,6 +2873,12 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     except LaunchFailed as e:
         if not stopped or not previous_repo:
             raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
+        if Path(previous_repo).resolve() == Path(repo).resolve():
+            raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
+                               "retried: the lane is down until it is relaunched") from None
+        if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
+            raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
+                               "the lane is down until it is relaunched") from None
         try:
             back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
                           vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
