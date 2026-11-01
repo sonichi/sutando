@@ -140,6 +140,54 @@ def main() -> int:
     check(gate.cors_origin(None, HOST) == "" and gate.cors_origin("", HOST) == "", "gate: no Origin, no grant")
     check(gate.cors_origin("http://[::1", HOST) == "", "gate: a malformed Origin gets no grant")
 
+    # f) the same paths in-process: CI's coverage traces the main thread only (concurrency =
+    #    multiprocessing), so the server thread above proves behaviour and this measures it
+    import io
+    from unittest import mock
+
+    def bare(method, path, headers, body=b""):
+        h = api.Handler.__new__(api.Handler)
+        h.path, h.headers, h.rfile, h.wfile = path, dict(headers), io.BytesIO(body), io.BytesIO()
+        h.server = type("S", (), {"server_address": ("127.0.0.1", PORT)})()
+        sent = []
+        h.send_response = lambda code, msg=None: sent.append(("status", code))
+        h.send_header = lambda k, v: sent.append((k, v))
+        h.end_headers = lambda: None
+        getattr(h, "do_" + method)()
+        return dict(sent), h
+
+    rebound = {"Host": f"evil.example:{PORT}", "Origin": f"http://evil.example:{PORT}"}
+    sent, _h = bare("GET", "/ping", {"Host": HOST, "Origin": "tauri://localhost"})
+    check(sent.get("Access-Control-Allow-Origin") == "tauri://localhost", "f) in-process: the desktop origin is echoed")
+    for method, path in (("GET", "/ping"), ("OPTIONS", "/tasks/active"), ("DELETE", "/x")):
+        sent, _h = bare(method, path, rebound)
+        check(sent.get("status") == 403, f"f) in-process: {method} under a rebinding Host is 403")
+    sent, h = bare("POST", "/task", {**rebound, "Content-Length": "5"}, b"hello")
+    check(sent.get("status") == 403 and h.rfile.tell() == 5, "f) in-process: POST /task refused after reading its body")
+    sent, _h = bare("POST", "/task", {**rebound, "Content-Length": "junk"})
+    check(sent.get("status") == 403, "f) in-process: a malformed Content-Length is still a refusal")
+    h = api.Handler.__new__(api.Handler)
+    h.path, h.headers = "/twilio/voice", dict(rebound)
+    check(h.host_allowed() is True, "f) in-process: Twilio's tunnel Host is exempt")
+    check(h._bound_port() is None, "f) a handler with no server has no bound port")
+    sent, _h = bare("GET", "/media/results/media/pic.png", {"Host": HOST, "Origin": "tauri://localhost"})
+    check(sent.get("status") == 200 and sent.get("Access-Control-Allow-Origin") == "tauri://localhost",
+          "f) in-process: media carries the echoed grant")
+    avatar = WS / "avatar.png"
+    avatar.write_bytes(b"\x89PNG")
+    with mock.patch.object(api, "personal_path", lambda *a, **k: avatar):
+        sent, _h = bare("GET", "/avatar", {"Host": HOST, "Origin": "tauri://localhost"})
+    check(sent.get("status") == 200 and sent.get("Access-Control-Allow-Origin") == "tauri://localhost",
+          "f) in-process: the avatar carries the echoed grant")
+    with mock.patch.object(api, "config_get", lambda key, default=None: "not-a-port"):
+        check(api._port_setting("CLIENT_PORT", 8080) == 8080, "f) a malformed CLIENT_PORT falls back to 8080")
+    check(gate.cors_origin("tauri://localhost", HOST) == "tauri://localhost", "gate: a loopback origin is echoed")
+    check(gate.cors_origin("http://192.168.1.20:9999", "192.168.1.20:7843", {7843}) == "",
+          "gate: the same host on another port gets no grant")
+    check(gate.cors_origin("http://evil.example", "192.168.1.20:7843", {7843}) == "", "gate: another host gets none")
+    check(gate.rebinding_safe_host("10.0.0.1:7843") and not gate.rebinding_safe_host("evil.example:7843"),
+          "gate: an IP literal is safe, a foreign name is not")
+
     server.shutdown()
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}")
