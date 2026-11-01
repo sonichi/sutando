@@ -22,7 +22,6 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from task_origins import origin_header
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -38,6 +37,7 @@ sys.stderr.reconfigure(line_buffering=True)
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
 # best-effort so the bridge keeps booting if vision_push.py is missing.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from task_origins import origin_header  # noqa: E402
 try:
     from vision_push import push_image as _push_vision_image  # type: ignore
 except Exception:  # pragma: no cover — bridge must keep running

@@ -7,14 +7,9 @@ import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
 
-try:
-    from .file_lock import locked_file
-except ImportError:
-    from file_lock import locked_file
-
 MAX_ORIGINS = 128
 MAX_MESSAGE_ID = 512
-MAX_RECORD_BYTES = MAX_ORIGINS * (MAX_MESSAGE_ID * 6 + 4) + 1024
+MAX_RECORD_BYTES = MAX_ORIGINS * (MAX_MESSAGE_ID * 12 + 4) + 1024
 
 
 def normalize_origins(values: Iterable[str]) -> list[str]:
@@ -66,6 +61,10 @@ def read_origins(state_dir: Path, task_id: str) -> list[str]:
 
 def append_origins(state_dir: Path, task_id: str, values: Iterable[str]) -> bool:
     """Keep the first 128 unique ids. Return False on IO failure; leave delivery decisions unchanged."""
+    try:
+        from .file_lock import locked_file
+    except ImportError:
+        from file_lock import locked_file
     try:
         path = _path(state_dir, task_id)
         incoming = normalize_origins(values)

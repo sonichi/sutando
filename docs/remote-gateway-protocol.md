@@ -983,7 +983,8 @@ replaces the record. Retries are idempotent; concurrent processes share the lock
 
 Records keep the first 128 unique IDs, each at most 512 characters, with no
 whitespace, control characters or commas. Excess IDs are dropped; this is a
-bounded correlation window, not an exhaustive audit trail. Missing or malformed
+bounded correlation window, not an exhaustive audit trail. The read cap includes
+JSON surrogate-pair escaping for all 128 maximum-length non-BMP IDs. Missing or malformed
 records read as empty. Write failures are logged by dedup recovery and do not
 change delivery behavior. There is no migration or new configuration; rollback
 leaves sidecars inert. Sidecar retention follows workspace retention.

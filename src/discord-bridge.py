@@ -19,7 +19,6 @@ import sys
 import tempfile
 import time
 import weakref
-from task_origins import origin_header
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -112,6 +111,7 @@ except ModuleNotFoundError:
     raise
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from task_origins import origin_header  # noqa: E402
 # Entrypoint-owned path setup: ``import ag2_sparrow`` resolves uninstalled (5b).
 _PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package (gateway-shim parity)
 if _PKG_ROOT not in sys.path:

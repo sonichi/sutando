@@ -2,6 +2,7 @@
 import ast
 import concurrent.futures
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -68,6 +69,32 @@ class Origins(unittest.TestCase):
         self.assertEqual(result[0], '$seed')
         self.assertFalse(origins.append_origins(self.state, '../escape', ['$x']))
         self.assertEqual(origins.read_origins(self.state, '../escape'), [])
+
+    def test_maximum_non_bmp_record_round_trips_without_loss(self):
+        values = [chr(0x1F600 + i) * origins.MAX_MESSAGE_ID
+                  for i in range(origins.MAX_ORIGINS)]
+        self.assertTrue(origins.append_origins(self.state, 'task-holder', values))
+        path = self.state / 'task-origins/task-holder.json'
+        self.assertLessEqual(path.stat().st_size, origins.MAX_RECORD_BYTES)
+        self.assertEqual(origins.read_origins(self.state, 'task-holder'), values)
+        self.assertTrue(origins.append_origins(self.state, 'task-holder', ['$later']))
+        self.assertEqual(origins.read_origins(self.state, 'task-holder'), values)
+
+    def test_standalone_file_spec_serializer_seeds_origins(self):
+        script = """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('isolated_protocol', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+text = module.serialize_task_last([('source_message_id', '$standalone')], 'hello')
+assert 'origin_message_ids: $standalone\\n' in text, text
+"""
+        for path in ('src/local_task_protocol.py',
+                     'packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py'):
+            proc = subprocess.run([sys.executable, '-I', '-c', script, str(REPO / path)],
+                                  cwd=self.ws, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_failure_preserves_old_record_and_cleans_stage(self):
         origins.append_origins(self.state, 'task-holder', ['$old'])

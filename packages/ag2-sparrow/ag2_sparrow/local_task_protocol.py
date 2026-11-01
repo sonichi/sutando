@@ -998,7 +998,15 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
         try:
             from .task_origins import origin_header
         except ImportError:
-            from task_origins import origin_header
+            try:
+                from task_origins import origin_header
+            except ImportError:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "_task_origin_header", Path(__file__).with_name("task_origins.py"))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                origin_header = module.origin_header
         source = next((v for k, v in headers if k == "source_message_id"), "")
         seeded = origin_header(source)
         if seeded:
