@@ -489,6 +489,65 @@ class Hook(unittest.TestCase):
         (self.ws / "fence.jsonl").write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "```\ncode\n```"}]}}) + "\nnot json\n")
         self.assertIsNone(hook.last_narration(self.ws / "fence.jsonl"))
 
+    def stop_text(self, text, run=None):
+        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "t1"}, "line": "a"})
+        hook.bind(self.p, "t1", "S1")
+        tp = self.ws / "stop.jsonl"
+        tp.write_text(json.dumps({"type": "assistant", "message": {
+            "content": [{"type": "text", "text": text}]}}) + "\n")
+        return hook.handle({"hook_event_name": "Stop", "session_id": "S1", "transcript_path": str(tp)},
+                           self.p, run or self.run)
+
+    def test_stop_suppresses_harness_text_before_truncating(self):
+        samples = ["Monitor event: TASK_FILE: task-dev-s-space~task-123",
+                   "Streaming task watcher", "task-dev-s-space~task-123.txt",
+                   "<system-reminder>internal prompt</system-reminder>",
+                   "<task-notification>finished</task-notification>",
+                   "Notification: background tool finished", "Background notification from watcher",
+                   "System reminder: internal prompt", "Sutando task ready: task-123.txt",
+                   "Looking at it.\nTASK_FILE: task-123", "x" * 300 + " Monitor event: ready"]
+        for text in samples:
+            with self.subTest(text=text):
+                self.runs.clear()
+                self.assertEqual(self.stop_text(text), [])
+                self.assertEqual(self.runs, [])
+
+    def test_stop_maps_limit_errors_to_one_safe_notice(self):
+        samples = [
+            ("Monitor event: TASK_FILE: task-dev-s-space~task-123 · Streaming task watcher "
+             "You've hit your weekly limit · resets Nov 5 at 2pm (America/Los_Angeles)",
+             "Paused: usage limit (resets Nov 5 at 2pm (America/Los_Angeles))"),
+            ("API Error: 429 rate_limit_error: too many requests", "Paused: usage limit"),
+            ("Usage limit reached. Resets 14:30 UTC", "Paused: usage limit (resets 14:30 UTC)"),
+            ("Rate limit exceeded. resets 2pm TASK_FILE: task-secret", "Paused: usage limit (resets 2pm)"),
+            ("You've hit your session limit\nresets 3pm", "Paused: usage limit (resets 3pm)"),
+            ("API Error: 429 resets <system-reminder>secret</system-reminder>", "Paused: usage limit"),
+            ("API Error: 429 resets 2pm (" + "A" * 70 + "/Zone)", "Paused: usage limit"),
+        ]
+        for raw, expected in samples:
+            with self.subTest(raw=raw):
+                self.runs.clear()
+                self.assertEqual(self.stop_text(raw), [("notice", expected)])
+                self.assertEqual(len(self.runs), 1)
+                cmd = self.runs[0]
+                self.assertEqual(cmd[cmd.index("--kind") + 1], "notice")
+                self.assertEqual(cmd[3], expected)
+                self.assertEqual(cmd[cmd.index("--room") + 1], "!dm:s")
+
+    def test_stop_keeps_normal_narration_and_does_not_replay_old_text(self):
+        for text in ("Checking the rate limit configuration.", "The task is ready for review."):
+            self.assertEqual(self.stop_text(text), [("thinking", text)])
+        self.assertEqual(self.stop_text("x" * 300), [("thinking", "x" * 240)])
+        self.assertEqual(self.stop_text("Notification: finished"), [])
+
+    def test_limit_notice_is_sanitized_in_the_production_writer(self):
+        raw = "Monitor event: TASK_FILE: task-secret You've hit your weekly limit · resets 2pm"
+        self.assertEqual(self.stop_text(raw, subprocess.run), [("notice", "Paused: usage limit (resets 2pm)")])
+        row = json.loads(self.p["log"].read_text().splitlines()[-1])
+        self.assertEqual((row["kind"], row["line"], row["room"]),
+                         ("notice", "Paused: usage limit (resets 2pm)", "!dm:s"))
+        self.assertNotIn("task-secret", json.dumps(row))
+
     def test_first_touch_of_a_task_file_binds_and_writes_processing_from_its_headers(self):
         (self.ws / "tasks" / "task-abc123.txt").write_text(
             "id: task-abc123\nchannel_id: !team:s\nuser_id: @q:s\nsender_name: qingyun\ntask: Read the latest discussion in this room.\nsource: ag2space\n")

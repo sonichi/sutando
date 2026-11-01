@@ -966,3 +966,19 @@ The s.space dashboard already classifies `error` as unhealthy, so this
 requires updating Sutando's health checker and restarting its gateway bridge;
 no dashboard schema change is needed. Reporting starts after the first health
 check completes and follows the installed check cadence.
+
+### Turn-end activity text
+
+The agent-activity Stop hook classifies the last assistant text before creating
+a row. Task IDs, `TASK_FILE`/Monitor events, streaming-watcher text,
+system-reminder tags and notification text are suppressed rather than displayed
+as thinking. Ordinary narration still uses its first line, capped at 240
+characters, and remains attached only to the session's bound open task.
+
+Recognized API 429, rate-limit and usage-limit errors emit one `notice` per
+Stop invocation: `Paused: usage limit (resets <time>)`. Only a recognized
+clock time (optionally month/day and timezone), bounded to 64 characters, is
+carried through. Without a recognized reset time the notice is simply
+`Paused: usage limit`. Mixed harness/error text uses the same sanitized notice;
+the raw error is never copied into that row. This deterministic filter does not
+change task execution, retries, room routing, or historical activity rows.

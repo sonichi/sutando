@@ -220,10 +220,35 @@ def working_line(tool_name: str, tool_input) -> str | None:
 
 TAIL_BYTES = 64 * 1024
 
+LIMIT_ERROR = re.compile(
+    r"\b(?:you['’]ve|you have) (?:hit|reached|exceeded) your (?:session|usage|weekly|daily) limit"
+    r"|\b(?:usage|rate)[ _-]limit(?:_error|\s+(?:reached|exceeded))\b"
+    r"|\bAPI\s+(?:error|rate[ -]limit)\s*:?\s*429\b", re.I)
+RESET_TIME = re.compile(
+    r"\bresets?\s+(?:at\s+)?((?:[A-Z][a-z]{2} \d{1,2} at )?"
+    r"(?:\d{1,2}(?::\d{2})?\s*[ap]m|\d{1,2}:\d{2})"
+    r"(?: \(?(?:[A-Za-z_]+/[A-Za-z_]+|UTC|GMT|[A-Z]{2,4}[SD]T)\)?)?)(?![\w:])", re.I)
+HARNESS_TEXT = re.compile(
+    r"\btask-[A-Za-z0-9][\w.~/-]*|\bTASK_FILE\s*:|\bMonitor\s+event\s*:"
+    r"|Streaming task watcher|Sutando task ready|</?(?:system-reminder|[\w-]*notification)\b"
+    r"|^\s*(?:system[- ]reminder|(?:task[- ]|background[- ])?notification)\b", re.I | re.M)
 
-def last_narration(transcript: Path) -> str | None:
-    """First line of the last assistant text block, read from the file's tail only (a transcript grows
-    to tens of MB; Stop fires per turn), from complete lines only (a row mid-write is ignored)."""
+
+def narration_row(text: str) -> tuple[str, str] | None:
+    """Only narration or a bounded limit notice may become turn-end activity."""
+    if LIMIT_ERROR.search(text):
+        reset = RESET_TIME.search(text)
+        when = " ".join(reset.group(1).split()) if reset else ""
+        suffix = f" (resets {when})" if when and len(when) <= 64 else ""
+        return "notice", "Paused: usage limit" + suffix
+    if HARNESS_TEXT.search(text):
+        return None
+    return "thinking", text.split("\n", 1)[0][:TEXT_MAX]
+
+
+def last_narration(transcript: Path, *, full_text: bool = False) -> str | None:
+    """Read complete transcript rows from the bounded tail; return the last assistant first line.
+    full_text lets the writer classify the entire block before truncating its display line."""
     try:
         with open(transcript, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -250,7 +275,7 @@ def last_narration(transcript: Path) -> str | None:
             if isinstance(b, dict) and b.get("type") == "text":
                 t = (b.get("text") or "").strip()
                 if t and not t.startswith("```"):
-                    return t.split("\n", 1)[0][:TEXT_MAX]
+                    return t if full_text else t.split("\n", 1)[0][:TEXT_MAX]
         return None
     return None
 
@@ -365,10 +390,12 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         tp = payload.get("transcript_path")
         task, room = bound_task(p, sid)
         if task and isinstance(tp, str):
-            line = last_narration(Path(tp))
-            if line:
-                emit("thinking", line, task, room, p["ws"], run)
-                out.append(("thinking", line))
+            line = last_narration(Path(tp), full_text=True)
+            row = narration_row(line) if line else None
+            if row:
+                kind, line = row
+                emit(kind, line, task, room, p["ws"], run)
+                out.append(row)
     return out
 
 
