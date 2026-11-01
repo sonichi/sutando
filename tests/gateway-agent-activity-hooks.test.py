@@ -753,6 +753,52 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._post_task_ack(run, durable=True))
         self.assertNotEqual(gw._ATTEMPTS.get(tid)["turn_id"], first, "a new turn at the same generation")
 
+    def test_a_wake_served_again_under_a_new_lease_is_held_and_its_ack_decides(self):
+        wake = {"blocker_episode_id": "ew1", "resolved_blockers": [
+            {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "blue"}}]}
+        for gen, restart in ((1, False), (2, False), (1, True), (2, True)):
+            with self.subTest(gen=gen, restart=restart):
+                tid = f"task-wake-l2-g{gen}-{restart}"
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L1", source_event_id="$e", wake=wake)), (tid, True))
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True},
+                                               "/v1/tasks/heartbeat": {"ok": True}}))
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+                self.assertEqual(gw._ATTEMPTS.get(tid)["wake_episode"], "ew1")
+                inflight = {tid}
+                before = sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*"))
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", wake=wake)), (tid, True))
+                self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), before, "nothing published")
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertEqual((rec["lease_id"], rec["pending_serve"]["lease"], rec["pending_serve"]["wake_episode"]),
+                                 ("L1", "L2", "ew1"), "held, never rebound to the running wake")
+                if restart:
+                    gw._ATTEMPTS.take_ownership()
+                fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid, g=gen: _ack(t, g)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                rec = gw._ATTEMPTS.get(tid)
+                if gen == 1:
+                    self.assertEqual((rec["run"], rec["lease_id"], rec.get("pending_serve"), rec.get("owed_publish")),
+                                     (tid, "L2", None, None), "the same generation: one run, the lease rotated")
+                    self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), before)
+                    continue
+                run = rec["run"]
+                self.assertNotEqual(run, tid)
+                self.assertEqual((rec["execution_generation"], rec["wake_episode"]), (2, "ew1"), "its episode kept")
+                gw._post_task_beats(inflight, force=True)
+                text = (gw.TASKS_DIR / f"{run}.txt").read_text()
+                self.assertIn('answered "blue"', text, "the newer run carries the wake's answer")
+                self.assertIn("wake_episode: ew1", text)
+                self.assertIn(gw.task_attempts.wake_turn_rule("ew1"), text)
+                self.assertEqual(len(list(gw.TASKS_DIR.glob(f"{run}.txt"))), 1, "published once")
+
+    def test_a_held_serve_saved_with_a_whole_wake_is_never_adopted(self):
+        tid = "task-legacy-wake-hold"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e"), set(), []))
+        with gw._ATTEMPTS.transition(tid) as t:
+            self.assertTrue(t.put(pending_serve={"lease": "L2", "run": f"{tid}~~2", "source": "$e",
+                                                 "wake": {"blocker_episode_id": "x"}, "at": 1.0}))
+            self.assertIs(t.serve_adoptable(1), False)
+
     def test_a_running_wake_served_again_is_a_redelivery_not_a_conflict(self):
         wake = {"blocker_episode_id": "e3", "resolved_blockers": []}
         self.assertEqual(gw._write_task(_task("task-rerun", wake=wake)), ("task-rerun", True))

@@ -671,10 +671,12 @@ class Transition:
         pending = rec.get("pending_serve") if isinstance(rec, dict) else None
         return pending.get("lease") if isinstance(pending, dict) else None
 
-    def hold_serve(self, lease: "str | None", run: str, source: "str | None", wake=None) -> bool:
+    def hold_serve(self, lease: "str | None", run: str, source: "str | None",
+                   wake_episode: "str | None" = None) -> bool:
         """Record a serve under a new lease for a run that may already execute: the run keeps its
         generation and nothing is published until the serve's ack names one."""
-        return self.put(pending_serve={"lease": lease, "run": run, "source": source, "wake": wake, "at": self.now()})
+        return self.put(pending_serve={"lease": lease, "run": run, "source": source,
+                                       "wake_episode": wake_episode, "at": self.now()})
 
     def serve_adoptable(self, gen) -> bool:
         """Whether the pending serve is the run's own generation re-served (a lost ack): the same
@@ -695,8 +697,9 @@ class Transition:
             return UNKNOWN
         seq, newest = (run or {}).get("seq"), (cand or {}).get("seq")
         no_newer = type(seq) is int and type(newest) is int and seq < newest and newest == last
-        return (same and quiet and no_newer and pending.get("source") == rec.get("source_event_id")
-                and pending.get("wake") == rec.get("wake_episode"))
+        episode = _pending_episode(pending)
+        return (same and quiet and no_newer and episode is not _LEGACY_WAKE
+                and pending.get("source") == rec.get("source_event_id") and episode == rec.get("wake_episode"))
 
     def revive_finished(self, first_run: str, lease: "str | None",
                         used: Callable[[str], bool] = lambda _local: False):
@@ -745,6 +748,7 @@ class Transition:
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if not self.holds_claim(c) or not isinstance(pending, dict) or type(gen) is not int:
             return None
+        episode = _pending_episode(pending)
         if rec.get("turn_id"):
             self.close_turn(rec["turn_id"])
         fields = {**context, "run": pending["run"], "lease_id": pending.get("lease"), "pending_serve": None,
@@ -753,7 +757,8 @@ class Transition:
                   "published_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None,
                   "awaiting_ack": False, "dispatch_lost": None, "owed_close": None, "owed_ctl": None,
                   "stop_ctl": None, "stop_requested": None, "stop_confirmed": None,
-                  "missing_since": None, "hold_reported": None, "wake_episode": None,
+                  "missing_since": None, "hold_reported": None,
+                  "wake_episode": episode if type(episode) is str else None,
                   "cancel_requested_generation": None, "cancel_requested_attempt": None,
                   "owed_publish": pending["run"], "finished": None}
         if self.owner.turn_context and open_turn:
@@ -1181,6 +1186,19 @@ def serve_context(task: dict) -> dict:
     return {"room_id": s("source_room_id", "channel_id"), "thread_root_id": s("thread_root"),
             "source_event_id": s("source_event_id", "source_message_id", "event_id"),
             "source_kind": s("source_kind", "interaction_type")}
+
+
+# A held serve saved before episodes were stored by id: never adopted, its episode never guessed.
+_LEGACY_WAKE = "<legacy wake>"
+
+
+def _pending_episode(pending: dict):
+    """The wake episode a held serve was served for: its id, None for no wake, or _LEGACY_WAKE."""
+    if "wake_episode" in pending:
+        ep = pending["wake_episode"]
+        return ep if ep is None or type(ep) is str else _LEGACY_WAKE
+    legacy = pending.get("wake")
+    return legacy if legacy is None or type(legacy) is str else _LEGACY_WAKE
 
 
 def _close_turn(owner: TaskAttempts, turn_id: str) -> None:

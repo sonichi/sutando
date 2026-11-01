@@ -4583,7 +4583,7 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
         _log_backoff((run, "reserve-unread"), f"task {run}: its served task cannot be read now "
                      f"({diagnostics.describe(e)}) — not published yet, retried next beat")
         return
-    if not _write_task(task, run=run, rerun=rerun):
+    if not _write_task(task, run=run, rerun=rerun, woken=rec.get("wake_episode")):
         _log_backoff((run, "unpublished"), f"task {run}: its run is not published yet — retried next beat")
         return
     with _ATTEMPTS.transition(wire_tid) as t:
@@ -5584,7 +5584,7 @@ def _task_intake_veto(task: dict) -> "str | None":
 
 
 def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
-                rerun: "str | None" = None) -> "tuple[str, bool] | None":
+                rerun: "str | None" = None, woken: "str | None" = None) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
     committed, which is what an ack may claim — or None when nothing was queued.
@@ -5601,10 +5601,13 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
-    woken = None
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication
         task = {**task, "id": tid}
+        if woken and isinstance(task.get("wake"), dict):
+            task = {**task, "task": task_attempts.render_wake(str(task.get("task") or ""), task["wake"])}
+        else:
+            woken = None
     elif _ATTEMPTS is not None:
         # Decided before any local shortcut: running a wake without its answer, or closing it as a
         # redelivery, would lose the answer.
@@ -5824,6 +5827,10 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
             episode = wake.get("blocker_episode_id") if isinstance(wake, dict) else None
             opened = None
             if TURN_CONTEXT and not hold:
+                rec = t.rec
+                if (isinstance(rec, dict) and episode and rec.get("wake_episode") == episode
+                        and rec.get("run") and rec.get("lease_id") != lease):
+                    return _hold_reserve(t, first, task, lease)   # the same episode under a new lease
                 if _earlier_run_settling(t, first, episode):
                     _log_backoff((first, "wake-settling"), f"wake for {first}: its earlier run is still "
                                  "settling here — left unacked until the broker serves it again")
@@ -5892,13 +5899,19 @@ def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str,
     path = _reserve_path(t.wire)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not _durable_write(path, json.dumps({**task, "id": t.wire}, sort_keys=True)) or not t.hold_serve(
-            lease, cand, task_attempts.serve_context(task)["source_event_id"], task.get("wake")):
+            lease, cand, task_attempts.serve_context(task)["source_event_id"], _wake_episode_of(task)):
         _log_backoff((first, "unrecorded"), f"task {first}: its re-serve could not be recorded "
                      "— left unacked for a re-serve")
         return None
     _log(f"task {first}: served again under a new lease while its run may be executing — nothing is "
          "published until the ack names the generation")
     return rec["run"], None, True
+
+
+def _wake_episode_of(task: dict) -> "str | None":
+    wake = task.get("wake")
+    ep = wake.get("blocker_episode_id") if isinstance(wake, dict) else None
+    return ep if type(ep) is str and ep else None
 
 
 def _serve_run(t, first: str) -> "str | None":
