@@ -132,13 +132,16 @@ class StepPublisher:
                 args = None
             if args is None:
                 continue
-            self._send(tid, wire, gen, room, args, json.dumps(args, sort_keys=True))
+            if self._send(tid, wire, gen, room, args, json.dumps(args, sort_keys=True)):
+                self.log(f"task step {tid}: published {args['phase']}"
+                         + (f" ({args['waiting']})" if args.get("waiting") else ""))
 
-    def _send(self, tid, wire, gen, room, args, stamp) -> None:
+    def _send(self, tid, wire, gen, room, args, stamp) -> bool:
+        """Send one step unless it is unchanged or throttled; True when it was published now."""
         identity = (wire, gen, stamp)
         now = self.now()
         if self.sent.get(tid) == identity or now - self.attempted.get(tid, -float("inf")) < INTERVAL:
-            return
+            return False
         key = hashlib.sha256(json.dumps([wire, gen, stamp], ensure_ascii=False).encode()).hexdigest()
         payload = {"action": "room.task.progress", "target_kind": "room", "room_id": room,
                    "task_id": wire, "execution_generation": gen, "operation_id": "step-" + key, "arguments": args}
@@ -147,10 +150,11 @@ class StepPublisher:
             response = self.send(payload)
             if isinstance(response, dict) and response.get("status") == "not_deployed":
                 self.log(f"task step {tid}: room.task.progress not deployed; skipping")
-                return
+                return False
             if not isinstance(response, dict) or response.get("status") != "completed":
                 raise ValueError("Action did not succeed")
         except Exception as exc:
             self.log(f"task step {tid}: Action failed ({type(exc).__name__}); continuing")
-            return
+            return False
         self.sent[tid] = identity
+        return True

@@ -432,6 +432,16 @@ class Typed(unittest.TestCase):
         self.assertEqual(self.calls[-1]["arguments"]["waiting"], "delegated")
         self.assertNotIn("queue_ahead", self.calls[-1]["arguments"])
 
+    def test_a_published_step_is_logged_with_its_phase_and_never_its_text(self):
+        self.status["task-dev~task-a"] = {"phase": "Waiting", "summary": "Queued · next", "since": 1.0,
+                                          "waiting": {"reason": "queued", "position": 1}}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.logs, ["task step task-dev~task-a: published Waiting (queued)"])
+        self.clock += 10
+        self.status["task-dev~task-a"] = {"phase": "Running tests", "summary": "Running tests", "since": 2.0}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.logs[-1], "task step task-dev~task-a: published Running tests")
+
     def test_unchanged_status_is_not_resent_and_nothing_for_a_finished_task(self):
         self.status["task-dev~task-a"] = {"phase": "Reading files", "summary": "Reading files", "since": 1.0}
         self.pub.publish(self.tasks)
