@@ -184,6 +184,31 @@ class Writer(unittest.TestCase):
         self.assertEqual(len({json.loads(line)["interaction_id"] for line in lines}), 100)
 
 
+class ProducerIds(unittest.TestCase):
+    """is_task_id accepts every id a producer mints (built here by the producers themselves), within
+    the archive lookup charset, and still refuses a person's handle in any position."""
+
+    def test_every_producer_shape_is_a_task_id(self):
+        from cron_task_id import task_id as cron_id
+        from ingress_identity import provider_task_id
+        from local_task_protocol import valid_archive_lookup_id
+        minted = [provider_task_id("tg123", "42"), provider_task_id("tg123", "1234567"),
+                  provider_task_id("dc111", "222"), provider_task_id("slack-T0ABC", "1700000000.123456"),
+                  provider_task_id("s_dspace", "task-9905cc47dfa0f6b12e"), provider_task_id("s-space", "C0X-17"),
+                  cron_id("PR Review Digest", 1793500000), cron_id("nightly_build", 1),
+                  "task-0123456789", "worker-pin-1792961474014-3de79056", "ask-1", "sc-ask-Ab.1"]
+        for tid in minted:
+            self.assertTrue(cl.is_task_id(tid), tid)
+            self.assertTrue(cl.is_run_id(tid + "~2"), tid)
+        escaped = provider_task_id("tg123", "a b")  # a %XX escape is outside the filename charset
+        self.assertEqual(cl.is_task_id(escaped), valid_archive_lookup_id(escaped))
+
+    def test_handles_and_rooms_are_still_refused(self):
+        for bad in ("chi-wang", "Mary-Jane", "task-s-space~chi-wang", "task-s-space~Mary-Jane", "@chi:s.space",
+                    "!room:s.space", "has space", "..", "task-", "task-s-space~"):
+            self.assertFalse(cl.is_task_id(bad), bad)
+
+
 class Trailers(unittest.TestCase):
     def test_trailers_render_only_the_ids_given_and_refuse_non_ids(self):
         self.assertEqual(cl.trailers(), "")

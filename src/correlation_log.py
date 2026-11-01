@@ -41,11 +41,12 @@ INTERACTION_RE = re.compile(r"^ix_[0-9a-f]{12}$")
 _HOST = r"[A-Za-z0-9.-]+(?::\d{1,5})?"
 
 
-# The producer families task files are named by, after an optional `task-<lane>~` prefix (lane keys
-# such as s_dspace); a Discord task is `task-dc<channel>~<message id>`. Nothing else is a task id.
-_SEG = r"[a-z0-9_-]{1,120}"
-_TASK_ID = re.compile(rf"^(?:(?:staging-)?task-{_SEG}~)?"
-                      rf"(?:(?:task|worker-pin|worker-add|ask|sc-ask|reco-skill|voice-end|air)-{_SEG}|\d{{6,24}})$")
+# What producers mint, in the filename charset: a family id (cron's `task-cron-<Name>-<stamp>` too), or
+# an ingress id `task-<lane>~<event>` (provider_task_id) whose event is a family id or carries a digit.
+_SEG = r"[A-Za-z0-9._-]{1,120}"
+_FAMILY = rf"(?:task|worker-pin|worker-add|ask|sc-ask|reco-skill|voice-end|air)-{_SEG}"
+_EVENT = r"(?=[A-Za-z0-9._-]*\d)[A-Za-z0-9._-]{1,120}"
+_TASK_ID = re.compile(rf"^(?:(?:staging-)?task-{_SEG}~(?:{_FAMILY}|{_EVENT})|{_FAMILY})$")
 
 
 def is_task_id(value: str) -> bool:
