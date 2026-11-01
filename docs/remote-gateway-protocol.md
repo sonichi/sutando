@@ -975,3 +975,18 @@ activity log. Later working or queued rows cannot change that selection. A done
 row or an existing result (including archived results) excludes a task, even
 when its session binding or open-task index entry remains. Without an eligible
 pickup in the live log, the hook emits no working or thinking row.
+
+### Local activity row room scope
+
+The agent-activity CLI assigns a room only from explicit `--room` or the
+task file's `channel_id` (explicit wins). Without either, the JSON row omits
+`room`; it never reads the owner's last activity to infer a destination.
+This keeps background health-check and cron activity from acquiring the
+owner's latest DM or room. Task rows retain their own room.
+
+A roomless ordinary activity row belongs in the dock, not every room's drawer.
+Only `kind: wedge` represents a global blocker: it always omits `room`, even
+when a task file supplies one, and the CLI rejects an explicit `--room`.
+Clients must distinguish a roomless wedge from other roomless kinds; missing
+`room` alone does not mean global. This is a writer contract, not a change to
+client rendering. No historical rows are rewritten.
