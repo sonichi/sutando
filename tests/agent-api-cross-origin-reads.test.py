@@ -198,6 +198,14 @@ def main() -> int:
     h.path, h.headers = "/twilio/voice", dict(rebound)
     check(h.host_allowed() is True, "f) in-process: Twilio's tunnel Host is exempt")
     check(h._bound_port() is None, "f) a handler with no server has no bound port")
+    sent, _h = bare("GET", "/media/state/agent-activity.jsonl", {"Host": HOST})
+    check(sent.get("status") == 401, "f) in-process: state needs the bearer")
+    sent, h = bare("GET", "/media/state/agent-activity.jsonl",
+                   {"Host": HOST, "Origin": "tauri://localhost", "Authorization": f"Bearer {TOKEN}"})
+    check(sent.get("status") == 200 and sent.get("X-Content-Type-Options") == "nosniff"
+          and b"private task text" in h.wfile.getvalue(), "f) in-process: with the bearer, state is served nosniff")
+    sent, _h = bare("GET", "/media/results/media/smuggled.png", {"Host": HOST})
+    check(sent.get("status") == 401, "f) in-process: a results/ link into state/ needs the bearer")
     sent, _h = bare("GET", "/media/results/media/pic.png", {"Host": HOST, "Origin": "tauri://localhost"})
     check(sent.get("status") == 200 and sent.get("Access-Control-Allow-Origin") == "tauri://localhost",
           "f) in-process: media carries the echoed grant")
