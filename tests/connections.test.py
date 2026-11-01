@@ -868,16 +868,16 @@ class ReconnectPreflight(Base):
         (repo / "src" / "workspace_default.py").write_text(
             "from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path('/ws/x')\n")
         (repo / "src" / "util_paths.py").write_text("def host_label():\n    return 'host-x'\n")
-        self.assertEqual(C._launch_probe(repo, {**os.environ}, None), {"workspace": "/ws/x", "host": "host-x"})
+        self.assertEqual(C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None), {"workspace": "/ws/x", "host": "host-x"})
         (repo / "src" / "util_paths.py").write_text("raise ImportError('broken checkout')\n")
         with self.assertRaisesRegex(ValueError, "could not resolve its workspace"):
-            C._launch_probe(repo, {**os.environ}, None)
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None)
         (repo / "src" / "util_paths.py").write_text("def host_label():\n    return 'h'\nprint('[]')\n")
         (repo / "src" / "workspace_default.py").write_text("import sys\nprint('[1]')\nsys.exit(0)\n")
         with self.assertRaisesRegex(ValueError, "gave no workspace|could not resolve"):
-            C._launch_probe(repo, {**os.environ}, None)
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None)
         with self.assertRaisesRegex(ValueError, "did not run"):
-            C._launch_probe(repo, {**os.environ}, "/nonexistent/python")
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, "/nonexistent/python")
         with self.assertRaisesRegex(ValueError, "no src/remote-gateway-bridge.py"):
             C._launch_probe(self.ws / "empty", {}, None)
         self.assertTrue(C._this_host())
