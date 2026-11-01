@@ -311,6 +311,16 @@ class MediaTests(EnvCase):
                 self.assertFalse(md.fetch_media(ref, HS, room, gate=None)["ok"])
                 req.assert_not_called()
 
+    def test_fetch_rejects_invalid_ref_syntax_before_network(self):
+        os.environ["GATEWAY_URL"] = "https://dev-chat.s.space/relay"
+        for ref in ("file:///image", "https://user:pass@example.com/image",
+                    "mxc://dev.s.space/image#fragment", "mxc://dev.s.space/image?query=1"):
+            with self.subTest(ref=ref), mock.patch.object(md, "http_request") as req:
+                result = md.fetch_media(ref, HS, ROOM, gate=None)
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["reason"])
+                req.assert_not_called()
+
     def test_embedded_room_reaches_gate_and_connection_selection(self):
         ref = "https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=" + _gateway.quote(ROOM)
         with mock.patch.object(md, "gateway", return_value=("https://dev-chat.s.space/relay", {})) as gateway:
