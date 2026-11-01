@@ -30,6 +30,9 @@ from local_task_protocol import find_result, valid_local_task_id  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import turns  # noqa: E402
+
 WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # lint-workspace-resolution: allow-repo-root (sibling script, not a data root)
 SKIP_TOOLS = {"Read", "Glob", "Grep", "TodoWrite"}
 MAXLEN = 100
@@ -359,8 +362,32 @@ def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> None
         pass
 
 
+def stop_rulings(ws: Path) -> None:
+    """Rule any stop still waiting on its answer: a turn ending is when the core may have given it."""
+    if any(ws.joinpath("state", "stop-interrupts").glob("*.ruling.json")):
+        import stop_interrupt
+        log = ws / "logs" / "stop-interrupt.log"
+
+        def note(line: str) -> None:            # never stderr: a hook's stderr reads as a hook error
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+        stop_interrupt.sweep(ws, log=note)
+
+
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
+    # The pane stamp moves first: the fenced key reads only the stamp, so a turn that ended or began
+    # is never stamped as one the record no longer shows open.
+    for step in (lambda: turns.stamp_pane(payload), lambda: turns.record(payload, p["ws"]),
+                 lambda: payload.get("hook_event_name") == "Stop" and stop_rulings(p["ws"])):
+        try:
+            step()
+        except Exception:  # noqa: BLE001 — turn records and stop rulings never hold up the rows below
+            pass
     sid = payload.get("session_id")
     if not isinstance(sid, str) or not sid:
         return []

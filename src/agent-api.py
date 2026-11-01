@@ -1931,6 +1931,10 @@ def _resolve_local_ip() -> str:
 
 if __name__ == "__main__":
     bind = config_get("AGENT_API_BIND", "127.0.0.1")
+    refusal = local_api_gate.lan_bind_refusal(bind, API_TOKEN)
+    if refusal:
+        print(refusal, file=sys.stderr, flush=True)
+        sys.exit(2)
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's
@@ -1959,7 +1963,7 @@ if __name__ == "__main__":
     print("  GET  /status — health + capabilities")
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
-        print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+        print("  (localhost only — for LAN access set AGENT_API_BIND=0.0.0.0 and SUTANDO_API_TOKEN)")
     # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
     # sends SIGTERM.
     def _reap_and_exit(_signum, _frame):
