@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import agent_turn, file_lock, local_task_protocol
+from .safe_number import finite
 from .result_ready import identity_of
 
 TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
@@ -1356,6 +1357,7 @@ def session_row(rec) -> "tuple[str, float, str] | None":
     if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
         return None
     task, ts = rec.get("task"), rec.get("ts")
-    if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+    ts = finite(ts)
+    if not isinstance(task, dict) or ts is None:
         return None
     return task.get("id"), ts, rec.get("kind")

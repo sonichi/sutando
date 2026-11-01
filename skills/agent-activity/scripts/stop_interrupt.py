@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import subprocess
@@ -41,6 +40,7 @@ from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
 from delivery.task_dispatch import has_ready_result, is_wake_turn, worker_holds
 from file_lock import locked_file
 from local_task_protocol import iter_result_candidates, valid_local_task_id
+from safe_number import finite
 from skill_config import enabled as config_enabled
 from tmux_pane_keys import fence_keys_argv
 from workspace_default import resolve_workspace
@@ -286,7 +286,7 @@ def _valid_ruling(rec, f: Path) -> bool:
     return (type(rec) is dict and set(rec) == {"target", "control", "at"}
             and type(rec["target"]) is str and valid_local_task_id(rec["target"])
             and valid_control_id(rec["control"])
-            and type(rec["at"]) in (int, float) and math.isfinite(rec["at"])
+            and finite(rec["at"]) is not None
             and f.name == f"{rec['target']}{RULING}")
 
 
@@ -298,7 +298,7 @@ def rule(workspace: Path, rec: dict, now: float,
     if state == "ready":
         log(f"stop-interrupt: {target}: the core finished it despite the Stop")
         return "finished"
-    late = now - rec["at"] >= CONFIRM_MAX_S
+    late = now - finite(rec["at"]) >= CONFIRM_MAX_S
     if state == "pending" and not late:
         return None                         # an answer may be on its way: never ruled a stop yet
     if _result_state(workspace, rec["control"]) != "ready" and not late:

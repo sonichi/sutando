@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import math
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -28,6 +27,7 @@ from activity_rows import append as append_row
 from activity_rows import task_from_file
 from file_lock import locked_file
 from local_task_protocol import parse_task_headers, valid_local_task_id
+from safe_number import finite
 from task_queue import position as queue_position
 from workspace_default import resolve_workspace
 
@@ -274,8 +274,8 @@ def cancel_target(task_text: str | None) -> str | None:
     return tid if tid and ("~" not in tid or valid_local_task_id(tid)) else None
 
 
-# Who may stop a task: the bridge's own control writer, the owner's local voice session, and the
-# runtime API's task.cancel (its actor resolved daemon-side, never by the client).
+# Who may stop a task: the bridge's own control writer and the owner's local voice session; the
+# runtime API only through task.cancel, which alone writes `interaction_type: task_cancel`.
 STOP_SOURCES = frozenset({"relay-control", "voice", "runtime-api"})
 
 
@@ -285,7 +285,10 @@ def trusted_cancel_target(text: str | None, filename: str | None = None) -> str 
     file's own, and its task line the instruction. None for anything else."""
     parsed = parse_task_headers(text or "")
     h = parsed.headers
-    if (h.get("access_tier") or "").strip() != "owner" or (h.get("source") or "").strip() not in STOP_SOURCES:
+    source = (h.get("source") or "").strip()
+    if (h.get("access_tier") or "").strip() != "owner" or source not in STOP_SOURCES:
+        return None
+    if source == "runtime-api" and (h.get("interaction_type") or "").strip() != "task_cancel":
         return None
     if filename is not None and (h.get("id") or "").strip() != Path(filename).name.removesuffix(".txt"):
         return None
@@ -344,8 +347,8 @@ def engaged_at(workspace: Path, task_id: str) -> float | None:
                     continue
                 if rec.get("kind") not in _ENGAGED_KINDS:
                     continue
-                ts = rec.get("ts")
-                if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
+                ts = finite(rec.get("ts"))
+                if ts is not None:
                     newest = ts if newest is None else max(newest, ts)
     except OSError:
         return None
@@ -372,7 +375,7 @@ def in_progress(workspace: Path, task_id: str, max_age: float = IN_PROGRESS_MAX_
     row_ts = engaged_at(workspace, task_id)
     if row_ts is not None:
         stamps.append(row_ts)
-    stamps = [x for x in stamps if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)]
+    stamps = [finite(x) for x in stamps if finite(x) is not None]
     if not stamps:
         return False
     age = (time.time() if now is None else now) - float(max(stamps))
