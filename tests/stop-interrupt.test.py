@@ -6,7 +6,9 @@ Run: python3 tests/stop-interrupt.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -514,6 +516,17 @@ class Rulings(Base):
         (self.ws / "results" / "archive").mkdir()
         (self.ws / "results" / "archive" / "task-ctl-2-1793057500.txt").write_text("[no-send]")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
+
+    def test_the_hooks_turn_end_ruling_writes_nothing_to_stderr(self):
+        si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
+        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        hook = load_hook()
+        err = io.StringIO()
+        with mock.patch.object(hook.turns, "stamp_pane"), contextlib.redirect_stderr(err):
+            hook.handle({"hook_event_name": "Stop", "session_id": "S1", "prompt_id": "P1"}, hook.paths(self.ws),
+                        run=lambda *a, **k: None)
+        self.assertEqual(err.getvalue(), "", "a hook's stderr shows as a hook error in the pane")
+        self.assertIn("stopped", (self.ws / "logs" / "stop-interrupt.log").read_text())
 
     def test_after_a_restart_the_hooks_turn_end_rules_the_stop(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)

@@ -309,7 +309,16 @@ def stop_rulings(ws: Path) -> None:
     """Rule any stop still waiting on its answer: a turn ending is when the core may have given it."""
     if any(ws.joinpath("state", "stop-interrupts").glob("*.ruling.json")):
         import stop_interrupt
-        stop_interrupt.sweep(ws)
+        log = ws / "logs" / "stop-interrupt.log"
+
+        def note(line: str) -> None:            # never stderr: a hook's stderr reads as a hook error
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+        stop_interrupt.sweep(ws, log=note)
 
 
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
