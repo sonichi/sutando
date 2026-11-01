@@ -513,8 +513,7 @@ class DurableAck(unittest.TestCase):
 
 
     def test_a_lease_file_that_did_not_commit_withholds_the_round(self):
-        """The ledger must never name a leased task whose generation is not on
-        disk; an unreadable lease file is unknown, and nothing is written over it."""
+        """The ledger must never name a leased task whose generation is not on disk."""
         mod = self.mod
         real = mod._durable_write
         with patch.object(mod, "_durable_write",
@@ -522,11 +521,32 @@ class DurableAck(unittest.TestCase):
             self.assertFalse(mod._record_pending_acks([("task-wl", True, "gen-1")]))
         self.assertEqual(mod._load_pending_acks(), {})
         self.assertTrue(mod._record_pending_acks([("task-wl", True, "gen-1")]))
-        mod._ack_lease_file().write_text("{not json")
-        self.assertIs(mod._load_pending_leases(), mod.task_attempts.UNKNOWN)
-        self.assertEqual(mod._load_pending_acks(), {"task-wl": True})
-        self.assertFalse(mod._record_pending_acks([("task-wl2", True, "gen-1")]), "never over what it cannot read")
-        self.assertEqual(mod._ack_lease_file().read_text(), "{not json")
+
+    def test_without_the_ledger_a_damaged_index_reads_as_empty_and_is_rewritten(self):
+        mod = self.mod
+        self.assertIsNone(mod._ATTEMPTS)
+        mod.PENDING_ACK_FILE.write_text("[]")
+        self._drive_main([self._task("task-damaged-1")])
+        self._drive_main([self._task("task-damaged-2")])
+        self.assertEqual([c[2]["id"] for c in self._acks()], ["task-damaged-1", "task-damaged-2"],
+                         "every round's ack goes, as before the ledger")
+        self.assertEqual(json.loads(mod.PENDING_ACK_FILE.read_text()), {})
+
+    def test_with_the_ledger_a_damaged_index_is_set_aside_and_an_unreadable_one_kept(self):
+        mod = self.mod
+        with patch.object(mod, "_ATTEMPTS", object()):
+            mod._ack_lease_file().write_text("{not json")
+            self.assertEqual(mod._load_pending_leases(), {}, "the ledger's claims are the authority")
+            aside = list(mod._ack_lease_file().parent.glob(f"{mod._ack_lease_file().name}.damaged-*"))
+            self.assertEqual([p.read_text() for p in aside], ["{not json"], "its bytes are kept aside")
+            self.assertTrue(mod._record_pending_acks([("task-wl3", True, "gen-1")]))
+            real = Path.read_text
+            with patch.object(Path, "read_text", autospec=True, side_effect=lambda p, *a, **k: (
+                    (_ for _ in ()).throw(PermissionError(13, "denied")) if p == mod._ack_lease_file()
+                    else real(p, *a, **k))):
+                self.assertIs(mod._load_pending_leases(), mod.task_attempts.UNKNOWN)
+                self.assertFalse(mod._record_pending_acks([("task-wl4", True, "gen-1")]),
+                                 "never over what it cannot read now")
 
     # -- 5. the production ack round, driven through main() ------------------ #
 

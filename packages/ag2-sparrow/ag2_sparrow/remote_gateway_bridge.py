@@ -3236,18 +3236,31 @@ def _ack_lease_file() -> Path:
 
 
 def _read_ack_json(path: Path):
-    """One pending-ack file as a dict; {} when there is none; UNKNOWN when it cannot be read or is
-    not a map, so nothing overwrites or retires what it may hold."""
+    """One pending-ack file as a dict; {} when there is none. Without the ledger a damaged file reads
+    as {} and is rewritten. With it, the ledger's claims are the authority: a damaged file is set
+    aside and reads as {}, and one that cannot be read now is UNKNOWN, so nothing overwrites it."""
     try:
         data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not a map")
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
+        if _ATTEMPTS is None:
+            _log_backoff((path.name, "unreadable"), f"pending-ack file {path.name} unreadable "
+                         f"({diagnostics.describe(e)}) — read as empty")
+            return {}
+        if isinstance(e, ValueError):
+            aside = path.with_name(f"{path.name}.damaged-{int(time.time())}")
+            try:
+                os.replace(path, aside)
+            except OSError:
+                return task_attempts.UNKNOWN
+            _log(f"pending-ack file {path.name} damaged ({diagnostics.describe(e)}) — set aside as "
+                 f"{aside.name}; the ledger's claims retry its acks")
+            return {}
         _log_backoff((path.name, "unreadable"), f"pending-ack file {path.name} unreadable "
                      f"({diagnostics.describe(e)}) — left as it is")
-        return task_attempts.UNKNOWN
-    if not isinstance(data, dict):
-        _log_backoff((path.name, "unreadable"), f"pending-ack file {path.name} is not a map — left as it is")
         return task_attempts.UNKNOWN
     return {str(k): v for k, v in data.items()}
 
@@ -3334,9 +3347,9 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
         lease = leases.get(tid)
         if lease is None and _ATTEMPTS is not None:
             rec = _ATTEMPTS.entry(_broker_tid(tid))
-            if not isinstance(rec, dict) or not rec.get("lease_id"):
+            if rec is task_attempts.UNKNOWN:
                 continue                        # its lease cannot be proved: kept, never posted as None
-            lease = rec["lease_id"]
+            lease = rec.get("lease_id") if isinstance(rec, dict) else None   # served without one: acked without
         _post_task_ack(tid, durable, lease)
 
 
@@ -4244,10 +4257,9 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
         pending = t.rec.get("pending_serve") if isinstance(t.rec.get("pending_serve"), dict) else {}
         ref = pending.get("reserve")
         if adoptable:
-            rec = t.adopt_serve(claim, doc, _reenroll_identity() or None, open_turn=open_turn)
-            if isinstance(rec, dict) and not _run_id_used(rec["run"]):
-                # Its run was never published: it is, from this serve's own saved copy.
-                rec = t.rec if t.put(owed_publish=rec["run"], owed_reserve=ref) else None
+            # A run never published is owed, from this serve's own saved copy.
+            owed = {} if _run_id_used(t.rec["run"]) else {"owed_publish": t.rec["run"], "owed_reserve": ref}
+            rec = t.adopt_serve(claim, doc, _reenroll_identity() or None, open_turn=open_turn, owed=owed)
             adopted = True
         elif t.rec.get("finished") and (gen is None or gen == t.rec.get("execution_generation")):
             # The run already settled this generation: the re-serve has nothing left to run.
@@ -4269,8 +4281,12 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
         return "unrecorded"
     try:
         context = task_attempts.serve_context(_read_reserve(wire_tid, ref, pending.get("run"), pending.get("lease")))
-    except (OSError, _ReserveLost):
-        context = {}
+    except _ReserveLost:
+        context = {}                            # its publish fails the generation
+    except OSError as e:
+        _log_backoff((wire_tid, "reserve-unread"), f"task {wire_tid}: its held serve cannot be read now "
+                     f"({diagnostics.describe(e)}) — its ack is retried")
+        return "unrecorded"
     with _ATTEMPTS.transition(wire_tid) as t:
         if t.rec is task_attempts.UNKNOWN or not t.holds_claim(claim):
             return "unrecorded"
@@ -4577,7 +4593,9 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
     rerun = _earlier_attempt(wire_tid, rec, earlier)
     ref = rec.get("owed_reserve")
     try:
-        task = {**_read_reserve(wire_tid, ref, run, rec.get("lease_id")), "id": wire_tid}
+        # An adopted run publishes the copy saved for the serve's candidate run, under the run's own id.
+        owner = ref.get("run") if isinstance(ref, dict) else run
+        task = {**_read_reserve(wire_tid, ref, owner, rec.get("lease_id")), "id": wire_tid}
     except _ReserveLost as e:
         with _ATTEMPTS.transition(wire_tid) as t:
             if isinstance(t.rec, dict) and t.rec.get("owed_publish") == run and _fail_unanswered(
@@ -4926,25 +4944,28 @@ def _close_stale_turns(inflight: "set[str]") -> None:
 def _sweep_reserves() -> int:
     """At start: drop each saved serve no record names, once every record was read. With any record
     unreadable nothing goes; a legacy task-wide file is never swept."""
-    records = _ATTEMPTS.records()
-    if records is None or any(r is task_attempts.UNKNOWN for r in records.values()):
-        return 0
-    named = set()
-    for rec in records.values():
-        for ref in ((rec.get("pending_serve") or {}).get("reserve") if isinstance(rec.get("pending_serve"), dict)
-                    else None, rec.get("owed_reserve")):
-            if isinstance(ref, dict) and type(ref.get("id")) is str:
-                named.add(ref["id"])
+    def sweep(named: set) -> int:
+        try:
+            names = [p for p in _reserve_dir().iterdir() if _RESERVE_ID_RE.fullmatch(p.stem) and p.suffix == ".json"]
+        except OSError:
+            return 0
+        dropped = 0
+        for p in names:
+            if p.stem not in named and _unlink_reserve(p):
+                dropped += 1
+        return dropped
+    return _ATTEMPTS.with_reserves(sweep, "the saved-serve sweep")[1] or 0
+
+
+def _unlink_reserve(path: Path) -> bool:
+    """Remove one saved copy; a failure is logged and left for the next start's sweep."""
     try:
-        names = [p for p in _reserve_dir().iterdir() if _RESERVE_ID_RE.fullmatch(p.stem) and p.suffix == ".json"]
-    except OSError:
-        return 0
-    dropped = 0
-    for p in names:
-        if p.stem not in named:
-            p.unlink(missing_ok=True)
-            dropped += 1
-    return dropped
+        path.unlink(missing_ok=True)
+        return True
+    except OSError as e:
+        _log_backoff((path.name, "reserve-undropped"), f"saved serve {path.name} could not be removed "
+                     f"({diagnostics.describe(e)}) — left for the next start")
+        return False
 
 
 def _recover_claims() -> None:
@@ -4953,6 +4974,9 @@ def _recover_claims() -> None:
     retry, an ack_first ack by the held-task pass, a result by the drain, a cancel-ack here."""
     for wire_tid, rec in sorted((_ATTEMPTS.records() or {}).items()):
         if not isinstance(rec, dict) or not rec.get("claims"):
+            continue
+        if not isinstance(rec["claims"], dict):
+            _log(f"task {wire_tid}: its claims cannot be read — held, not reconciled")
             continue
         ops = ", ".join(f"{c.get('kind')} {op}" for op, c in sorted(rec["claims"].items()))
         _log(f"task {wire_tid}: effects claimed before this start, outcome unknown: {ops} — reconciled "
@@ -5928,21 +5952,36 @@ def _save_reserve(wire_tid: str, run: str, lease: "str | None", task: dict) -> "
     reference the ledger keeps for it, or None when it could not be saved or a different one holds
     its name. An identical envelope already there is the same serve."""
     body = {**task, "id": wire_tid}
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    rid = "v1-" + hashlib.sha256(f"{wire_tid}\0{run}\0{lease}".encode()).hexdigest()[:32]
+    digest = _digest(body)
+    rid = _reserve_id(wire_tid, run, lease)
     text = json.dumps({"format": 1, "owner": {"task": wire_tid, "candidate_run": run, "lease": lease},
                        "sha256": digest, "task": body}, sort_keys=True)
     path = _reserve_dir() / f"{rid}.json"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        if task_attempts.write_if_absent(path, text) is None and path.read_text() != text:
-            _log(f"task {wire_tid}: a different saved serve holds {rid} — left as it is")
-            return None
-    except OSError as e:
+        if task_attempts.write_if_absent(path, text, mode=0o600) is None:
+            # Already there, perhaps from a write whose fsync failed: durable before it is named.
+            task_attempts.make_durable(path)
+            if path.read_text() != text:
+                # The same lease is the same serve: its first copy is kept, whatever bytes came again.
+                ref = {"id": rid, "run": run, "lease": lease, "sha256": json.loads(path.read_text()).get("sha256")}
+                _read_reserve(wire_tid, ref, run, lease)
+                _log(f"task {wire_tid}: served again under the same lease with other bytes — the first copy is kept")
+                return ref
+    except (OSError, ValueError, _ReserveLost) as e:
         _log_backoff((wire_tid, "reserve-unsaved"), f"task {wire_tid}: its held serve could not be saved "
                      f"({diagnostics.describe(e)})")
         return None
     return {"id": rid, "run": run, "lease": lease, "sha256": digest}
+
+
+def _digest(body: dict) -> str:
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _reserve_id(wire_tid: str, run, lease) -> str:
+    """The one name a serve's copy has: its owner (task, candidate run, lease)."""
+    return "v1-" + hashlib.sha256(f"{wire_tid}\0{run}\0{lease}".encode()).hexdigest()[:32]
 
 
 def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
@@ -5962,8 +6001,7 @@ def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
         body = env.get("task") if isinstance(env, dict) else None
         owner = {"task": wire_tid, "candidate_run": run, "lease": lease}
         if (not isinstance(body, dict) or env.get("owner") != owner or env.get("sha256") != ref.get("sha256")
-                or hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                != ref.get("sha256")):
+                or _digest(body) != ref.get("sha256")):
             raise _ReserveLost("the saved serve is not the one its reference names")
         return body
     except FileNotFoundError as e:
@@ -5973,11 +6011,16 @@ def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
 
 
 def _drop_reserve(wire_tid: str, ref) -> None:
-    """The held serve `ref` names is decided: only its own saved copy goes."""
-    if isinstance(ref, dict) and type(ref.get("id")) is str and _RESERVE_ID_RE.fullmatch(ref["id"]):
-        (_reserve_dir() / f"{ref['id']}.json").unlink(missing_ok=True)
-    elif ref is None:
-        _reserve_path(wire_tid).unlink(missing_ok=True)
+    """The held serve `ref` names is decided: its own saved copy goes, and only while it is this
+    task's and no record names it. Anything else stays for the start's sweep."""
+    if ref is None:
+        _unlink_reserve(_reserve_path(wire_tid))
+        return
+    if not (isinstance(ref, dict) and ref.get("id") == _reserve_id(wire_tid, ref.get("run"), ref.get("lease"))):
+        _log(f"task {wire_tid}: a saved-serve reference not its own — nothing removed")
+        return
+    _ATTEMPTS.with_reserves(lambda named: ref["id"] in named or _unlink_reserve(_reserve_dir() / f"{ref['id']}.json"),
+                            f"task {wire_tid}: the removal of its saved serve")
 
 
 def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str, None, bool] | None":
@@ -6005,6 +6048,8 @@ def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str,
         _log_backoff((first, "unrecorded"), f"task {first}: its re-serve could not be recorded "
                      "— left unacked for a re-serve")
         return None
+    if pending.get("reserve") not in (None, ref):
+        _drop_reserve(t.wire, pending["reserve"])   # the hold it replaced
     _log(f"task {first}: served again under a new lease while its run may be executing — nothing is "
          "published until the ack names the generation")
     return rec["run"], None, True

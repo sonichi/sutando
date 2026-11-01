@@ -444,8 +444,12 @@ Sutando checkout around it sends neither field.
   (task, candidate run, lease) with the task's digest; the ledger names it by reference, the
   newer generation's debt carries that reference, and only its owner reads or removes it. A copy
   that is missing, damaged or another owner's fails that generation (`dispatch_lost`) and is never
-  used for another; the same held serve delivered again repairs a missing copy and refuses changed
-  bytes; at start, copies no record names are removed, and none while any record cannot be read. Its result
+  used for another; the same held serve delivered again repairs a missing copy, and one whose bytes
+  changed keeps its first copy (the lease is the serve). An adopted run never published is owed in
+  the adoption's own write and publishes the copy saved for its serve. A copy is removed only by the
+  ledger's owner, under the ledger's lock, while no record names it: at start, copies no record
+  names are removed, and none while any record or reference cannot be read; a copy whose removal
+  fails is left for the next start. Copies are private (0600). Its result
   goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
   An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
   The same holds after the earlier run has finished: a serve under a lease other than the one it
@@ -473,7 +477,15 @@ Sutando checkout around it sends neither field.
   outcome is unknown (a timeout, a crash) keeps its claim and is reconciled under the same id. Each
   start takes the ledger over with a new epoch, and a bridge whose epoch is gone makes no further
   claim or call and stops polling. A ledger that cannot be locked, read or written is never written
-  over, and nothing that depends on it moves.
+  over, and nothing that depends on it moves. The ledger is format 4 (saved-serve references); a
+  format-3 ledger is read and upgraded on its next write, and a format-3 bridge refuses a format-4
+  ledger rather than serve its debts from a legacy file. A damaged value inside it (its `contract`,
+  a record, a run entry) is never read as absent: the work that needs it is held and logged. The way
+  out is to stop the bridge, set the ledger aside (or repair the named key), and restart: a missing
+  ledger starts empty, and the attempts the old one held are not resumed.
+- The pending-ack index (`remote-task-acks*.json`) is a backup of the ledger's ack claims. With the
+  ledger on, a damaged index is set aside (`*.damaged-<ts>`) and the claims retry its acks; one that
+  cannot be read now is left as it is. With the ledger off, a damaged index reads as empty, as before.
 - The result drain pins the file it will deliver as a hard link under `results/.delivering/` and
   claims it for the run and generation in the same transition, before any effect (attachments,
   Stop, settle, publish). A reply written at the result's name after that is a new result; one that
