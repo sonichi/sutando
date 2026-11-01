@@ -1535,9 +1535,20 @@ class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
         self.assertFalse(self.outrun(pane))
         self.assertTrue(pg.turn_in_flight(pane.replace("(2s", "(12s")))
 
+    def spinner(self, paren):
+        return self.MID_TURN.replace("(running Stop hooks\u2026 2/3 \u00b7 2m 37s)", paren)
+
+    def test_the_threshold_is_inclusive(self):
+        at = pg.FLIGHT_MIN_S
+        self.assertTrue(pg.turn_in_flight(self.spinner(f"({at}s \u00b7 esc to interrupt)")))
+        self.assertFalse(pg.turn_in_flight(self.spinner(f"({at - 1}s \u00b7 esc to interrupt)")))
+
     def test_a_spinner_below_the_composer_is_not_a_turn_in_flight(self):
-        pane = self.STANDING.replace(self.BANNER, self.BANNER + "\u2733 Choreographing\u2026 (3s)\n")
+        row = "\u2733 Choreographing\u2026 (30s \u00b7 esc to interrupt)\n"
+        self.assertTrue(pg.turn_in_flight(self.STANDING.replace("\u273b Worked for 3m \u00b7 done 3:16 PM\n", row)))
+        pane = self.STANDING.replace(self.BANNER, self.BANNER + row)
         self.assertFalse(pg.turn_in_flight(pane))
+        self.assertFalse(self.outrun(pane))
 
 
 if __name__ == "__main__":
