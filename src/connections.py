@@ -1426,7 +1426,7 @@ def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict]
 
 
 def _lane_running(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
-    """Whether the row's bridge is running now: its lane record (state/auth/lane-identity*) is fresh.
+    """Whether the row's bridge is running now: its lane record (agent_identity.lane_state) is fresh.
     An owner-routing file outlives a crashed or revoked bridge; a handoff to it would strand."""
     try:
         state, _rec = _agent_identity().lane_state(_workspace(workspace) / "state", str(row.get("instance") or ""))
