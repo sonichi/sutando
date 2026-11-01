@@ -79,7 +79,7 @@ skill hook. The hook never depends on the agent remembering anything:
   on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog); a turn on no task never gets one. It then rules the stop from
   `state/stop-interrupts/<task>.ruling.json`, which the hook re-checks at every turn end: no result once
   the control task is answered, CANCELLED; a ready result, left to delivery; one being written, wait; unanswered for an hour,
-  CANCELLED. Off, the handler declines and the watcher cancels the task at once.
+  CANCELLED. A stop for a task a pool worker holds is routed to that worker's inbox (`pool_router.stop_holder`), so the worker's own watcher runs this. Off, the handler declines and the watcher cancels the task at once.
 - **Scope of task ids.** `task-<hex>` and `task-chat-…` files are tasks; `task-cron-*`, `task-bench-*`,
   `task-workstream-*` and `task-project-grouping-*` are the core's own bookkeeping and produce no rows.
   A result whose body starts with `[no-send]` or `[REPLIED]` closes the task with

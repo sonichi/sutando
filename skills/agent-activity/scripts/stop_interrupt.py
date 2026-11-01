@@ -6,13 +6,15 @@ is read when the turn ends).
 The pane names its open turn (`turns.PANE_OPTION`, stamped by this skill's hook), and the turn's
 record says which tasks its prompt named and which dialog it is parked on. The Escape goes when
 the turn is on the stopped task alone and the pane is mid-turn or showing a dialog. Anything
-unreadable or unrecorded
-sends nothing. The key is fenced on the same turn id, so a turn that ended meanwhile gets no key.
+unreadable or unrecorded sends nothing. The key is fenced on the same turn id, so a turn that
+ended meanwhile gets no key.
 One Escape per task, ever; each decision is logged to stderr and as an owner row.
 
 The stop is then ruled, from a durable record this skill's hook re-checks at every turn end: once
-the core has answered the control task, a stopped task with no result is CANCELLED and one with a
-result is left to delivery. Unanswered for an hour, it is CANCELLED as it would be with the switch off.
+the core has answered the control task, a stopped task with no result is CANCELLED, one with a
+ready result is left to delivery, and one whose result is still pending waits. Unanswered for an
+hour, it is CANCELLED as it would be with the switch off. A task a pool worker holds gets its stop
+routed to that worker's inbox, where the worker's own watcher runs this.
 
 The skill's `on_stop_requested` handler: exit 0 takes the stop, 1 leaves it to the watcher.
 """
@@ -35,9 +37,8 @@ from activity_bus import ActivityStore, LifecycleTransition
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
-from delivery.task_dispatch import worker_holds
+from delivery.task_dispatch import has_ready_result, is_wake_turn, worker_holds
 from file_lock import locked_file
-from delivery.task_dispatch import _mtime, has_ready_result, is_wake_turn
 from local_task_protocol import iter_result_candidates, valid_local_task_id
 from skill_config import enabled as config_enabled
 from tmux_pane_keys import fence_keys_argv
@@ -104,7 +105,7 @@ def decide(target: str, *, turn, pane_text: str | None, held_elsewhere: bool = F
     if finished:
         return False, finished
     if held_elsewhere:
-        return False, "a pool worker holds it; only that worker's watcher interrupts it"
+        return False, "a pool worker holds it; the stop is routed to that worker, whose watcher interrupts it"
     if turn is None:
         return False, "no turn is open in the pane"
     if not isinstance(turn, dict) or not isinstance(turn.get("tasks"), list):
@@ -234,6 +235,13 @@ def _log_row(workspace: Path, tasks_dir: Path, target: str, line: str, now: floa
         append_row(line, kind="notice", room=room, task=task, workspace=workspace, audience="owner", ts=now)
     except (OSError, ValueError):
         pass
+
+
+def _mtime(path) -> "float | None":
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
 
 
 def _result_state(workspace: Path, task_id: str) -> "str | None":
