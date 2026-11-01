@@ -987,6 +987,17 @@ class Hooks(unittest.TestCase):
         with open(gw._STATE / "agent-activity.jsonl", "a") as fh:
             fh.write(json.dumps({"ts": ts, "kind": kind, "task": {"id": tid}}) + "\n")
 
+    def test_with_the_stop_interrupt_on_a_stalled_task_is_told_to_stop_once(self):
+        tid = "task-stalled-on"
+        mock.patch.object(gw, "STOP_INTERRUPT", True).start()
+        _, clock = self.held_in_queue(tid)
+        self.row(tid, clock[0] + 12, "processing")
+        clock[0] += 12 + gw.task_attempts.STALLED_S
+        self.assertFalse(self.beat(tid))
+        self.assertEqual(len(self.controls(tid)), 1, "one control task, written with the failure")
+        self.beat(tid)
+        self.assertEqual(len(self.controls(tid)), 1, "asked once")
+
     def test_a_queued_task_the_core_took_up_then_left_is_failed_after_thirty_minutes(self):
         tid = "task-stalled"
         fake, clock = self.held_in_queue(tid)
@@ -999,9 +1010,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALLED_RESULT)
         self.assertTrue(any("then wrote no turn activity or result for 30 min and is not mid-turn" in m
                             for m in self.logs))
-        self.assertEqual(len(self.controls(tid)), 1, "a turn parked on a prompt gets the Stop path's Escape")
-        self.beat(tid)
-        self.assertEqual(len(self.controls(tid)), 1, "asked once")
+        self.assertEqual(self.controls(tid), [], "with the Stop interrupt off, as before it existed")
         gw._post_ready_results({tid})                # the drain reads the file it posts
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"]), ("failed", True))

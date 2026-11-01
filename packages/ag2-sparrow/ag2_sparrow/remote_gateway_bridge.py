@@ -2067,6 +2067,9 @@ PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = 
 # Host-injected task -> reason or None, asked before a fresh task is queued: a reason settles it
 # as a redelivery instead. None (standalone default) queues every fresh task.
 TASK_INTAKE_GATE: Callable[[dict], "str | None"] | None = None
+# The Stop interrupt's switch, set by the loader from the skill's config; off, a stalled attempt
+# owes no control task, as before the interrupt existed.
+STOP_INTERRUPT = False
 # A gate returns INTAKE_DEFER while it would wait on another lane; `defer` makes it answer that at
 # once, and `deadline` (monotonic) bounds the whole round's waiting.
 INTAKE_DEFER = "\0intake-defer"
@@ -4772,10 +4775,10 @@ def _watch_dispatch(t) -> None:
                          f"with no turn activity for {task_attempts.DISPATCH_LOST_S // 60} min")
     elif pending and not answered and t.stalled_due(_queued_at(tid), activity, (motion := _core_motion())):
         window = task_attempts.STALLED_S if motion == "idle" else task_attempts.STALLED_UNOBSERVED_S
-        # A turn parked on a terminal prompt is answered by the Stop path's Escape: one control task.
+        # With the Stop interrupt on, the core is told to stop the turn it walked away from.
+        stop = {"owed_ctl": {"id": _new_ctl_id(), "reason": "stalled"}} if STOP_INTERRUPT else {}
         _fail_unanswered(t, tid, STALLED_RESULT, "the core took it up, then wrote no turn "
-                         f"activity or result for {window // 60} min and is not mid-turn",
-                         owed_ctl={"id": _new_ctl_id(), "reason": "stalled"})
+                         f"activity or result for {window // 60} min and is not mid-turn", **stop)
 
 
 def _core_motion() -> "str | None":

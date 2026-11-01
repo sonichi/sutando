@@ -37,6 +37,7 @@ from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
 from delivery.task_dispatch import worker_holds
 from local_task_protocol import find_archived_result, valid_local_task_id
 from result_markers import parse_markers
+from session_rows import session_row
 from skill_config import TRUE
 from workspace_default import resolve_workspace
 
@@ -64,18 +65,6 @@ def current_task(workspace: Path, now: float, fresh_s: float = FRESH_S) -> str |
     """The task the newest session-hook row names, when that row is fresh; else None."""
     task, ts, _ = newest_task(workspace)
     return task if ts is not None and 0 <= now - ts <= fresh_s else None
-
-
-def session_row(rec) -> "tuple[str, float, str] | None":
-    """(task id, ts, kind) of a row the session's own hooks wrote, else None. task_attempts reads
-    the same rows for its stall watch; a parity test holds the two readers together."""
-    # TASK_STATUS rows mark delivery, and owner rows are this module's own: neither is the session's turn.
-    if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
-        return None
-    task, ts = rec.get("task"), rec.get("ts")
-    if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
-        return None
-    return task.get("id"), ts, rec.get("kind")
 
 
 def newest_task(workspace: Path) -> "tuple[str | None, float | None, str | None]":

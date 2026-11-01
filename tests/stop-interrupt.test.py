@@ -383,9 +383,15 @@ class StopInterrupt(unittest.TestCase):
         self.assertEqual(tmux.escapes()[0][tmux.escapes()[0].index("-t") + 1], "=sutando-core:2")
         self.assertFalse([c for c in tmux.calls if "list-windows" in c])
 
-    def test_the_session_rows_are_read_alike_by_the_stall_watch_and_the_stop(self):
+    def test_the_stall_watch_and_the_stop_read_the_session_rows_through_one_module(self):
         sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        import session_rows
+        from ag2_sparrow import session_rows as vendored
         from ag2_sparrow import task_attempts
+        self.assertIs(si.session_row, session_rows.session_row)
+        self.assertIs(task_attempts.session_row, vendored.session_row)
+        self.assertEqual((REPO / "src" / "session_rows.py").read_text(), Path(vendored.__file__).read_text(),
+                         "the package's copy is the src module, vendored")
         self.assertEqual(task_attempts.ACTIVITY_TAIL_BYTES, si.TAIL_BYTES)
         rows = [{"ts": 1.0, "kind": "working", "task": {"id": "t"}},
                 {"ts": 2.0, "kind": "done", "task": {"id": "t"}},
