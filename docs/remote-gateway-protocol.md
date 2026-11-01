@@ -235,6 +235,11 @@ retires that ack the same way; a task served without one is acked without the ke
 An `ack_first` task is not in the pending-ack ledger: its manifest entry is its
 retry record, because an accepted ack must also publish it, and its `404` is
 decided with the task's status rather than retired (see `GET /v1/tasks`).
+With `REMOTE_TASK_LIFECYCLE_V2=1` the ack's claim in the attempt ledger is the authority: it carries
+who retries it, the local id and the durability, so an open claim alone resends the ack under its
+own lease and operation id, whatever became of the pending-ack files. A pending-ack file that cannot
+be read is neither written over nor retired, and an entry whose lease cannot be proved is kept,
+never posted without one.
 
 ### `POST /v1/results`
 
@@ -436,7 +441,17 @@ Sutando checkout around it sends neither field.
   wait; a claim whose exact reply is gone from its name and pin and never reached the outbox sent nothing and is ended,
   whichever drain exit disposed of the file; every outbox item a result claim publishes is recorded on
   the claim before the publish, so the settle checks exactly those items; a name or outbox item that cannot be read is never taken
-  as absent: the claim is kept and the wait is logged with what clears it), and the generation gets a new run of its own, published from the held serve. Its result
+  as absent: the claim is kept and the wait is logged with what clears it), and the generation gets a new run of its own, published from the held serve. Each
+  held serve saves its task as an immutable envelope, `relay-reserves*/v1-<hash>.json`, owned by
+  (task, candidate run, lease) with the task's digest; the ledger names it by reference, the
+  newer generation's debt carries that reference, and only its owner reads or removes it. A copy
+  that is missing, damaged or another owner's fails that generation (`dispatch_lost`) and is never
+  used for another; the same held serve delivered again repairs a missing copy, and one whose bytes
+  changed keeps its first copy (the lease is the serve). An adopted run never published is owed in
+  the adoption's own write and publishes the copy saved for its serve. A copy is removed only by the
+  ledger's owner, under the ledger's lock, while no record names it: at start, copies no record
+  names are removed, and none while any record or reference cannot be read; a copy whose removal
+  fails is left for the next start. Copies are private (0600). Its result
   goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
   An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
   The same holds after the earlier run has finished: a serve under a lease other than the one it
@@ -449,10 +464,12 @@ Sutando checkout around it sends neither field.
   carries one writer-owned line saying what became of the earlier attempt, from what the bridge
   recorded: its answer delivered (a real receipt, not one the broker settled by refusing it), its
   result undelivered but its own `room.message.send` messages sent, unknown (the journal cannot be
-  read), or not delivered. So the core never takes it for a redelivery it already answered. The run
+  read, or the earlier run's entry has aged out of the ledger), or not delivered. So the core never takes it for a redelivery it already answered. The run
   is published only once that can be read; until then it stays owed and its held serve is kept.
   A wake is a new run too, even under the same generation; a replay of the same episode reuses
-  its run and publishes nothing.
+  its run and publishes nothing. The same episode served again under a new lease is held like any
+  serve: its ack keeps the run (same generation) or gives the newer generation its own run, which
+  carries the wake's answer, episode and rule.
 - Every change to a task's attempt is one transition under that task's lock, committed to
   `state/relay-task-ledger.json` under a file lock (re-read, compared, written to a temp file,
   fsynced, renamed, directory fsynced). A remote effect (an ack, a cancel-ack, a result) is
@@ -462,7 +479,15 @@ Sutando checkout around it sends neither field.
   outcome is unknown (a timeout, a crash) keeps its claim and is reconciled under the same id. Each
   start takes the ledger over with a new epoch, and a bridge whose epoch is gone makes no further
   claim or call and stops polling. A ledger that cannot be locked, read or written is never written
-  over, and nothing that depends on it moves.
+  over, and nothing that depends on it moves. The ledger is format 4 (saved-serve references); a
+  format-3 ledger is read and upgraded on its next write, and a format-3 bridge refuses a format-4
+  ledger rather than serve its debts from a legacy file. A damaged value inside it (its `contract`,
+  a record, a run entry) is never read as absent: the work that needs it is held and logged. The way
+  out is to stop the bridge, set the ledger aside (or repair the named key), and restart: a missing
+  ledger starts empty, and the attempts the old one held are not resumed.
+- The pending-ack index (`remote-task-acks*.json`) is a backup of the ledger's ack claims. With the
+  ledger on, a damaged index is set aside (`*.damaged-<ts>`) and the claims retry its acks; one that
+  cannot be read now is left as it is. With the ledger off, a damaged index reads as empty, as before.
 - The result drain pins the file it will deliver as a hard link under `results/.delivering/` and
   claims it for the run and generation in the same transition, before any effect (attachments,
   Stop, settle, publish). A reply written at the result's name after that is a new result; one that

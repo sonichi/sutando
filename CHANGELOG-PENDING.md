@@ -19,6 +19,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- ag2-sparrow (behind `REMOTE_TASK_LIFECYCLE_V2` / `REMOTE_TASK_TURN_CONTEXT`): the four task-lifecycle failure schedules from #5885's review are closed. A ledger read that fails or finds a damaged map is unknown, never a decision; each held serve keeps its own saved copy, so no generation publishes another's; a wake served again under a new lease is held and decided by its ack; an open ack claim alone recovers a lost ack. The ledger becomes format 4 on its first write: on a host that opted in, rolling back to an earlier Sparrow leaves its bridge unable to read the ledger, so the attempts in it are not resumed; set the ledger aside to start clean. ([#6088])
 - task-orphan-check: a task's age is how long it has waited in this inbox (its `local_time:` header), not since the sender sent it, so messages held at the broker while the app was closed are answered on relaunch instead of archived as orphans. Only a `local_time:` above `task:` counts, so a body line cannot make a fresh task from an older writer look orphaned. ([#5929])
 
 ## Changed
