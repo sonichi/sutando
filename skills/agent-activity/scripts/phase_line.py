@@ -243,9 +243,13 @@ _ASSIGN = re.compile(r"\S+=\S*")
 _LONGNUM = re.compile(r"\d[\d ().-]{5,}\d|\d{7,}")
 _MIXED = re.compile(r"\b(?=[A-Za-z_-]*\d)(?=\d*[A-Za-z])[A-Za-z0-9_-]{6,}\b")
 _LONGWORD = re.compile(r"\b[A-Za-z]{25,}\b")
+try:
+    from chat_secret_filter import SLACK_TOKEN_PATTERN as _SLACK  # the one Slack token family
+except ImportError:
+    _SLACK = re.compile(r"(?!)")
 _CRED = re.compile(r"\b(?:(?:sk|pk|rk)-[A-Za-z0-9_-]{6,}|(?:ghp|gho|ghu|ghs|ghr|github_pat|npm)_[A-Za-z0-9_]{6,}"
-                   r"|xox[a-z]-[A-Za-z0-9-]{6,}|xapp-[A-Za-z0-9-]{6,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|AIza[A-Za-z0-9_-]{20,}"
-                   r"|ya29\.[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{6,})")
+                   r"|(?:AKIA|ASIA)[A-Z0-9]{12,}|AIza[A-Za-z0-9_-]{20,}"
+                   r"|ya29\.[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{6,})|" + _SLACK.pattern)
 _FILTERED = re.compile(r"\[(?:REDACTED|STORED-IN-KEYCHAIN)-[^\]]*\]")
 _PLACEHOLDER = re.compile(r"<[a-z]+>|\bPR\d+\b|\bPerson\d+\b")
 # Words that may stand mid-sentence capitalised; any other is treated as a possible name.
