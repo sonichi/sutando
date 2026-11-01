@@ -119,6 +119,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+import gateway_sessions  # noqa: E402
 from access_store import (  # noqa: E402  — single locked writer for access.json (#3318)
     mutate_access_file,
     read_access_for_transaction,
@@ -2731,6 +2732,39 @@ async def _supervise_loop(coro_fn, name):
         await asyncio.sleep(POLL_LOOP_RESTART_SEC)
 
 
+# discord.py's DEBUG records that say why a session ended; every other DEBUG record (raw gateway
+# payloads among them, which carry message content) stays out of the log.
+GATEWAY_REASON_TEMPLATES = frozenset({
+    "Shard ID %s has sent the IDENTIFY payload.",
+    "Shard ID %s has sent the RESUME payload.",
+    "Received RECONNECT opcode.",
+    "Timed out receiving packet. Attempting a reconnect.",
+    "Websocket closed with %s, attempting a reconnect.",
+    "Websocket closed with %s, cannot reconnect.",
+    "Got a request to %s the websocket.",
+})
+GATEWAY_SESSIONS_FILE = REPO / "state" / "discord-bridge.sessions.json"
+
+
+def _gateway_reason_filter(record) -> bool:
+    import logging
+    return record.levelno >= logging.INFO or record.msg in GATEWAY_REASON_TEMPLATES
+
+
+def _log_gateway_reasons(stream=None) -> None:
+    """Send discord.py's gateway and client records to the bridge log: they alone say why a session
+    ended (close code, timeout, invalidated session, missed heartbeat)."""
+    import logging
+    handler = logging.StreamHandler(stream or sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s",
+                                           "%Y-%m-%dT%H:%M:%S"))
+    handler.addFilter(_gateway_reason_filter)
+    for name in ("discord.gateway", "discord.client"):
+        log = logging.getLogger(name)
+        log.setLevel(logging.DEBUG)
+        log.addHandler(handler)
+
+
 @client.event
 async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
     global _resume_count
@@ -2752,6 +2786,7 @@ async def on_disconnect():  # pragma: no cover — gateway callback
 async def on_ready():
     global _ready_count
     _ready_count += 1
+    gateway_sessions.record(GATEWAY_SESSIONS_FILE, time.time())
     # Restart-safety FIRST: if access.json was wiped/corrupted while the bridge
     # was down, auto-restore it from the durable state/auth/ backup BEFORE any
     # access read below. Without this a wipe+restart boots into pairing/TOFU with
@@ -6249,4 +6284,5 @@ if __name__ == "__main__":
         _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
         _single_instance_acquire("discord-bridge")
+        _log_gateway_reasons()
         client.run(TOKEN, log_handler=None)
