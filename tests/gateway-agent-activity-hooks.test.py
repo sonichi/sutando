@@ -339,6 +339,70 @@ class Hooks(unittest.TestCase):
         self.assertEqual(self.acks(fake, orphan), [], "no lease to prove it by: kept, never posted as None")
         self.assertIn(orphan, json.loads(gw.PENDING_ACK_FILE.read_text()), "and kept")
 
+    def test_a_claimed_ack_still_unanswered_is_posted_once_per_pass(self):
+        tid = "task-ack-once-a-pass"
+        fake, op = self.lost_ack(tid)
+        self.addCleanup(self.sidecars_restored)
+        fake.answers[f"/v1/tasks/{tid}/ack"] = TimeoutError("still lost")
+        sent = len(self.acks(fake, tid))
+        gw._retry_pending_acks({tid})
+        self.assertEqual(len(self.acks(fake, tid)) - sent, 1, "its claim and its sidecar entry: one post, not two")
+
+    def test_the_claim_pass_does_nothing_on_an_unreadable_ledger_or_an_older_claim_it_cannot_place(self):
+        with mock.patch.object(gw._ATTEMPTS, "open_claims", return_value=gw.task_attempts.UNKNOWN):
+            self.assertEqual(gw._retry_claimed_acks(), set())
+        tid = "task-ack-legacy-claim"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e"), set(), []))
+        with gw._ATTEMPTS.transition(tid) as t:
+            self.assertIsNotNone(t.claim("ack", serve="L1"))          # written before claims carried an owner
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": lambda p: _ack(tid, 1)}))
+        with mock.patch.object(gw, "_load_held", return_value=None):
+            self.assertNotIn(tid, gw._retry_claimed_acks(), "the held manifest that may own it cannot be read")
+        self.assertEqual(self.acks(fake, tid), [])
+
+    def test_a_sidecar_entry_whose_attempt_names_no_lease_is_kept_unposted(self):
+        tid = "task-ack-no-record-lease"
+        self.assertTrue(gw._take_served_task(_task(tid, source_event_id="$e"), set(), []))
+        self.addCleanup(self.sidecars_restored)
+        gw.PENDING_ACK_FILE.write_text(json.dumps({tid: True}))
+        gw._ack_lease_file().write_text("{}")
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": lambda p: _ack(tid, 1)}))
+        gw._retry_pending_acks({tid})
+        self.assertEqual(self.acks(fake, tid), [])
+        leased = "task-ack-record-lease"
+        self.assertTrue(gw._take_served_task(_task(leased, lease_id="L7", source_event_id="$e"), set(), []))
+        gw.PENDING_ACK_FILE.write_text(json.dumps({leased: True}))
+        gw._ack_lease_file().write_text("{}")
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{leased}/ack": lambda p: _ack(leased, 1)}))
+        gw._retry_pending_acks({leased})
+        self.assertEqual([p.get("lease_id") for p, _op in self.acks(fake, leased)], ["L7"],
+                         "the sidecar lost its lease: the attempt's own record proves it")
+
+    def test_an_adopted_serve_whose_run_was_never_published_owes_it_from_its_own_copy(self):
+        tid = "task-adopt-unpublished"
+        fake, inflight = self.held(tid, gen_answer=1)
+        ref = gw._ATTEMPTS.get(tid)["pending_serve"]["reserve"]
+        with mock.patch.object(gw, "_run_id_used", return_value=False):
+            self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["owed_publish"], rec["owed_reserve"]), (rec["run"], ref))
+
+    def test_a_saved_serve_read_fails_closed_on_a_wrong_reference_a_missing_copy_or_an_unlistable_folder(self):
+        with self.assertRaises(gw._ReserveLost):
+            gw._read_reserve("task-x", {"id": "v1-" + "0" * 32, "run": "task-x~~2", "lease": "L9"}, "task-x~~2", "L2")
+        with self.assertRaises(gw._ReserveLost):
+            gw._read_reserve("task-x", {"id": "v1-" + "1" * 32, "run": "task-x~~2", "lease": "L2", "sha256": "x"},
+                             "task-x~~2", "L2")
+        with mock.patch.object(gw, "_reserve_dir", return_value=gw.TASKS_DIR / "task-x.txt-not-a-dir"):
+            self.assertEqual(gw._sweep_reserves(), 0)
+
+    def test_a_serve_whose_runs_publication_cannot_be_read_gets_no_run(self):
+        tid = "task-serve-unread-pub"
+        self.served_acked(tid)
+        with mock.patch.object(gw.task_attempts.Transition, "run_published", return_value=gw.task_attempts.UNKNOWN):
+            with gw._ATTEMPTS.transition(tid) as t:
+                self.assertIsNone(gw._serve_run(t, tid))
+
     def test_an_ack_first_claim_is_left_to_the_held_task_pass(self):
         tid = "task-ack-first-owned"
         self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e"), set(), []))

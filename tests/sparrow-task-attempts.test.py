@@ -664,6 +664,33 @@ class Attempts(unittest.TestCase):
             self.assertIsNone(t.switch_run(t.claim("ack", serve="L9"), _ack(3), {}), "nothing held: no switch")
 
 
+class UnreadableEdges(unittest.TestCase):
+    """The failure branches of the tri-state readers and writers, one each."""
+    setUp = Attempts.setUp
+    mk = Attempts.mk
+
+    def test_open_claims_is_unknown_on_an_unreadable_ledger_and_skips_an_unreadable_claim_map(self):
+        a = self.mk()
+        put(a, "tsk_A", run="tsk_A")
+        with unittest.mock.patch.object(a, "_read", return_value=None):
+            self.assertIs(a.open_claims("ack"), task_attempts.UNKNOWN)
+        a._commit(lambda d: d["tasks"]["tsk_A"].__setitem__("claims", ["junk"]), why="test")
+        self.assertEqual(a.open_claims("ack"), [])
+        self.assertTrue(any("its claims cannot be read" in m for m in self.logs))
+
+    def test_a_contract_that_is_not_a_map_refuses_the_ack_write(self):
+        a = self.mk()
+        put(a, "tsk_A", run="tsk_A", awaiting_ack=True, published_at=1000.0)
+        a._commit(lambda d: d.__setitem__("contract", ["junk"]), why="test")
+        self.assertIsNone(ack(a, "tsk_A", {**_ack(1), "task_id": "tsk_A"}), "never recorded over a damaged contract")
+
+    def test_a_result_waits_while_whether_the_broker_names_leases_cannot_be_read(self):
+        a = self.mk(now=lambda: 1000.0 + task_attempts.ACK_HOLD_MAX_S + 1)
+        put(a, "tsk_A", run="tsk_A", awaiting_ack=True, published_at=1000.0)
+        with unittest.mock.patch.object(a, "broker_names_leases", return_value=task_attempts.UNKNOWN):
+            self.assertEqual(call(a, "tsk_A", "result_hold"), "whether this broker names leases cannot be read")
+
+
 class FailurePaths(unittest.TestCase):
     """Every failure costs one pass and a log line; none raises into the bridge."""
 
