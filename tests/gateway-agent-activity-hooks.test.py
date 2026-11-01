@@ -154,7 +154,8 @@ class Hooks(unittest.TestCase):
 
     def test_only_owner_and_collaborator_tasks_get_the_answer_rule(self):
         q = {"question_id": "rq_tier", "expected_revision": 1, "prompt": "Blue?"}
-        for tid, extra, rule in (("task-rq-guest", {"user_id": "@g:x", "access_tier": "guest"}, False),
+        for tid, extra, rule in (("task-rq-owner", {}, True),
+                                 ("task-rq-guest", {"user_id": "@g:x", "access_tier": "guest"}, False),
                                  ("task-rq-team", {"user_id": "@t:x", "access_tier": "team"}, False),
                                  ("task-rq-collab", {"user_id": "@t:x", "access_tier": "team", "collaborator": True}, True)):
             with self.subTest(tid=tid):
@@ -163,6 +164,34 @@ class Hooks(unittest.TestCase):
                 self.assertIn("[AG2 Space room question data", text)
                 self.assertEqual("`room.question.answer`" in text, rule)
                 self.assertEqual(f"rq_{tid}" in (ledger().get("questions") or {}), rule, "no offer without the rule")
+
+    def test_a_secret_anywhere_in_a_room_question_never_reaches_the_task_file(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        q = {"question_id": "rq_sec", "expected_revision": 1, "prompt": f"use {token}?",
+             "options": [{"id": "o1", "label": f"yes {token}"}, {"id": "o2", "label": "no"}],
+             "target_members": [{"name": token}]}
+        self.assertIsNotNone(gw._write_task(_task("task-rq-sec", task=f"see {token}", room_question=q)))
+        text = (gw.TASKS_DIR / "task-rq-sec.txt").read_text()
+        self.assertNotIn(token, text, "redacted in the body and in every nested question field")
+        self.assertIn('"question_id":"rq_sec"', text)
+        self.assertIn("`room.question.answer`", text, "only text fields changed: the question is still answerable")
+        self.assertNotIn(token, json.dumps(ledger()))
+        self.assertTrue(any("room question" in m and "redacted" in m for m in self.logs))
+        self.assertIsNotNone(gw._write_task(_task("task-rq-only", room_question={**q, "question_id": "rq_only"})))
+        only = (gw.TASKS_DIR / "task-rq-only.txt").read_text()
+        self.assertNotIn(token, only)
+        self.assertIn(gw.secret_handling_instruction("AG2Space", ("github_token",)).strip("\n")[:40], only,
+                      "a secret only in the question still brings the secret notice")
+
+    def test_a_question_whose_identity_a_redaction_would_change_is_withheld_whole(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        q = {"question_id": token, "expected_revision": 1, "prompt": "Blue?"}
+        self.assertIsNotNone(gw._write_task(_task("task-rq-id", room_question=q)))
+        text = (gw.TASKS_DIR / "task-rq-id.txt").read_text()
+        self.assertNotIn(token, text)
+        self.assertNotIn("room question data", text)
+        self.assertNotIn("`room.question.answer`", text)
+        self.assertNotIn(token, json.dumps(ledger()), "no offer recorded under it")
 
     def test_a_long_question_is_capped_in_the_task_file(self):
         q = {"question_id": "rq_long", "expected_revision": 1, "prompt": "x" * 50000}
@@ -595,7 +624,8 @@ class Hooks(unittest.TestCase):
                     fh.write(json.dumps({"ts": time.time() + 5, "kind": "working", "task": {"id": tid}}) + "\n")
                 with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
                     for rec in ({"record_type": "dispatch_intent", "turn_id": turn, "task_id": tid, "seq": 1,
-                                 "ts": time.time(), "operation_id": f"op_{tid}", "action": "room.question.answer"},
+                                 "ts": time.time(), "operation_id": f"op_{tid}", "action": "room.question.answer",
+                                 "question_id": qid},
                                 {"record_type": "dispatch_outcome", "turn_id": turn, "task_id": tid, "seq": 1,
                                  "ts": time.time(), "operation_id": f"op_{tid}", "operation_status": "succeeded"}):
                         fh.write(json.dumps(rec) + "\n")
@@ -613,6 +643,49 @@ class Hooks(unittest.TestCase):
                 self.assertEqual(fake.posted("/v1/results"), [], "settled, nothing posted")
                 self.assertIsNone(gw._ATTEMPTS.entry(tid), "retired")
                 self.assertTrue(ledger()["questions"][qid].get("answered"), "its answer is recorded at the settle")
+
+    def taken_offer(self, tid, qid):
+        q = {"question_id": qid, "expected_revision": 1, "prompt": "Blue?"}
+        self.assertIsNotNone(gw._write_task(_task(tid, room_question=q)))
+        turn = seed_ack(tid, _ack(tid, 1))["turn_id"]
+        with open(gw._STATE / "agent-activity.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": time.time() + 5, "kind": "working", "task": {"id": tid}}) + "\n")
+        return turn
+
+    def test_a_taken_task_offered_a_question_but_closed_for_another_reason_is_stopped(self):
+        for reason in ("max_queued_age_exceeded", "question_resolved", "cancelled_by_owner"):
+            with self.subTest(reason=reason):
+                tid = f"task-offer-other-{reason}"
+                self.taken_offer(tid, f"rq_{reason}")
+                self.closed_by_beat(tid, reason=reason)          # its journal shows no answer
+                self.assertEqual(len(self.controls(tid)), 1, "the normal stop")
+                self.assertFalse(gw._ATTEMPTS.entry(tid).get("owed_close"))
+
+    def test_an_answer_that_stays_unknown_keeps_the_stop_owed_until_it_can_be_told(self):
+        for later in (False, True):
+            with self.subTest(answered_later=later):
+                tid, qid = f"task-offer-unknown-{later}", f"rq_unknown_{later}"
+                turn = self.taken_offer(tid, qid)
+                with mock.patch.object(gw.task_attempts.agent_turn, "answered_in_journal", return_value=None):
+                    for _ in range(3):
+                        self.closed_by_beat(tid)
+                        self.assertEqual(self.controls(tid), [], "never a stop on what cannot be told")
+                        self.assertTrue(gw._ATTEMPTS.entry(tid).get("owed_close"), "still owed, for the next pass")
+                gw._ATTEMPTS.take_ownership()                      # the restarted bridge reads the same ledger
+                self.assertTrue(gw._ATTEMPTS.entry(tid).get("owed_close"), "the marker survives a restart")
+                if later:
+                    with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
+                        for rec in ({"record_type": "dispatch_intent", "turn_id": turn, "task_id": tid, "seq": 1,
+                                     "ts": time.time(), "operation_id": f"op_{tid}",
+                                     "action": "room.question.answer", "question_id": qid},
+                                    {"record_type": "dispatch_outcome", "turn_id": turn, "task_id": tid, "seq": 1,
+                                     "ts": time.time(), "operation_id": f"op_{tid}", "operation_status": "succeeded"}):
+                            fh.write(json.dumps(rec) + "\n")
+                self.closed_by_beat(tid)                           # recovered: the journal can be read
+                self.assertEqual(len(self.controls(tid)), 0 if later else 1,
+                                 "answered: no stop; not answered: the normal stop")
+                self.assertFalse(gw._ATTEMPTS.entry(tid).get("owed_close"))
+                self.assertEqual(ledger()["questions"][qid].get("answered") is True, later)
 
     def test_a_closed_question_task_the_core_has_not_taken_is_withdrawn_whatever_its_answer_reads(self):
         for answered in (None, True):

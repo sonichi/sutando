@@ -345,21 +345,56 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
     return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, sent)
 
 
-def answered_in_journal(state_dir: Path, task_id: str) -> "bool | None":
-    """Whether any turn of this task already answered a room question: a room.question.answer intent
-    the proxy tagged with this task whose outcome succeeded. Durable before the result is decided.
-    None when that cannot be told: a journal that cannot be read, a damaged line naming the task, or
-    an answer sent with no outcome, or with one other than succeeded or failed."""
-    path = room_actions_path(state_dir)
-    ops, ok, failed = set(), set(), set()
-    for p in (path.with_name(path.name + ".1"), path):
+JOURNAL_SNAPSHOT_TRIES = 3
+
+
+def _journal_signature(path: Path):
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _journal_snapshot(path: Path) -> "list | None":
+    """(file, text, age) for the rotated and the live journal, read while neither changed; None when
+    a file cannot be read or no read was stable: a rotation mid-read must not lose an answer."""
+    rotated = path.with_name(path.name + ".1")
+    for _ in range(JOURNAL_SNAPSHOT_TRIES):
         try:
-            text = p.read_text()
-            age = time.time() - p.stat().st_mtime
+            before = [_journal_signature(p) for p in (rotated, path)]
+            out = []
+            for p, sig in zip((rotated, path), before):
+                if sig is not None:
+                    out.append((p, p.read_text(), time.time() - sig[2] / 1e9))
+            if [_journal_signature(p) for p in (rotated, path)] == before:
+                return out
         except FileNotFoundError:
-            continue
+            continue                            # rotated away between the look and the read
         except OSError:
             return None
+    return None
+
+
+def answer_question_id(intent: dict):
+    """The question an answer intent names: top-level or in its arguments; None when it names none."""
+    args = intent.get("arguments")
+    qid = intent.get("question_id", args.get("question_id") if isinstance(args, dict) else None)
+    return qid if isinstance(qid, str) and qid else None
+
+
+def answered_in_journal(state_dir: Path, task_id: str, question_id: str) -> "bool | None":
+    """Whether a turn of this task already answered this room question: a room.question.answer
+    intent the proxy tagged with this task and question whose outcome succeeded. None when that
+    cannot be told: a journal that cannot be read, a damaged line naming the task, an answer with
+    no outcome or one other than succeeded or failed, or one that names no question (it may be
+    this one's). An answer to another question does not count."""
+    path = room_actions_path(state_dir)
+    snapshot = _journal_snapshot(path)
+    if snapshot is None:
+        return None
+    ops, unnamed, ok, failed = set(), set(), set(), set()
+    for _p, text, _age in snapshot:
         lines = text.split("\n")
         for i, line in enumerate(lines):
             if not line.strip():
@@ -371,13 +406,15 @@ def answered_in_journal(state_dir: Path, task_id: str) -> "bool | None":
             if not isinstance(rec, dict):
                 if task_id in line:
                     return None                 # even an append in progress may be this task's answer
-                if p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S:
-                    continue                    # an append in progress
                 continue
             if rec.get("task_id") != task_id:
                 continue
             if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
-                ops.add(rec.get("operation_id"))
+                named = answer_question_id(rec)
+                if named is None:
+                    unnamed.add(rec.get("operation_id"))
+                elif named == question_id:
+                    ops.add(rec.get("operation_id"))
             elif rec.get("record_type") == OUTCOME:
                 status = rec.get("operation_status")
                 if status == "succeeded":
@@ -386,7 +423,7 @@ def answered_in_journal(state_dir: Path, task_id: str) -> "bool | None":
                     failed.add(rec.get("operation_id"))
     if ops & ok:
         return True
-    return None if ops - failed else False
+    return None if (ops | unnamed) - failed else False
 
 
 def unmatched_intents(records: TurnRecords) -> list:

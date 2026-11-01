@@ -359,45 +359,80 @@ class AnsweredInJournal(unittest.TestCase):
         self.state = Path(tempfile.mkdtemp())
 
     def answer(self, tid, op, status=None):
-        recs = [{"record_type": at.INTENT, "task_id": tid, "operation_id": op, "action": "room.question.answer"}]
+        recs = [{"record_type": at.INTENT, "task_id": tid, "operation_id": op, "action": "room.question.answer",
+                 "question_id": "rq"}]
         if status:
             recs.append({"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
         _journal(self.state, *recs)
 
     def test_each_outcome_reads_as_answered_not_answered_or_unknown(self):
-        self.assertFalse(at.answered_in_journal(self.state, "tsk_A"), "no journal: not answered")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A", "rq"), "no journal: not answered")
         self.answer("tsk_A", "op1", "failed")
-        self.assertFalse(at.answered_in_journal(self.state, "tsk_A"))
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A", "rq"))
         self.answer("tsk_B", "op2")
-        self.assertIsNone(at.answered_in_journal(self.state, "tsk_B"), "sent, outcome unknown")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_B", "rq"), "sent, outcome unknown")
         self.answer("tsk_C", "op3", "succeeded")
-        self.assertTrue(at.answered_in_journal(self.state, "tsk_C"))
+        self.assertTrue(at.answered_in_journal(self.state, "tsk_C", "rq"))
         _journal(self.state, {"record_type": at.INTENT, "task_id": "tsk_D", "operation_id": "op4",
                               "action": "room.message.send"})
-        self.assertFalse(at.answered_in_journal(self.state, "tsk_D"), "another action is not an answer")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_D", "rq"), "another action is not an answer")
+
+    def test_an_answer_counts_only_for_the_question_it_names(self):
+        def sent(tid, op, status, **q):
+            _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": op,
+                                  "action": "room.question.answer", **q},
+                     {"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
+        sent("tsk_Q", "q1", "succeeded", question_id="rq_other")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_Q", "rq"), False, "another question's answer")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_Q", "rq_other"), True)
+        sent("tsk_Q", "q2", "succeeded", arguments={"question_id": "rq_args"})
+        self.assertIs(at.answered_in_journal(self.state, "tsk_Q", "rq_args"), True, "named in its arguments")
+        sent("tsk_L", "l1", "succeeded")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_L", "rq"), "a legacy answer naming no question")
+        sent("tsk_M", "m1", "failed")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_M", "rq"), False, "a failed one is no answer at all")
+
+    def test_a_rotation_mid_read_never_loses_an_answer(self):
+        self.answer("tsk_R", "r1", "succeeded")
+        live = at.room_actions_path(self.state)
+        real, rotations = Path.read_text, []
+
+        def rotating(path, *a, **k):
+            if path == live and len(rotations) < self.rotate_times:
+                rotations.append(1)
+                os.replace(live, live.with_name(live.name + ".1"))
+                live.write_text("")
+            return real(path, *a, **k)
+        self.rotate_times = 1
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
+            self.assertIs(at.answered_in_journal(self.state, "tsk_R", "rq"), True, "re-read once the files hold still")
+        self.rotate_times = at.JOURNAL_SNAPSHOT_TRIES + 1
+        rotations.clear()
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
+            self.assertIsNone(at.answered_in_journal(self.state, "tsk_R", "rq"), "never still: cannot be told")
 
     def test_only_a_definite_failure_reads_as_not_answered(self):
         for i, status in enumerate(("dispatched_unknown", "accepted", "running", "timeout", "", None, 7)):
             with self.subTest(status=status):
                 tid = f"tsk_S{i}"
                 _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": f"s{i}",
-                                      "action": "room.question.answer"},
+                                      "action": "room.question.answer", "question_id": "rq"},
                          {"record_type": at.OUTCOME, "task_id": tid, "operation_id": f"s{i}",
                           "operation_status": status})
-                self.assertIsNone(at.answered_in_journal(self.state, tid), "its answer may have been applied")
+                self.assertIsNone(at.answered_in_journal(self.state, tid, "rq"), "its answer may have been applied")
         self.answer("tsk_F", "f1", "failed")
-        self.assertIs(at.answered_in_journal(self.state, "tsk_F"), False)
+        self.assertIs(at.answered_in_journal(self.state, "tsk_F", "rq"), False)
 
     def test_a_damaged_or_unreadable_journal_is_unknown_only_for_the_task_it_names(self):
         path = at.room_actions_path(self.state)
         path.write_text('{"task_id": "tsk_A", "record\n\n{"task_id": "tsk_Z"}\n')
-        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"))
-        self.assertFalse(at.answered_in_journal(self.state, "tsk_B"), "another task's damage is not its")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A", "rq"))
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_B", "rq"), "another task's damage is not its")
         path.write_text('{"task_id": "tsk_A", "record_type": "dispatch_intent"}\n{"task_id": "tsk_A", "parti')
-        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"), "an append in progress may be its answer")
-        self.assertFalse(at.answered_in_journal(self.state, "tsk_B"), "a fresh partial line of another task is not")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A", "rq"), "an append in progress may be its answer")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_B", "rq"), "a fresh partial line of another task is not")
         with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
-            self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"))
+            self.assertIsNone(at.answered_in_journal(self.state, "tsk_A", "rq"))
 
 
 class ResultFileDecision(unittest.TestCase):

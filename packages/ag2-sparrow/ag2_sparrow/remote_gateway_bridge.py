@@ -4704,7 +4704,7 @@ def _withdraw_closed(t, why: str) -> None:
         if answered is None:
             return                              # cannot be told: its marker stays for the next pass
         if answered:
-            t.put(owed_close=None)              # closed by its own answer: no stop
+            t.settle_answer(owed_close=None)    # closed by its own answer: recorded, no stop
             return
     ctl = _new_ctl_id()
     if t.put(owed_close=None, owed_ctl={"id": ctl, "reason": why}, fence_ctl=ctl):
@@ -4712,6 +4712,32 @@ def _withdraw_closed(t, why: str) -> None:
 
 
 _last_task_beat_at = 0.0
+
+# The fields that name the question: one a redaction would change is not the question it names.
+_QUESTION_IDENTITY = ("question_id", "expected_revision")
+
+
+def _redacted_question(question) -> "tuple[dict | None, tuple]":
+    """(the question with every string redacted, the secret types found); (None, found) when a
+    redaction would change a field that identifies it, so it is withheld whole."""
+    if not isinstance(question, dict):
+        return None, ()
+    found: set = set()
+
+    def clean(v):
+        if isinstance(v, str):
+            r = filter_chat_secrets(v)
+            found.update(r.secret_types)
+            return r.text
+        if isinstance(v, dict):
+            return {clean(k): clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+    out = clean(question)
+    if any(out.get(k) != question.get(k) for k in _QUESTION_IDENTITY):
+        return None, tuple(sorted(found))
+    return out, tuple(sorted(found))
 
 
 def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
@@ -5668,7 +5694,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # with the discord/slack/telegram bridges): a token pasted into a
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
-                _secret_types = tuple(_filtered.secret_types)
+                _secret_types = tuple(sorted(set(_secret_types) | set(_filtered.secret_types)))
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
@@ -5708,7 +5734,12 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f == "room_question":
-            rq_line = task_attempts.render_room_question(task.get(f)) if TURN_CONTEXT else None
+            question, found = _redacted_question(task.get(f)) if TURN_CONTEXT else (None, ())
+            if found:
+                _secret_types = tuple(sorted(set(_secret_types) | set(found)))
+                _log(f"redacted pasted secret(s) in {tid} room question: {', '.join(found)}")
+            task[f] = question                  # the sanitized copy is the only one any later reader sees
+            rq_line = task_attempts.render_room_question(question)
             if rq_line:
                 lines.append(rq_line)
         elif f == "picker_command":
