@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "owner": "github:sonichi/sutando",
   "stability": "experimental",
-  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering. Config: AGENT_DISPLAY_NAME names the agent in the first row (env override > this manifest > 'Your agent').",
+  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering. Config: AGENT_DISPLAY_NAME names the agent in the first row (env override > this manifest > 'Your agent'). SUTANDO_STOP_INTERRUPT=1 lets a Stop send one Escape to the core's turn on that task and marks it cancelled only once the stop is confirmed; off (default), a cancel marks the task cancelled at once.",
   "permissions": {
     "network": false,
     "filesystem": "read-write",
@@ -24,6 +24,7 @@
     }
   ],
   "config": {
-    "AGENT_DISPLAY_NAME": ""
+    "AGENT_DISPLAY_NAME": "",
+    "SUTANDO_STOP_INTERRUPT": ""
   }
 }

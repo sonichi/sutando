@@ -4772,8 +4772,10 @@ def _watch_dispatch(t) -> None:
                          f"with no turn activity for {task_attempts.DISPATCH_LOST_S // 60} min")
     elif pending and not answered and t.stalled_due(_queued_at(tid), activity, (motion := _core_motion())):
         window = task_attempts.STALLED_S if motion == "idle" else task_attempts.STALLED_UNOBSERVED_S
+        # A turn parked on a terminal prompt is answered by the Stop path's Escape: one control task.
         _fail_unanswered(t, tid, STALLED_RESULT, "the core took it up, then wrote no turn "
-                         f"activity or result for {window // 60} min and is not mid-turn")
+                         f"activity or result for {window // 60} min and is not mid-turn",
+                         owed_ctl={"id": _new_ctl_id(), "reason": "stalled"})
 
 
 def _core_motion() -> "str | None":
@@ -4793,11 +4795,11 @@ def _queued_at(tid: str) -> "float | None":
         return None
 
 
-def _fail_unanswered(t, tid: str, body: str, why: str) -> bool:
+def _fail_unanswered(t, tid: str, body: str, why: str, **extra) -> bool:
     """The failure is recorded with its result body before the result is written, so a result
-    that cannot be written yet is owed and retried by every beat until it is. False when the
-    failure could not be recorded."""
-    if not t.mark_dispatch_lost(body):
+    that cannot be written yet is owed and retried by every beat until it is; `extra` debts ride
+    the same write. False when the failure could not be recorded."""
+    if not t.mark_dispatch_lost(body, **extra):
         _log_backoff((tid, "lost-unrecorded"), f"task {tid}: {why}, but that could not be "
                      "recorded — retried next beat")
         return False

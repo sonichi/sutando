@@ -423,6 +423,8 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # The watcher's emit decides whether a Stop interrupts the core's turn.
+  [ -n "${SUTANDO_STOP_INTERRUPT:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=$SUTANDO_STOP_INTERRUPT")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_WINDOW=${CORE_WINDOW:-0}")
   [ -n "$CORE_PANE" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_PANE=$CORE_PANE")
