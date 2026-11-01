@@ -429,9 +429,24 @@ class DeclaredLocalServer(unittest.TestCase):
                     C.preview_connection("http://chat.home.example/relay|s",
                                          fetch=lambda *a: self.fail(f"cleartext to {ip}"),
                                          getaddrinfo=self.resolving_to(ip))
-            p = C.preview_connection("http://chat.home.example/relay|s", fetch=fetch,
+            # A name that resolves to loopback today is not loopback: the bridge re-resolves it.
+            with self.assertRaises(C.InvalidToken):
+                C.preview_connection("http://chat.home.example/relay|s", fetch=fetch,
                                      getaddrinfo=self.resolving_to("127.0.0.1"))
-            self.assertTrue(p["verified"])
+        fetch, _ = self.listing("@a.agent:localhost")
+        for entry, url in (({"server": "localhost", "allow_local": True}, "http://localhost/relay"),
+                           ({"server": "localhost", "gateway_host": "127.0.0.1", "allow_local": True}, "http://127.0.0.1/relay"),
+                           ({"server": "localhost", "gateway_host": "[::1]", "allow_local": True}, "http://[::1]/relay")):
+            with self.section(entry):
+                ip = "::1" if "::1" in url else "127.0.0.1"
+                self.assertTrue(C.preview_connection(url + "|s", fetch=fetch, getaddrinfo=self.resolving_to(ip))["verified"], url)
+
+    def test_a_malformed_port_in_an_entry_matches_nothing(self):
+        fetch, _ = self.listing("@a.agent:localhost")
+        with self.section({"server": "bad", "gateway_host": "localhost:99999", "allow_local": True}, self.ENTRY):
+            self.assertEqual(C.local_server_for("localhost", port=80), "localhost")
+            self.assertTrue(C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                                 getaddrinfo=self.resolving_to("127.0.0.1"))["verified"])
 
     def test_an_entry_that_names_a_port_covers_that_port_only(self):
         fetch, seen = self.listing("@alice.agent:localhost")

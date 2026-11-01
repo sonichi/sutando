@@ -510,6 +510,15 @@ def _local_address(ip: str) -> bool:
     return addr in ipaddress.ip_network("fc00::/7")
 
 
+def _loopback_host(host: str) -> bool:
+    """Whether a gateway host names this machine itself: localhost (or a name under .localhost),
+    or a loopback address literal. A name that merely resolves to loopback today is not."""
+    h = (host or "").strip().lower().rstrip(".").strip("[]")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    return _loopback_address(h)
+
+
 def _loopback_address(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip.split("%", 1)[0])
@@ -655,7 +664,10 @@ def local_server_for(host: str, config=None, port: Optional[int] = None) -> str:
         gateway = str(e.get("gateway_host") or e.get("server") or "").strip().lower().rstrip(".")
         if not want or host_only(gateway) != want:
             continue
-        named = urllib.parse.urlsplit(f"//{gateway}").port if gateway.count(":") == 1 or "]:" in gateway else None
+        try:
+            named = urllib.parse.urlsplit(f"//{gateway}").port if gateway.count(":") == 1 or "]:" in gateway else None
+        except ValueError:  # a malformed port in the owner's entry matches nothing
+            continue
         if named is not None and named != port:
             continue
         return host_only(str(e.get("server") or ""))
@@ -717,8 +729,10 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     address = vetted_address(host, port, getaddrinfo, allow_private=bool(local))
     if address == "":
         raise InvalidToken("invalid_gateway")
-    if address and url.lower().startswith("http://") and not _loopback_address(address):
+    if url.lower().startswith("http://") and not (_loopback_host(host) and (not address or _loopback_address(address))):
         # The bearer rides every poll, ack and result: in cleartext only to this machine itself.
+        # The host must BE loopback (localhost, 127/8, ::1), not merely resolve to it now: the
+        # bridge resolves the name again on every poll.
         raise InvalidToken("invalid_gateway")
     if address is None:
         out["error"] = "unreachable (resolution)"
