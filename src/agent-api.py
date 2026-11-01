@@ -141,10 +141,16 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 # Host names (beyond loopback and IP literals) this API may be reached by, e.g. a LAN name;
 # any other Host is refused as DNS rebinding. The web client's port gets same-host CORS reads.
 ALLOWED_HOSTS = config_get("AGENT_API_ALLOWED_HOSTS", "")
-try:
-    WEB_CLIENT_PORT = int(config_get("CLIENT_PORT", "8080") or 8080)
-except ValueError:
-    WEB_CLIENT_PORT = 8080
+
+
+def _port_setting(key: str, default: int) -> int:
+    try:
+        return int(config_get(key, str(default)) or default)
+    except ValueError:
+        return default
+
+
+WEB_CLIENT_PORT = _port_setting("CLIENT_PORT", 8080)
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
