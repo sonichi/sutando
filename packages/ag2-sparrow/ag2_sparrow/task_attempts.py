@@ -21,6 +21,7 @@ import contextlib
 import hashlib
 from datetime import datetime
 import json
+import math
 import os
 import re
 import secrets
@@ -770,8 +771,17 @@ class Transition:
                   "owed_publish": pending["run"], "finished": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
-        return self.rec if self._change(lambda _d, r: {**r, **fields, "claims": None},
-                                        f"the switch to run {pending['run']}")[0] else None
+        qid = rec.get("answer_offered")
+
+        def edit(d, r):
+            if qid:
+                # The earlier run may still answer, unfenced: its question is closed, never handed on.
+                try:
+                    _close_or_free(d, qid, self.wire, None)
+                except _Refused:
+                    pass                        # a damaged map withholds every later offer anyway
+            return {**r, **fields, "claims": None, "answer_offered": None}
+        return self.rec if self._change(edit, f"the switch to run {pending['run']}")[0] else None
 
     # ── claims ───────────────────────────────────────────────────────────
     def claim(self, kind: str, *, data: "dict | None" = None, sole: bool = False, **extra) -> "Claim | None":
@@ -1106,7 +1116,7 @@ class Transition:
                 raise _Refused                  # it cannot be told whether it was answered
             holder = q.get("holder")
             if holder is not None:
-                seen = agent_turn.answered_in_journal(state_dir, holder, qid, q.get("since"))
+                seen = agent_turn.answered_in_journal(state_dir, holder, qid)
                 if seen is True:
                     _close_or_free(data, qid, holder, True)      # seen once, recorded for good
                     verdict.append("answered")
@@ -1121,12 +1131,11 @@ class Transition:
                     raise _Refused               # a holder gone without its settle: cannot be told
             if qid not in questions:
                 _make_room(questions, self.now())
-            expires, since = _expiry(question), self.now()
+            expires = _expiry(question)
             questions.pop(qid, None)
-            questions[qid] = {"holder": self.wire, "since": since,
-                              **({"expires": expires} if expires is not None else {})}
+            questions[qid] = {"holder": self.wire, **({"expires": expires} if expires is not None else {})}
             verdict.append("offered")
-            return {**rec, "answer_offered": qid, "answer_offered_at": since} if isinstance(rec, dict) else rec
+            return {**rec, "answer_offered": qid} if isinstance(rec, dict) else rec
         saved, _ = self._change(offer, f"the offer of question {qid}")
         if saved and verdict == ["offered"]:
             return rule
@@ -1179,12 +1188,8 @@ class Transition:
     def answered_here(self):
         """Whether this task's offered room question was answered in its journal: True, False, or
         None when that cannot be told."""
-        rec = self.rec if isinstance(self.rec, dict) else {}
-        qid, since = rec.get("answer_offered"), rec.get("answer_offered_at")
-        if not qid:
-            return False
-        return agent_turn.answered_in_journal(self.owner.state_dir, self.wire, qid,
-                                              since if type(since) in (int, float) else None)
+        qid = self.rec.get("answer_offered") if isinstance(self.rec, dict) else None
+        return agent_turn.answered_in_journal(self.owner.state_dir, self.wire, qid) if qid else False
 
     def _note_answered(self, rec, records) -> None:
         """The offered question is closed before the result is decided when this turn answered it
@@ -1435,7 +1440,7 @@ def _questions(data) -> dict:
     """The questions map, every entry checked; _Refused, before anything changes, when any entry is
     not exactly one of the three shapes this writer makes:
       free    {}                                   offered before, nobody holds it now
-      held    {"holder": <task id>, "since": <t>}  one task may answer it, offered at t
+      held    {"holder": <task id>}                one task may answer it
       closed  {"answered": true | "unknown"}       answered, or it cannot be told: never again
     each optionally with "expires" (epoch seconds)."""
     questions = data.setdefault("questions", {})
@@ -1463,9 +1468,11 @@ def _log_damaged(qid) -> None:
 
 
 def _state(q, tasks: dict) -> str:
-    if type(q) is not dict or set(q) - {"holder", "since", "answered", "expires"} or {"holder", "answered"} <= set(q):
+    # "since" was written on a hold by an earlier version of this writer; it is accepted and unused.
+    if (type(q) is not dict or set(q) - {"holder", "since", "answered", "expires"} or {"holder", "answered"} <= set(q)
+            or ("since" in q and ("holder" not in q or type(q["since"]) not in (int, float)))):
         raise _Refused
-    if any(k in q and type(q[k]) not in (int, float) for k in ("expires", "since")) or ("since" in q) > ("holder" in q):
+    if "expires" in q and (type(q["expires"]) not in (int, float) or not math.isfinite(q["expires"])):
         raise _Refused
     if "answered" in q:
         if q["answered"] is not True and not (type(q["answered"]) is str and q["answered"] == ANSWERED_UNKNOWN):
@@ -1483,7 +1490,7 @@ def _expiry(question) -> "float | None":
     """The question's `expires_at` as epoch seconds; None when absent or unreadable."""
     v = question.get("expires_at") if isinstance(question, dict) else None
     if type(v) in (int, float):
-        return float(v)
+        return float(v) if math.isfinite(v) else None
     if type(v) is str:
         try:
             return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
@@ -1510,17 +1517,17 @@ def _make_room(questions: dict, now: float) -> None:
 
 
 def _close_or_free(data, qid: str, wire: str, answered) -> None:
-    """Record what `wire`'s journal says of the question it held: True or None (cannot be told)
-    close it for good; False frees it. An entry no longer there was forgotten as expired: no write."""
+    """Close the question `wire` held, for good: answered when its journal proves it, else unknown.
+    No answer in the journal proves nothing (it may have rotated away), so a hold is never freed.
+    An entry no longer there was forgotten as expired: no write."""
     questions = _questions(data)
     q = questions.get(qid)
     if q is None or q.get("answered") is True:
         return
+    if answered is not True and q.get("holder") not in (wire, None):
+        return                              # another task's hold: only proof of an answer closes it
     keep = {"expires": q["expires"]} if "expires" in q else {}
-    if answered is True or answered is None:
-        questions[qid] = {"answered": True if answered else ANSWERED_UNKNOWN, **keep}
-    elif q.get("holder") == wire:
-        questions[qid] = keep
+    questions[qid] = {"answered": True if answered is True else ANSWERED_UNKNOWN, **keep}
 
 
 def _question_id(question) -> "str | None":

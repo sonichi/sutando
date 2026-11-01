@@ -522,7 +522,7 @@ rulebook) by a line that it is context only and must not be answered.
 
 An answer cannot be undone, so the attempt ledger's `questions` map, by question id, decides who
 may answer. Each entry is exactly one of three shapes, and any entry that is not refuses every offer:
-- free `{}`: offered before, nobody holds it now;
+- free `{}`: left only by a previous version; offered again like a new one;
 - held `{"holder": <task id>}`: one task may answer it;
 - closed `{"answered": true}` or `{"answered": "unknown"}`: answered, or it cannot be told; never
   offered again.
@@ -539,13 +539,14 @@ re-reads.
 - Closed unknown, or it cannot be told: a note to leave it unanswered.
 
 The settle fences the task's turn first, then reads the journal, so no answer of that turn can land
-after the read; a turn whose fence cannot be had yet keeps the attempt for the next pass, and an
-attempt with no turn (unbound: nothing to fence) counts as cannot be told unless its answer is
-already there. A hold records when it was given; a journal whose kept history starts after that may
-have rotated the answer away, so no answer found then is cannot be told, never "not answered". It then closes the entry
-(true or unknown) or frees it. Only an offer creates an entry, within 2,000; free and expired
-(a day past `expires_at`) entries are forgotten first, and with none, the new offer is withheld. A
-settle whose entry was forgotten as expired writes nothing.
+after the read; a turn whose fence cannot be had yet keeps the attempt for the next pass. It then
+**closes** the question for good: `true` when the journal proves the answer, else `"unknown"`. No
+answer found never frees a question, since it may have rotated away or (with no turn to fence) still
+be on its way, so the same agent never offers a question twice. A newer generation replacing a run
+closes that run's question in the same write, since the earlier run may still answer. Only an offer
+creates an entry, within 2,000; entries a day past `expires_at` (and free ones a previous version
+left) are forgotten first, and with none, the new offer is withheld. A settle whose entry was
+forgotten as expired writes nothing.
 
 A task the broker closed is withdrawn from the inbox if the core has not taken it. Once taken, and
 offered a question, its journal decides: answered, the answer is recorded and no stop is sent;

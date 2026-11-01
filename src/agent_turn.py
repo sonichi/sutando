@@ -389,35 +389,18 @@ def answer_question_id(intent: dict):
     return next(iter(named), None)
 
 
-def _first_ts(text: str):
-    """The ts of a file's first record, or None when its first line is not one."""
-    for line in text.split("\n"):
-        if line.strip():
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                return None
-            ts = rec.get("ts") if isinstance(rec, dict) else None
-            return ts if type(ts) in (int, float) else None
-    return None
-
-
-def answered_in_journal(state_dir: Path, task_id: str, question_id: str,
-                        since: "float | None" = None) -> "bool | None":
+def answered_in_journal(state_dir: Path, task_id: str, question_id: str) -> "bool | None":
     """Whether a turn of this task already answered this room question: a room.question.answer
     intent the proxy tagged with this task and question whose outcome succeeded. None when that
     cannot be told: a journal that cannot be read, a damaged line naming the task, an answer with
     no outcome or one other than succeeded or failed, or one that names no question (it may be
-    this one's). An answer to another question does not count. With `since` (when the question was
-    offered), a journal whose kept history starts after it may have rotated the answer away: only
-    an answer still there counts, and no answer is unknown, never False."""
+    this one's). An answer to another question does not count. False only says none is in the
+    journal as kept now, never that none was given: an answer may have rotated away."""
     path = room_actions_path(state_dir)
     snapshot = _journal_snapshot(path)
     if snapshot is None:
         return None
     ops, unnamed, ok, failed = set(), set(), set(), set()
-    starts = [_first_ts(text) for rotated, text in snapshot if rotated]
-    aged_out = since is not None and bool(starts) and any(s is None or s > since for s in starts)
     for _rotated, text in snapshot:
         lines = text.split("\n")
         for i, line in enumerate(lines):
@@ -450,7 +433,7 @@ def answered_in_journal(state_dir: Path, task_id: str, question_id: str,
                     failed.add(op)
     if ops & ok:
         return True
-    return None if (ops | unnamed) - failed or aged_out else False
+    return None if (ops | unnamed) - failed else False
 
 
 def unmatched_intents(records: TurnRecords) -> list:

@@ -758,7 +758,9 @@ class AnsweredOnce(unittest.TestCase):
                 self.answer_in_journal(self.turn(a, "tsk_A"), "tsk_A", **kw)
                 call(a, "tsk_A", "result_decision", "done", False)
                 self.assertTrue(call(a, "tsk_A", "finish"))
-                self.assertIn(self.RULE, call(a, "tsk_C", "answer_rule", self.Q))
+                self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"},
+                                 "never recorded as answered, and never freed: absence proves nothing")
+                self.assertEqual(call(a, "tsk_C", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
 
     def test_a_question_offered_to_a_task_still_open_is_never_offered_twice(self):
         a = self.mk(turn_context=True)
@@ -882,7 +884,7 @@ class AnsweredOnce(unittest.TestCase):
                     self.assertEqual(after["questions"], before["questions"], "nothing changed, nothing evicted")
                     self.assertNotIn("answer_offered", after["tasks"]["tsk_B"])
 
-    def test_the_bound_forgets_only_what_can_never_be_answered_twice(self):
+    def test_the_bound_forgets_only_expired_questions_and_otherwise_withholds(self):
         a = self.mk(turn_context=True)
         with unittest.mock.patch.object(task_attempts, "QUESTIONS_KEPT", 2):
             self.served(a, "tsk_ans")
@@ -890,20 +892,45 @@ class AnsweredOnce(unittest.TestCase):
             self.answer_in_journal(self.turn(a, "tsk_ans"), "tsk_ans", qid="q_ans")
             call(a, "tsk_ans", "finish")
             self.served(a, "tsk_0")
-            self.assertIn(self.RULE, call(a, "tsk_0", "answer_rule", {"question_id": "q0"}))
+            self.assertIn(self.RULE, call(a, "tsk_0", "answer_rule", {"question_id": "q0", "expires_at": 0}))
             self.turn(a, "tsk_0")
+            call(a, "tsk_0", "finish")                     # its journal shows no answer: closed, not freed
             self.served(a, "tsk_1")
             before = a._read()["questions"]
             self.assertEqual(call(a, "tsk_1", "answer_rule", {"question_id": "q1"}), task_attempts.ANSWER_UNRECORDED_NOTE,
-                             "an answer and a held question are both protected: no room, withheld")
+                             "closed questions are kept: no room, withheld")
             self.assertEqual(a._read()["questions"], before, "and nothing changed")
-            call(a, "tsk_0", "finish")                     # its journal says it did not answer
-            self.assertEqual(a._read()["questions"]["q0"], {}, "free: nobody holds it, nobody answered it")
-            self.assertIn(self.RULE, call(a, "tsk_1", "answer_rule", {"question_id": "q1"}))
-            self.assertEqual(list(a._read()["questions"]), ["q_ans", "q1"], "only the free one was forgotten")
+            with unittest.mock.patch.object(a, "now", lambda: task_attempts.QUESTION_EXPIRY_GRACE_S + 1):
+                self.assertIn(self.RULE, call(a, "tsk_1", "answer_rule", {"question_id": "q1"}))
+            self.assertEqual(list(a._read()["questions"]), ["q_ans", "q1"], "only the expired one was forgotten")
             self.served(a, "tsk_9")
             self.assertEqual(call(a, "tsk_9", "answer_rule", {"question_id": "q_ans"}), task_attempts.ANSWERED_HERE_NOTE)
-            self.assertEqual(a._read()["questions"]["q_ans"], {"answered": True})
+
+    def test_a_newer_generation_never_inherits_the_earlier_runs_question(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_A")
+        self.assertIn(self.RULE, call(a, "tsk_A", "answer_rule", self.Q))
+        self.turn(a, "tsk_A")
+        with a.transition("tsk_A") as t:
+            self.assertTrue(t.hold_serve("L2", "tsk_A~~2", None))
+            c = t.claim("ack", serve="L2")
+            self.assertIsNotNone(t.switch_run(c, {**_ack(2), "task_id": "tsk_A"}, {}))
+        rec = a.entry("tsk_A")
+        self.assertEqual((rec["run"], rec.get("answer_offered")), ("tsk_A~~2", None))
+        self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"},
+                         "the earlier run may still answer, unfenced: closed in the switch's own write")
+        self.assertEqual(call(a, "tsk_A", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE,
+                         "the new run is never handed the rule")
+
+    def test_an_entry_from_the_previous_writer_or_a_non_finite_time_never_reopens_a_question(self):
+        for entry in ({"holder": "tsk_A", "since": 1000.0}, {"holder": "tsk_A", "expires": float("nan")},
+                      {"holder": "tsk_A", "expires": float("inf")}):
+            with self.subTest(entry=entry):
+                self.state = Path(tempfile.mkdtemp())
+                a = self.mk(turn_context=True)
+                self.served(a, "tsk_B")
+                a._commit(lambda d: d.setdefault("questions", {}).__setitem__("rq_1", entry), why="test")
+                self.assertEqual(call(a, "tsk_B", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
 
     def test_a_settle_after_its_expired_question_was_forgotten_writes_nothing(self):
         a = self.mk(turn_context=True)
@@ -919,7 +946,8 @@ class AnsweredOnce(unittest.TestCase):
             self.assertEqual(list(a._read()["questions"]), ["q_new"], "no tombstone outside the bound")
 
     def test_a_swept_attempt_frees_or_closes_the_question_it_held(self):
-        for answered, want in ((False, {}), (True, {"answered": True}), (None, {"answered": "unknown"})):
+        for answered, want in ((False, {"answered": "unknown"}), (True, {"answered": True}),
+                               (None, {"answered": "unknown"})):
             with self.subTest(answered=answered):
                 a = self.mk(turn_context=True)
                 tid, qid = f"tsk_S{answered}", f"rq_s_{answered}"
@@ -930,11 +958,7 @@ class AnsweredOnce(unittest.TestCase):
                 with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=answered):
                     a.sweep([])
                 self.assertIsNone(a.entry(tid), "the attempt is gone")
-                self.assertEqual(a._read()["questions"][qid], want)
-                if answered is False:
-                    self.served(a, "tsk_next")
-                    self.assertIn(self.RULE, call(a, "tsk_next", "answer_rule", {"question_id": qid}),
-                                  "freed: the next task may answer it")
+                self.assertEqual(a._read()["questions"][qid], want, "closed, never freed")
 
     def test_an_unbound_attempt_never_frees_its_question_on_an_empty_journal(self):
         a = self.mk(turn_context=True)
@@ -967,8 +991,8 @@ class AnsweredOnce(unittest.TestCase):
             os.replace(live, live.with_name(live.name + ".1"))
             live.write_text(json.dumps({"record_type": "dispatch_intent", "task_id": "tsk_other", "ts": 3e9 + n,
                                         "operation_id": f"op_o{n}", "action": "room.message.send"}) + "\n")
-        self.assertIsNone(agent_turn.answered_in_journal(self.state, "tsk_R1", "rq_1", 1000.0))
-        self.assertIs(agent_turn.answered_in_journal(self.state, "tsk_R1", "rq_1"), False, "without the offer time")
+        self.assertIs(agent_turn.answered_in_journal(self.state, "tsk_R1", "rq_1"), False,
+                      "the journal as kept no longer shows it")
         put(a, "tsk_R1", awaiting_ack=False)
         a.sweep([])                                                       # the restart's recovery
         self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"})
@@ -982,10 +1006,10 @@ class AnsweredOnce(unittest.TestCase):
         self.turn(a, "tsk_T")
         with unittest.mock.patch.object(agent_turn, "close_turn", return_value=False):
             self.assertIs(call(a, "tsk_T", "finish"), False, "kept: the settle runs again next pass")
-        self.assertEqual(a._read()["questions"]["rq_1"], {"holder": "tsk_T", "since": 1000.0})
+        self.assertEqual(a._read()["questions"]["rq_1"], {"holder": "tsk_T"})
         with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=False):
             self.assertIs(call(a, "tsk_T", "finish"), True)
-        self.assertEqual(a._read()["questions"]["rq_1"], {})
+        self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"})
 
     def test_the_settle_fences_the_turn_before_its_last_journal_read(self):
         a = self.mk(turn_context=True)
@@ -1004,7 +1028,7 @@ class AnsweredOnce(unittest.TestCase):
         self.turn(a, "tsk_G")
         with unittest.mock.patch.object(agent_turn, "close_turn", side_effect=OSError("disk")):
             self.assertIs(call(a, "tsk_G", "finish"), False)
-        self.assertEqual(a._read()["questions"]["rq_g"], {"holder": "tsk_G", "since": 1000.0},
+        self.assertEqual(a._read()["questions"]["rq_g"], {"holder": "tsk_G"},
                          "a turn that could not be fenced may still answer: held, never freed")
 
     def test_an_expired_question_may_be_forgotten_even_when_answered(self):
