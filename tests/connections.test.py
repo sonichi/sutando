@@ -233,8 +233,14 @@ class Preview(unittest.TestCase):
 
     def test_probe_requires_https(self):
         with self.assertRaises(C.InvalidToken) as cm:
-            C.preview_connection("http://chat.alpha-fixture.net/relay|s", fetch=lambda *a: self.fail("probed"))
+            C.preview_connection("http://chat.alpha-fixture.net/relay|s", fetch=lambda *a: self.fail("probed"),
+                                 getaddrinfo=lambda *a, **k: self.fail("resolved"))
         self.assertEqual(str(cm.exception), "invalid_gateway")
+        # An undeclared http gateway is refused before resolution, even where port 80 would apply.
+        for url in ("http://chat.alpha-fixture.net:80/relay", "http://localhost/relay", "http://127.0.0.1/relay"):
+            with self.assertRaises(C.InvalidToken, msg=url):
+                C.preview_connection(url + "|s", fetch=lambda *a: self.fail("probed"),
+                                     getaddrinfo=lambda *a, **k: self.fail("resolved"))
         self.assertEqual(C.gateway_url_of("http://chat.alpha-fixture.net/relay|s"), "http://chat.alpha-fixture.net/relay",
                          "env rows may still carry an http gateway; only the probe refuses it")
 
@@ -330,6 +336,173 @@ class Preview(unittest.TestCase):
             t.join(5)
             srv.server_close()
         self.assertEqual(cm.exception.code, 302)
+
+class DeclaredLocalServer(unittest.TestCase):
+    """A self-hosted homeserver on this machine or the owner's own network (#3165): only a
+    `core.dotspace.instances` entry with `allow_local: true` for that exact gateway host lets a
+    token be plain http, name localhost or a private address. Nothing else changes."""
+
+    ENTRY = {"server": "localhost", "gateway_host": "localhost", "allow_local": True}
+
+    def section(self, *entries):
+        return unittest.mock.patch.object(dotspace, "_loaded_section", lambda: {"instances": list(entries)})
+
+    def listing(self, mxid):
+        seen = []
+        def fetch(url, token, address):
+            seen.append((url, address)); return {"agents": [{"id": mxid}]}
+        return fetch, seen
+
+    def resolving_to(self, ip):
+        return lambda host, port, **kw: [(2, 1, 6, "", (ip, port))]
+
+    def test_a_declared_local_server_is_probed_over_http_and_verified(self):
+        fetch, seen = self.listing("@alice-laptop.agent:localhost")
+        with self.section(self.ENTRY):
+            p = C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        self.assertEqual((p["server"], p["server_source"], p["verified"], p["agent_mxid"]),
+                         ("localhost", "identity", True, "@alice-laptop.agent:localhost"))
+        self.assertEqual(seen, [("http://localhost/relay", "127.0.0.1")])
+
+    def test_a_declared_lan_server_may_resolve_to_a_private_address(self):
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        entry = {"server": "chat.home.example", "allow_local": True}
+        with self.section(entry):
+            p = C.preview_connection("https://chat.home.example/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("192.168.1.20"))
+        self.assertEqual((p["server"], p["verified"]), ("chat.home.example", True))
+
+    def test_without_the_entry_nothing_changes(self):
+        for entries in ((), ({**self.ENTRY, "allow_local": False},), ({**self.ENTRY, "allow_local": "true"},),
+                        ({"server": "localhost", "gateway_host": "other-host", "allow_local": True},)):
+            with self.section(*entries), self.assertRaises(C.InvalidToken, msg=entries) as cm:
+                C.preview_connection("http://localhost/relay|s", fetch=lambda *a: self.fail("probed"),
+                                     getaddrinfo=lambda *a, **k: self.fail("resolved"))
+            self.assertEqual(str(cm.exception), "invalid_gateway")
+        with self.section(), self.assertRaises(C.InvalidToken):
+            C.preview_connection("https://chat.home.example/relay|s", fetch=lambda *a: self.fail("probed"),
+                                 getaddrinfo=self.resolving_to("192.168.1.20"))
+
+    def test_the_entry_names_one_host_and_the_listing_still_only_confirms(self):
+        with self.section(self.ENTRY):
+            self.assertEqual(C.local_server_for("localhost"), "localhost")
+            self.assertEqual(C.local_server_for("LOCALHOST."), "localhost")
+            self.assertEqual(C.local_server_for("127.0.0.1"), "")
+            self.assertEqual(C.local_server_for("evil.example"), "")
+            # A gateway on the declared host still has to name an agent of the declared server.
+            fetch, _ = self.listing("@mallory:evil.example")
+            p = C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertEqual((p["verified"], p["agent_mxid"]), (False, None))
+            # A URL that is neither http nor https, or a bad port, is still refused.
+            with self.assertRaises(C.InvalidToken):
+                C.preview_connection("http://localhost:99999/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertEqual(C.local_server_for("localhost"), "")
+
+    def test_a_declared_local_server_resolves_only_to_loopback_private_or_shared_addresses(self):
+        """allow_local admits this machine and the owner's own network, never any address."""
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        entry = {"server": "chat.home.example", "allow_local": True}
+        with self.section(entry):
+            for ip in ("127.0.0.1", "::1", "10.1.2.3", "172.16.0.9", "192.168.1.20", "100.64.0.1",
+                       "fd00::1", "::ffff:192.168.1.20"):
+                p = C.preview_connection("https://chat.home.example/relay|s", fetch=fetch,
+                                         getaddrinfo=self.resolving_to(ip))
+                self.assertTrue(p["verified"], ip)
+            for ip in ("169.254.169.254", "fe80::1", "0.0.0.0", "::", "8.8.8.8", "2001:4860::8888",
+                       "224.0.0.1", "240.0.0.1", "::ffff:169.254.169.254", "203.0.113.5"):
+                with self.assertRaises(C.InvalidToken, msg=ip) as cm:
+                    C.preview_connection("https://chat.home.example/relay|s",
+                                         fetch=lambda *a: self.fail(f"probed {ip}"),
+                                         getaddrinfo=self.resolving_to(ip))
+                self.assertEqual(str(cm.exception), "invalid_gateway")
+
+    def test_plain_http_only_to_loopback(self):
+        """The bearer rides every poll in cleartext over http: only to this machine itself."""
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        with self.section({"server": "chat.home.example", "allow_local": True}):
+            for ip in ("192.168.1.20", "10.0.0.5", "100.64.0.1", "fd00::1"):
+                with self.assertRaises(C.InvalidToken, msg=ip):
+                    C.preview_connection("http://chat.home.example/relay|s",
+                                         fetch=lambda *a: self.fail(f"cleartext to {ip}"),
+                                         getaddrinfo=self.resolving_to(ip))
+            # A name that resolves to loopback today is not loopback: the bridge re-resolves it.
+            with self.assertRaises(C.InvalidToken):
+                C.preview_connection("http://chat.home.example/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        fetch, _ = self.listing("@a.agent:localhost")
+        for entry, url in (({"server": "localhost", "allow_local": True}, "http://localhost/relay"),
+                           ({"server": "localhost", "gateway_host": "127.0.0.1", "allow_local": True}, "http://127.0.0.1/relay"),
+                           ({"server": "localhost", "gateway_host": "[::1]", "allow_local": True}, "http://[::1]/relay")):
+            with self.section(entry):
+                ip = "::1" if "::1" in url else "127.0.0.1"
+                self.assertTrue(C.preview_connection(url + "|s", fetch=fetch, getaddrinfo=self.resolving_to(ip))["verified"], url)
+
+    def test_a_malformed_port_in_an_entry_matches_nothing(self):
+        fetch, _ = self.listing("@a.agent:localhost")
+        with self.section({"server": "bad", "gateway_host": "localhost:99999", "allow_local": True}, self.ENTRY):
+            self.assertEqual(C.local_server_for("localhost", port=80), "localhost")
+            self.assertTrue(C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                                 getaddrinfo=self.resolving_to("127.0.0.1"))["verified"])
+
+    def test_an_entry_that_names_a_port_covers_that_port_only(self):
+        fetch, seen = self.listing("@alice.agent:localhost")
+        with self.section({"server": "localhost", "gateway_host": "localhost:8008", "allow_local": True}):
+            p = C.preview_connection("http://localhost:8008/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+            for url in ("http://localhost:22/relay", "http://localhost/relay", "https://localhost/relay"):
+                with self.assertRaises(C.InvalidToken, msg=url):
+                    C.preview_connection(url + "|s", fetch=lambda *a: self.fail(f"probed {url}"),
+                                         getaddrinfo=lambda *a, **k: self.fail(f"resolved {url}"))
+        with self.section(self.ENTRY):  # no port named: every port on the host
+            p = C.preview_connection("http://localhost:8008/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+
+    def test_userinfo_and_other_schemes_are_refused_on_the_local_path(self):
+        with self.section(self.ENTRY):
+            for url in ("http://evil@localhost/relay", "http://u:p@localhost/relay", "http://localhost@evil.example/relay",
+                        "ws://localhost/relay", "ftp://localhost/relay", "http://ｌocalhost/relay"):
+                with self.assertRaises(C.InvalidToken, msg=url):
+                    C.preview_connection(url + "|s", fetch=lambda *a: self.fail(f"probed {url}"),
+                                         getaddrinfo=lambda *a, **k: self.fail(f"resolved {url}"))
+
+    def test_an_ipv6_host_header_is_bracketed(self):
+        sent = []
+        class Sock:
+            def makefile(self, *a, **k):
+                import io
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            def sendall(self, data): sent.append(data)
+            def close(self): pass
+        C._fetch_json("http://[::1]:8008/relay", "t|s", "::1", "/v1/whoami", connect=lambda *a: Sock())
+        C._fetch_json("http://[::1]/relay", "t|s", "::1", "/v1/whoami", connect=lambda *a: Sock())
+        heads = b"".join(sent)
+        self.assertIn(b"Host: [::1]:8008\r\n", heads)
+        self.assertIn(b"Host: [::1]\r\n", heads)
+
+    def test_an_http_gateway_defaults_to_port_80_and_is_fetched_without_tls(self):
+        self.assertEqual(C._gateway_port("http://localhost/relay"), 80)
+        self.assertEqual(C._gateway_port("https://localhost/relay"), 443)
+        calls = []
+        class Sock:
+            def makefile(self, *a, **k):
+                import io
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            def sendall(self, data): calls.append(("sent", data[:4]))
+            def close(self): pass
+        def connect(address, port, host, timeout):
+            calls.append((address, port, host)); return Sock()
+        self.assertEqual(C._fetch_json("http://localhost/relay", "http://localhost/relay|s", "127.0.0.1",
+                                       "/v1/whoami", connect=connect), {})
+        self.assertEqual(calls[0], ("127.0.0.1", 80, "localhost"))
+        with unittest.mock.patch.object(C.socket, "create_connection", lambda addr, timeout: ("plain", addr)):
+            self.assertEqual(C._connect_plain("127.0.0.1", 80, "localhost", 1.0), ("plain", ("127.0.0.1", 80)))
+
 
 class AddConnection(Base):
     def test_add_writes_row_and_stores_secret_only_in_vault(self):
@@ -1219,7 +1392,14 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({}, {"ok": True, "pid": 4}), ("pending", None))
         self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}), ("failed", "no_token"))
         self.assertEqual(C.derive_state({"connected": True}, {"ok": True}), ("connected", None))
-        self.assertEqual(C.derive_state({"connected": False, "error": "timed out"}, {}), ("disconnected", None))
+        self.assertEqual(C.derive_state({"connected": False, "error": "timed out", "last_ok_ts": 9}, {}),
+                         ("disconnected", None))
+        starting = {"connected": False, "error": "starting — not yet connected", "last_ok_ts": None}
+        self.assertEqual(C.derive_state(starting, {"ok": True}), ("pending", None),
+                         "a live bridge that has never polled is starting, not disconnected")
+        self.assertEqual(C.derive_state(starting, {"ok": True}, writer_alive=False), ("disconnected", None),
+                         "one whose writer is gone is not starting")
+        self.assertEqual(C.derive_state({**starting, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "reenroll": {"pending": True}}, {}),
                          ("failed", "auth_rejected"))

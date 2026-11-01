@@ -638,7 +638,7 @@ def unproven_holder(record: "dict | None", pid: int) -> "str | None":
     recorded, now = (record or {}).get("proc_start"), process_start(pid)
     if not isinstance(recorded, str) or not recorded:
         why = "the lock record carries no process start time"
-    elif now != recorded:
+    elif not workspace_lock.same_start(recorded, now):
         why = f"it started at {now or 'an unreadable time'}, the record names {recorded}"
     else:
         return None
@@ -863,7 +863,7 @@ def _successor(cfg: dict, old: "tuple[int, str | None]", since: float) -> "tuple
     if start is None or not proven_sparrow(cfg, pid, lock):
         return None, f"pid {pid} holds the lock but is not proven to be the Sparrow that took it"
     gen = (lock or {}).get("proc_start")
-    if not isinstance(gen, str) or not gen or process_start(pid) != gen:
+    if not isinstance(gen, str) or not gen or not workspace_lock.same_start(gen, process_start(pid)):
         return None, f"pid {pid} is not proven to be the generation its lock names (proc_start)"
     status = _status_snapshot(state, instance) or {}
     if status.get("pid") != pid or status.get("start") != start or status.get("proc_start") != gen:
