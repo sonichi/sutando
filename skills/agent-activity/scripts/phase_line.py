@@ -22,6 +22,7 @@ the grounding check; a bad phase drops the record, a bad line drops only the lin
 
     python3 skills/agent-activity/scripts/phase_line.py enrich --task <task id> [--workspace W]
     python3 skills/agent-activity/scripts/phase_line.py latest --task <task id> [--workspace W]
+    python3 skills/agent-activity/scripts/phase_line.py status --task <task id> [--workspace W]
 """
 from __future__ import annotations
 
@@ -484,9 +485,92 @@ def enrich(workspace, task_id: str, call=None) -> "dict | None":
     return rec
 
 
+# ---- why a task isn't moving: one status for every open or waiting task -------------------------
+
+BUSY_WINDOW_S = 300.0
+PICKUP_WINDOW_S = 3600.0
+
+
+def _recent_other_task(workspace, task_id: str, now: float) -> bool:
+    """Another task on this host recorded a step in the last BUSY_WINDOW_S: the agent is busy."""
+    try:
+        with open(sidecar_path(workspace), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for raw in lines[1:] if size > TAIL_BYTES else lines:  # a cut first line is not a record
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("task_id") not in (None, task_id) \
+                and r.get("phase_source") == "rules" and now - float(r.get("at") or 0) <= BUSY_WINDOW_S:
+            return True
+    return False
+
+
+def _picked_up_at(workspace, task_id: str, now: float) -> "float | None":
+    """When the activity index saw this task picked up, if recently (the index is never pruned)."""
+    try:
+        from activity_rows import open_task_index
+        started = float((open_task_index(Path(workspace)).get(task_id) or {}).get("started") or 0)
+    except Exception:  # noqa: BLE001
+        return None
+    return started if started and now - started <= PICKUP_WINDOW_S else None
+
+
+def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = None,
+               now: "float | None" = None) -> "dict | None":
+    """{phase, line, since} saying why the task is where it is, or None for a finished or unknown
+    task (its label shows). The line never carries an age: the client renders it from `since`.
+
+    In order: delegated (handoffs), running (the newest phase record), queued behind another
+    request, queued, picked up with no step yet. `active` is the task this seat is working on now,
+    when the caller knows it; otherwise any other task's step in the last few minutes means busy.
+    Nothing about another task is ever named."""
+    now = time.time() if now is None else now
+    try:
+        import handoffs
+        delegated = handoffs.delegated_status(workspace, task_id, now=now)
+    except Exception:  # noqa: BLE001 - delegated status is optional (src/handoffs.py)
+        delegated = None
+    if delegated:
+        since = min((handoffs._epoch(h.get("at")) for h in handoffs.open_handoffs(workspace, task_id, now=now)),
+                    default=now)
+        return {"phase": "Delegated", "line": delegated["line"], "since": since}
+    st = latest(workspace, task_id)
+    if st is not None:
+        rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
+        line = st.get("line") or st.get("step") or st["phase"]
+        return {"phase": st["phase"], "line": line, "since": float(rules[-1].get("at") or now) if rules else now}
+    try:
+        from task_queue import position
+        pos = position(Path(workspace), task_id, inbox)
+    except Exception:  # noqa: BLE001 - an unreadable queue is no queue line
+        pos = {"position": 0}
+    if pos.get("position"):
+        try:
+            from task_queue import pending
+            since = next((float(t.get("since") or now) for t in pending(Path(workspace), inbox) if t["id"] == task_id), now)
+        except Exception:  # noqa: BLE001
+            since = now
+        busy = (active is not None and active != task_id) or (active is None and _recent_other_task(workspace, task_id, now))
+        if busy:
+            return {"phase": "Waiting", "line": "Waiting: working on another request", "since": since}
+        ahead = int(pos["position"]) - 1
+        return {"phase": "Waiting", "line": f"Queued · {ahead} ahead" if ahead else "Queued · next", "since": since}
+    picked = _picked_up_at(workspace, task_id, now)
+    if picked is not None:
+        return {"phase": "Understanding the request", "line": "Reading the request", "since": picked}
+    return None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Phase word and status line for a task's live status.")
-    ap.add_argument("cmd", choices=("enrich", "latest"))
+    ap.add_argument("cmd", choices=("enrich", "latest", "status"))
     ap.add_argument("--task", required=True)
     ap.add_argument("--workspace")
     a = ap.parse_args(argv)
@@ -498,7 +582,7 @@ def main(argv=None) -> int:
     if a.cmd == "enrich":
         enrich(ws, a.task)
         return 0
-    print(json.dumps(latest(ws, a.task)))
+    print(json.dumps(status_for(ws, a.task) if a.cmd == "status" else latest(ws, a.task)))
     return 0
 
 

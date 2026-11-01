@@ -407,6 +407,107 @@ class Edges(unittest.TestCase):
             self.assertEqual(pl.main(["latest", "--task", "task-a"]), 0)
 
 
+class WhyNotMoving(unittest.TestCase):
+    """status_for: every open or waiting task has a reason, and no age is baked into the line."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+        self.tasks = Path(self.ws) / "tasks"
+        self.tasks.mkdir(parents=True)
+
+    def _pending(self, tid, at):
+        p = self.tasks / f"{tid}.txt"
+        p.write_text(f"id: {tid}\ntimestamp: 2026-11-01T00:00:00Z\ntask: hi\n")
+        os.utime(p, (at, at))
+
+    def test_queued_tasks_say_how_many_are_ahead(self):
+        t0 = time.time() - 600
+        self._pending("task-q1", t0)
+        self._pending("task-q2", t0 + 1)
+        first, second = pl.status_for(self.ws, "task-q1"), pl.status_for(self.ws, "task-q2")
+        self.assertEqual((first["phase"], first["line"]), ("Waiting", "Queued · next"))
+        self.assertEqual(second["line"], "Queued · 1 ahead")
+        self.assertNotRegex(second["line"], r"\d+\s*(s|m|h|min)\b", "no age in the line: the client renders it")
+        self.assertIsInstance(second["since"], float)
+
+    def test_a_queued_task_behind_another_request_says_so_without_naming_it(self):
+        self._pending("task-q1", time.time() - 60)
+        _rules(self.ws, "task-busy", "Running tests", step="Run the secret-project suite")
+        st = pl.status_for(self.ws, "task-q1")
+        self.assertEqual((st["phase"], st["line"]), ("Waiting", "Waiting: working on another request"))
+        self.assertNotIn("secret", json.dumps(st))
+        self.assertEqual(pl.status_for(self.ws, "task-q1", active="task-busy")["line"], "Waiting: working on another request")
+        self.assertEqual(pl.status_for(self.ws, "task-q1", active="task-q1")["line"], "Queued · next")
+        old = Path(self.ws)
+        with patch.object(pl, "BUSY_WINDOW_S", -1):
+            self.assertEqual(pl.status_for(old, "task-q1")["line"], "Queued · next", "a stale step elsewhere is not busy")
+
+    def test_a_running_task_shows_its_step_with_the_steps_own_start(self):
+        _rules(self.ws, "task-r", "Running tests", step="Run the phase tests")
+        st = pl.status_for(self.ws, "task-r")
+        self.assertEqual((st["phase"], st["line"]), ("Running tests", "Run the phase tests"))
+        self.assertAlmostEqual(st["since"], pl.records(self.ws, "task-r")[-1]["at"], places=2)
+        _rules(self.ws, "task-n", "Reading files")
+        self.assertEqual(pl.status_for(self.ws, "task-n")["line"], "Reading files", "no step text: the phase word")
+
+    def test_a_delegated_task_says_who_has_it(self):
+        fake = type("H", (), {"delegated_status": staticmethod(lambda ws, tid, now=None: {"line": "Delegated: a worker"}),
+                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "2026-11-01T00:00:00Z"}]),
+                              "_epoch": staticmethod(lambda at: 1793491200.0)})
+        with patch.dict(sys.modules, {"handoffs": fake}):
+            st = pl.status_for(self.ws, "task-d")
+        self.assertEqual(st, {"phase": "Delegated", "line": "Delegated: a worker", "since": 1793491200.0})
+
+    def test_picked_up_without_a_step_reads_the_request_and_finished_shows_nothing(self):
+        idx = Path(self.ws) / "state" / "agent-activity.index.json"
+        idx.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        idx.write_text(json.dumps({"task-p": {"started": now - 30}, "task-old": {"started": now - 86400}}))
+        self.assertEqual(pl.status_for(self.ws, "task-p")["line"], "Reading the request")
+        self.assertIsNone(pl.status_for(self.ws, "task-old"), "the index is never pruned: old entries are not open")
+        self.assertIsNone(pl.status_for(self.ws, "task-unknown"))
+
+    def test_a_pool_workers_own_inbox_is_its_queue(self):
+        inbox = Path(self.ws) / "deliveries" / "w1"
+        inbox.mkdir(parents=True)
+        for i, tid in enumerate(("task-w1", "task-w2")):
+            p = inbox / f"{tid}.txt"
+            p.write_text(f"id: {tid}\ntask: hi\n")
+            os.utime(p, (time.time() - 100 + i, time.time() - 100 + i))
+        self.assertEqual(pl.status_for(self.ws, "task-w2", inbox=inbox)["line"], "Queued · 1 ahead")
+        self.assertIsNone(pl.status_for(self.ws, "task-w2"), "not in the core's queue")
+
+    def test_unreadable_inputs_degrade_quietly(self):
+        with patch("task_queue.position", side_effect=OSError("x")), patch("activity_rows.open_task_index", side_effect=OSError("x")):
+            self.assertIsNone(pl.status_for(self.ws, "task-x"))
+        self.assertFalse(pl._recent_other_task(tempfile.mkdtemp(), "task-x", time.time()))
+
+    def test_a_bad_sidecar_line_or_a_queue_read_error_is_tolerated(self):
+        p = pl.sidecar_path(self.ws)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("not json\n")
+        self.assertFalse(pl._recent_other_task(self.ws, "task-x", time.time()))
+        self._pending("task-q1", time.time() - 60)
+        import task_queue
+        real, calls = task_queue.pending, []
+
+        def first_then_fail(*a, **k):
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError("x")
+            return real(*a, **k)
+        with patch.object(task_queue, "pending", side_effect=first_then_fail):
+            st = pl.status_for(self.ws, "task-q1", now=123.0)
+        self.assertEqual((st["line"], st["since"]), ("Queued · next", 123.0))
+
+    def test_the_cli_prints_the_status(self):
+        _rules(self.ws, "task-r", "Waiting", step="Wait for CI")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pl.main(["status", "--task", "task-r", "--workspace", self.ws])
+        self.assertEqual(json.loads(out.getvalue())["line"], "Wait for CI")
+
+
 class Hook(unittest.TestCase):
     def _hook(self):
         spec = importlib.util.spec_from_file_location("activity_hook_pl", REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
