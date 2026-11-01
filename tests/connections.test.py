@@ -754,6 +754,11 @@ class Primary(Base):
         next(r for r in rec["connections"] if r["instance"] == "")["disabled"] = True
         C.record_path(self.ws).write_text(json.dumps(rec))
         self.assertEqual(owners(), [False, True], "a disabled lane never takes them")
+        with unittest.mock.patch.object(C, "_agent_identity", side_effect=ImportError("no package")):
+            self.assertFalse(C._lane_running({"instance": ""}, self.ws), "an unknown lane state is not running")
+        self.assertEqual(C.lane_server("beta-fixture-net", self.ws), "beta-fixture.net")
+        C.record_path(self.ws).write_text("{broken")
+        self.assertEqual(C.lane_server("beta-fixture-net", self.ws), "", "an unreadable record names no server")
 
     def test_primary_in_the_plan_keeps_the_proactive_room(self):
         self.add()

@@ -192,6 +192,17 @@ def drain_cases() -> None:
           f"d) the hold is logged on the 1st, 2nd and 4th pass ({len(held)}: {held[-1:]})")
     check(any("whoami failed" in m for m in logs), "d) the failed whoami is logged")
 
+    real_hook = gb.LANE_SERVER
+    try:
+        gb.LANE_SERVER = None
+        check(gb._lane_server() == "", "g) no host hook: no server to check")
+        gb.LANE_SERVER = lambda: "s.space"
+        check(gb._lane_server() == "s.space", "g) the host names the lane's server")
+        gb.LANE_SERVER = lambda: 1 / 0
+        check(gb._lane_server() == "", "g) a failing host hook checks nothing")
+    finally:
+        gb.LANE_SERVER = real_hook
+
     gb._LOG_COUNTS.clear()
     gb._LANE_WHOAMI["until"] = 0.0
     state, results, posts, logs = state_with_binding(), results_with(OTHER_ROOM), [], []
@@ -236,6 +247,22 @@ def health_cases() -> None:
         presenter_mode.presenter_mode_active = real_active
     got = hc.check_proactive_undelivered(results / "missing", now)
     check(got["status"] == "ok", "f) a missing results/ is no reading, not a failure")
+
+    class Unlistable:
+        parent = results
+
+        def glob(self, pattern):
+            raise PermissionError("no listing")
+    got = hc.check_proactive_undelivered(Unlistable(), now)
+    check(got["status"] == "ok" and "not readable" in got["detail"], "f) an unlistable results/ is no reading")
+    real_modules = dict(sys.modules)
+    sys.modules["proactive_routing"] = None
+    try:
+        got = hc.check_proactive_undelivered(results, now)
+    finally:
+        sys.modules.clear()
+        sys.modules.update(real_modules)
+    check(got["status"] == "ok" and "could not load" in got["detail"], "f) no routing module is no reading")
 
 
 def main() -> int:
