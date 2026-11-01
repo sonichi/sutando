@@ -891,6 +891,7 @@ class AnsweredOnce(unittest.TestCase):
             call(a, "tsk_ans", "finish")
             self.served(a, "tsk_0")
             self.assertIn(self.RULE, call(a, "tsk_0", "answer_rule", {"question_id": "q0"}))
+            self.turn(a, "tsk_0")
             self.served(a, "tsk_1")
             before = a._read()["questions"]
             self.assertEqual(call(a, "tsk_1", "answer_rule", {"question_id": "q1"}), task_attempts.ANSWER_UNRECORDED_NOTE,
@@ -935,6 +936,45 @@ class AnsweredOnce(unittest.TestCase):
                     self.assertIn(self.RULE, call(a, "tsk_next", "answer_rule", {"question_id": qid}),
                                   "freed: the next task may answer it")
 
+    def test_an_unbound_attempt_never_frees_its_question_on_an_empty_journal(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_U1")                         # no ack yet: no turn to fence
+        self.assertIn(self.RULE, call(a, "tsk_U1", "answer_rule", self.Q))
+        real = agent_turn.answered_in_journal
+
+        def read_then_answer(*args):
+            out = real(*args)                            # the settle's read finds nothing...
+            with open(agent_turn.room_actions_path(self.state), "a") as fh:   # ...then the unbound answer lands
+                for rec in ({"record_type": "dispatch_intent", "task_id": "tsk_U1", "seq": 1, "ts": 2e9,
+                             "operation_id": "op_u1", "action": "room.question.answer", "question_id": "rq_1"},
+                            {"record_type": "dispatch_outcome", "task_id": "tsk_U1", "seq": 1, "ts": 2e9,
+                             "operation_id": "op_u1", "operation_status": "succeeded"}):
+                    fh.write(json.dumps(rec) + "\n")
+            return out
+        with unittest.mock.patch.object(agent_turn, "answered_in_journal", side_effect=read_then_answer):
+            call(a, "tsk_U1", "finish")
+        self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"}, "nothing fenced it: never freed")
+        self.served(a, "tsk_U2")
+        self.assertEqual(call(a, "tsk_U2", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+
+    def test_an_answer_rotated_away_before_a_restart_is_never_read_as_none(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_R1")
+        self.assertIn(self.RULE, call(a, "tsk_R1", "answer_rule", self.Q))
+        self.answer_in_journal(self.turn(a, "tsk_R1"), "tsk_R1")         # answered; the bridge then dies
+        live = agent_turn.room_actions_path(self.state)
+        for n in range(2):                                                # two later rotations
+            os.replace(live, live.with_name(live.name + ".1"))
+            live.write_text(json.dumps({"record_type": "dispatch_intent", "task_id": "tsk_other", "ts": 3e9 + n,
+                                        "operation_id": f"op_o{n}", "action": "room.message.send"}) + "\n")
+        self.assertIsNone(agent_turn.answered_in_journal(self.state, "tsk_R1", "rq_1", 1000.0))
+        self.assertIs(agent_turn.answered_in_journal(self.state, "tsk_R1", "rq_1"), False, "without the offer time")
+        put(a, "tsk_R1", awaiting_ack=False)
+        a.sweep([])                                                       # the restart's recovery
+        self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"})
+        self.served(a, "tsk_R2")
+        self.assertEqual(call(a, "tsk_R2", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+
     def test_a_settle_whose_turn_cannot_be_fenced_yet_is_retried_not_closed(self):
         a = self.mk(turn_context=True)
         self.served(a, "tsk_T")
@@ -942,7 +982,7 @@ class AnsweredOnce(unittest.TestCase):
         self.turn(a, "tsk_T")
         with unittest.mock.patch.object(agent_turn, "close_turn", return_value=False):
             self.assertIs(call(a, "tsk_T", "finish"), False, "kept: the settle runs again next pass")
-        self.assertEqual(a._read()["questions"]["rq_1"], {"holder": "tsk_T"})
+        self.assertEqual(a._read()["questions"]["rq_1"], {"holder": "tsk_T", "since": 1000.0})
         with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=False):
             self.assertIs(call(a, "tsk_T", "finish"), True)
         self.assertEqual(a._read()["questions"]["rq_1"], {})
@@ -964,7 +1004,7 @@ class AnsweredOnce(unittest.TestCase):
         self.turn(a, "tsk_G")
         with unittest.mock.patch.object(agent_turn, "close_turn", side_effect=OSError("disk")):
             self.assertIs(call(a, "tsk_G", "finish"), False)
-        self.assertEqual(a._read()["questions"]["rq_g"], {"holder": "tsk_G"},
+        self.assertEqual(a._read()["questions"]["rq_g"], {"holder": "tsk_G", "since": 1000.0},
                          "a turn that could not be fenced may still answer: held, never freed")
 
     def test_an_expired_question_may_be_forgotten_even_when_answered(self):

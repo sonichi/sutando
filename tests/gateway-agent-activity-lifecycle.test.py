@@ -144,7 +144,7 @@ class Lifecycle(unittest.TestCase):
         self.assertIn(f"top-level `task_id` `{TID}`", text, "the broker's id, not the local one")
         self.assertIn("`room.question.answer`", text)
         ledger = json.loads(next(self.state.glob("relay-task-ledger*.json")).read_text())
-        self.assertEqual(ledger["questions"]["rq_live"], {"holder": TID})
+        self.assertEqual(ledger["questions"]["rq_live"]["holder"], TID)
 
     WAKE = {"blocker_episode_id": "ep1", "resolved_blockers": [
         {"blocker_id": "b1", "blocker_kind": "question", "question_id": "q1", "outcome": "answered",

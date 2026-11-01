@@ -1106,7 +1106,7 @@ class Transition:
                 raise _Refused                  # it cannot be told whether it was answered
             holder = q.get("holder")
             if holder is not None:
-                seen = agent_turn.answered_in_journal(state_dir, holder, qid)
+                seen = agent_turn.answered_in_journal(state_dir, holder, qid, q.get("since"))
                 if seen is True:
                     _close_or_free(data, qid, holder, True)      # seen once, recorded for good
                     verdict.append("answered")
@@ -1121,11 +1121,12 @@ class Transition:
                     raise _Refused               # a holder gone without its settle: cannot be told
             if qid not in questions:
                 _make_room(questions, self.now())
-            expires = _expiry(question)
+            expires, since = _expiry(question), self.now()
             questions.pop(qid, None)
-            questions[qid] = {"holder": self.wire, **({"expires": expires} if expires is not None else {})}
+            questions[qid] = {"holder": self.wire, "since": since,
+                              **({"expires": expires} if expires is not None else {})}
             verdict.append("offered")
-            return {**rec, "answer_offered": qid} if isinstance(rec, dict) else rec
+            return {**rec, "answer_offered": qid, "answer_offered_at": since} if isinstance(rec, dict) else rec
         saved, _ = self._change(offer, f"the offer of question {qid}")
         if saved and verdict == ["offered"]:
             return rule
@@ -1149,9 +1150,11 @@ class Transition:
         if not rec.get("answer_offered"):
             return True, False
         turn = rec.get("turn_id")
+        if not turn:
+            # Nothing to fence: an unbound answer may still land, so only one already there counts.
+            return True, (True if self.answered_here() is True else None)
         try:
-            fenced = (not turn or agent_turn.is_closed(self.owner.state_dir, turn)
-                      or agent_turn.close_turn(self.owner.state_dir, turn))
+            fenced = agent_turn.is_closed(self.owner.state_dir, turn) or agent_turn.close_turn(self.owner.state_dir, turn)
         except (OSError, ValueError):
             fenced = False
         return (True, self.answered_here()) if fenced else (False, None)
@@ -1176,8 +1179,12 @@ class Transition:
     def answered_here(self):
         """Whether this task's offered room question was answered in its journal: True, False, or
         None when that cannot be told."""
-        qid = self.rec.get("answer_offered") if isinstance(self.rec, dict) else None
-        return agent_turn.answered_in_journal(self.owner.state_dir, self.wire, qid) if qid else False
+        rec = self.rec if isinstance(self.rec, dict) else {}
+        qid, since = rec.get("answer_offered"), rec.get("answer_offered_at")
+        if not qid:
+            return False
+        return agent_turn.answered_in_journal(self.owner.state_dir, self.wire, qid,
+                                              since if type(since) in (int, float) else None)
 
     def _note_answered(self, rec, records) -> None:
         """The offered question is closed before the result is decided when this turn answered it
@@ -1428,7 +1435,7 @@ def _questions(data) -> dict:
     """The questions map, every entry checked; _Refused, before anything changes, when any entry is
     not exactly one of the three shapes this writer makes:
       free    {}                                   offered before, nobody holds it now
-      held    {"holder": <task id>}                one task may answer it
+      held    {"holder": <task id>, "since": <t>}  one task may answer it, offered at t
       closed  {"answered": true | "unknown"}       answered, or it cannot be told: never again
     each optionally with "expires" (epoch seconds)."""
     questions = data.setdefault("questions", {})
@@ -1456,9 +1463,9 @@ def _log_damaged(qid) -> None:
 
 
 def _state(q, tasks: dict) -> str:
-    if type(q) is not dict or set(q) - {"holder", "answered", "expires"} or {"holder", "answered"} <= set(q):
+    if type(q) is not dict or set(q) - {"holder", "since", "answered", "expires"} or {"holder", "answered"} <= set(q):
         raise _Refused
-    if "expires" in q and type(q["expires"]) not in (int, float):
+    if any(k in q and type(q[k]) not in (int, float) for k in ("expires", "since")) or ("since" in q) > ("holder" in q):
         raise _Refused
     if "answered" in q:
         if q["answered"] is not True and not (type(q["answered"]) is str and q["answered"] == ANSWERED_UNKNOWN):

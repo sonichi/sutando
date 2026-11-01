@@ -539,7 +539,10 @@ re-reads.
 - Closed unknown, or it cannot be told: a note to leave it unanswered.
 
 The settle fences the task's turn first, then reads the journal, so no answer of that turn can land
-after the read; a turn that cannot be fenced counts as cannot be told. It then closes the entry
+after the read; a turn whose fence cannot be had yet keeps the attempt for the next pass, and an
+attempt with no turn (unbound: nothing to fence) counts as cannot be told unless its answer is
+already there. A hold records when it was given; a journal whose kept history starts after that may
+have rotated the answer away, so no answer found then is cannot be told, never "not answered". It then closes the entry
 (true or unknown) or frees it. Only an offer creates an entry, within 2,000; free and expired
 (a day past `expires_at`) entries are forgotten first, and with none, the new offer is withheld. A
 settle whose entry was forgotten as expired writes nothing.
