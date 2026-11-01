@@ -13,8 +13,8 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | field  | meaning |
 |--------|---------|
 | `ts`   | epoch seconds |
-| `room` | room id the row belongs to; the drawer in that room shows it. Absent → dock only |
-| `kind` | `processing` (picked the message up) · `thinking` (narration while deciding) · `working` (the tool in use, one line) · `notice` (PR heartbeats and the like) · `done` |
+| `room` | room id the row belongs to; the drawer in that room shows it. Absent → a **global** row: every room's drawer shows it, because it follows the owner, not a room |
+| `kind` | `processing` (picked the message up) · `thinking` (narration while deciding) · `working` (the tool in use, one line) · `notice` (PR heartbeats and the like) · `wedge` (**stopped: the owner has to act** — always written roomless, and it shows through a drawer the owner dismissed, because a blocker is not activity, it is why activity stopped) · `done` |
 | `line` | the text, plain |
 | `task` | `{id, from, text}` — the user message this row belongs to (`from` an mxid, `text` ≤160 chars) |
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |

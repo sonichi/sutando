@@ -89,6 +89,10 @@ class Writer(unittest.TestCase):
         with self.assertRaises(ValueError):
             card.append("x", kind="verbose", room=None, workspace=self.ws)
 
+    def test_a_wedge_is_a_kind_the_writer_takes(self):
+        rec = card.append("needs your sign-off", kind="wedge", room=None, workspace=self.ws)
+        self.assertEqual((rec["kind"], "room" in rec), ("wedge", False))
+
     def test_the_live_log_rotates_to_an_archive(self):
         for i in range(card.LIVE_ROWS + 3):
             card.append(f"row {i}", kind="notice", room=None, workspace=self.ws)
@@ -194,6 +198,26 @@ class WriterCli(unittest.TestCase):
     def test_done_without_a_task_is_refused(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             card.main(["done", "finished", "--workspace", str(self.ws)])
+
+    def test_a_wedge_is_written_without_a_room_even_from_a_task_file(self):
+        # The seat is stopped, not a room: the client shows a roomless row wherever the owner is,
+        # and through a drawer they dismissed. A task file still names the task, just not the room.
+        p = self.ws / "t.txt"
+        p.write_text("id: task-w\nchannel_id: !team:s\nuser_id: @q:s\ntask: hello\n")
+        rc, rec = self.run_main("append", "waiting on your go-ahead", "--kind", "wedge", "--task-file", str(p))
+        self.assertEqual((rc, rec["kind"], rec["task"]["id"], "room" in rec), (0, "wedge", "task-w", False))
+
+    def test_a_wedge_with_an_explicit_room_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            card.main(["append", "x", "--kind", "wedge", "--room", "!r:s", "--workspace", str(self.ws)])
+        self.assertFalse(card.log_path(self.ws).exists())
+
+    def test_a_non_wedge_row_still_falls_back_to_the_default_room(self):
+        st = self.ws / "state"
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
+        self.assertEqual(self.run_main("append", "CI green")[1]["room"], "!dm:s")
+        self.assertNotIn("room", self.run_main("append", "blocked", "--kind", "wedge")[1])
 
     def test_task_file_plus_task_id_override(self):
         p = self.ws / "t.txt"
