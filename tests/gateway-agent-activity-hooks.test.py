@@ -3192,6 +3192,104 @@ class Hooks(unittest.TestCase):
         fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, gen_answer)
         return fake, inflight
 
+    def test_an_owed_run_publishes_its_own_saved_serve_while_a_later_one_is_held(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                tid = f"task-g2-l3-{restart}"
+                fake, inflight = self.held(tid)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                run2, owed2 = gw._ATTEMPTS.get(tid)["run"], self.saved(tid)
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L3", source_event_id="$e", task="the L3 text")),
+                                 (run2, True), "held while generation 2's run is still owed")
+                held3 = self.saved(tid)
+                self.assertNotEqual(held3, owed2, "two serves, two saved copies")
+                if restart:
+                    gw._ATTEMPTS.take_ownership()
+                    gw._sweep_reserves()
+                    self.assertTrue(owed2.exists() and held3.exists(), "both are named: neither is swept")
+                gw._post_task_beats(inflight, force=True)
+                text2 = (gw.TASKS_DIR / f"{run2}.txt").read_text()
+                self.assertIn("task: reply", text2)
+                self.assertNotIn("the L3 text", text2, "generation 2 publishes only its own serve")
+                self.assertFalse(owed2.exists())
+                self.assertTrue(held3.exists(), "the held serve's copy survives")
+                fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 3)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L3"))
+                run3 = gw._ATTEMPTS.get(tid)["run"]
+                gw._post_task_beats(inflight, force=True)
+                self.assertIn("the L3 text", (gw.TASKS_DIR / f"{run3}.txt").read_text())
+                self.assertFalse(held3.exists())
+
+    def test_a_saved_serve_that_is_not_its_owners_fails_that_owner_and_publishes_nothing_else(self):
+        tid = "task-reserve-swapped"
+        fake, inflight = self.held(tid)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        run2, owed2 = gw._ATTEMPTS.get(tid)["run"], self.saved(tid)
+        env = json.loads(owed2.read_text())
+        env["task"]["task"] = "someone else's text"
+        owed2.write_text(json.dumps(env, sort_keys=True))
+        gw._post_task_beats(inflight, force=True)
+        self.assertFalse((gw.TASKS_DIR / f"{run2}.txt").exists(), "never published from bytes it does not own")
+        self.assertEqual((gw.RESULTS_DIR / f"{run2}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("owed_publish"))
+
+    def test_the_same_held_serve_again_repairs_its_saved_copy_and_refuses_changed_bytes(self):
+        tid = "task-held-repair"
+        self.held(tid)
+        saved = self.saved(tid)
+        saved.unlink()
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+        self.assertTrue(saved.exists(), "made again before the serve is reported durable")
+        self.assertIsNone(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task="changed")),
+                          "the same lease with other bytes is not this serve")
+        self.assertIn('"task": "reply"', saved.read_text(), "and the saved copy is never overwritten")
+
+    def test_a_legacy_task_wide_saved_serve_is_used_only_by_its_own_lease(self):
+        tid = "task-legacy-reserve"
+        fake, inflight = self.held(tid)
+        with txn(tid) as t:                            # as a ledger written before envelopes
+            pending = dict(t.rec["pending_serve"])
+            pending.pop("reserve")
+            self.assertTrue(t.put(pending_serve=pending))
+        legacy = gw._reserve_path(tid)
+        legacy.write_text(json.dumps({**_task(tid, lease_id="L3", task="the L3 text")}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        run2 = gw._ATTEMPTS.get(tid)["run"]
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("owed_reserve"))
+        gw._post_task_beats(inflight, force=True)
+        self.assertFalse((gw.TASKS_DIR / f"{run2}.txt").exists(), "the file holds another lease's serve")
+        self.assertEqual((gw.RESULTS_DIR / f"{run2}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+        tid2 = "task-legacy-reserve-own"
+        fake2, inflight2 = self.held(tid2)
+        with txn(tid2) as t:
+            pending = dict(t.rec["pending_serve"])
+            pending.pop("reserve")
+            self.assertTrue(t.put(pending_serve=pending))
+        gw._reserve_path(tid2).write_text(json.dumps(_task(tid2, lease_id="L2", task="the legacy L2 text")))
+        self.assertTrue(gw._post_task_ack(tid2, durable=True, lease_id="L2"))
+        run = gw._ATTEMPTS.get(tid2)["run"]
+        gw._post_task_beats(inflight2, force=True)
+        self.assertIn("the legacy L2 text", (gw.TASKS_DIR / f"{run}.txt").read_text())
+        self.assertFalse(gw._reserve_path(tid2).exists())
+
+    def test_the_start_sweeps_only_unnamed_saved_serves_and_nothing_on_an_unreadable_ledger(self):
+        tid = "task-sweep-named"
+        self.held(tid)
+        named = self.saved(tid)
+        orphan = gw._reserve_dir() / ("v1-" + "0" * 32 + ".json")
+        orphan.write_text("{}")
+        legacy = gw._reserve_path("task-sweep-legacy")
+        legacy.write_text("{}")
+        self.addCleanup(lambda: legacy.unlink(missing_ok=True))
+        with mock.patch.object(gw._ATTEMPTS, "records", return_value=None):
+            self.assertEqual(gw._sweep_reserves(), 0)
+        with mock.patch.object(gw._ATTEMPTS, "records", return_value={"t": gw.task_attempts.UNKNOWN}):
+            self.assertEqual(gw._sweep_reserves(), 0)
+        self.assertTrue(orphan.exists())
+        self.assertGreaterEqual(gw._sweep_reserves(), 1)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(named.exists() and legacy.exists(), "a named copy and a legacy file stay")
+
     def test_a_held_serves_ack_refused_ends_it_and_only_a_task_wide_answer_fences_the_run(self):
         for code, fenced in (("stale_execution_generation", None), ("task_cancelled", "cancel_confirmed")):
             with self.subTest(code=code):
