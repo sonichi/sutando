@@ -327,7 +327,7 @@ from . import (agent_identity, diagnostics, gateway_credential_io, gateway_crede
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
-from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import parse_markers, render_skill_prelude, DELIVERY_SKIP_AFTER_CHANNEL
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
@@ -1545,10 +1545,6 @@ def _is_redelivery_control(body: str) -> bool:
     in a newline, so a raw `==` never matches a body that came off disk."""
     return (body or "").strip() == GATEWAY_REDELIVERY_RESULT.strip()
 
-
-# The one marker verdict every delivery decision here reads on the guarded body; the
-# suppression journal reads it too, so whatever the drain closes silently is recorded.
-DELIVERY_SKIP_AFTER_CHANNEL = True
 
 
 def _team_task_media_root(tid: str, tier) -> "str | None":

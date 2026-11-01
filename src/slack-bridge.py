@@ -93,11 +93,7 @@ try:
 except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
-from result_markers import parse_markers  # noqa: E402
-
-# The one marker verdict every delivery decision here reads on the guarded body; the
-# guard's suppression journal reads it too, so whatever is closed silently is recorded.
-DELIVERY_SKIP_AFTER_CHANNEL = True
+from result_markers import parse_markers, DELIVERY_SKIP_AFTER_CHANNEL  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)

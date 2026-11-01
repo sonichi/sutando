@@ -157,11 +157,7 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, has_skip_action  # noqa: E402
-
-# The one marker verdict every delivery decision here reads on the guarded body; the
-# guard's suppression journal reads it too, so whatever is closed silently is recorded.
-DELIVERY_SKIP_AFTER_CHANNEL = True
+from result_markers import parse_markers, has_skip_action, DELIVERY_SKIP_AFTER_CHANNEL  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
