@@ -966,3 +966,12 @@ The s.space dashboard already classifies `error` as unhealthy, so this
 requires updating Sutando's health checker and restarting its gateway bridge;
 no dashboard schema change is needed. Reporting starts after the first health
 check completes and follows the installed check cadence.
+
+### Local hook activity attribution
+
+The agent-activity hook attributes working and turn-end thinking rows to the
+most recently picked-up (`processing`) task bound to that session in the live
+activity log. Later working or queued rows cannot change that selection. A done
+row or an existing result (including archived results) excludes a task, even
+when its session binding or open-task index entry remains. Without an eligible
+pickup in the live log, the hook emits no working or thinking row.
