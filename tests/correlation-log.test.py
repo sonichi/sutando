@@ -55,6 +55,8 @@ class Writer(unittest.TestCase):
             ("interaction", dict(GOOD, interaction_id="ix_short"), "interaction_id is not a valid id"),
             ("interaction", dict(GOOD, task_id="has space"), "task_id is not a valid id"),
             ("interaction", dict(GOOD, task_id="@chi:s.space"), "task_id is not a valid id"),
+            ("interaction", dict(GOOD, task_id="chi-wang"), "task_id is not a valid id"),
+            ("interaction", dict(GOOD, task_id="alice.smith-x"), "task_id is not a valid id"),
             ("interaction", dict(GOOD, run_id="task-0123456789"), "run_id is not a valid id"),
             ("interaction", dict(GOOD, counterpart="Chi Wang"), "counterpart is not a valid id"),
             ("interaction", dict(GOOD, object="some prose here"), "object is not a valid id"),
@@ -74,7 +76,8 @@ class Writer(unittest.TestCase):
                 cl.validate(kind, fields)
             self.assertIn(why, str(cm.exception))
         for task in ("task-s_dspace~task-9905cc47dfa0f6b12e", "task-ag2space_dlocal~task-c5acab9841335db0ad",
-                     "task-chat-1730000000", "task-rtapi", "ask-mtaczepu-fkpdtqqe",
+                     "task-chat-1730000000", "task-rtapi", "ask-mtaczepu-fkpdtqqe", "air-routing-gap-1792000000",
+                     "task-dc1504316176686120980~1550809777339371562", "worker-add-1792961761921-60fb041f",
                      "task-s-space~task-182c2b5ce99cc9e8ae", "task-9f06cb8851db56858f",
                      "worker-pin-1792961761921-60fb041f", "task-local-hs~worker-pin-1790398604983-fada1e1c"):
             self.assertEqual(cl.validate("interaction", dict(GOOD, task_id=task))["task_id"], task)
@@ -193,7 +196,8 @@ class Trailers(unittest.TestCase):
                          "Sutando-Run: task-s_dspace~task-9905cc47dfa0f6b12e~3")
         for bad in ({"task_id": "two words"}, {"interaction_id": "ix_x"}, {"task_id": "@chi:s.space"},
                     {"task_id": "!room:s.space"}, {"run_id": "task-1a2b3c"}, {"task_id": "Chi Wang"},
-                    {"task_id": "Mary-Jane"}, {"task_id": "chi"}, {"task_id": ".."}, {"run_id": "task-1~x"}):
+                    {"task_id": "Mary-Jane"}, {"task_id": "chi"}, {"task_id": ".."}, {"run_id": "task-1~x"},
+                    {"task_id": "chi-wang"}, {"task_id": "alice.smith-x"}, {"task_id": "task-s-space~chi-wang"}):
             with self.assertRaises(ValueError):
                 cl.trailers(**bad)
 

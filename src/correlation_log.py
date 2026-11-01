@@ -41,10 +41,16 @@ INTERACTION_RE = re.compile(r"^ix_[0-9a-f]{12}$")
 _HOST = r"[A-Za-z0-9.-]+(?::\d{1,5})?"
 
 
+# The producer families task files are named by, after an optional `task-<lane>~` prefix (lane keys
+# such as s_dspace); a Discord task is `task-dc<channel>~<message id>`. Nothing else is a task id.
+_SEG = r"[a-z0-9_-]{1,120}"
+_TASK_ID = re.compile(rf"^(?:(?:staging-)?task-{_SEG}~)?"
+                      rf"(?:(?:task|worker-pin|worker-add|ask|sc-ask|reco-skill|voice-end|air)-{_SEG}|\d{{6,24}})$")
+
+
 def is_task_id(value: str) -> bool:
-    """A task id as the engine names its task files (the shared filename-safe id charset, so lane
-    segments like `s_dspace` pass), lowercase-led and hyphenated, so a name or handle never does."""
-    return isinstance(value, str) and valid_archive_lookup_id(value) and value[:1].islower() and "-" in value
+    """A task id as the engine's producers mint them, in the shared filename-safe charset."""
+    return isinstance(value, str) and valid_archive_lookup_id(value) and bool(_TASK_ID.match(value))
 
 
 def is_run_id(value: str) -> bool:
