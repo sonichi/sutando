@@ -42,6 +42,8 @@ MAP = {
     "src/delivery/disposal.py": "result_disposal.py",
     "src/dedup_recovery.py": "dedup_recovery.py",
     "src/file_lock.py": "file_lock.py",
+    # the one writer of correlation records (outcome signals from the event consumer)
+    "src/correlation_log.py": "correlation_log.py",
     # one-process exclusion per work root (flock + holder record); builds on file_lock
     "src/holder_lock.py": "holder_lock.py",
     # where the gateway credentials come from and which source wins; parsing and masking are

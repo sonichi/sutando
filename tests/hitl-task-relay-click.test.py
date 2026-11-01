@@ -569,12 +569,14 @@ class EventChannelWiringTests(unittest.TestCase):
     def test_set_owner_and_room_wires_decisions_then_hitl_then_taskify_and_posts_cards(self):
         from ag2_sparrow.event_consumer import TaskifyHandler
         from ag2_sparrow.human_action import DecisionHandler
+        from ag2_sparrow.outcome_reactions import OutcomeReactionHandler
         os.environ["SPARROW_HA_OWNER"] = OWNER
         os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
         handler, posters = self._wire()
         chain = self._chain(handler)
         self.assertEqual([type(h) for h in chain],
-                         [DecisionHandler, rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+                         [DecisionHandler, rgb._ClaudeLocalClicks, rgb._HitlClicks, OutcomeReactionHandler,
+                          TaskifyHandler])
         self.assertEqual(chain[0]._owner, OWNER, "decisions are judged against the configured owner")
         self.assertEqual(chain[1].owner, OWNER, "claude-local clicks keep the configured owner")
         self.assertEqual(rgb._hitl_owner(), OWNER, "the HITL claimant resolves the same owner")
@@ -589,12 +591,14 @@ class EventChannelWiringTests(unittest.TestCase):
         self.assertEqual(posters, [])
 
     def test_unset_owner_wires_only_the_hitl_claimants(self):
+        from ag2_sparrow.outcome_reactions import OutcomeReactionHandler
         from ag2_sparrow.event_consumer import TaskifyHandler
         os.environ.pop("SPARROW_HA_OWNER", None)
         os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
         handler, posters = self._wire()
         chain = self._chain(handler)
-        self.assertEqual([type(h) for h in chain], [rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+        self.assertEqual([type(h) for h in chain],
+                         [rgb._ClaudeLocalClicks, rgb._HitlClicks, OutcomeReactionHandler, TaskifyHandler])
         self.assertIsNone(chain[0].owner, "claude-local clicks read the owner at each click")
         self.assertEqual(posters, [], "no owner, no decision cards")
 

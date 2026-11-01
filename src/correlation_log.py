@@ -5,6 +5,10 @@ Every record is one JSON line with a `kind`; this module owns the schema of each
 bounds, the locked append, rotation, and the failure semantics, and every writer calls it. A
 record names exact ids only; nothing here infers a link.
 
+    kind "outcome_signal": evidence about how a task's result landed, attached beside its label and
+    never replacing it; for now a reaction on the agent's own result message
+        {kind, at, signal, value, reactor_id, reactor_relation, evidence, ref, task_id?, room_id?}
+
     kind "interaction": an ask we made, so the answer can be joined back by its id, with where it
     happened, captured when it happens and by id only (no names)
         {kind, at, interaction_id, object, counterpart, counterpart_kind?, counterpart_scope?,
@@ -30,9 +34,13 @@ import secrets
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from file_lock import locked_file  # noqa: E402
-from local_task_protocol import valid_archive_lookup_id  # noqa: E402
+try:  # relative-first, so the ag2-sparrow package's synced copy uses its own siblings
+    from .file_lock import locked_file
+    from .local_task_protocol import valid_archive_lookup_id
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from file_lock import locked_file  # noqa: E402
+    from local_task_protocol import valid_archive_lookup_id  # noqa: E402
 
 LOG_NAME = "correlation.jsonl"
 MAX_BYTES = 8 * 1024 * 1024
@@ -66,15 +74,23 @@ PATTERNS = {
     "object": re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#\d{1,9}$"),
     "interaction_id": INTERACTION_RE,
 }
+PATTERNS["reactor_id"] = PATTERNS["counterpart"]
+PATTERNS["ref"] = PATTERNS["event_id"]
+# A reaction key as Matrix carries it: an emoji or a short token, one line, no spaces.
+PATTERNS["value"] = re.compile(r"^\S{1,16}$")
 CHECKS = {"task_id": is_task_id, "run_id": is_run_id}
 
 KINDS = {
+    "outcome_signal": {"required": ("signal", "value", "reactor_id", "reactor_relation", "evidence", "ref"),
+                       "optional": ("task_id", "room_id")},
     "interaction": {"required": ("interaction_id", "object", "counterpart"),
                     "optional": ("counterpart_kind", "counterpart_scope", "room_id", "room_kind",
                                  "task_id", "run_id", "channel", "event_id")},
 }
 ENUMS = {"counterpart_kind": ("person", "agent", "owner"), "counterpart_scope": ("internal", "external", "unknown"),
-         "room_kind": ("dm", "room", "unknown"), "channel": ("room", "dm", "thread")}
+         "room_kind": ("dm", "room", "unknown"), "channel": ("room", "dm", "thread"),
+         "signal": ("reaction", "reaction_removed"), "reactor_relation": ("owner", "member"),
+         "evidence": ("direct", "correlated", "weak", "inferred")}
 
 _warned = False
 
