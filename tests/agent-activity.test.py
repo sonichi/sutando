@@ -56,6 +56,11 @@ def _bind_in_process(ws, task_id, sid):
     h.bind(h.paths(_pl.Path(ws)), task_id, sid)
 
 
+def _lookup_in_process(ws, sid):
+    h = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
+    return h.bound_task(h.paths(Path(ws)), sid)[0]["id"]
+
+
 class Writer(unittest.TestCase):
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp())
@@ -487,7 +492,74 @@ class Hook(unittest.TestCase):
                 self.assertEqual(cmd[cmd.index("--task-id") + 1], current)
                 self.assertEqual(cmd[cmd.index("--room") + 1], "!current:s")
         self.log({"kind": "done", "task": {"id": current}, "done": True},
-                 {"kind": "processing", "task": {"id": current}})
+                 {"kind": "working", "task": {"id": current}})
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+
+    def test_answer_cache_survives_hook_reload_and_is_session_scoped(self):
+        self.log({"ts": 10, "kind": "processing", "task": {"id": "task-cache"}})
+        hook.bind(self.p, "task-cache", "S1")
+        with mock.patch.object(hook, "find_result", wraps=hook.find_result) as lookup:
+            self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], "task-cache")
+            self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], "task-cache")
+            self.assertEqual(lookup.call_count, 1)
+        fresh = load_at(Path(hook.__file__))
+        with mock.patch.object(fresh, "find_result", wraps=fresh.find_result) as lookup:
+            self.assertEqual(fresh.bound_task(fresh.paths(self.ws), "S1")[0]["id"], "task-cache")
+            lookup.assert_not_called()
+            fresh.bind(self.p, "task-cache", "S2")
+            self.assertEqual(fresh.bound_task(self.p, "S2")[0]["id"], "task-cache")
+            self.assertEqual(lookup.call_count, 1)
+
+    def test_answer_cache_concurrent_writers_keep_each_sessions_entry(self):
+        import multiprocessing
+        ids = [f"task-cache{i}" for i in range(4)]
+        for i, tid in enumerate(ids):
+            self.log({"ts": i, "kind": "processing", "task": {"id": tid}})
+            hook.bind(self.p, tid, f"S{i}")
+        with multiprocessing.get_context("spawn").Pool(4) as pool:
+            found = pool.starmap(_lookup_in_process, [(str(self.ws), f"S{i}") for i in range(4)])
+            pool.close(); pool.join()
+        self.assertEqual(found, ids)
+        cache = hook.load_json(self.p["bind"].with_name("agent-activity.answers.json"), {})
+        self.assertEqual(sorted(cache), ids)
+        self.assertFalse(list((self.ws / "state").glob(".agent-activity.answers.json.*.tmp")))
+
+    def test_cached_negative_notices_a_result_and_archive_move(self):
+        tid = "task-cache"
+        self.log({"ts": 10, "kind": "processing", "task": {"id": tid}})
+        hook.bind(self.p, tid, "S1")
+        self.assertIsNotNone(hook.bound_task(self.p, "S1")[0])
+        results = self.ws / "results"
+        results.mkdir()
+        result = results / f"{tid}.txt"
+        result.write_text("answered")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        archive = results / "archive"
+        archive.mkdir()
+        result.rename(archive / f"{tid}-1234567890.txt")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        with mock.patch.object(hook, "find_result", side_effect=AssertionError("repeat archive scan")):
+            self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+
+    def test_same_id_pickup_after_done_reopens_with_an_old_result(self):
+        tid = "task-resume"
+        self.log({"ts": 10, "kind": "processing", "task": {"id": tid}})
+        hook.bind(self.p, tid, "S1")
+        results = self.ws / "results"
+        results.mkdir()
+        result = results / f"{tid}.txt"
+        result.write_text("old answer")
+        os.utime(result, (15, 15))
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        self.log({"ts": 20, "kind": "done", "done": True, "task": {"id": tid}},
+                 {"ts": 25, "kind": "working", "task": {"id": tid}})
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        self.log({"ts": 30, "kind": "processing", "room": "!resumed:s", "task": {"id": tid}})
+        hook.handle(self.pre("S1", "Bash", {"description": "Resume work"}), self.p, self.run)
+        cmd = self.runs[-1]
+        self.assertEqual(cmd[cmd.index("--task-id") + 1], tid)
+        self.assertEqual(cmd[cmd.index("--room") + 1], "!resumed:s")
+        result.write_text("new answer")
         self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
 
     def test_bound_task_excludes_live_result_without_done(self):
