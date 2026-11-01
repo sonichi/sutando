@@ -972,9 +972,20 @@ check completes and follows the installed check cadence.
 The agent-activity hook attributes working and turn-end thinking rows to the
 most recently picked-up (`processing`) task bound to that session in the live
 activity log. Later working or queued rows cannot change that selection. A done
-row or an existing result (including archived results) excludes a task, even
-when its session binding or open-task index entry remains. Without an eligible
+row closes a task until a later processing row explicitly picks up the same ID
+again; late working rows cannot reopen it. Results older than that renewed pickup
+do not close the resumed task. Otherwise, an existing result (including archived
+results) excludes the task even when its session binding remains. Without an eligible
 pickup in the live log, the hook emits no working or thinking row.
+
+Result lookups are cached per task, session and pickup in
+`state/agent-activity.answers.json`, under a lock with atomic replacement. Each
+hook invocation checks only result-directory, archive-root and live-result
+modification times before reusing a cached answer. A changed stamp, session or
+pickup triggers a new archive lookup; cache writes prune unbound task IDs. Normal
+result publication and archival invalidate the stamps. Direct edits inside an
+existing nested archive directory without a live-result transition are not a
+cache invalidation signal.
 
 ### Local activity row room scope
 

@@ -56,6 +56,7 @@ def open_tasks(log: Path, *, processing_only: bool = False) -> dict[str, dict]:
     """{task_id: {"task", "room"}} for unfinished tasks, optionally ordered only by pickup rows."""
     out: dict[str, dict] = {}
     done: set[str] = set()
+    picked_up: set[str] = set()
     try:
         lines = log.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -70,7 +71,14 @@ def open_tasks(log: Path, *, processing_only: bool = False) -> dict[str, dict]:
             continue
         if r.get("done") or r.get("kind") == "done":
             done.add(t["id"])
-            out.pop(t["id"], None)
+            if t["id"] in picked_up and t["id"] in out:
+                out[t["id"]]["reopened"] = True
+            else:
+                out.pop(t["id"], None)
+        elif r.get("kind") == "processing" and t["id"] not in done:
+            picked_up.add(t["id"])
+            if processing_only or t["id"] not in out:
+                out.setdefault(t["id"], {"task": t, "room": r.get("room") if isinstance(r.get("room"), str) else None, "pickup": r.get("ts")})
         elif processing_only and r.get("kind") != "processing":
             continue
         elif t["id"] not in done and t["id"] not in out:
@@ -99,9 +107,48 @@ def bound_task(p: dict, session_id: str) -> tuple[dict | None, str | None]:
     binds = load_json(p["bind"], {})
     opened = open_tasks(p["log"], processing_only=True)
     for tid in opened:
-        if binds.get(tid) == session_id and not answered(p["ws"], tid):
+        if binds.get(tid) == session_id and not cached_answered(p, session_id, tid, opened[tid]):
             return opened[tid]["task"], opened[tid]["room"]
     return None, None
+
+
+def _atomic_json(path: Path, value: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
+    try:
+        tmp.write_text(json.dumps(value, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _mtime(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def cached_answered(p: dict, session_id: str, task_id: str, entry: dict) -> bool:
+    """Persist result lookups across hook processes, scoped to the session and pickup."""
+    results = p["ws"] / "results"
+    stamp = [_mtime(results), _mtime(results / "archive"), _mtime(results / f"{task_id}.txt")]
+    key = [session_id, entry.get("pickup"), bool(entry.get("reopened")), stamp]
+    path = p["bind"].with_name("agent-activity.answers.json")
+    with locked_file(path.with_suffix(".lock"), create_mode=0o600):
+        cache = load_json(path, {})
+        hit = cache.get(task_id)
+        if isinstance(hit, dict) and hit.get("key") == key:
+            return bool(hit.get("answered"))
+        result = find_result(results, task_id)
+        answer = result is not None
+        if answer and entry.get("reopened") and isinstance(entry.get("pickup"), (int, float)):
+            modified = _mtime(result)
+            answer = modified is not None and modified >= entry["pickup"] * 1_000_000_000
+        binds = load_json(p["bind"], {})
+        cache = {tid: value for tid, value in cache.items() if tid in binds}
+        cache[task_id] = {"key": key, "answered": answer}
+        _atomic_json(path, cache)
+        return answer
 
 
 def processing_task_id(command: str, ws: Path) -> str | None:
@@ -142,9 +189,7 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
         alive = open_tasks(p["log"])
         alive.update(indexed_open_tasks(p["ws"]))
         binds = {t: sid for t, sid in binds.items() if t in alive or t == task_id}
-        tmp = p["bind"].with_name(f".{p['bind'].name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
-        tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")
-        os.replace(tmp, p["bind"])
+        _atomic_json(p["bind"], binds)
 
 
 TASK_FILE = re.compile(rf"tasks[\\/]+({TASK_ID})\.txt\b")  # tasks/archive/… has no direct match
