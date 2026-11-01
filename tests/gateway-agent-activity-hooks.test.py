@@ -388,6 +388,56 @@ class Hooks(unittest.TestCase):
         self.assertEqual([p.get("lease_id") for p, _op in self.acks(fake, leased)], ["L7"],
                          "the sidecar lost its lease: the attempt's own record proves it")
 
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_a_held_serves_saved_copy_is_redacted_and_publishes_without_intercepting_again(self):
+        tid = "task-reserve-clean"
+        self.addCleanup(self.forget, tid)
+        marker = f"[{gw.MEDIA_MARKER_TAG}: https://example.invalid/m/abc mime=image/png]"
+        body = f"use {self.TOKEN} and vault set K hunter2secret {marker}"
+        fake, inflight = self.served_acked(tid), {tid}
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task=body)), (tid, True))
+        saved = self.saved(tid).read_text()
+        for s in (self.TOKEN, "hunter2secret"):
+            self.assertNotIn(s, saved)
+        self.assertIn(marker, saved, "the media marker is kept whole for the fetch")
+        found = json.loads(saved)["task"][gw.RESERVE_CLEANED]
+        self.assertEqual((len(found), "vault-set command" in found), (2, True), "the token's type and the vault command")
+        fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        gw._ATTEMPTS.take_ownership()                                   # a restart before it runs
+        intercept = mock.Mock(side_effect=AssertionError("intercepted again"))
+        with mock.patch.object(gw, "_vault_intercept_fns", return_value=(intercept, None)), \
+                mock.patch.object(gw, "_maybe_fetch_media", side_effect=lambda b, _r=None: b):
+            gw._post_task_beats(inflight, force=True)
+        text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
+        for s in (self.TOKEN, "hunter2secret"):
+            self.assertNotIn(s, text)
+        self.assertIn("vault set K [redacted before saving]", text)
+        self.assertIn("SECURITY NOTICE", text, "the secret notice still comes with it")
+        intercept.assert_not_called()
+
+    def test_a_saved_copy_redacts_the_wake_and_the_room_question_but_not_their_ids(self):
+        wake = {"blocker_episode_id": "ep_1", "resolved_blockers": [
+            {"question_id": "rq_1", "outcome": "answered", "answered_by": "@t:x",
+             "answer": {"kind": "text", "text": f"vault set K hunter2secret {self.TOKEN}"}}]}
+        q = {"question_id": "rq_2", "expected_revision": 1, "prompt": f"use {self.TOKEN}?",
+             "options": [{"id": "o1", "label": "vault set K hunter2secret"}]}
+        out = gw._cleaned_for_reserve(_task("task-c", wake=wake, room_question=q))
+        flat = json.dumps(out)
+        for s in (self.TOKEN, "hunter2secret"):
+            self.assertNotIn(s, flat)
+        self.assertEqual((out["wake"]["blocker_episode_id"], out["wake"]["resolved_blockers"][0]["question_id"],
+                          out["room_question"]["question_id"]), ("ep_1", "rq_1", "rq_2"))
+        named = gw._cleaned_for_reserve(_task("task-c", room_question={**q, "question_id": self.TOKEN}))
+        self.assertIsNone(named["room_question"], "a question named by a secret is not kept")
+        self.assertNotIn(self.TOKEN, json.dumps(named))
+
+    def test_a_broker_field_never_marks_a_fresh_task_as_already_redacted(self):
+        tid = "task-reserve-forged"
+        self.assertIsNotNone(gw._write_task(_task(tid, task=f"see {self.TOKEN}", **{gw.RESERVE_CLEANED: []})))
+        self.assertNotIn(self.TOKEN, (gw.TASKS_DIR / f"{tid}.txt").read_text())
+
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
         self.addCleanup(self.forget, tid)

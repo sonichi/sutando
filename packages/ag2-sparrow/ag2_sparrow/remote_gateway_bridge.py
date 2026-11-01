@@ -5784,6 +5784,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if run is None:
+        task.pop(RESERVE_CLEANED, None)         # only a saved serve's own copy carries it
     if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
         task["task_id"] = broker_tid
     if run is not None:
@@ -5878,7 +5880,12 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # Every path below intercepts-and-stores or falls through to a redactor — never neither.
             _intercept_fn, _redact_fn = _vault_intercept_fns()
             _redact_fallback = _redact_fn or _local_redact_vault_set
-            if sender_tier == "owner" and _intercept_fn is not None:
+            _cleaned = task.get(RESERVE_CLEANED)
+            if isinstance(_cleaned, list):
+                # Its vault commands were redacted when it was saved; intercepting the placeholder
+                # would report a key as not stored.
+                _secret_types = tuple(sorted({str(t) for t in _cleaned}))
+            elif sender_tier == "owner" and _intercept_fn is not None:
                 try:
                     _vault_result = _intercept_fn(_fetched)
                     _fetched = _vault_result.text
@@ -5897,7 +5904,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # with the discord/slack/telegram bridges): a token pasted into a
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
-                _secret_types = tuple(_filtered.secret_types)
+                _secret_types = tuple(sorted(set(_secret_types) | set(_filtered.secret_types)))
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
@@ -6076,11 +6083,65 @@ class _ReserveLost(Exception):
 _RESERVE_ID_RE = re.compile(r"v1-[0-9a-f]{32}")
 
 
+# Set only on a saved serve's copy: its strings are redacted, so rendering it must not redact again.
+RESERVE_CLEANED = "reserve_cleaned"
+_RESERVE_PLACEHOLDER = "[redacted before saving]"
+
+
+def _clean_text(text: str, found: set) -> str:
+    """`text` with vault commands and pasted secrets redacted; nothing is stored."""
+    from .vault_set_grammar import redact_vault_commands
+    unvaulted = redact_vault_commands(text, placeholder=_RESERVE_PLACEHOLDER)
+    if unvaulted != text:
+        found.add("vault-set command")
+    r = filter_chat_secrets(unvaulted)
+    found.update(r.secret_types)
+    return r.text
+
+
+def _clean_strings(value, found: set):
+    """Every string in `value` cleaned, except identifiers, which name what the copy is about."""
+    if isinstance(value, str):
+        return _clean_text(value, found)
+    if isinstance(value, dict):
+        return {k: v if _identifier(k) else _clean_strings(v, found) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_strings(v, found) for v in value]
+    return value
+
+
+def _identifier(key) -> bool:
+    return isinstance(key, str) and (key.endswith("_id") or key in ("answered_by", "outcome", "kind",
+                                                                   "expected_revision"))
+
+
+def _cleaned_for_reserve(task: dict) -> dict:
+    """The copy of a held serve that may be saved: the body (outside its media marker, which the
+    fetch needs), the wake and the room question redacted, and RESERVE_CLEANED naming what was found."""
+    found: set = set()
+    out = dict(task)
+    if isinstance(out.get("task"), str):
+        body, at = [], 0
+        for m in MEDIA_MARKER_RE.finditer(out["task"]):
+            body += [_clean_text(out["task"][at:m.start()], found), m.group(0)]
+            at = m.end()
+        out["task"] = "".join(body + [_clean_text(out["task"][at:], found)])
+    for f in ("wake", "room_question"):
+        if f in out:
+            out[f] = _clean_strings(out[f], found)
+    q = out.get("room_question")
+    if isinstance(q, dict) and any(_clean_text(str(q.get(k, "")), found) != str(q.get(k, ""))
+                                   for k in ("question_id", "expected_revision")):
+        out["room_question"] = None             # a question named by a secret is not kept at all
+    out[RESERVE_CLEANED] = sorted(found)
+    return out
+
+
 def _save_reserve(wire_tid: str, run: str, lease: "str | None", task: dict) -> "dict | None":
     """Save one held serve as an immutable envelope owned by (task, candidate run, lease); the
     reference the ledger keeps for it, or None when it could not be saved or a different one holds
     its name. An identical envelope already there is the same serve."""
-    body = {**task, "id": wire_tid}
+    body = _cleaned_for_reserve({**task, "id": wire_tid})
     digest = _digest(body)
     rid = _reserve_id(wire_tid, run, lease)
     text = json.dumps({"format": 1, "owner": {"task": wire_tid, "candidate_run": run, "lease": lease},
