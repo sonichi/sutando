@@ -52,8 +52,8 @@ def load_json(path: Path, default):
     return v if isinstance(v, type(default)) else default
 
 
-def open_tasks(log: Path) -> dict[str, dict]:
-    """{task_id: {"task", "room"}} for tasks with a row and no later done row; malformed rows skipped."""
+def open_tasks(log: Path, *, processing_only: bool = False) -> dict[str, dict]:
+    """{task_id: {"task", "room"}} for unfinished tasks, optionally ordered only by pickup rows."""
     out: dict[str, dict] = {}
     done: set[str] = set()
     try:
@@ -68,8 +68,11 @@ def open_tasks(log: Path) -> dict[str, dict]:
         t = r.get("task") if isinstance(r, dict) else None
         if not isinstance(t, dict) or not isinstance(t.get("id"), str):
             continue
-        if r.get("done"):
+        if r.get("done") or r.get("kind") == "done":
             done.add(t["id"])
+            out.pop(t["id"], None)
+        elif processing_only and r.get("kind") != "processing":
+            continue
         elif t["id"] not in done and t["id"] not in out:
             out[t["id"]] = {"task": t, "room": r.get("room") if isinstance(r.get("room"), str) else None}
     return out
@@ -94,9 +97,9 @@ def indexed_open_tasks(ws: Path) -> dict[str, dict]:
 def bound_task(p: dict, session_id: str) -> tuple[dict | None, str | None]:
     """The open task this session is bound to; None when none is (fail closed)."""
     binds = load_json(p["bind"], {})
-    opened = open_tasks(p["log"])
-    for tid in opened:  # open_tasks() yields newest first; the newest open task wins
-        if binds.get(tid) == session_id:
+    opened = open_tasks(p["log"], processing_only=True)
+    for tid in opened:
+        if binds.get(tid) == session_id and not answered(p["ws"], tid):
             return opened[tid]["task"], opened[tid]["room"]
     return None, None
 
