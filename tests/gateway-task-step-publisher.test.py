@@ -12,7 +12,22 @@ from _helpers.hermetic_gateway import isolate_then_import
 from _helpers.gateway_relay import Bridges, Relay
 
 gw, _ = isolate_then_import()
-from ag2_sparrow.task_step_publisher import StepPublisher
+from ag2_sparrow.task_step_publisher import StepPublisher, progress_arguments
+
+EXECUTE = "/api/capabilities/v1/actions/execute"
+
+
+def minting(answer):
+    """A relay `on_post` that mints an MCP token at the mint path and answers Actions with `answer`."""
+    def on_post(path, body):
+        if path == gw.AGENT_ACCESS_MINT_PATH:
+            return 200, {"access_token": "mcp-token", "expires_in": 900}
+        return answer(path, body)
+    return on_post
+
+
+def actions(relay):
+    return [p for p in relay.post_paths if p[0] == EXECUTE]
 
 
 class Publisher(unittest.TestCase):
@@ -22,6 +37,7 @@ class Publisher(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.calls, self.logs = [], []
         self.clock = 100.0
+        gw._AGENT_ACCESS.update(token="", until=0.0)
         self.pub = StepPublisher(self.root, self.send, self.logs.append, lambda: self.clock)
         self.tasks = {"task-dev~task-a": {"task_id": "task-a", "execution_generation": 3, "room_id": "!r:test"}}
 
@@ -88,8 +104,7 @@ class Publisher(unittest.TestCase):
 
     def test_bridge_scope_and_progress_action_transport(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.token = "fixture-token"
-        relay.on_post = lambda path, body: (200, {"status": "completed"})
+        relay.on_post = minting(lambda path, body: (200, {"status": "completed"}))
         tasks_dir, results = self.root / "tasks", self.root / "results"
         tasks_dir.mkdir(); results.mkdir()
         for instance in ("dev", "prod"):
@@ -101,9 +116,8 @@ class Publisher(unittest.TestCase):
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", GATEWAY_INSTANCE="dev",
                             TASKS_DIR=tasks_dir, RESULTS_DIR=results, _ATTEMPTS=None, _STEP_PUBLISHER=self.pub):
             gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
-            self.assertEqual(len(relay.post_paths), 1)
-            path, payload = relay.post_paths[0]
-            self.assertEqual(path, "/api/capabilities/v1/actions/execute")
+            self.assertEqual([p for p, _ in relay.post_paths], [gw.AGENT_ACCESS_MINT_PATH, EXECUTE])
+            path, payload = actions(relay)[0]
             self.assertEqual(payload["action"], "room.task.progress")
             self.assertEqual(payload["arguments"], {"summary": "Step one"})
             self.assertEqual(payload["task_id"], "task-a")
@@ -220,32 +234,183 @@ class Publisher(unittest.TestCase):
 
     def test_undeployed_action_is_skipped_then_retried_after_rate_limit(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = lambda path, body: (404, {"error_code": "ACTION_NOT_FOUND"})
+        relay.on_post = minting(lambda path, body: (404, {"error_code": "ACTION_NOT_FOUND"}))
         self.row()
         self.pub.send = gw._send_task_step
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
             self.pub.publish(self.tasks)
-            self.assertEqual(len(relay.post_paths), 1)
+            self.assertEqual(len(actions(relay)), 1)
             self.assertIn("room.task.progress not deployed; skipping", self.logs[0])
             self.assertNotIn("task-dev~task-a", self.pub.sent)
             self.pub.publish(self.tasks)
-            self.assertEqual(len(relay.post_paths), 1)
+            self.assertEqual(len(actions(relay)), 1)
             self.clock += 10
-            relay.on_post = lambda path, body: (200, {"status": "completed"})
+            relay.on_post = minting(lambda path, body: (200, {"status": "completed"}))
             self.pub.publish(self.tasks)
-            self.assertEqual(len(relay.post_paths), 2)
-            self.assertEqual(relay.post_paths[0][1], relay.post_paths[1][1])
+            self.assertEqual(len(actions(relay)), 2)
+            self.assertEqual(actions(relay)[0][1], actions(relay)[1][1])
             self.assertIn("task-dev~task-a", self.pub.sent)
 
     def test_non_404_transport_error_is_logged_as_failure(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = lambda path, body: (503, {"error": "unavailable"})
+        relay.on_post = minting(lambda path, body: (503, {"error": "unavailable"}))
         self.row()
         self.pub.send = gw._send_task_step
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
             self.pub.publish(self.tasks)
         self.assertIn("Action failed (HTTPError)", self.logs[0])
         self.assertEqual(self.pub.sent, {})
+
+
+class AgentAccess(unittest.TestCase):
+    """Actions take the lane's MCP delegation, minted from its relay bearer, never the bearer itself."""
+
+    def setUp(self):
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        self.calls = []
+
+    def fake_req(self, answers):
+        answers = list(answers)
+
+        def req(method, path, payload=None, timeout=None, operation_id=None, origin=False, bearer=None, **kw):
+            self.calls.append((path, bearer))
+            out = answers.pop(0)
+            if isinstance(out, Exception):
+                raise out
+            return out
+        return req
+
+    def http(self, code):
+        import io
+        import urllib.error
+        return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b""))
+
+    def test_the_action_carries_the_minted_token_and_the_token_is_reused(self):
+        step = {"operation_id": "step-1", "action": "room.task.progress"}
+        req = self.fake_req([{"access_token": "mcp-1", "expires_in": 900}, {"status": "completed"},
+                             {"status": "completed"}])
+        with patch.object(gw, "_req", req):
+            self.assertEqual(gw._send_task_step(step), {"status": "completed"})
+            gw._send_task_step(step)
+        self.assertEqual(self.calls, [(gw.AGENT_ACCESS_MINT_PATH, None), (EXECUTE, "mcp-1"), (EXECUTE, "mcp-1")])
+
+    def test_a_rejected_token_is_minted_once_more(self):
+        req = self.fake_req([{"access_token": "old", "expires_in": 900}, self.http(401),
+                             {"access_token": "new", "expires_in": "junk"}, {"status": "completed"}])
+        with patch.object(gw, "_req", req):
+            self.assertEqual(gw._send_task_step({"operation_id": "s"}), {"status": "completed"})
+        self.assertEqual([b for _, b in self.calls], [None, "old", None, "new"])
+
+    def test_a_second_rejection_or_another_error_raises(self):
+        import urllib.error
+        req = self.fake_req([{"access_token": "a"}, self.http(401), {"access_token": "b"}, self.http(401)])
+        with patch.object(gw, "_req", req), self.assertRaises(urllib.error.HTTPError):
+            gw._send_task_step({"operation_id": "s"})
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        with patch.object(gw, "_req", self.fake_req([{"access_token": "a"}, self.http(500)])), \
+                self.assertRaises(urllib.error.HTTPError):
+            gw._send_task_step({"operation_id": "s"})
+
+    def test_a_mint_without_a_token_or_not_deployed(self):
+        with patch.object(gw, "_req", self.fake_req([{"nope": 1}])), self.assertRaises(ValueError):
+            gw._send_task_step({"operation_id": "s"})
+        with patch.object(gw, "_req", self.fake_req([self.http(404)])):
+            self.assertEqual(gw._send_task_step({"operation_id": "s"}), {"status": "not_deployed"})
+
+
+class Typed(unittest.TestCase):
+    """With the host's status hook, a step carries only the typed fields of its published status."""
+
+    def setUp(self):
+        self.calls, self.logs, self.clock = [], [], 100.0
+        self.status = {}
+        self.pub = StepPublisher(Path(tempfile.mkdtemp()), self.send, self.logs.append, lambda: self.clock,
+                                 status_of=lambda tid: self.status.get(tid))
+        self.tasks = {"task-dev~task-a": {"task_id": "task-a", "execution_generation": 3, "room_id": "!r:test"}}
+
+    def send(self, body):
+        self.calls.append(body)
+        return {"status": "completed"}
+
+    def test_running_queued_and_delegated_tasks(self):
+        self.status["task-dev~task-a"] = {"phase": "Running tests", "summary": "Running tests", "since": 1793491200.0}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.calls[-1]["arguments"], {"summary": "Running tests", "phase": "Running tests",
+                                                       "since": "2026-11-01T00:00:00+00:00"})
+        self.clock += 10
+        self.status["task-dev~task-a"] = {"phase": "Waiting", "summary": "Queued · 2 ahead", "since": 1793491260.0,
+                                          "waiting": {"reason": "queued", "position": 3}}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.calls[-1]["arguments"], {"summary": "Queued · 2 ahead", "phase": "Waiting",
+                                                       "line": "Queued · 2 ahead", "since": "2026-11-01T00:01:00+00:00",
+                                                       "waiting": "queued", "queue_ahead": 2})
+        self.clock += 10
+        self.status["task-dev~task-a"] = {"phase": "Delegated", "summary": "Delegated", "since": 1793491200.0,
+                                          "waiting": {"reason": "delegated"}}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.calls[-1]["arguments"]["waiting"], "delegated")
+        self.assertNotIn("queue_ahead", self.calls[-1]["arguments"])
+
+    def test_unchanged_status_is_not_resent_and_nothing_for_a_finished_task(self):
+        self.status["task-dev~task-a"] = {"phase": "Reading files", "summary": "Reading files", "since": 1.0}
+        self.pub.publish(self.tasks)
+        self.clock += 20
+        self.pub.publish(self.tasks)
+        self.assertEqual(len(self.calls), 1)
+        self.status.clear()
+        self.clock += 20
+        self.pub.publish(self.tasks)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_bad_statuses_and_envelopes_publish_nothing(self):
+        for bad in (None, {"phase": "Juggling", "summary": "x"}, {"phase": "Thinking", "summary": ""}, "x"):
+            self.assertIsNone(progress_arguments(bad), bad)
+        args = progress_arguments({"phase": "Thinking", "summary": "Thinking", "since": float("nan"),
+                                   "waiting": {"reason": "queued", "position": 0}})
+        self.assertEqual(args, {"summary": "Thinking", "phase": "Thinking", "waiting": "queued"})
+        long = progress_arguments({"phase": "Thinking", "summary": "x" * 90})
+        self.assertNotIn("line", long, "a summary over the line cap is not a line")
+        self.pub.status_of = lambda tid: 1 / 0
+        self.pub.publish(self.tasks)
+        self.tasks["task-dev~task-a"]["execution_generation"] = 0
+        self.pub.status_of = lambda tid: {"phase": "Thinking", "summary": "Thinking"}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.calls, [])
+
+    def test_failures_and_undeployed_are_logged_and_retried_later(self):
+        self.status["task-dev~task-a"] = {"phase": "Thinking", "summary": "Thinking"}
+        self.pub.send = lambda body: {"status": "not_deployed"}
+        self.pub.publish(self.tasks)
+        self.pub.send = lambda body: (_ for _ in ()).throw(OSError("down"))
+        self.clock += 10
+        self.pub.publish(self.tasks)
+        self.pub.send = lambda body: {"status": "denied"}
+        self.clock += 10
+        self.pub.publish(self.tasks)
+        self.assertIn("not deployed", self.logs[0])
+        self.assertIn("Action failed (OSError)", self.logs[1])
+        self.assertIn("Action failed (ValueError)", self.logs[2])
+        self.assertEqual(self.pub.sent, {})
+
+    def test_the_publishers_phases_are_phase_lines_words_plus_delegated(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        from ag2_sparrow import task_step_publisher as tsp
+        self.assertEqual(tsp.PHASES, tuple(phase_line.PHASES) + ("Delegated",))
+        tools = [("Read", {}), ("Grep", {}), ("WebSearch", {}), ("Edit", {}), ("Write", {}), ("Agent", {}),
+                 ("SendMessage", {}), ("Bash", {"command": "pytest -q"}), ("Bash", {"command": "git diff"}),
+                 ("Bash", {"command": "sleep 5"}), ("Bash", {"command": "ls"}), ("Bash", {"command": "make"}),
+                 ("Unknown", {})]
+        for tool, inp in tools:
+            self.assertIn(phase_line.rules_phase(tool, inp), tsp.PHASES, tool)
+        self.assertTrue(set(phase_line.MODEL_PHASES) <= set(tsp.PHASES))
+
+    def test_the_bridge_hands_the_host_hook_to_the_publisher(self):
+        hook = lambda tid: None  # noqa: E731
+        with patch.multiple(gw, TASK_STATUS=hook, _STEP_PUBLISHER=self.pub, TASKS_DIR=Path(tempfile.mkdtemp())):
+            gw._publish_task_steps_snapshot(set())
+        self.assertIs(self.pub.status_of, hook)
 
 
 class BridgeLoop(unittest.TestCase):

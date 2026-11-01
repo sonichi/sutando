@@ -2963,7 +2963,8 @@ def _read_by(resp, deadline: float) -> bytes:
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
-         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False):
+         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False,
+         bearer: "str | None" = None):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
     `deadline` (time.monotonic()), the whole request must finish by then. `operation_id` is a
     claimed effect's idempotency key, the same on every retry of it."""
@@ -2976,7 +2977,7 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         data = json.dumps(payload).encode() if payload is not None else None
         base = urllib.parse.urlunsplit((*urllib.parse.urlsplit(URL)[:2], "", "", "")) if origin else URL
         req = urllib.request.Request(f"{base}{path}", data=data, method=method)
-        req.add_header("Authorization", f"Bearer {TOKEN}")
+        req.add_header("Authorization", f"Bearer {bearer or TOKEN}")
         req.add_header("Accept", "application/json")
         # CloudFlare bot-fight (error 1010) rejects python-urllib's default
         # User-Agent with a 403; send an explicit client UA so the gateway's edge
@@ -4111,17 +4112,53 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
+# Actions accept an MCP delegation, never the relay bearer: the lane's relay credential is exchanged
+# for one at the mint endpoint, as the agent's own MCP proxy does, and kept until shortly before it expires.
+AGENT_ACCESS_MINT_PATH = "/api/v1/mcp/agent-access-tokens"
+_AGENT_ACCESS = {"token": "", "until": 0.0}
+_AGENT_ACCESS_LOCK = threading.Lock()
+
+
+def _agent_access_token(refresh: bool = False) -> str:
+    """This lane's MCP delegation token for Actions: minted with the relay bearer (POST, no body ->
+    {access_token, expires_in}), reused until a minute before it expires; `refresh` mints again."""
+    with _AGENT_ACCESS_LOCK:
+        now = time.monotonic()
+        if not refresh and _AGENT_ACCESS["token"] and now < _AGENT_ACCESS["until"]:
+            return _AGENT_ACCESS["token"]
+        _AGENT_ACCESS.update(token="", until=0.0)
+        out = _req("POST", AGENT_ACCESS_MINT_PATH, None, timeout=10, origin=True)
+        token = out.get("access_token") if isinstance(out, dict) else None
+        if not isinstance(token, str) or not token:
+            raise ValueError("the mint endpoint returned no access token")
+        try:
+            ttl = float(out.get("expires_in") or 900)
+        except (TypeError, ValueError):
+            ttl = 900.0
+        _AGENT_ACCESS.update(token=token, until=now + max(30.0, ttl - 60.0))
+        return token
+
+
 def _send_task_step(payload: dict):
-    try:
-        return _req("POST", "/api/capabilities/v1/actions/execute", payload,
-                    timeout=10, operation_id=payload["operation_id"], origin=True)
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        if exc.code != 404:
+    """room.task.progress through Actions with this lane's MCP delegation; a rejected token is minted
+    once more. Not deployed (404 from the mint or the Action) is a skip, not a failure."""
+    for attempt in (0, 1):
+        try:
+            return _req("POST", "/api/capabilities/v1/actions/execute", payload, timeout=10,
+                        operation_id=payload["operation_id"], origin=True,
+                        bearer=_agent_access_token(refresh=attempt > 0))
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == 404:
+                return {"status": "not_deployed"}
+            if exc.code == 401 and attempt == 0:
+                continue
             raise
-        return {"status": "not_deployed"}
 
 
+# Host-injected (local task id) -> its published status (phase_line.published_status), whose typed
+# fields are all a published step carries. None (standalone default): the latest activity row's text.
+TASK_STATUS: Callable[[str], "dict | None"] | None = None
 _STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)
 
 
@@ -4180,6 +4217,7 @@ def _publish_task_steps_snapshot(inflight: set[str]) -> None:
             continue
         tasks[tid] = {"task_id": wire, "execution_generation": gen,
                       "room_id": headers.get("source_room_id") or headers.get("channel_id")}
+    _STEP_PUBLISHER.status_of = TASK_STATUS
     _STEP_PUBLISHER.publish(tasks)
 
 
