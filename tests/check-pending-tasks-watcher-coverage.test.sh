@@ -10,7 +10,7 @@ bad() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=1; }
 BUNDLE="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hook-coverage.XXXXXX")"
 trap 'rm -rf "$BUNDLE"' EXIT
 mkdir -p "$BUNDLE/src/delivery" "$BUNDLE/src/runtime-api" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/results" "$BUNDLE/workspace/state" "$BUNDLE/workspace/deliveries/w1" "$BUNDLE/stubbin"
-cp "$REPO/src/check-pending-tasks.sh" "$REPO/src/watch-tasks-stream.sh" "$BUNDLE/src/"
+cp "$REPO/src/check-pending-tasks.sh" "$REPO/src/watch-tasks-stream.sh" "$REPO/src/session_identity.sh" "$BUNDLE/src/"
 cp "$REPO/scripts/git-binary.sh" "$BUNDLE/scripts/"
 # The queue gates run before the coverage gate and need the dispatch modules
 # (owned ids, readiness), so the bundle carries the real src/ python whole.

@@ -7,11 +7,13 @@
 # `~/.claude/settings.json` — they only fire when Claude runs in this project
 # context, not in unrelated sessions.
 #
-# Hooks installed (4):
+# Hooks installed (6):
 #   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
+#   UserPromptSubmit → bash src/turn-start.sh
+#   StopFailure → bash src/stop-failure.sh   (an API-error turn; see delivery/turn_failure.py)
 #
 # The SessionEnd → session-handoff.sh hook fires session-state.md on a clean
 # exit (⌘Q / crash) too, not just on PreCompact — so the last session's tail
@@ -100,6 +102,8 @@ HOOKS=(
   # Without this the Stop gate spends its one reminder and never re-arms:
   # begin_turn is the only reset and nothing else in the lifecycle calls it.
   "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
+  # An API-error turn fires this instead of Stop; the notifier re-delivers what it lost.
+  "StopFailure|src/stop-failure.sh|bash $(shq "$REPO_DIR/src/stop-failure.sh")"
 )
 
 # The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
