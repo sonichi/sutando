@@ -861,6 +861,21 @@ class TestBindingIsDurable(WorldCase):
         self.assertIn("malformed", self.w.m(self.e, final=True)["reason"])
         self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
 
+    def test_a_malformed_binding_no_longer_pins_waiting_answers_to_a_dead_row(self):
+        # It can never close, so it holds nothing: the agent's next unbound message is offered and closes it.
+        policy._claim_file(policy._key_path(self.w.ws[SELF], "bound", self.e), {"cid": C1, "disposition": "answer"})
+        e2 = self.sib("Correction: it is up now.")
+        got = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1]
+        self.assertEqual(got, {"event_id": e2, "text": "Correction: it is up now."})
+        self.assertTrue(self.w.m(e2, final=True)["matched"])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [])
+
+    def test_closable_binding_is_the_one_well_formed_rule(self):
+        self.assertTrue(policy._closable_binding({"cid": C1, "payload": {}, "record": {}}))
+        for bad in ({"cid": C1}, {"payload": {}, "record": "x"}, {"payload": [], "record": {}}, None, "x"):
+            with self.subTest(bad=bad):
+                self.assertFalse(policy._closable_binding(bad))
+
     def test_an_unwritable_binding_closes_nothing(self):
         with mock.patch.object(policy, "_claim_file", side_effect=OSError("read-only")):
             self.assertIn("could not be bound", self.w.m(self.e, final=True)["reason"])

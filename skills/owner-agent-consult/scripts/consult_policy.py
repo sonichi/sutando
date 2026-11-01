@@ -741,6 +741,13 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     return _close(workspace, data, event, task_id, no)
 
 
+def _closable_binding(binding) -> bool:
+    """Whether a binding holds what _close needs: its payload and its consult record. A malformed
+    one can never close a consult, so nothing may treat it as holding one open either."""
+    return (isinstance(binding, dict) and isinstance(binding.get("payload"), dict)
+            and isinstance(binding.get("record"), dict))
+
+
 def _judged(workspace: Path, bound: dict, event: str, task_id, final: bool, not_final: bool, no) -> dict:
     """A message already bound: its recorded judgement wins; an answer binding finishes
     closing its own consult from what the binding holds, without the room or the expiry."""
@@ -750,7 +757,7 @@ def _judged(workspace: Path, bound: dict, event: str, task_id, final: bool, not_
             return no("this message was bound as not final; --final conflicts with that judgement",
                       conflict=True, cid=cid)
         return no("this message was already judged not final", progress=True, cid=cid)
-    if not isinstance(bound.get("payload"), dict) or not isinstance(bound.get("record"), dict):
+    if not _closable_binding(bound):
         return no(f"the binding of {event} is malformed; nothing is closed")
     if not_final:
         return no("this message was bound as the answer; --not-final conflicts with that judgement "
@@ -799,9 +806,7 @@ def _answer_bindings(workspace: Path, cids) -> dict:
     d, out = Path(workspace) / _STATE / "bound", {}
     for p in sorted(d.glob("*.json")) if cids and d.is_dir() else []:
         b = _read_record(p)
-        # Only a binding _judged can close holds its consult open; a malformed one never closes.
-        if (b and b.get("cid") in cids and b.get("disposition") == "answer"
-                and isinstance(b.get("payload"), dict) and isinstance(b.get("record"), dict)):
+        if b and b.get("cid") in cids and b.get("disposition") == "answer" and _closable_binding(b):
             out.setdefault(b["cid"], b)
     return out
 
