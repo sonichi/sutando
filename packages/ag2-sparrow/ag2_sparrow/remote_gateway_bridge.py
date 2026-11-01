@@ -2963,8 +2963,7 @@ def _read_by(resp, deadline: float) -> bytes:
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
-         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False,
-         bearer: "str | None" = None):
+         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
     `deadline` (time.monotonic()), the whole request must finish by then. `operation_id` is a
     claimed effect's idempotency key, the same on every retry of it."""
@@ -2977,7 +2976,7 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         data = json.dumps(payload).encode() if payload is not None else None
         base = urllib.parse.urlunsplit((*urllib.parse.urlsplit(URL)[:2], "", "", "")) if origin else URL
         req = urllib.request.Request(f"{base}{path}", data=data, method=method)
-        req.add_header("Authorization", f"Bearer {bearer or TOKEN}")
+        req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Accept", "application/json")
         # CloudFlare bot-fight (error 1010) rejects python-urllib's default
         # User-Agent with a 403; send an explicit client UA so the gateway's edge
@@ -4112,16 +4111,19 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
-# Actions accept an MCP delegation, never the relay bearer: the lane's relay credential is exchanged
-# for one at the mint endpoint, as the agent's own MCP proxy does, and kept until shortly before it expires.
+# Room Actions are reached the way the agent's own MCP tools reach them: the lane's relay credential is
+# exchanged for an MCP delegation at the mint endpoint (kept until shortly before it expires), and the
+# Action is one stateless JSON-RPC tools/call on the lane's MCP endpoint. The relay bearer is refused there.
 AGENT_ACCESS_MINT_PATH = "/api/v1/mcp/agent-access-tokens"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+_MCP_AUTH_CODES = ("UNAUTHORIZED", "AGENT_CREDENTIAL_STALE")
 _AGENT_ACCESS = {"token": "", "until": 0.0}
 _AGENT_ACCESS_LOCK = threading.Lock()
 
 
 def _agent_access_token(refresh: bool = False) -> str:
-    """This lane's MCP delegation token for Actions: minted with the relay bearer (POST, no body ->
-    {access_token, expires_in}), reused until a minute before it expires; `refresh` mints again."""
+    """This lane's MCP delegation: minted with the relay bearer (POST, no body -> {access_token,
+    expires_in}), reused until a minute before it expires; `refresh` mints again."""
     with _AGENT_ACCESS_LOCK:
         now = time.monotonic()
         if not refresh and _AGENT_ACCESS["token"] and now < _AGENT_ACCESS["until"]:
@@ -4139,21 +4141,75 @@ def _agent_access_token(refresh: bool = False) -> str:
         return token
 
 
-def _send_task_step(payload: dict):
-    """room.task.progress through Actions with this lane's MCP delegation; a rejected token is minted
-    once more. Not deployed (404 from the mint or the Action) is a skip, not a failure."""
-    for attempt in (0, 1):
+def _lane_mcp_url() -> str:
+    """This lane's MCP endpoint, from its gateway's DotSpace (no fetch: a hot path)."""
+    return _dotspace_for(urllib.parse.urlsplit(URL).hostname or "", fetch=_NO_FETCH).mcp_url
+
+
+def _mcp_envelope(result: dict) -> dict:
+    """A tool result's JSON: its structuredContent, else the last content text that is a JSON object
+    (a success carries a sentence first, an error its envelope alone)."""
+    if isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    for item in reversed(result.get("content") or []):
         try:
-            return _req("POST", "/api/capabilities/v1/actions/execute", payload, timeout=10,
-                        operation_id=payload["operation_id"], origin=True,
-                        bearer=_agent_access_token(refresh=attempt > 0))
+            value = json.loads(item.get("text") or "")
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _mcp_tool(name: str, arguments: dict, timeout: int = 10) -> dict:
+    """One MCP tools/call on this lane's endpoint with its delegation; the tool's envelope, with
+    `is_error` set on a tool error. A rejected delegation (HTTP 401 or an auth envelope) is minted once
+    more. Raises HTTPError on any other HTTP failure, ValueError on a reply that is not JSON-RPC."""
+    url = _lane_mcp_url()
+    if not url:
+        raise LookupError("this lane's homeserver names no MCP endpoint")
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": name, "arguments": arguments}}).encode()
+    for attempt in (0, 1):
+        req = urllib.request.Request(url, data=body, method="POST")
+        for key, value in (("Authorization", f"Bearer {_agent_access_token(refresh=attempt > 0)}"),
+                           ("Content-Type", "application/json"), ("Accept", "application/json"),
+                           ("MCP-Protocol-Version", MCP_PROTOCOL_VERSION), ("User-Agent", "sutando-gateway-client/1.0")):
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                rpc = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             exc.close()
-            if exc.code == 404:
-                return {"status": "not_deployed"}
             if exc.code == 401 and attempt == 0:
                 continue
             raise
+        result = rpc.get("result") if isinstance(rpc, dict) else None
+        if not isinstance(result, dict):
+            raise ValueError("the MCP endpoint did not answer the call")
+        envelope = _mcp_envelope(result)
+        if result.get("isError"):
+            if envelope.get("code") in _MCP_AUTH_CODES and attempt == 0:
+                continue
+            return {**envelope, "is_error": True}
+        return envelope
+
+
+def _send_task_step(payload: dict):
+    """room.task.progress as room.action.execute through this lane's MCP endpoint. Not deployed (a 404
+    from the mint or the endpoint, no MCP endpoint, or the Action not available here) is a skip."""
+    try:
+        out = _mcp_tool("room.action.execute", payload)
+    except LookupError:
+        return {"status": "not_deployed"}
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code == 404:
+            return {"status": "not_deployed"}
+        raise
+    if out.get("is_error") and out.get("code") in ("NOT_FOUND", "ACTION_NOT_FOUND"):
+        return {"status": "not_deployed"}
+    return out
 
 
 # Host-injected (local task id) -> its published status (phase_line.published_status), whose typed

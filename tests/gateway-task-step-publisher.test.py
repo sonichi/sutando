@@ -14,20 +14,30 @@ from _helpers.gateway_relay import Bridges, Relay
 gw, _ = isolate_then_import()
 from ag2_sparrow.task_step_publisher import StepPublisher, progress_arguments
 
-EXECUTE = "/api/capabilities/v1/actions/execute"
+MCP = "/mcp"
 
 
 def minting(answer):
-    """A relay `on_post` that mints an MCP token at the mint path and answers Actions with `answer`."""
+    """A relay `on_post` that mints an MCP token at the mint path and serves the MCP endpoint as the
+    hosted facade does: `answer(action payload)` gives (HTTP status, Action envelope); 200 with a
+    `code` is a tool error, 200 without one a success (a sentence, then the JSON, plus structuredContent)."""
     def on_post(path, body):
         if path == gw.AGENT_ACCESS_MINT_PATH:
             return 200, {"access_token": "mcp-token", "expires_in": 900}
-        return answer(path, body)
+        status, envelope = answer(body["params"]["arguments"])
+        if status != 200:
+            return status, envelope
+        if "code" in envelope:
+            return 200, {"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True, "content": [{"type": "text", "text": json.dumps(envelope)}]}}
+        return 200, {"jsonrpc": "2.0", "id": 1, "result": {
+            "content": [{"type": "text", "text": "room.task.progress completed."},
+                        {"type": "text", "text": json.dumps(envelope)}], "structuredContent": envelope}}
     return on_post
 
 
 def actions(relay):
-    return [p for p in relay.post_paths if p[0] == EXECUTE]
+    return [(p, b["params"]["arguments"]) for p, b in relay.post_paths if p == MCP]
 
 
 class Publisher(unittest.TestCase):
@@ -104,7 +114,7 @@ class Publisher(unittest.TestCase):
 
     def test_bridge_scope_and_progress_action_transport(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = minting(lambda path, body: (200, {"status": "completed"}))
+        relay.on_post = minting(lambda body: (200, {"status": "completed"}))
         tasks_dir, results = self.root / "tasks", self.root / "results"
         tasks_dir.mkdir(); results.mkdir()
         for instance in ("dev", "prod"):
@@ -114,9 +124,11 @@ class Publisher(unittest.TestCase):
         self.row()
         self.pub.send = gw._send_task_step
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", GATEWAY_INSTANCE="dev",
-                            TASKS_DIR=tasks_dir, RESULTS_DIR=results, _ATTEMPTS=None, _STEP_PUBLISHER=self.pub):
+                            TASKS_DIR=tasks_dir, RESULTS_DIR=results, _ATTEMPTS=None, _STEP_PUBLISHER=self.pub,
+                            _lane_mcp_url=lambda: relay.url + MCP):
             gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
-            self.assertEqual([p for p, _ in relay.post_paths], [gw.AGENT_ACCESS_MINT_PATH, EXECUTE])
+            self.assertEqual([p for p, _ in relay.post_paths], [gw.AGENT_ACCESS_MINT_PATH, MCP])
+            self.assertEqual(relay.post_paths[1][1]["params"]["name"], "room.action.execute")
             path, payload = actions(relay)[0]
             self.assertEqual(payload["action"], "room.task.progress")
             self.assertEqual(payload["arguments"], {"summary": "Step one"})
@@ -234,10 +246,10 @@ class Publisher(unittest.TestCase):
 
     def test_undeployed_action_is_skipped_then_retried_after_rate_limit(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = minting(lambda path, body: (404, {"error_code": "ACTION_NOT_FOUND"}))
+        relay.on_post = minting(lambda body: (200, {"code": "NOT_FOUND", "message": "Action is not available"}))
         self.row()
         self.pub.send = gw._send_task_step
-        with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
+        with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", _lane_mcp_url=lambda: relay.url + MCP):
             self.pub.publish(self.tasks)
             self.assertEqual(len(actions(relay)), 1)
             self.assertIn("room.task.progress not deployed; skipping", self.logs[0])
@@ -245,7 +257,7 @@ class Publisher(unittest.TestCase):
             self.pub.publish(self.tasks)
             self.assertEqual(len(actions(relay)), 1)
             self.clock += 10
-            relay.on_post = minting(lambda path, body: (200, {"status": "completed"}))
+            relay.on_post = minting(lambda body: (200, {"status": "completed"}))
             self.pub.publish(self.tasks)
             self.assertEqual(len(actions(relay)), 2)
             self.assertEqual(actions(relay)[0][1], actions(relay)[1][1])
@@ -253,69 +265,138 @@ class Publisher(unittest.TestCase):
 
     def test_non_404_transport_error_is_logged_as_failure(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = minting(lambda path, body: (503, {"error": "unavailable"}))
+        relay.on_post = minting(lambda body: (503, {"error": "unavailable"}))
         self.row()
         self.pub.send = gw._send_task_step
-        with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
+        with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", _lane_mcp_url=lambda: relay.url + MCP):
             self.pub.publish(self.tasks)
         self.assertIn("Action failed (HTTPError)", self.logs[0])
         self.assertEqual(self.pub.sent, {})
 
 
 class AgentAccess(unittest.TestCase):
-    """Actions take the lane's MCP delegation, minted from its relay bearer, never the bearer itself."""
+    """Room Actions go through the lane's MCP endpoint with a delegation minted from its relay bearer."""
 
     def setUp(self):
         gw._AGENT_ACCESS.update(token="", until=0.0)
-        self.calls = []
+        self.mints, self.calls = [], []
 
-    def fake_req(self, answers):
-        answers = list(answers)
+    def mint(self, *tokens):
+        tokens = list(tokens)
 
-        def req(method, path, payload=None, timeout=None, operation_id=None, origin=False, bearer=None, **kw):
-            self.calls.append((path, bearer))
-            out = answers.pop(0)
+        def req(method, path, payload=None, timeout=None, origin=False, **kw):
+            self.mints.append(path)
+            out = tokens.pop(0)
             if isinstance(out, Exception):
                 raise out
             return out
         return req
+
+    def endpoint(self, *answers):
+        answers = list(answers)
+
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(self.body).encode()
+
+        def urlopen(req, timeout=None):
+            self.calls.append((req.full_url, req.get_header("Authorization"), json.loads(req.data)))
+            out = answers.pop(0)
+            if isinstance(out, Exception):
+                raise out
+            return Resp(out)
+        return urlopen
+
+    @staticmethod
+    def ok(envelope):
+        return {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": envelope, "content": []}}
+
+    @staticmethod
+    def tool_error(code):
+        return {"jsonrpc": "2.0", "id": 1, "result": {"isError": True,
+                                                       "content": [{"type": "text", "text": json.dumps({"code": code})}]}}
 
     def http(self, code):
         import io
         import urllib.error
         return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b""))
 
-    def test_the_action_carries_the_minted_token_and_the_token_is_reused(self):
-        step = {"operation_id": "step-1", "action": "room.task.progress"}
-        req = self.fake_req([{"access_token": "mcp-1", "expires_in": 900}, {"status": "completed"},
-                             {"status": "completed"}])
-        with patch.object(gw, "_req", req):
-            self.assertEqual(gw._send_task_step(step), {"status": "completed"})
-            gw._send_task_step(step)
-        self.assertEqual(self.calls, [(gw.AGENT_ACCESS_MINT_PATH, None), (EXECUTE, "mcp-1"), (EXECUTE, "mcp-1")])
+    def run_step(self, mint, endpoint, url="https://mcp.test/mcp"):
+        with patch.object(gw, "_req", mint), patch.object(gw.urllib.request, "urlopen", endpoint), \
+                patch.object(gw, "_lane_mcp_url", lambda: url):
+            return gw._send_task_step({"action": "room.task.progress", "operation_id": "step-1"})
 
-    def test_a_rejected_token_is_minted_once_more(self):
-        req = self.fake_req([{"access_token": "old", "expires_in": 900}, self.http(401),
-                             {"access_token": "new", "expires_in": "junk"}, {"status": "completed"}])
-        with patch.object(gw, "_req", req):
-            self.assertEqual(gw._send_task_step({"operation_id": "s"}), {"status": "completed"})
-        self.assertEqual([b for _, b in self.calls], [None, "old", None, "new"])
+    def test_the_call_carries_the_minted_token_and_the_token_is_reused(self):
+        mint, endpoint = self.mint({"access_token": "mcp-1", "expires_in": 900}), \
+            self.endpoint(self.ok({"status": "completed"}), self.ok({"status": "completed"}))
+        self.assertEqual(self.run_step(mint, endpoint), {"status": "completed"})
+        self.assertEqual(self.run_step(mint, endpoint), {"status": "completed"})
+        self.assertEqual(self.mints, [gw.AGENT_ACCESS_MINT_PATH], "one mint, reused")
+        url, auth, rpc = self.calls[0]
+        self.assertEqual((url, auth), ("https://mcp.test/mcp", "Bearer mcp-1"))
+        self.assertEqual((rpc["method"], rpc["params"]["name"]), ("tools/call", "room.action.execute"))
+        self.assertEqual(rpc["params"]["arguments"]["action"], "room.task.progress")
 
-    def test_a_second_rejection_or_another_error_raises(self):
-        import urllib.error
-        req = self.fake_req([{"access_token": "a"}, self.http(401), {"access_token": "b"}, self.http(401)])
-        with patch.object(gw, "_req", req), self.assertRaises(urllib.error.HTTPError):
-            gw._send_task_step({"operation_id": "s"})
+    def test_a_rejected_token_is_minted_once_more_for_a_401_or_an_auth_envelope(self):
+        mint = self.mint({"access_token": "old", "expires_in": 900}, {"access_token": "new", "expires_in": "junk"})
+        endpoint = self.endpoint(self.http(401), self.ok({"status": "completed"}))
+        self.assertEqual(self.run_step(mint, endpoint), {"status": "completed"})
+        self.assertEqual([c[1] for c in self.calls], ["Bearer old", "Bearer new"])
         gw._AGENT_ACCESS.update(token="", until=0.0)
-        with patch.object(gw, "_req", self.fake_req([{"access_token": "a"}, self.http(500)])), \
-                self.assertRaises(urllib.error.HTTPError):
-            gw._send_task_step({"operation_id": "s"})
+        self.calls.clear()
+        mint = self.mint({"access_token": "a"}, {"access_token": "b"})
+        endpoint = self.endpoint(self.tool_error("AGENT_CREDENTIAL_STALE"), self.ok({"status": "completed"}))
+        self.assertEqual(self.run_step(mint, endpoint), {"status": "completed"})
+        self.assertEqual([c[1] for c in self.calls], ["Bearer a", "Bearer b"])
 
-    def test_a_mint_without_a_token_or_not_deployed(self):
-        with patch.object(gw, "_req", self.fake_req([{"nope": 1}])), self.assertRaises(ValueError):
-            gw._send_task_step({"operation_id": "s"})
-        with patch.object(gw, "_req", self.fake_req([self.http(404)])):
-            self.assertEqual(gw._send_task_step({"operation_id": "s"}), {"status": "not_deployed"})
+    def test_repeated_rejections_and_other_failures(self):
+        import urllib.error
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_step(self.mint({"access_token": "a"}, {"access_token": "b"}),
+                          self.endpoint(self.http(401), self.http(401)))
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        out = self.run_step(self.mint({"access_token": "a"}, {"access_token": "b"}),
+                            self.endpoint(self.tool_error("UNAUTHORIZED"), self.tool_error("UNAUTHORIZED")))
+        self.assertEqual((out.get("is_error"), out.get("code")), (True, "UNAUTHORIZED"))
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_step(self.mint({"access_token": "a"}), self.endpoint(self.http(500)))
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        with self.assertRaises(ValueError):
+            self.run_step(self.mint({"access_token": "a"}), self.endpoint({"jsonrpc": "2.0", "id": 1, "error": {}}))
+        out = self.run_step(self.mint(), self.endpoint(self.tool_error("RATE_LIMITED")))
+        self.assertEqual(out, {"code": "RATE_LIMITED", "is_error": True})
+
+    def test_not_deployed_cases_are_a_skip(self):
+        self.assertEqual(self.run_step(self.mint(self.http(404)), self.endpoint()), {"status": "not_deployed"})
+        self.assertEqual(self.run_step(self.mint(), self.endpoint(), url=""), {"status": "not_deployed"})
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        self.assertEqual(self.run_step(self.mint({"access_token": "a"}), self.endpoint(self.http(404))),
+                         {"status": "not_deployed"})
+        self.assertEqual(self.run_step(self.mint(), self.endpoint(self.tool_error("NOT_FOUND"))),
+                         {"status": "not_deployed"})
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        with self.assertRaises(ValueError):
+            self.run_step(self.mint({"nope": 1}), self.endpoint())
+
+    def test_the_envelope_is_read_from_structured_content_or_the_last_json_text(self):
+        self.assertEqual(gw._mcp_envelope({"content": [{"text": "done."}, {"text": "[1]"}, {"text": '{"a": 1}'},
+                                                       {"text": "not json"}, {}]}), {"a": 1})
+        self.assertEqual(gw._mcp_envelope({"content": [{"text": "only words"}]}), {})
+        self.assertEqual(gw._mcp_envelope({"structuredContent": {"b": 2}, "content": []}), {"b": 2})
+
+    def test_the_lane_endpoint_comes_from_its_gateways_dotspace(self):
+        with patch.object(gw, "URL", "https://dev-chat.s.space/relay"):
+            self.assertEqual(gw._lane_mcp_url(), "https://dev-mcp.s.space/mcp")
 
 
 class Typed(unittest.TestCase):
