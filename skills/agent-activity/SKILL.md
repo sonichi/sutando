@@ -13,8 +13,8 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | field  | meaning |
 |--------|---------|
 | `ts`   | epoch seconds |
-| `room` | room id the row belongs to; the drawer in that room shows it. Absent → dock only |
-| `kind` | `processing` (picked the message up) · `thinking` (narration while deciding) · `working` (the tool in use, one line) · `notice` (PR heartbeats and the like) · `done` |
+| `room` | room id the row belongs to; the drawer in that room shows it. Absent → dock only for ordinary activity; only a roomless `wedge` is global |
+| `kind` | `processing` (picked the message up) · `thinking` (narration while deciding) · `working` (the tool in use, one line) · `notice` (PR heartbeats and the like) · `wedge` (**stopped: the owner has to act** — always written roomless, and it shows through a drawer the owner dismissed, because a blocker is not activity, it is why activity stopped) · `done` |
 | `line` | the text, plain |
 | `task` | `{id, from, text}` — the user message this row belongs to (`from` an mxid, `text` ≤160 chars) |
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |
@@ -105,3 +105,7 @@ skill hook. The hook never depends on the agent remembering anything:
 The private thinking blocks in the transcript hold a signature and no text; narration is the
 nearest available signal. The agent writes nothing it can forget: `processing` and `done` come from the hook. Hand-written
 `thinking`/`notice` rows remain the personalisation surface.
+
+Room scope comes only from explicit `--room` or the task file's `channel_id`.
+Taskless background activity never borrows the owner's last-used room. A wedge
+remains roomless even with a task file, and refuses an explicit `--room`.
