@@ -4,7 +4,9 @@
     python3 scripts/attribution-check.py [--day 2026-10-31] [--grace 120] [--workspace W] [--max-wrong-pct N]
 
 A row is CORRECT when its task id resolves to a task file, the row's time falls inside that task's
-processing window (task timestamp .. result time + grace), and its room is the task's channel_id.
+processing window (picked up .. result time + grace), and its room is the task's channel_id. Picked up
+is the task's first `processing` row that day, else the task file's timestamp. Task files and results
+are found through src/local_task_protocol.py (live, flat and month-partitioned archives).
 UNLINKED: the row names no task, or a task id that no task file has. WRONG_ROOM: the room is not the
 task's channel. WRONG_TASK: outside the window while another task was in flight (the row belongs to
 that one). STALE: outside the window with no other task in flight (late, but not misattributed). Deterministic, no model.
@@ -15,57 +17,55 @@ above it. Rows carry no seat id yet, so "another task in flight" is host-wide.
 import argparse
 import collections
 import datetime as dt
-import glob
 import hashlib
 import json
 import os
 import re
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import local_task_protocol as ltp  # noqa: E402
 
 
 def h(s):
     return hashlib.sha256(str(s).encode()).hexdigest()[:8]
 
 
-def headers(path):
-    out = {}
+def _start_from_file(path):
+    """The task file's own `timestamp:` header, else its mtime."""
     try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                m = re.match(r"^([a-z_]+):\s?(.*)$", line.rstrip("\n"))
-                if not m:
-                    break
-                out.setdefault(m.group(1), m.group(2))
+        hd = ltp.parse_task_headers_lenient(Path(path).read_text(errors="replace")).headers
     except OSError:
-        pass
-    return out
+        return None, None
+    try:
+        start = dt.datetime.strptime(hd.get("timestamp", ""), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        start = os.path.getmtime(path)
+    return start, hd.get("channel_id") or hd.get("source_room_id")
 
 
-def task_index(W):
-    """id -> (start_epoch, channel_id) from every task file, live or archived."""
-    idx = {}
-    for p in glob.glob(f"{W}/tasks/*.txt") + glob.glob(f"{W}/tasks/archive/*.txt"):
-        tid = os.path.basename(p)[:-4]
-        hd = headers(p)
-        ts = hd.get("timestamp")
-        try:
-            start = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp() if ts else os.path.getmtime(p)
-        except ValueError:
-            start = os.path.getmtime(p)
-        idx[hd.get("id") or tid] = (start, hd.get("channel_id") or hd.get("source_room_id"))
-    return idx
-
-
-def result_index(W):
-    """id -> result time: the epoch suffix of an archived result, else the live result's mtime."""
+def task_index(W, ids):
+    """id -> (file start, channel_id), through the shared lookup (live, flat and month archives)."""
     out = {}
-    for p in glob.glob(f"{W}/results/archive/*.txt"):
-        m = re.match(r"^(.*)-(\d{10})\.txt$", os.path.basename(p))
-        if m:
-            out[m.group(1)] = max(out.get(m.group(1), 0), int(m.group(2)))
-    for p in glob.glob(f"{W}/results/*.txt"):
-        out[os.path.basename(p)[:-4]] = max(out.get(os.path.basename(p)[:-4], 0), os.path.getmtime(p))
+    for tid in ids:
+        p = ltp.find_archived_task(Path(W) / "tasks", tid)
+        if p is not None:
+            out[tid] = _start_from_file(p)
     return out
+
+
+def _result_time(path):
+    m = re.match(r"^.*-(\d{10})\.txt$", path.name)
+    return int(m.group(1)) if m else os.path.getmtime(path)
+
+
+def result_index(W, ids):
+    """id -> latest result time, from every candidate the shared owner knows (live and all archives).
+    index_result_candidates is the bulk form of find_result: the same files, one listing per layout."""
+    return {tid: max(_result_time(p) for p in ps)
+            for tid, ps in ltp.index_result_candidates(Path(W) / "results", ids).items() if ps}
 
 
 def rows_for(W, day):
@@ -88,15 +88,27 @@ def main(argv=None):
     ap.add_argument("--max-wrong-pct", type=float, default=None, help="gate: exit 1 above this share")
     a = ap.parse_args(argv)
     W = a.workspace
-    tasks, results = task_index(W), result_index(W)
+    rows = list(rows_for(W, a.day))
+
+    def tid_of(r):
+        t = r.get("task")
+        return t.get("id") if isinstance(t, dict) else t
+
+    ids = {tid_of(r) for r in rows if tid_of(r)}
+    tasks, results = task_index(W, ids), result_index(W, ids)
+    # The window opens when the task was picked up (its first processing row), not when the message came.
+    picked = {}
+    for r in rows:
+        if r.get("kind") == "processing" and tid_of(r):
+            picked[tid_of(r)] = min(picked.get(tid_of(r), float("inf")), float(r.get("ts") or 0))
+    tasks = {k: (picked.get(k, st), room) for k, (st, room) in tasks.items()}
     c, by_kind, ex = collections.Counter(), collections.defaultdict(collections.Counter), collections.defaultdict(list)
     windows = sorted((st, results[k] + a.grace, k) for k, (st, _) in tasks.items() if k in results)
 
     def other_live(ts, tid):
         return any(st <= ts <= en and k != tid for st, en, k in windows if st <= ts)
-    for r in rows_for(W, a.day):
-        t = r.get("task")
-        tid = t.get("id") if isinstance(t, dict) else t
+    for r in rows:
+        tid = tid_of(r)
         kind = r.get("kind")
         ts = float(r.get("ts") or 0)
         if not tid:
@@ -105,6 +117,8 @@ def main(argv=None):
             v = "unlinked_unknown_task"
         else:
             start, room = tasks[tid]
+            if start is None:
+                start = ts
             end = results.get(tid)
             if r.get("room") and room and r["room"] != room:
                 v = "wrong_room"

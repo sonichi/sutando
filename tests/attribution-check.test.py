@@ -106,6 +106,27 @@ class Attribution(unittest.TestCase):
             ac.main(["--workspace", str(self.ws), "--day", "2001-01-01"])
         self.assertEqual(json.loads(out.getvalue())["counts"], {"correct": 1})
 
+    def test_month_partitioned_archives_are_found(self):
+        (self.ws / "tasks/archive/2026-10").mkdir()
+        (self.ws / "results/archive/2026-10").mkdir()
+        (self.ws / "tasks/archive/2026-10/task-m.txt").write_text(
+            f"id: task-m\ntimestamp: {_iso(T0 + 3000)}\nchannel_id: !roomM:s.space\ntask: x\n")
+        (self.ws / "results/archive/2026-10/task-m.txt").write_text("done")
+        os.utime(self.ws / "results/archive/2026-10/task-m.txt", (T0 + 3100, T0 + 3100))
+        self._row(T0 + 3050, "task-m", "!roomM:s.space")
+        self._row(T0 + 3500, "task-m", "!roomM:s.space")          # after its month-archived result
+        self.assertEqual(self._run()[1]["counts"], {"correct": 1, "stale_no_other_task": 1})
+
+    def test_window_opens_at_the_processing_row(self):
+        # task-b's message is at T0+1000, but it is picked up only at T0+1200: a task-a row at
+        # T0+1100 had no other task in flight, so it is stale, not misattributed.
+        self._row(T0 + 1200, "task-b", "!roomB:s.space", kind="processing")
+        self._row(T0 + 1100, "task-a", "!roomA:s.space")
+        self._row(T0 + 1150, "task-b", "!roomB:s.space")          # before pickup, past a 10 s grace
+        c = self._run("--grace", "10")[1]["counts"]
+        self.assertEqual(c["stale_no_other_task"], 2)
+        self.assertEqual(c["correct"], 1)
+
     def test_task_without_timestamp_uses_file_time(self):
         p = self.ws / "tasks" / "task-c.txt"
         p.write_text("id: task-c\nchannel_id: !roomC:s.space\n")
