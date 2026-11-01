@@ -116,6 +116,12 @@ class Base(unittest.TestCase):
         self.ws = Path(self.tmp.name)
         self.vault = FakeVault()
         self.children = []
+        # reconnect's preflight asks the target checkout what it resolves; these fixtures have no real
+        # checkout, so it answers "this workspace, this host" (ReconnectPreflight tests the real probe).
+        probe = unittest.mock.patch.object(C, "_launch_probe", lambda repo, env, python: {
+            "workspace": str(self.ws.resolve()), "host": C._this_host()})
+        probe.start()
+        self.addCleanup(probe.stop)
 
     def tearDown(self):
         for proc in self.children:
@@ -795,6 +801,178 @@ class Primary(Base):
         self.assertEqual(C.launch_env(alpha, environ, vault=self.vault)["REMOTE_PROACTIVE_ROOM"], "",
                          "the old primary's next launch has no room")
         self.assertTrue(C.disconnect("alpha-fixture-net", workspace=self.ws, kill=lambda *a: None)["disabled"])
+
+
+class ReconnectPreflight(Base):
+    """reconnect refuses, touching nothing, when the new bridge cannot start here; a launch that still
+    fails after the stop brings the previous bridge back from the checkout its last good launch ran from."""
+
+    def setUp(self):
+        super().setUp()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.killed = []
+        self.logs = self.ws / "logs"
+
+    def kill(self, pid, sig):
+        self.killed.append(pid)
+        os.kill(pid, sig)
+
+    def reconnect(self, repo, spawn=None):
+        return C.reconnect("beta-fixture-net", repo=repo, logs_dir=self.logs, environ={}, workspace=self.ws,
+                           vault=self.vault, spawn=spawn or self.bridge_spawn(), kill=self.kill, fetch=unreachable)
+
+    def running(self):
+        bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        self.children.append(bridge)
+        return bridge
+
+    def test_a_checkout_that_resolves_elsewhere_is_refused_before_the_stop(self):
+        bridge = self.running()
+        for answer, why in (({"workspace": "/elsewhere", "host": C._this_host()}, "workspace"),
+                            ({"workspace": str(self.ws.resolve()), "host": "another-host"}, "host label")):
+            with unittest.mock.patch.object(C, "_launch_probe", lambda repo, env, python, a=answer: a):
+                with self.assertRaises(C.RelaunchPreflightFailed) as cm:
+                    self.reconnect(self.ws / "wt")
+            self.assertIn(why, str(cm.exception))
+            self.assertIn("the running bridge was left up", str(cm.exception))
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid), "nothing stopped")
+
+    def test_no_bridge_or_no_token_is_refused_before_the_stop(self):
+        bridge = self.running()
+        with unittest.mock.patch.object(C, "_launch_probe", side_effect=ValueError("no src/remote-gateway-bridge.py")):
+            with self.assertRaises(C.RelaunchPreflightFailed):
+                self.reconnect(self.ws / "empty")
+        self.vault.store.clear()
+        with self.assertRaises(C.RelaunchPreflightFailed) as cm:
+            self.reconnect(self.ws / "repo")
+        self.assertIn("no token", str(cm.exception))
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid))
+
+    def test_a_row_without_an_identity_yet_still_passes_the_preflight(self):
+        rec = json.loads(C.record_path(self.ws).read_text())
+        for r in rec["connections"]:
+            r["agent_mxid"] = ""
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        seen = []
+        with unittest.mock.patch.object(C, "_launch_probe", lambda repo, env, python: seen.append(env) or {
+                "workspace": str(self.ws.resolve()), "host": C._this_host()}):
+            C._launch_preflight("beta-fixture-net", self.ws / "repo", {}, self.ws, self.vault, None)
+        self.assertEqual(seen[0]["GATEWAY_INSTANCE"], "beta-fixture-net")
+
+    def test_a_disconnected_row_without_its_token_is_refused_too(self):
+        self.add()
+        C.set_primary("alpha-fixture-net", workspace=self.ws)
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        self.vault.store.clear()
+        with self.assertRaisesRegex(C.RelaunchPreflightFailed, "no token"):
+            self.reconnect(self.ws / "repo")
+        beta = next(r for r in self.rows() if r["instance"] == "beta-fixture-net")
+        self.assertTrue(beta["disabled"], "still disconnected: nothing changed")
+
+    def test_every_good_launch_records_its_checkout(self):
+        rec = C.launch("beta-fixture-net", repo=self.ws / "main", logs_dir=self.logs,
+                       environ={"SUTANDO_BRIDGE_LOCK": "0"}, workspace=self.ws, vault=self.vault,
+                       spawn=self.bridge_spawn(), fetch=unreachable)
+        self.assertEqual((rec["lease"], rec["repo"]), ("disabled", str((self.ws / "main").resolve())))
+
+    def test_a_failed_launch_brings_the_previous_bridge_back_from_its_checkout(self):
+        good, bad = self.ws / "main", self.ws / "wt"
+        (good / "src").mkdir(parents=True)
+        (good / "src" / "remote-gateway-bridge.py").write_text("")
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        self.assertEqual(C._launch_record("beta-fixture-net", self.ws)["repo"], str(good.resolve()))
+        argvs = []
+
+        def spawn(argv, env, log_path):
+            argvs.append(argv[1])
+            if str(bad) in argv[1]:
+                raise OSError("will not start")
+            return self.bridge_spawn()(argv, env, log_path)
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.reconnect(bad, spawn=spawn)
+        self.assertIn(f"the previous bridge was brought back from {good.resolve()}", str(cm.exception))
+        self.assertEqual([Path(a).parents[1] for a in argvs], [bad, good.resolve()])
+        self.assertTrue(C.bridge_pid("beta-fixture-net", self.ws), "the lane is up again")
+        self.assertEqual(C._launch_record("beta-fixture-net", self.ws)["repo"], str(good.resolve()))
+
+    def test_when_the_previous_bridge_will_not_start_either_both_failures_are_named(self):
+        good = self.ws / "main"
+        (good / "src").mkdir(parents=True)
+        (good / "src" / "remote-gateway-bridge.py").write_text("")
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+
+        def spawn(argv, env, log_path):
+            raise OSError("nothing starts")
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertIn("failed too", str(cm.exception))
+        self.assertEqual(C._launch_record("beta-fixture-net", self.ws).get("last_repo"), str(good.resolve()),
+                         "the last good checkout survives failed records")
+
+    def test_a_failure_from_the_same_checkout_is_not_retried(self):
+        repo = self.ws / "main"
+        C.launch("beta-fixture-net", repo=repo, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            spawned.append(argv)
+            raise OSError("will not start")
+        with self.assertRaisesRegex(C.LaunchFailed, "same checkout, so it was not retried"):
+            self.reconnect(repo, spawn=spawn)
+        self.assertEqual(len(spawned), 1, "one attempt, no second run of the same code")
+
+    def test_a_previous_checkout_without_its_bridge_is_not_spawned(self):
+        good = self.ws / "gone"
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            spawned.append(argv)
+            raise OSError("will not start")
+        with self.assertRaisesRegex(C.LaunchFailed, "has no bridge any more"):
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertEqual(len(spawned), 1)
+
+    def test_a_vault_error_passes_through_unwrapped(self):
+        bridge = self.running()
+        with unittest.mock.patch.object(C, "launch_env", side_effect=C.VaultUnavailable("vault down")):
+            with self.assertRaises(C.VaultUnavailable) as cm:
+                self.reconnect(self.ws / "repo")
+        self.assertNotIsInstance(cm.exception, C.RelaunchPreflightFailed)
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid))
+
+    def test_with_no_previous_bridge_the_failure_says_so(self):
+        def spawn(argv, env, log_path):
+            raise OSError("nothing starts")
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertIn("no previous bridge to bring back", str(cm.exception))
+
+    def test_the_real_probe_asks_the_checkout_itself(self):
+        unittest.mock.patch.stopall()
+        repo = self.ws / "stub"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "remote-gateway-bridge.py").write_text("")
+        (repo / "src" / "workspace_default.py").write_text(
+            "from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path('/ws/x')\n")
+        (repo / "src" / "util_paths.py").write_text("def host_label():\n    return 'host-x'\n")
+        self.assertEqual(C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None), {"workspace": "/ws/x", "host": "host-x"})
+        (repo / "src" / "util_paths.py").write_text("raise ImportError('broken checkout')\n")
+        with self.assertRaisesRegex(ValueError, "could not resolve its workspace"):
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None)
+        (repo / "src" / "util_paths.py").write_text("def host_label():\n    return 'h'\nprint('[]')\n")
+        (repo / "src" / "workspace_default.py").write_text("import sys\nprint('[1]')\nsys.exit(0)\n")
+        with self.assertRaisesRegex(ValueError, "gave no workspace|could not resolve"):
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None)
+        with self.assertRaisesRegex(ValueError, "did not run"):
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, "/nonexistent/python")
+        with self.assertRaisesRegex(ValueError, "no src/remote-gateway-bridge.py"):
+            C._launch_probe(self.ws / "empty", {}, None)
+        self.assertTrue(C._this_host())
 
 
 class RemoveConnection(Base):
@@ -2257,10 +2435,11 @@ class Disconnect(Base):
         self.assertEqual([e["instance"] for e in C.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net", "beta-fixture-net"])
         # A failed row still reconnects as before, enabled rows untouched by the flag path.
         self.vault.store.pop("AG2_REMOTE_TOKEN_BETA_FIXTURE_NET")
-        with self.assertRaises(C.LaunchFailed):
+        before = C.status_for(self.rows()[1], self.ws)["state"]
+        with self.assertRaises(C.RelaunchPreflightFailed):  # refused before the stop: the running bridge stays up
             C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
                         workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=unreachable)
-        self.assertEqual(C.status_for(self.rows()[1], self.ws)["state"], "failed")
+        self.assertEqual(C.status_for(self.rows()[1], self.ws)["state"], before, "nothing was changed")
         self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
         record = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
                              workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=unreachable)

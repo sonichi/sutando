@@ -275,6 +275,16 @@ class BridgeStillRunning(Refusal):
         self.pid = pid
 
 
+class RelaunchPreflightFailed(Refusal):
+    """The bridge `reconnect` would launch cannot be shown to start here; the running one is left up."""
+
+    CODE = "relaunch_preflight_failed"
+
+    def __init__(self, instance: str, detail: str):
+        super().__init__(f"{self.CODE}: the bridge for {instance or '<primary>'} would not start from that "
+                         f"checkout ({detail}); the running bridge was left up; nothing changed")
+
+
 class BridgeLeaseIndeterminate(Refusal):
     """The bridge's lease does not show which process holds it; nothing is signalled or written."""
 
@@ -2531,9 +2541,91 @@ def _agent_identity():
 
 
 def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
+    """Write the launch record. A failed launch keeps the checkout the last good one ran from
+    (`last_repo`), so `reconnect` can still bring that bridge back."""
     record = {"instance": instance, "ts": int(time.time()), **fields}
+    if not fields.get("repo"):
+        prev = _launch_record(instance, workspace)
+        if prev.get("repo") or prev.get("last_repo"):
+            record["last_repo"] = prev.get("repo") or prev.get("last_repo")
     _atomic_json(launch_record_path(instance, workspace), record)
     return record
+
+
+def _launch_record(instance: str, workspace: Optional[Path]) -> dict:
+    try:
+        rec = json.loads(launch_record_path(instance, workspace).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+_LAUNCH_PROBE = (
+    "import json, sys\n"
+    "sys.path.insert(0, 'src')\n"
+    "from workspace_default import resolve_workspace\n"
+    "from util_paths import host_label\n"
+    "print(json.dumps({'workspace': str(resolve_workspace(migrate=False).resolve()), 'host': host_label()}))\n")
+
+
+def _launch_probe(repo: Path, env: Mapping[str, str], python: Optional[str]) -> dict:
+    """What a bridge started from `repo` with `env` would resolve, asked of that checkout's own code:
+    {workspace, host}. ValueError (with why) when it has no bridge or the probe does not answer."""
+    if not (Path(repo) / "src" / "remote-gateway-bridge.py").is_file():
+        raise ValueError(f"no src/remote-gateway-bridge.py under {repo}")
+    try:
+        out = subprocess.run([python or sys.executable, "-c", _LAUNCH_PROBE], cwd=str(repo), env=dict(env),
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ValueError(f"the checkout's Python did not run ({type(e).__name__})") from None
+    try:
+        answer = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise ValueError(f"the checkout could not resolve its workspace (exit {out.returncode})") from None
+    if not isinstance(answer, dict):
+        raise ValueError("the checkout gave no workspace")
+    return answer
+
+
+def _this_host() -> str:
+    from util_paths import host_label
+    return host_label()
+
+
+def _launch_preflight(instance: str, repo: Path, environ: Mapping[str, str], workspace: Optional[Path],
+                      vault, python: Optional[str]) -> None:
+    """Refuse (`RelaunchPreflightFailed`) a relaunch that cannot start here, before anything is
+    stopped: the checkout must have the bridge, its token must be reachable, and that checkout's own
+    code must resolve this workspace and this host label (else its lease lands where no one looks).
+    A row with no identity yet, or disconnected, passes those steps: `reconnect` learns the identity
+    and re-enables the row after the stop; its token must still be there."""
+    try:
+        row = _row_named(instance, workspace)
+        if row is not None and row.get("disabled") and not row.get("parked"):
+            ref = str(row["token_ref"])
+            if not ((environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)):
+                raise NoToken(f"no token under {ref}")
+            env = {**environ, "GATEWAY_INSTANCE": instance}
+        else:
+            entry = plan_entry(instance, environ, workspace=workspace)
+            try:
+                env = launch_env(entry, environ, vault=vault)
+            except NoIdentity:
+                env = {**environ, "GATEWAY_INSTANCE": str(entry["instance"])}
+        answer = _launch_probe(Path(repo), env, python)
+    except NoToken as e:
+        raise RelaunchPreflightFailed(instance, str(e)) from None
+    except VaultUnavailable:
+        raise  # the vault's own error (HTTP 503), not this checkout's
+    except (ValueError, ConnectionsError) as e:
+        raise RelaunchPreflightFailed(instance, str(e)) from None
+    here = str(_workspace(workspace).resolve())
+    if str(answer.get("workspace") or "") != here:
+        raise RelaunchPreflightFailed(instance, f"it resolves the workspace {answer.get('workspace')!r}, not {here!r}"
+                                      " — give it this install's sutando.config.local.json")
+    host = _this_host()
+    if str(answer.get("host") or "") != host:
+        raise RelaunchPreflightFailed(instance, f"it resolves the host label {answer.get('host')!r}, not {host!r}")
 
 
 # Children this process spawned, kept so their exit is observed and reaped, never guessed from a pid.
@@ -2683,7 +2775,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
         for alias in alias_instances(_row_named(instance, workspace) or {}):
             holder = _proven_holder(alias, workspace)
             if holder:  # the same connection, already up under the name its host launched it as
-                return _record_launch(instance, workspace, ok=True, pid=holder, lease="alias_running", alias=alias)
+                return _record_launch(instance, workspace, ok=True, pid=holder, lease="alias_running", alias=alias, repo=str(Path(repo).resolve()))
         try:
             env = launch_env(entry, environ, vault=vault)
         except NoToken as e:
@@ -2706,10 +2798,10 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
                 _CHILDREN[pid] = child
                 _reap_when_done(child)
             if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
-                return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled", repo=str(Path(repo).resolve()))
             lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))
             if lease == "held":
-                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease)
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, repo=str(Path(repo).resolve()))
             if lease == "timeout":
                 mine = _CHILDREN.pop(pid, None)
                 if mine is not None:
@@ -2719,7 +2811,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
                 raise LaunchFailed(f"the bridge for {instance} (pid {pid}) took no lease within {LEASE_TIMEOUT_S}s"
                                    + ("; it was stopped" if mine is not None else ""))
             if holder:
-                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, holder_pid=holder)
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, holder_pid=holder, repo=str(Path(repo).resolve()))
             rc = _exit_code(child)
             wait = _retained_wait(instance, workspace) if rc in (None, 75) else None
             if wait is not None and attempt == 1 and time.monotonic() + wait + 0.1 < deadline:
@@ -2810,11 +2902,16 @@ def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
 def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
               workspace: Optional[Path] = None, vault=None, spawn=None, kill=None,
               python: Optional[str] = None, fetch=None, getaddrinfo=None) -> dict:
-    """Relaunch exactly this one bridge: stop the running one, learn the identity its token
-    answers to now (a provisional row is re-keyed), then `launch`."""
+    """Relaunch exactly this one bridge: refuse first, touching nothing, when the new one cannot
+    start here (`_launch_preflight`); then stop the running one, learn the identity its token
+    answers to now (a provisional row is re-keyed), and `launch`. A launch that still fails brings
+    the previous bridge back from the checkout its last good launch recorded, and says so."""
+    environ = os.environ if environ is None else environ
+    _launch_preflight(instance, repo, environ, workspace, vault, python)
+    previous = _launch_record(instance, workspace)
+    previous_repo = previous.get("repo") or previous.get("last_repo") or ""
     known = _row_named(instance, workspace)
     stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
-    environ = os.environ if environ is None else environ
     rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
     if instance in rows:
         if rows[instance].get("disabled"):
@@ -2827,8 +2924,25 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
                                workspace=workspace)
             except ConnectionsError:
                 pass
-    record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                    vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+    try:
+        record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                        vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+    except LaunchFailed as e:
+        if not stopped or not previous_repo:
+            raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
+        if Path(previous_repo).resolve() == Path(repo).resolve():
+            raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
+                               "retried: the lane is down until it is relaunched") from None
+        if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
+            raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
+                               "the lane is down until it is relaunched") from None
+        try:
+            back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
+                          vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+        except LaunchFailed as e2:
+            raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
+        raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
+                           f"(pid {back.get('pid')})") from None
     record["stopped_pid"] = stopped
     return record
 
