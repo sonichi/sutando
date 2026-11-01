@@ -7,6 +7,8 @@ A REAL HTTP server on an ephemeral port, the workspace a temp dir. Contract:
   b) a loopback page, the desktop app's origins and a page served from the same host get their
      Origin echoed, with Vary: Origin
   c) responses still reach callers that need no grant (same-origin, <img>, local tools)
+  d) DNS rebinding is refused: a Host that is not loopback, an IP literal or declared gets 403
+     on every route (reads and POST /task), unless the request carries a valid bearer
 
 Run: python3 tests/agent-api-cross-origin-reads.test.py
 """
@@ -100,6 +102,35 @@ def main() -> int:
           "b) a page served from the same LAN host is echoed")
     check(req("/ping", origin="http://evil.example", host=f"192.168.1.20:{PORT}")[1] is None,
           "b) a different host is not")
+    check(req("/ping", origin="http://192.168.1.20:9999", host=f"192.168.1.20:{PORT}")[1] is None,
+          "b) another service on the same host (another port) is not")
+    for origin in ("null", "http://127.0.0.1@evil.com", "http://localhost.evil.com", "http://127.0.0.1.evil.com"):
+        check(req("/ping", origin=origin)[1] is None, f"b) {origin} gets no grant")
+
+    # d) DNS rebinding: the Host is the attacker's name, so the request is refused
+    rebound = f"evil.example:{PORT}"
+    for path in ("/ping", "/tasks/active", "/activity", "/media/results/media/pic.png"):
+        status, acao, _v, body = req(path, origin=f"http://{rebound}", host=rebound)
+        check(status == 403 and b"host not allowed" in body, f"d) {path} under a rebinding Host: 403 ({status})")
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    c.request("POST", "/task", body="hello", headers={"Host": rebound, "Origin": f"http://{rebound}",
+                                                       "Content-Type": "text/plain"})
+    r = c.getresponse()
+    r.read()
+    c.close()
+    check(r.status == 403, f"d) POST /task under a rebinding Host: 403 ({r.status})")
+    check(req("/ping", host=rebound, bearer=api.connections_bearer())[0] == 200,
+          "d) a valid bearer is not a rebinding page: allowed")
+    check(req("/ping", host=f"192.168.1.20:{PORT}")[0] == 200, "d) an IP-literal LAN Host: allowed")
+    check(req("/ping", host=f"[::1]:{PORT}")[0] == 200, "d) [::1]: allowed")
+    api.ALLOWED_HOSTS = "my-mac.lan"
+    try:
+        check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 200, "d) a declared LAN name: allowed")
+    finally:
+        api.ALLOWED_HOSTS = ""
+    check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 403, "d) an undeclared name: 403")
+    check(gate.rebinding_safe_host("") and gate.rebinding_safe_host("app.localhost:1"),
+          "d) no Host (no browser) and *.localhost are safe")
 
     # the response still reaches same-origin callers; only the grant is withheld
     status, acao, _v, body = req("/media/results/media/pic.png")
