@@ -21,11 +21,11 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "skills" / "agent-activity" / "scripts"
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(SCRIPTS))
-import activity_bus  # noqa: E402
-import skill_roots  # noqa: E402
-import stop_hooks  # noqa: E402
-import stop_interrupt as si  # noqa: E402
-import turns  # noqa: E402
+import activity_bus
+import skill_roots
+import stop_hooks
+import stop_interrupt as si
+import turns
 
 
 def load_hook():
@@ -66,12 +66,12 @@ class FakeTmux:
             return None if self.turn is None else f"{self.turn}\n"
         if argv[-1] == "tmux-socket":
             return "/run/core.sock\n"
-        if "--fence" in argv:
+        if "--fence-keys" in argv:
             return "" if self.fence_ok else None
         return ""
 
     def escapes(self):
-        return [c for c in self.calls if "--fence" in c]
+        return [c for c in self.calls if "--fence-keys" in c]
 
 
 class NoSocket(FakeTmux):
@@ -128,8 +128,8 @@ class StopInterrupt(Base):
         self.assertIn("tmux-pane-keys.sh", esc[0][1])
         self.assertEqual(esc[0][esc[0].index("-S") + 1], "/run/core.sock", "the launcher's socket, via the config helper")
         self.assertEqual(esc[0][esc[0].index("-t") + 1], "=sutando-core:0")
-        fence = esc[0][esc[0].index("--fence") + 1:]
-        self.assertEqual(fence, ["#{==:#{@sutando_turn},P1}", "send-keys -t '=sutando-core:0' Escape"],
+        fence = esc[0][esc[0].index("--fence-keys") + 1:]
+        self.assertEqual(fence, ["#{==:#{@sutando_turn},P1}", "--", "Escape"],
                          "the server sends the key only while the pane's turn is still the one read")
         self.assertIn("interrupted the running turn (the pane is mid-turn on this task)", self.owner_rows()[-1]["line"])
         self.assertEqual(self.owner_rows()[-1]["room"], "!room:x")

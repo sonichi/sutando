@@ -30,17 +30,17 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import turns  # noqa: E402
-from activity_bus import ActivityStore, LifecycleTransition  # noqa: E402
-from activity_rows import append as append_row  # noqa: E402
-from activity_rows import task_from_file  # noqa: E402
-from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status  # noqa: E402
-from delivery.task_dispatch import worker_holds  # noqa: E402
-from file_lock import locked_file  # noqa: E402
-from local_task_protocol import find_archived_result, valid_local_task_id  # noqa: E402
-from skill_config import enabled as config_enabled  # noqa: E402
-from tmux_pane_keys import fence_argv, tmux_quote  # noqa: E402
-from workspace_default import resolve_workspace  # noqa: E402
+import turns
+from activity_bus import ActivityStore, LifecycleTransition
+from activity_rows import append as append_row
+from activity_rows import task_from_file
+from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
+from delivery.task_dispatch import worker_holds
+from file_lock import locked_file
+from local_task_protocol import find_archived_result, valid_local_task_id
+from skill_config import enabled as config_enabled
+from tmux_pane_keys import fence_keys_argv
+from workspace_default import resolve_workspace
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
 CONFIRM_POLL_S = 2.0
@@ -221,7 +221,7 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     if send:
         manager, reqs = _tui_requirements(workspace, _session())
         fence = "#{==:#{%s},%s}" % (turns.PANE_OPTION, pid)
-        sent = run(fence_argv(sock, pane, fence, f"send-keys -t {tmux_quote(pane)} Escape")) is not None
+        sent = run(fence_keys_argv(sock, pane, fence, "Escape")) is not None
         why = why if sent else f"{why}, but the key was not sent (the turn moved on, or tmux failed)"
         send = sent
         if send and reqs:

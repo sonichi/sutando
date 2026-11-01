@@ -19,13 +19,15 @@ while [ $# -gt 0 ]; do
     -t) TARGET="${2:?}"; shift 2 ;;
     --timeout) TIMEOUT="${2:?}"; shift 2 ;;
     --fence) FENCE_PRED="${2:?}"; FENCE_ACTION="${3:?}"; FENCED=1; shift 3 ;;
+    --fence-keys) FENCE_PRED="${2:?}"; FENCED=keys; shift 2 ;;
     --) shift; break ;;
     *) echo "tmux-pane-keys: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$SOCK" ] && [ -n "$TARGET" ] && { [ $# -gt 0 ] || [ -n "$FENCED" ]; } \
   || { echo "tmux-pane-keys: need -S, -t and keys after -- (or --fence PREDICATE ACTION)" >&2; exit 2; }
-[ -z "$FENCED" ] || [ $# -eq 0 ] || { echo "tmux-pane-keys: --fence takes no keys" >&2; exit 2; }
+[ "$FENCED" != 1 ] || [ $# -eq 0 ] || { echo "tmux-pane-keys: --fence takes no keys" >&2; exit 2; }
+[ "$FENCED" != keys ] || [ $# -gt 0 ] || { echo "tmux-pane-keys: --fence-keys needs keys after --" >&2; exit 2; }
 case "$TIMEOUT" in ''|*[!0-9]*) echo "tmux-pane-keys: --timeout takes whole seconds" >&2; exit 2 ;; esac
 
 [ "$((10#$TIMEOUT))" -gt 0 ] || { echo "tmux-pane-keys: --timeout must be positive" >&2; exit 2; }
@@ -62,19 +64,22 @@ STARTED="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$PPID" 2>/dev/null)"; STARTED="${ST
 ORPHAN="mv $(tmux_quote "$TICKET.claimed") $(tmux_quote "$TICKET.orphaned")"
 CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p $PPID 2>/dev/null)\" in \"$STARTED\"*Z*) $ORPHAN; false ;; \"$STARTED\"*) true ;; *) $ORPHAN; false ;; esac"
 
-if [ -n "$FENCED" ]; then
+KEYS="send-keys -t $(tmux_quote "$TARGET")"
+for key in "$@"; do
+  # As argv, a trailing ';' ends the command and a trailing '\;' is a literal ';'.
+  case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
+  KEYS="$KEYS $(tmux_quote "$key")"
+done
+if [ "$FENCED" = keys ]; then
+  # Keys under a fence: leave any mode, then send only while the pane is out of one and the predicate holds.
+  SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "#{&&:#{==:#{pane_in_mode},0},$FENCE_PRED}") $(tmux_quote "$KEYS") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")")"
+elif [ -n "$FENCED" ]; then
   # The compare and the action are one server command: the predicate is evaluated against the pane
   # -t selects, and a false predicate orphans the ticket and fails, so nothing reaches a replacement.
   SEND="if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "$FENCE_PRED") $(tmux_quote "$FENCE_ACTION") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")")"
 else
   # Hooks may run between the commands of a list, so the send is withheld (and its claim orphaned)
   # when the pane is back in a mode at the moment of sending.
-  KEYS="send-keys -t $(tmux_quote "$TARGET")"
-  for key in "$@"; do
-    # As argv, a trailing ';' ends the command and a trailing '\;' is a literal ';'.
-    case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
-    KEYS="$KEYS $(tmux_quote "$key")"
-  done
   SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") '#{pane_in_mode}' $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")") $(tmux_quote "$KEYS")"
 fi
 printf '%s\n' "$SEND" > "$WORK/cmd"
