@@ -39,7 +39,7 @@ def _hook():
 class Records(unittest.TestCase):
     def test_the_log_checks_each_path_child_and_label(self):
         good = {"handoff_id": "ho_0123456789ab", "parent_task_id": PARENT, "path": "pool", "child_ref": CHILD,
-                "delegate_label": "Engine 2", "holds": "yes"}
+                "delegate_label": "worker-a", "holds": "yes"}
         self.assertEqual(cl.validate("handoff", good)["path"], "pool")
         self.assertEqual(cl.validate("handoff", dict(good, path="agent", child_ref="toolu_01AbCdEf1234"))["path"], "agent")
         self.assertEqual(cl.validate("handoff", dict(good, path="message", child_ref="ix_0123456789ab"))["path"], "message")
@@ -58,7 +58,7 @@ class Records(unittest.TestCase):
         self.assertRegex(cl.mint_handoff_id(), r"^ho_[0-9a-f]{12}$")
 
     def test_safe_label_trims_to_what_the_log_accepts(self):
-        self.assertEqual(ho.safe_label("Engine 2", "x"), "Engine 2")
+        self.assertEqual(ho.safe_label("worker-a", "x"), "worker-a")
         self.assertEqual(ho.safe_label("general-purpose", "x"), "general-purpose")
         self.assertEqual(ho.safe_label("<script>", "a worker"), "script")
         self.assertEqual(ho.safe_label("", "a worker"), "a worker")
@@ -70,11 +70,11 @@ class Lifecycle(unittest.TestCase):
         self.ws = Path(tempfile.mkdtemp())
 
     def test_a_pool_handoff_holds_the_parent_until_the_child_result_exists(self):
-        hid = ho.open_handoff(self.ws, PARENT, "pool", CHILD, "Engine 2", holds=True, parent_generation=3)
+        hid = ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True, parent_generation=3)
         self.assertRegex(hid, r"^ho_")
         st = ho.delegated_status(self.ws, PARENT)
         self.assertEqual((st["phase"], st["line"], st["handoffs"], st["holding"]),
-                         ("Delegated", "Delegated: Engine 2", 1, 1))
+                         ("Delegated", "Delegated: worker-a", 1, 1))
         (self.ws / "results").mkdir()
         (self.ws / "results" / f"{CHILD}.txt").write_text("[no-send]\nok")
         self.assertEqual(ho.open_handoffs(self.ws, PARENT), [])
@@ -85,43 +85,43 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(len([r for r in cl.read(workspace=self.ws) if r["kind"] == "handoff_closed"]), 1)
 
     def test_a_handoff_out_too_long_times_out(self):
-        ho.open_handoff(self.ws, PARENT, "pool", CHILD, "Engine 2", holds=True)
+        ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
         self.assertEqual(ho.open_handoffs(self.ws, PARENT, now=time.time() + ho.MAX_OPEN_S + 60), [])
         self.assertEqual([r["outcome"] for r in cl.read(workspace=self.ws) if r["kind"] == "handoff_closed"], ["timeout"])
 
     def test_only_holding_handoffs_hold_and_several_read_as_helpers(self):
-        ho.open_handoff(self.ws, PARENT, "message", "ix_0123456789ab", "Reviewer", holds=False)
+        ho.open_handoff(self.ws, PARENT, "message", "ix_0123456789ab", "helper-b", holds=False)
         self.assertEqual(ho.open_handoffs(self.ws, PARENT, holding_only=True), [])
         ho.open_handoff(self.ws, PARENT, "agent", "toolu_01AbCdEf1234", "general-purpose", holds=True)
         st = ho.delegated_status(self.ws, PARENT)
         self.assertEqual((st["line"], st["handoffs"], st["holding"]), ("Delegated: 2 helpers", 2, 1))
         self.assertEqual(ho.close_by_child(self.ws, "agent", "toolu_01AbCdEf1234"), 1)
-        self.assertEqual(ho.delegated_status(self.ws, PARENT)["line"], "Delegated: Reviewer")
+        self.assertEqual(ho.delegated_status(self.ws, PARENT)["line"], "Delegated: helper-b")
         self.assertIsNone(ho.delegated_status(self.ws, "task-other-1"))
 
     def test_the_delegates_own_line_rolls_up_and_is_capped(self):
-        ho.open_handoff(self.ws, PARENT, "pool", CHILD, "Reviewer", holds=True)
+        ho.open_handoff(self.ws, PARENT, "pool", CHILD, "helper-b", holds=True)
         fake = types.SimpleNamespace(latest=lambda ws, tid: {"line": "Reviewing 14 PRs on the dev board for the owner today"}
                                      if tid == CHILD else None)
         with patch.dict(sys.modules, {"phase_line": fake}):
             line = ho.delegated_status(self.ws, PARENT)["line"]
-        self.assertTrue(line.startswith("Delegated: Reviewer, reviewing 14 PRs"), line)
+        self.assertTrue(line.startswith("Delegated: helper-b, reviewing 14 PRs"), line)
         self.assertLessEqual(len(line), ho.LINE_MAX)
         broken = types.SimpleNamespace(latest=lambda ws, tid: (_ for _ in ()).throw(RuntimeError("x")))
         with patch.dict(sys.modules, {"phase_line": broken}):
-            self.assertEqual(ho.delegated_status(self.ws, PARENT)["line"], "Delegated: Reviewer")
+            self.assertEqual(ho.delegated_status(self.ws, PARENT)["line"], "Delegated: helper-b")
 
     def test_a_refused_record_is_no_handoff(self):
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNone(ho.open_handoff(self.ws, "@chi:s.space", "pool", CHILD, "Engine 2", holds=True))
+            self.assertIsNone(ho.open_handoff(self.ws, "@chi:s.space", "pool", CHILD, "worker-a", holds=True))
         self.assertEqual(ho.open_handoffs(self.ws, "@chi:s.space"), [])
 
     def test_the_cli_lists_and_closes(self):
-        hid = ho.open_handoff(self.ws, PARENT, "message", "ix_0123456789ab", "Reviewer", holds=False)
+        hid = ho.open_handoff(self.ws, PARENT, "message", "ix_0123456789ab", "helper-b", holds=False)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(ho.main(["open-list", "--task", PARENT, "--workspace", str(self.ws)]), 0)
-        self.assertEqual(json.loads(out.getvalue())["status"]["line"], "Delegated: Reviewer")
+        self.assertEqual(json.loads(out.getvalue())["status"]["line"], "Delegated: helper-b")
         self.assertEqual(ho.main(["close", "--handoff", hid, "--workspace", str(self.ws)]), 0)
         self.assertEqual(ho.open_handoffs(self.ws, PARENT), [])
         with contextlib.redirect_stderr(io.StringIO()):
@@ -189,10 +189,10 @@ class Hook(unittest.TestCase):
     def test_a_sendmessage_ask_with_an_id_is_a_handoff_and_a_plain_send_is_not(self):
         self._pre("SendMessage", {"to": "sutando-core", "message": "status?"})
         self.assertEqual(ho.open_handoffs(self.ws, PARENT), [])
-        self._pre("SendMessage", {"to": "Engine 2", "message": "please review\n\nInteraction-Id: ix_0123456789ab"})
+        self._pre("SendMessage", {"to": "worker-a", "message": "please review\n\nInteraction-Id: ix_0123456789ab"})
         h = ho.open_handoffs(self.ws, PARENT)
         self.assertEqual([(x["path"], x["child_ref"], x["delegate_label"], x["holds"]) for x in h],
-                         [("message", "ix_0123456789ab", "Engine 2", "no")])
+                         [("message", "ix_0123456789ab", "worker-a", "no")])
 
     def test_an_unbound_call_records_nothing_and_a_broken_module_breaks_nothing(self):
         with patch.object(self.hook, "bound_task", return_value=(None, None)):
