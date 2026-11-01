@@ -299,6 +299,38 @@ def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subpr
     run(cmd, capture_output=True)
 
 
+_IX = re.compile(r"Interaction-Id: (ix_[0-9a-f]{12})")
+DELEGATING = ("Agent", "Workflow", "SendMessage")
+
+
+def handoff_pre(ws: Path, task_id: str, tool: str, inp, tool_use_id) -> None:
+    """Record work given away from a bound task: a subagent call, or a SendMessage ask with an id."""
+    try:
+        import handoffs
+        inp = inp if isinstance(inp, dict) else {}
+        if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str):
+            label = handoffs.safe_label(inp.get("subagent_type") or tool.lower(), "a subagent")
+            handoffs.open_handoff(ws, task_id, "agent", tool_use_id, label, holds=not inp.get("run_in_background"))
+        elif tool == "SendMessage":
+            m = _IX.search(str(inp.get("message") or ""))
+            if m:
+                handoffs.open_handoff(ws, task_id, "message", m.group(1), handoffs.safe_label(inp.get("to"), "an agent"),
+                                      holds=False)
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a tool call
+        pass
+
+
+def handoff_post(ws: Path, tool, inp, tool_use_id) -> None:
+    """A foreground subagent's call returning is its work coming back."""
+    try:
+        if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str) \
+                and not (isinstance(inp, dict) and inp.get("run_in_background")):
+            import handoffs
+            handoffs.close_by_child(ws, "agent", tool_use_id, "done")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
     sid = payload.get("session_id")
@@ -336,6 +368,10 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             return out
         if result_file_refs(blob):
             return out  # the result write itself is not "working"; PostToolUse decides whether it closed the task
+        if tool in DELEGATING:
+            owner, _room = bound_task(p, sid)
+            if owner:
+                handoff_pre(p["ws"], owner["id"], tool, inp, payload.get("tool_use_id"))
         line = working_line(tool, inp) if isinstance(tool, str) else None
         if line:
             task, room = bound_task(p, sid)
@@ -344,6 +380,7 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
                 out.append(("working", line))
     elif event == "PostToolUse":
         inp = payload.get("tool_input")
+        handoff_post(p["ws"], payload.get("tool_name"), inp, payload.get("tool_use_id"))
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
         binds = load_json(p["bind"], {})
         opened = open_tasks(p["log"])
