@@ -9,7 +9,9 @@ nothing here reaches the network. In process, so coverage sees it.
 
 Run: python3 tests/skills/agent-activity-phase-line.test.py   (stdlib only)
 """
+import contextlib
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -314,6 +316,95 @@ class Enrich(unittest.TestCase):
         with patch.object(pl.subprocess, "run", return_value=fake), \
              patch.object(urllib.request, "urlopen", side_effect=urllib.error.URLError("down")):
             self.assertEqual(pl.gemini("p", "m", "s", "u"), {})
+
+
+class Edges(unittest.TestCase):
+    """The defensive branches: each degrades to the rules record, never raises."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+
+    def test_unreadable_settings_and_stamps_read_as_off(self):
+        with patch.dict(sys.modules, {"skill_config": None}):
+            self.assertEqual(pl.setting("PHASE_MODEL", "off"), "off")
+        with patch.object(pl, "_try_locked", side_effect=OSError("x")):
+            self.assertFalse(pl._debounced(self.ws, "task-a"))
+
+    def test_without_the_shared_filters_the_allowlist_still_decides(self):
+        import importlib
+        with patch.dict(sys.modules, {"chat_secret_filter": None}):
+            mod = importlib.reload(pl)
+            out = mod.Redactor([])("mail bob@example.com about PR #3")
+        importlib.reload(pl)
+        self.assertEqual(out, "mail <email> about PR1")
+        self.assertTrue(pl.allowed(out))
+
+    def test_gemini_parses_an_answer_and_refuses_an_empty_token(self):
+        import urllib.request
+        empty = type("R", (), {"stdout": ""})()
+        with patch.object(pl.subprocess, "run", return_value=empty):
+            self.assertEqual(pl.gemini("p", "m", "s", "u"), {})
+        tok = type("R", (), {"stdout": "tok"})()
+        body = json.dumps({"candidates": [{"content": {"parts": [{"text": '{"phase": "Waiting", "line": "x"}'}]}}]})
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return body.encode()
+        with patch.object(pl.subprocess, "run", return_value=tok), patch.object(urllib.request, "urlopen", return_value=Resp()):
+            self.assertEqual(pl.gemini("p", "m", "s", "u"), {"phase": "Waiting", "line": "x"})
+
+    def test_a_task_mid_file_sends_only_its_task_line(self):
+        d = Path(self.ws) / "tasks"
+        d.mkdir(parents=True)
+        (d / "task-m.txt").write_text("id: task-m\naccess_tier: owner\ntask: Merge #5 with evidence.\n"
+                                      "room_name: Dev\nuser_id: @alice:s.space\n")
+        goal, _people = pl._task_context(self.ws, "task-m")
+        self.assertEqual(goal, "Merge #5 with evidence.")
+        self.assertEqual(pl._task_context(self.ws, "task-none"), (None, []))
+        with patch("local_task_protocol.find_archived_task", side_effect=RuntimeError("x")):
+            self.assertEqual(pl._task_context(self.ws, "task-m"), (None, []))
+
+    def test_steps_tolerate_a_missing_log_and_bad_lines(self):
+        self.assertEqual(pl._steps(self.ws, "task-a"), [])
+        p = Path(self.ws) / "state" / "agent-activity.jsonl"
+        p.parent.mkdir(parents=True)
+        p.write_text("not json\n" + json.dumps({"kind": "working", "line": "Fetch", "task": {"id": "task-a"}}) + "\n")
+        self.assertEqual(pl._steps(self.ws, "task-a"), ["[working] Fetch"])
+
+    def test_enrich_stops_when_its_answer_is_current_or_the_record_is_gone(self):
+        _task(self.ws, "task-a")
+        _rows(self.ws, "task-a", ["Fetch origin"])
+        _rules(self.ws, "task-a")
+        calls = []
+
+        def call(*a):
+            calls.append(1)
+            _rules(self.ws, "task-a")          # a newer step lands during every call
+            return {"phase": "Waiting", "line": "Fetching"}
+        with patch.dict(os.environ, ON):
+            rec = pl.enrich(self.ws, "task-a", call=call)
+        self.assertEqual(len(calls), 1 + pl.RERUNS, "bounded re-runs")
+        self.assertIsNotNone(rec)
+        with patch.dict(os.environ, ON), patch.object(pl, "latest", side_effect=[{"seq": "s", "phase": "Waiting"}, None]), \
+                patch.object(pl, "prompt_for", return_value=None):
+            self.assertIsNone(pl.enrich(self.ws, "task-a", call=call))
+
+    def test_the_cli_prints_latest_and_runs_enrich(self):
+        _rules(self.ws, "task-a", "Waiting")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pl.main(["latest", "--task", "task-a", "--workspace", self.ws]), 0)
+        self.assertEqual(json.loads(out.getvalue())["phase"], "Waiting")
+        with patch.dict(os.environ, OFF):
+            self.assertEqual(pl.main(["enrich", "--task", "task-a", "--workspace", self.ws]), 0)
+        with patch("workspace_default.resolve_workspace", return_value=Path(self.ws)), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pl.main(["latest", "--task", "task-a"]), 0)
 
 
 class Hook(unittest.TestCase):

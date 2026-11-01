@@ -464,8 +464,6 @@ def enrich(workspace, task_id: str, call=None) -> "dict | None":
         now = latest(workspace, task_id)
         if now is None:
             return rec
-        if rec is not None and rec.get("for_seq") == now["seq"]:
-            return rec
         built = prompt_for(workspace, task_id)
         if built is None:
             return rec
