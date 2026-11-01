@@ -28,6 +28,8 @@ LIVE_FILE="$WORK/live"
 case "\$3" in
   has-session) name="\$5"; name="\${name#=}"; grep -qx "\$name" "\$LIVE_FILE" 2>/dev/null; exit \$? ;;
   new-session) printf '%s\n' "\$@" >> "$WORK/new-session.log"; exit 0 ;;
+  show-environment) cat "$WORK/supenv" 2>/dev/null; exit 0 ;;
+  kill-session) echo "\$5" >> "$WORK/kill.log"; exit 0 ;;
 esac
 exit 0
 EOF
@@ -98,6 +100,22 @@ kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; sleep 0.5
 bash "$ENSURE" >"$WORK/f2.out" 2>"$WORK/f2.err"; rc=$?
 check "(f) ...and once the holder is gone the same ensure starts one" "$rc" "$(cat "$WORK/f2.err")"
 [ "$(grep -c '^new-session$' "$WORK/new-session.log" 2>/dev/null)" = 1 ] && r=0 || r=1; check "(f) ...exactly one new-session" "$r"
+
+# (g) the Stop interrupt switch reaches the worker's watcher, and a change replaces a running one.
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "sutando-worker-w-abc123" "sutando-worker-w-abc123-watcher" > "$WORK/live"
+echo "-SUTANDO_STOP_INTERRUPT" > "$WORK/supenv"
+SUTANDO_STOP_INTERRUPT=1 bash "$ENSURE" >"$WORK/g.out" 2>"$WORK/g.err"; rc=$?
+check "(g) switch turned on while running -> exit 0" "$rc" "$(cat "$WORK/g.err")"
+grep -qx "=sutando-worker-w-abc123-watcher" "$WORK/kill.log" 2>/dev/null && r=0 || r=1; check "(g) ...the old watcher is replaced" "$r"
+grep -qx "SUTANDO_STOP_INTERRUPT=1" "$WORK/new-session.log" 2>/dev/null && r=0 || r=1; check "(g) ...and the new one carries the switch" "$r"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+echo "SUTANDO_STOP_INTERRUPT=1" > "$WORK/supenv"
+SUTANDO_STOP_INTERRUPT=1 bash "$ENSURE" >"$WORK/g2.out" 2>"$WORK/g2.err"
+grep -q "already running" "$WORK/g2.out" && [ ! -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) the same switch -> left running" "$r"
+bash "$ENSURE" >"$WORK/g3.out" 2>"$WORK/g3.err"
+[ -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) switch unset (rollback) -> replaced" "$r"
+rm -f "$WORK/supenv"
 
 if [ "$fail" = 0 ]; then echo "  ok  one supervisor per worker inbox, idempotent"; else echo "  FAILED"; fi
 exit "$fail"

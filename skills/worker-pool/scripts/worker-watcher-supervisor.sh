@@ -57,7 +57,8 @@ fi
 # standby watcher announces nothing for a worker inbox.
 for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
          SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT \
-         SUTANDO_TASK_EVENT_HANDLER SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL; do
+         SUTANDO_TASK_EVENT_HANDLER SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL \
+         SUTANDO_STOP_INTERRUPT; do
   if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ] \
      && [ "$v" = SUTANDO_TASK_EVENT_HANDLER ]; then continue; fi
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
@@ -69,8 +70,14 @@ if [ "${1:-}" = "--print-command" ]; then
   exit 0
 fi
 if tmux -S "$SOCK" has-session -t "=$SUP_SESSION" 2>/dev/null; then
-  echo "worker-watcher-supervisor: $SUP_SESSION already running"
-  exit 0
+  # The stop handler reads the switch in this watcher's environment: a change replaces it.
+  have="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STOP_INTERRUPT 2>/dev/null | sed -n 's/^SUTANDO_STOP_INTERRUPT=//p')"
+  if [ "$have" = "${SUTANDO_STOP_INTERRUPT:-}" ]; then
+    echo "worker-watcher-supervisor: $SUP_SESSION already running"
+    exit 0
+  fi
+  tmux -S "$SOCK" kill-session -t "=$SUP_SESSION" 2>/dev/null || true
+  echo "worker-watcher-supervisor: $SUP_SESSION restarted: the Stop interrupt switch changed"
 fi
 if ! tmux -S "$SOCK" has-session -t "=$WORKER_SESSION" 2>/dev/null; then
   echo "worker-watcher-supervisor: worker session $WORKER_SESSION is not running; nothing to supervise" >&2
