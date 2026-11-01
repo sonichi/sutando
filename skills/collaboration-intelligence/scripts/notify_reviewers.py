@@ -400,6 +400,9 @@ def codeowner_violations(files, author: str, logins, rules) -> "list[tuple[str, 
     return bad
 
 
+CHECK_FAILED = "code-owner check FAILED"
+
+
 def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
     """(ok, lines) — every PR named in `message` must have, among `targets`, a
     non-author code owner of each owned changed file. No CODEOWNERS = no rule."""
@@ -411,8 +414,7 @@ def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
             facts = pr_facts(repo, num)
             found = fetch_codeowners(repo, facts["base"])
         except CodeownerCheckError as exc:
-            return False, [f"code-owner check FAILED for {repo}#{num}: {exc} — "
-                           "refusing rather than sending unchecked"]
+            return False, [f"{CHECK_FAILED} for {repo}#{num}: {exc}"]
         if found is None:
             continue
         path, text = found
@@ -857,6 +859,13 @@ def main() -> int:
             print(f"code-owner rule overridden: {a.no_codeowner}", file=sys.stderr)
         else:
             owned, lines = codeowner_gate(a.message, targets, load_roster())
+            if not owned and lines and lines[0].startswith(CHECK_FAILED):
+                # Failing closed is right; reading it as a roster problem is not.
+                print("NOT SENT: couldn't check code owners (the lookup failed), so nothing was "
+                      "refused and the roster is not at fault. Retry the ask.", file=sys.stderr)
+                for line in lines:
+                    print(line, file=sys.stderr)
+                return 9
             if not owned:
                 print("REFUSED: code-owner rule — where the base branch has CODEOWNERS, "
                       "an ask must include a non-author code owner.", file=sys.stderr)
