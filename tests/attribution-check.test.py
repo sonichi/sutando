@@ -65,13 +65,17 @@ class Attribution(unittest.TestCase):
         return rc, json.loads(out.getvalue()), out.getvalue()
 
     def test_classifies_each_kind_of_row(self):
-        self._row(T0 + 10, "task-a", "!roomA:s.space")            # correct
-        self._row(T0 + 20, "task-a", "!roomB:s.space")            # wrong room
-        self._row(T0 + 1100, "task-a", "!roomA:s.space")          # task-b in flight: wrong task
-        self._row(T0 + 700, "task-a", "!roomA:s.space")           # late, nothing else running: stale
-        self._row(T0 + 30, None, "!roomA:s.space")                # no task: unlinked
-        self._row(T0 + 40, "task-zzz", "!roomA:s.space")          # unknown task: unlinked
-        self._row(T0 + 1010, "task-b", None, kind="done")         # live result by mtime, no room on row
+        cases = [
+            (T0 + 10, "task-a", "!roomA:s.space", "working", "correct"),
+            (T0 + 20, "task-a", "!roomB:s.space", "working", "wrong_room"),
+            (T0 + 1100, "task-a", "!roomA:s.space", "working", "wrong_task, task-b in flight"),
+            (T0 + 700, "task-a", "!roomA:s.space", "working", "stale, nothing else running"),
+            (T0 + 30, None, "!roomA:s.space", "working", "unlinked"),
+            (T0 + 40, "task-zzz", "!roomA:s.space", "working", "unlinked, unknown task"),
+            (T0 + 1010, "task-b", None, "done", "correct_no_room, live result by mtime"),
+        ]
+        for ts, task, room, kind, _why in cases:
+            self._row(ts, task, room, kind=kind)
         rc, r, _ = self._run()
         self.assertEqual(rc, 0)
         self.assertEqual(r["counts"], {"correct": 1, "wrong_room": 1, "wrong_task": 1, "stale_no_other_task": 1,
