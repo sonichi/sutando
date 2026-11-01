@@ -517,7 +517,8 @@ with `room.question.answer` through `room.action.execute_safe`, then write a `[n
 result. Locally only `can_answer: false` withholds the rule; `target_members` and `expires_at` are
 left to the broker, which refuses an answer it does not permit. The rule, and the offer it records,
 go only to owner tasks: an answer is an irreversible room write, which the guest, team and
-collaborator rulebooks all forbid. Those tasks still get the data line.
+collaborator rulebooks all forbid. Those tasks still get the data line, followed (after their
+rulebook) by a line that it is context only and must not be answered.
 
 An answer cannot be undone, so the attempt ledger's `questions` map, by question id, decides who
 may answer. Each entry is exactly one of three shapes, and any entry that is not refuses every offer:

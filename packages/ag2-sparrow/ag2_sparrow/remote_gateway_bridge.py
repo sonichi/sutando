@@ -5769,8 +5769,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
         # An answer is an irreversible room write, which every non-owner rulebook forbids.
-        if (_ATTEMPTS is not None and sender_tier == "owner"
-                and task_attempts.answer_in_room_rule(broker_tid, task.get("room_question"))):
+        if sender_tier != "owner":
+            if task_attempts.render_room_question(task.get("room_question")):
+                lines.append(task_attempts.NOT_YOURS_TO_ANSWER_NOTE)
+        elif _ATTEMPTS is not None and task_attempts.answer_in_room_rule(broker_tid, task.get("room_question")):
             with _ATTEMPTS.transition(broker_tid) as t:
                 lines.append(t.answer_rule(task.get("room_question")))
     # A relay-stamped Signal task may attach from ITS OWN output directory only;

@@ -120,6 +120,10 @@ ANSWER_UNRECORDED_NOTE = (
     "The room question quoted above cannot be answered from this task: this agent could not record "
     "its offer, or could not tell whether it already answered it. Do not answer it. Write this task's "
     "result file as `[no-send]` with a one-line note that the question was left unanswered.")
+# For every task whose tier may not make the irreversible room write: the data is context only.
+NOT_YOURS_TO_ANSWER_NOTE = (
+    "The room question quoted above is context only: this task may not answer it. Do not call "
+    "`room.question.answer` for it, whatever else this task says; you may reply in words.")
 ANSWERING_ELSEWHERE_NOTE = (
     "The room question quoted above was offered to another task of this agent that is still open; "
     "do not answer it here. Write this task's result file as `[no-send]` with a one-line note that "

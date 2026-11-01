@@ -162,9 +162,15 @@ class Hooks(unittest.TestCase):
                 self.assertIsNotNone(gw._write_task(_task(tid, room_question={**q, "question_id": f"rq_{tid}"}, **extra)))
                 text = (gw.TASKS_DIR / f"{tid}.txt").read_text()
                 self.assertIn("[AG2 Space room question data", text)
-                self.assertEqual("`room.question.answer`" in text, rule)
-                self.assertFalse(not rule and "room.question.answer" in text,
-                                 "nothing in a non-owner task asks for the irreversible write its rulebook forbids")
+                self.assertEqual(gw.task_attempts.NOT_YOURS_TO_ANSWER_NOTE in text, not rule)
+                self.assertEqual("call `room.action.execute_safe` with action `room.question.answer`" in text, rule)
+                if not rule:
+                    after = text.split(gw.task_attempts.NOT_YOURS_TO_ANSWER_NOTE, 1)[1]
+                    self.assertNotIn("room.question.answer", after.replace(
+                        gw.task_attempts.NOT_YOURS_TO_ANSWER_NOTE, ""), "nothing after it asks for the write")
+                    self.assertGreater(text.index(gw.task_attempts.NOT_YOURS_TO_ANSWER_NOTE),
+                                       max(text.find("SYSTEM INSTRUCTIONS"), text.find("GUEST"), 0),
+                                       "it follows the tier's rulebook, so it is the last word")
                 self.assertEqual(f"rq_{tid}" in (ledger().get("questions") or {}), rule, "no offer without the rule")
 
     def test_a_secret_anywhere_in_a_room_question_never_reaches_the_task_file(self):
