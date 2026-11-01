@@ -124,6 +124,8 @@ class Lifecycle(unittest.TestCase):
         self.bridges.wait_for(lambda: not (results / f"{local}.txt").exists(), proc, "generation 1 settled")
         self.relay.queue.append(_task(lease_id="lease-2"))
         self.bridges.wait_for((tasks / f"{local}~~2.txt").exists, proc, "generation 2 queued as its own run")
+        self.assertIn("The earlier attempt's answer was never delivered", (tasks / f"{local}~~2.txt").read_text(),
+                      "the core is told this is not a redelivery it already answered")
         (results / f"{local}~~2.txt").write_text("generation 2's answer")
         self.bridges.wait_for(lambda: self.relay.results, proc, "generation 2's answer")
         self.assertEqual([(r["execution_generation"], r["body"]) for r in self.relay.results],

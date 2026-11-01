@@ -443,7 +443,11 @@ Sutando checkout around it sends neither field.
   first has its own item, `<task>.run-<n>`. A serve under a lease other than the record's is always
   held, whether or not the earlier run's publication was recorded. An ack the broker accepted counts
   as done only once its generation can reach the core: its run is on disk or owed a publish, or a
-  newer serve has replaced it; otherwise the ack is kept and retried.
+  newer serve has replaced it; otherwise the ack is kept and retried. A newer generation's task file
+  carries one writer-owned line saying what became of the earlier attempt, from what the bridge
+  recorded: its answer delivered (a real receipt, not one the broker settled by refusing it), its
+  result undelivered but its own `room.message.send` messages sent, unknown (the journal cannot be
+  read), or not delivered. So the core never takes it for a redelivery it already answered.
   A wake is a new run too, even under the same generation; a replay of the same episode reuses
   its run and publishes nothing.
 - Every change to a task's attempt is one transition under that task's lock, committed to

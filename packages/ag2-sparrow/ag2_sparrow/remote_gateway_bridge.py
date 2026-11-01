@@ -4224,6 +4224,10 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
         earlier = t.rec.get("run")
         if not _stop_run(t, earlier, "a newer generation of this task runs as its own run"):
             return "unrecorded"
+        root = _delivery_core().backend.root
+        context = {**context, "earlier_run": earlier, "earlier_delivered": any(
+            _really_delivered(_outbox_record(root, item))
+            for c in t.claims("result") for item in c.get("items") or ())}
         rec = t.switch_run(claim, doc, context, _reenroll_identity() or None, open_turn=open_turn)
     if not isinstance(rec, dict):
         return "unrecorded"
@@ -5703,6 +5707,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None) -> "tu
     # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
     # closing the Team session route removed the only thing that used to deliver it.
     lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
+    earlier = _earlier_attempt(broker_tid) if run is not None and _ATTEMPTS is not None else None
+    if earlier:
+        lines.append(task_attempts.rerun_rule(earlier))
     if TURN_CONTEXT:
         if woken:
             lines.append(task_attempts.wake_turn_rule(woken))
@@ -8456,14 +8463,14 @@ def _dm_only(parsed) -> bool:
     return any(a.kind == "dm-only" for a in parsed.actions)
 
 
-def _retired(tid: str, broker_tid: str, claim=None):
+def _retired(tid: str, broker_tid: str, claim=None, delivered: "bool | None" = None):
     """Retire the settled attempt (the one `claim` was made for). False keeps the result live (not
     archived, still in flight), so the next drain retries; "kept" when another attempt holds the
     task now: only this result's file is then retired."""
     if _ATTEMPTS is None:
         return True
     with _ATTEMPTS.transition(broker_tid) as t:
-        done = t.finish(claim)
+        done = t.finish(claim, delivered=delivered)
     if done is False:
         _log_backoff((tid, "retire"), f"result {tid}: settled, but its attempt could not be retired yet "
                      "— the result stays live and is retried")
@@ -8708,7 +8715,30 @@ def _committed(tid: str, broker_tid: str, claim, record):
         with _ATTEMPTS.transition(broker_tid) as t:
             t.release_claim(claim)
         return "kept"
-    return _retired(tid, broker_tid, claim)
+    return _retired(tid, broker_tid, claim, delivered=_really_delivered(record))
+
+
+def _really_delivered(record) -> bool:
+    """A delivery the broker took as the answer, not one it settled by refusing it (a late generation,
+    a closed task)."""
+    return (isinstance(record, dict) and record.get("status") == "DELIVERED"
+            and not str(record.get("provider_ref") or "").startswith("settled:"))
+
+
+def _earlier_attempt(wire_tid: str) -> "str | None":
+    """What became of the attempt a newer generation's run replaced, from what this bridge recorded:
+    its answer delivered, its result undelivered but its own room messages sent, or neither; None
+    for a run that replaced nothing."""
+    rec = _ATTEMPTS.entry(wire_tid)
+    earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
+    if not earlier:
+        return None
+    if rec.get("earlier_delivered") or _ATTEMPTS.run_entry(earlier).get("delivered") is True:
+        return "answered"
+    records = task_attempts.agent_turn.read_turn_records(_STATE, "", task_id=wire_tid)
+    if not records.readable:
+        return "unknown"
+    return "posted_in_room" if records.sibling_sends else "not_delivered"
 
 
 def _relay_result(tid: str, broker_id: str) -> "bool | None":

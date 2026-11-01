@@ -78,6 +78,28 @@ WAKE_TURN_RULE = (
     "closed only the earlier turn. Continue from the answer, then write this task's result file "
     "again, starting it with `[no-send]` when there is nothing to post.")
 
+# A newer generation's run is not a redelivery: its file says what became of the earlier attempt.
+RERUN_RULES = {
+    "not_delivered": (
+        "This is a NEW generation of this task, re-issued by the broker; it is NOT a redelivery of a "
+        "message already answered. The earlier attempt's answer was never delivered (the broker "
+        "refused it as late), so nobody has seen it. Do the task again and write a full answer to this "
+        "task's result file; do not end it with `[no-send]` because it was answered before."),
+    "posted_in_room": (
+        "This is a NEW generation of this task, re-issued by the broker; it is NOT a redelivery. The "
+        "earlier attempt's result was never delivered, but the messages it sent with "
+        "`room.message.send` were. Do not repeat those: finish the task, post only what the room has "
+        "not seen yet, and start the result file with `[no-send]` if nothing remains."),
+    "unknown": (
+        "This is a NEW generation of this task, re-issued by the broker; it is NOT a redelivery. The "
+        "earlier attempt's result was never delivered; whether messages it sent to the room went out "
+        "cannot be read. Check the room first, repeat nothing it already shows, and answer the rest."),
+    "answered": (
+        "This is a NEW generation of this task, re-issued by the broker. The earlier attempt's answer "
+        "WAS delivered: do not post it again. Start this task's result file with `[no-send]` unless "
+        "something new is needed."),
+}
+
 FORMAT = 3
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
@@ -338,6 +360,12 @@ class TaskAttempts:
         if rec is UNKNOWN:
             return UNKNOWN
         return _wake_item(wire_tid, rec)
+
+    def run_entry(self, local: str) -> dict:
+        """What the ledger keeps of a run: its task, number, item, and once finished its lease,
+        generation and whether its answer was delivered."""
+        data = self._read()
+        return dict(((data or {}).get("runs") or {}).get(local) or {})
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its
@@ -1008,7 +1036,7 @@ class Transition:
         records = agent_turn.read_turn_records(self.owner.state_dir, rec["turn_id"], since, task_id=self.wire)
         return agent_turn.result_file_decision(records, body, no_send=no_send)
 
-    def finish(self, c: "Claim | None" = None) -> bool:
+    def finish(self, c: "Claim | None" = None, delivered: "bool | None" = None) -> bool:
         """The result claimed by `c` is settled: close the attempt's turn and forget the attempt. A
         record the claim no longer owns is kept, with only the claim's turn closed and the claim
         released; so is one holding another open claim. A wake's episode is saved in the same write.
@@ -1036,6 +1064,8 @@ class Transition:
             if isinstance(run, dict):
                 # What a later serve is judged against once the record is gone.
                 run.update(lease=r.get("lease_id"), gen=r.get("execution_generation"))
+                if delivered is not None:
+                    run["delivered"] = delivered
             episode = (r or {}).get("wake_episode")
             if episode:
                 wakes = data.setdefault("wakes", {})
@@ -1200,6 +1230,10 @@ def render_wake(text: str, wake: dict) -> str:
 
 def wake_turn_rule(episode: str) -> str:
     return WAKE_TURN_RULE.format(episode=episode)
+
+
+def rerun_rule(verdict: str) -> str:
+    return RERUN_RULES[verdict]
 
 
 def ask_in_room_rule(task_id: str) -> str:

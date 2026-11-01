@@ -2754,6 +2754,8 @@ class Hooks(unittest.TestCase):
                 self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "only the delivered result is retired")
                 self.assertFalse(agent_turn.is_closed(gw._STATE, rec["turn_id"]), "generation 2's turn is open")
                 self.answered_by_its_own_run(fake, tid, inflight)
+                self.assertIn(gw.task_attempts.RERUN_RULES["answered"], gw._archived_task_file(f"{tid}~~2").read_text(),
+                              "generation 1's answer went out before the switch: generation 2 is told so")
 
     def answered_by_its_own_run(self, fake, tid, inflight):
         """Generation 2's run is published and its own answer posts under generation 2, on its own item."""
@@ -3397,6 +3399,47 @@ class Hooks(unittest.TestCase):
         self.answered_by_its_own_run(fake, tid, inflight)
         self.assertEqual(len(mine()), before + 1, "generation 2 makes its own POST")
 
+    def newer_run_file(self, tid, fake, inflight):
+        """L2 served and acked as generation 2; its run published. The text of its task file."""
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        gw._post_task_beats(inflight, force=True)
+        return (gw.TASKS_DIR / f"{tid}~~2.txt").read_text()
+
+    def test_a_newer_generations_task_says_what_became_of_the_earlier_answer(self):
+        rules = gw.task_attempts.RERUN_RULES
+        cases = {"refused": "not_delivered", "delivered": "answered", "sent in the room": "posted_in_room",
+                 "journal unreadable": "unknown"}
+        for case, verdict in cases.items():
+            with self.subTest(case=case):
+                tid = f"task-rerun-{case.split()[0]}"
+                fake = self.served_acked(tid)
+                first = (gw.TASKS_DIR / f"{tid}.txt").read_text()
+                self.assertFalse(any(r in first for r in rules.values()), "a first run carries none")
+                if case == "sent in the room":
+                    with open(gw._STATE / "room-actions.jsonl", "a") as fh:
+                        fh.write(json.dumps({"v": 2, "record_type": "dispatch_intent", "ts": 4e9, "seq": 1,
+                                             "turn_id": f"{tid}_g1_01X", "task_id": tid, "execution_generation": 1,
+                                             "operation_id": "op1", "action": "room.message.send"}) + "\n")
+                if case != "delivered":
+                    fake.answers["/v1/results"] = _http(409, {"error_code": "stale_execution_generation"})
+                self.core_writes(tid, "generation 1's answer")
+                old = time.time() - 5
+                os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+                inflight = {tid}
+                gw._post_ready_results(inflight)
+                self.assertIsNone(gw._ATTEMPTS.entry(tid), "generation 1 settled")
+                fake.answers["/v1/results"] = {"ok": True}
+                broken = (mock.patch.object(gw.task_attempts.agent_turn, "read_turn_records",
+                                            return_value=gw.task_attempts.agent_turn.TurnRecords([], [], False))
+                          if case == "journal unreadable" else contextlib.nullcontext())
+                with broken:
+                    text = self.newer_run_file(tid, fake, inflight)
+                self.assertIn(rules[verdict], text)
+                self.assertEqual([r for r in rules.values() if r in text], [rules[verdict]], "exactly one")
+                (gw._STATE / "room-actions.jsonl").unlink(missing_ok=True)
+
     def test_the_same_lease_served_again_after_its_run_finished_is_still_a_redelivery(self):
         tid = "task-stale-then-l1"
         fake, _ = self.stale_refused_then_served_again(tid)
@@ -3704,7 +3747,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual(seen.get("Idempotency-key"), "ack-0123")
 
     # ── enforcement: one writer, provider calls with no transition held ──
-    READERS = {"transition", "entry", "records", "owing", "holds", "beating", "wake_item", "run_item", "run_of",
+    READERS = {"transition", "entry", "records", "owing", "holds", "beating", "wake_item", "run_item", "run_entry", "run_of",
                "ack_fields", "worker_id", "broker_names_leases", "report_superseded", "sweep",
                "close_finished_turns", "beat_snapshot", "now", "take_ownership", "task_beat_disabled", "unowned"}
 
