@@ -2518,7 +2518,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "picker_command", "picker_args",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.
-                "source", "channel_id", "source_room_id", "task_id", "execution_generation",
+                "source", "channel_id", "task_id", "execution_generation",
                 # Declares the task-mid shape (one-line body, writer-owned trailer) so a
                 # verified reader may trust the lines below task:. Above it: a body cannot claim it.
                 "task_layout",
@@ -2532,7 +2532,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "addressed_to",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
-                "thread_root",
+                "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total, and the
                 # broker's own dm|room verdict so a skill need not count members.
@@ -2955,7 +2955,7 @@ def _read_by(resp, deadline: float) -> bytes:
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
-         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False):
+         deadline: "float | None" = None, operation_id: "str | None" = None):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
     `deadline` (time.monotonic()), the whole request must finish by then. `operation_id` is a
     claimed effect's idempotency key, the same on every retry of it."""
@@ -2966,8 +2966,7 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
             raise TimeoutError("request deadline already passed")
     with _gateway_call():
         data = json.dumps(payload).encode() if payload is not None else None
-        base = urllib.parse.urlunsplit((*urllib.parse.urlsplit(URL)[:2], "", "", "")) if origin else URL
-        req = urllib.request.Request(f"{base}{path}", data=data, method=method)
+        req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Accept", "application/json")
         # CloudFlare bot-fight (error 1010) rejects python-urllib's default
@@ -4107,14 +4106,42 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
 
 
 def _send_task_step(payload: dict):
-    return _req("POST", "/api/capabilities/v1/actions/execute", payload,
-                timeout=10, operation_id=payload["operation_id"], origin=True)
+    # A working transition can resume a suspended task; no transport until summary-only exists.
+    raise RuntimeError("summary-only Action contract pending")
 
 
 _STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)
 
 
+TASK_STEP_PUBLICATION_ENABLED = None
+_STEP_PUSH_THREAD = None
+_STEP_PUSH_LOCK = threading.Lock()
+
+
 def _publish_task_steps(inflight: set[str]) -> None:
+    global _STEP_PUSH_THREAD
+    try:
+        enabled = callable(TASK_STEP_PUBLICATION_ENABLED) and TASK_STEP_PUBLICATION_ENABLED() is True
+    except Exception:
+        enabled = False
+    if not enabled or not inflight or not _publication_permitted():
+        return
+    with _STEP_PUSH_LOCK:
+        if _STEP_PUSH_THREAD is not None and _STEP_PUSH_THREAD.is_alive():
+            return
+        _STEP_PUSH_THREAD = threading.Thread(target=_publish_task_steps_now, args=(set(inflight),),
+                                             name="task-step-publisher", daemon=True)
+        _STEP_PUSH_THREAD.start()
+
+
+def _publish_task_steps_now(inflight: set[str]) -> None:
+    try:
+        _publish_task_steps_snapshot(inflight)
+    except Exception as exc:
+        _log(f"task step publisher failed ({type(exc).__name__}); continuing")
+
+
+def _publish_task_steps_snapshot(inflight: set[str]) -> None:
     tasks = {}
     for tid in inflight:
         if not gateway_instance.owns(tid, GATEWAY_INSTANCE):

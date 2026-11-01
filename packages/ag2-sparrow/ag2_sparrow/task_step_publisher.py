@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+from .chat_secret_filter import filter_chat_secrets
+
 SUMMARY_MAX = 140
 INTERVAL = 10.0
 TAIL_BYTES = 256 * 1024
@@ -22,6 +24,8 @@ class StepPublisher:
         """Tasks are live envelopes selected by this connection, keyed by their local run id."""
         self.sent = {k: v for k, v in self.sent.items() if k in tasks}
         self.attempted = {k: v for k, v in self.attempted.items() if k in tasks}
+        if not tasks:
+            return
         try:
             with self.path.open("rb") as stream:
                 stream.seek(0, 2)
@@ -52,7 +56,7 @@ class StepPublisher:
                 continue
             if row["room"] != tasks[tid].get("room_id"):
                 continue
-            latest[tid] = (" ".join(text.split())[:SUMMARY_MAX], row.get("ts"))
+            latest[tid] = (" ".join(filter_chat_secrets(text).text.split())[:SUMMARY_MAX], row.get("ts"))
         for tid, (summary, stamp) in latest.items():
             task = tasks[tid]
             gen, wire, room = (task.get(k) for k in ("execution_generation", "task_id", "room_id"))
@@ -65,7 +69,7 @@ class StepPublisher:
             key = hashlib.sha256(json.dumps([wire, gen, summary, stamp], ensure_ascii=False).encode()).hexdigest()
             payload = {"action": "room.task.update", "target_kind": "room", "room_id": room,
                        "task_id": wire, "execution_generation": gen, "operation_id": "step-" + key,
-                       "arguments": {"status": "working", "summary": summary}}
+                       "arguments": {"summary": summary}}
             self.attempted[tid] = now
             try:
                 response = self.send(payload)

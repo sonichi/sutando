@@ -2,6 +2,7 @@
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -85,7 +86,7 @@ class Publisher(unittest.TestCase):
         self.assertEqual(len(self.calls[0]["arguments"]["summary"]), 140)
         self.assertTrue(self.logs)
 
-    def test_bridge_envelope_scope_and_real_action_socket(self):
+    def test_bridge_scope_and_held_transport(self):
         relay = Relay(); self.addCleanup(relay.close)
         relay.token = "fixture-token"
         relay.on_post = lambda path, body: (200, {"status": "completed"})
@@ -99,19 +100,62 @@ class Publisher(unittest.TestCase):
         self.pub.send = gw._send_task_step
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", GATEWAY_INSTANCE="dev",
                             TASKS_DIR=tasks_dir, RESULTS_DIR=results, _ATTEMPTS=None, _STEP_PUBLISHER=self.pub):
-            gw._publish_task_steps({"task-dev~task-a", "task-prod~task-a"})
-            self.assertEqual(len(relay.post_paths), 1)
-            path, body = relay.post_paths[0]
-            self.assertEqual(path, "/api/capabilities/v1/actions/execute")
-            self.assertEqual(body["arguments"], {"status": "working", "summary": "Step one"})
+            gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
+            self.assertEqual(relay.post_paths, [])
+            self.assertIn("Action failed", self.logs[0])
+            self.pub.send = self.send
+            self.clock += 10
+            gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(self.calls[0]["arguments"], {"summary": "Step one"})
             (results / "task-dev~task-a.txt").write_text("done")
             self.clock += 10; self.row("Later")
-            gw._publish_task_steps({"task-dev~task-a"})
-            self.assertEqual(len(relay.post_paths), 1)
+            gw._publish_task_steps_snapshot({"task-dev~task-a"})
+            self.assertEqual(len(self.calls), 1)
+
+
+    def test_secret_redaction_precedes_length_cap(self):
+        secret = "sk-ant-" + "a" * 60
+        self.row("Inspect " + secret + " " + "z" * 180)
+        self.pub.publish(self.tasks)
+        summary = self.calls[0]["arguments"]["summary"]
+        self.assertNotIn(secret, summary)
+        self.assertNotIn("sk-ant-", summary)
+        self.assertEqual(len(summary), 140)
+
+    def test_empty_tasks_do_not_read_activity(self):
+        with patch.object(Path, "open", side_effect=AssertionError("must not read")):
+            self.pub.publish({})
+
+    def test_default_off_and_enabled_worker_never_blocks_poll(self):
+        entered, release = threading.Event(), threading.Event()
+        def slow(_):
+            entered.set()
+            release.wait(5)
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=None, _STEP_PUSH_THREAD=None), \
+                patch.object(gw, "_publish_task_steps_now", side_effect=slow):
+            gw._publish_task_steps(set(self.tasks))
+            self.assertIsNone(gw._STEP_PUSH_THREAD)
+            with patch.object(gw, "TASK_STEP_PUBLICATION_ENABLED", lambda: True):
+                try:
+                    gw._publish_task_steps(set(self.tasks))
+                    self.assertTrue(entered.wait(1))
+                    worker = gw._STEP_PUSH_THREAD
+                    gw._publish_task_steps(set(self.tasks))
+                    self.assertIs(gw._STEP_PUSH_THREAD, worker)
+                    self.assertTrue(worker.is_alive())
+                finally:
+                    release.set()
+                    gw._STEP_PUSH_THREAD.join(2)
+
+    def test_switch_declared_off_in_manifest(self):
+        repo = Path(__file__).resolve().parents[1]
+        manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())
+        self.assertIs(manifest["config"]["LEDGER_STEP_PUBLISH_ENABLED"], False)
 
 
 class BridgeLoop(unittest.TestCase):
-    def test_served_generation_is_stamped_and_a_working_row_reaches_action(self):
+    def test_served_generation_is_stamped_but_publisher_defaults_off(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         relay = Relay()
@@ -133,9 +177,9 @@ class BridgeLoop(unittest.TestCase):
         with (bridges.ws / "state" / "agent-activity.jsonl").open("a") as stream:
             stream.write(json.dumps({"ts": 1, "kind": "working", "room": "!r:test",
                                      "task": {"id": "task-step1"}, "line": "Checking the fix"}) + "\n")
-        bridges.wait_for(lambda: actions, proc, "ledger step Action")
-        self.assertEqual(actions[0]["execution_generation"], 4)
-        self.assertEqual(actions[0]["arguments"]["summary"], "Checking the fix")
+        polls = len(relay.polls)
+        bridges.wait_for(lambda: len(relay.polls) > polls + 1, proc, "further intake polls")
+        self.assertEqual(actions, [])
 
 
 if __name__ == "__main__":

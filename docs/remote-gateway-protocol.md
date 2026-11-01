@@ -982,26 +982,32 @@ Clients must distinguish a roomless wedge from other roomless kinds; missing
 `room` alone does not mean global. This is a writer contract, not a change to
 client rendering. No historical rows are rewritten.
 
-### Owner task step summaries
+### Owner task step summaries (held, disabled)
 
-The bridge publishes `working` and `thinking` rows from `state/agent-activity.jsonl`
-through `POST /api/capabilities/v1/actions/execute` on the gateway's origin, using
-that connection's agent bearer. The `room.task.update` Action carries top-level
-`task_id`, `execution_generation` and `operation_id`, with arguments
-`status: working` and `summary` (one line, at most 140 characters). This updates
-the owner-only ledger summary and `last_reported_at`; it does not send a room
-message. Other room members see only the backend's active-task count.
+`skills/agent-activity/manifest.json` declares `LEDGER_STEP_PUBLISH_ENABLED: false`.
+The Sutando adapter reads this through `skill_config.enabled` (environment override
+then manifest). Standalone Sparrow has no enablement callback and defaults off.
+When off, the bridge does not read the activity tail or start a publisher worker.
+When enabled, an optional daemon thread coalesces steps without blocking intake;
+a still-running worker is not duplicated. Empty task sets never read the log.
 
-Only in-flight tasks belonging to this bridge's connection qualify. The bridge
-preserves the served task's broker ID and generation above the body in its local
-envelope. Missing generation/room, another connection's task, a locally finished
-or fenced attempt, a ready result, and terminal activity are skipped. Health,
-notice, processing and projected rows are never published. Existing envelopes
-without generation remain unchanged and are skipped.
+The sender remains explicitly blocked pending a backend summary-only contract,
+even with the switch enabled. `room.task.update` with `status: working` is unsafe
+for this purpose: it can clear external blockers and resume `waiting_input`, or
+claim `queued`/`input_ready`. It must not be used merely to report a thinking line.
+A summary-only backend write and a live owner-ledger witness are required before
+this feature can be released. No live bridge should be restarted for this draft.
 
-The latest eligible summary is coalesced per task and sent only when it changes,
-at most once per ten seconds (including failed attempts). An Action failure logs
-its exception type and leaves task processing running; the next eligible pass
-may retry with the same operation ID for the same row. Deduplication and timing
-are process-local; restarting may replay the latest row with its same operation
-ID. No new configuration or lifecycle-v2 opt-in is needed for served generations.
+The prepared publisher selects working/thinking rows for the connection's own
+in-flight task envelopes. Missing generation/room, a different connection or
+room, ready results, terminal rows and finished/fenced/stale attempts are skipped.
+The bridge preserves served task ID and execution generation above the body;
+legacy envelopes lacking generation are unchanged and skipped. Health, notice,
+processing and projected rows are excluded. `filter_chat_secrets` redacts each
+summary before normalization and the 140-character cap.
+
+Eligible changes coalesce to the latest summary, with at most one attempt per
+ten seconds per task including failures. Failure logs contain exception types,
+not summaries or credential values. The prepared idempotency key is stable for
+retries of a row. Timing and deduplication remain process-local. Intended owner
+ledger visibility is private step text; other room members receive only counts.
