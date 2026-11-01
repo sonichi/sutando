@@ -986,3 +986,18 @@ pickup triggers a new archive lookup; cache writes prune unbound task IDs. Norma
 result publication and archival invalidate the stamps. Direct edits inside an
 existing nested archive directory without a live-result transition are not a
 cache invalidation signal.
+
+### Local activity row room scope
+
+The agent-activity CLI assigns a room only from explicit `--room` or the
+task file's `channel_id` (explicit wins). Without either, the JSON row omits
+`room`; it never reads the owner's last activity to infer a destination.
+This keeps background health-check and cron activity from acquiring the
+owner's latest DM or room. Task rows retain their own room.
+
+A roomless ordinary activity row belongs in the dock, not every room's drawer.
+Only `kind: wedge` represents a global blocker: it always omits `room`, even
+when a task file supplies one, and the CLI rejects an explicit `--room`.
+Clients must distinguish a roomless wedge from other roomless kinds; missing
+`room` alone does not mean global. This is a writer contract, not a change to
+client rendering. No historical rows are rewritten.
