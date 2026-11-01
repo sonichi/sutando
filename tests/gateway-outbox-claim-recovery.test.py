@@ -153,7 +153,10 @@ class OutboxClaimRecovery(unittest.TestCase):
         self.assertNotIn("DELIVERED", outbox._read_item(root, "task-dead-queued").get("status", ""))
 
     def test_one_lane_failing_does_not_stop_the_others_and_is_reported(self):
-        root = self.crash("task-dead-terminal")
+        # The failing lane sits between two that must still be swept: one before it, one after.
+        self.assertEqual(gw._OUTBOX_LANES.index("withheld") + 1, gw._OUTBOX_LANES.index("proactive"))
+        before = self.crash("task-dead-terminal")
+        after = self.crash("task-proactive", lane="proactive")
         real = gw._delivery_core
 
         def flaky(lane="result"):
@@ -162,7 +165,8 @@ class OutboxClaimRecovery(unittest.TestCase):
             return real(lane)
         gw._delivery_core = flaky
         self.sweep()
-        self.assertFalse(self.held(root, "task-dead-terminal"))
+        self.assertFalse(self.held(before, "task-dead-terminal"), "the lane before the failure")
+        self.assertFalse(self.held(after, "task-proactive"), "the lane after the failure is still swept")
         self.assertTrue(any("withheld" in m and "claim recovery failed" in m for m in self.logs),
                         self.logs)
 
