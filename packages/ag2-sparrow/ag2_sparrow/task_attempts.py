@@ -104,6 +104,8 @@ FORMAT = 3
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
+# A run the ledger no longer keeps (its entry pruned with age): what became of it is not known.
+PRUNED = "<pruned>"
 # Work a record owes until it is done; each is stamped with the generation it belongs to.
 DEBTS = ("owed_ctl", "owed_close", "dispatch_lost", "owed_publish")
 # What one attempt is: a record that differs in any of these has moved on to another attempt.
@@ -363,17 +365,21 @@ class TaskAttempts:
 
     def owed_view(self, wire_tid: str):
         """From one read of the ledger: the record, and what it keeps of the run the record's run
-        replaced (its lease, generation and whether its answer was delivered), or None when it
-        replaced none; UNKNOWN when either cannot be read."""
+        replaced (its lease, generation and whether its answer was delivered), None when it replaced
+        none, PRUNED when its entry is no longer kept; UNKNOWN when either cannot be read."""
         data = self._read()
         rec = _freeze_entry(_entry_of(data, wire_tid))
         if rec is UNKNOWN:
             return UNKNOWN
         earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
-        runs = data.get("runs") or {}
-        if earlier and not isinstance(runs, dict):
+        if not earlier:
+            return rec, None
+        runs = data.get("runs", {})
+        if not isinstance(runs, dict):
             return UNKNOWN
-        return rec, (dict(runs.get(earlier) or {}) if earlier else None)
+        if earlier not in runs:
+            return rec, PRUNED
+        return (rec, dict(runs[earlier])) if isinstance(runs[earlier], dict) else UNKNOWN
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its

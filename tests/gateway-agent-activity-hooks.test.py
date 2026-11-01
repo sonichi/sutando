@@ -3483,6 +3483,44 @@ class Hooks(unittest.TestCase):
                     self.assertIsNone(gw._ATTEMPTS.get(tid).get("owed_publish"))
                     self.assertFalse(reserve.exists())
 
+    def test_an_earlier_run_aged_out_of_the_ledger_is_unknown_never_known_non_delivery(self):
+        rules = gw.task_attempts.RERUN_RULES
+        for case, verdict in (("pruned", "unknown"), ("delivered", "answered"), ("refused", "not_delivered"),
+                              ("malformed", "answered")):
+            with self.subTest(case=case):
+                tid = f"task-aged-{case}"
+                fake = self.served_acked(tid)
+                if case == "refused":
+                    fake.answers["/v1/results"] = _http(409, {"error_code": "stale_execution_generation"})
+                self.core_writes(tid, "generation 1's answer")
+                old = time.time() - 5
+                os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+                inflight = {tid}
+                gw._post_ready_results(inflight)
+                fake.answers["/v1/results"] = {"ok": True}
+                if case == "pruned":           # ordinary retention: later runs push its entry out
+                    with mock.patch.object(gw.task_attempts, "RUNS_KEPT", 2):
+                        for i in range(3):
+                            with txn(f"task-later-{case}-{i}") as t:
+                                self.assertIsNotNone(t.new_run(f"task-later-{case}-{i}", current=False))
+                    self.assertNotIn(tid, ledger().get("runs") or {}, "its entry aged out")
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+                fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                run = f"{tid}~~2"
+                if case == "malformed":
+                    with txn(tid) as t:
+                        kept = dict(ledger()["runs"][tid])
+                        t._change(lambda d, r: (d["runs"].__setitem__(tid, "junk"), r)[1], "damage")
+                    gw._post_task_beats(inflight, force=True)
+                    self.assertFalse((gw.TASKS_DIR / f"{run}.txt").exists(), "a malformed entry is never empty")
+                    self.assertEqual(gw._ATTEMPTS.get(tid)["owed_publish"], run, "the debt is kept")
+                    with txn(tid) as t:
+                        t._change(lambda d, r: (d["runs"].__setitem__(tid, kept), r)[1], "repair")
+                gw._post_task_beats(inflight, force=True)
+                text = (gw.TASKS_DIR / f"{run}.txt").read_text()
+                self.assertEqual([r for r in rules.values() if r in text], [rules[verdict]])
+
     def test_the_same_lease_served_again_after_its_run_finished_is_still_a_redelivery(self):
         tid = "task-stale-then-l1"
         fake, _ = self.stale_refused_then_served_again(tid)
