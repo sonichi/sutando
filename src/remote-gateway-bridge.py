@@ -447,6 +447,16 @@ PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed
+
+
+def _ag2space_lane_server() -> str:
+    """The homeserver this lane's connection row names: a secondary lane's relay answer on another
+    server is refused."""
+    from connections import lane_server
+    return lane_server(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+LANE_SERVER = _ag2space_lane_server
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 

@@ -2060,6 +2060,9 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
+# relay answer on another server is refused. None (standalone default) checks nothing.
+LANE_SERVER: Callable[[], str] | None = None
 # Host-injected () -> reason or None, asked once right after the poller lease is taken: a reason
 # stands this bridge down (exit 75) before it polls. None (standalone default) never stands down.
 STAND_DOWN_GATE: Callable[[], "str | None"] | None = None
@@ -2406,20 +2409,47 @@ def _reenroll_identity() -> str:
     per-host identity enrolment wrote to state/auth/ag2space.json; a launcher's
     pin (agent_identity.PINNED_KEY) leaves only its AGENT_MXID. Re-read per
     call, so an identity that appears mid-episode takes effect without a restart."""
+    if not GATEWAY_INSTANCE:
+        return agent_identity.resolve(_STATE, _config_from_channel_env)
     return agent_identity.resolve(_STATE, _config_from_channel_env, instance=GATEWAY_INSTANCE,
-                                  whoami=_lane_whoami if GATEWAY_INSTANCE else None)
+                                  whoami=_lane_whoami, credential=_lane_credential(), server=_lane_server())
+
+
+LANE_WHOAMI_RETRY_S = 60.0
+_LANE_WHOAMI = {"until": 0.0}
+
+
+def _lane_credential() -> str:
+    """A digest naming this lane's credential (gateway and token), never the token: the lane record
+    holds only for the credential it was made with."""
+    return hashlib.sha256(f"lane-agent\0{URL}\0{TOKEN}".encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def _lane_server() -> str:
+    if LANE_SERVER is None:
+        return ""
+    try:
+        return str(LANE_SERVER() or "")
+    except Exception:  # noqa: BLE001 - an unanswerable host checks nothing
+        return ""
 
 
 def _lane_whoami() -> str:
     """This lane's agent id as its own relay knows its credential (GET /v1/whoami, side-effect free);
-    '' when the relay cannot say. A secondary lane is never the host's primary agent."""
+    '' when the relay cannot say, and then not asked again for LANE_WHOAMI_RETRY_S: identity is read
+    on hot paths. A secondary lane is never the host's primary agent."""
+    if time.monotonic() < _LANE_WHOAMI["until"]:
+        return ""
     try:
         out = _req("GET", "/v1/whoami", timeout=5)
     except Exception as e:  # noqa: BLE001 - unknown, and said so by the caller
         _log_backoff(("lane-whoami", type(e).__name__), f"lane {GATEWAY_INSTANCE}: whoami failed ({diagnostics.describe(e)})")
-        return ""
+        out = None
     v = out.get("agent_mxid") if isinstance(out, dict) else None
-    return v.strip() if isinstance(v, str) else ""
+    v = v.strip() if isinstance(v, str) else ""
+    if not v:
+        _LANE_WHOAMI["until"] = time.monotonic() + LANE_WHOAMI_RETRY_S
+    return v
 
 
 def _reenroll_claim() -> None:

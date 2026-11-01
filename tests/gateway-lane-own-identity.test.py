@@ -11,7 +11,10 @@ lane's and skipped it without a log line; ten owner messages sat for eight hours
   c) drain, secondary lane with no env identity: its own server's room is delivered
   d) drain, secondary lane whose identity is unknown: held, and the log says so (backed off)
   e) drain, a room on another server: left, and the log says so once per backoff step
-  f) health check: a proactive file unclaimed for 10 minutes fails the probe; a fresh one does not
+  f) health check: an undestined proactive file unclaimed for 10 minutes warns; a fresh one, a
+     destined one (the stranded-destined probe's) or presenter mode does not
+  g) the record holds only for the credential it was made with and the lane's server; it is never
+     read or written through a symlink; a failed whoami is not asked again for a minute
 
 Run: python3 tests/gateway-lane-own-identity.test.py
 """
@@ -100,6 +103,33 @@ def resolve_cases() -> None:
     got = agent_identity.resolve(state, no_channel, environ={})
     check(got == HOST_AGENT, f"b) the primary lane keeps the host binding ({got!r})")
 
+    # g) bound to the credential and the server, never through a symlink
+    st = state_with_binding()
+    asked.clear()
+    got = agent_identity.resolve(st, no_channel, environ={}, instance="s-space", whoami=whoami, credential="c1",
+                                 server="s.space")
+    check(got == LANE_AGENT and len(asked) == 1, "g) recorded for credential c1")
+    agent_identity.resolve(st, no_channel, environ={}, instance="s-space", whoami=whoami, credential="c1",
+                           server="s.space")
+    check(len(asked) == 1, "g) the same credential reads the record")
+    got = agent_identity.resolve(st, no_channel, environ={}, instance="s-space", whoami=lambda: "@new:s.space",
+                                 credential="c2", server="s.space")
+    check(got == "@new:s.space", f"g) a re-linked lane (credential c2) asks again ({got!r})")
+    got = agent_identity.resolve(st, no_channel, environ={}, instance="s-space", whoami=lambda: "@x:ag2.space",
+                                 credential="c3", server="s.space")
+    check(got == "", f"g) a relay answer on another server is refused ({got!r})")
+    got = agent_identity.resolve(st, no_channel, environ={}, instance="s-space", whoami=lambda: "",
+                                 credential="c2", server="dev.s.space")
+    check(got == "", f"g) a record on another server than the row's is not used ({got!r})")
+    linked = Path(tempfile.mkdtemp(prefix="gw-lane-id-link-"))
+    real = Path(tempfile.mkdtemp(prefix="gw-lane-id-real-"))
+    (real / "lane-agent.s-space.json").write_text(json.dumps({"agent_id": "@planted:s.space", "credential": ""}))
+    (linked / "auth").symlink_to(real)
+    got = agent_identity.lane_agent(linked, "s-space", whoami=lambda: LANE_AGENT)
+    check(got == LANE_AGENT, f"g) a symlinked auth dir is not read ({got!r})")
+    check(json.loads((real / "lane-agent.s-space.json").read_text())["agent_id"] == "@planted:s.space",
+          "g) nor written through")
+
 
 def drain(state: Path, results: Path, instance: str, whoami_answer, posts: list, logs: list) -> None:
     def fake_req(method, path, payload=None, timeout=None, **_kw):
@@ -143,8 +173,19 @@ def drain_cases() -> None:
 
     gb._LOG_COUNTS.clear()
     state, results, posts, logs = state_with_binding(), results_with(LANE_ROOM), [], []
+    asked: list = []
+    real_req = gb._req
     for _ in range(4):
+        gb._LANE_WHOAMI["until"] = 0.0  # each pass asks again here; the minute's backoff is tested below
         drain(state, results, "s-space", OSError("relay down"), posts, logs)
+    gb._req = lambda *a, **k: asked.append(a) or {"agent_mxid": LANE_AGENT}
+    try:
+        check(gb._lane_whoami() == "" and asked == [], "g) after a failed whoami, none is asked for a minute")
+        gb._LANE_WHOAMI["until"] = 0.0
+        check(gb._lane_whoami() == LANE_AGENT and len(asked) == 1, "g) then it is asked again")
+    finally:
+        gb._req = real_req
+        gb._LANE_WHOAMI["until"] = 0.0
     held = [m for m in logs if "own identity is unknown" in m]
     check(posts == [] and (results / "proactive-1.txt").exists(), "d) unknown identity: held, not sent")
     check(len(held) == 3 and "seen 4 times" in held[-1],
@@ -152,6 +193,7 @@ def drain_cases() -> None:
     check(any("whoami failed" in m for m in logs), "d) the failed whoami is logged")
 
     gb._LOG_COUNTS.clear()
+    gb._LANE_WHOAMI["until"] = 0.0
     state, results, posts, logs = state_with_binding(), results_with(OTHER_ROOM), [], []
     for _ in range(2):
         drain(state, results, "s-space", LANE_AGENT, posts, logs)
@@ -177,8 +219,21 @@ def health_cases() -> None:
     stuck.write_text("x")
     os.utime(stuck, (now - 1800, now - 1800))
     got = hc.check_proactive_undelivered(results, now)
-    check(got["status"] == "fail" and "1 proactive" in got["detail"] and "30 min" in got["detail"],
-          f"f) a file unclaimed for 30 min fails ({got['detail']})")
+    check(got["status"] == "warn" and "1 proactive" in got["detail"] and "30 min" in got["detail"],
+          f"f) a file unclaimed for 30 min warns ({got['detail']})")
+    destined = results / "proactive-9.to-telegram.txt"
+    destined.write_text("x")
+    os.utime(destined, (now - 1800, now - 1800))
+    check("1 proactive" in hc.check_proactive_undelivered(results, now)["detail"],
+          "f) a destined file is the stranded-destined probe's, not counted here")
+    import presenter_mode
+    real_active = presenter_mode.presenter_mode_active
+    presenter_mode.presenter_mode_active = lambda *a, **k: True
+    try:
+        got = hc.check_proactive_undelivered(results, now)
+        check(got["status"] == "ok" and "presenter" in got["detail"], "f) presenter mode holds on purpose: ok")
+    finally:
+        presenter_mode.presenter_mode_active = real_active
     got = hc.check_proactive_undelivered(results / "missing", now)
     check(got["status"] == "ok", "f) a missing results/ is no reading, not a failure")
 

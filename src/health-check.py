@@ -819,19 +819,32 @@ PROACTIVE_STUCK_S = 600
 
 
 def check_proactive_undelivered(results_dir: "Path | None" = None, now: "float | None" = None) -> dict:
-    """A proactive message (results/proactive-*.txt) no bridge has claimed for 10 minutes: an owner
-    message stranded silently. Names only the count and the oldest age, never a file's content."""
+    """An undestined proactive message (results/proactive-*.txt with no `.to-<channel>` tag) no
+    bridge has claimed for 10 minutes: an owner message stranded silently. Destined files are
+    check_stranded_destined_proactive's; presenter mode holds every delivery on purpose. Names
+    only the count and the oldest age, never a file's content."""
     check = {"name": "proactive-undelivered", "status": "ok", "detail": ""}
     results_dir = WORKSPACE_DIR / "results" if results_dir is None else results_dir
     now = time.time() if now is None else now
     try:
-        ages = [now - p.stat().st_mtime for p in results_dir.glob("proactive-*.txt")]
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
+        from proactive_routing import proactive_destination
+    except ImportError as e:
+        check["detail"] = f"could not load proactive_routing: {e} — no reading"
+        return check
+    if presenter_mode_active(results_dir.parent):
+        check["detail"] = "presenter mode active — deliveries intentionally held"
+        return check
+    try:
+        ages = [now - p.stat().st_mtime for p in results_dir.glob("proactive-*.txt")
+                if proactive_destination(p.name) is None]
     except OSError as e:
         check["detail"] = f"results/ not readable ({type(e).__name__}) — no reading"
         return check
     stuck = [a for a in ages if a >= PROACTIVE_STUCK_S]
     if stuck:
-        check["status"] = "fail"
+        check["status"] = "warn"
         check["detail"] = (f"{len(stuck)} proactive message(s) unclaimed for over {PROACTIVE_STUCK_S // 60} min "
                            f"(oldest {int(max(stuck) // 60)} min): no bridge is delivering them; see the bridge "
                            "logs' 'proactive … held' / 'left for another lane' lines")

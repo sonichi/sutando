@@ -345,15 +345,16 @@ def published_lane_record(state_dir, instance: str, now: "float | None" = None) 
     return rec if state == LANE_FRESH else None
 
 
-def resolve(state_dir, channel_value, environ=None, strict=None, instance: str = "", whoami=None) -> str:
+def resolve(state_dir, channel_value, environ=None, strict=None, instance: str = "", whoami=None,
+            credential: str = "", server: str = "") -> str:
     """The agent id by the bridge's chain; `channel_value(key)` reads the channel .env tier. '' = unknown.
     A pinned environment answers from its own `AGENT_MXID` alone. `strict` (default: the environment is a
     seat's) stops at the channel tier: the host's binding is the host's agent, never a seat's.
 
     A secondary lane (`instance` set) is its own agent on its own homeserver: after the env and channel
     tiers it reads its own lane record, else asks its own relay (`whoami()`, the server's answer for
-    this lane's credential) and records that. It never falls back to the host's binding, which is the
-    primary lane's agent; '' tells the caller the lane's identity is unknown."""
+    this lane's credential) and records that (see `lane_agent`). It never falls back to the host's
+    binding, which is the primary lane's agent; '' tells the caller the lane's identity is unknown."""
     env = os.environ if environ is None else environ
     if strict is None:
         strict = _sources.is_seat(env)
@@ -368,41 +369,59 @@ def resolve(state_dir, channel_value, environ=None, strict=None, instance: str =
         if v:
             return v
     if instance:
-        return lane_agent(state_dir, instance, whoami)
+        return lane_agent(state_dir, instance, whoami, credential=credential, server=server)
     return "" if strict else enrolled(state_dir)
 
 
-def _lane_agent_path(state_dir, instance: str) -> Path:
-    return Path(state_dir) / "auth" / f"lane-agent{_instance_suffix(instance)}.json"
+def _lane_agent_name(instance: str) -> str:
+    return f"lane-agent{_instance_suffix(instance)}.json"
 
 
-def lane_agent(state_dir, instance: str, whoami=None) -> str:
-    """A secondary lane's own agent id: its record, else its relay's answer (then recorded). ''
-    when neither knows; never the host's binding."""
+def _on_server(agent_id: str, server: str) -> bool:
+    return not server or agent_id.split(":", 1)[-1].lower() == server.strip().lower()
+
+
+def lane_agent(state_dir, instance: str, whoami=None, *, credential: str = "", server: str = "") -> str:
+    """A secondary lane's own agent id: its record, else its relay's answer (then recorded). '' when
+    neither knows; never the host's binding. The record holds only for the credential it was made
+    with (`credential`, a digest the caller derives from the lane's gateway and token), so a lane
+    re-linked to another agent asks again; an id on another server than `server` (the lane's row)
+    is refused from either source. Read and written without following a symlink."""
     if state_dir is None or not instance:
         return ""
-    path = _lane_agent_path(state_dir, instance)
-    try:
-        v = json.loads(path.read_text()).get("agent_id")
-        if isinstance(v, str) and _MXID.fullmatch(v.strip().lower()):
+    name = _lane_agent_name(instance)
+    if LANE_SUPPORTED:
+        try:
+            dfd = _auth_dir(state_dir, create=False)
+            rec = None
+            if dfd is not None:
+                try:
+                    rec, _why = _read_at(dfd, name)
+                finally:
+                    _close(dfd)
+        except OSError:
+            rec = None
+        v = (rec or {}).get("agent_id")
+        if isinstance(v, str) and _MXID.fullmatch(v.strip().lower()) and _on_server(v.strip(), server) \
+                and (rec or {}).get("credential", "") == credential:
             return v.strip()
-    except Exception:  # noqa: BLE001 - an absent or unreadable record is asked again
-        pass
     try:
         v = (whoami() if whoami is not None else "") or ""
     except Exception:  # noqa: BLE001 - an unreachable relay is unknown, not the host's agent
         v = ""
     v = v.strip() if isinstance(v, str) else ""
-    if not _MXID.fullmatch(v.lower()):
+    if not _MXID.fullmatch(v.lower()) or not _on_server(v, server):
         return ""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"agent_id": v, "instance": instance, "source": "relay-whoami"}))
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except OSError:
-        pass  # answered all the same; recorded next time
+    if LANE_SUPPORTED:
+        try:
+            dfd = _auth_dir(state_dir, create=True)
+            try:
+                _write_at(dfd, name, {"agent_id": v, "instance": instance, "credential": credential,
+                                      "source": "relay-whoami"})
+            finally:
+                _close(dfd)
+        except OSError:
+            pass  # answered all the same; recorded next time
     return v
 
 

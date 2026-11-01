@@ -726,7 +726,12 @@ class Primary(Base):
         self.assertEqual(owners(), [False, True], "no owner DM anywhere: the designated lane keeps them")
         self.assertEqual(C.unaddressed_owner(self.ws)[1], None)
         routing("")
-        self.assertEqual(owners(), [True, False], "handed to the lane with an owner DM")
+        self.assertEqual(owners(), [False, True], "a lane whose bridge is not running never takes them")
+        ai = C._agent_identity()
+        ai.publish_lane(state, "", rows[""].get("agent_mxid") or "@a:alpha-fixture.net")
+        with unittest.mock.patch.object(ai, "LANE_FRESH_S", -1.0):
+            self.assertEqual(owners(), [False, True], "nor one whose lane record is stale")
+        self.assertEqual(owners(), [True, False], "handed to the running lane with an owner DM")
         owner, handed_from = C.unaddressed_owner(self.ws)
         self.assertEqual((owner["instance"], handed_from["instance"]), ("", "beta-fixture-net"))
         routing("beta-fixture-net", private=None)
@@ -740,6 +745,12 @@ class Primary(Base):
         self.assertEqual(C.unaddressed_owner(self.ws)[1], None)
         routing("beta-fixture-net", owner_dm="")
         rec = json.loads(C.record_path(self.ws).read_text())
+        for r in rec["connections"]:
+            r["owner_mxid"] = "@owner-a:x" if r["instance"] == "beta-fixture-net" else "@owner-b:x"
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        self.assertEqual(owners(), [False, True], "a lane serving another owner never takes them")
+        for r in rec["connections"]:
+            r.pop("owner_mxid", None)
         next(r for r in rec["connections"] if r["instance"] == "")["disabled"] = True
         C.record_path(self.ws).write_text(json.dumps(rec))
         self.assertEqual(owners(), [False, True], "a disabled lane never takes them")

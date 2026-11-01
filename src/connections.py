@@ -1403,9 +1403,10 @@ def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
 
 def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
     """(the row whose bridge owns unaddressed messages, the designated row it was handed from or None).
-    Designated: the primary row; with no named primary the legacy unsuffixed row. A designated lane
-    with no owner DM can only hold them, so they go to the first enabled lane that has one (the
-    unsuffixed primary first, then by name); with none anywhere the designated lane keeps them.
+    Designated: the primary row. A designated lane with no owner DM can only hold them, so they go
+    to the first enabled lane whose bridge is running (a fresh lane record) and has one (the
+    unsuffixed lane first, then by name). Only a lane serving the same owner (`owner_mxid`, where
+    both rows name one) may take them. With none, the designated lane keeps them.
     (None, None) when the record is unreadable or names no primary: the legacy bridge, as before."""
     try:
         rows = _read(record_path(workspace))
@@ -1416,10 +1417,32 @@ def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict]
         return None, None
     if _has_owner_dm(designated, workspace):
         return designated, None
-    live = [r for r in rows if r is not designated and not r.get("disabled") and not r.get("parked")]
+    owner = designated.get("owner_mxid")
+    live = [r for r in rows if r is not designated and not r.get("disabled") and not r.get("parked")
+            and (not owner or not r.get("owner_mxid") or r.get("owner_mxid") == owner)]
     live.sort(key=lambda r: (bool(r["instance"]), str(r["instance"])))
-    taker = next((r for r in live if _has_owner_dm(r, workspace)), None)
+    taker = next((r for r in live if _has_owner_dm(r, workspace) and _lane_running(r, workspace)), None)
     return (taker, designated) if taker is not None else (designated, None)
+
+
+def _lane_running(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge is running now: its lane record (state/auth/lane-identity*) is fresh.
+    An owner-routing file outlives a crashed or revoked bridge; a handoff to it would strand."""
+    try:
+        state, _rec = _agent_identity().lane_state(_workspace(workspace) / "state", str(row.get("instance") or ""))
+        return state == _agent_identity().LANE_FRESH
+    except Exception:  # noqa: BLE001 - unknown is not running
+        return False
+
+
+def lane_server(instance: str, workspace: Optional[Path] = None) -> str:
+    """The homeserver the row running as `instance` (by slug or launch-key alias) names; "" if none."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return ""
+    row = next((r for r in rows if instance and instance in [r["instance"]] + alias_instances(r)), None)
+    return str((row or {}).get("server") or "")
 
 
 def _names_mxid(text: str, mxid: str) -> bool:
