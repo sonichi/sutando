@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -278,7 +279,7 @@ class AgentAccess(unittest.TestCase):
     """Room Actions go through the lane's MCP endpoint with a delegation minted from its relay bearer."""
 
     def setUp(self):
-        gw._AGENT_ACCESS.update(token="", until=0.0)
+        gw._AGENT_ACCESS.update(token="", until=0.0, penalty_until=0.0)
         self.mints, self.calls = [], []
 
     def mint(self, *tokens):
@@ -305,7 +306,7 @@ class AgentAccess(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            def read(self, size=-1):
                 return json.dumps(self.body).encode()
 
         def urlopen(req, timeout=None):
@@ -354,7 +355,7 @@ class AgentAccess(unittest.TestCase):
         gw._AGENT_ACCESS.update(token="", until=0.0)
         self.calls.clear()
         mint = self.mint({"access_token": "a"}, {"access_token": "b"})
-        endpoint = self.endpoint(self.tool_error("AGENT_CREDENTIAL_STALE"), self.ok({"status": "completed"}))
+        endpoint = self.endpoint(self.tool_error("AUTHENTICATION_FAILED"), self.ok({"status": "completed"}))
         self.assertEqual(self.run_step(mint, endpoint), {"status": "completed"})
         self.assertEqual([c[1] for c in self.calls], ["Bearer a", "Bearer b"])
 
@@ -365,8 +366,12 @@ class AgentAccess(unittest.TestCase):
                           self.endpoint(self.http(401), self.http(401)))
         gw._AGENT_ACCESS.update(token="", until=0.0)
         out = self.run_step(self.mint({"access_token": "a"}, {"access_token": "b"}),
-                            self.endpoint(self.tool_error("UNAUTHORIZED"), self.tool_error("UNAUTHORIZED")))
-        self.assertEqual((out.get("is_error"), out.get("code")), (True, "UNAUTHORIZED"))
+                            self.endpoint(self.tool_error("AUTHENTICATION_FAILED"),
+                                          self.tool_error("AUTHENTICATION_FAILED")))
+        self.assertEqual((out.get("is_error"), out.get("code")), (True, "AUTHENTICATION_FAILED"))
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        out = self.run_step(self.mint({"access_token": "a"}), self.endpoint(self.tool_error("UNAUTHORIZED")))
+        self.assertEqual(out.get("code"), "UNAUTHORIZED", "only the proxy's AUTHENTICATION_FAILED mints again")
         gw._AGENT_ACCESS.update(token="", until=0.0)
         with self.assertRaises(urllib.error.HTTPError):
             self.run_step(self.mint({"access_token": "a"}), self.endpoint(self.http(500)))
@@ -375,6 +380,29 @@ class AgentAccess(unittest.TestCase):
             self.run_step(self.mint({"access_token": "a"}), self.endpoint({"jsonrpc": "2.0", "id": 1, "error": {}}))
         out = self.run_step(self.mint(), self.endpoint(self.tool_error("RATE_LIMITED")))
         self.assertEqual(out, {"code": "RATE_LIMITED", "is_error": True})
+
+    def test_a_rate_limited_mint_backs_off_for_a_minute(self):
+        with self.assertRaises(gw.MintRateLimited):
+            self.run_step(self.mint(self.http(429)), self.endpoint())
+        with self.assertRaises(gw.MintRateLimited):
+            self.run_step(self.mint(), self.endpoint())  # no mint is attempted inside the penalty
+        self.assertEqual(self.mints, [gw.AGENT_ACCESS_MINT_PATH])
+        with patch.object(gw.time, "monotonic", return_value=gw.time.monotonic() + gw.MINT_RATE_LIMIT_S + 1):
+            self.assertEqual(self.run_step(self.mint({"access_token": "c"}), self.endpoint(self.ok({"status": "completed"}))),
+                             {"status": "completed"})
+        self.assertEqual(len(self.mints), 2, "after the penalty it mints again")
+
+    def test_the_token_is_withheld_from_logs_and_its_lifetime_bounded(self):
+        registered = []
+        with patch.object(gw._SECRETS, "register", side_effect=lambda v, *a: registered.append(v)):
+            self.run_step(self.mint({"access_token": "tok-secret", "expires_in": float("inf")}),
+                          self.endpoint(self.ok({"status": "completed"})))
+        self.assertEqual(registered, ["tok-secret"])
+        left = gw._AGENT_ACCESS["until"] - gw.time.monotonic()
+        self.assertLessEqual(left, gw.TOKEN_TTL_MAX_S, "an infinite expires_in is not cached forever")
+        gw._AGENT_ACCESS.update(token="", until=0.0)
+        self.run_step(self.mint({"access_token": "t", "expires_in": 10 ** 9}), self.endpoint(self.ok({"status": "completed"})))
+        self.assertLessEqual(gw._AGENT_ACCESS["until"] - gw.time.monotonic(), gw.TOKEN_TTL_MAX_S)
 
     def test_not_deployed_cases_are_a_skip(self):
         self.assertEqual(self.run_step(self.mint(self.http(404)), self.endpoint()), {"status": "not_deployed"})
@@ -502,6 +530,33 @@ class Typed(unittest.TestCase):
         with patch.multiple(gw, TASK_STATUS=hook, _STEP_PUBLISHER=self.pub, TASKS_DIR=Path(tempfile.mkdtemp())):
             gw._publish_task_steps_snapshot(set())
         self.assertIs(self.pub.status_of, hook)
+
+
+class PickedUp(unittest.TestCase):
+    """With the engine's status hook, "Queued" never outlives the wait: once the core picks the task up
+    (its file still in the queue), the next published step is not waiting."""
+
+    def test_queued_then_picked_up_publishes_a_non_waiting_step(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        ws = Path(tempfile.mkdtemp())
+        (ws / "tasks").mkdir()
+        (ws / "tasks" / "task-dev~task-a.txt").write_text("id: task-dev~task-a\ntask: hi\n")
+        calls, clock = [], [100.0]
+        pub = StepPublisher(ws, lambda body: calls.append(body) or {"status": "completed"}, lambda m: None,
+                            lambda: clock[0], status_of=lambda tid: phase_line.published_status(ws, tid))
+        tasks = {"task-dev~task-a": {"task_id": "task-a", "execution_generation": 1, "room_id": "!r:test"}}
+        pub.publish(tasks)
+        self.assertEqual((calls[-1]["arguments"]["phase"], calls[-1]["arguments"].get("waiting")), ("Waiting", "queued"))
+        index = ws / "state" / "agent-activity.index.json"
+        index.parent.mkdir(parents=True, exist_ok=True)
+        index.write_text(json.dumps({"task-dev~task-a": {"started": time.time()}}))  # the core picked it up
+        clock[0] += 10
+        pub.publish(tasks)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[-1]["arguments"]["phase"], "Understanding the request")
+        self.assertNotIn("waiting", calls[-1]["arguments"])
 
 
 class BridgeLoop(unittest.TestCase):

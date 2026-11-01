@@ -4111,14 +4111,20 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
-# Room Actions are reached the way the agent's own MCP tools reach them: the lane's relay credential is
-# exchanged for an MCP delegation at the mint endpoint (kept until shortly before it expires), and the
-# Action is one stateless JSON-RPC tools/call on the lane's MCP endpoint. The relay bearer is refused there.
+# Room Actions go as the agent's MCP proxy sends them: a delegation minted from the relay credential,
+# then one stateless tools/call on the lane's MCP endpoint (the relay bearer is refused there).
 AGENT_ACCESS_MINT_PATH = "/api/v1/mcp/agent-access-tokens"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-_MCP_AUTH_CODES = ("UNAUTHORIZED", "AGENT_CREDENTIAL_STALE")
-_AGENT_ACCESS = {"token": "", "until": 0.0}
+MCP_AUTH_CODE = "AUTHENTICATION_FAILED"  # the proxy's in-band auth failure, read from content[0]
+MINT_RATE_LIMIT_S = 60.0  # the mint allows 30 per 60 s per agent, shared with its MCP tools
+TOKEN_TTL_MAX_S = 3600.0
+MCP_REPLY_MAX = 1 << 20
+_AGENT_ACCESS = {"token": "", "until": 0.0, "penalty_until": 0.0}
 _AGENT_ACCESS_LOCK = threading.Lock()
+
+
+class MintRateLimited(RuntimeError):
+    """The mint answered 429: no mint for MINT_RATE_LIMIT_S."""
 
 
 def _agent_access_token(refresh: bool = False) -> str:
@@ -4128,15 +4134,26 @@ def _agent_access_token(refresh: bool = False) -> str:
         now = time.monotonic()
         if not refresh and _AGENT_ACCESS["token"] and now < _AGENT_ACCESS["until"]:
             return _AGENT_ACCESS["token"]
+        if now < _AGENT_ACCESS["penalty_until"]:
+            raise MintRateLimited("the mint is rate limited; not minting yet")
         _AGENT_ACCESS.update(token="", until=0.0)
-        out = _req("POST", AGENT_ACCESS_MINT_PATH, None, timeout=10, origin=True)
+        try:
+            out = _req("POST", AGENT_ACCESS_MINT_PATH, None, timeout=10, origin=True)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                exc.close()
+                _AGENT_ACCESS["penalty_until"] = now + MINT_RATE_LIMIT_S
+                raise MintRateLimited("the mint answered 429; backing off") from None
+            raise
         token = out.get("access_token") if isinstance(out, dict) else None
         if not isinstance(token, str) or not token:
             raise ValueError("the mint endpoint returned no access token")
+        _SECRETS.register(token)
         try:
             ttl = float(out.get("expires_in") or 900)
         except (TypeError, ValueError):
             ttl = 900.0
+        ttl = min(ttl, TOKEN_TTL_MAX_S) if math.isfinite(ttl) else 900.0
         _AGENT_ACCESS.update(token=token, until=now + max(30.0, ttl - 60.0))
         return token
 
@@ -4177,8 +4194,8 @@ def _mcp_tool(name: str, arguments: dict, timeout: int = 10) -> dict:
                            ("MCP-Protocol-Version", MCP_PROTOCOL_VERSION), ("User-Agent", "sutando-gateway-client/1.0")):
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                rpc = json.loads(resp.read())
+            with gateway_instance.gateway_call(url), urllib.request.urlopen(req, timeout=timeout) as resp:
+                rpc = json.loads(resp.read(MCP_REPLY_MAX))
         except urllib.error.HTTPError as exc:
             exc.close()
             if exc.code == 401 and attempt == 0:
@@ -4189,7 +4206,7 @@ def _mcp_tool(name: str, arguments: dict, timeout: int = 10) -> dict:
             raise ValueError("the MCP endpoint did not answer the call")
         envelope = _mcp_envelope(result)
         if result.get("isError"):
-            if envelope.get("code") in _MCP_AUTH_CODES and attempt == 0:
+            if envelope.get("code") == MCP_AUTH_CODE and attempt == 0:
                 continue
             return {**envelope, "is_error": True}
         return envelope
