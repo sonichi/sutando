@@ -574,6 +574,22 @@ def resolve_web_client_port(
     return {"port": port}
 
 
+DISCORD_FLAP_SESSIONS_PER_HOUR = 6
+
+
+def _discord_flap_detail(state_dir: Path, now: "float | None" = None) -> "str | None":
+    """The warn detail when the Discord bridge opened too many new gateway sessions in the last
+    hour, read from the record the bridge alone writes; None when it did not."""
+    import time
+    import gateway_sessions
+    now = time.time() if now is None else now
+    n = gateway_sessions.count_recent(state_dir / "discord-bridge.sessions.json", now)
+    if n < DISCORD_FLAP_SESSIONS_PER_HOUR:
+        return None
+    return (f"running but gateway flapping ({n} new sessions in the last hour; "
+            f"see the [discord.gateway] lines in its log)")
+
+
 def check_voice_stack(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -13328,6 +13344,12 @@ def run_all_checks() -> list[dict]:
             else:
                 status = "warn"
                 detail = f"running but heartbeat stale ({int(hb_age)}s old)"
+
+        # Check 3b: gateway flapping. A heartbeat stays fresh through a loop of fresh sessions.
+        if name == "discord-bridge" and status == "ok":
+            flap = _discord_flap_detail(WORKSPACE_DIR / "state")
+            if flap:
+                status, detail = "warn", flap
 
         # Check 4: Stale code — process started before the source file's last
         # modification. This catches the case where a fix is on disk but the
