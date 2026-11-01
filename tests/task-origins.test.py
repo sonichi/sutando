@@ -60,7 +60,7 @@ class Origins(unittest.TestCase):
                          {f'$msg{i}' for i in range(64)})
 
     def test_bounds_idempotence_and_invalid_ids(self):
-        values = ['$seed', '$seed', '', 'bad,id', 'x' * 513, *[f'${i}' for i in range(200)]]
+        values = ['$seed', '$seed', '', 'bad,id', 'bad\x7fid', 'x' * 513, *[f'${i}' for i in range(200)]]
         self.assertTrue(origins.append_origins(self.state, 'task-holder', values))
         self.assertTrue(origins.append_origins(self.state, 'task-holder', ['$seed']))
         result = origins.read_origins(self.state, 'task-holder')

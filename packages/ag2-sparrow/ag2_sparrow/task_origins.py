@@ -21,7 +21,7 @@ def normalize_origins(values: Iterable[str]) -> list[str]:
     result = []
     for value in values:
         if (isinstance(value, str) and value and len(value) <= MAX_MESSAGE_ID
-                and not any(c.isspace() or ord(c) < 32 or c == ',' for c in value)
+                and value.isprintable() and not any(c.isspace() or c == ',' for c in value)
                 and value not in result):
             result.append(value)
             if len(result) == MAX_ORIGINS:
@@ -65,7 +65,7 @@ def read_origins(state_dir: Path, task_id: str) -> list[str]:
 
 
 def append_origins(state_dir: Path, task_id: str, values: Iterable[str]) -> bool:
-    """Keep the first 128 unique ids. Return False on IO failure; never block delivery."""
+    """Keep the first 128 unique ids. Return False on IO failure; leave delivery decisions unchanged."""
     try:
         path = _path(state_dir, task_id)
         incoming = normalize_origins(values)
