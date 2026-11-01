@@ -201,6 +201,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
+- **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
@@ -239,6 +240,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.
+- **`stop_hooks.py`** — Stop handlers: the scripts installed skills declare with the manifest field `on_stop_requested`, offered each Stop the task watcher reads (a CANCEL_INSTRUCTION naming a task).
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
