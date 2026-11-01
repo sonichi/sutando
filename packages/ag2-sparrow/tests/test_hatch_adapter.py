@@ -5058,12 +5058,8 @@ class Reply(Base):
 
     def test_no_reply_settles_only_once_sparrow_recorded_it(self):
         sent = []
-
-        def settled(body):
-            sent.append(body)
-            outbox.record_delivered(self.outbox, self.TID)
-            self.result_file.unlink()
-        self.sparrow(settled)
+        self.sparrow(lambda body: (sent.append(body), outbox.record_delivered(self.outbox, self.TID),
+                                   self.result_file.unlink()))
         r = self.no_reply(str(self.result_file), "--reason", " thanks,\n just an ack ",
                           "--wait", "10")
         self.assertEqual(r.returncode, 0, r.stderr)
