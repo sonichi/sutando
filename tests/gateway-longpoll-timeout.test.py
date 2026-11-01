@@ -720,19 +720,16 @@ class RoundAccountingTest(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            def read(self, amt=None):
                 return b""
 
         with _Loop(self.gw) as loop, patch.dict(self.gw._LOG_COUNTS, clear=True):
             real_req = loop._saved["_req"]
             self.gw._req = lambda method, path, *a, **k: (
                 real_req(method, path, *a, **k) if path.startswith("/v1/tasks?") else {})
-            saved_open = urllib.request.urlopen
-            urllib.request.urlopen = lambda *a, **k: _Resp()
-            try:
+            # The opener every request uses, with or without a deadline.
+            with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: _Resp()):
                 loop.run()
-            finally:
-                urllib.request.urlopen = saved_open
         lines = [m for m in loop.logs if m.startswith("poll anomaly #")]
         self.assertEqual(len(lines), 1)
         self.assertIn("status=200, content-length=0, cf-ray=8f00aa11bb22cc33-SJC", lines[0])
@@ -889,6 +886,80 @@ class SlowDripTest(unittest.TestCase):
                              deadline=start + 5)
             self.assertLessEqual(clock.now - start, 5 + 1, "one drip past the deadline at most")
 
+    def _short(self, clock, body, sent, ends_at=None):
+        """A response whose body stops after `sent` bytes of `body` (Content-Length says all of it):
+        a read blocked until `ends_at` (the deadline's socket shutdown), or a peer that hung up."""
+        class _Resp:
+            status = 200
+            headers = {"Content-Length": str(len(body))}
+
+            def __init__(self):
+                self.left, self.length, self.sent = body, len(body), 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, amt=None):
+                if self.sent >= sent:
+                    if ends_at is not None:
+                        clock.now = ends_at      # blocked in the read until the cut
+                    return b""
+                out, self.left = self.left[:1], self.left[1:]
+                self.sent, self.length = self.sent + 1, self.length - 1
+                return out
+        return _Resp
+
+    def test_a_body_the_deadline_cuts_short_is_a_timeout_not_an_answer(self):
+        import urllib.request
+        clock = _Clock()
+        start, body = clock.now, b'{"tasks": []}' + b" " * 40
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open",
+                             new=lambda *a, **k: self._short(clock, body, 13, ends_at=start + 5)()):
+            with self.assertRaises(TimeoutError, msg="the cut body passed for a whole {'tasks': []}"):
+                self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=start + 5)
+
+    def test_a_peer_that_hangs_up_short_of_its_content_length_is_incomplete(self):
+        import http.client
+        import urllib.request
+        clock = _Clock()
+        body = b'{"tasks": []}' + b" " * 40
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: self._short(clock, body, 13)()):
+            with self.assertRaises(http.client.IncompleteRead):
+                self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=clock.now + 5)
+
+    def test_control_a_whole_body_still_parses(self):
+        import urllib.request
+        clock = _Clock()
+        body = b'{"tasks": []}'
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open",
+                             new=lambda *a, **k: self._short(clock, body, len(body))()):
+            self.assertEqual(self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=clock.now + 5),
+                             {"tasks": []})
+
+    def test_a_dripping_poll_ends_at_its_budget_and_reads_as_an_empty_poll(self):
+        # #5968: urllib's timeout bounds each read, so a long poll whose body drips stayed open.
+        import urllib.request
+        with _Loop(self.gw) as loop:
+            real = loop._saved["_req"]
+            self.gw._req = lambda m, p, payload=None, **kw: (
+                real(m, p, payload, **kw) if p.startswith("/v1/tasks?wait=") else {})
+            drip = self._drip(loop.clock, body=b'{"tasks": []}' + b" " * 10_000)
+            start = loop.clock.now
+            with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: drip()):
+                loop.run()
+        budget = self.gw.POLL_WAIT + 10
+        self.assertLessEqual(loop.clock.now - start, budget + 1, "the whole poll is bounded by its budget")
+        self.assertTrue(any(f"poll read timed out after {budget}s" in m for m in loop.logs), loop.logs)
+
     def test_the_budgeted_retry_gives_up_at_the_budget(self):
         import urllib.request
         clock = _Clock()
@@ -1043,7 +1114,7 @@ class DroppedConnectionTest(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            def read(self, amt=None):
                 raise ConnectionResetError(54, "Connection reset by peer")
 
         with _Loop(self.gw) as loop:
@@ -1056,12 +1127,8 @@ class DroppedConnectionTest(unittest.TestCase):
                 return real_req(method, path, *a, **k)
 
             self.gw._req = _req
-            saved_open = urllib.request.urlopen
-            urllib.request.urlopen = lambda *a, **k: _Resp()
-            try:
+            with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: _Resp()):
                 loop.run()
-            finally:
-                urllib.request.urlopen = saved_open
         self._assert_network_path(loop, "ConnectionResetError")
 
     def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
