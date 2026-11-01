@@ -1553,6 +1553,29 @@ class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
                 self.assertEqual(pg.spinner_elapsed(f"\u2733 Pondering\u2026 {paren}"), secs)
         self.assertFalse(pg.turn_in_flight(self.spinner("(8s \u00b7 \u2193 42 tokens \u00b7 thought for 4s)")))
 
+    def test_control_a_turn_waiting_on_a_limit_or_retry_mid_turn_still_stands(self):
+        waits = (
+            ("spinner names the limit", self.spinner(
+                "(Usage limit reached \u00b7 continuing automatically at 1am \u00b7 esc to cancel \u00b7 2m 37s)")),
+            ("spinner names a retry", self.spinner("(retrying in 30s \u00b7 attempt 3/10 \u00b7 2m 37s)")),
+            ("spinner names a rate limit", self.spinner("(rate limited \u00b7 2m 37s \u00b7 esc to interrupt)")),
+            ("wait row under the spinner", self.MID_TURN.replace(
+                "  \u2714 Update installed",
+                "  \u23bf  Continuing automatically at 1am \u00b7 esc to cancel\n  \u2714 Update installed")),
+            ("retry row under the spinner", self.MID_TURN.replace(
+                "  \u2714 Update installed",
+                "  \u23bf  API Error (529 Overloaded) \u00b7 Retrying in 8 seconds\u2026 (attempt 2/10)\n"
+                "  \u2714 Update installed")),
+        )
+        for name, pane in waits:
+            with self.subTest(wait=name):
+                self.assertFalse(pg.turn_in_flight(pane))
+                outrun = self.outrun(pane)
+                self.assertFalse(outrun)
+                self.assertTrue(pg.limit_standing(pane, "claude", outrun))
+                v = pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws")
+                self.assertNotEqual((v.state, v.reason), ("busy", "working"))
+
     def test_a_spinner_below_the_composer_is_not_a_turn_in_flight(self):
         row = "\u2733 Choreographing\u2026 (30s \u00b7 esc to interrupt)\n"
         self.assertTrue(pg.turn_in_flight(self.STANDING.replace("\u273b Worked for 3m \u00b7 done 3:16 PM\n", row)))

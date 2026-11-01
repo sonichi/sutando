@@ -612,18 +612,26 @@ def spinner_elapsed(row: str) -> Optional[int]:
     return None
 #: A delivery the limit refuses ends within seconds; a turn running longer was served.
 FLIGHT_MIN_S = 10
+# A turn waiting rather than working: a limit, a retry or a cancellable wait on its rows.
+_WAIT_TEXT = re.compile(r"\bretry(?:ing)?\b|\brate[ -]?limit|\boverloaded\b|\battempt \d+"
+                        r"|esc to cancel|\b429\b", re.I)
+
+
+def _waiting_row(plain: str) -> bool:
+    return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
 
 
 def turn_in_flight(capture: Optional[str]) -> bool:
-    """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more:
-    the seat is mid-turn, so a limit banner under the composer is from before it."""
+    """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
+    and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
+    so a limit banner under the composer is from before it."""
     lines = (capture or "").splitlines()
-    for ln in reversed(lines[:len(lines) - len(_below_composer(capture))]):
-        plain = _SGR.sub("", ln)
-        if _TURN_ROW.search(plain):
-            if not _SPINNER_ROW.search(plain):
+    above = [_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]]
+    for i in range(len(above) - 1, -1, -1):
+        if _TURN_ROW.search(above[i]):
+            if not _SPINNER_ROW.search(above[i]) or any(_waiting_row(r) for r in above[i:]):
                 return False
-            ran = spinner_elapsed(plain)
+            ran = spinner_elapsed(above[i])
             return ran is not None and ran >= FLIGHT_MIN_S
     return False
 
