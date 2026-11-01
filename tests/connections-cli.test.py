@@ -251,6 +251,16 @@ class CliTests(unittest.TestCase):
             "import os, pathlib\n"
             "pathlib.Path(os.environ['FAKE_OUT']).write_text(os.environ['GATEWAY_INSTANCE'] + ' ' "
             "+ os.environ['REMOTE_TASK_CHANNEL_DIR'] + ' ' + repr(os.environ['REMOTE_PROACTIVE_ROOM']))\n")
+        # reconnect asks the checkout what it resolves before stopping anything: this one answers this
+        # test's workspace and, through the real util_paths, this host.
+        (repo / "src" / "workspace_default.py").write_text(
+            f"from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path({str(self.ws)!r})\n")
+        real_src = Path(__file__).resolve().parent.parent / "src"
+        (repo / "src" / "util_paths.py").write_text(
+            f"import importlib.util, sys\nsys.path.append({str(real_src)!r})\n"
+            f"_spec = importlib.util.spec_from_file_location('_real_util_paths', {str(real_src / 'util_paths.py')!r})\n"
+            "_real = importlib.util.module_from_spec(_spec)\n_spec.loader.exec_module(_real)\n"
+            "host_label = _real.host_label\n")
         out = box / "launched.txt"
         self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta-fixture.net")
         record_file = self.ws / "state" / "connections.json"
