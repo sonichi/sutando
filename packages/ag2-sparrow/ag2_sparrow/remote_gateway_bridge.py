@@ -4684,6 +4684,9 @@ def _withdraw_closed(t, why: str) -> None:
     if answered or _own_copy_exists(tid):
         t.put(owed_close=None)
         return
+    if t.rec.get("answer_offered") and t.answered_here() is not False:
+        t.put(owed_close=None)                  # closed by its own answer, or that cannot be told: no stop
+        return
     queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{glob.escape(tid)}.assigned-*")]
     activity = task_attempts.last_activity(_STATE, tid)
     for path in queued:

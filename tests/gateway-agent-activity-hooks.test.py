@@ -565,6 +565,34 @@ class Hooks(unittest.TestCase):
         gw._post_heartbeat({tid}, force=True)
         return fake
 
+    def test_a_task_its_own_answer_closed_is_never_stopped_and_its_answer_is_recorded(self):
+        for fault in (False, True):
+            with self.subTest(journal_unreadable=fault):
+                tid, qid = f"task-answer-closes-{fault}", f"rq_closes_{fault}"
+                q = {"question_id": qid, "expected_revision": 1, "prompt": "Blue?", "can_answer": True}
+                self.assertIsNotNone(gw._write_task(_task(tid, room_question=q)))
+                turn = seed_ack(tid, _ack(tid, 1))["turn_id"]
+                with open(gw._STATE / "agent-activity.jsonl", "a") as fh:     # the core took it up
+                    fh.write(json.dumps({"ts": time.time() + 5, "kind": "working", "task": {"id": tid}}) + "\n")
+                with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
+                    for rec in ({"record_type": "dispatch_intent", "turn_id": turn, "task_id": tid, "seq": 1,
+                                 "ts": time.time(), "operation_id": f"op_{tid}", "action": "room.question.answer"},
+                                {"record_type": "dispatch_outcome", "turn_id": turn, "task_id": tid, "seq": 1,
+                                 "ts": time.time(), "operation_id": f"op_{tid}", "operation_status": "succeeded"}):
+                        fh.write(json.dumps(rec) + "\n")
+                stuck = (mock.patch.object(gw.task_attempts.agent_turn, "answered_in_journal", return_value=None)
+                         if fault else contextlib.nullcontext())
+                with stuck:
+                    fake = self.closed_by_beat(tid)      # the answer closed it before its result file
+                self.assertEqual(self.controls(tid), [], "never asked to stop a task its own answer closed")
+                self.core_writes(tid, "[no-send] answered Blue")
+                old = time.time() - 5
+                os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+                gw._post_ready_results({tid})
+                self.assertEqual(fake.posted("/v1/results"), [], "settled, nothing posted")
+                self.assertIsNone(gw._ATTEMPTS.entry(tid), "retired")
+                self.assertTrue(ledger()["questions"][qid].get("answered"), "its answer is recorded at the settle")
+
     def test_a_closed_task_the_core_has_not_taken_is_withdrawn_from_the_inbox(self):
         tid = "task-closed-untaken"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))

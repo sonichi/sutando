@@ -1116,6 +1116,11 @@ class Transition:
             return ANSWERING_ELSEWHERE_NOTE
         return ANSWERED_HERE_NOTE if saved and verdict == ["answered"] else ANSWER_UNRECORDED_NOTE
 
+    def answered_here(self):
+        """Whether this task's offered room question was answered in its journal: True, False, or
+        None when that cannot be told."""
+        return agent_turn.answered_in_journal(self.owner.state_dir, self.wire)
+
     def _note_answered(self, rec, records) -> None:
         """A question this task was offered and answered (a succeeded room.question.answer) is
         recorded as answered, by question id, before the result is decided."""
@@ -1155,7 +1160,15 @@ class Transition:
             self.log(f"task {self.wire}: settled, but {', '.join(waiting)} is still open — attempt kept")
             return False
 
+        answered = (self.answered_here() is True) if (rec or {}).get("answer_offered") else False
+
         def edit(data, r):
+            if answered and r and r.get("answer_offered"):
+                # Every settle, a fenced one included: its answer is recorded by question id.
+                questions = data.setdefault("questions", {})
+                qid = r["answer_offered"]
+                if isinstance(questions, dict) and isinstance(questions.get(qid, {}), dict):
+                    questions[qid] = {**(questions.get(qid) or {}), "answered": True}
             run = ((data.get("runs") or {}).get((r or {}).get("run")) if r else None)
             if isinstance(run, dict):
                 # What a later serve is judged against once the record is gone.

@@ -514,7 +514,9 @@ was answered or may be: one already answered here (recorded at a settle, or a su
 `room.question.answer` in the journal of a task it was offered to) gets a note not to answer again;
 one offered to another task still open gets a note that it is being answered elsewhere; one whose
 state cannot be told (the ledger or journal unreadable, a damaged line naming that task, or an
-answer sent with no outcome yet) gets a note to leave it unanswered. The turn gate reads only outcomes about its own task: an
+answer sent with no outcome yet) gets a note to leave it unanswered. A succeeded answer is recorded by
+question id at the task's settle, whatever path settles it (a fenced or closed one included), and a
+task the broker closed because its own answer closed it is never asked to stop. The turn gate reads only outcomes about its own task: an
 outcome naming another task's `task_id` neither suspends nor settles this one. A resolved blocker
 that carries an `answers` list is rendered answer by answer.
 
