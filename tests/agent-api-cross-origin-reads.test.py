@@ -10,6 +10,8 @@ A REAL HTTP server on an ephemeral port, the workspace a temp dir. Contract:
      bearer: 401 without it (before any existence check), 403 for a foreign Origin even with it,
      200 with it from the desktop app's origin
   d) embeddable media in results/, data/ and notes/ needs no bearer (an <img> cannot send one)
+  e) DNS rebinding is refused: a Host that is not loopback, an IP literal or declared gets 403
+     on every route (reads and POST /task), unless the request carries a valid bearer
 
 Run: python3 tests/agent-api-cross-origin-reads.test.py
 """
@@ -104,6 +106,35 @@ def main() -> int:
           "b) a page served from the same LAN host is echoed")
     check(req("/ping", origin="http://evil.example", host=f"192.168.1.20:{PORT}")[1] is None,
           "b) a different host is not")
+    check(req("/ping", origin="http://192.168.1.20:9999", host=f"192.168.1.20:{PORT}")[1] is None,
+          "b) another service on the same host (another port) is not")
+    for origin in ("null", "http://127.0.0.1@evil.com", "http://localhost.evil.com", "http://127.0.0.1.evil.com"):
+        check(req("/ping", origin=origin)[1] is None, f"b) {origin} gets no grant")
+
+    # e) DNS rebinding: the Host is the attacker's name, so the request is refused
+    rebound = f"evil.example:{PORT}"
+    for path in ("/ping", "/tasks/active", "/activity", "/media/results/media/pic.png"):
+        status, acao, _v, body = req(path, origin=f"http://{rebound}", host=rebound)
+        check(status == 403 and b"host not allowed" in body, f"e) {path} under a rebinding Host: 403 ({status})")
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    c.request("POST", "/task", body="hello", headers={"Host": rebound, "Origin": f"http://{rebound}",
+                                                       "Content-Type": "text/plain"})
+    r = c.getresponse()
+    r.read()
+    c.close()
+    check(r.status == 403, f"e) POST /task under a rebinding Host: 403 ({r.status})")
+    check(req("/ping", host=rebound, bearer=api.connections_bearer())[0] == 200,
+          "e) a valid bearer is not a rebinding page: allowed")
+    check(req("/ping", host=f"192.168.1.20:{PORT}")[0] == 200, "e) an IP-literal LAN Host: allowed")
+    check(req("/ping", host=f"[::1]:{PORT}")[0] == 200, "e) [::1]: allowed")
+    api.ALLOWED_HOSTS = "my-mac.lan"
+    try:
+        check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 200, "e) a declared LAN name: allowed")
+    finally:
+        api.ALLOWED_HOSTS = ""
+    check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 403, "e) an undeclared name: 403")
+    check(gate.rebinding_safe_host("") and gate.rebinding_safe_host("app.localhost:1"),
+          "e) no Host (no browser) and *.localhost are safe")
 
     # c) state, tasks and text need the bearer; the refusal comes before any existence check
     for path in ("/media/state/agent-activity.jsonl", "/media/tasks/task-1.txt", "/media/results/task-1.txt",
@@ -119,7 +150,17 @@ def main() -> int:
     check(req("/media/state/missing.json", bearer=TOKEN)[0] == 404, "c) with the bearer, a missing file is 404")
     check(req("/media/state/agent-activity.jsonl", bearer="wrong")[0] == 401, "c) a wrong bearer is 401")
 
-    # d) embeddable media in a shared folder needs no bearer
+    # d) embeddable media in a shared folder needs no bearer, judged by where the file really is
+    (WS / "state" / "secret.png").write_bytes(b"\x89PNG private")
+    (WS / "results" / "media" / "smuggled.png").symlink_to(WS / "state" / "secret.png")
+    status, _a, _v, body = req("/media/results/media/smuggled.png")
+    check(status == 401 and b"private" not in body, f"d) a results/ symlink into state/ still needs the bearer ({status})")
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    c.request("GET", "/media/results/media/pic.png", headers={"Host": HOST})
+    r = c.getresponse()
+    r.read()
+    c.close()
+    check(r.getheader("X-Content-Type-Options") == "nosniff", "d) media is served with nosniff")
     status, acao, _v, body = req("/media/results/media/pic.png")
     check(status == 200 and body.startswith(b"\x89PNG"), f"d) an image in results/ embeds without the bearer ({status})")
 
