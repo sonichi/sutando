@@ -5,7 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import
@@ -152,6 +152,63 @@ class Publisher(unittest.TestCase):
         repo = Path(__file__).resolve().parents[1]
         manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())
         self.assertIs(manifest["config"]["LEDGER_STEP_PUBLISH_ENABLED"], False)
+
+
+    def test_truncated_malformed_or_missing_activity_is_best_effort(self):
+        self.pub.publish(self.tasks)
+        self.pub.path.write_bytes(b"junk" * 100 + b"\n{bad json\n")
+        self.row()
+        with patch("ag2_sparrow.task_step_publisher.TAIL_BYTES", 250):
+            self.pub.publish(self.tasks)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_failed_switch_and_worker_are_contained(self):
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=Mock(side_effect=OSError("broken")),
+                            _STEP_PUSH_THREAD=None):
+            gw._publish_task_steps(set(self.tasks))
+            self.assertIsNone(gw._STEP_PUSH_THREAD)
+        with patch.object(gw, "_publish_task_steps_snapshot", side_effect=OSError("private")), \
+                patch.object(gw, "_log") as log:
+            gw._publish_task_steps_now(set(self.tasks))
+            self.assertIn("OSError", log.call_args.args[0])
+            self.assertNotIn("private", log.call_args.args[0])
+
+    def test_attempt_and_envelope_boundaries(self):
+        tasks_dir, results = self.root / "tasks", self.root / "results"
+        tasks_dir.mkdir(); results.mkdir()
+        tid = "task-dev~task-a"
+        envelope = tasks_dir / f"{tid}.txt"
+        attempts = Mock()
+        self.row()
+        with patch.multiple(gw, GATEWAY_INSTANCE="dev", TASKS_DIR=tasks_dir, RESULTS_DIR=results,
+                            _ATTEMPTS=attempts, _STEP_PUBLISHER=self.pub):
+            attempts.entry.return_value = None
+            gw._publish_task_steps_now({tid})
+            for body in ("id: " + tid + "\ntask: missing generation\n",
+                         f"id: {tid}\ntask_id: task-other\nexecution_generation: 3\ntask: bad id\n"):
+                envelope.write_text(body)
+                gw._publish_task_steps_now({tid})
+            envelope.write_text(f"id: {tid}\ntask_id: task-a\nexecution_generation: 3\n"
+                                "channel_id: !r:test\ntask: live\n")
+            for rec in (gw.task_attempts.UNKNOWN, {"finished": True}, {"fenced": "cancelled"},
+                        {"run": tid, "execution_generation": 4}):
+                attempts.entry.return_value = rec
+                gw._publish_task_steps_now({tid})
+            self.assertEqual(self.calls, [])
+            attempts.entry.return_value = {"run": tid, "execution_generation": 3}
+            gw._publish_task_steps_now({tid})
+            self.assertEqual(len(self.calls), 1)
+
+    def test_real_writer_preserves_broker_generation(self):
+        with patch.multiple(gw, TASKS_DIR=self.root / "tasks", RESULTS_DIR=self.root / "results",
+                            GATEWAY_INSTANCE="", _ATTEMPTS=None):
+            gw.RESULTS_DIR.mkdir()
+            gw._write_task({"id": "task-step-gen", "task": "test", "channel_id": "!r:test",
+                            "execution_generation": 9})
+            headers = gw.local_task_protocol.parse_task_headers(
+                (gw.TASKS_DIR / "task-step-gen.txt").read_text()).headers
+            self.assertEqual(headers["execution_generation"], "9")
+            self.assertEqual(headers["task_id"], "task-step-gen")
 
 
 class BridgeLoop(unittest.TestCase):
