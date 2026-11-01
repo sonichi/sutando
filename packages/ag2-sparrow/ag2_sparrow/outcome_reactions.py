@@ -38,24 +38,32 @@ class OutcomeReactionHandler:
 
     @staticmethod
     def _fields(event: dict) -> "dict | None":
-        if event.get("type") not in TYPES:
+        """The signal for an own-message reaction, or None for any other event. Never raises."""
+        if not isinstance(event, dict) or event.get("type") not in TYPES:
             return None
         target, reactor = event.get("target_event_id"), event.get("reactor_id")
         relation = event.get("reactor_relation")
         if not (isinstance(target, str) and isinstance(reactor, str) and relation in ("owner", "member")):
             return None
-        return {"signal": TYPES[event["type"]], "value": str(event.get("key") or "").strip(),
+        key, task, room = event.get("key"), event.get("task_id"), event.get("room_id")
+        return {"signal": TYPES[event["type"]], "value": key.strip() if isinstance(key, str) else "",
                 "reactor_id": reactor, "reactor_relation": relation,
                 "evidence": "direct" if relation == "owner" else "correlated", "ref": target,
-                "task_id": event.get("task_id") or None, "room_id": event.get("room_id") or None}
+                "source_event_id": str(event.get("event_id") or ""),
+                "task_id": task if isinstance(task, str) and task else None,
+                "room_id": room if isinstance(room, str) and room else None}
 
     def claims(self, event: dict) -> bool:
         return self._fields(event) is not None
 
     def offer(self, event: dict) -> list:
-        eid = str(event.get("event_id") or "")
-        fields = self._fields(event)
-        if fields is not None:
+        """The ids to settle: a recorded, already-recorded or unrecordable reaction is settled; one
+        whose write failed is not, so the next drain retries it (and nothing else ever takes it)."""
+        eid = str(event.get("event_id") or "") if isinstance(event, dict) else ""
+        try:
+            fields = self._fields(event)
+            if fields is None:
+                return [eid] if eid else []
             try:
                 from . import correlation_log as cl
             except ImportError:  # run from src/, not the package
@@ -64,6 +72,18 @@ class OutcomeReactionHandler:
                 fields["task_id"] = None  # recorded untasked rather than lost
             if fields["room_id"] and not cl.PATTERNS["room_id"].match(fields["room_id"]):
                 fields["room_id"] = None
+            try:
+                cl.validate("outcome_signal", fields)
+            except ValueError as e:
+                self._log(f"outcome-reactions: {eid} not recorded ({e})")
+                return [eid] if eid else []          # terminal: retrying cannot make it valid
+            if any(r.get("source_event_id") == fields["source_event_id"]
+                   for r in cl.read("outcome_signal", path=self._path)):
+                return [eid]                          # a replay of one already recorded
             if cl.record("outcome_signal", fields, path=self._path) is None:
-                self._log(f"outcome-reactions: {eid} not recorded (refused by the log)")
-        return [eid] if eid else []
+                self._log(f"outcome-reactions: {eid} write failed; kept for the next drain")
+                return []
+            return [eid]
+        except Exception as e:  # noqa: BLE001 - one event must never stall the drain for the rest
+            self._log(f"outcome-reactions: {eid} left for the next drain ({type(e).__name__})")
+            return []

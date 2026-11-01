@@ -7,7 +7,7 @@ record names exact ids only; nothing here infers a link.
 
     kind "outcome_signal": evidence about how a task's result landed, attached beside its label and
     never replacing it; for now a reaction on the agent's own result message
-        {kind, at, signal, value, reactor_id, reactor_relation, evidence, ref, task_id?, room_id?}
+        {kind, at, signal, value, reactor_id, reactor_relation, evidence, ref, source_event_id, task_id?, room_id?}
 
     kind "interaction": an ask we made, so the answer can be joined back by its id, with where it
     happened, captured when it happens and by id only (no names)
@@ -76,12 +76,15 @@ PATTERNS = {
 }
 PATTERNS["reactor_id"] = PATTERNS["counterpart"]
 PATTERNS["ref"] = PATTERNS["event_id"]
+# The delivering event's own id, as the broker numbers it: what makes a replay recognisable.
+PATTERNS["source_event_id"] = re.compile(r"^[A-Za-z0-9$_:.+/=~-]{1,255}$")
 # A reaction key as Matrix carries it: an emoji or a short token, one line, no spaces.
 PATTERNS["value"] = re.compile(r"^\S{1,16}$")
 CHECKS = {"task_id": is_task_id, "run_id": is_run_id}
 
 KINDS = {
-    "outcome_signal": {"required": ("signal", "value", "reactor_id", "reactor_relation", "evidence", "ref"),
+    "outcome_signal": {"required": ("signal", "value", "reactor_id", "reactor_relation", "evidence", "ref",
+                                    "source_event_id"),
                        "optional": ("task_id", "room_id")},
     "interaction": {"required": ("interaction_id", "object", "counterpart"),
                     "optional": ("counterpart_kind", "counterpart_scope", "room_id", "room_kind",

@@ -17,6 +17,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 from ag2_sparrow import correlation_log as cl, event_consumer, event_inbox, human_action, outcome_reactions  # noqa: E402
@@ -127,6 +132,63 @@ class FakeFeed(unittest.TestCase):
         made = [p.read_text() for p in tasks.iterdir()]
         self.assertEqual(len(made), 1, "only the message became a task")
         self.assertNotIn("reaction", made[0])
+
+
+class Durable(unittest.TestCase):
+    """The inbox contract: nothing malformed stalls the drain, nothing failed is lost, nothing replayed doubles."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.inbox = EventInbox(str(self.d / "event-inbox.db"))
+        self.tasks = self.d / "tasks"
+        self.tasks.mkdir()
+        self.log = self.d / "state" / "correlation.jsonl"
+        self.log.parent.mkdir()
+
+    def _chain(self):
+        return HandlerChain([OutcomeReactionHandler(self.log, log=lambda *a: None),
+                             TaskifyHandler(str(self.tasks), "@agent:s.space", threshold=1, log=lambda *a: None)])
+
+    def _drain(self):
+        return EventConsumer(self.inbox, self._chain()).drain()
+
+    def _signals(self):
+        return cl.read("outcome_signal", path=self.log)
+
+    def test_malformed_metadata_never_stalls_the_drain(self):
+        msg = {"type": "message.created", "event_id": "$m9:s.space", "cursor": 9, "room_id": "!dm:s.space",
+               "actor_id": "@guest:s.space", "content": {"body": "hello"}}
+        for ev in (reaction(1), reaction(2, room_id=12345, task_id=7, key=["x"]), msg):
+            self.inbox.insert(ev)
+        self.assertEqual(self._drain()["consumed"], 3)
+        self.assertEqual(self._drain()["consumed"], 0)
+        self.assertEqual(len(self._signals()), 1, "the bad-key reaction is refused, the good one recorded once")
+        self.assertEqual(len(list(self.tasks.iterdir())), 1, "the message behind them still became a task")
+
+    def test_a_failed_write_is_kept_and_recorded_once_storage_is_back(self):
+        self.inbox.insert(reaction(1))
+        self.log.mkdir()                                    # unwritable: the log path is a directory
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._drain()["consumed"], 0)
+        self.assertEqual(len(self.inbox.unconsumed()), 1)
+        self.assertEqual(list(self.tasks.iterdir()), [], "a kept reaction never falls through to taskify")
+        self.log.rmdir()
+        self.assertEqual(self._drain()["consumed"], 1)
+        self.assertEqual(len(self._signals()), 1)
+
+    def test_a_replay_after_the_write_records_nothing_twice(self):
+        ev = reaction(1)
+        self.inbox.insert(ev)
+        OutcomeReactionHandler(self.log, log=lambda *a: None).offer(ev)    # written, then a crash before consume
+        self.assertEqual(self._drain()["consumed"], 1)
+        self.assertEqual([s["source_event_id"] for s in self._signals()], ["$r1:s.space"])
+
+    def test_distinct_reactions_on_one_message_each_count(self):
+        for ev in (reaction(1), reaction(2, kind="reaction.removed"), reaction(3)):
+            self.inbox.insert(ev)
+        self._drain()
+        self.assertEqual([(s["signal"], s["source_event_id"]) for s in self._signals()],
+                         [("reaction", "$r1:s.space"), ("reaction_removed", "$r2:s.space"), ("reaction", "$r3:s.space")])
 
 
 class Wiring(unittest.TestCase):
