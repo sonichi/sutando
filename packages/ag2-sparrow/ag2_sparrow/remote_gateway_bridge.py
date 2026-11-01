@@ -4511,16 +4511,16 @@ def _settle_ledger(inflight: "set[str]") -> None:
 def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
     """Publish the run a newer generation was given, from the serve held for it; the debt clears
     once the run is queued and in flight. A serve whose text is lost fails that generation instead."""
-    rec = _ATTEMPTS.entry(wire_tid)
+    view = _ATTEMPTS.owed_view(wire_tid)      # one snapshot: the run is published with its line, or not at all
+    if view is task_attempts.UNKNOWN:
+        _log_backoff((wire_tid, "rerun-unread"), f"task {wire_tid}: its owed run and what became of the "
+                     "earlier attempt cannot be read — not published yet, retried next beat")
+        return
+    rec, earlier = view
     run = rec.get("owed_publish") if isinstance(rec, dict) else None
     if not isinstance(run, str) or run not in inflight and not _hold_in_flight(inflight, {run}):
         return
-    # Read once, here: the run is published with the line it decides, or not at all.
-    rerun = _earlier_attempt(wire_tid, rec)
-    if rerun is task_attempts.UNKNOWN:
-        _log_backoff((run, "rerun-unread"), f"task {run}: what became of the earlier attempt cannot be read "
-                     "— not published yet, retried next beat")
-        return
+    rerun = _earlier_attempt(wire_tid, rec, earlier)
     try:
         task = {**json.loads(_reserve_path(wire_tid).read_text()), "id": wire_tid}
     except (FileNotFoundError, ValueError, TypeError) as e:
@@ -8735,19 +8735,13 @@ def _really_delivered(record) -> bool:
             and not str(record.get("provider_ref") or "").startswith("settled:"))
 
 
-def _earlier_attempt(wire_tid: str, rec) -> "str | None":
-    """What became of the attempt a newer generation's run replaced, from what this bridge recorded:
-    its answer delivered, its result undelivered but its own room messages sent, or neither; None
-    for a run that replaced nothing; UNKNOWN while the ledger cannot be read."""
-    if rec is task_attempts.UNKNOWN:
-        return task_attempts.UNKNOWN
-    earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
-    if not earlier:
+def _earlier_attempt(wire_tid: str, rec, earlier: "dict | None") -> "str | None":
+    """What became of the attempt a newer generation's run replaced, from what this bridge recorded
+    (`rec` and the replaced run's `earlier` entry, read together): its answer delivered, its result
+    undelivered but its own room messages sent, or neither; None for a run that replaced nothing."""
+    if earlier is None:
         return None
-    entry = {} if rec.get("earlier_delivered") else _ATTEMPTS.run_entry(earlier)
-    if entry is task_attempts.UNKNOWN:
-        return task_attempts.UNKNOWN
-    if rec.get("earlier_delivered") or entry.get("delivered") is True:
+    if rec.get("earlier_delivered") or earlier.get("delivered") is True:
         return "answered"
     records = task_attempts.agent_turn.read_turn_records(_STATE, "", task_id=wire_tid)
     if not records.readable:

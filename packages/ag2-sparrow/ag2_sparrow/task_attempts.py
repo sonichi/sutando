@@ -361,13 +361,19 @@ class TaskAttempts:
             return UNKNOWN
         return _wake_item(wire_tid, rec)
 
-    def run_entry(self, local: str):
-        """What the ledger keeps of a run: its task, number, item, and once finished its lease,
-        generation and whether its answer was delivered; UNKNOWN when the ledger cannot be read."""
+    def owed_view(self, wire_tid: str):
+        """From one read of the ledger: the record, and what it keeps of the run the record's run
+        replaced (its lease, generation and whether its answer was delivered), or None when it
+        replaced none; UNKNOWN when either cannot be read."""
         data = self._read()
-        if data is None:
+        rec = _freeze_entry(_entry_of(data, wire_tid))
+        if rec is UNKNOWN:
             return UNKNOWN
-        return dict((data.get("runs") or {}).get(local) or {})
+        earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
+        runs = data.get("runs") or {}
+        if earlier and not isinstance(runs, dict):
+            return UNKNOWN
+        return rec, (dict(runs.get(earlier) or {}) if earlier else None)
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its
