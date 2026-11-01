@@ -183,7 +183,7 @@ thing to try, in the list's order:
 1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
 2. Rooms.
 3. Commons.
-4. Connect other agents: Dot, Grok Bot, Muse. Claude Code and Codex are Sutando cores chosen at
+4. Connect other agents: Dot, Grokbot, Muse, Duet. Claude Code and Codex are Sutando cores chosen at
    setup, not agents you add.
 5. Teamwork.
 6. Calls & voice: the headphone icon in the room header only.
