@@ -542,11 +542,14 @@ The settle fences the task's turn first, then reads the journal, so no answer of
 after the read; a turn whose fence cannot be had yet keeps the attempt for the next pass. It then
 **closes** the question for good: `true` when the journal proves the answer, else `"unknown"`. No
 answer found never frees a question, since it may have rotated away or (with no turn to fence) still
-be on its way, so the same agent never offers a question twice. A newer generation replacing a run
+be on its way, so the same agent never offers a question twice. The cost is deliberate: a task that
+ends without answering leaves its question closed, and no later task of this agent is offered it, so
+a question left unanswered here is not a bug. A newer generation replacing a run
 closes that run's question in the same write, since the earlier run may still answer. Only an offer
 creates an entry, within 2,000: free and expired entries are forgotten first, then the oldest closed
 ones (the broker refuses a second answer from the same respondent, so a forgotten question is never
-answered twice). A live hold is never forgotten; only 2,000 of them at once withhold a new offer. A settle whose entry was
+answered twice). A live hold is never forgotten, even past `expires_at` (a clock ahead of the broker's would hand it
+to a second task); only 2,000 of them at once withhold a new offer. A settle whose entry was
 forgotten as expired writes nothing.
 
 A task the broker closed is withdrawn from the inbox if the core has not taken it. Once taken, and

@@ -936,18 +936,95 @@ class AnsweredOnce(unittest.TestCase):
                 a._commit(lambda d: d.setdefault("questions", {}).__setitem__("rq_1", entry), why="test")
                 self.assertEqual(call(a, "tsk_B", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
 
-    def test_a_settle_after_its_expired_question_was_forgotten_writes_nothing(self):
+    def test_a_clock_jumped_past_expiry_never_hands_a_live_hold_to_another_task(self):
         a = self.mk(turn_context=True)
+        q1 = {"question_id": "q1", "expires_at": 1000}
         with unittest.mock.patch.object(task_attempts, "QUESTIONS_KEPT", 1):
-            self.served(a, "tsk_old")
-            call(a, "tsk_old", "answer_rule", {"question_id": "q_old", "expires_at": 0})
-            self.turn(a, "tsk_old")
-            with unittest.mock.patch.object(a, "now", lambda: task_attempts.QUESTION_EXPIRY_GRACE_S + 1):
-                self.served(a, "tsk_new")
-                self.assertIn(self.RULE, call(a, "tsk_new", "answer_rule", {"question_id": "q_new"}))
-            with unittest.mock.patch.object(agent_turn, "answered_in_journal", return_value=None):
-                call(a, "tsk_old", "finish")
-            self.assertEqual(list(a._read()["questions"]), ["q_new"], "no tombstone outside the bound")
+            self.served(a, "tsk_A")
+            self.assertIn(self.RULE, call(a, "tsk_A", "answer_rule", q1))
+            self.turn(a, "tsk_A")
+            jumped = lambda: 1000 + task_attempts.QUESTION_EXPIRY_GRACE_S + 1    # noqa: E731
+            with unittest.mock.patch.object(a, "now", jumped):
+                self.served(a, "tsk_B")
+                self.assertEqual(call(a, "tsk_B", "answer_rule", {"question_id": "q2"}),
+                                 task_attempts.ANSWER_UNRECORDED_NOTE, "A's live hold is never displaced")
+                self.served(a, "tsk_C")
+                self.assertEqual(call(a, "tsk_C", "answer_rule", q1), task_attempts.ANSWERING_ELSEWHERE_NOTE,
+                                 "A still holds q1: C never gets the rule")
+            self.assertEqual(a._read()["questions"]["q1"]["holder"], "tsk_A")
+            call(a, "tsk_A", "finish")                  # closed now, and past expiry: it may go
+            with unittest.mock.patch.object(a, "now", jumped):
+                self.assertIn(self.RULE, call(a, "tsk_B", "answer_rule", {"question_id": "q2"}))
+            self.assertEqual(list(a._read()["questions"]), ["q2"])
+
+    def test_the_unbound_run_a_newer_generation_replaces_never_shares_the_rule(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_A")                         # served, never acked: no turn to fence
+        self.assertIn(self.RULE, call(a, "tsk_A", "answer_rule", self.Q))
+        self.assertIsNone(a.entry("tsk_A").get("turn_id"))
+        with a.transition("tsk_A") as t:
+            self.assertTrue(t.hold_serve("L2", "tsk_A~~2", None))
+            c = t.claim("ack", serve="L2")
+            self.assertIsNotNone(t.switch_run(c, {**_ack(2), "task_id": "tsk_A"}, {}))
+        real = agent_turn.answered_in_journal
+
+        def read_then_old_run_answers(*args):
+            out = real(*args)                            # the new run's read finds nothing...
+            with open(agent_turn.room_actions_path(self.state), "a") as fh:   # ...then the old run answers, unbound
+                for rec in ({"record_type": "dispatch_intent", "task_id": "tsk_A", "ts": 2e9, "operation_id": "op_old",
+                             "action": "room.question.answer", "question_id": "rq_1"},
+                            {"record_type": "dispatch_outcome", "task_id": "tsk_A", "ts": 2e9, "operation_id": "op_old",
+                             "operation_status": "succeeded"}):
+                    fh.write(json.dumps(rec) + "\n")
+            return out
+        with unittest.mock.patch.object(agent_turn, "answered_in_journal", side_effect=read_then_old_run_answers):
+            self.assertEqual(call(a, "tsk_A", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE,
+                             "the new run is never handed the rule the old run may still use")
+
+    def test_a_previous_writers_cutoff_missing_or_non_finite_never_frees_an_answered_question(self):
+        for since in ("missing", float("nan"), float("inf"), float("-inf")):
+            with self.subTest(since=since):
+                self.state = Path(tempfile.mkdtemp())
+                a = self.mk(turn_context=True)
+                self.served(a, "tsk_A")
+                self.assertIn(self.RULE, call(a, "tsk_A", "answer_rule", self.Q))
+                self.answer_in_journal(self.turn(a, "tsk_A"), "tsk_A")       # answered; then the bridge dies
+
+                def legacy(d):                           # the shape the previous version left
+                    d["questions"]["rq_1"] = {"holder": "tsk_A", **({} if since == "missing" else {"since": since})}
+                    d["tasks"]["tsk_A"].pop("answer_offered_at", None)
+                a._commit(legacy, why="test")
+                self.rotate_twice(ts=3e9)
+                put(a, "tsk_A", awaiting_ack=False)
+                a.sweep([])                              # the restart's recovery
+                self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"})
+                self.served(a, "tsk_B")
+                self.assertEqual(call(a, "tsk_B", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+
+    def test_a_clock_set_back_after_the_offer_never_frees_an_answered_question(self):
+        a = self.mk(turn_context=True)                   # offered at 1000
+        self.served(a, "tsk_A")
+        self.assertIn(self.RULE, call(a, "tsk_A", "answer_rule", self.Q))
+        turn = self.turn(a, "tsk_A")
+        with open(agent_turn.room_actions_path(self.state), "a") as fh:     # answered at 900: the clock went back
+            for rec in ({"record_type": "dispatch_intent", "turn_id": turn, "task_id": "tsk_A", "ts": 900.0,
+                         "operation_id": "op_b", "action": "room.question.answer", "question_id": "rq_1"},
+                        {"record_type": "dispatch_outcome", "turn_id": turn, "task_id": "tsk_A", "ts": 900.0,
+                         "operation_id": "op_b", "operation_status": "succeeded"}):
+                fh.write(json.dumps(rec) + "\n")
+        self.rotate_twice(ts=950.0)                      # kept history still "older" than the offer
+        put(a, "tsk_A", awaiting_ack=False)
+        a.sweep([])
+        self.assertEqual(a._read()["questions"]["rq_1"], {"answered": "unknown"})
+        self.served(a, "tsk_B")
+        self.assertEqual(call(a, "tsk_B", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+
+    def rotate_twice(self, ts):
+        live = agent_turn.room_actions_path(self.state)
+        for n in range(2):
+            os.replace(live, live.with_name(live.name + ".1"))
+            live.write_text(json.dumps({"record_type": "dispatch_intent", "task_id": "tsk_other", "ts": ts + n,
+                                        "operation_id": f"op_r{n}", "action": "room.message.send"}) + "\n")
 
     def test_a_swept_attempt_frees_or_closes_the_question_it_held(self):
         for answered, want in ((False, {"answered": "unknown"}), (True, {"answered": True}),

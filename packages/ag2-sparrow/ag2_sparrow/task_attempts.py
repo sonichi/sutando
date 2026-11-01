@@ -1501,8 +1501,10 @@ def _expiry(question) -> "float | None":
 
 
 def _forgettable(q: dict, now: float) -> bool:
-    """Forgetting it can never lead to a second answer: nobody holds it and nobody answered it, or
-    it expired (the broker takes no answer then)."""
+    """Not held, and either free or expired (the broker takes no answer then). A live hold is never
+    forgotten on local time: a clock ahead of the broker's would hand it to a second task."""
+    if "holder" in q:
+        return False
     expires = q.get("expires")
     return (expires is not None and now > expires + QUESTION_EXPIRY_GRACE_S) or not set(q) - {"expires"}
 
