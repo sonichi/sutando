@@ -447,7 +447,8 @@ Sutando checkout around it sends neither field.
   carries one writer-owned line saying what became of the earlier attempt, from what the bridge
   recorded: its answer delivered (a real receipt, not one the broker settled by refusing it), its
   result undelivered but its own `room.message.send` messages sent, unknown (the journal cannot be
-  read), or not delivered. So the core never takes it for a redelivery it already answered.
+  read), or not delivered. So the core never takes it for a redelivery it already answered. The run
+  is published only once that can be read; until then it stays owed and its held serve is kept.
   A wake is a new run too, even under the same generation; a replay of the same episode reuses
   its run and publishes nothing.
 - Every change to a task's attempt is one transition under that task's lock, committed to

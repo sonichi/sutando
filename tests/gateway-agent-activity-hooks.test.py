@@ -3440,6 +3440,44 @@ class Hooks(unittest.TestCase):
                 self.assertEqual([r for r in rules.values() if r in text], [rules[verdict]], "exactly one")
                 (gw._STATE / "room-actions.jsonl").unlink(missing_ok=True)
 
+    def test_a_newer_run_is_published_only_once_what_became_of_the_earlier_answer_can_be_read(self):
+        rules = gw.task_attempts.RERUN_RULES
+        for case, verdict in (("refused", "not_delivered"), ("delivered", "answered")):
+            for fault in ("ledger", "reserve"):
+                with self.subTest(case=case, fault=fault):
+                    tid = f"task-unread-{case}-{fault}"
+                    fake = self.served_acked(tid)
+                    if case == "refused":
+                        fake.answers["/v1/results"] = _http(409, {"error_code": "stale_execution_generation"})
+                    self.core_writes(tid, "generation 1's answer")
+                    old = time.time() - 5
+                    os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+                    inflight = {tid}
+                    gw._post_ready_results(inflight)
+                    fake.answers["/v1/results"] = {"ok": True}
+                    self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+                    fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+                    self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                    run, reserve = f"{tid}~~2", gw._reserve_path(tid)
+                    real_read = gw.Path.read_text
+                    stuck = (mock.patch.object(gw._ATTEMPTS, "run_entry", return_value=gw.task_attempts.UNKNOWN)
+                             if fault == "ledger" else mock.patch.object(
+                                 gw.Path, "read_text", autospec=True, side_effect=lambda p, *a, **k: (
+                                     (_ for _ in ()).throw(PermissionError(13, "denied")) if p == reserve
+                                     else real_read(p, *a, **k))))
+                    with stuck:
+                        gw._post_task_beats(inflight, force=True)
+                    self.assertFalse((gw.TASKS_DIR / f"{run}.txt").exists(), "withheld while it cannot be read")
+                    self.assertEqual((gw._ATTEMPTS.get(tid)["owed_publish"], reserve.exists()), (run, True),
+                                     "still owed, its serve kept")
+                    self.assertIsNone(gw._ATTEMPTS.get(tid).get("dispatch_lost"), "never failed for a read error")
+                    gw._post_task_beats(inflight, force=True)
+                    text = (gw.TASKS_DIR / f"{run}.txt").read_text()
+                    self.assertEqual([r for r in rules.values() if r in text], [rules[verdict]], "the right line, once")
+                    self.assertEqual(text.count("task: "), 1)
+                    self.assertIsNone(gw._ATTEMPTS.get(tid).get("owed_publish"))
+                    self.assertFalse(reserve.exists())
+
     def test_the_same_lease_served_again_after_its_run_finished_is_still_a_redelivery(self):
         tid = "task-stale-then-l1"
         fake, _ = self.stale_refused_then_served_again(tid)

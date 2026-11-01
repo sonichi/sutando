@@ -4515,19 +4515,29 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
     run = rec.get("owed_publish") if isinstance(rec, dict) else None
     if not isinstance(run, str) or run not in inflight and not _hold_in_flight(inflight, {run}):
         return
+    # Read once, here: the run is published with the line it decides, or not at all.
+    rerun = _earlier_attempt(wire_tid, rec)
+    if rerun is task_attempts.UNKNOWN:
+        _log_backoff((run, "rerun-unread"), f"task {run}: what became of the earlier attempt cannot be read "
+                     "— not published yet, retried next beat")
+        return
     try:
         task = {**json.loads(_reserve_path(wire_tid).read_text()), "id": wire_tid}
-    except (OSError, ValueError, TypeError) as e:
+    except (FileNotFoundError, ValueError, TypeError) as e:
         with _ATTEMPTS.transition(wire_tid) as t:
-            if t.rec.get("owed_publish") == run and _fail_unanswered(
+            if isinstance(t.rec, dict) and t.rec.get("owed_publish") == run and _fail_unanswered(
                     t, run, DISPATCH_LOST_RESULT, f"its served task could not be read ({diagnostics.describe(e)})"):
                 t.put(owed_publish=None)
         return
-    if not _write_task(task, run=run):
+    except OSError as e:
+        _log_backoff((run, "reserve-unread"), f"task {run}: its served task cannot be read now "
+                     f"({diagnostics.describe(e)}) — not published yet, retried next beat")
+        return
+    if not _write_task(task, run=run, rerun=rerun):
         _log_backoff((run, "unpublished"), f"task {run}: its run is not published yet — retried next beat")
         return
     with _ATTEMPTS.transition(wire_tid) as t:
-        if t.rec.get("owed_publish") == run and t.put(owed_publish=None):
+        if isinstance(t.rec, dict) and t.rec.get("owed_publish") == run and t.put(owed_publish=None):
             _drop_reserve(wire_tid)
 
 
@@ -5523,7 +5533,8 @@ def _task_intake_veto(task: dict) -> "str | None":
     return reason
 
 
-def _write_task(task: dict, hold: bool = False, run: "str | None" = None) -> "tuple[str, bool] | None":
+def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
+                rerun: "str | None" = None) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
     committed, which is what an ack may claim — or None when nothing was queued.
@@ -5707,9 +5718,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None) -> "tu
     # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
     # closing the Team session route removed the only thing that used to deliver it.
     lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
-    earlier = _earlier_attempt(broker_tid) if run is not None and _ATTEMPTS is not None else None
-    if earlier:
-        lines.append(task_attempts.rerun_rule(earlier))
+    if rerun:
+        lines.append(task_attempts.rerun_rule(rerun))
     if TURN_CONTEXT:
         if woken:
             lines.append(task_attempts.wake_turn_rule(woken))
@@ -8725,15 +8735,19 @@ def _really_delivered(record) -> bool:
             and not str(record.get("provider_ref") or "").startswith("settled:"))
 
 
-def _earlier_attempt(wire_tid: str) -> "str | None":
+def _earlier_attempt(wire_tid: str, rec) -> "str | None":
     """What became of the attempt a newer generation's run replaced, from what this bridge recorded:
     its answer delivered, its result undelivered but its own room messages sent, or neither; None
-    for a run that replaced nothing."""
-    rec = _ATTEMPTS.entry(wire_tid)
+    for a run that replaced nothing; UNKNOWN while the ledger cannot be read."""
+    if rec is task_attempts.UNKNOWN:
+        return task_attempts.UNKNOWN
     earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
     if not earlier:
         return None
-    if rec.get("earlier_delivered") or _ATTEMPTS.run_entry(earlier).get("delivered") is True:
+    entry = {} if rec.get("earlier_delivered") else _ATTEMPTS.run_entry(earlier)
+    if entry is task_attempts.UNKNOWN:
+        return task_attempts.UNKNOWN
+    if rec.get("earlier_delivered") or entry.get("delivered") is True:
         return "answered"
     records = task_attempts.agent_turn.read_turn_records(_STATE, "", task_id=wire_tid)
     if not records.readable:

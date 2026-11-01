@@ -91,9 +91,9 @@ RERUN_RULES = {
         "`room.message.send` were. Do not repeat those: finish the task, post only what the room has "
         "not seen yet, and start the result file with `[no-send]` if nothing remains."),
     "unknown": (
-        "This is a NEW generation of this task, re-issued by the broker; it is NOT a redelivery. The "
-        "earlier attempt's result was never delivered; whether messages it sent to the room went out "
-        "cannot be read. Check the room first, repeat nothing it already shows, and answer the rest."),
+        "This is a NEW generation of this task, re-issued by the broker; it is NOT a redelivery. "
+        "Whether the earlier attempt's answer or the messages it sent reached the room cannot be "
+        "established. Check the room first, repeat nothing it already shows, and answer the rest."),
     "answered": (
         "This is a NEW generation of this task, re-issued by the broker. The earlier attempt's answer "
         "WAS delivered: do not post it again. Start this task's result file with `[no-send]` unless "
@@ -361,11 +361,13 @@ class TaskAttempts:
             return UNKNOWN
         return _wake_item(wire_tid, rec)
 
-    def run_entry(self, local: str) -> dict:
+    def run_entry(self, local: str):
         """What the ledger keeps of a run: its task, number, item, and once finished its lease,
-        generation and whether its answer was delivered."""
+        generation and whether its answer was delivered; UNKNOWN when the ledger cannot be read."""
         data = self._read()
-        return dict(((data or {}).get("runs") or {}).get(local) or {})
+        if data is None:
+            return UNKNOWN
+        return dict((data.get("runs") or {}).get(local) or {})
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its
