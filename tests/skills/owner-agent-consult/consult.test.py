@@ -955,6 +955,46 @@ class TestExpiryAndPending(WorldCase):
         self.assertTrue(policy._record_path(self.w.ws[SELF], "nudged", C1).exists())
         self.assertTrue(policy._root_claim(self.w.ws[SELF], TID).exists())
 
+    def _expired_nudged_and_done(self, binding=None):
+        self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() - 8 * 86400)
+        if binding is not None:
+            policy._claim_file(policy._key_path(self.w.ws[SELF], "bound", "$answer"), binding)
+        policy.mark_nudged(self.w.ws[SELF], C1)
+        (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
+        return policy.pending(self.w.ws[SELF], 600)
+
+    def test_a_malformed_answer_binding_does_not_keep_an_expired_consult_listed(self):
+        # --final refuses a malformed binding, so it can never close: it held the row forever.
+        self.assertEqual(self._expired_nudged_and_done({"cid": C1, "disposition": "answer"}), [])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1], "hidden, never deleted")
+
+    def test_control_a_well_formed_answer_binding_still_keeps_it_listed(self):
+        rows = self._expired_nudged_and_done({"cid": C1, "disposition": "answer",
+                                              "payload": {"reply_text": "yes"}, "record": {"cid": C1}})
+        self.assertEqual([r["cid"] for r in rows], [C1])
+
+    def test_a_dotted_named_instance_id_with_a_live_task_is_still_seen(self):
+        # The listing shortcut only answers for ids without a `.`; this one takes the full lookup.
+        tid = "task-dev~ask.5"
+        ws = self.w.ws[SELF]
+        (ws / "tasks" / f"{tid}.txt").write_text(f"id: {tid}\nsource: ag2space\ntask: x\n")
+        policy._claim_file(policy._root_claim(ws, tid), {"cid": C2})
+        self.assertEqual([(r["task_id"], r.get("claim_only")) for r in policy.pending(ws, 600)],
+                         [(tid, True)])
+
+    def test_dead_tasks_cost_no_task_file_lookup(self):
+        ws, old = self.w.ws[SELF], time.time() - 9 * 86400
+        for i in range(20):
+            cid, tid = f"{i:016x}", f"task-{1700000000000 + i}"
+            policy._write_record(policy._record_path(ws, "pending", cid),
+                                 {"cid": cid, "task_id": tid, "asked_at": old, "ask_event": f"$a{i}"})
+            policy._write_record(policy._record_path(ws, "nudged", cid), {"cid": cid, "asked_at": old})
+            policy._claim_file(policy._root_claim(ws, tid), {"cid": cid})
+        import task_archive
+        with mock.patch.object(task_archive, "find_task_file", wraps=task_archive.find_task_file) as lookup:
+            self.assertEqual(policy.pending(ws, 600), [])
+        self.assertEqual(lookup.call_count, 0, "a dead task is answered from one listing of tasks/")
+
     def test_overdue_consults_are_due_a_nudge_once(self):
         self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() - 700)
         [row] = policy.pending(self.w.ws[SELF], 600)
