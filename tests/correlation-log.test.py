@@ -73,7 +73,9 @@ class Writer(unittest.TestCase):
             with self.assertRaises(ValueError, msg=why) as cm:
                 cl.validate(kind, fields)
             self.assertIn(why, str(cm.exception))
-        for task in ("task-s-space~task-182c2b5ce99cc9e8ae", "task-9f06cb8851db56858f",
+        for task in ("task-s_dspace~task-9905cc47dfa0f6b12e", "task-ag2space_dlocal~task-c5acab9841335db0ad",
+                     "task-chat-1730000000", "task-rtapi", "ask-mtaczepu-fkpdtqqe",
+                     "task-s-space~task-182c2b5ce99cc9e8ae", "task-9f06cb8851db56858f",
                      "worker-pin-1792961761921-60fb041f", "task-local-hs~worker-pin-1790398604983-fada1e1c"):
             self.assertEqual(cl.validate("interaction", dict(GOOD, task_id=task))["task_id"], task)
         rec = cl.validate("interaction", dict(GOOD, run_id=None, event_id=""))
@@ -186,8 +188,12 @@ class Trailers(unittest.TestCase):
                          "Sutando-Task: task-s-space~task-1a2b3c\nSutando-Run: task-1a2b3c~2\n"
                          "Interaction-Id: ix_0123456789ab")
         self.assertEqual(cl.trailers(task_id=" task-1 "), "Sutando-Task: task-1")
+        self.assertEqual(cl.trailers("task-s_dspace~task-9905cc47dfa0f6b12e", "task-s_dspace~task-9905cc47dfa0f6b12e~3"),
+                         "Sutando-Task: task-s_dspace~task-9905cc47dfa0f6b12e\n"
+                         "Sutando-Run: task-s_dspace~task-9905cc47dfa0f6b12e~3")
         for bad in ({"task_id": "two words"}, {"interaction_id": "ix_x"}, {"task_id": "@chi:s.space"},
-                    {"task_id": "!room:s.space"}, {"run_id": "task-1a2b3c"}, {"task_id": "Chi Wang"}):
+                    {"task_id": "!room:s.space"}, {"run_id": "task-1a2b3c"}, {"task_id": "Chi Wang"},
+                    {"task_id": "Mary-Jane"}, {"task_id": "chi"}, {"task_id": ".."}, {"run_id": "task-1~x"}):
             with self.assertRaises(ValueError):
                 cl.trailers(**bad)
 

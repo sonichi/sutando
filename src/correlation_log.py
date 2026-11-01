@@ -32,24 +32,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from file_lock import locked_file  # noqa: E402
+from local_task_protocol import valid_archive_lookup_id  # noqa: E402
 
 LOG_NAME = "correlation.jsonl"
 MAX_BYTES = 8 * 1024 * 1024
 FIELD_MAX = 300
 INTERACTION_RE = re.compile(r"^ix_[0-9a-f]{12}$")
 _HOST = r"[A-Za-z0-9.-]+(?::\d{1,5})?"
-_SEG = r"[a-z0-9-]{1,100}"
-TASK_RE = re.compile(rf"^[a-z]{_SEG}(?:~{_SEG}){{0,3}}$")
-RUN_RE = re.compile(rf"^[a-z]{_SEG}(?:~{_SEG}){{0,3}}~\d{{1,9}}$")
+
+
+def is_task_id(value: str) -> bool:
+    """A task id as the engine names its task files (the shared filename-safe id charset, so lane
+    segments like `s_dspace` pass), lowercase-led and hyphenated, so a name or handle never does."""
+    return isinstance(value, str) and valid_archive_lookup_id(value) and value[:1].islower() and "-" in value
+
+
+def is_run_id(value: str) -> bool:
+    """A task id plus `~<attempt>`."""
+    task, _, n = value.rpartition("~") if isinstance(value, str) else ("", "", "")
+    return n.isdigit() and len(n) <= 9 and is_task_id(task)
+
+
 PATTERNS = {
     "counterpart": re.compile(rf"^@[a-z0-9._=/+-]{{1,255}}:{_HOST}$"),
     "room_id": re.compile(rf"^![A-Za-z0-9._~=+-]{{1,255}}:{_HOST}$"),
     "event_id": re.compile(rf"^\$[A-Za-z0-9_+/=-]{{1,255}}(?::{_HOST})?$"),
     "object": re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#\d{1,9}$"),
     "interaction_id": INTERACTION_RE,
-    "task_id": TASK_RE,
-    "run_id": RUN_RE,
 }
+CHECKS = {"task_id": is_task_id, "run_id": is_run_id}
 
 KINDS = {
     "interaction": {"required": ("interaction_id", "object", "counterpart"),
@@ -98,8 +109,8 @@ def validate(kind: str, fields: dict) -> dict:
     for key, allowed in ENUMS.items():
         if key in rec and rec[key] not in allowed:
             raise ValueError(f"{key} must be one of {allowed}")
-    for key, rx in PATTERNS.items():
-        if key in rec and not rx.match(rec[key]):
+    for key, ok in list(PATTERNS.items()) + list(CHECKS.items()):
+        if key in rec and not (ok.match(rec[key]) if hasattr(ok, "match") else ok(rec[key])):
             raise ValueError(f"{key} is not a valid id for that field")
     return rec
 
@@ -168,11 +179,11 @@ def trailers(task_id: "str | None" = None, run_id: "str | None" = None,
              interaction_id: "str | None" = None) -> str:
     """Git trailer lines for a commit or PR body; empty when no id is given."""
     lines = []
-    for label, value, rx in (("Sutando-Task", task_id, TASK_RE), ("Sutando-Run", run_id, RUN_RE),
-                             ("Interaction-Id", interaction_id, INTERACTION_RE)):
+    for label, value, ok in (("Sutando-Task", task_id, is_task_id), ("Sutando-Run", run_id, is_run_id),
+                             ("Interaction-Id", interaction_id, INTERACTION_RE.match)):
         if value:
             value = str(value).strip()
-            if not rx.match(value):
+            if not ok(value):
                 raise ValueError(f"{label}: {value!r} is not an id")
             lines.append(f"{label}: {value}")
     return "\n".join(lines)

@@ -722,7 +722,7 @@ def main() -> int:
         return 7
     if a.task:
         log = _correlation()
-        if log is not None and not log.TASK_RE.match(a.task):
+        if log is not None and not log.is_task_id(a.task):
             print(f"REFUSED: --task {a.task!r} is not a task id (the task file's `id:` header).", file=sys.stderr)
             return 7
     a.message = resolve_body(a.message, a.body_file)
