@@ -6,6 +6,7 @@ to outbox_adapter with Slack's receipt key (`ts`) pinned.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +25,9 @@ PARK_AT_ATTEMPTS = 5
 SLACK_ID_KEYS = ("ts",)
 
 _BACKENDS: dict = {}
+# Inside the backend's 300 s reclaim TTL recover() retires nothing, so one pass at start would not do.
+RECOVER_EVERY_S = 600.0
+_LAST_RECOVER: dict = {}
 
 
 def result_backend(results_dir: Path) -> DesignAClaimBackend:
@@ -34,6 +38,21 @@ def result_backend(results_dir: Path) -> DesignAClaimBackend:
     if b is None:
         b = _BACKENDS[root] = DesignAClaimBackend(root)
     return b
+
+
+def recover_claims(results_dir: Path) -> list:
+    """Retire the claims a crash left on terminal items. complete() writes the terminal status,
+    then releases the claim, and claim_for_send never claims a DELIVERED or PARKED item again,
+    so only recover() reaches such a claim. It releases one only on a terminal item whose owner
+    is dead past the reclaim TTL, so live work is never displaced. At most once per
+    RECOVER_EVERY_S per root, the first call at once; returns the retired ids."""
+    b = result_backend(results_dir)
+    now = time.monotonic()
+    last = _LAST_RECOVER.get(b.root)
+    if last is not None and 0 <= now - last < RECOVER_EVERY_S:
+        return []
+    _LAST_RECOVER[b.root] = now
+    return sorted(b.recover().retired)
 
 
 def is_delivered(results_dir: Path, task_id: str) -> bool:

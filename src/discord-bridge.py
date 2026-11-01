@@ -2687,6 +2687,19 @@ def _recover_orphan_sending_files() -> int:
     return _proactive_fence().recover()
 
 
+def _recover_result_claims() -> None:
+    """Each poll_results pass (throttled in _drd): retire the result claims a crash stranded on
+    terminal outbox items. Fails open: recovery serves the operator, never delivery."""
+    try:
+        retired = _drd.recover_claims(RESULTS_DIR)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [outbox] result claim recovery failed ({type(e).__name__}: {e}); delivery continues", flush=True)
+        return
+    if retired:
+        print(f"  [outbox] retired {len(retired)} result claim(s) a crash left on terminal items: "
+              f"{', '.join(retired[:5])}{' …' if len(retired) > 5 else ''}", flush=True)
+
+
 # Guards the once-only startup of the long-lived poll loops below. `on_ready`
 # re-fires on every gateway reconnect, so without this the loops accumulate.
 _poll_loops_started = False
@@ -4912,6 +4925,7 @@ async def poll_results():
                 last_heartbeat = now
             except Exception:
                 pass
+        _recover_result_claims()
 
         # A task written straight into tasks/ was never in pending_replies, so
         # its result would sit forever. Adopt the route it declared, then let

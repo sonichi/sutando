@@ -1708,6 +1708,7 @@ def result_watcher():
         try:
             # Surface tasks the core never answered (timeout → visible reply).
             _check_task_timeouts()
+            _recover_result_claims()
 
             # Replies to pending tasks
             with pending_replies_lock:
@@ -1900,6 +1901,19 @@ def _no_events_hint_thread():
 def _recover_orphan_sending_files() -> int:
     """Recover this adapter's stranded proactive delivery claims."""
     return recover_orphan_sending_files(RESULTS_DIR)
+
+
+def _recover_result_claims() -> None:
+    """Each result_watcher pass (throttled in _srd): retire the reply claims a crash stranded on
+    terminal outbox items. Fails open: recovery serves the operator, never delivery."""
+    try:
+        retired = _srd.recover_claims(RESULTS_DIR)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [outbox] reply claim recovery failed ({type(e).__name__}: {e}); delivery continues", flush=True)
+        return
+    if retired:
+        print(f"  [outbox] retired {len(retired)} reply claim(s) a crash left on terminal items: "
+              f"{', '.join(retired[:5])}{' …' if len(retired) > 5 else ''}", flush=True)
 
 
 def main():  # pragma: no cover
