@@ -981,3 +981,27 @@ when a task file supplies one, and the CLI rejects an explicit `--room`.
 Clients must distinguish a roomless wedge from other roomless kinds; missing
 `room` alone does not mean global. This is a writer contract, not a change to
 client rendering. No historical rows are rewritten.
+
+### Owner task step summaries
+
+The bridge publishes `working` and `thinking` rows from `state/agent-activity.jsonl`
+through `POST /api/capabilities/v1/actions/execute` on the gateway's origin, using
+that connection's agent bearer. The `room.task.update` Action carries top-level
+`task_id`, `execution_generation` and `operation_id`, with arguments
+`status: working` and `summary` (one line, at most 140 characters). This updates
+the owner-only ledger summary and `last_reported_at`; it does not send a room
+message. Other room members see only the backend's active-task count.
+
+Only in-flight tasks belonging to this bridge's connection qualify. The bridge
+preserves the served task's broker ID and generation above the body in its local
+envelope. Missing generation/room, another connection's task, a locally finished
+or fenced attempt, a ready result, and terminal activity are skipped. Health,
+notice, processing and projected rows are never published. Existing envelopes
+without generation remain unchanged and are skipped.
+
+The latest eligible summary is coalesced per task and sent only when it changes,
+at most once per ten seconds (including failed attempts). An Action failure logs
+its exception type and leaves task processing running; the next eligible pass
+may retry with the same operation ID for the same row. Deduplication and timing
+are process-local; restarting may replay the latest row with its same operation
+ID. No new configuration or lifecycle-v2 opt-in is needed for served generations.

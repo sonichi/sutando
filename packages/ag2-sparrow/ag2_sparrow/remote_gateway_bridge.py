@@ -357,6 +357,7 @@ from .result_publish import (is_staged_for as _is_staged_for, publish_staged as 
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from . import task_attempts
+from . import task_step_publisher
 from . import task_hold
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
@@ -2517,7 +2518,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "picker_command", "picker_args",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.
-                "source", "channel_id",
+                "source", "channel_id", "source_room_id", "task_id", "execution_generation",
                 # Declares the task-mid shape (one-line body, writer-owned trailer) so a
                 # verified reader may trust the lines below task:. Above it: a body cannot claim it.
                 "task_layout",
@@ -2531,7 +2532,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "addressed_to",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
-                "thread_root", "source_room_id",
+                "thread_root",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total, and the
                 # broker's own dm|room verdict so a skill need not count members.
@@ -2954,7 +2955,7 @@ def _read_by(resp, deadline: float) -> bytes:
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
-         deadline: "float | None" = None, operation_id: "str | None" = None):
+         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
     `deadline` (time.monotonic()), the whole request must finish by then. `operation_id` is a
     claimed effect's idempotency key, the same on every retry of it."""
@@ -2965,7 +2966,8 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
             raise TimeoutError("request deadline already passed")
     with _gateway_call():
         data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
+        base = urllib.parse.urlunsplit((*urllib.parse.urlsplit(URL)[:2], "", "", "")) if origin else URL
+        req = urllib.request.Request(f"{base}{path}", data=data, method=method)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Accept", "application/json")
         # CloudFlare bot-fight (error 1010) rejects python-urllib's default
@@ -4051,6 +4053,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
+    _publish_task_steps(inflight)
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
@@ -4101,6 +4104,44 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {diagnostics.describe(e)} — continuing")
         return False
+
+
+def _send_task_step(payload: dict):
+    return _req("POST", "/api/capabilities/v1/actions/execute", payload,
+                timeout=10, operation_id=payload["operation_id"], origin=True)
+
+
+_STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)
+
+
+def _publish_task_steps(inflight: set[str]) -> None:
+    tasks = {}
+    for tid in inflight:
+        if not gateway_instance.owns(tid, GATEWAY_INSTANCE):
+            continue
+        wire = _broker_tid(tid)
+        if not _valid_tid(wire) or (RESULTS_DIR / f"{tid}.txt").exists():
+            continue
+        if _ATTEMPTS is not None:
+            rec = _ATTEMPTS.entry(wire)
+            if (rec is task_attempts.UNKNOWN or isinstance(rec, dict) and
+                    (rec.get("finished") or rec.get("fenced") or _run_tid(wire, rec) != tid)):
+                continue
+        path = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+        if path is None:
+            continue
+        try:
+            headers = local_task_protocol.parse_task_headers(path.read_text()).headers
+            gen = int(headers.get("execution_generation", ""))
+        except (OSError, ValueError):
+            continue
+        if _ATTEMPTS is not None and isinstance(rec, dict) and rec.get("execution_generation") != gen:
+            continue
+        if headers.get("task_id") != wire or headers.get("id") != tid:
+            continue
+        tasks[tid] = {"task_id": wire, "execution_generation": gen,
+                      "room_id": headers.get("source_room_id") or headers.get("channel_id")}
+    _STEP_PUBLISHER.publish(tasks)
 
 
 def _claim_ack(wire_tid: str, lease_id: "str | None"):
@@ -5551,6 +5592,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
+        task["task_id"] = broker_tid
     woken = None
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication
