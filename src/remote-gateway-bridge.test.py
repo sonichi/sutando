@@ -130,17 +130,17 @@ class Handler(BaseHTTPRequestHandler):
             })
             self.send_response(200); self.end_headers()
         elif self.path == "/v1/room":
+            n = int(self.headers.get("Content-Length") or 0)
+            post = json.loads(self.rfile.read(n).decode())
+            if post.get("op") == "members":  # pragma: no cover - the server thread is outside the gate's trace
+                body = json.dumps({"members": [{"user_id": "@agent-t:example.org"}, {"user_id": "@owner:example.org"}]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.end_headers(); self.wfile.write(body); return
             if STATE["force_room_502"]:
                 self.send_response(502); self.end_headers(); return
             if STATE["force_room_429"]:  # pragma: no cover - the server thread is outside the gate's trace
                 self.send_response(429); self.end_headers(); return
-            n = int(self.headers.get("Content-Length") or 0)
-            STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
-            if STATE["room_posts"][-1].get("op") == "members":  # pragma: no cover - the server thread is outside the gate's trace
-                STATE["room_posts"].pop()
-                body = json.dumps({"members": [{"user_id": "@agent-t:example.org"}, {"user_id": "@owner:example.org"}]}).encode()
-                self.send_response(200); self.send_header("Content-Type", "application/json")
-                self.end_headers(); self.wfile.write(body); return
+            STATE["room_posts"].append(post)
             if STATE["force_room_400_body"] is not None:  # pragma: no cover - the server thread is outside the gate's trace
                 body = json.dumps(STATE["force_room_400_body"]).encode()
                 self.send_response(400)
@@ -1353,6 +1353,10 @@ def main() -> int:
     check("task-MOCK2" not in rtc._load_inflight(), "delivered task removed from persisted inflight")
 
     # 3.5 proactive drain (REMOTE_PROACTIVE_ROOM)
+    # Every send to the owner DM re-reads its members, which needs this agent and its owner.
+    _harness_identity, _real_identity = (lambda: "@agent-t:example.org"), rtc._reenroll_identity
+    _harness_row = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]
+    rtc._reenroll_identity, STATE["agents"] = _harness_identity, _harness_row
     # The sutando loader wires the ag2space claim gate (proactive_routing
     # policy). Seed owner-activity = ag2space — the normal desktop condition —
     # so the delivery-mechanics tests below claim immediately; the gate's own
@@ -1673,7 +1677,7 @@ def main() -> int:
           "the successful retry records the receipt")
 
     # 3.5b the owner DM comes from the gateway; the pin is never an owner-private destination (owner 2026-09-07)
-    _real_identity, _real_state = rtc._reenroll_identity, rtc._STATE
+    _real_state = rtc._STATE
     rtc._reenroll_identity = lambda: "@agent-t:example.org"  # the row match, not an env var the CI box lacks
     rtc._STATE = Path(tempfile.mkdtemp(prefix="rtc-routing-"))  # the persisted reading lands here, never live state
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
@@ -1811,9 +1815,9 @@ def main() -> int:
     check(len(_calls) == 2 and len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1g.txt").exists(),
           "a secondary hands back a file whose target vanished after the claim, whatever DM it has read")
     rtc._proactive_route = _real_route; rtc.GATEWAY_INSTANCE = _inst; (rtc.RESULTS_DIR / "proactive-t1g.txt").unlink()
-    STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
+    STATE["agents"] = _harness_row  # teardown: the sections below run on the harness reading, no routing lookups
     rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
-    rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
+    rtc._reenroll_identity, rtc._STATE = _harness_identity, _real_state
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the
@@ -2032,6 +2036,7 @@ def main() -> int:
     check(STATE["room_posts"][-1]["body"] == "orphan nudge",
           "recovered orphan delivers on next drain")
     rtc.PROACTIVE_ROOM = ""
+    rtc._reenroll_identity, STATE["agents"] = _real_identity, None
 
     # 4. auth header was sent on every call
     check(all(a == "Bearer testtoken" for a in STATE["auth_seen"] if a is not None)
