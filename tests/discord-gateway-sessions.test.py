@@ -14,15 +14,23 @@ from _helpers.hermetic_env import isolate_os_environ
 
 isolate_os_environ()
 
+import os
+import tempfile
+from pathlib import Path
+
+# The bridge resolves channel config at import; seed an empty allowlist before anything reads it.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-gateway-sessions-")
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
+
 import ast
 import importlib.util
 import io
 import json
 import logging
 import sys
-import tempfile
 import unittest
-from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
