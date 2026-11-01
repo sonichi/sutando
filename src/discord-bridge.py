@@ -2763,6 +2763,14 @@ def _log_gateway_reasons(stream=None) -> None:
         log = logging.getLogger(name)
         log.setLevel(logging.DEBUG)
         log.addHandler(handler)
+        # An ancestor handler would otherwise receive the DEBUG payloads this handler refuses.
+        log.propagate = False
+
+
+def _run_bridge() -> None:
+    _single_instance_acquire("discord-bridge")
+    _log_gateway_reasons()
+    client.run(TOKEN, log_handler=None)
 
 
 @client.event
@@ -2786,13 +2794,13 @@ async def on_disconnect():  # pragma: no cover — gateway callback
 async def on_ready():
     global _ready_count
     _ready_count += 1
-    gateway_sessions.record(GATEWAY_SESSIONS_FILE, time.time())
     # Restart-safety FIRST: if access.json was wiped/corrupted while the bridge
     # was down, auto-restore it from the durable state/auth/ backup BEFORE any
     # access read below. Without this a wipe+restart boots into pairing/TOFU with
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
+    gateway_sessions.record(GATEWAY_SESSIONS_FILE, time.time())
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
@@ -6283,6 +6291,4 @@ if __name__ == "__main__":
                              "<body|--body-file PATH>")
         _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
-        _single_instance_acquire("discord-bridge")
-        _log_gateway_reasons()
-        client.run(TOKEN, log_handler=None)
+        _run_bridge()
