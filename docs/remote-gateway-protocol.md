@@ -966,3 +966,12 @@ The s.space dashboard already classifies `error` as unhealthy, so this
 requires updating Sutando's health checker and restarting its gateway bridge;
 no dashboard schema change is needed. Reporting starts after the first health
 check completes and follows the installed check cadence.
+
+### Local activity row room scope
+
+The agent-activity CLI assigns a room only from explicit `--room` or the
+task file's `channel_id` (explicit wins). Without either, the JSON row omits
+`room`; it never reads the owner's last activity to infer a destination.
+Background health-check and cron rows therefore do not acquire the owner's
+latest DM or room. Task rows retain their own room. Existing rows are not
+rewritten; callers needing a room must supply one or a task file.

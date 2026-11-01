@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402,F401
 from task_queue import position as queue_position  # noqa: E402
 from activity_rows import (  # noqa: E402,F401  (the writer lives in core; the CLI keeps these names)
-    KINDS, LIVE_ROWS, TEXT_MAX, append, day_of, day_range, default_room, index_path, log_path, open_task_index,
+    KINDS, LIVE_ROWS, TEXT_MAX, append, day_of, day_range, index_path, log_path, open_task_index,
     rotate, summaries_path, summarize, task_from_file,
 )
 
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "done":
             s.add_argument("--into", dest="task_into", default=None,
                            help="consolidated reply: event id of the message whose reply answered this one too")
-        s.add_argument("--room", default=None, help="room id; default: the owner's latest AG2 Space room")
+        s.add_argument("--room", default=None, help="room id; default: task-file room, otherwise unset")
         s.add_argument("--workspace", default=None, help=argparse.SUPPRESS)  # tests only
         s.add_argument("--task-id", default=None)
         s.add_argument("--task-file", default=None, help="a task file: fills --task-id/--from/--text/--room from its headers")
@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         task = dict(task or {}, into=a.task_into)
     done = a.cmd == "done"
     ws = Path(a.workspace) if a.workspace else None
-    rec = append(a.line, kind="done" if done else a.kind, room=room or default_room(ws), task=task, done=done,
+    rec = append(a.line, kind="done" if done else a.kind, room=room, task=task, done=done,
                  workspace=ws)
     print(json.dumps(rec, ensure_ascii=False))
     return 0

@@ -73,16 +73,6 @@ def open_task_index(workspace: Path | None = None) -> dict:
     return _load_index(index_path(workspace))
 
 
-def default_room(workspace: Path | None = None) -> str | None:
-    """The room of the owner's latest AG2 Space message; a row with no room shows only in the dock."""
-    p = (workspace or resolve_workspace()) / "state" / "last-owner-activity.json"
-    try:
-        d = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None
-    return d.get("channel_id") if d.get("channel") == "ag2space" else None
-
-
 def acks_dir(workspace: Path | None = None) -> Path:
     """Per task, the projection ids the writer has applied — the sink's acknowledgement, kept apart
     from the rotating live log and per task so unrelated traffic can never evict an owed row's ack."""
