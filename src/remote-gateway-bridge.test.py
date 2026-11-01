@@ -1767,6 +1767,16 @@ def main() -> int:
           "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
     (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
     check(rtc.OWNS_UNADDRESSED is rtc._owns_unaddressed, "the host answers which bridge is the primary")
+    check(rtc.TASK_STATUS is rtc._ag2space_task_status, "the host supplies each task's published status")
+    import json as _json
+    _sidecar = rtc.WS / "state" / "agent-activity.phase.jsonl"
+    _sidecar.parent.mkdir(parents=True, exist_ok=True)
+    _sidecar.write_text(_json.dumps({"task_id": "task-status-probe", "seq": "s1", "step": "Run the suite",
+                                     "phase": "Running tests", "phase_source": "rules", "at": 1793491200.0}) + "\n")
+    _st = rtc._ag2space_task_status("task-status-probe")
+    check(isinstance(_st, dict) and _st.get("phase") == "Running tests" and _st.get("summary") == "Running tests",
+          f"the host's status is the Basic fields only, never the step text ({_st})")
+    _sidecar.unlink()
     import connections as _conn
     _saved_conn = (_conn.unaddressed_owner, _conn.owns_unaddressed, rtc._log)
     _handoff_logs: list = []

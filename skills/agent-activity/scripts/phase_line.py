@@ -681,8 +681,9 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
     """{phase, line, since} saying why the task is where it is, or None for a finished or unknown
     task (its label shows). The line never carries an age: the client renders it from `since`.
 
-    In order: delegated (handoffs), running (the newest phase record), queued behind another
-    request, queued, picked up with no step yet. `active` is the task this seat is working on now,
+    In order: delegated (handoffs), running (the newest phase record), picked up with no step yet,
+    queued behind another request, queued. Pickup outranks the queue: a task's file stays in the
+    queue while the core works it, and "Queued" must never outlive the wait. `active` is the task this seat is working on now,
     when the caller knows it; otherwise any other task's step in the last few minutes means busy.
     Nothing about another task is ever named."""
     now = time.time() if now is None else now
@@ -702,6 +703,9 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
         rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
         line = st.get("line") or st.get("step") or st["phase"]
         return {"phase": st["phase"], "line": line, "since": _ts(rules[-1].get("at"), now) if rules else now}
+    picked = _picked_up_at(workspace, task_id, now)
+    if picked is not None:
+        return {"phase": "Understanding the request", "line": "Reading the request", "since": picked}
     try:
         from task_queue import position
         pos = position(Path(workspace), task_id, inbox)
@@ -720,9 +724,6 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
         ahead = int(pos["position"]) - 1
         return {"phase": "Waiting", "line": f"Queued · {ahead} ahead" if ahead else "Queued · next", "since": since,
                 "waiting": {"reason": "queued", "position": int(pos["position"])}}
-    picked = _picked_up_at(workspace, task_id, now)
-    if picked is not None:
-        return {"phase": "Understanding the request", "line": "Reading the request", "since": picked}
     return None
 
 

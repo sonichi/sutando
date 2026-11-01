@@ -436,6 +436,15 @@ class WhyNotMoving(unittest.TestCase):
         self.assertNotRegex(second["line"], r"\d+\s*(s|m|h|min)\b", "no age in the line: the client renders it")
         self.assertIsInstance(second["since"], float)
 
+    def test_a_picked_up_task_is_no_longer_queued_while_its_file_waits(self):
+        self._pending("task-q1", time.time() - 60)
+        idx = Path(self.ws) / "state" / "agent-activity.index.json"
+        idx.parent.mkdir(parents=True, exist_ok=True)
+        idx.write_text(json.dumps({"task-q1": {"started": time.time() - 5}}))
+        st = pl.status_for(self.ws, "task-q1")
+        self.assertEqual((st["phase"], st["line"]), ("Understanding the request", "Reading the request"))
+        self.assertNotIn("waiting", st)
+
     def test_a_queued_task_behind_another_request_says_so_without_naming_it(self):
         self._pending("task-q1", time.time() - 60)
         _rules(self.ws, "task-busy", "Running tests", step="Run the secret-project suite")
