@@ -127,6 +127,26 @@ class Attribution(unittest.TestCase):
         self.assertEqual(c["stale_no_other_task"], 2)
         self.assertEqual(c["correct"], 1)
 
+    def test_missing_log_is_a_clear_error(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ac.main(["--workspace", str(self.ws), "--day", "2001-01-01"])
+        self.assertEqual((rc, json.loads(out.getvalue())["error"]), (2, "no activity log: FileNotFoundError"))
+
+    def test_workspace_defaults_to_the_loader(self):
+        orig = ac.resolve_workspace
+        ac.resolve_workspace = lambda migrate=True: self.ws
+        try:
+            self._row(T0 + 10, "task-a", "!roomA:s.space")
+            with open(self.ws / "state" / "agent-activity.archive.2026-11-01.jsonl", "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in self.rows)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ac.main(["--day", "2026-11-01"])
+            self.assertEqual(json.loads(out.getvalue())["counts"], {"correct": 1})
+        finally:
+            ac.resolve_workspace = orig
+
     def test_task_without_timestamp_uses_file_time(self):
         p = self.ws / "tasks" / "task-c.txt"
         p.write_text("id: task-c\nchannel_id: !roomC:s.space\n")

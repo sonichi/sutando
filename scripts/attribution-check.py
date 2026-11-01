@@ -24,8 +24,9 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import local_task_protocol as ltp  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 
 def h(s):
@@ -82,13 +83,17 @@ def rows_for(W, day):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--workspace", default=os.environ.get("SUTANDO_WORKSPACE_DIR"))
+    ap.add_argument("--workspace", default=None, help="default: the resolved Sutando workspace")
     ap.add_argument("--day", default=(dt.date.today() - dt.timedelta(days=1)).isoformat())
     ap.add_argument("--grace", type=float, default=120.0, help="seconds after the result a row may still land")
     ap.add_argument("--max-wrong-pct", type=float, default=None, help="gate: exit 1 above this share")
     a = ap.parse_args(argv)
-    W = a.workspace
-    rows = list(rows_for(W, a.day))
+    W = a.workspace or str(resolve_workspace(migrate=False))
+    try:
+        rows = list(rows_for(W, a.day))
+    except OSError as e:
+        print(json.dumps({"day": a.day, "error": f"no activity log: {type(e).__name__}"}))
+        return 2
 
     def tid_of(r):
         t = r.get("task")
