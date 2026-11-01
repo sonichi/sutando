@@ -105,6 +105,7 @@ from workspace_default import resolve_workspace, status_read_path, write_status 
 __all__ = [
     "LEDGER_NAME", "STOP_NAME", "ledger_path", "record_send", "record_no_send",
     "last_action_after", "delivery_after", "last_stop_ts", "mark_stop", "stop_gate",
+    "turn_started_at",
     "ROOM_ACTIONS_NAME", "room_actions_path",
 ]
 
@@ -446,8 +447,32 @@ def begin_turn(workspace: Path | str | None = None, session: str | None = None) 
     session id is known.
     """
     session = _resolve_session(session)
-    write_status(_scoped_name(TURN_NAME, session), {"reminded": False, "ts": time.time()},
+    now = time.time()
+    # `started` is the turn's immutable origin; `ts` is the record's own write time.
+    write_status(_scoped_name(TURN_NAME, session), {"reminded": False, "ts": now, "started": now},
                  _workspace(workspace))
+
+
+def _turn_record(workspace: Path | str | None, session: str | None) -> dict:
+    try:
+        raw = json.loads(
+            status_read_path(_scoped_name(TURN_NAME, session), _workspace(workspace)).read_text())
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def turn_started_at(workspace: Path | str | None = None,
+                    session: str | None = None) -> float | None:
+    """When the current turn began (`begin_turn`'s marker), or None if none was recorded.
+
+    Only `started` counts: `ts` moves when the reminder is spent, and Stop hooks run
+    in parallel, so a boundary read from `ts` could land past this turn's own evidence.
+    """
+    started = _turn_record(workspace, _resolve_session(session)).get("started")
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        return None
+    return float(started)
 
 
 def reminder_spent(workspace: Path | str | None = None, session: str | None = None) -> bool:
@@ -462,8 +487,11 @@ def reminder_spent(workspace: Path | str | None = None, session: str | None = No
 
 def spend_reminder(workspace: Path | str | None = None, session: str | None = None) -> None:
     session = _resolve_session(session)
-    write_status(_scoped_name(TURN_NAME, session), {"reminded": True, "ts": time.time()},
-                 _workspace(workspace))
+    record = {"reminded": True, "ts": time.time()}
+    started = _turn_record(workspace, session).get("started")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        record["started"] = started
+    write_status(_scoped_name(TURN_NAME, session), record, _workspace(workspace))
 
 
 # Below this, the message was effectively the last thing the turn did.
