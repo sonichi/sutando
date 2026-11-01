@@ -159,7 +159,8 @@ class Launcher(unittest.TestCase):
         def broker(method, path, payload=None, timeout=None, **k):
             sent.append((method, path, payload))
             if method == "GET":
-                return {"tasks": [{"id": tid, "lease_id": broker.lease}, {"id": "task-other", "lease_id": "Lx"}]}
+                mine = [{"id": tid, "lease_id": broker.lease}] if broker.lease else []
+                return {"tasks": [*mine, {"id": "task-other", "lease_id": "Lx"}]}
             return _ack(tid, 1) if path.endswith("/ack") else {"ok": True}
         broker.lease = "L1"
         mock.patch.object(gw, "_req", broker).start()
@@ -178,10 +179,16 @@ class Launcher(unittest.TestCase):
             self.assertEqual([t["id"] for t in gw._req("GET", "/v1/tasks?wait=1")["tasks"]], ["task-other"],
                              "the newer serve is kept back, every time it is offered")
         sentinel.unlink()
+        broker.lease = None
+        delivered = gw._req("GET", "/v1/tasks?wait=1")["tasks"]
+        self.assertEqual([(t["id"], t.get("lease_id")) for t in delivered], [("task-other", "Lx"), (tid, "L2")],
+                         "released: the held serve itself, as the broker sent it")
+        broker.lease = "L2"
         self.assertEqual([t["id"] for t in gw._req("GET", "/v1/tasks?wait=1")["tasks"]], [tid, "task-other"])
         gw._req("POST", launcher.BEATS, {"tasks": [{"task_id": tid}]})
         self.assertEqual(sent[-1][2]["tasks"], [{"task_id": tid}], "released: beats pass again")
-        self.assertEqual([e["event"] for e in self.events()], ["beats withheld", "matched", "released"])
+        self.assertEqual([e["event"] for e in self.events()],
+                         ["beats withheld", "matched", "released", "delivered the held serve"])
         self.assertEqual(rule.matches[0]["lease_id"], "L2")
         sentinel.write_text("hold")
         broker.lease = "L3"

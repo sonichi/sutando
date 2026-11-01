@@ -648,8 +648,8 @@ class Transition:
         if last is None:
             return False
         run = ((self.owner._read() or {}).get("runs") or {}).get(last)
-        if isinstance(run, dict) and not (run.get("published") and run.get("lease") != lease):
-            return False                        # unpublished, or the same serve redelivered
+        if isinstance(run, dict) and run.get("lease") == lease:
+            return False                        # the same serve redelivered
         known = run if isinstance(run, dict) else {}
         return self.put(run=last, lease_id=known.get("lease"), execution_generation=known.get("gen"),
                         finished=True) or None
@@ -692,7 +692,7 @@ class Transition:
                   "stop_ctl": None, "stop_requested": None, "stop_confirmed": None,
                   "missing_since": None, "hold_reported": None, "wake_episode": None,
                   "cancel_requested_generation": None, "cancel_requested_attempt": None,
-                  "owed_publish": pending["run"]}
+                  "owed_publish": pending["run"], "finished": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
         return self.rec if self._change(lambda _d, r: {**r, **fields, "claims": None},
@@ -1043,8 +1043,11 @@ class Transition:
                 wakes[self.wire] = (seen + [episode])[-WAKE_EPISODES_KEPT:]
                 _bound(wakes, keep={self.wire, *(data.get("tasks") or {})})
             if isinstance((r or {}).get("pending_serve"), dict):
-                # A serve held for its generation outlives the run: its ack still decides.
-                return {**r, "finished": True, "claims": None, "turn_id": None, "owed_close": None,
+                # A serve held for its generation outlives the run: its ack, claim included, still decides.
+                lease = r["pending_serve"].get("lease")
+                acks = {op: k for op, k in (r.get("claims") or {}).items()
+                        if k.get("kind") == "ack" and k.get("serve") == lease}
+                return {**r, "finished": True, "claims": acks or None, "turn_id": None, "owed_close": None,
                         "owed_ctl": None, "dispatch_lost": None, "stop_requested": None}
             return None
         if not self._change(edit, "the retirement")[0]:

@@ -440,7 +440,10 @@ Sutando checkout around it sends neither field.
   The same holds after the earlier run has finished: a serve under a lease other than the one it
   finished under (or for a run whose details were pruned) is held for its ack, so an answer the
   broker refused as stale never makes a newer generation look already handled. Every run after the
-  first has its own item, `<task>.run-<n>`.
+  first has its own item, `<task>.run-<n>`. A serve under a lease other than the record's is always
+  held, whether or not the earlier run's publication was recorded. An ack the broker accepted counts
+  as done only once its generation can reach the core: its run is on disk or owed a publish, or a
+  newer serve has replaced it; otherwise the ack is kept and retried.
   A wake is a new run too, even under the same generation; a replay of the same episode reuses
   its run and publishes nothing.
 - Every change to a task's attempt is one transition under that task's lock, committed to

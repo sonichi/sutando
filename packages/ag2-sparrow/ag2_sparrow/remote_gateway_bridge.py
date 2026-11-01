@@ -3390,6 +3390,10 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 _log_backoff((tid, "ack-unrecorded"), f"task ack for {tid}: accepted, but its generation "
                              "could not be recorded — the pending ack is kept and retried")
                 return False
+            if _ack_unlanded(wire_tid, lease_id):
+                _log_backoff((tid, "ack-unlanded"), f"task ack for {tid}: accepted, but its generation has "
+                             "no run here yet — the pending ack is kept and retried")
+                return False
         _forget_pending_ack(tid, lease_id)
         return True
     except urllib.error.HTTPError as e:
@@ -3467,6 +3471,8 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
         doc = _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body,
                    timeout=_ACK_TIMEOUT_S, **bound)
         recorded = _commit_ack(wire_tid, claim, doc) if claim is not None else "recorded"
+        if recorded != "unrecorded" and claim is not None and _ack_unlanded(wire_tid, lease_id):
+            recorded = "unrecorded"             # accepted, but its generation has no run here yet
         if recorded == "stale":
             return "stale"
         if recorded == "unrecorded":
@@ -4149,6 +4155,24 @@ def _commit_ack(wire_tid: str, claim, doc, open_turn: bool = True) -> str:
     return _ack_recorded(rec, gen)
 
 
+def _ack_unlanded(wire_tid: str, lease: "str | None") -> bool:
+    """Whether an ack the broker accepted for `lease` has left its generation no way to reach the
+    core: its serve still held, or the record holding it with its run neither on disk nor owed a
+    publish. A record now holding another serve, or none, superseded or settled it."""
+    rec = _ATTEMPTS.entry(wire_tid)
+    if rec is task_attempts.UNKNOWN:
+        return True
+    if not isinstance(rec, dict) or not lease:
+        return False
+    pending = rec.get("pending_serve")
+    if isinstance(pending, dict):
+        return pending.get("lease") == lease
+    if rec.get("lease_id") != lease or rec.get("finished"):
+        return False
+    run = rec.get("run")
+    return not (isinstance(run, str) and (rec.get("owed_publish") == run or _run_id_used(run)))
+
+
 def _ack_recorded(rec, gen) -> str:
     if not isinstance(rec, dict) or rec.get("awaiting_ack"):
         return "unrecorded"
@@ -4169,6 +4193,8 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
             return "stale"
         if t.serve_adoptable(gen):
             rec = t.adopt_serve(claim, doc, _reenroll_identity() or None, open_turn=open_turn)
+            if isinstance(rec, dict) and not _run_id_used(rec["run"]):
+                rec = t.rec if t.put(owed_publish=rec["run"]) else None   # its run was never published
             adopted = True
         elif t.rec.get("finished") and (gen is None or gen == t.rec.get("execution_generation")):
             # The run already settled this generation: the re-serve has nothing left to run.
@@ -4179,7 +4205,8 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
             adopted = False
     if adopted:
         if isinstance(rec, dict):
-            _drop_reserve(wire_tid)
+            if not rec.get("owed_publish"):
+                _drop_reserve(wire_tid)
             _log(f"task {wire_tid}: re-served under the generation its run holds — the lease moves to the "
                  "run; nothing re-executes")
         return "stale" if rec in ("stale", "generation") else _ack_recorded(rec, gen)
@@ -4485,8 +4512,8 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
     if not isinstance(run, str) or run not in inflight and not _hold_in_flight(inflight, {run}):
         return
     try:
-        task = json.loads(_reserve_path(wire_tid).read_text())
-    except (OSError, ValueError) as e:
+        task = {**json.loads(_reserve_path(wire_tid).read_text()), "id": wire_tid}
+    except (OSError, ValueError, TypeError) as e:
         with _ATTEMPTS.transition(wire_tid) as t:
             if t.rec.get("owed_publish") == run and _fail_unanswered(
                     t, run, DISPATCH_LOST_RESULT, f"its served task could not be read ({diagnostics.describe(e)})"):
@@ -5753,9 +5780,8 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
                              "— left unacked for a re-serve")
                 return None
             rec = t.rec
-            if (isinstance(rec, dict) and rec.get("run") and rec.get("lease_id") != lease
-                    and (t.run_published(rec["run"]) or rec.get("finished"))):
-                return _hold_reserve(t, first, task, lease)
+            if isinstance(rec, dict) and rec.get("run") and rec.get("lease_id") != lease:
+                return _hold_reserve(t, first, task, lease)   # never rebound to the earlier run
             tid = _serve_run(t, first)
             if tid is None:
                 _log_backoff((first, "unrecorded"), f"task {first}: its attempt could not be recorded "
@@ -5793,7 +5819,7 @@ def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str,
         return None
     path = _reserve_path(t.wire)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not _durable_write(path, json.dumps(task, sort_keys=True)) or not t.hold_serve(
+    if not _durable_write(path, json.dumps({**task, "id": t.wire}, sort_keys=True)) or not t.hold_serve(
             lease, cand, task_attempts.serve_context(task)["source_event_id"], task.get("wake")):
         _log_backoff((first, "unrecorded"), f"task {first}: its re-serve could not be recorded "
                      "— left unacked for a re-serve")

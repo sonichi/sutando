@@ -16,7 +16,9 @@ lease and run). The rule fires once; a second match, or none by exit, is reporte
            task's per-task beats are left out, the newer serve (a lease other than the one the
            running generation holds) is kept from the bridge, and the task's result POST waits
            until that newer serve exists, so the broker answers it as stale. Removing `<sentinel>`
-           lets everything through. The held serve is the one match; a third lease fails the run.
+           lets everything through, and the next poll hands the bridge the held serve exactly as the
+           broker sent it, unless that poll carries it already. The held serve is the one match; a
+           third lease fails the run.
 
 Usage (all on the rig, at the exact head under test):
   python3 scripts/witness/lifecycle-fault-launcher.py --fault crash --kind ack --task <broker id> \\
@@ -112,7 +114,8 @@ def install_reclaim(mod, rule: Rule, report: Path, sentinel: Path) -> None:
     """The `reclaim` fault: the task's beats are withheld and its newer serve kept back while the
     sentinel exists; every other task and call passes unchanged."""
     real = mod._req
-    seen: dict = {"first": None, "held": None, "beats": False, "released": False, "withheld": 0}
+    seen: dict = {"first": None, "held": None, "held_task": None, "beats": False, "released": False,
+                  "delivered": False, "withheld": 0}
     offline = sentinel.with_name(sentinel.name + ".offline")
 
     def wrapped(method, path, payload=None, *a, **k):
@@ -156,6 +159,13 @@ def install_reclaim(mod, rule: Rule, report: Path, sentinel: Path) -> None:
         answer = real(method, path, payload, *a, **k)
         if method != "GET" or path.split("?")[0] != KINDS["serve"] or not isinstance(answer, dict):
             return answer
+        if not holding and seen["held_task"] is not None and not seen["delivered"]:
+            seen["delivered"] = True
+            tasks = answer.get("tasks") or []
+            if not any(isinstance(t, dict) and t.get("id") == rule.task for t in tasks):
+                answer = {**answer, "tasks": [*tasks, seen["held_task"]]}
+                _report(report, {"event": "delivered the held serve", "lease_id": seen["held"]})
+            return answer
         served = []
         for task in answer.get("tasks") or []:
             lease = task.get("lease_id") if isinstance(task, dict) else None
@@ -169,6 +179,8 @@ def install_reclaim(mod, rule: Rule, report: Path, sentinel: Path) -> None:
             identity = {"task": rule.task, "kind": "serve", "lease_id": lease,
                         "execution_generation": task.get("execution_generation")}
             with rule.lock:
+                if seen["held"] in (None, lease):
+                    seen["held_task"] = task    # the broker's latest copy of the held serve
                 if seen["held"] is None:
                     seen["held"] = lease
                     rule.matches.append(identity)

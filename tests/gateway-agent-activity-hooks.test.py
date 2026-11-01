@@ -3435,6 +3435,92 @@ class Hooks(unittest.TestCase):
         self.assertEqual((gw._ATTEMPTS.run_item(first), gw._ATTEMPTS.run_item(second)),
                          (None, "task-fresh.run-2"), "the first run has the task's item, every later one its own")
 
+    def test_an_accepted_ack_its_generation_cannot_reach_returns_no_success_and_is_retried(self):
+        tid = "task-ack-unlanded"
+        fake, inflight = self.held(tid)
+        self.assertTrue(gw._record_pending_acks([(tid, True, "L2")]))
+        with mock.patch.object(gw, "_commit_ack", return_value="stale"):
+            self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L2"),
+                             "the serve is still held for it: not done")
+        self.assertIn(tid, gw._load_pending_acks(), "kept for the retry")
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "the retry lands it")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["owed_publish"], f"{tid}~~2")
+        self.answered_by_its_own_run(fake, tid, inflight)
+
+    def test_finishing_the_earlier_generation_keeps_a_newer_serves_accepted_ack(self):
+        tid = "task-finish-vs-ack"
+        fake = self.served_acked(tid)
+        fake.answers["/v1/results"] = _http(409, {"error_code": "stale_execution_generation"})
+        self.core_writes(tid, "generation 1's answer")
+        old = time.time() - 5
+        os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+        at_retire, go_retire, at_commit, go_commit = (threading.Event() for _ in range(4))
+        real_retired, real_commit = gw._retired, gw._commit_ack
+
+        def retired(*a, **k):
+            at_retire.set()
+            go_retire.wait(10)
+            return real_retired(*a, **k)
+
+        def commit(*a, **k):
+            at_commit.set()
+            go_commit.wait(10)
+            return real_commit(*a, **k)
+        mock.patch.object(gw, "_retired", side_effect=retired).start()
+        mock.patch.object(gw, "_commit_ack", side_effect=commit).start()
+        inflight = {tid}
+        drain = threading.Thread(target=gw._post_ready_results, args=(inflight,))
+        drain.start()
+        self.assertTrue(at_retire.wait(10), "generation 1 refused as stale, paused before its retirement")
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+        acked = []
+        ack = threading.Thread(target=lambda: acked.append(gw._post_task_ack(tid, durable=True, lease_id="L2")))
+        ack.start()
+        self.assertTrue(at_commit.wait(10), "L2's ack accepted as generation 2, paused before its commit")
+        go_retire.set()
+        drain.join(10)
+        self.assertEqual(gw._ATTEMPTS.get(tid)["pending_serve"]["lease"], "L2")
+        go_commit.set()
+        ack.join(10)
+        mock.patch.stopall()
+        mock.patch.object(gw, "_log", self.logs.append).start()
+        self.use(fake)
+        if not acked[0]:
+            self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "kept and retried")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2")
+        fake.answers["/v1/results"] = {"ok": True}
+        self.answered_by_its_own_run(fake, tid, inflight)
+
+    def test_a_failed_publication_marker_never_rebinds_a_newer_lease_to_the_earlier_run(self):
+        for finished in (False, True):
+            with self.subTest(finished=finished):
+                tid = f"task-marker-{'finished' if finished else 'running'}"
+                with failing_commit("the run's publication"):
+                    self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e"), set(), []))
+                self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists())
+                self.assertFalse(gw._ATTEMPTS.run_published(tid) if hasattr(gw._ATTEMPTS, "run_published")
+                                 else ((ledger().get("runs") or {}).get(tid) or {}).get("published"))
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True},
+                                               "/v1/tasks/heartbeat": {"ok": True}}))
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+                inflight = {tid}
+                if finished:
+                    fake.answers["/v1/results"] = _http(409, {"error_code": "stale_execution_generation"})
+                    self.core_writes(tid, "generation 1's answer")
+                    old = time.time() - 5
+                    os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+                    gw._post_ready_results(inflight)
+                    self.assertIsNone(gw._ATTEMPTS.entry(tid))
+                    fake.answers["/v1/results"] = {"ok": True}
+                self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+                self.assertEqual(gw._ATTEMPTS.get(tid)["pending_serve"]["lease"], "L2", "held for its ack")
+                self.assertFalse(any(f"dedup: {tid} already handled" in m for m in self.logs))
+                fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+                self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                self.assertEqual(gw._ATTEMPTS.get(tid)["run"], f"{tid}~~2", "never the earlier run")
+                self.answered_by_its_own_run(fake, tid, inflight)
+
     def paused_before_publish(self, tid):
         """Served, acked as generation 1; its result pinned and claimed by a worker paused before its
         publish; then served again under L2."""
