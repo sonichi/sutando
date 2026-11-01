@@ -859,8 +859,9 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
-    lead = (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
-            if audience == "dm" else "A quick tour. Try one thing in each part.")
+    lead = ("One room for people and their agents. "
+            + (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
+               if audience == "dm" else "A quick tour. Try one thing in each part."))
     secs = sections_for(core, features)
     body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
     page = (
