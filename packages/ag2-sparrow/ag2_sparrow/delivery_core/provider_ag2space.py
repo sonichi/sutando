@@ -244,10 +244,17 @@ class AG2SpaceRoomMessageProvider:
             if is_retryable_http_status(e.code, auth_recoverable=True):
                 raise ProviderRefused(f"gateway refused {item_id} for now: HTTP {e.code}") from e
             raise ProviderPermanentRefused(f"gateway refused {item_id}: HTTP {e.code}") from e
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as e:
             if _never_connected(e):
                 raise ProviderRefused(f"gateway unreachable for {item_id}: {e}") from e
             raise ProviderIndeterminate(f"transport failure for {item_id}: {e}") from e
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # A 2xx whose body is not JSON may still be a posted message: unknown, never stranded.
+            raise ProviderIndeterminate(f"unreadable 2xx answer for {item_id}: {e}") from e
+        except ValueError as e:
+            # Raised before or after the send (a bad URL, or the response): unknown, but named so.
+            raise ProviderIndeterminate(
+                f"request error for {item_id} (check the gateway URL/config): {e!r}") from e
         if room_response_refused(resp):
             raise ProviderPermanentRefused(f"gateway declined {item_id}: {str(resp)[:200]}")
         receipt = classify_response(200, resp, id_keys=("event_id",))
