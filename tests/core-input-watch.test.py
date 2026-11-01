@@ -1954,6 +1954,15 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
         self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
                          ("blocked-human", "awaiting user: unknown"))
 
+    def test_a_turn_in_flight_above_the_composer_outruns_the_banner_with_work_owed(self):
+        mid_turn = ("● Writing the result file now.\n"
+                    "✳ Choreographing… (running Stop hooks… 2/3 · 2m 37s)\n"
+                    "  ✔ Update installed · Restart to update\n" + _RULE + "❯ \n" + _RULE
+                    + _STALE_BANNER + _SEAT_FOOTER)
+        for name, pane in (("stop hooks", mid_turn), ("thinking", _ALERT_WORKING)):
+            with self.subTest(spinner=name):
+                self.assertNotIn("blocked-human", self._seat([pane] * 3, owes=True))
+
     def test_owes_work_is_the_cores_queue_and_never_a_worker_seats(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:

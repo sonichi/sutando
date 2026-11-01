@@ -1489,5 +1489,56 @@ class SharedLimitStepUnknownQueueHolds(unittest.TestCase):
         self.assertFalse(self.step(True))
 
 
+class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
+    """A turn in flight above the composer outruns the limit banner pinned under it; the
+    same banner under a finished turn, with work owed, still stands."""
+
+    RULE = "\u2500" * 40 + "\n"
+    BANNER = ("  \u26a0 Usage limit reached \u00b7 continuing automatically at 1am \u00b7 esc to cancel\n"
+              "  \u26a0 /usage-credits to continue now\n")
+    TAIL = ("  \u2714 Update installed \u00b7 Restart to update\n" + RULE + "\u276f \n" + RULE
+            + BANNER + "  " + FOOTER)
+    MID_TURN = ("\u25cf Writing the result file now.\n"
+                "\u2733 Choreographing\u2026 (running Stop hooks\u2026 2/3 \u00b7 2m 37s)\n" + TAIL)
+    STANDING = "\u25cf Logged. Standing by.\n\u273b Worked for 3m \u00b7 done 3:16 PM\n" + TAIL
+
+    def outrun(self, pane):
+        baseline = pg.limit_step(pane, None, "/nonexistent-ws", owes_work=True)[1]
+        return pg.limit_step(pane, baseline, "/nonexistent-ws", owes_work=True)[0]
+
+    def test_a_turn_in_flight_outruns_the_banner_for_every_caller(self):
+        self.assertTrue(pg.turn_in_flight(self.MID_TURN))
+        outrun = self.outrun(self.MID_TURN)
+        self.assertTrue(outrun)
+        self.assertFalse(pg.limit_standing(self.MID_TURN, "claude", outrun))
+        self.assertNotIn("usage", pg.strip_limit_banners(self.MID_TURN).lower())
+        v = pg.classify_pane(self.MID_TURN, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "working"))
+        self.assertFalse(pg.is_usage_limit(v.reason, self.MID_TURN))
+
+    def test_control_a_banner_under_a_finished_turn_still_stands(self):
+        self.assertFalse(pg.turn_in_flight(self.STANDING))
+        outrun = self.outrun(self.STANDING)
+        self.assertFalse(outrun)
+        self.assertTrue(pg.limit_standing(self.STANDING, "claude", outrun))
+        v = pg.classify_pane(self.STANDING, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "usage-limit"))
+
+    def test_a_spinner_in_scrollback_under_a_later_finished_turn_is_not_in_flight(self):
+        pane = self.MID_TURN.replace("2m 37s)\n", "2m 37s)\n\u273b Worked for 3m \u00b7 done 3:16 PM\n")
+        self.assertFalse(pg.turn_in_flight(pane))
+        self.assertFalse(self.outrun(pane))
+
+    def test_a_delivery_seconds_old_is_not_yet_outrun(self):
+        pane = self.MID_TURN.replace("running Stop hooks\u2026 2/3 \u00b7 2m 37s", "2s \u00b7 esc to interrupt")
+        self.assertFalse(pg.turn_in_flight(pane))
+        self.assertFalse(self.outrun(pane))
+        self.assertTrue(pg.turn_in_flight(pane.replace("(2s", "(12s")))
+
+    def test_a_spinner_below_the_composer_is_not_a_turn_in_flight(self):
+        pane = self.STANDING.replace(self.BANNER, self.BANNER + "\u2733 Choreographing\u2026 (3s)\n")
+        self.assertFalse(pg.turn_in_flight(pane))
+
+
 if __name__ == "__main__":
     unittest.main()
