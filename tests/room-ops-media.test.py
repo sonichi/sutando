@@ -4,6 +4,10 @@ import sys
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"))
 from test_room_ops import MediaTests  # noqa: E402,F401
 
