@@ -282,6 +282,17 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("reconnect", "beta-fixture-net", "--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reconnected beta-fixture-net", proc.stdout)
+        # A checkout that resolves another workspace is refused before the stop, with exit status 1.
+        elsewhere = box / "elsewhere"
+        (elsewhere / "src").mkdir(parents=True)
+        for name in ("remote-gateway-bridge.py", "util_paths.py"):
+            (elsewhere / "src" / name).write_text((repo / "src" / name).read_text())
+        (elsewhere / "src" / "workspace_default.py").write_text(
+            "from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path('/somewhere/else')\n")
+        proc = self.run_cli("reconnect", "beta-fixture-net", "--repo", str(elsewhere), "--logs-dir", str(box / "logs"))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("relaunch_preflight_failed", proc.stderr)
+        self.assertIn("the running bridge was left up", proc.stderr)
         proc = self.run_cli("launch", "nope", "--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no connection", proc.stderr)
