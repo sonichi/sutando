@@ -99,6 +99,42 @@ def loopback_origin(origin: str) -> bool:
     return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
 
 
+def cors_origin(origin: Optional[str], host: str, same_host_ports=()) -> str:
+    """The Origin a read response may grant (echoed, never `*`), or "" for none: a loopback page
+    (the desktop app's tauri://localhost and http://tauri.localhost included; so any local dev
+    server on localhost or *.localhost too), or a page served from the same host the request
+    addresses on one of `same_host_ports` (the web client opened by LAN address). Any other
+    site, or another service on that host, gets no grant."""
+    if not origin:
+        return ""
+    if loopback_origin(origin):
+        return origin
+    try:
+        parsed = urlparse(origin)
+        origin_host = (parsed.hostname or "").lower()
+        origin_port = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme.lower())
+    except ValueError:
+        return ""
+    if not origin_host or origin_host != _authority_host(host):
+        return ""
+    return origin if origin_port in set(same_host_ports) else ""
+
+
+def rebinding_safe_host(host: str, allowed_hosts: str = "") -> bool:
+    """Whether a request's Host cannot be a DNS-rebinding name. Rebinding reaches this server
+    under the attacker's own hostname, so a loopback name, *.localhost, an IP literal or a
+    declared name is safe; any other name is not. No Host at all is no browser, so no rebinding."""
+    h = _authority_host(host)
+    if not h or h in _LOOPBACK_HOSTS or h.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    return h in {_authority_host(x) for x in (allowed_hosts or "").split(",") if x.strip()}
+
+
 def lan_bind_refusal(bind: str, token: str) -> Optional[str]:
     """None when the agent API may listen on `bind`; else the startup error. A loopback bind
     needs nothing; any other (a LAN address, a hostname, 0.0.0.0, ::) needs SUTANDO_API_TOKEN,
