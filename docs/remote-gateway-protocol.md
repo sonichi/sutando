@@ -503,6 +503,21 @@ branch that archives a result and retires its id does both as one step under the
 recovery judgement that a result was already disposed of is made inside that step too, and a
 settle never archives a task whose open wake has not delivered its own result.
 
+A task that asks this agent a room question (`task["room_question"]`) carries the question's
+`question_id`, `expected_revision`, `prompt`, `options`, `allow_free_text`, `response_mode`,
+`target_members` and `expires_at` as one line of quoted room data. Unless its `can_answer` is
+`false`, a second writer-owned line tells the agent to answer it once with `room.question.answer`
+through `room.action.execute_safe` (revision and `can_answer` from `room.question.inspect`), then
+write a `[no-send]` one-line result. An answer cannot be undone, so the rule is given only when the
+offer is recorded in the attempt ledger (`questions`, by question id) and nothing says the question
+was answered or may be: one already answered here (recorded at a settle, or a succeeded
+`room.question.answer` in the journal of a task it was offered to) gets a note not to answer again;
+one offered to another task still open gets a note that it is being answered elsewhere; one whose
+state cannot be told (the ledger or journal unreadable, a damaged line naming that task, or an
+answer sent with no outcome yet) gets a note to leave it unanswered. The turn gate reads only outcomes about its own task: an
+outcome naming another task's `task_id` neither suspends nor settles this one. A resolved blocker
+that carries an `answers` list is rendered answer by answer.
+
 ### `GET /v1/setup` *(optional)*
 
 The agent's own `agent.setup.steps` result (served text, tunables, package pin), for the

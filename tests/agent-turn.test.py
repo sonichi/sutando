@@ -565,5 +565,56 @@ class ResultFileDecision(unittest.TestCase):
                          {"status": "failed", "no_send": True})
 
 
+
+class AnswerOutcomes(unittest.TestCase):
+    """An answer to another task's question never rules this task's turn."""
+
+    def recs(self, *outcomes, action="room.question.answer"):
+        intents = [{"record_type": at.INTENT, "turn_id": "t", "seq": o["seq"],
+                    "operation_id": o["operation_id"], "action": action} for o in outcomes]
+        return at.TurnRecords(intents, list(outcomes), True, (), False)
+
+    def test_another_tasks_input_ready_does_not_suspend_this_one(self):
+        other = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_asker"}
+        v = at.classify_turn(self.recs(other), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(other), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_an_answer_outcome_tagged_with_this_task_still_never_rules_it(self):
+        # The proxy tags the record with the caller's task, while the applied state is the asker's.
+        for applied in ({"phase": "input_ready"}, {"phase": "completed", "terminal": True}):
+            with self.subTest(applied=applied):
+                ans = {**_outcome("t", 1, **applied), "task_id": "tsk_me", "action": "room.question.answer"}
+                v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+                self.assertNotIn(v.outcome, (at.DURABLY_SUSPENDED, at.TERMINAL_CONFIRMED))
+                d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_an_answer_outcome_without_its_own_action_field_still_never_rules_it(self):
+        # The action may sit on the intent only; the outcome is matched to it by operation_id.
+        ans = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        self.assertNotIn("action", ans)
+        v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_its_own_ask_still_suspends_it(self):
+        own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        ask = "room.question.ask"
+        self.assertEqual(at.classify_turn(self.recs(own, action=ask), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED)
+        untagged = _outcome("t", 1, phase="input_ready")
+        self.assertEqual(at.classify_turn(self.recs(untagged, action=ask), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED, "an outcome without a task_id is the turn's own")
+
+    def test_another_tasks_terminal_or_reconciled_outcome_does_not_settle_this_one(self):
+        other = {**_outcome("t", 1, phase="completed", terminal=True), "task_id": "tsk_asker"}
+        self.assertNotEqual(at.classify_turn(self.recs(other), task_id="tsk_me").outcome, at.TERMINAL_CONFIRMED)
+        rec = {**_outcome("t", 2, phase="input_ready"), "task_id": "tsk_asker"}
+        v = at.classify_turn(self.recs(), reconciled=[rec], task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+
 if __name__ == "__main__":
     unittest.main()

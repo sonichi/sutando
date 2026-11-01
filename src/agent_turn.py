@@ -343,6 +343,46 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
     return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, sent)
 
 
+def answered_in_journal(state_dir: Path, task_id: str) -> "bool | None":
+    """Whether any turn of this task already answered a room question: a room.question.answer intent
+    the proxy tagged with this task whose outcome succeeded. Durable before the result is decided.
+    None when that cannot be told: a journal that cannot be read, a damaged line naming the task, or
+    an answer sent with no outcome yet."""
+    path = room_actions_path(state_dir)
+    ops, ok, failed = set(), set(), set()
+    for p in (path.with_name(path.name + ".1"), path):
+        try:
+            text = p.read_text()
+            age = time.time() - p.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                rec = None
+            if not isinstance(rec, dict):
+                if p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S:
+                    continue                    # an append in progress
+                if task_id in line:
+                    return None
+                continue
+            if rec.get("task_id") != task_id:
+                continue
+            if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
+                ops.add(rec.get("operation_id"))
+            elif rec.get("record_type") == OUTCOME:
+                (ok if rec.get("operation_status") == "succeeded" else failed).add(rec.get("operation_id"))
+    if ops & ok:
+        return True
+    return None if ops - failed else False
+
+
 def unmatched_intents(records: TurnRecords) -> list:
     """Intents whose server outcome is unknown and must be reconciled with core-api."""
     known = {o.get("operation_id") for o in records.outcomes
@@ -373,21 +413,32 @@ def _seq(rec: dict) -> int:
         return 0
 
 
+def _own(rec: dict, task_id: str | None) -> bool:
+    return task_id is None or rec.get("task_id") in (None, task_id)
+
+
 def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterable[dict] = (),
                   server_state: dict | None = None,
-                  server_operation_count: int | None = None) -> TurnVerdict:
+                  server_operation_count: int | None = None,
+                  task_id: str | None = None) -> TurnVerdict:
     """`reconciled`: core-api outcomes for unmatched intents. `server_state`: the task row.
-    `server_operation_count`: core-api operations for (task_id, turn_id); None is unknown."""
+    `server_operation_count`: core-api operations for (task_id, turn_id); None is unknown.
+    `task_id`: an outcome naming another task (an answer to its question) never rules this one."""
     by_op: dict = {}
     for o in sorted(records.outcomes, key=_seq):
-        by_op[o.get("operation_id")] = o
+        if _own(o, task_id):
+            by_op[o.get("operation_id")] = o
     intent_by_op = {i.get("operation_id"): i for i in records.intents}
-    for r in reconciled:
+    for r in (r for r in reconciled if _own(r, task_id)):
         op = r.get("operation_id")
         merged = {**intent_by_op.get(op, {}), **by_op.get(op, {}), **r}
         merged["record_type"] = OUTCOME
         by_op[op] = merged
-    outcomes = sorted(by_op.values(), key=_seq)
+    # The proxy tags an outcome with the caller's own task, but an answer's applied state is the
+    # asker's: a room.question.answer never rules this turn's terminal or suspended state.
+    outcomes = sorted((o for op, o in by_op.items()
+                       if (o.get("action") or intent_by_op.get(op, {}).get("action")) != "room.question.answer"),
+                      key=_seq)
     n = len(records.intents)
 
     if any(o.get("operation_status") == "succeeded" and _applied_terminal(o) for o in outcomes):
@@ -441,11 +492,13 @@ def body_sha256(body: str) -> str:
 
 def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = False,
                          reconciled: Iterable[dict] = (),
-                         server_state: dict | None = None) -> ResultDecision:
+                         server_state: dict | None = None,
+                         task_id: str | None = None) -> ResultDecision:
     """What to do with a result file the agent wrote on purpose (not inferred stdout):
     post it unless the task is already closed or the same text was sent as a room message, in this
     turn or an earlier one of the same task (a re-serve under a new generation)."""
-    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state)
+    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state,
+                            task_id=task_id)
     if verdict.outcome == TERMINAL_CONFIRMED or (server_state or {}).get("terminal") is True:
         return ResultDecision(SETTLE, {}, verdict.reason if verdict.outcome == TERMINAL_CONFIRMED
                               else "task already closed on server")
