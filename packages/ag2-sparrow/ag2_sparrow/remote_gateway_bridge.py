@@ -4176,7 +4176,7 @@ def _ack_unlanded(wire_tid: str, lease: "str | None") -> bool:
 def _ack_recorded(rec, gen) -> str:
     if not isinstance(rec, dict) or rec.get("awaiting_ack"):
         return "unrecorded"
-    ok = gen is None or (rec.get("execution_generation") == gen and _ATTEMPTS.broker_names_leases())
+    ok = gen is None or (rec.get("execution_generation") == gen and _ATTEMPTS.broker_names_leases() is True)
     return "recorded" if ok else "unrecorded"
 
 
@@ -4191,7 +4191,10 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
         if not t.holds_claim(claim):
             t.release_claim(claim)
             return "stale"
-        if t.serve_adoptable(gen):
+        adoptable = t.serve_adoptable(gen)
+        if adoptable is task_attempts.UNKNOWN:
+            return "unrecorded"
+        if adoptable:
             rec = t.adopt_serve(claim, doc, _reenroll_identity() or None, open_turn=open_turn)
             if isinstance(rec, dict) and not _run_id_used(rec["run"]):
                 rec = t.rec if t.put(owed_publish=rec["run"]) else None   # its run was never published
@@ -5780,7 +5783,12 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
                     return None
                 replay = isinstance(t.rec, dict) and bool(episode) and t.rec.get("wake_episode") == episode
                 opened = t.open_wake(wake, first, used=_run_id_used)
-                if (opened and replay and t.run_published(opened[1]) and not _task_pending(opened[1])
+                published = t.run_published(opened[1]) if opened and replay else False
+                if published is task_attempts.UNKNOWN:
+                    _log_backoff((first, "wake-unread"), f"wake for {first}: whether its run was published "
+                                 "cannot be read — left unacked until the broker serves it again")
+                    return None
+                if (published and not _task_pending(opened[1])
                         and opened[1] not in (_load_held() or {})):
                     opened = None               # its run has left the queue: a replay publishes nothing
             if not opened:
@@ -5852,10 +5860,16 @@ def _serve_run(t, first: str) -> "str | None":
     rec = t.rec
     if rec is task_attempts.UNKNOWN:
         return None
-    cur = (rec or {}).get("run") or t.last_run(first) or (first if _run_id_used(first) else None)
+    last = None if (rec or {}).get("run") else t.last_run(first)
+    if last is task_attempts.UNKNOWN:
+        return None
+    cur = (rec or {}).get("run") or last or (first if _run_id_used(first) else None)
     if cur is None:
         return t.new_run(first, used=_run_id_used)
-    if (not t.run_published(cur) or _task_pending(cur) or cur in (_load_held() or {})
+    published = t.run_published(cur)
+    if published is task_attempts.UNKNOWN:
+        return None
+    if (not published or _task_pending(cur) or cur in (_load_held() or {})
             or _archived_task_file(cur) is not None or _delivered_copy_exists(cur)):
         if (rec or {}).get("run") != cur and not t.put(run=cur):
             return None
@@ -5877,7 +5891,10 @@ def _earlier_run_settling(t, first: str, episode) -> bool:
     if isinstance(rec, dict) and rec.get("wake_episode") == episode and episode:
         return False
     tid = (rec or {}).get("run") if isinstance(rec, dict) else None
-    tid = tid or t.last_run(first) or first
+    last = None if tid else t.last_run(first)
+    if last is task_attempts.UNKNOWN:
+        return True                             # cannot be told: treated as still settling
+    tid = tid or last or first
     return (tid in _RETIRING or _on_disk(RESULTS_DIR / f"{tid}.txt") is not False or _task_pending(tid)
             or tid in _SETTLE_PENDING or _on_disk(disposal.pin_path(RESULTS_DIR, tid)) is not False)
 
@@ -5888,7 +5905,7 @@ def _mark_published(tid: str) -> None:
     if _ATTEMPTS is None:
         return
     with _ATTEMPTS.transition(_broker_tid(tid)) as t:
-        if not t.run_published(tid):
+        if t.run_published(tid) is False:
             t.mark_published(tid)
 
 

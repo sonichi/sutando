@@ -336,19 +336,20 @@ class TaskAttempts:
         data = self._read()
         return any(isinstance(r, dict) and _beats(r) for r in (_entry_of(data, t) for t in wire_tids))
 
-    def broker_names_leases(self) -> bool:
-        """Whether this broker has ever answered an ack with a lease generation."""
-        data = self._read()
-        return bool(data) and (data.get("contract") or {}).get("names_lease_generation") is True
+    def broker_names_leases(self):
+        """Whether this broker has ever answered an ack with a lease generation; UNKNOWN when the
+        ledger cannot be read."""
+        named = _at(self._read(), "contract", "names_lease_generation")
+        return named if named is UNKNOWN else named is True
 
     def run_of(self, local_tid: str):
         """(task, run number, live) for a local run id this node allocated, None when it has no such
         run, UNKNOWN when the ledger cannot be read. Live: it is the run its task's record holds."""
         data = self._read()
-        if data is None:
+        run = _at(data, "runs", local_tid)
+        if run is UNKNOWN or run is not None and not (isinstance(run, dict) and isinstance(run.get("task"), str)):
             return UNKNOWN
-        run = (data.get("runs") or {}).get(local_tid)
-        if not isinstance(run, dict) or not isinstance(run.get("task"), str):
+        if run is None:
             return None
         rec = _entry_of(data, run["task"])
         if rec is UNKNOWN:
@@ -374,24 +375,23 @@ class TaskAttempts:
         earlier = rec.get("earlier_run") if isinstance(rec, dict) else None
         if not earlier:
             return rec, None
-        runs = data.get("runs", {})
-        if not isinstance(runs, dict):
-            return UNKNOWN
-        if earlier not in runs:
+        run = _at(data, "runs", earlier)
+        if run is None:
             return rec, PRUNED
-        return (rec, dict(runs[earlier])) if isinstance(runs[earlier], dict) else UNKNOWN
+        return (rec, dict(run)) if isinstance(run, dict) else UNKNOWN
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its
         recorded item, else the wake item of a record holding it; None for a task's own item, UNKNOWN
         when unreadable."""
         data = self._read()
-        if data is None:
+        run, tasks = _at(data, "runs", local_tid), _at(data, "tasks")
+        if UNKNOWN in (run, tasks) or run is not None and not isinstance(run, dict):
             return UNKNOWN
-        item = ((data.get("runs") or {}).get(local_tid) or {}).get("item")
+        item = (run or {}).get("item")
         if isinstance(item, str):
             return item
-        for wire, rec in (data.get("tasks") or {}).items():
+        for wire, rec in (tasks or {}).items():
             if isinstance(rec, dict) and rec.get("run") == local_tid:
                 return _wake_item(wire, rec)
         return None
@@ -629,14 +629,20 @@ class Transition:
         saved, _ = self._change(edit, "a new run")
         return made[0] if saved else None
 
-    def last_run(self, first_run: str) -> "str | None":
-        """The local id of the latest run allocated for this task, kept after its record is gone."""
-        seq = ((self.owner._read() or {}).get("seqs") or {}).get(self.wire)
-        return local_task_protocol.run_task_id(first_run, seq) if type(seq) is int and seq >= 1 else None
+    def last_run(self, first_run: str):
+        """The local id of the latest run allocated for this task, kept after its record is gone;
+        None when none is kept; UNKNOWN when the ledger or its counter cannot be read."""
+        seq = _at(self.owner._read(), "seqs", self.wire)
+        if seq is None or seq is UNKNOWN:
+            return seq
+        return local_task_protocol.run_task_id(first_run, seq) if type(seq) is int and seq >= 1 else UNKNOWN
 
-    def run_published(self, local: str) -> bool:
-        data = self.owner._read() or {}
-        return bool(((data.get("runs") or {}).get(local) or {}).get("published"))
+    def run_published(self, local: str):
+        """Whether the run's publication is recorded; UNKNOWN when its entry cannot be read."""
+        run = _at(self.owner._read(), "runs", local)
+        if run is None or run is UNKNOWN:
+            return bool(run) if run is None else UNKNOWN
+        return run.get("published") is True if isinstance(run, dict) else UNKNOWN
 
     def mark_published(self, local: str) -> bool:
         def edit(data, rec):
@@ -670,11 +676,13 @@ class Transition:
         same = gen is None or (bound == gen if type(bound) is int else gen == 1)
         quiet = not any(rec.get(k) for k in ("fenced", "stop_requested", "stop_confirmed", "dispatch_lost",
                                               "owed_close", "owed_ctl", "finished"))
-        data = self.owner._read() or {}
-        seq = ((data.get("runs") or {}).get(rec["run"]) or {}).get("seq")
-        newest = ((data.get("runs") or {}).get(pending.get("run")) or {}).get("seq")
-        no_newer = (type(seq) is int and type(newest) is int and seq < newest
-                    and newest == (data.get("seqs") or {}).get(self.wire))
+        data = self.owner._read()
+        run, cand, last = (_at(data, "runs", rec["run"]), _at(data, "runs", pending.get("run")),
+                           _at(data, "seqs", self.wire))
+        if UNKNOWN in (run, cand, last) or not all(isinstance(r, dict) for r in (run, cand) if r is not None):
+            return UNKNOWN
+        seq, newest = (run or {}).get("seq"), (cand or {}).get("seq")
+        no_newer = type(seq) is int and type(newest) is int and seq < newest and newest == last
         return (same and quiet and no_newer and pending.get("source") == rec.get("source_event_id")
                 and pending.get("wake") == rec.get("wake_episode"))
 
@@ -686,13 +694,18 @@ class Transition:
         could not be saved."""
         if self.rec is UNKNOWN or self.rec or not lease:
             return False
-        last = self.last_run(first_run) or (first_run if used(first_run) else None)
+        last = self.last_run(first_run)
+        if last is UNKNOWN:
+            return None
+        last = last or (first_run if used(first_run) else None)
         if last is None:
             return False
-        run = ((self.owner._read() or {}).get("runs") or {}).get(last)
+        run = _at(self.owner._read(), "runs", last)
+        if run is UNKNOWN or run is not None and not isinstance(run, dict):
+            return None
         if isinstance(run, dict) and run.get("lease") == lease:
             return False                        # the same serve redelivered
-        known = run if isinstance(run, dict) else {}
+        known = run or {}
         return self.put(run=last, lease_id=known.get("lease"), execution_generation=known.get("gen"),
                         finished=True) or None
 
@@ -721,7 +734,7 @@ class Transition:
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if not self.holds_claim(c) or not isinstance(pending, dict) or type(gen) is not int:
             return None
-        if not self.owner.broker_names_leases():
+        if self.owner.broker_names_leases() is not True:
             self.owner._commit(lambda d: d.setdefault("contract", {}).update(names_lease_generation=True),
                                why="the broker's lease contract")
         if rec.get("turn_id"):
@@ -838,7 +851,7 @@ class Transition:
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if type(gen) is not int or gen < 1:
             return self.rec if self.commit_claim(c, awaiting_ack=False) else None
-        if not self.owner.broker_names_leases():
+        if self.owner.broker_names_leases() is not True:
             # Before the same-generation return, so a re-ack repairs a contract write that failed.
             self.owner._commit(lambda d: d.setdefault("contract", {}).update(names_lease_generation=True),
                                why="the broker's lease contract")
@@ -1010,7 +1023,10 @@ class Transition:
             return None
         if self.now() - float(rec.get("published_at", 0)) < ACK_HOLD_MAX_S:
             return "its ack has not named the lease yet"
-        if self.owner.broker_names_leases():
+        names = self.owner.broker_names_leases()
+        if names is UNKNOWN:
+            return "whether this broker names leases cannot be read"
+        if names:
             if not rec.get("hold_reported"):
                 self.put(hold_reported=True)
                 self.log(f"task {self.wire}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s on a "
@@ -1103,10 +1119,10 @@ class Transition:
     # ── wake after a human answered ──────────────────────────────────────
     def wake_seen(self, episode: str):
         """Whether this node already ran the wake's episode; UNKNOWN when that cannot be read."""
-        data = self.owner._read()
-        if data is None:
+        seen = _at(self.owner._read(), "wakes", self.wire)
+        if seen is UNKNOWN or seen is not None and not isinstance(seen, list):
             return UNKNOWN
-        return episode in ((data.get("wakes") or {}).get(self.wire) or [])
+        return episode in (seen or [])
 
     def open_wake(self, wake, first_run: str, used: Callable[[str], bool] = lambda _local: False
                   ) -> "tuple[str, str] | None":
@@ -1316,6 +1332,21 @@ def owns_result(rec, identity) -> bool:
     lost = rec.get("dispatch_lost")
     return (isinstance(lost, dict) and identity is not None and lost.get("file") is not None
             and list(lost["file"]) == list(identity) and lost.get("gen") == rec.get("execution_generation"))
+
+
+def _at(data, *keys):
+    """The ledger value at `keys`: None when absent; UNKNOWN when the ledger, or a map on the way,
+    cannot be read or is not a map. Never absence for a damaged value, never an exception."""
+    if data is None:
+        return UNKNOWN
+    cur = data
+    for k in keys:
+        if not isinstance(cur, dict):
+            return UNKNOWN
+        if k not in cur:
+            return None
+        cur = cur[k]
+    return cur
 
 
 def _wake_item(wire_tid: str, rec) -> "str | None":
