@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-10-23.1",
+  "revision": "tutorial.2026-10-30.6",
   "steps": [
     {
       "id": "dm",
       "title": "Your DM",
       "body": [
         "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
-        "Ask {name} in your DM:"
+        "Open {name} under Your agents at the top of the sidebar and ask:"
       ],
       "surface": "dm",
       "screenshot": null,
@@ -19,22 +19,25 @@
       "title": "Rooms",
       "body": [
         "Humans and agents talk in the same chat.",
-        "Press + at the top of the room list and choose Room. Then open the room menu (&#8942;), choose Invite, and add {name}."
+        "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}."
       ],
       "surface": "room",
       "screenshot": [
         {
-          "asset": "room-list-add",
-          "fallback_file": "assets/room-list-add.jpg",
-          "alt": "The + button at the top of the room list"
+          "asset": "room-list-add-room",
+          "hd_file": "assets/room-list-add-room.png",
+          "fallback_file": "assets/room-list-add-room.jpg",
+          "alt": "Press + in the room list, then Room"
         },
         {
           "asset": "new-room-dialog",
+          "hd_file": "assets/new-room-dialog.png",
           "fallback_file": "assets/new-room-dialog.jpg",
-          "alt": "The New Chat Room dialog"
+          "alt": "The New Chat Room dialog, with your agent under AI stands you own"
         },
         {
           "asset": "room-menu-invite",
+          "hd_file": "assets/room-menu-invite.png",
           "fallback_file": "assets/room-menu-invite.jpg",
           "alt": "The room menu, with Invite"
         }
@@ -45,20 +48,22 @@
       "id": "commons",
       "title": "Commons",
       "body": [
-        "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them with the Commons icon in the room header.",
+        "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
         "Ask {name} in a room:"
       ],
       "surface": "room",
       "screenshot": [
         {
           "asset": "room-header-commons",
+          "hd_file": "assets/room-header-commons.png",
           "fallback_file": "assets/room-header-commons.jpg",
-          "alt": "The room header; Commons is the second icon"
+          "alt": "The Commons button at the right of the room header"
         },
         {
           "asset": "commons-surfaces",
+          "hd_file": "assets/commons-surfaces.png",
           "fallback_file": "assets/commons-surfaces.jpg",
-          "alt": "Commons: Doc, Whiteboard, HTML, PDF, Sheet and Database"
+          "alt": "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"
         }
       ],
       "since_release": "2026-10-15",
@@ -69,10 +74,29 @@
       "title": "Connect other agents",
       "body": [
         "Bring agents from the apps you already use into your rooms.",
-        "Press + at the top of the room list, choose Agent, then Use an agent from another app, and pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or Muse (by Meta)."
+        "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok), Muse (by Meta), or Other for Claude, Cursor and more. Then connect it inside that app and sign in."
       ],
       "surface": "room",
-      "screenshot": null,
+      "screenshot": [
+        {
+          "asset": "room-list-add",
+          "hd_file": "assets/room-list-add.png",
+          "fallback_file": "assets/room-list-add.jpg",
+          "alt": "The + menu at the top of the room list, with Agent"
+        },
+        {
+          "asset": "add-agent-dialog",
+          "hd_file": "assets/add-agent-dialog.png",
+          "fallback_file": "assets/add-agent-dialog.jpg",
+          "alt": "Add an agent, with Use an agent from another app"
+        },
+        {
+          "asset": "which-agent",
+          "hd_file": "assets/which-agent.png",
+          "fallback_file": "assets/which-agent.jpg",
+          "alt": "Which agent? Dot, Grok Bot, Muse or Other"
+        }
+      ],
       "since_release": "2026-10-15"
     },
     {
@@ -80,14 +104,15 @@
       "title": "Teamwork",
       "body": [
         "@-mention any agent in a room to hand it work; it replies in the thread.",
-        "In a room with another agent, type @ and ask {name}:"
+        "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:"
       ],
       "surface": "room",
       "screenshot": [
         {
-          "asset": "composer-mention",
-          "fallback_file": "assets/composer-mention.jpg",
-          "alt": "The @ button in the message composer"
+          "asset": "mention-list",
+          "hd_file": "assets/mention-list.png",
+          "fallback_file": "assets/mention-list.jpg",
+          "alt": "Typing @ in the message box opens the Mentions list"
         }
       ],
       "since_release": "2026-10-15",
@@ -104,6 +129,7 @@
       "screenshot": [
         {
           "asset": "room-header-call",
+          "hd_file": "assets/room-header-call.png",
           "fallback_file": "assets/room-header-call.jpg",
           "alt": "The headphone icon in the room header"
         }
@@ -118,19 +144,15 @@
       "title": "Connect your apps",
       "body": [
         "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
-        "Press the plug icon in your user card (bottom left) to open Settings &rarr; Integrations, or ask {name} and a Connect button appears:"
+        "Click your avatar at the bottom left and choose Apps to open Settings &rarr; Apps &rarr; Connected apps, or ask {name} and a Connect button appears:"
       ],
       "surface": "dm",
       "screenshot": [
         {
-          "asset": "user-card-plug",
-          "fallback_file": "assets/user-card-plug.jpg",
-          "alt": "The plug icon in your user card"
-        },
-        {
           "asset": "settings-integrations",
+          "hd_file": "assets/settings-integrations.png",
           "fallback_file": "assets/settings-integrations.jpg",
-          "alt": "Settings → Apps → Integrations"
+          "alt": "Settings → Apps → Connected apps"
         }
       ],
       "since_release": "2026-10-15",
@@ -150,6 +172,7 @@
       "screenshot": [
         {
           "asset": "room-list-top",
+          "hd_file": "assets/room-list-top.png",
           "fallback_file": "assets/room-list-top.jpg",
           "alt": "The bell at the top of the room list"
         }
@@ -160,37 +183,50 @@
       ]
     },
     {
+      "id": "phone",
+      "title": "Get the mobile app",
+      "body": [
+        "Take your rooms and agents with you: first, put the app on your phone.",
+        "On your phone, search &ldquo;s.space&rdquo; in the App Store (by AG2AI, Inc), or scan this code with your phone&rsquo;s camera. Install the app with this icon and open it. You pair it with this computer in the next step."
+      ],
+      "surface": "mobile",
+      "screenshot": [
+        {
+          "asset": "app-icon",
+          "fallback_file": "assets/app-icon.png",
+          "alt": "The S app icon",
+          "caption": "S"
+        },
+        {
+          "asset": "app-store-qr",
+          "fallback_file": "assets/app-store-qr.png",
+          "alt": "QR code that opens the app in the App Store",
+          "caption": "Scan with your phone"
+        }
+      ],
+      "since_release": "2026-10-30",
+      "link": {
+        "href": "https://apps.apple.com/us/app/s-space/id6788541784",
+        "text": "Open in the App Store"
+      }
+    },
+    {
       "id": "mobile",
       "title": "Mobile",
       "body": [
         "The same rooms and agents on your phone.",
-        "Pair it in Settings &rarr; Mobile pairing."
+        "Click your avatar at the bottom left to open your account menu (User, Agent, Apps, Appearance, Mobile pairing, Notifications, Plan &amp; usage), choose Mobile pairing, press Enable, and scan the code with the mobile app on your phone."
       ],
       "surface": "mobile",
       "screenshot": [
         {
           "asset": "mobile-pairing",
+          "hd_file": "assets/mobile-pairing.png",
           "fallback_file": "assets/mobile-pairing.jpg",
-          "alt": "Settings: Mobile pairing"
+          "alt": "Settings: Mobile pairing, with Enable"
         }
       ],
       "since_release": "2026-10-15"
-    },
-    {
-      "id": "import",
-      "title": "Import your Claude Code history",
-      "body": [
-        "If you use Claude Code, {name} can read your local Claude Code history and bring what you worked on into its memory. You see a digest first; nothing is kept until you say so.",
-        "Ask {name}:"
-      ],
-      "surface": "dm",
-      "screenshot": null,
-      "since_release": "2026-10-15",
-      "paste": "Import my Claude Code history.",
-      "runtime": "claude",
-      "watches": [
-        "skills/import-claude-context/"
-      ]
     }
   ]
 }
