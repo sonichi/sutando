@@ -982,7 +982,7 @@ Clients must distinguish a roomless wedge from other roomless kinds; missing
 `room` alone does not mean global. This is a writer contract, not a change to
 client rendering. No historical rows are rewritten.
 
-### Owner task step summaries (held, disabled)
+### Owner task step summaries (default off)
 
 `skills/agent-activity/manifest.json` declares `LEDGER_STEP_PUBLISH_ENABLED: false`.
 The Sutando adapter reads this through `skill_config.enabled` (environment override
@@ -991,14 +991,20 @@ When off, the bridge does not read the activity tail or start a publisher worker
 When enabled, an optional daemon thread coalesces steps without blocking intake;
 a still-running worker is not duplicated. Empty task sets never read the log.
 
-The sender remains explicitly blocked pending a backend summary-only contract,
-even with the switch enabled. `room.task.update` with `status: working` is unsafe
-for this purpose: it can clear external blockers and resume `waiting_input`, or
-claim `queued`/`input_ready`. It must not be used merely to report a thinking line.
-A summary-only backend write and a live owner-ledger witness are required before
-this feature can be released. No live bridge should be restarted for this draft.
+The publisher sends `room.task.progress` through
+`POST /api/capabilities/v1/actions/execute` on the gateway's origin, authenticated
+with that connection's bearer. Arguments contain only `summary`; top-level fields
+carry `task_id`, `execution_generation`, `operation_id`, and the room. The same
+operation ID is sent as `Idempotency-Key`. Per the backend contract, this changes
+only summary and `last_reported_at`, never phase or blockers. It never uses
+`room.task.update` or a `working` transition for progress.
 
-The prepared publisher selects working/thinking rows for the connection's own
+An HTTP 404 means the Action is not deployed: log it and skip, leaving the row
+eligible for a later rate-limited retry. Other failures are logged and contained.
+Keep the switch off until the Action is live and a live owner-ledger witness has
+been captured. Enabling it does not authorize a bridge restart.
+
+The publisher selects working/thinking rows for the connection's own
 in-flight task envelopes. Missing generation/room, a different connection or
 room, ready results, terminal rows and finished/fenced/stale attempts are skipped.
 The bridge preserves served task ID and execution generation above the body;
@@ -1008,6 +1014,6 @@ summary before normalization and the 140-character cap.
 
 Eligible changes coalesce to the latest summary, with at most one attempt per
 ten seconds per task including failures. Failure logs contain exception types,
-not summaries or credential values. The prepared idempotency key is stable for
+not summaries or credential values. The idempotency key is stable for
 retries of a row. Timing and deduplication remain process-local. Intended owner
 ledger visibility is private step text; other room members receive only counts.

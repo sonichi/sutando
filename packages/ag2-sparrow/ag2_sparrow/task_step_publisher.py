@@ -67,12 +67,15 @@ class StepPublisher:
             if self.sent.get(tid) == identity or now - self.attempted.get(tid, -float("inf")) < INTERVAL:
                 continue
             key = hashlib.sha256(json.dumps([wire, gen, summary, stamp], ensure_ascii=False).encode()).hexdigest()
-            payload = {"action": "room.task.update", "target_kind": "room", "room_id": room,
+            payload = {"action": "room.task.progress", "target_kind": "room", "room_id": room,
                        "task_id": wire, "execution_generation": gen, "operation_id": "step-" + key,
                        "arguments": {"summary": summary}}
             self.attempted[tid] = now
             try:
                 response = self.send(payload)
+                if isinstance(response, dict) and response.get("status") == "not_deployed":
+                    self.log(f"task step {tid}: room.task.progress not deployed; skipping")
+                    continue
                 if not isinstance(response, dict) or response.get("status") != "completed":
                     raise ValueError("Action did not succeed")
             except Exception as exc:

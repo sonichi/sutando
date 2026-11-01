@@ -2955,7 +2955,7 @@ def _read_by(resp, deadline: float) -> bytes:
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
-         deadline: "float | None" = None, operation_id: "str | None" = None):
+         deadline: "float | None" = None, operation_id: "str | None" = None, origin: bool = False):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
     `deadline` (time.monotonic()), the whole request must finish by then. `operation_id` is a
     claimed effect's idempotency key, the same on every retry of it."""
@@ -2966,7 +2966,8 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
             raise TimeoutError("request deadline already passed")
     with _gateway_call():
         data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
+        base = urllib.parse.urlunsplit((*urllib.parse.urlsplit(URL)[:2], "", "", "")) if origin else URL
+        req = urllib.request.Request(f"{base}{path}", data=data, method=method)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Accept", "application/json")
         # CloudFlare bot-fight (error 1010) rejects python-urllib's default
@@ -4106,8 +4107,14 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
 
 
 def _send_task_step(payload: dict):
-    # A working transition can resume a suspended task; no transport until summary-only exists.
-    raise RuntimeError("summary-only Action contract pending")
+    try:
+        return _req("POST", "/api/capabilities/v1/actions/execute", payload,
+                    timeout=10, operation_id=payload["operation_id"], origin=True)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code != 404:
+            raise
+        return {"status": "not_deployed"}
 
 
 _STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)

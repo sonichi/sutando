@@ -86,7 +86,7 @@ class Publisher(unittest.TestCase):
         self.assertEqual(len(self.calls[0]["arguments"]["summary"]), 140)
         self.assertTrue(self.logs)
 
-    def test_bridge_scope_and_held_transport(self):
+    def test_bridge_scope_and_progress_action_transport(self):
         relay = Relay(); self.addCleanup(relay.close)
         relay.token = "fixture-token"
         relay.on_post = lambda path, body: (200, {"status": "completed"})
@@ -101,13 +101,20 @@ class Publisher(unittest.TestCase):
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", GATEWAY_INSTANCE="dev",
                             TASKS_DIR=tasks_dir, RESULTS_DIR=results, _ATTEMPTS=None, _STEP_PUBLISHER=self.pub):
             gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
-            self.assertEqual(relay.post_paths, [])
-            self.assertIn("Action failed", self.logs[0])
+            self.assertEqual(len(relay.post_paths), 1)
+            path, payload = relay.post_paths[0]
+            self.assertEqual(path, "/api/capabilities/v1/actions/execute")
+            self.assertEqual(payload["action"], "room.task.progress")
+            self.assertEqual(payload["arguments"], {"summary": "Step one"})
+            self.assertEqual(payload["task_id"], "task-a")
+            self.assertEqual(payload["execution_generation"], 3)
+            self.assertNotIn("task_status", payload)
+            self.row("Step two")
             self.pub.send = self.send
             self.clock += 10
             gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
             self.assertEqual(len(self.calls), 1)
-            self.assertEqual(self.calls[0]["arguments"], {"summary": "Step one"})
+            self.assertEqual(self.calls[0]["arguments"], {"summary": "Step two"})
             (results / "task-dev~task-a.txt").write_text("done")
             self.clock += 10; self.row("Later")
             gw._publish_task_steps_snapshot({"task-dev~task-a"})
@@ -209,6 +216,36 @@ class Publisher(unittest.TestCase):
                 (gw.TASKS_DIR / "task-step-gen.txt").read_text()).headers
             self.assertEqual(headers["execution_generation"], "9")
             self.assertEqual(headers["task_id"], "task-step-gen")
+
+
+    def test_undeployed_action_is_skipped_then_retried_after_rate_limit(self):
+        relay = Relay(); self.addCleanup(relay.close)
+        relay.on_post = lambda path, body: (404, {"error_code": "ACTION_NOT_FOUND"})
+        self.row()
+        self.pub.send = gw._send_task_step
+        with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
+            self.pub.publish(self.tasks)
+            self.assertEqual(len(relay.post_paths), 1)
+            self.assertIn("room.task.progress not deployed; skipping", self.logs[0])
+            self.assertNotIn("task-dev~task-a", self.pub.sent)
+            self.pub.publish(self.tasks)
+            self.assertEqual(len(relay.post_paths), 1)
+            self.clock += 10
+            relay.on_post = lambda path, body: (200, {"status": "completed"})
+            self.pub.publish(self.tasks)
+            self.assertEqual(len(relay.post_paths), 2)
+            self.assertEqual(relay.post_paths[0][1], relay.post_paths[1][1])
+            self.assertIn("task-dev~task-a", self.pub.sent)
+
+    def test_non_404_transport_error_is_logged_as_failure(self):
+        relay = Relay(); self.addCleanup(relay.close)
+        relay.on_post = lambda path, body: (503, {"error": "unavailable"})
+        self.row()
+        self.pub.send = gw._send_task_step
+        with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
+            self.pub.publish(self.tasks)
+        self.assertIn("Action failed (HTTPError)", self.logs[0])
+        self.assertEqual(self.pub.sent, {})
 
 
 class BridgeLoop(unittest.TestCase):
