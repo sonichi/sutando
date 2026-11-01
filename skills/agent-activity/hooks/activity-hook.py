@@ -304,29 +304,38 @@ DELEGATING = ("Agent", "Workflow", "SendMessage")
 
 
 def handoff_pre(ws: Path, task_id: str, tool: str, inp, tool_use_id) -> None:
-    """Record work given away from a bound task: a subagent call, or a SendMessage ask with an id."""
+    """Record work given away from a bound task: a subagent call, or a SendMessage ask with an id.
+    Silent: a record that cannot be written must never surface as a hook error."""
     try:
+        import contextlib
+        import io
         import handoffs
         inp = inp if isinstance(inp, dict) else {}
-        if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str):
-            label = handoffs.safe_label(inp.get("subagent_type") or tool.lower(), "a subagent")
-            handoffs.open_handoff(ws, task_id, "agent", tool_use_id, label, holds=not inp.get("run_in_background"))
-        elif tool == "SendMessage":
-            m = _IX.search(str(inp.get("message") or ""))
-            if m:
-                handoffs.open_handoff(ws, task_id, "message", m.group(1), handoffs.safe_label(inp.get("to"), "an agent"),
-                                      holds=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str):
+                handoffs.open_handoff(ws, task_id, "agent", tool_use_id,
+                                      handoffs.label_for("agent", inp.get("subagent_type")),
+                                      holds=not inp.get("run_in_background"))
+            elif tool == "SendMessage":
+                m = _IX.search(str(inp.get("message") or ""))
+                if m:
+                    handoffs.open_handoff(ws, task_id, "message", m.group(1), handoffs.label_for("message", None),
+                                          holds=False)
     except Exception:  # noqa: BLE001 - bookkeeping must never break a tool call
         pass
 
 
-def handoff_post(ws: Path, tool, inp, tool_use_id) -> None:
-    """A foreground subagent's call returning is its work coming back."""
+def handoff_post(ws: Path, tool, inp, tool_use_id, outcome: str = "done") -> None:
+    """A foreground subagent's call returning (done) or failing (failed) is its work coming back.
+    One index-file lookup; the log is not read unless a handoff is open for this call."""
     try:
         if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str) \
                 and not (isinstance(inp, dict) and inp.get("run_in_background")):
+            import contextlib
+            import io
             import handoffs
-            handoffs.close_by_child(ws, "agent", tool_use_id, "done")
+            with contextlib.redirect_stderr(io.StringIO()):
+                handoffs.close_by_child(ws, "agent", tool_use_id, outcome)
     except Exception:  # noqa: BLE001
         pass
 
@@ -378,6 +387,8 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             if task:
                 emit("working", line, task, room, p["ws"], run)
                 out.append(("working", line))
+    elif event == "PostToolUseFailure":
+        handoff_post(p["ws"], payload.get("tool_name"), payload.get("tool_input"), payload.get("tool_use_id"), "failed")
     elif event == "PostToolUse":
         inp = payload.get("tool_input")
         handoff_post(p["ws"], payload.get("tool_name"), inp, payload.get("tool_use_id"))

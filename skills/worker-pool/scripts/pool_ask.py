@@ -158,7 +158,9 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     out = {"task_id": task_id, "to": rid, "from": sender, "task_file": str(tasks / f"{task_id}.txt")}
     if parent_task:
         import handoffs
-        out["handoff_id"] = handoffs.open_handoff(ws, parent_task, "pool", task_id, handoffs.safe_label(to, "a worker"),
+        row = (roster.get("workers") or {}).get(rid) if isinstance(roster, dict) else None
+        label = handoffs.label_for("pool", to, verified=(row or {}).get("label"))
+        out["handoff_id"] = handoffs.open_handoff(ws, parent_task, "pool", task_id, label,
                                                   holds=True, parent_generation=parent_generation)
     if rid != pr.CORE:
         # Routed here as well as by the watcher's own pass: the router is idempotent,
