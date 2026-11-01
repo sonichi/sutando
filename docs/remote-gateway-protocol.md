@@ -953,8 +953,14 @@ an idle report continues to omit its stale step.
 
 Health travels separately in the existing `health` object (`alive`, `motion`,
 `condition`, `reason`, `since`) with the `worker_health.v1` capability. The
-snapshot/injected-command selection, validation, reason normalization, cadence
-and recovery behavior are unchanged. Consumers must use this structured field
+snapshot/injected-command selection, validation and reason grammar are unchanged.
+A valid independent report with failures and age at most 35 minutes sets
+`condition: abnormal`, `reason: health-check`, and `since: checked_at`, preserving
+`alive` and `motion` from that source. Without a source, they remain null/unknown.
+Passing, stale or invalid reports leave the source row unchanged. The broker
+derives `needs_attention: false` for `health-check`; the bridge does not send a
+new attention field. A diagnostic condition change participates in the existing
+heartbeat change detection. Consumers must use this structured field
 for health, rather than interpreting the work status as a liveness verdict.
 
 This bridge change requires loading the updated bridge code. It does not require

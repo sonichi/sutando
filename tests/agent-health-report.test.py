@@ -63,7 +63,9 @@ class HealthReportTests(unittest.TestCase):
                     (self.state / 'agent-health.json').write_text(report)
                     payload = self.heartbeat()
                     self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
-                    self.assertEqual(payload['health'], health)
+                    expected = health if report == '{' else {**health, 'condition': 'abnormal',
+                        'reason': 'health-check', 'since': json.loads(report)['checked_at']}
+                    self.assertEqual(payload['health'], expected)
                     self.assertIn('worker_health.v1', payload['capabilities'])
         (self.state / 'core-status.json').unlink()
         with patch.object(bridge, '_HEALTH_COMMAND', None), \
@@ -71,7 +73,33 @@ class HealthReportTests(unittest.TestCase):
             payload = self.heartbeat()
             self.assertNotIn('status', payload)
             self.assertNotIn('step', payload)
-            self.assertEqual(payload['health'], health)
+            self.assertEqual(payload['health']['reason'], 'health-check')
+
+    def test_failing_diagnostic_supplies_health_without_a_snapshot(self):
+        self.publish('down')
+        with patch.object(bridge, '_HEALTH_COMMAND', None), \
+                patch.object(bridge, '_health_snapshot', return_value=None):
+            payload = self.heartbeat()
+        health = payload['health']
+        self.assertEqual((health['alive'], health['motion'], health['condition'], health['reason']),
+                         (None, 'unknown', 'abnormal', 'health-check'))
+        self.assertEqual(bridge.health_command.validate(health), (health, None))
+        self.assertNotIn('needs_attention', health)
+        self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
+
+    def test_unusable_or_passing_diagnostics_preserve_structured_health(self):
+        health = {'alive': True, 'motion': 'moving', 'condition': 'healthy', 'reason': None, 'since': None}
+        valid = {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}
+        reports = [None, [], {}, {**valid, 'checked_at': time.time() + 60},
+                   {**valid, 'checked_at': time.time() - 3600}, {**valid, 'checked_at': float('nan')},
+                   {**valid, 'failures': 0}, {**valid, 'failures': True},
+                   {**valid, 'failures': 2}, {**valid, 'total': 0}]
+        for report in reports:
+            with self.subTest(report=report):
+                (self.state / 'agent-health.json').write_text(json.dumps(report))
+                self.assertEqual(bridge._diagnostic_health(health), health)
+        (self.state / 'agent-health.json').unlink()
+        self.assertEqual(bridge._diagnostic_health(health), health)
 
     def test_injected_health_preserves_work_and_motion_contract(self):
         command = Mock()
@@ -82,7 +110,8 @@ class HealthReportTests(unittest.TestCase):
         with patch.object(bridge, '_HEALTH_COMMAND', command):
             payload = self.heartbeat()
         self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
-        self.assertEqual(payload['health'], {**health, 'motion': 'idle'})
+        self.assertEqual(payload['health'], {**health, 'motion': 'idle', 'reason': 'health-check',
+                         'since': json.loads((self.state / 'agent-health.json').read_text())['checked_at']})
         self.assertEqual(command.row.return_value, health)
 
     def test_failure_and_recovery_over_http(self):
@@ -114,7 +143,9 @@ class HealthReportTests(unittest.TestCase):
                     self.assertTrue(bridge._post_heartbeat(set(), force=True))
             self.assertEqual([path for path, _ in received], ['/v1/heartbeat'] * 2)
             self.assertEqual([payload['status'] for _, payload in received], ['running', 'running'])
-            self.assertEqual([payload['health'] for _, payload in received], health_rows)
+            self.assertEqual(received[0][1]['health']['reason'], 'health-check')
+            self.assertEqual(received[0][1]['health']['condition'], 'abnormal')
+            self.assertEqual(received[1][1]['health'], health_rows[1])
         finally:
             server.shutdown()
             server.server_close()

@@ -3963,6 +3963,25 @@ def _maybe_pull_worker_labels(record) -> bool:
     return True
 
 
+_HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
+def _diagnostic_health(health: "dict | None") -> "dict | None":
+    """A fresh failing independent check is a quiet structured health warning."""
+    try:
+        report = json.loads((_STATE / "agent-health.json").read_text())
+        ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
+        if (report.get("version") != 1 or type(ts) not in (int, float)
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or type(total) is not int or total <= 0
+                or type(failures) is not int or not 0 < failures <= total):
+            return health
+    except (OSError, ValueError, KeyError, TypeError):
+        return health
+    row = health or {"alive": None, "motion": "unknown"}
+    return {**row, "condition": "abnormal", "reason": "health-check", "since": ts}
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -3974,6 +3993,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
+    health = _diagnostic_health(health)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
