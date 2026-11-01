@@ -15,6 +15,7 @@ import json
 import contextlib
 import os
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -986,6 +987,26 @@ class Hooks(unittest.TestCase):
     def row(self, tid, ts, kind="working"):
         with open(gw._STATE / "agent-activity.jsonl", "a") as fh:
             fh.write(json.dumps({"ts": ts, "kind": kind, "task": {"id": tid}}) + "\n")
+
+    def test_the_loader_reads_the_stop_interrupt_switch_as_the_skill_does(self):
+        loader = Path(__file__).resolve().parents[1] / "src" / "remote-gateway-bridge.py"
+        tree = ast.parse(loader.read_text())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_stop_interrupt_enabled")
+        self.assertTrue(any(isinstance(n, ast.Assign) and ast.unparse(n) == "STOP_INTERRUPT = _stop_interrupt_enabled()"
+                            for n in tree.body), "the loader sets the engine's switch")
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        manifest = Path(td.name) / "manifest.json"
+        ns = {"_AGENT_ACTIVITY_MANIFEST": manifest}
+        exec(compile(ast.Module([fn], []), str(loader), "exec"), ns)
+        enabled = ns["_stop_interrupt_enabled"]
+        manifest.write_text(json.dumps({"config": {"SUTANDO_STOP_INTERRUPT": ""}}))
+        self.assertFalse(enabled({}), "off by default")
+        self.assertTrue(enabled({"SUTANDO_STOP_INTERRUPT": "1"}))
+        manifest.write_text(json.dumps({"config": {"SUTANDO_STOP_INTERRUPT": "on"}}))
+        self.assertTrue(enabled({}), "the skill's manifest config")
+        with mock.patch("skill_config.enabled", side_effect=RuntimeError("unreadable")):
+            self.assertFalse(enabled({"SUTANDO_STOP_INTERRUPT": "1"}))
 
     def test_with_the_stop_interrupt_on_a_stalled_task_is_told_to_stop_once(self):
         tid = "task-stalled-on"

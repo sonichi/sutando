@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Callable
 
 from . import agent_turn, file_lock, local_task_protocol
-from .session_rows import session_row
 from .result_ready import identity_of
 
 TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
@@ -1350,3 +1349,13 @@ def last_activity(state_dir: Path, task_id: str) -> "float | None":
             newest = row[1] if newest is None else max(newest, row[1])
     return newest
 
+
+def session_row(rec) -> "tuple[str, float, str] | None":
+    """(task id, ts, kind) of a row the session's own hooks wrote, else None."""
+    # Delivery (TASK_STATUS) and owner rows are written for the task, not by its turn.
+    if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
+        return None
+    task, ts = rec.get("task"), rec.get("ts")
+    if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return task.get("id"), ts, rec.get("kind")

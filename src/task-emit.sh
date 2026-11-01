@@ -9,8 +9,8 @@
 # Fire-and-forget through the skill's own writer (which decides whether the file names a room);
 # it must never delay or fail the emit, and it is inert when TASKS_DIR is unset (tests, probes).
 # The scheduler owns the task's lifecycle: QUEUED when the file lands, RUNNING once a live core was
-# told, CANCELLED for the task a CANCEL_INSTRUCTION names (with SUTANDO_STOP_INTERRUPT on: a stop request,
-# CANCELLED once confirmed). Through the activity bus (state, then rows),
+# told, CANCELLED for the task a CANCEL_INSTRUCTION names (a stop request instead, when a skill's
+# stop handler takes it and rules it). Through the activity bus (state, then rows),
 # fire-and-forget: it can neither delay nor fail the emit, and it is inert when TASKS_DIR is unset.
 # `$2` is a basename (joined to TASKS_DIR) or an absolute resolved path: rejoining
 # an absolute one to TASKS_DIR would read an existing payload as missing.
@@ -32,29 +32,22 @@ activity_transition() {
 	return 0
 }
 # The same true values as src/skill_config.py; anything else, unset included, is off.
-stop_interrupt_enabled() {
-	case "$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | tr '[:upper:]' '[:lower:]')" in
-		1 | true | yes | on) return 0 ;;
-	esac
-	return 1
-}
 activity_cancel_target() {
 	local filename="$1" target task_file
 	task_file="$(_activity_task_file "$filename")"
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local bus="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/activity_bus.py"
 	[ -f "$bus" ] || return 0
-	# The bus and stop_interrupt.py refuse a lane id (task-<instance>~<broker id>) the shared rule rejects.
+	# The bus and the stop handlers refuse a lane id (task-<instance>~<broker id>) the shared rule rejects.
 	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._~-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._~-]+$' | head -1)"
 	[ -n "$target" ] || return 0
-	if ! stop_interrupt_enabled; then
-		( "${SUTANDO_PY_BIN:-python3}" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1 & ) 2>/dev/null || true
-		return 0
-	fi
-	# Escape to this pane only when it is mid-turn on the named task, then CANCELLED once the stop is confirmed.
-	local stop="$(dirname "$bus")/stop_interrupt.py"
-	[ ! -f "$stop" ] || ( "${SUTANDO_PY_BIN:-python3}" "$stop" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" --control-file "$task_file" >/dev/null & ) || true
-	( "${SUTANDO_PY_BIN:-python3}" "$bus" stop-requested --task-id "$target" >/dev/null 2>&1 & ) 2>/dev/null || true
+	# A skill's stop handler (src/stop_hooks.py) may take the stop and rule it; else it is cancelled at once.
+	local py="${SUTANDO_PY_BIN:-python3}" hooks="$(dirname "$bus")/stop_hooks.py"
+	( if "$py" "$hooks" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" --control-file "$task_file" >/dev/null; then
+		"$py" "$bus" stop-requested --task-id "$target" >/dev/null 2>&1
+	else
+		"$py" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1
+	fi & ) || true
 	return 0
 }
 queued_activity_row() { activity_transition QUEUED "$1"; activity_cancel_target "$1"; }

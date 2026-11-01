@@ -210,7 +210,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
-- **`session_rows.py`** — The session's own activity rows: which task a row the session's hooks wrote names, and when.
 - **`session_runtime.py`** — Runtime a tmux core session was launched with, read from the session's own environment.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
@@ -239,7 +238,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.
-- **`stop_interrupt.py`** — Interrupt the turn a Stop names: one Escape to this watcher's pane, only when that pane is mid-turn on exactly the cancelled task.
+- **`stop_hooks.py`** — Stop handlers: the scripts installed skills declare with the manifest field `on_stop_requested`, offered each Stop the task watcher reads (a CANCEL_INSTRUCTION naming a task).
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.

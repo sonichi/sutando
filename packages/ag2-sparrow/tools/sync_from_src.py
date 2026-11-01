@@ -73,8 +73,6 @@ MAP = {
     # task ordering (urgent > normal > low, FIFO within a tier) for every inbox consumer
     "src/task_priority.py": "task_priority.py",
     "src/agent_turn.py": "agent_turn.py",
-    # the one reader of the session's own activity rows (stall watch, Stop interrupt)
-    "src/session_rows.py": "session_rows.py",
     # one adapter's task execution lifecycle: work-dir lock, classifier, claims, publication
     "src/task_lifecycle.py": "task_lifecycle.py",
     # worker-pool completion-record contract: the pool skill writes through it
