@@ -514,7 +514,7 @@ class DurableAck(unittest.TestCase):
 
     def test_a_lease_file_that_did_not_commit_withholds_the_round(self):
         """The ledger must never name a leased task whose generation is not on
-        disk; an unreadable lease file fails open to no generations."""
+        disk; an unreadable lease file is unknown, and nothing is written over it."""
         mod = self.mod
         real = mod._durable_write
         with patch.object(mod, "_durable_write",
@@ -523,8 +523,10 @@ class DurableAck(unittest.TestCase):
         self.assertEqual(mod._load_pending_acks(), {})
         self.assertTrue(mod._record_pending_acks([("task-wl", True, "gen-1")]))
         mod._ack_lease_file().write_text("{not json")
-        self.assertEqual(mod._load_pending_leases(), {})
+        self.assertIs(mod._load_pending_leases(), mod.task_attempts.UNKNOWN)
         self.assertEqual(mod._load_pending_acks(), {"task-wl": True})
+        self.assertFalse(mod._record_pending_acks([("task-wl2", True, "gen-1")]), "never over what it cannot read")
+        self.assertEqual(mod._ack_lease_file().read_text(), "{not json")
 
     # -- 5. the production ack round, driven through main() ------------------ #
 
