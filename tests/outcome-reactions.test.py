@@ -90,6 +90,33 @@ class Handler(unittest.TestCase):
         self.assertEqual(self._signals(), [])
         self.assertIn("not recorded", said[0])
 
+    def test_an_unclaimed_event_offered_directly_is_just_settled(self):
+        self.assertEqual(self.h.offer({"type": "message.created", "event_id": "$m"}), ["$m"])
+        self.assertEqual(self.h.offer({"type": "message.created"}), [])
+        self.assertEqual(self._signals(), [])
+
+    def test_an_invalid_room_is_dropped_not_the_reaction(self):
+        self.h.offer(reaction(1, room_id="the dev room"))
+        self.assertNotIn("room_id", self._signals()[0])
+
+    def test_an_unexpected_error_leaves_only_that_event_for_the_next_drain(self):
+        said = []
+        h = OutcomeReactionHandler(self.log, log=said.append)
+        from unittest.mock import patch
+        with patch.object(cl, "read", side_effect=RuntimeError("disk")):
+            self.assertEqual(h.offer(reaction(1)), [])
+        self.assertIn("left for the next drain", said[0])
+
+    def test_loaded_outside_the_package_it_uses_the_engine_copy(self):
+        import importlib.util
+        sys.path.insert(0, str(REPO / "src"))
+        spec = importlib.util.spec_from_file_location(
+            "outcome_reactions_flat", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outcome_reactions.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.OutcomeReactionHandler(self.log, log=lambda *a: None).offer(reaction(1))
+        self.assertEqual(len(self._signals()), 1)
+
     def test_buckets_are_for_display(self):
         self.assertEqual((bucket("✅"), bucket("👎"), bucket("🤔")), ("positive", "negative", "neutral"))
 
