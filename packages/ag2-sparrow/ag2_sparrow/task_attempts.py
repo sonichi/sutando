@@ -362,6 +362,22 @@ class TaskAttempts:
             return UNKNOWN
         return _wake_item(wire_tid, rec)
 
+    def open_claims(self, kind: str):
+        """[(task, claim)] for every open claim of `kind`, from one read of the ledger; UNKNOWN when it
+        cannot be read. A record whose claims cannot be read is reported and skipped, never emptied."""
+        tasks = _at(self._read(), "tasks")
+        if tasks is UNKNOWN or tasks is not None and not isinstance(tasks, dict):
+            return UNKNOWN
+        out = []
+        for wire, rec in sorted((tasks or {}).items()):
+            claims = rec.get("claims") if isinstance(rec, dict) else None
+            if claims is not None and not isinstance(claims, dict):
+                self.log(f"task {wire}: its claims cannot be read — not retried")
+                continue
+            out += [(wire, Claim({**c, "op": op})) for op, c in sorted((claims or {}).items())
+                    if isinstance(c, dict) and c.get("kind") == kind]
+        return out
+
     def owed_view(self, wire_tid: str):
         """From one read of the ledger: the record, and what it keeps of the run the record's run
         replaced (its lease, generation and whether its answer was delivered), None when it replaced

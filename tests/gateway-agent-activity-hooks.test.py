@@ -3935,7 +3935,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual(seen.get("Idempotency-key"), "ack-0123")
 
     # ── enforcement: one writer, provider calls with no transition held ──
-    READERS = {"transition", "entry", "records", "owing", "holds", "beating", "wake_item", "run_item", "owed_view", "run_of",
+    READERS = {"transition", "entry", "records", "owing", "holds", "beating", "wake_item", "run_item", "owed_view", "open_claims", "run_of",
                "ack_fields", "worker_id", "broker_names_leases", "report_superseded", "sweep",
                "close_finished_turns", "beat_snapshot", "now", "take_ownership", "task_beat_disabled", "unowned"}
 

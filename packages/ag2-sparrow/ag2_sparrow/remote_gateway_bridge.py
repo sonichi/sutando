@@ -3235,16 +3235,21 @@ def _ack_lease_file() -> Path:
     return PENDING_ACK_FILE.with_name(f"{PENDING_ACK_FILE.stem}-leases.json")
 
 
-def _read_ack_json(path: Path) -> dict:
-    """One pending-ack file as a dict (fail-open to empty)."""
+def _read_ack_json(path: Path):
+    """One pending-ack file as a dict; {} when there is none; UNKNOWN when it cannot be read or is
+    not a map, so nothing overwrites or retires what it may hold."""
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"pending-ack file {path.name} unreadable ({diagnostics.describe(e)}) — starting empty")
-        return {}
-    return {str(k): v for k, v in data.items()} if isinstance(data, dict) else {}
+        _log_backoff((path.name, "unreadable"), f"pending-ack file {path.name} unreadable "
+                     f"({diagnostics.describe(e)}) — left as it is")
+        return task_attempts.UNKNOWN
+    if not isinstance(data, dict):
+        _log_backoff((path.name, "unreadable"), f"pending-ack file {path.name} is not a map — left as it is")
+        return task_attempts.UNKNOWN
+    return {str(k): v for k, v in data.items()}
 
 
 def _lease_id_of(d: dict) -> "str | None":
@@ -3255,15 +3260,18 @@ def _lease_id_of(d: dict) -> "str | None":
 
 def _load_pending_acks() -> "dict[str, bool]":
     """Acks the gateway never confirmed, mapped to the durability each may
-    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
-    return {k: bool(v) for k, v in _read_ack_json(PENDING_ACK_FILE).items()}
+    claim; UNKNOWN when the file cannot be read."""
+    acks = _read_ack_json(PENDING_ACK_FILE)
+    return acks if acks is task_attempts.UNKNOWN else {k: bool(v) for k, v in acks.items()}
 
 
 def _load_pending_leases() -> "dict[str, str]":
-    """The lease generation each pending ack was served under, where known."""
-    acks = _read_ack_json(PENDING_ACK_FILE)
-    leases = {k: _lease_id_of({"lease_id": v})
-              for k, v in _read_ack_json(_ack_lease_file()).items() if k in acks}
+    """The lease generation each pending ack was served under, where known; UNKNOWN when either file
+    cannot be read."""
+    acks, stored = _read_ack_json(PENDING_ACK_FILE), _read_ack_json(_ack_lease_file())
+    if task_attempts.UNKNOWN in (acks, stored):
+        return task_attempts.UNKNOWN
+    leases = {k: _lease_id_of({"lease_id": v}) for k, v in stored.items() if k in acks}
     return {k: v for k, v in leases.items() if v}
 
 
@@ -3275,6 +3283,8 @@ def _record_pending_acks(pending: "list[tuple]") -> bool:
     with _PENDING_ACK_MUTEX:
         acks = _load_pending_acks()
         stored = _read_ack_json(_ack_lease_file())
+        if task_attempts.UNKNOWN in (acks, stored):
+            return False                        # never overwrites what an unreadable file holds
         leases = dict(stored)
         for entry in pending:
             tid, durable, lease = (tuple(entry) + (None,))[:3]
@@ -3296,7 +3306,8 @@ def _forget_pending_ack(tid: str, lease_id: "str | None" = None) -> None:
     with _PENDING_ACK_MUTEX:
         acks = _load_pending_acks()
         leases = _read_ack_json(_ack_lease_file())
-        if tid not in acks or _lease_id_of({"lease_id": leases.get(tid)}) != lease_id:
+        if task_attempts.UNKNOWN in (acks, leases) or tid not in acks \
+                or _lease_id_of({"lease_id": leases.get(tid)}) != lease_id:
             return
         acks.pop(tid)
         if _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True)) \
@@ -3310,12 +3321,45 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
     That inference needs a TRUSTWORTHY in-flight set. When the restore degraded
     the set is empty-because-unknown, so post instead and let the gateway's
     'not leased' 404 retire the lease it actually closed."""
-    leases = _load_pending_leases()
-    for tid, durable in sorted(_load_pending_acks().items()):
+    done = _retry_claimed_acks()
+    acks, leases = _load_pending_acks(), _load_pending_leases()
+    if task_attempts.UNKNOWN in (acks, leases):
+        return                                  # an unreadable index is neither retried nor retired
+    for tid, durable in sorted(acks.items()):
+        if tid in done:
+            continue
         if tid not in inflight and not _INFLIGHT_DEGRADED:
             _forget_pending_ack(tid, leases.get(tid))
             continue
-        _post_task_ack(tid, durable, leases.get(tid))
+        lease = leases.get(tid)
+        if lease is None and _ATTEMPTS is not None:
+            rec = _ATTEMPTS.entry(_broker_tid(tid))
+            if not isinstance(rec, dict) or not rec.get("lease_id"):
+                continue                        # its lease cannot be proved: kept, never posted as None
+            lease = rec["lease_id"]
+        _post_task_ack(tid, durable, lease)
+
+
+def _retry_claimed_acks() -> "set[str]":
+    """Re-post every ordinary ack the ledger holds an open claim for, under the claim's own lease
+    and operation id, whatever the pending-ack files say. An `ack_first` claim is the held-task
+    pass's. The local ids posted."""
+    if _ATTEMPTS is None:
+        return set()
+    claims = _ATTEMPTS.open_claims("ack")
+    if claims is task_attempts.UNKNOWN:
+        return set()
+    held, done = _load_held(), set()
+    for _wire, c in claims:
+        data = c.get("data") or {}
+        local = data.get("local_tid") or c.get("run")
+        if data.get("retry_owner") == "ack_first" or not isinstance(local, str) or not _valid_local_tid(local):
+            continue
+        if not data.get("retry_owner") and (held is None or local in held):
+            continue                            # an older claim the held manifest may own: never guessed
+        _post_task_ack(local, bool(data.get("durable")), c.get("serve"))
+        done.add(local)
+    return done
 
 
 ACK_DROP_RETRY_S = 0.5
@@ -3352,7 +3396,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         wire_tid = _broker_tid(tid)
         safe_tid = urllib.parse.quote(wire_tid, safe="")
         if _ATTEMPTS is not None:
-            claim = _claim_ack(wire_tid, lease_id)
+            claim = _claim_ack(wire_tid, lease_id, local=tid, durable=durable)
             if claim == "elsewhere":
                 _forget_pending_ack(tid, lease_id)
                 _log(f"task ack for {tid}: its attempt no longer holds this serve — not posted")
@@ -3455,7 +3499,7 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     wire_tid = _broker_tid(tid)
     claim = None
     if _ATTEMPTS is not None:
-        claim = _claim_ack(wire_tid, lease_id)
+        claim = _claim_ack(wire_tid, lease_id, local=tid, durable=True, owner="ack_first")
         if claim == "elsewhere":
             return "stale"
         if claim is None:
@@ -4103,9 +4147,11 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
-def _claim_ack(wire_tid: str, lease_id: "str | None"):
+def _claim_ack(wire_tid: str, lease_id: "str | None", local: "str | None" = None, durable: bool = False,
+               owner: str = "pending_ack"):
     """The ack's claim on the serve under `lease_id`, the run's own or one held pending: "elsewhere"
-    when the attempt holds neither, None when it cannot be read or the claim could not be saved."""
+    when the attempt holds neither, None when it cannot be read or the claim could not be saved. The
+    claim carries who retries it, so an open claim alone is enough to recover the ack."""
     with _ATTEMPTS.transition(wire_tid) as t:
         rec = t.rec
         if rec is task_attempts.UNKNOWN:
@@ -4114,7 +4160,8 @@ def _claim_ack(wire_tid: str, lease_id: "str | None"):
         held = isinstance(pending, dict) and pending.get("lease") == lease_id
         if not rec or not (rec.get("lease_id") == lease_id or held):
             return "elsewhere"
-        return t.claim("ack", serve=lease_id)
+        return t.claim("ack", serve=lease_id, data={"retry_owner": owner, "local_tid": local or wire_tid,
+                                                    "durable": bool(durable)})
 
 
 def _superseded_by_held(rec, claim) -> bool:
