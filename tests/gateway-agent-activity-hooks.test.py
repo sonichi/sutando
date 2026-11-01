@@ -390,7 +390,7 @@ class Hooks(unittest.TestCase):
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
         self.addCleanup(self.forget, tid)
-        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": lambda p: _ack(tid, 1)}))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": lambda p: _ack(tid, 1)}))
         with mock.patch.object(gw, "_publish_staged", return_value=False):
             gw._write_task(_task(tid, lease_id="L1", source_event_id="$e"))
         self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "generation 1 was never published")
