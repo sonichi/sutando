@@ -70,8 +70,8 @@ except ImportError:
     _d.File, _d.Message, _d.DMChannel = (type(n, (), {}) for n in ("F", "M", "DM"))
     sys.modules["discord"] = _d
 
-from ag2_sparrow import outbox  # noqa: E402
-from ag2_sparrow.delivery_core import DesignAClaimBackend  # noqa: E402
+from ag2_sparrow import delivery_core, outbox  # noqa: E402
+from ag2_sparrow.delivery_core import DesignAClaimBackend, backend_a  # noqa: E402
 
 import discord_result_delivery as drd  # noqa: E402
 import slack_result_delivery as srd  # noqa: E402
@@ -119,8 +119,8 @@ class _Recovery:
         (self.results / "archive").mkdir(parents=True)
         (self.td / "tasks" / "archive").mkdir(parents=True)
         (self.td / "state").mkdir()
-        self.mod._LAST_RECOVER.clear()
-        self.addCleanup(self.mod._LAST_RECOVER.clear)
+        backend_a._RECOVERED_AT.clear()
+        self.addCleanup(backend_a._RECOVERED_AT.clear)
 
     def root(self) -> Path:
         return self.mod.result_backend(self.results).root
@@ -170,6 +170,13 @@ class _Recovery:
         self.one_pass()
         self.assertTrue(self.held("task-live"), "a running sender is never displaced")
 
+    def test_the_pass_runs_the_one_shared_throttled_recovery_on_its_own_backend(self):
+        self.assertIs(self.mod._recover_claims, delivery_core.recover_claims)
+        self.assertFalse([n for n in vars(self.mod) if "RECOVER" in n.upper() and n.isupper()],
+                         "no copy of the cadence: delivery_core.RECOVER_EVERY_S is its one owner")
+        self.one_pass()
+        self.assertEqual(list(backend_a._RECOVERED_AT), [self.root()], "the shared throttle ran on this backend")
+
     def test_a_failing_recovery_is_reported_and_the_pass_goes_on(self):
         def broken(_results_dir):
             raise OSError("outbox unreadable")
@@ -183,10 +190,10 @@ class _Recovery:
         self.crash("task-later")
         self.one_pass()
         self.assertTrue(self.held("task-later"), "within RECOVER_EVERY_S the next pass does not sweep")
-        self.assertGreater(self.mod.RECOVER_EVERY_S, DesignAClaimBackend(self.root()).reclaim_ttl_s,
+        self.assertGreater(backend_a.RECOVER_EVERY_S, DesignAClaimBackend(self.root()).reclaim_ttl_s,
                            "the cadence outlasts the reclaim TTL, or a sweep could never retire anything")
-        for key in list(self.mod._LAST_RECOVER):
-            self.mod._LAST_RECOVER[key] -= self.mod.RECOVER_EVERY_S
+        for key in list(backend_a._RECOVERED_AT):
+            backend_a._RECOVERED_AT[key] -= backend_a.RECOVER_EVERY_S
         self.one_pass()
         self.assertFalse(self.held("task-later"), "once it is due again, the sweep runs")
 
