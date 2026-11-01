@@ -768,6 +768,7 @@ class StopHooks(unittest.TestCase):
                     if record.exists() and want in record.read_text():
                         break
                     time.sleep(0.05)
+                time.sleep(1.0)                         # both emits are detached: let the raw one land too
                 calls = record.read_text()
                 self.assertIn(f"{want}", calls)
                 self.assertEqual(calls.count(f"--task-id {work}"), 1, "the cancel stops it once; the raw submit never")
