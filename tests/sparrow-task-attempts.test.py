@@ -884,27 +884,31 @@ class AnsweredOnce(unittest.TestCase):
                     self.assertEqual(after["questions"], before["questions"], "nothing changed, nothing evicted")
                     self.assertNotIn("answer_offered", after["tasks"]["tsk_B"])
 
-    def test_the_bound_forgets_only_expired_questions_and_otherwise_withholds(self):
+    def test_at_the_bound_closed_questions_go_oldest_first_and_only_live_holds_withhold(self):
         a = self.mk(turn_context=True)
         with unittest.mock.patch.object(task_attempts, "QUESTIONS_KEPT", 2):
-            self.served(a, "tsk_ans")
-            call(a, "tsk_ans", "answer_rule", {"question_id": "q_ans"})
-            self.answer_in_journal(self.turn(a, "tsk_ans"), "tsk_ans", qid="q_ans")
-            call(a, "tsk_ans", "finish")
-            self.served(a, "tsk_0")
-            self.assertIn(self.RULE, call(a, "tsk_0", "answer_rule", {"question_id": "q0", "expires_at": 0}))
-            self.turn(a, "tsk_0")
-            call(a, "tsk_0", "finish")                     # its journal shows no answer: closed, not freed
-            self.served(a, "tsk_1")
+            for tid, qid in (("tsk_0", "q0"), ("tsk_1", "q1")):
+                self.served(a, tid)
+                self.assertIn(self.RULE, call(a, tid, "answer_rule", {"question_id": qid}))
+                self.turn(a, tid)
+            self.served(a, "tsk_2")
             before = a._read()["questions"]
-            self.assertEqual(call(a, "tsk_1", "answer_rule", {"question_id": "q1"}), task_attempts.ANSWER_UNRECORDED_NOTE,
-                             "closed questions are kept: no room, withheld")
+            self.assertEqual(call(a, "tsk_2", "answer_rule", {"question_id": "q2"}), task_attempts.ANSWER_UNRECORDED_NOTE,
+                             "two live holds: never forgotten, so this one is withheld")
             self.assertEqual(a._read()["questions"], before, "and nothing changed")
-            with unittest.mock.patch.object(a, "now", lambda: task_attempts.QUESTION_EXPIRY_GRACE_S + 1):
-                self.assertIn(self.RULE, call(a, "tsk_1", "answer_rule", {"question_id": "q1"}))
-            self.assertEqual(list(a._read()["questions"]), ["q_ans", "q1"], "only the expired one was forgotten")
-            self.served(a, "tsk_9")
-            self.assertEqual(call(a, "tsk_9", "answer_rule", {"question_id": "q_ans"}), task_attempts.ANSWERED_HERE_NOTE)
+            call(a, "tsk_0", "finish")                     # closed (unknown)
+            self.assertIn(self.RULE, call(a, "tsk_2", "answer_rule", {"question_id": "q2"}),
+                          "the cap never wedges: the oldest closed entry makes room")
+            self.assertEqual(list(a._read()["questions"]), ["q1", "q2"], "q0 forgotten, the live hold q1 kept")
+            call(a, "tsk_1", "finish")
+            call(a, "tsk_2", "finish")
+            for n in range(5):                             # a long-lived install keeps answering
+                tid = f"tsk_x{n}"
+                self.served(a, tid)
+                self.assertIn(self.RULE, call(a, tid, "answer_rule", {"question_id": f"qx{n}"}))
+                self.turn(a, tid)
+                call(a, tid, "finish")
+            self.assertEqual(len(a._read()["questions"]), 2)
 
     def test_a_newer_generation_never_inherits_the_earlier_runs_question(self):
         a = self.mk(turn_context=True)

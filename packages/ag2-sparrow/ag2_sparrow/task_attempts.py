@@ -131,6 +131,7 @@ ANSWERING_ELSEWHERE_NOTE = (
     "do not answer it here. Write this task's result file as `[no-send]` with a one-line note that "
     "it is being answered elsewhere.")
 # Only offer() creates an entry, and only within QUESTIONS_KEPT; a settle edits an existing one.
+# Past it, closed entries are forgotten oldest first; only live holds can fill it.
 QUESTIONS_KEPT = 2000
 QUESTION_EXPIRY_GRACE_S = 86400.0
 ANSWERED_UNKNOWN = "unknown"
@@ -1507,9 +1508,15 @@ def _forgettable(q: dict, now: float) -> bool:
 
 
 def _make_room(questions: dict, now: float) -> None:
-    """Room for one new entry: the oldest forgettable ones go; with none, _Refused and nothing changes."""
+    """Room for one new entry: free and expired entries go first, then the oldest closed ones (the
+    broker refuses a second answer from the same respondent, so a forgotten one is never answered
+    twice). A live hold is never forgotten; with every slot one, _Refused and nothing changes."""
     excess = len(questions) + 1 - QUESTIONS_KEPT
-    victims = [k for k, q in questions.items() if _forgettable(q, now)][:max(excess, 0)]
+    if excess <= 0:
+        return
+    first = [k for k, q in questions.items() if _forgettable(q, now)]
+    closed = [k for k, q in questions.items() if "answered" in q and k not in first]
+    victims = (first + closed)[:excess]
     if len(victims) < excess:
         raise _Refused
     for k in victims:
