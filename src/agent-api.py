@@ -1399,22 +1399,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             repo_resolved = WORKSPACE_DIR.resolve()  # /media/ serves from workspace (results/, data/, notes/)
             media_path = repo_resolved.joinpath(*safe_parts).resolve()
-            # Only embeddable media in the shared folders goes without the local API bearer (an
-            # <img>/<audio>/<video> cannot send one, and a foreign page cannot read its bytes);
-            # state, tasks, logs and any text-like file anywhere need it.
-            # Judged by where the file really is: a results/ link into state/ is a state file.
-            try:
-                top = media_path.relative_to(repo_resolved).parts[0]
-            except (ValueError, IndexError):
-                top = ""
-            if not (top in MEDIA_OPEN_DIRS and media_path.suffix.lower() in MEDIA_OPEN_TYPES):
-                try:
-                    bound_port = int(self.server.server_address[1])
-                except (AttributeError, TypeError, ValueError, IndexError):
-                    bound_port = None
+            # Only embeddable media in a shared folder (judged where the file really is) skips the
+            # bearer: an <img> cannot send one. State, tasks, logs and text anywhere need it.
+            parts = media_path.relative_to(repo_resolved).parts if media_path.is_relative_to(repo_resolved) else ()
+            if not (parts[:1] and parts[0] in MEDIA_OPEN_DIRS and media_path.suffix.lower() in MEDIA_OPEN_TYPES):
                 status, why = local_api_gate.bearer_request_allowed(
                     self.headers.get("Origin"), self.headers.get("Host", ""), self.headers.get("Authorization", ""),
-                    expected_token=connections_bearer(), bound_port=bound_port)
+                    expected_token=connections_bearer(), bound_port=self._bound_port())
                 if why:
                     self.send_json(status, {"error": why})
                     return
