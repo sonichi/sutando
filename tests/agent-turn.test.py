@@ -408,6 +408,35 @@ class ResultFileDecision(unittest.TestCase):
                 d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
                 self.assertEqual((d.action, d.fields), (at.SETTLE, {}))
 
+    def test_a_lost_or_unknown_ask_outcome_is_never_posted_as_the_reply(self):
+        for outcome in (None, "dispatched_unknown"):
+            with self.subTest(outcome=outcome):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                recs = [_intent(turn, 1, action="room.question.ask")]
+                if outcome:
+                    recs.append(_outcome(turn, 1, op_status=outcome))
+                _journal(state, *recs)
+                d = at.result_file_decision(at.read_turn_records(state, turn), "I asked which colour")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "waiting_input", "no_send": True}))
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"))
+        failed = {"operation_id": f"op_{turn}_1", "operation_status": "failed", "turn_id": turn, "seq": 1}
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked",
+                                                 reconciled=[failed]).fields,
+                         {"status": "failed", "no_send": True}, "the ask failed: 'I asked' is never the reply")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"), _outcome(turn, 1, op_status="failed"))
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked").fields,
+                         {"status": "failed", "no_send": True}, "a failed ask in the journal itself")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1), _outcome(turn, 1, op_status="dispatched_unknown"))
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "the answer").fields,
+                         {"status": "completed"}, "a lost message send is not a question")
+
     def test_an_outcome_whose_task_the_ledger_does_not_know_is_unknown_not_terminal_or_suspended(self):
         def unknown(turn, seq, action="room.message.send", status="done"):
             return {"record_type": at.OUTCOME, "turn_id": turn, "seq": seq, "action": action,

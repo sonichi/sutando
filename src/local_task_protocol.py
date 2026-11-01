@@ -180,6 +180,8 @@ KNOWN_HEADER_KEYS = (
     "addressed_to", "callSid", "caller",
     # The relay's judgement of a voice task: quick or long; the core dispatches on it.
     "lane",
+    # The question episode a woken task resumes: its file is a new turn of an id answered before.
+    "wake_episode",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -265,14 +267,42 @@ def valid_broker_id(tid) -> bool:
 
 
 def valid_local_task_id(tid) -> bool:
-    """A live task id, or one a named gateway instance owns (`task-<instance>~<broker id>`)."""
+    """A live task id, or one a named gateway instance owns (`task-<instance>~<broker id>`), or a
+    later run of either (`run_task_id`)."""
     if not isinstance(tid, str):
+        return False
+    try:
+        tid, _seq = split_run_id(tid)
+    except ValueError:
         return False
     if valid_task_id(tid):
         return True
     inst, sep, broker = tid[len("task-"):].partition("~")
     return (tid.startswith("task-") and bool(sep) and INSTANCE_ID_RE.fullmatch(inst) is not None
             and valid_broker_id(broker))
+
+
+# A later local run of one served task (published again, or woken): `<local id>~~<n>`, n >= 2.
+# No local id contains `~~` (broker ids and instance names exclude `~`), so the split is exact.
+RUN_SEPARATOR = "~~"
+_RUN_SEQ_RE = re.compile(r"[1-9][0-9]{0,5}")
+
+
+def run_task_id(base: str, seq: int) -> str:
+    """The local id of run `seq` of the task whose first run is `base`; run 1 is `base` itself."""
+    if RUN_SEPARATOR in base or type(seq) is not int or not 1 <= seq <= 999999:
+        raise ValueError(f"no run {seq!r} of {base!r}")
+    return base if seq == 1 else f"{base}{RUN_SEPARATOR}{seq}"
+
+
+def split_run_id(tid: str) -> "tuple[str, int]":
+    """(first run's id, run number) of a local id; ValueError for a malformed run suffix."""
+    base, sep, seq = tid.rpartition(RUN_SEPARATOR)
+    if not sep:
+        return tid, 1
+    if not base or RUN_SEPARATOR in base or not _RUN_SEQ_RE.fullmatch(seq) or seq == "1":
+        raise ValueError(f"malformed run id {tid!r}")
+    return base, int(seq)
 
 
 def valid_archive_lookup_id(tid: str) -> bool:
