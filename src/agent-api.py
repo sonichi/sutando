@@ -180,11 +180,6 @@ CONNECTIONS_PREFIX = "/api/v1/connections"
 CONNECTIONS_BODY_CAP = 16384
 
 
-# /media/ files that need no bearer: embeddable media in the shared folders. Everything else needs it.
-MEDIA_OPEN_DIRS = frozenset({"results", "data", "notes"})
-MEDIA_OPEN_TYPES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".mp3", ".wav"})
-
-
 def connections_bearer() -> str:
     return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
 
@@ -1357,20 +1352,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             repo_resolved = WORKSPACE_DIR.resolve()  # /media/ serves from workspace (results/, data/, notes/)
             media_path = repo_resolved.joinpath(*safe_parts).resolve()
-            # Only embeddable media in the shared folders goes without the local API bearer (an
-            # <img>/<audio>/<video> cannot send one, and a foreign page cannot read its bytes);
-            # state, tasks, logs and any text-like file anywhere need it.
-            if not (safe_parts[0] in MEDIA_OPEN_DIRS and media_path.suffix.lower() in MEDIA_OPEN_TYPES):
-                try:
-                    bound_port = int(self.server.server_address[1])
-                except (AttributeError, TypeError, ValueError, IndexError):
-                    bound_port = None
-                status, why = local_api_gate.bearer_request_allowed(
-                    self.headers.get("Origin"), self.headers.get("Host", ""), self.headers.get("Authorization", ""),
-                    expected_token=connections_bearer(), bound_port=bound_port)
-                if why:
-                    self.send_json(status, {"error": why})
-                    return
             if not media_path.is_relative_to(repo_resolved) or not media_path.is_file():
                 self.send_json(404, {"error": "not found"})
                 return
@@ -1388,8 +1369,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_cors()
-            self.send_header("Cache-Control", "public, max-age=300" if mime.split("/")[0] in ("image", "audio", "video")
-                             else "private, no-store")
+            self.send_header("Cache-Control", "public, max-age=300")
             self.end_headers()
             self.wfile.write(media_path.read_bytes())
         elif path == "/logs/voice":

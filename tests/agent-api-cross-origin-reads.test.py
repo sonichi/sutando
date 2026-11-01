@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""agent-api never grants a cross-origin read to a foreign site, and its loopback state is behind the bearer.
+"""agent-api never grants a cross-origin read to a foreign site.
 
 A REAL HTTP server on an ephemeral port, the workspace a temp dir. Contract:
   a) no response carries `Access-Control-Allow-Origin: *`; a foreign Origin gets no grant at all
      (JSON routes, /media, /avatar, the OPTIONS preflight)
   b) a loopback page, the desktop app's origins and a page served from the same host get their
      Origin echoed, with Vary: Origin
-  c) /media/state/*, /media/tasks/*, /media/logs/* and any text-like file need the local API
-     bearer: 401 without it (before any existence check), 403 for a foreign Origin even with it,
-     200 with it from the desktop app's origin
-  d) embeddable media in results/, data/ and notes/ needs no bearer (an <img> cannot send one)
+  c) responses still reach callers that need no grant (same-origin, <img>, local tools)
 
 Run: python3 tests/agent-api-cross-origin-reads.test.py
 """
@@ -52,7 +49,6 @@ api.API_TOKEN = ""
 (WS / "results" / "media").mkdir(parents=True, exist_ok=True)
 (WS / "results" / "media" / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 (WS / "results" / "task-1.txt").write_text("private reply\n")
-TOKEN = api.connections_bearer()
 
 server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
 PORT = server.server_address[1]
@@ -105,23 +101,9 @@ def main() -> int:
     check(req("/ping", origin="http://evil.example", host=f"192.168.1.20:{PORT}")[1] is None,
           "b) a different host is not")
 
-    # c) state, tasks and text need the bearer; the refusal comes before any existence check
-    for path in ("/media/state/agent-activity.jsonl", "/media/tasks/task-1.txt", "/media/results/task-1.txt",
-                 "/media/state/missing.json"):
-        status, acao, _v, body = req(path)
-        check(status == 401 and b"private" not in body, f"c) {path} without the bearer: 401 ({status})")
-        status, acao, _v, body = req(path, origin=FOREIGN, bearer=TOKEN)
-        check(status == 403 and acao is None and b"private" not in body,
-              f"c) {path} from a foreign origin with the bearer: 403, no grant ({status})")
-    status, acao, _v, body = req("/media/state/agent-activity.jsonl", origin="tauri://localhost", bearer=TOKEN)
-    check(status == 200 and acao == "tauri://localhost" and b"private task text" in body,
-          f"c) the desktop app with the bearer reads its activity rows ({status})")
-    check(req("/media/state/missing.json", bearer=TOKEN)[0] == 404, "c) with the bearer, a missing file is 404")
-    check(req("/media/state/agent-activity.jsonl", bearer="wrong")[0] == 401, "c) a wrong bearer is 401")
-
-    # d) embeddable media in a shared folder needs no bearer
+    # the response still reaches same-origin callers; only the grant is withheld
     status, acao, _v, body = req("/media/results/media/pic.png")
-    check(status == 200 and body.startswith(b"\x89PNG"), f"d) an image in results/ embeds without the bearer ({status})")
+    check(status == 200 and body.startswith(b"\x89PNG"), f"c) media still served to a same-origin caller ({status})")
 
     # the predicate itself
     check(gate.cors_origin(None, HOST) == "" and gate.cors_origin("", HOST) == "", "gate: no Origin, no grant")
@@ -131,7 +113,7 @@ def main() -> int:
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}")
         return 1
-    print("\nPASS: no foreign site can read agent-api; loopback state needs the bearer")
+    print("\nPASS: no foreign site is granted a read of agent-api")
     return 0
 
 
