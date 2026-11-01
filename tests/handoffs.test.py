@@ -163,6 +163,56 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(ho.main(["close", "--handoff", "bad", "--workspace", str(self.ws)]), 2)
 
 
+class Faults(unittest.TestCase):
+    """Every defensive branch keeps its promise: never raises, never closes what it cannot prove."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+
+    def test_a_bad_timestamp_reads_as_epoch_zero(self):
+        self.assertEqual(ho._epoch("not a time"), 0.0)
+        self.assertEqual(ho._epoch(None), 0.0)
+
+    def test_an_index_that_cannot_be_written_is_no_handoff(self):
+        with patch.object(ho, "_index_dir", side_effect=OSError("read-only")):
+            self.assertIsNone(ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True))
+
+    def test_a_missing_child_key_does_not_stop_the_close(self):
+        hid = ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
+        ho._child_key(self.ws, "pool", CHILD).unlink()
+        self.assertTrue(ho.close_handoff(self.ws, hid))
+        self.assertEqual(ho.open_handoffs(self.ws, PARENT), [])
+
+    def test_an_unreadable_index_file_is_skipped(self):
+        ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
+        (ho._index_dir(self.ws, PARENT) / "ho_bad.json").write_text("not json")
+        self.assertEqual(len(ho.open_handoffs(self.ws, PARENT)), 1)
+
+    def test_close_by_id_without_an_index_or_with_a_bad_file_fails_closed(self):
+        self.assertFalse(ho.close_handoff(self.ws, "ho_0123456789ab"), "no index root at all")
+        d = ho._index_dir(self.ws, PARENT)
+        d.mkdir(parents=True)
+        (d / "ho_0123456789ab.json").write_text("not json")
+        self.assertFalse(ho.close_handoff(self.ws, "ho_0123456789ab"))
+
+    def test_a_child_key_whose_handoff_is_gone_closes_nothing(self):
+        key = ho._child_key(self.ws, "agent", "toolu_01AbCdEf1234")
+        key.parent.mkdir(parents=True)
+        key.write_text(json.dumps({"handoff_id": "ho_0123456789ab", "parent_task_id": PARENT}))
+        self.assertEqual(ho.close_by_child(self.ws, "agent", "toolu_01AbCdEf1234"), 0)
+
+    def test_a_readiness_check_that_fails_keeps_the_handoff_open(self):
+        ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
+        with patch("local_task_protocol.iter_result_candidates", side_effect=RuntimeError("boom")):
+            self.assertEqual(len(ho.open_handoffs(self.ws, PARENT)), 1)
+
+    def test_the_cli_defaults_to_the_resolved_workspace(self):
+        out = io.StringIO()
+        with patch("workspace_default.resolve_workspace", return_value=self.ws), contextlib.redirect_stdout(out):
+            self.assertEqual(ho.main(["open-list", "--task", PARENT]), 0)
+        self.assertEqual(json.loads(out.getvalue()), {"open": [], "status": None})
+
+
 class PoolAsk(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(REPO / "tests" / "skills" / "worker-pool"))
