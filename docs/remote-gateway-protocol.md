@@ -437,6 +437,10 @@ Sutando checkout around it sends neither field.
   as absent: the claim is kept and the wait is logged with what clears it), and the generation gets a new run of its own, published from the held serve. Its result
   goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
   An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
+  The same holds after the earlier run has finished: a serve under a lease other than the one it
+  finished under (or for a run whose details were pruned) is held for its ack, so an answer the
+  broker refused as stale never makes a newer generation look already handled. Every run after the
+  first has its own item, `<task>.run-<n>`.
   A wake is a new run too, even under the same generation; a replay of the same episode reuses
   its run and publishes nothing.
 - Every change to a task's attempt is one transition under that task's lock, committed to

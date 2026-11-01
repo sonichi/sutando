@@ -3365,6 +3365,76 @@ class Hooks(unittest.TestCase):
         self.assertTrue((gw.TASKS_DIR / f"{tid}~~3.txt").exists(), "generation 3's run is published")
         self.assertEqual(unrecorded, [], "every item is recorded on its claim before it is published")
 
+    def stale_refused_then_served_again(self, tid):
+        """Generation 1 runs and answers; the broker refuses the answer as stale (settled, archived);
+        then L2 is served and acked as generation 2."""
+        fake = self.served_acked(tid)
+        fake.answers["/v1/results"] = _http(409, {"error_code": "stale_execution_generation"})
+        self.core_writes(tid, "generation 1's answer")
+        old = time.time() - 5
+        os.utime(gw.RESULTS_DIR / f"{tid}.txt", (old, old))
+        inflight = {tid}
+        gw._post_ready_results(inflight)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "settled and archived")
+        self.assertIsNone(gw._ATTEMPTS.entry(tid), "generation 1's attempt is finished")
+        fake.answers["/v1/results"] = {"ok": True}
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+        return fake, inflight
+
+    def test_a_generation_served_after_the_earlier_was_refused_as_stale_runs_on_its_own_run_and_item(self):
+        tid = "task-stale-then-l2"
+        fake, inflight = self.stale_refused_then_served_again(tid)
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True),
+                         "held for its ack, never swallowed as already handled")
+        self.assertFalse(any(f"dedup: {tid} already handled" in m for m in self.logs))
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        run = f"{tid}~~2"
+        self.assertEqual(gw._ATTEMPTS.get(tid)["run"], run)
+        self.assertEqual(gw._ATTEMPTS.run_item(run), f"{tid}.run-2")
+        def mine():
+            return [p for p in fake.posted("/v1/results") if p["id"] == tid]
+        before = len(mine())
+        self.answered_by_its_own_run(fake, tid, inflight)
+        self.assertEqual(len(mine()), before + 1, "generation 2 makes its own POST")
+
+    def test_the_same_lease_served_again_after_its_run_finished_is_still_a_redelivery(self):
+        tid = "task-stale-then-l1"
+        fake, _ = self.stale_refused_then_served_again(tid)
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L1", source_event_id="$e")), (tid, True))
+        self.assertTrue(any(f"dedup: {tid} already handled" in m for m in self.logs), "the same serve")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}~~2.txt").exists())
+        del fake
+
+    def test_a_served_again_generation_the_finished_run_already_settled_runs_nothing(self):
+        tid = "task-stale-then-same-gen"
+        fake, inflight = self.stale_refused_then_served_again(tid)
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 1)
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
+        gw._post_task_ack(tid, durable=True, lease_id="L2")
+        gw._post_task_beats(inflight, force=True)
+        self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), [], "nothing re-runs")
+        self.assertIsNone(gw._ATTEMPTS.entry(tid))
+
+    def test_every_run_after_the_first_has_its_own_item_even_when_its_task_left_no_trace(self):
+        tid = "task-pruned-run"
+        fake, inflight = self.stale_refused_then_served_again(tid)
+        with gw._ATTEMPTS.transition(tid) as t:      # retained state pruned: no lease to judge by
+            t._change(lambda d, r: (d.get("runs", {}).pop(tid, None), r)[1], "prune")
+        for p in (gw.TASKS_DIR / "archive").rglob(f"{tid}.txt"):
+            p.unlink()
+        for p in gw.ARCHIVE_RESULTS_DIR.rglob(f"{tid}*.txt"):
+            p.unlink()
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True),
+                         "a finished run it knows nothing of: held for its ack")
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        self.assertEqual(gw._ATTEMPTS.run_item(f"{tid}~~2"), f"{tid}.run-2", "never the task's own item")
+        self.answered_by_its_own_run(fake, tid, inflight)
+        with txn("task-fresh") as t:
+            first = t.new_run("task-fresh")
+            second = t.new_run("task-fresh", current=False)
+        self.assertEqual((gw._ATTEMPTS.run_item(first), gw._ATTEMPTS.run_item(second)),
+                         (None, "task-fresh.run-2"), "the first run has the task's item, every later one its own")
+
     def paused_before_publish(self, tid):
         """Served, acked as generation 1; its result pinned and claimed by a worker paused before its
         publish; then served again under L2."""

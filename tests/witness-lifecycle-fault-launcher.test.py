@@ -140,8 +140,47 @@ class Launcher(unittest.TestCase):
             mod = launcher.load_bridge()
         self.assertEqual((mod.RUNTIME_IDENTITY["entrypoint"], mod.RAN_MAIN), (str(loader), False),
                          "its script tail is not run by the load")
-        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
-            launcher.main(["--fault", "stall", "--kind", "ack", "--task", "t", "--report", str(self.report)])
+        for bad in (["--fault", "stall", "--kind", "ack"], ["--fault", "reclaim", "--kind", "ack", "--sentinel", "s"],
+                    ["--fault", "crash", "--kind", "serve"]):
+            with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+                launcher.main([*bad, "--task", "t", "--report", str(self.report)])
+
+    def test_reclaim_withholds_the_tasks_beats_and_its_newer_serve_until_released(self):
+        tid = "task-launcher-reclaim"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1"), set(), []))
+        sent = []
+
+        def broker(method, path, payload=None, timeout=None, **k):
+            sent.append((method, path, payload))
+            if method == "GET":
+                return {"tasks": [{"id": tid, "lease_id": broker.lease}, {"id": "task-other", "lease_id": "Lx"}]}
+            return _ack(tid, 1) if path.endswith("/ack") else {"ok": True}
+        broker.lease = "L1"
+        mock.patch.object(gw, "_req", broker).start()
+        with mock.patch.object(gw, "_req", Broker(tid)):
+            self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+        sentinel = Path(tempfile.mkdtemp()) / "held"
+        sentinel.write_text("hold")
+        rule = launcher.Rule("serve", tid, None, None, None)
+        launcher.install(gw, rule, "reclaim", self.report, sentinel)
+        gw._req("POST", launcher.BEATS, {"tasks": [{"task_id": tid}, {"task_id": "task-other"}]})
+        self.assertEqual(sent[-1][2]["tasks"], [{"task_id": "task-other"}], "its beats are withheld")
+        self.assertEqual([t["id"] for t in gw._req("GET", "/v1/tasks?wait=1")["tasks"]], [tid, "task-other"],
+                         "the running generation's own lease passes")
+        broker.lease = "L2"
+        for _ in range(2):
+            self.assertEqual([t["id"] for t in gw._req("GET", "/v1/tasks?wait=1")["tasks"]], ["task-other"],
+                             "the newer serve is kept back, every time it is offered")
+        sentinel.unlink()
+        self.assertEqual([t["id"] for t in gw._req("GET", "/v1/tasks?wait=1")["tasks"]], [tid, "task-other"])
+        gw._req("POST", launcher.BEATS, {"tasks": [{"task_id": tid}]})
+        self.assertEqual(sent[-1][2]["tasks"], [{"task_id": tid}], "released: beats pass again")
+        self.assertEqual([e["event"] for e in self.events()], ["beats withheld", "matched", "released"])
+        self.assertEqual(rule.matches[0]["lease_id"], "L2")
+        sentinel.write_text("hold")
+        broker.lease = "L3"
+        gw._req("GET", "/v1/tasks?wait=1")
+        self.assertEqual(self.events()[-1]["event"], "FAIL: matched more than once", "a third lease")
 
     def test_main_starts_the_loader_and_writes_its_identity_first(self):
         impl = Path(gw.__file__)

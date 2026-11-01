@@ -5748,9 +5748,13 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
                 return None
             woken, tid = opened
         else:
+            if t.revive_finished(first, lease, used=_run_id_used) is None:
+                _log_backoff((first, "unrecorded"), f"task {first}: its attempt could not be recorded "
+                             "— left unacked for a re-serve")
+                return None
             rec = t.rec
-            if (isinstance(rec, dict) and rec.get("run") and t.run_published(rec["run"])
-                    and rec.get("lease_id") != lease):
+            if (isinstance(rec, dict) and rec.get("run") and rec.get("lease_id") != lease
+                    and (t.run_published(rec["run"]) or rec.get("finished"))):
                 return _hold_reserve(t, first, task, lease)
             tid = _serve_run(t, first)
             if tid is None:

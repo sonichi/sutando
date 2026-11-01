@@ -563,8 +563,9 @@ class Transition:
                 used: Callable[[str], bool] = lambda _local: False, **fields) -> "str | None":
         """Allocate and save the next local run id of this task (the bare `first_run` the first time),
         never one used before: one `used` finds anywhere on disk is skipped. `item` is the run's own
-        outbox item, `{n}` its number. Not `current`: allocated for a re-serve still waiting for its
-        generation, and the record keeps its run. None when not saved."""
+        outbox item, `{n}` its number; every run after the first has one (`<task>.run-<n>` unless
+        given). Not `current`: allocated for a re-serve still waiting for its generation, and the
+        record keeps its run. None when not saved."""
         def edit(data, rec):
             seqs = data.setdefault("seqs", {})
             seq = int(seqs.get(self.wire) or 0) + 1
@@ -577,7 +578,7 @@ class Transition:
             seqs[self.wire] = seq
             runs = data.setdefault("runs", {})
             runs[local] = {"task": self.wire, "seq": seq, "published": False,
-                           "item": item.format(n=seq) if item else None}
+                           "item": item.format(n=seq) if item else (f"{self.wire}.run-{seq}" if seq > 1 else None)}
             live = set(data.get("tasks") or {})
             _bound(seqs, keep=live), _bound(runs, keep=live, task_of=lambda r: (r or {}).get("task"))
             made.append(local)
@@ -634,6 +635,24 @@ class Transition:
                     and newest == (data.get("seqs") or {}).get(self.wire))
         return (same and quiet and no_newer and pending.get("source") == rec.get("source_event_id")
                 and pending.get("wake") == rec.get("wake_episode"))
+
+    def revive_finished(self, first_run: str, lease: "str | None",
+                        used: Callable[[str], bool] = lambda _local: False):
+        """A serve under a lease other than the one the task's last run finished under, or for a run
+        whose details were pruned: restore that run's record, finished, so the serve is held until
+        its ack names the generation. True when restored, False when it does not apply, None when it
+        could not be saved."""
+        if self.rec is UNKNOWN or self.rec or not lease:
+            return False
+        last = self.last_run(first_run) or (first_run if used(first_run) else None)
+        if last is None:
+            return False
+        run = ((self.owner._read() or {}).get("runs") or {}).get(last)
+        if isinstance(run, dict) and not (run.get("published") and run.get("lease") != lease):
+            return False                        # unpublished, or the same serve redelivered
+        known = run if isinstance(run, dict) else {}
+        return self.put(run=last, lease_id=known.get("lease"), execution_generation=known.get("gen"),
+                        finished=True) or None
 
     def abandon_serve(self) -> bool:
         """The pending serve ends without a run of its own: its allocated run is never published. A
@@ -1013,6 +1032,10 @@ class Transition:
             return False
 
         def edit(data, r):
+            run = ((data.get("runs") or {}).get((r or {}).get("run")) if r else None)
+            if isinstance(run, dict):
+                # What a later serve is judged against once the record is gone.
+                run.update(lease=r.get("lease_id"), gen=r.get("execution_generation"))
             episode = (r or {}).get("wake_episode")
             if episode:
                 wakes = data.setdefault("wakes", {})

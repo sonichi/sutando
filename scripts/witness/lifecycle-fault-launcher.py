@@ -7,9 +7,13 @@ unchanged except the ONE that matches the rule, identified by its claimed effect
 kind and task, plus the claim the ledger holds for the request's operation id (its generation,
 lease and run). The rule fires once; a second match, or none by exit, is reported as a failed run.
 
-  crash  call the real broker, record its answer (the proof it accepted), then os._exit(9)
-         before the bridge sees the answer, so nothing is committed.
-  stall  hold the matching call until the sentinel file is removed, then pass it through.
+  crash    call the real broker, record its answer (the proof it accepted), then os._exit(9)
+           before the bridge sees the answer, so nothing is committed.
+  stall    hold the matching call until the sentinel file is removed, then pass it through.
+  reclaim  (`--kind serve`) while the sentinel exists, leave the task out of the per-task beats so
+           the real broker reclaims its lease and moves it to a newer generation, and keep that
+           newer serve (a lease other than the first seen) from the bridge. Removing the sentinel
+           lets both through. The held serve is the one match; a third lease fails the run.
 
 Usage (all on the rig, at the exact head under test):
   python3 scripts/witness/lifecycle-fault-launcher.py --fault crash --kind ack --task <broker id> \\
@@ -35,7 +39,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LOADER = REPO / "src" / "remote-gateway-bridge.py"
-KINDS = {"ack": "/ack", "cancel-ack": "/cancel-ack", "result": "/v1/results"}
+KINDS = {"ack": "/ack", "cancel-ack": "/cancel-ack", "result": "/v1/results", "serve": "/v1/tasks"}
+BEATS = "/v1/tasks/heartbeat"
 
 
 class Rule:
@@ -98,7 +103,57 @@ def load_bridge():
     return mod
 
 
+def install_reclaim(mod, rule: Rule, report: Path, sentinel: Path) -> None:
+    """The `reclaim` fault: the task's beats are withheld and its newer serve kept back while the
+    sentinel exists; every other task and call passes unchanged."""
+    real = mod._req
+    seen: dict = {"first": None, "held": None, "beats": False, "released": False}
+
+    def wrapped(method, path, payload=None, *a, **k):
+        holding = sentinel.exists()
+        record = mod._ATTEMPTS.entry(rule.task) if mod._ATTEMPTS is not None else None
+        if seen["first"] is None and isinstance(record, dict) and record.get("lease_id"):
+            seen["first"] = record["lease_id"]  # the lease the running generation holds
+        if not holding and seen["held"] and not seen["released"]:
+            seen["released"] = True
+            _report(report, {"event": "released", "lease_id": seen["held"]})
+        if holding and method == "POST" and path.split("?")[0] == BEATS and isinstance(payload, dict):
+            kept = [t for t in payload.get("tasks") or [] if t.get("task_id") != rule.task]
+            if len(kept) != len(payload.get("tasks") or []) and not seen["beats"]:
+                seen["beats"] = True
+                _report(report, {"event": "beats withheld", "task": rule.task})
+            payload = {**payload, "tasks": kept}
+        answer = real(method, path, payload, *a, **k)
+        if method != "GET" or path.split("?")[0] != KINDS["serve"] or not isinstance(answer, dict):
+            return answer
+        served = []
+        for task in answer.get("tasks") or []:
+            lease = task.get("lease_id") if isinstance(task, dict) else None
+            if not isinstance(task, dict) or task.get("id") != rule.task or not lease:
+                served.append(task)
+                continue
+            seen["first"] = seen["first"] or lease
+            if lease == seen["first"] or not holding:
+                served.append(task)
+                continue
+            identity = {"task": rule.task, "kind": "serve", "lease_id": lease,
+                        "execution_generation": task.get("execution_generation")}
+            with rule.lock:
+                if seen["held"] is None:
+                    seen["held"] = lease
+                    rule.matches.append(identity)
+                    _report(report, {"event": "matched", "fault": "reclaim", "path": path, "claim": identity,
+                                     "first_lease": seen["first"]})
+                elif lease != seen["held"]:
+                    rule.matches.append(identity)
+                    _report(report, {"event": "FAIL: matched more than once", "claim": identity})
+        return {**answer, "tasks": served}
+    mod._req = wrapped
+
+
 def install(mod, rule: Rule, fault: str, report: Path, sentinel: "Path | None") -> None:
+    if fault == "reclaim":
+        return install_reclaim(mod, rule, report, sentinel)
     real = mod._req
 
     def wrapped(method, path, payload=None, *a, **k):
@@ -130,17 +185,19 @@ def install(mod, rule: Rule, fault: str, report: Path, sentinel: "Path | None") 
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fault", choices=("crash", "stall"), required=True)
+    ap.add_argument("--fault", choices=("crash", "stall", "reclaim"), required=True)
     ap.add_argument("--kind", choices=tuple(KINDS), required=True)
     ap.add_argument("--task", required=True, help="the broker task id")
     ap.add_argument("--lease", help="the lease the claim was made under ('*' for any)")
     ap.add_argument("--generation", help="the generation the claim was made under, or 'none'")
     ap.add_argument("--run", help="the local run id the claim was made under")
     ap.add_argument("--report", required=True, type=Path)
-    ap.add_argument("--sentinel", type=Path, help="stall: held while this file exists")
+    ap.add_argument("--sentinel", type=Path, help="stall, reclaim: held while this file exists")
     args, rest = ap.parse_known_args(argv)
-    if args.fault == "stall" and not args.sentinel:
-        ap.error("--sentinel is required with --fault stall")
+    if args.fault in ("stall", "reclaim") and not args.sentinel:
+        ap.error(f"--sentinel is required with --fault {args.fault}")
+    if (args.fault == "reclaim") != (args.kind == "serve"):
+        ap.error("--fault reclaim goes with --kind serve, and only with it")
     generation = int(args.generation) if args.generation and args.generation.isdigit() else args.generation
     rule = Rule(args.kind, args.task, args.lease, generation, args.run)
     sys.argv = [str(LOADER), *[a for a in rest if a != "--"]]
