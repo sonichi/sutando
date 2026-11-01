@@ -4581,7 +4581,7 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
     except _ReserveLost as e:
         with _ATTEMPTS.transition(wire_tid) as t:
             if isinstance(t.rec, dict) and t.rec.get("owed_publish") == run and _fail_unanswered(
-                    t, run, DISPATCH_LOST_RESULT, f"its served task could not be read ({e})"):
+                    t, run, DISPATCH_LOST_RESULT, f"its served task could not be read ({diagnostics.describe(e)})"):
                 t.put(owed_publish=None, owed_reserve=None)
         return
     except OSError as e:
