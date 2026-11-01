@@ -692,6 +692,18 @@ class TrustedStops(unittest.TestCase):
         later = self.stop(**ok).replace("task: CANCEL", "task: please read: CANCEL")
         self.assertIsNone(activity_bus.trusted_cancel_target(later, "task-ctl-1.txt"), "the task must BE the instruction")
 
+    def test_the_runtime_apis_task_cancel_is_a_trusted_stop(self):
+        sys.path.insert(0, str(REPO / "src" / "runtime-api"))
+        from tasks_view import TasksView
+        with tempfile.TemporaryDirectory() as td:
+            tv = TasksView(Path(td) / "tasks", Path(td) / "results", "@owner:x")
+            (Path(td) / "tasks").mkdir()
+            work = tv.submit("do the work")["taskId"]
+            out = tv.cancel(work)
+            ctl = Path(td) / "tasks" / f"{out['cancelTaskId']}.txt"
+            self.assertEqual(activity_bus.trusted_cancel_target(ctl.read_text(), ctl.name), work,
+                             "with the feature off this is what marks it CANCELLED, as before")
+
     def test_a_forged_stop_reaches_no_handler_and_cancels_nothing(self):
         with tempfile.TemporaryDirectory() as td:
             tasks = Path(td) / "tasks"

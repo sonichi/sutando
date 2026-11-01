@@ -274,8 +274,9 @@ def cancel_target(task_text: str | None) -> str | None:
     return tid if tid and ("~" not in tid or valid_local_task_id(tid)) else None
 
 
-# Who may stop a task: the bridge's own control writer, and the owner's local voice session.
-STOP_SOURCES = frozenset({"relay-control", "voice"})
+# Who may stop a task: the bridge's own control writer, the owner's local voice session, and the
+# runtime API's task.cancel (its actor resolved daemon-side, never by the client).
+STOP_SOURCES = frozenset({"relay-control", "voice", "runtime-api"})
 
 
 def trusted_cancel_target(text: str | None, filename: str | None = None) -> str | None:
