@@ -810,6 +810,21 @@ class AnsweredOnce(unittest.TestCase):
                     self.assertIsNone(agent_turn.answered_in_journal(self.state, "tsk_A"))
                     self.assertFalse(agent_turn.answered_in_journal(self.state, "tsk_other"), "another task's damage is not ours")
 
+    def test_a_question_that_may_not_be_answered_gets_no_rule_and_a_damaged_entry_records_nothing(self):
+        a = self.mk(turn_context=True)
+        self.served(a, "tsk_A")
+        self.assertIsNone(call(a, "tsk_A", "answer_rule", {**self.Q, "can_answer": False}))
+        self.assertIsNone(call(a, "tsk_A", "answer_rule", None))
+        a._commit(lambda d: d.setdefault("questions", {}).__setitem__("rq_1", {"offers": "junk"}), why="damage")
+        self.assertEqual(call(a, "tsk_A", "answer_rule", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+        a._commit(lambda d: d["questions"].__setitem__("rq_1", "junk"), why="damage")
+        self.assertIn(self.RULE, call(a, "tsk_A", "answer_rule", {**self.Q, "question_id": "rq_2"}))
+        turn = self.turn(a, "tsk_A")
+        put(a, "tsk_A", answer_offered="rq_1")
+        self.answer_in_journal(turn, "tsk_A")
+        call(a, "tsk_A", "result_decision", "[no-send]", True)
+        self.assertEqual(a._read()["questions"]["rq_1"], "junk", "a damaged entry is never overwritten")
+
     def test_the_questions_record_is_bounded(self):
         a = self.mk(turn_context=True)
         with unittest.mock.patch.object(task_attempts, "QUESTIONS_KEPT", 3):

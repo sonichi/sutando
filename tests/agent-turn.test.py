@@ -352,6 +352,41 @@ class TurnGate(unittest.TestCase):
 
 
 
+class AnsweredInJournal(unittest.TestCase):
+    """A succeeded answer is True, a failed one False; anything that cannot be told is None."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def answer(self, tid, op, status=None):
+        recs = [{"record_type": at.INTENT, "task_id": tid, "operation_id": op, "action": "room.question.answer"}]
+        if status:
+            recs.append({"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
+        _journal(self.state, *recs)
+
+    def test_each_outcome_reads_as_answered_not_answered_or_unknown(self):
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A"), "no journal: not answered")
+        self.answer("tsk_A", "op1", "failed")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A"))
+        self.answer("tsk_B", "op2")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_B"), "sent, outcome unknown")
+        self.answer("tsk_C", "op3", "succeeded")
+        self.assertTrue(at.answered_in_journal(self.state, "tsk_C"))
+        _journal(self.state, {"record_type": at.INTENT, "task_id": "tsk_D", "operation_id": "op4",
+                              "action": "room.message.send"})
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_D"), "another action is not an answer")
+
+    def test_a_damaged_or_unreadable_journal_is_unknown_only_for_the_task_it_names(self):
+        path = at.room_actions_path(self.state)
+        path.write_text('{"task_id": "tsk_A", "record\n\n{"task_id": "tsk_Z"}\n')
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"))
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_B"), "another task's damage is not its")
+        path.write_text('{"task_id": "tsk_A", "record_type": "dispatch_intent"}\n{"task_id": "tsk_A", "parti')
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A"), "a fresh last line is an append in progress")
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
+            self.assertIsNone(at.answered_in_journal(self.state, "tsk_A"))
+
+
 class ResultFileDecision(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp())
