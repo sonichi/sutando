@@ -507,7 +507,7 @@ def ledger_path() -> Path:
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
+def record_asks(message: str, reviewer: str, no_codeowner: str = "", interaction_id: str = "") -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
@@ -523,10 +523,41 @@ def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
                    "ts": ts, "channel": "room"}
             if no_codeowner:
                 row["no_codeowner"] = no_codeowner
+            if interaction_id:
+                row["interaction_id"] = interaction_id
             fh.write(json.dumps(row) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
+
+
+def _correlation():
+    """The correlation writer, or None where the engine's src/ is not beside this script."""
+    try:
+        import correlation_log
+    except ImportError:
+        return None
+    return correlation_log
+
+
+def with_interaction_id(message: str, interaction_id: str) -> str:
+    """The ask as sent: the id on its own last line, so the reviewer's answer can cite it."""
+    return f"{message}\n\nInteraction-Id: {interaction_id}"
+
+
+def record_interactions(message: str, target: dict, interaction_id: str, task_id: str, event_id: str) -> int:
+    """One correlation record per PR the ask names; the count written."""
+    n, log = 0, _correlation()
+    if log is None:
+        return 0
+    for repo, num in sorted({(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}):
+        if log.record("interaction", {
+                "interaction_id": interaction_id, "object": f"{repo}#{num}", "counterpart": target["stand"],
+                "counterpart_kind": "agent", "counterpart_scope": "unknown", "room_id": target.get("room"),
+                "room_kind": "unknown", "task_id": task_id or None, "channel": "room", "event_id": event_id or None},
+                path=ledger_path().with_name(log.LOG_NAME)):
+            n += 1
+    return n
 
 
 def _actor_map(roster) -> dict:
@@ -668,6 +699,8 @@ def main() -> int:
                     help="deliberately re-ask the SAME reviewers after 30min")
     ap.add_argument("--no-codeowner", dest="no_codeowner", metavar="REASON", default="",
                     help="deliberately ask without a non-author CODEOWNER; requires a reason")
+    ap.add_argument("--task", default=os.environ.get("SUTANDO_TASK_ID", ""),
+                    help="the task this ask is for (its id header); recorded with the ask's interaction id")
     ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
                     help="ask (default) requests review; notice tells reviewers "
                          "something about a PR without asking for anything")
@@ -827,7 +860,11 @@ def main() -> int:
                       "--no-codeowner '<reason>'.", file=sys.stderr)
                 return 8
     for t in targets:
+        log = _correlation()
+        ix = log.mint_interaction_id() if a.kind == "ask" and log is not None else ""
         argv = command_for(t, a.message)
+        if ix:
+            argv[4] = with_interaction_id(argv[4], ix)
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
@@ -866,7 +903,9 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"], a.no_codeowner) if a.kind == "ask" else 0
+                n_logged = record_asks(a.message, t["name"], a.no_codeowner, ix) if a.kind == "ask" else 0
+                if ix:
+                    record_interactions(a.message, t, ix, a.task, event)
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
