@@ -1543,6 +1543,16 @@ class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
         self.assertTrue(pg.turn_in_flight(self.spinner(f"({at}s \u00b7 esc to interrupt)")))
         self.assertFalse(pg.turn_in_flight(self.spinner(f"({at - 1}s \u00b7 esc to interrupt)")))
 
+    def test_only_the_spinners_own_clock_counts(self):
+        for paren, secs in (("(8s \u00b7 \u2193 42 tokens \u00b7 thought for 4s)", 8),
+                            ("(5s \u00b7 thought for 6s)", 5),
+                            ("(running Stop hooks\u2026 2/3 \u00b7 2m 37s)", 157),
+                            ("(1h 2m \u00b7 \u2193 1.2k tokens)", 3720),
+                            ("(thought for 40s)", None)):
+            with self.subTest(paren=paren):
+                self.assertEqual(pg.spinner_elapsed(f"\u2733 Pondering\u2026 {paren}"), secs)
+        self.assertFalse(pg.turn_in_flight(self.spinner("(8s \u00b7 \u2193 42 tokens \u00b7 thought for 4s)")))
+
     def test_a_spinner_below_the_composer_is_not_a_turn_in_flight(self):
         row = "\u2733 Choreographing\u2026 (30s \u00b7 esc to interrupt)\n"
         self.assertTrue(pg.turn_in_flight(self.STANDING.replace("\u273b Worked for 3m \u00b7 done 3:16 PM\n", row)))

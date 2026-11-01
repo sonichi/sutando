@@ -597,8 +597,19 @@ def limit_baseline(capture: str) -> LimitBaseline:
                          frozenset(key for key, _ in _turns(capture)))
 
 
-_ELAPSED = re.compile(r"(?<![\w./])(\d+)([hms])\b")
+# A spinner's clock: its first `·` field that is only a duration ("2m 37s"), never a
+# suffix such as "thought for 4s".
+_CLOCK = re.compile(r"\d+[hms](?:\s+\d+[hms])*")
 _UNIT_S = {"h": 3600, "m": 60, "s": 1}
+
+
+def spinner_elapsed(row: str) -> Optional[int]:
+    """Seconds on a spinner row's own clock, else None."""
+    inner = row.partition("(")[2].rpartition(")")[0]
+    for field in inner.split("\u00b7"):
+        if _CLOCK.fullmatch(field.strip()):
+            return sum(int(t[:-1]) * _UNIT_S[t[-1]] for t in field.split())
+    return None
 #: A delivery the limit refuses ends within seconds; a turn running longer was served.
 FLIGHT_MIN_S = 10
 
@@ -612,8 +623,8 @@ def turn_in_flight(capture: Optional[str]) -> bool:
         if _TURN_ROW.search(plain):
             if not _SPINNER_ROW.search(plain):
                 return False
-            ran = sum(int(n) * _UNIT_S[u] for n, u in _ELAPSED.findall(plain.partition("(")[2]))
-            return ran >= FLIGHT_MIN_S
+            ran = spinner_elapsed(plain)
+            return ran is not None and ran >= FLIGHT_MIN_S
     return False
 
 
@@ -629,10 +640,11 @@ def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, b
     """A quota-only banner is a line from before the reset, scrollback, not a hold, when
     the seat shows it is not held: a turn is in flight above the composer, the newest turn
     finished since `baseline` (limit_baseline of the first capture showing the banner) ran,
-    or a FRESH proxy record says accepted for a seat ROUTED through that proxy. A newest turn that was refused holds whatever the record
-    says. Anything else keeps the hold -- another abnormal family, no newer turn, an
-    unrouted or unobserved seat, or a record absent, stale or rejected. A retry never
-    reaches here: classify_pane returns on it before any gate."""
+    or a FRESH proxy record says accepted for a seat ROUTED through that proxy. A newest
+    turn that was refused holds whatever the record says. Anything else keeps the hold --
+    another abnormal family, no newer turn, an unrouted or unobserved seat, or a record
+    absent, stale or rejected. A retry never reaches here: classify_pane returns on it
+    before any gate."""
     if abn is None or abn.kind != "provider-limit":
         return False
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
