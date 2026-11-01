@@ -239,13 +239,32 @@ class Publisher(unittest.TestCase):
 
     def test_non_404_transport_error_is_logged_as_failure(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = lambda path, body: (503, {"error": "unavailable"})
+        relay.on_post = lambda path, body: (503, {"error_code": "UPSTREAM_UNAVAILABLE", "message": "private response content"})
         self.row()
         self.pub.send = gw._send_task_step
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token"):
             self.pub.publish(self.tasks)
-        self.assertIn("Action failed (HTTPError)", self.logs[0])
+        self.assertIn("HTTP 503", self.logs[0])
+        self.assertIn("error_code=UPSTREAM_UNAVAILABLE", self.logs[0])
+        self.assertNotIn("private response content", self.logs[0])
         self.assertEqual(self.pub.sent, {})
+
+
+    def test_error_codes_never_log_registered_secrets_or_free_text(self):
+        gw.diagnostics.register_secret("fixture-private-credential")
+        for code in ("fixture-private-credential", "private response body with spaces", None):
+            with self.subTest(code=code):
+                relay = Relay(); self.addCleanup(relay.close)
+                relay.on_post = lambda path, body: (401, {"error_code": code})
+                self.row()
+                self.pub.send = gw._send_task_step
+                with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-private-credential"):
+                    self.pub.publish(self.tasks)
+                self.assertIn("HTTP 401", self.logs[-1])
+                self.assertIn("error_code=unavailable", self.logs[-1])
+                self.assertNotIn("fixture-private-credential", self.logs[-1])
+                self.assertNotIn("private response body", self.logs[-1])
+                self.clock += 10
 
 
 class BridgeLoop(unittest.TestCase):

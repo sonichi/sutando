@@ -4108,10 +4108,19 @@ def _send_task_step(payload: dict):
         return _req("POST", "/api/capabilities/v1/actions/execute", payload,
                     timeout=10, operation_id=payload["operation_id"], origin=True)
     except urllib.error.HTTPError as exc:
-        exc.close()
+        try:
+            code, body = task_attempts.error_code_of(exc.read(65536).decode("utf-8", "replace"))
+            error = body.get("error")
+            code = code or body.get("code") or (error.get("code") if isinstance(error, dict) else None)
+            exc.task_step_error_code = diagnostics.code_field(code, URL)
+        except (OSError, ValueError):
+            exc.task_step_error_code = None
+        finally:
+            exc.close()
         if exc.code != 404:
             raise
-        return {"status": "not_deployed"}
+        return {"status": "not_deployed", "http_status": exc.code,
+                "error_code": exc.task_step_error_code}
 
 
 _STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)
