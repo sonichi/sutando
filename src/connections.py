@@ -2054,7 +2054,8 @@ def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
 
 
 def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
-                 disabled: bool = False, parked: bool = False) -> "tuple[str, Optional[str]]":
+                 disabled: bool = False, parked: bool = False,
+                 writer_alive: bool = True) -> "tuple[str, Optional[str]]":
     """(state, reason) from the bridge's sidecar and the last launch record; a disabled row is
     `parked` with reason `disabled`, a parked row with reason `parked`, whatever a
     stale sidecar still says."""
@@ -2073,6 +2074,9 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
     error = str(sidecar.get("error") or "")
     if re.search(r"\b(401|403)\b|auth", error, re.IGNORECASE):
         return "failed", "auth_rejected"
+    # A live bridge that has never completed a poll is still starting, not disconnected.
+    if writer_alive and sidecar.get("last_ok_ts") is None:
+        return "pending", None
     return "disconnected", None
 
 
@@ -2102,7 +2106,8 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     (`disabled` and `parked` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
-    if sidecar.get("connected") and _writer_gone(sidecar):
+    gone = bool(sidecar) and _writer_gone(sidecar)
+    if sidecar.get("connected") and gone:
         sidecar = {**sidecar, "connected": False}  # a bridge that died says nothing about now
     launch = _read_json(launch_record_path(inst, workspace))
     out = dict(row)
@@ -2111,7 +2116,8 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     out["legacy"] = not inst
     for key in IDENTITY_FIELDS:
         out.setdefault(key, None)
-    state, reason = derive_state(sidecar, launch, out["disabled"], out["parked"])
+    state, reason = derive_state(sidecar, launch, out["disabled"], out["parked"],
+                                 writer_alive=not gone)
     out["status"] = {"connected": bool(sidecar["connected"]) if "connected" in sidecar else None,
                      "last_ok_ts": sidecar.get("last_ok_ts")}
     out["state"] = state
