@@ -4188,14 +4188,16 @@ def _mcp_tool(name: str, arguments: dict, timeout: int = 10) -> dict:
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": name, "arguments": arguments}}).encode()
     for attempt in (0, 1):
-        req = urllib.request.Request(url, data=body, method="POST")
-        for key, value in (("Authorization", f"Bearer {_agent_access_token(refresh=attempt > 0)}"),
-                           ("Content-Type", "application/json"), ("Accept", "application/json"),
-                           ("MCP-Protocol-Version", MCP_PROTOCOL_VERSION), ("User-Agent", "sutando-gateway-client/1.0")):
-            req.add_header(key, value)
+        token = _agent_access_token(refresh=attempt > 0)
         try:
-            with gateway_instance.gateway_call(url), urllib.request.urlopen(req, timeout=timeout) as resp:
-                rpc = json.loads(resp.read(MCP_REPLY_MAX))
+            with gateway_instance.gateway_call(url):
+                req = urllib.request.Request(url, data=body, method="POST")
+                for key, value in (("Authorization", f"Bearer {token}"), ("Content-Type", "application/json"),
+                                   ("Accept", "application/json"), ("MCP-Protocol-Version", MCP_PROTOCOL_VERSION),
+                                   ("User-Agent", "sutando-gateway-client/1.0")):
+                    req.add_header(key, value)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    rpc = json.loads(resp.read(MCP_REPLY_MAX))
         except urllib.error.HTTPError as exc:
             exc.close()
             if exc.code == 401 and attempt == 0:
@@ -4251,19 +4253,21 @@ def _publish_task_steps(inflight: set[str]) -> None:
     with _STEP_PUSH_LOCK:
         if _STEP_PUSH_THREAD is not None and _STEP_PUSH_THREAD.is_alive():
             return
-        _STEP_PUSH_THREAD = threading.Thread(target=_publish_task_steps_now, args=(set(inflight),),
+        _STEP_PUSH_THREAD = threading.Thread(target=_publish_task_steps_now, args=(set(inflight), inflight),
                                              name="task-step-publisher", daemon=True)
         _STEP_PUSH_THREAD.start()
 
 
-def _publish_task_steps_now(inflight: set[str]) -> None:
+def _publish_task_steps_now(inflight: set[str], live: "set[str] | None" = None) -> None:
     try:
-        _publish_task_steps_snapshot(inflight)
+        _publish_task_steps_snapshot(inflight, live)
     except Exception as exc:
         _log(f"task step publisher failed ({type(exc).__name__}); continuing")
 
 
-def _publish_task_steps_snapshot(inflight: set[str]) -> None:
+def _publish_task_steps_snapshot(inflight: set[str], live: "set[str] | None" = None) -> None:
+    """`inflight` is the snapshot to publish for; `live` the outbound worker's own set, re-read right
+    before each send so a task retired meanwhile (its result delivered) is never stepped again."""
     tasks = {}
     for tid in inflight:
         if not gateway_instance.owns(tid, GATEWAY_INSTANCE):
@@ -4291,7 +4295,8 @@ def _publish_task_steps_snapshot(inflight: set[str]) -> None:
         tasks[tid] = {"task_id": wire, "execution_generation": gen,
                       "room_id": headers.get("source_room_id") or headers.get("channel_id")}
     _STEP_PUBLISHER.status_of = TASK_STATUS
-    _STEP_PUBLISHER.publish(tasks)
+    _STEP_PUBLISHER.publish(tasks, open_now=lambda tid: (live is None or tid in live)
+                            and not (RESULTS_DIR / f"{tid}.txt").exists())
 
 
 def _claim_ack(wire_tid: str, lease_id: "str | None"):

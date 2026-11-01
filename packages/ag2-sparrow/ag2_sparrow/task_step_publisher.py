@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,12 @@ PHASES = ("Understanding the request", "Thinking", "Reading files", "Searching c
           "Running a command", "Editing code", "Running tests", "Reviewing changes", "Writing a reply",
           "Asking someone", "Waiting", "Delegated")
 WAITING = ("queued", "busy", "delegated")
+
+
+def _code(value) -> str:
+    """An error code or status as it may be logged: a short identifier, never payload text."""
+    text = str(value or "")
+    return text if re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", text) else "unknown"
 
 
 def progress_arguments(status) -> "dict | None":
@@ -55,14 +62,15 @@ class StepPublisher:
         self.sent = {}
         self.attempted = {}
 
-    def publish(self, tasks: dict) -> None:
-        """Tasks are live envelopes selected by this connection, keyed by their local run id."""
+    def publish(self, tasks: dict, open_now=None) -> None:
+        """Tasks are live envelopes selected by this connection, keyed by their local run id.
+        `open_now(tid)`, when given, is asked right before each typed send: False skips the task."""
         self.sent = {k: v for k, v in self.sent.items() if k in tasks}
         self.attempted = {k: v for k, v in self.attempted.items() if k in tasks}
         if not tasks:
             return
         if self.status_of is not None:
-            self._publish_typed(tasks)
+            self._publish_typed(tasks, open_now)
             return
         try:
             with self.path.open("rb") as stream:
@@ -121,10 +129,12 @@ class StepPublisher:
                 continue
             self.sent[tid] = identity
 
-    def _publish_typed(self, tasks: dict) -> None:
+    def _publish_typed(self, tasks: dict, open_now=None) -> None:
         for tid, task in tasks.items():
             gen, wire, room = (task.get(k) for k in ("execution_generation", "task_id", "room_id"))
             if type(gen) is not int or gen < 1 or not wire or not room:
+                continue
+            if open_now is not None and not open_now(tid):
                 continue
             try:
                 args = progress_arguments(self.status_of(tid))
@@ -151,8 +161,13 @@ class StepPublisher:
             if isinstance(response, dict) and response.get("status") == "not_deployed":
                 self.log(f"task step {tid}: room.task.progress not deployed; skipping")
                 return False
+            if isinstance(response, dict) and response.get("is_error"):
+                self.log(f"task step {tid}: Action refused ({_code(response.get('code'))}); continuing")
+                return False
             if not isinstance(response, dict) or response.get("status") != "completed":
-                raise ValueError("Action did not succeed")
+                status = response.get("status") if isinstance(response, dict) else type(response).__name__
+                self.log(f"task step {tid}: Action answered {_code(status)}, not completed; continuing")
+                return False
         except Exception as exc:
             self.log(f"task step {tid}: Action failed ({type(exc).__name__}); continuing")
             return False

@@ -163,7 +163,7 @@ class Publisher(unittest.TestCase):
 
     def test_default_off_and_enabled_worker_never_blocks_poll(self):
         entered, release = threading.Event(), threading.Event()
-        def slow(_):
+        def slow(*_):
             entered.set()
             release.wait(5)
         with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=None, _STEP_PUSH_THREAD=None), \
@@ -508,7 +508,7 @@ class Typed(unittest.TestCase):
         self.pub.publish(self.tasks)
         self.assertIn("not deployed", self.logs[0])
         self.assertIn("Action failed (OSError)", self.logs[1])
-        self.assertIn("Action failed (ValueError)", self.logs[2])
+        self.assertIn("Action answered denied, not completed", self.logs[2])
         self.assertEqual(self.pub.sent, {})
 
     def test_the_publishers_phases_are_phase_lines_words_plus_delegated(self):
@@ -524,6 +524,43 @@ class Typed(unittest.TestCase):
         for tool, inp in tools:
             self.assertIn(phase_line.rules_phase(tool, inp), tsp.PHASES, tool)
         self.assertTrue(set(phase_line.MODEL_PHASES) <= set(tsp.PHASES))
+
+    def test_a_refusal_logs_its_code_and_never_payload_text(self):
+        self.status["task-dev~task-a"] = {"phase": "Thinking", "summary": "Thinking"}
+        self.pub.send = lambda body: {"is_error": True, "code": "task_already_terminal", "message": "secret text"}
+        self.pub.publish(self.tasks)
+        self.clock += 10
+        self.pub.send = lambda body: {"is_error": True, "code": "has spaces and secret text"}
+        self.pub.publish(self.tasks)
+        self.assertEqual(self.logs, ["task step task-dev~task-a: Action refused (task_already_terminal); continuing",
+                                     "task step task-dev~task-a: Action refused (unknown); continuing"])
+        self.assertEqual(self.pub.sent, {})
+
+    def test_a_task_closed_meanwhile_is_not_stepped(self):
+        self.status["task-dev~task-a"] = {"phase": "Thinking", "summary": "Thinking"}
+        self.pub.publish(self.tasks, open_now=lambda tid: False)
+        self.assertEqual(self.calls, [])
+        self.pub.publish(self.tasks, open_now=lambda tid: True)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_the_bridge_rechecks_the_live_set_and_results_before_sending(self):
+        results = Path(tempfile.mkdtemp())
+        seen = {}
+
+        class Spy(StepPublisher):
+            def publish(spy, tasks, open_now=None):
+                seen.update(tasks=tasks, open_now=open_now)
+        spy = Spy(Path(tempfile.mkdtemp()), self.send)
+        live = {"task-dev~task-a"}
+        with patch.multiple(gw, TASK_STATUS=None, _STEP_PUBLISHER=spy, RESULTS_DIR=results,
+                            TASKS_DIR=Path(tempfile.mkdtemp())):
+            gw._publish_task_steps_snapshot(set(), live)
+            self.assertTrue(seen["open_now"]("task-dev~task-a"))
+            live.clear()
+            self.assertFalse(seen["open_now"]("task-dev~task-a"), "retired from the outbound worker meanwhile")
+            live.add("task-dev~task-a")
+            (results / "task-dev~task-a.txt").write_text("done")
+            self.assertFalse(seen["open_now"]("task-dev~task-a"), "its result written meanwhile")
 
     def test_the_bridge_hands_the_host_hook_to_the_publisher(self):
         hook = lambda tid: None  # noqa: E731
