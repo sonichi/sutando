@@ -458,8 +458,7 @@ class WhyNotMoving(unittest.TestCase):
 
     def test_a_delegated_task_says_who_has_it(self):
         fake = type("H", (), {"delegated_status": staticmethod(lambda ws, tid, now=None: {"line": "Delegated: a worker"}),
-                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "2026-11-01T00:00:00Z"}]),
-                              "_epoch": staticmethod(lambda at: 1793491200.0)})
+                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "2026-11-01T00:00:00Z"}])})
         with patch.dict(sys.modules, {"handoffs": fake}):
             st = pl.status_for(self.ws, "task-d")
         self.assertEqual(st, {"phase": "Delegated", "line": "Delegated: a worker", "since": 1793491200.0,
@@ -550,8 +549,7 @@ class Published(unittest.TestCase):
 
     def test_a_delegated_task_publishes_no_delegate_name(self):
         fake = type("H", (), {"delegated_status": staticmethod(lambda ws, tid, now=None: {"line": "Delegated: Engine 2"}),
-                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "2026-11-01T00:00:00Z"}]),
-                              "_epoch": staticmethod(lambda at: 1793491200.0)})
+                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "2026-11-01T00:00:00Z"}])})
         with patch.dict(sys.modules, {"handoffs": fake}):
             outs = [pl.published_status(self.ws, "task-d", share_line=share) for share in (True, False)]
         for out in outs:
@@ -563,7 +561,8 @@ class Published(unittest.TestCase):
         pl.on_step(self.ws, "task-s", "Bash", {}, "Run the tests again", spawn=lambda *a: None)
         self.assertEqual(pl.published_status(self.ws, "task-s")["summary"], "Running a command",
                          "sharing is off by default: the phase word")
-        self.assertEqual(pl.published_status(self.ws, "task-s", share_line=True)["summary"], "Run the tests again")
+        self.assertEqual(pl.published_status(self.ws, "task-s", share_line=True)["summary"], "Running a command",
+                         "free step text never leaves, even opted in")
         _task(self.ws, "task-m")
         pl.on_step(self.ws, "task-m", "mcp__claude_ai_Gmail__search", {}, "Search mail from Dana", spawn=lambda *a: None)
         self.assertEqual(pl.published_status(self.ws, "task-m", share_line=True)["summary"], "Checking your email")
@@ -575,6 +574,49 @@ class Published(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             pl.main(["published", "--task", "task-r", "--workspace", self.ws])
         self.assertEqual(json.loads(buf.getvalue())["summary"], "Reading files")
+
+
+class Finished(unittest.TestCase):
+    """A finished task says nothing; a malformed timestamp never raises."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+
+    def test_a_result_or_a_done_summary_ends_the_status(self):
+        _rules(self.ws, "task-f", "Running a command", step="Run the tests")
+        self.assertIsNotNone(pl.status_for(self.ws, "task-f"))
+        (Path(self.ws) / "results").mkdir()
+        (Path(self.ws) / "results" / "task-f.txt").write_text("done")
+        self.assertIsNone(pl.status_for(self.ws, "task-f"))
+        self.assertIsNone(pl.published_status(self.ws, "task-f"))
+        _rules(self.ws, "task-g", "Running a command", step="Run the tests")
+        summaries = Path(self.ws) / "state" / "agent-activity.summaries.jsonl"
+        summaries.write_text('not json "task-g"\n' + json.dumps({"ts": 1, "line": "done", "task": {"id": "task-other"}})
+                             + "\n")
+        self.assertIsNotNone(pl.status_for(self.ws, "task-g"), "another task's summary does not end it")
+        with open(summaries, "a") as f:
+            f.write(json.dumps({"ts": 1, "line": "done", "task": {"id": "task-g"}}) + "\n")
+        self.assertIsNone(pl.status_for(self.ws, "task-g"), "a done summary ends it too")
+
+    def test_malformed_timestamps_never_raise(self):
+        _rules(self.ws, "task-m", "Running a command", step="Run the tests")
+        pl.write(self.ws, {"task_id": "task-m", "seq": "s2", "step": None, "phase": "Reading files",
+                           "phase_source": "rules"})
+        side = pl.sidecar_path(self.ws)
+        side.write_text(side.read_text().replace('"at":', '"at":"garbage","was":', 1))
+        self.assertIsNotNone(pl.status_for(self.ws, "task-m"))
+        self.assertIsNotNone(pl.published_status(self.ws, "task-m"))
+        for bad in ("garbage", None, float("nan"), "inf", [1]):
+            self.assertEqual(pl._ts(bad, 7.0), 7.0, bad)
+        self.assertEqual(pl._ts("2026-11-01T00:00:00Z"), 1793491200.0)
+        self.assertEqual(pl._ts("12.5"), 12.5)
+
+    def test_a_delegated_since_comes_from_a_parsed_handoff_time(self):
+        fake = type("H", (), {"delegated_status": staticmethod(lambda ws, tid, now=None: {"line": "Delegated"}),
+                              "open_handoffs": staticmethod(lambda ws, tid, now=None: [{"at": "garbage"},
+                                                                                       {"at": "2026-11-01T00:00:00Z"}])})
+        with patch.dict(sys.modules, {"handoffs": fake}):
+            self.assertEqual(pl.status_for(self.ws, "task-d")["since"], 1793491200.0)
 
 
 class Shareable(unittest.TestCase):
@@ -611,8 +653,17 @@ class Shareable(unittest.TestCase):
                           ("task-x", "Mail bob@example.com the notes"), ("task-t", "Use ghp_abcdefghijklmnop1234 now")):
             self.assertEqual(self._step(tid, "Bash", step), "Running a command", step)
 
-    def test_a_plain_line_and_the_fixed_lines_pass(self):
-        self.assertEqual(self._step("task-p", "Bash", "Run the tests again"), "Run the tests again")
+    def test_only_fixed_lines_pass_never_free_text(self):
+        self.assertEqual(self._step("task-p", "Bash", "Run the tests again"), "Running a command")
+        for tid, step in (("task-o", "read the rent increase email from the landlord"),
+                          ("task-h", "look up the biopsy results in the health record"),
+                          ("task-g", "read the overdue invoice in gmail")):
+            self.assertEqual(self._step(tid, "Bash", step), "Running a command", step)
+        pl.write(self.ws, {"task_id": "task-p", "for_seq": pl.latest(self.ws, "task-p")["seq"], "phase": "Running tests",
+                           "phase_source": "model", "line": "Testing the landlord email import", "line_source": "model"})
+        self.assertEqual(pl.shareable_line(self.ws, "task-p"), "Running tests", "the model line stays local too")
+        for fixed in ("Reading the request", "Queued · 3 ahead"):
+            self.assertEqual(pl.shareable_line(self.ws, "task-none", {"phase": "Waiting", "line": fixed}), fixed)
         self.assertIsNone(pl.shareable_line(self.ws, "task-none"))
         self.assertEqual(pl.shareable_line(self.ws, "task-none", {"phase": "Waiting", "line": "Queued · next",
                                                                     "waiting": {"reason": "queued", "position": 1}}),
