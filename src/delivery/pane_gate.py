@@ -186,6 +186,16 @@ _SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.
 _TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
 
 
+def turn_status(lines: List[str]) -> Optional[List[str]]:
+    """The last turn row and the lines below it (its status line and footer) while that row is a
+    live spinner; None when the last turn row is a completion line or there is none."""
+    for i in range(len(lines) - 1, -1, -1):
+        row = _SGR.sub("", lines[i])
+        if _TURN_ROW.search(row):
+            return lines[i:] if _SPINNER_ROW.search(row) else None
+    return None
+
+
 def live_tail(lines: List[str]) -> List[str]:
     """`lines` below the last turn spinner / completion row, else all of them. Tool output
     above that row may quote a dialog's caret or key hints; only a dialog below it is live."""

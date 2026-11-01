@@ -170,6 +170,7 @@ def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tu
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
     "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
+    "task_id", "execution_generation",
     "channel_id", "priority", "interaction_type", "source_message_id", "origin_message_ids",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",

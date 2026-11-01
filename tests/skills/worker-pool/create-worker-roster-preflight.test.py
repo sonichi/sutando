@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills/worker-pool/scripts"
 sys.path.insert(0, str(REPO / "tests"))
 from _helpers.hermetic_env import hermetic_env  # noqa: E402
+from _helpers.process_group import has_exited  # noqa: E402
 
 socket_setting = os.environ.get("SUTANDO_RUNTIME_SOCKET")
 environment_file = Path(socket_setting).parent / "environment.json" if socket_setting else None
@@ -350,14 +351,6 @@ class RosterPreflightTests(unittest.TestCase):
         self.events.append({"retained_worker_id": wid, "retained_worker_pid": retained_pid})
         self.assert_existing_work_unchanged(before)
 
-    @staticmethod
-    def pid_exists(pid):
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-
     def descendants(self, pid):
         result = self.run_command(["pgrep", "-P", str(pid)], expected=None)
         self.assertIn(result.returncode, (0, 1), result.stderr)
@@ -386,8 +379,19 @@ class RosterPreflightTests(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 self.server.kill()
                 self.server.wait(timeout=5)
-            self.wait_for(lambda: not any(self.pid_exists(pid) for pid in descendants),
-                          "disposable descendants to be reaped", timeout=5)
+            # Cleanup must not depend on a loaded runner's graceful exit: TERM, then KILL what is
+            # left. An exited child its parent has not reaped yet is a zombie: gone, not leaked (#6049).
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not all(has_exited(pid) for pid in descendants):
+                time.sleep(0.05)
+            for pid in descendants:
+                if not has_exited(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            self.wait_for(lambda: all(has_exited(pid) for pid in descendants),
+                          "disposable descendants to exit", timeout=5)
             self.events.append({"cleanup": {"tmux_pid": self.server.pid,
                                 "returncode": self.server.returncode,
                                 "descendants": descendants, "remaining": []}})

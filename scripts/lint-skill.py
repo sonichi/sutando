@@ -71,12 +71,13 @@ KNOWN_TOP = {
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
     "hooks", "documented_for_core", "core_description", "supervised_worker",
     "pending_questions_store", "claude_plugin", "orphan_reaper", "audience", "on_launch",
+    "on_stop_requested",
 }
 AUDIENCES = {"user", "developer"}
 # Fields a runtime scan activates straight from <repo>/skills, past the installers'
 # audience check, so a developer-only skill may not declare them.
 RUNTIME_ACTIVATED = ("tools", "hooks", "claude_plugin", "supervised_worker",
-                     "pending_questions_store", "documented_for_core", "on_launch")
+                     "pending_questions_store", "documented_for_core", "on_launch", "on_stop_requested")
 # Signals a skill actually touches the network (used for the permission cross-check).
 # No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed
 # by a non-word char, and a trailing \b there kills the match — so `curl -s …` and
@@ -143,7 +144,7 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
     # Script fields core discovers by name (src/skill_roots.py): each must be a relative script
     # that resolves inside the skill, symlinks followed, the containment discovery applies.
     for field, exts in (("pending_questions_store", (".py",)), ("orphan_reaper", (".py",)),
-                        ("on_launch", (".py", ".sh"))):
+                        ("on_launch", (".py", ".sh")), ("on_stop_requested", (".py", ".sh"))):
         if field not in m:  # absent is fine; present means a script, so null is an error
             continue
         pqs = m[field]
