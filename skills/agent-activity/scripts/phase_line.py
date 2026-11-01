@@ -746,9 +746,8 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
     return out
 
 
-# Lines the opt-in share may carry: fixed text this module writes, naming nothing. Free text (a
-# step's description, the model's line) never leaves: a private read is only recognisable by MCP
-# tool, so mail read another way (a shell, a browser) would pass any text scrubber in lowercase.
+# The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a
+# private read is recognisable only by MCP tool and mail read by shell or browser passes a scrubber.
 FIXED_LINES = frozenset({"Reading the request", "Waiting: working on another request", "Queued · next"})
 _QUEUED = re.compile(r"Queued · \d{1,4} ahead")
 
