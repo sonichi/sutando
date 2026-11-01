@@ -3598,6 +3598,10 @@ class Hooks(unittest.TestCase):
                 with stuck:
                     served = gw._write_task(_task(tid, lease_id="L2", source_event_id="$e"))
                 self.assertIn(served, (None, (f"{tid}~~2", True)), "left unacked, or the delivered run itself")
+                held = gw._ATTEMPTS.entry(tid)
+                if served is None or isinstance(held, dict) and held.get("pending_serve"):
+                    fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)    # the broker's answer: generation 2
+                    gw._post_task_ack(tid, durable=True, lease_id="L2")
                 self.assertFalse(list(gw.TASKS_DIR.glob(f"{tid}~~3*")), "never a new run")
                 rec = gw._ATTEMPTS.entry(tid)
                 self.assertFalse(isinstance(rec, dict) and rec.get("owed_publish"), "nothing owed")
