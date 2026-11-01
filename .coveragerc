@@ -53,6 +53,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/undelivered_quarantine.py
     packages/ag2-sparrow/ag2_sparrow/outbox_cli.py
     packages/ag2-sparrow/ag2_sparrow/holder_lock.py
+    packages/ag2-sparrow/ag2_sparrow/correlation_log.py
     packages/ag2-sparrow/ag2_sparrow/task_priority.py
     packages/ag2-sparrow/ag2_sparrow/agent_turn.py
     packages/ag2-sparrow/ag2_sparrow/task_lifecycle.py
