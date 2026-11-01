@@ -3982,8 +3982,9 @@ def _maybe_pull_worker_labels(record) -> bool:
     return True
 
 
-# The primary app checks every 30 minutes; the fallback checks every five.
 _HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
 # A self-report older than this needs a live beat to stand: a dead core leaves its last
 # "idle" behind, while an idle core rewrites nothing, so a beating core keeps it.
 _CORE_STATUS_MAX_AGE = 60 * 60
@@ -4006,7 +4007,7 @@ def _core_stopped_at() -> float | None:
 
 
 def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
-    """Overlay independent diagnostics without exporting their private details."""
+    """Keep stale or gracefully stopped cores from advertising obsolete work."""
     status, step = _read_core_status()
     alive = core_health.get("alive") if isinstance(core_health, dict) else None
     written_at = _core_status_written_at() if status is not None else None
@@ -4021,29 +4022,23 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
         status, step = _liveness_status(alive), None
         if status is None:
             status, step = "unknown", "Core liveness unavailable"
-    if status in ("error", "offline"):
-        return status, step
+    return status, step
+
+
+def _diagnostic_health(health: "dict | None") -> "dict | None":
+    """A fresh failing independent check is a quiet structured health warning."""
     try:
         report = json.loads((_STATE / "agent-health.json").read_text())
-    except FileNotFoundError:
-        return status, step
-    except Exception:
-        return "unknown", "Health check unavailable"
-    try:
         ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
         if (report.get("version") != 1 or type(ts) not in (int, float)
-                or not 0 <= time.time() - ts
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
                 or type(total) is not int or total <= 0
-                or type(failures) is not int or not 0 <= failures <= total):
-            return "unknown", "Health check unavailable"
-        if time.time() - ts > _HEALTH_REPORT_MAX_AGE:
-            # An old report is no opinion; a host that stopped checking must not read unknown forever.
-            return status, step
-        if failures:
-            return "error", f"Health check: {failures} failing check(s)"
-    except Exception:
-        return "unknown", "Health check unavailable"
-    return status, step
+                or type(failures) is not int or not 0 < failures <= total):
+            return health
+    except (OSError, ValueError, KeyError, TypeError):
+        return health
+    row = health or {"alive": None, "motion": "unknown"}
+    return {**row, "condition": "abnormal", "reason": "health-check", "since": ts}
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
@@ -4058,13 +4053,15 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
+    core_health = health
+    health = _diagnostic_health(health)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    # An injected row is not the core's beat: presence status stays the core-status file's.
-    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
+    # Diagnostics stay separate; liveness still invalidates obsolete work reports.
+    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else core_health)
     try:
         payload = {
             "client": "sutando-gateway-client",

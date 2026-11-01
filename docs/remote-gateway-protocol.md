@@ -946,26 +946,27 @@ It uses the same failure predicate as the local check's exit code. Warnings
 remain warnings; check names, diagnostic output, task text, and paths are not
 included in the record.
 
-The gateway overlays a recent failing report onto its next heartbeat as
-`status: error` with a failure count. This works even without a core status
-file, allowing the independent health checker to report a failed core.
-A later passing check removes the override and resumes the core's status.
-Repair attempts do not imply recovery: another completed check must verify it.
+The heartbeat's `status` and `step` describe work from `core-status.json`, subject
+to the existing liveness safeguards above: a newer graceful-stop tombstone reports
+`offline`, and a missing/stale self-report without a live beat uses the beat's
+`offline`/`idle`/`unknown` verdict. Diagnostic check failures never replace work
+fields. An idle or offline verdict omits the stale step.
 
-Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
-as the five-minute fallback. An expired report gives no opinion: the core status
-passes through exactly as with no report, so a cached failure is never refreshed
-and a host that stops running the checker is not pinned to `unknown`. Malformed,
-empty, or future-dated reports emit `status: unknown`.
-An absent report preserves legacy core-status reporting for installations
-without the health checker. A passing report alone does not invent a core
-status. If the gateway or host is down, no heartbeat can be sent; the broker's
-existing contact timeout still yields disconnected/unknown.
+Health travels separately in the existing `health` object (`alive`, `motion`,
+`condition`, `reason`, `since`) with the `worker_health.v1` capability. The
+snapshot/injected-command selection, validation and reason grammar are unchanged.
+A valid independent report with failures and age at most 35 minutes sets
+`condition: abnormal`, `reason: health-check`, and `since: checked_at`, preserving
+`alive` and `motion` from that source. Without a source, they remain null/unknown.
+Passing, stale or invalid reports leave the source row unchanged. The broker
+derives `needs_attention: false` for `health-check`; the bridge does not send a
+new attention field. A diagnostic condition change participates in the existing
+heartbeat change detection. Consumers use this structured field for diagnostic
+health; presence still receives the existing liveness override in `status`.
 
-The s.space dashboard already classifies `error` as unhealthy, so this
-requires updating Sutando's health checker and restarting its gateway bridge;
-no dashboard schema change is needed. Reporting starts after the first health
-check completes and follows the installed check cadence.
+This bridge change requires loading the updated bridge code. It does not require
+a core restart or change the broker's health schema. The broker's existing
+contact timeout still detects a disconnected bridge or host.
 
 ### Local hook activity attribution
 
