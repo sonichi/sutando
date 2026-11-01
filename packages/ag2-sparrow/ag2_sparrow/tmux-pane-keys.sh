@@ -71,8 +71,10 @@ for key in "$@"; do
   KEYS="$KEYS $(tmux_quote "$key")"
 done
 if [ "$FENCED" = keys ]; then
-  # Keys under a fence: leave any mode, then send only while the pane is out of one and the predicate holds.
-  SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "#{&&:#{==:#{pane_in_mode},0},$FENCE_PRED}") $(tmux_quote "$KEYS") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")")"
+  # Keys under a fence: nothing touches the pane unless the predicate holds; then leave any mode and
+  # send only while the pane is out of one.
+  INNER="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") '#{pane_in_mode}' $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")") $(tmux_quote "$KEYS")"
+  SEND="if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "$FENCE_PRED") $(tmux_quote "$INNER") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")")"
 elif [ -n "$FENCED" ]; then
   # The compare and the action are one server command: the predicate is evaluated against the pane
   # -t selects, and a false predicate orphans the ticket and fails, so nothing reaches a replacement.

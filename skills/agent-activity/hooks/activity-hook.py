@@ -311,7 +311,9 @@ def stop_rulings(ws: Path) -> None:
 
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
-    for step in (lambda: turns.record(payload, p["ws"]), lambda: turns.stamp_pane(payload),
+    # The pane stamp moves first: the fenced key reads only the stamp, so a turn that ended or began
+    # is never stamped as one the record no longer shows open.
+    for step in (lambda: turns.stamp_pane(payload), lambda: turns.record(payload, p["ws"]),
                  lambda: payload.get("hook_event_name") == "Stop" and stop_rulings(p["ws"])):
         try:
             step()

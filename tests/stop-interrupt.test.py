@@ -150,11 +150,9 @@ class StopInterrupt(Base):
         self.turn("P2", prompt="run the proactive loop")
         self.assert_no_key(FakeTmux(BUSY, turn="P2"), "the turn is on no task")
 
-    def test_a_turn_on_no_task_whose_dialog_names_the_task_file_gets_the_escape(self):
-        self.turn(prompt="/startup", dialog=f"cat tasks/{TARGET}.txt && rm -rf build")
-        self.assertTrue(self.run_it(FakeTmux(DIALOG)))
-        self.assertIn("the turn's dialog names this task", self.logs[-1])
-        self.assertFalse(si.names_task({"input": f"tasks/x{TARGET}.txt"}, TARGET), "a longer id is another task")
+    def test_a_turn_on_no_task_gets_no_key_even_when_its_dialog_names_the_task_file(self):
+        self.turn(prompt="/startup", dialog=f"python3 scripts/task_disposition.py tasks/{TARGET}.txt")
+        self.assert_no_key(FakeTmux(DIALOG), "the turn is on no task")
 
     def test_a_turn_on_several_tasks_gets_no_key_even_when_its_dialog_names_this_one(self):
         self.turn(prompt=notification(f"{TARGET}.txt", "task-other.txt"), dialog=f"cat tasks/{TARGET}.txt")
@@ -285,12 +283,15 @@ class StopInterrupt(Base):
             self.assertTrue(self.run_it(tmux))
         self.assertEqual(tmux.escapes()[0][tmux.escapes()[0].index("-t") + 1], "%7")
 
-    def test_a_result_that_cannot_be_read_counts_as_one(self):
-        (self.ws / "results" / f"{TARGET}.txt").write_text("x")
-        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
-            self.assertIs(si._result_body(self.ws / "results", TARGET), si.UNREADABLE)
-        with mock.patch.object(Path, "read_text", side_effect=FileNotFoundError()):
-            self.assertIsNone(si._result_body(self.ws / "results", TARGET), "gone between the look and the read")
+    def test_a_result_being_written_or_blank_is_never_escaped_over(self):
+        self.turn()
+        res = self.ws / "results" / f"{TARGET}.txt"
+        for body in ("", "  \n"):
+            res.write_text(body)
+            self.assertEqual(si._result_state(self.ws, TARGET), "pending")
+            self.assert_no_key(FakeTmux(), "it already has its result, or one being written")
+        res.unlink()
+        self.assertIsNone(si._result_state(self.ws, TARGET))
 
     def test_run_returns_stdout_only_on_success(self):
         self.assertEqual(si._run(["echo", "hi"]), "hi\n")
@@ -305,6 +306,9 @@ class Turns(Base):
         self.assertEqual(turns.prompt_tasks("TASK_FILE: /ws/tasks/task-c.txt"), ["task-c"])
         self.assertEqual(turns.prompt_tasks("/startup"), [])
         self.assertEqual(turns.prompt_tasks("see TASK_FILE: task-d.txt later"), [], "only a line of its own")
+        seat = "/Users/x/Library/Application Support/space.ag2.app/workspace/deliveries/w1/task-f.txt"
+        self.assertEqual(turns.prompt_tasks(notification(seat)), ["task-f"],
+                         "a worker seat's resolver path, a space in it")
         self.assertEqual(turns.prompt_tasks("<event>TASK_FILE: task-e.txt\nQUEUE: 1 pending after this</event>"),
                          ["task-e"], "a batched event: the line, then the queue line")
 
@@ -345,6 +349,18 @@ class Turns(Base):
             ["tmux", "set-option", "-p", "-t", "%3", "@sutando_turn", "P1"],
             ["tmux", "if-shell", "-F", "-t", "%3", "#{==:#{@sutando_turn},P1}", "set-option -p -u -t %3 @sutando_turn"],
         ])
+
+    def test_the_hook_moves_the_pane_stamp_before_the_turn_record(self):
+        hook = load_hook()
+        order = []
+        for event in ("UserPromptSubmit", "Stop"):
+            with mock.patch.object(hook.turns, "stamp_pane", side_effect=lambda p: order.append(("stamp", p["hook_event_name"]))), \
+                    mock.patch.object(hook.turns, "record", side_effect=lambda p, ws: order.append(("record", p["hook_event_name"]))):
+                hook.handle({"hook_event_name": event, "session_id": "S1", "prompt_id": "P1", "prompt": ""},
+                            hook.paths(self.ws), run=lambda *a, **k: None)
+        self.assertEqual(order, [("stamp", "UserPromptSubmit"), ("record", "UserPromptSubmit"),
+                                 ("stamp", "Stop"), ("record", "Stop")],
+                         "a new turn is stamped before it is recorded; an ended one unstamped before it is closed")
 
     def test_the_hook_records_the_turn_and_never_fails_on_it(self):
         hook = load_hook()
@@ -404,8 +420,8 @@ class Rulings(Base):
         self.assertEqual(self.phase("task-done"), "CANCELLED", "a terminal phase is left alone")
         self.assertEqual(activity_bus.main(["stop-requested", "--task-id", "task-x~../y", "--workspace", str(self.ws)]), 2)
 
-    def test_any_result_for_the_task_is_a_finish_left_to_delivery(self):
-        for body in ("[no-send] handled in the thread", "DONE", "  "):
+    def test_any_ready_result_for_the_task_is_a_finish_left_to_delivery(self):
+        for body in ("[no-send] handled in the thread", "DONE"):
             with self.subTest(body=body):
                 si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
                 (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
@@ -413,15 +429,57 @@ class Rulings(Base):
                 self.assertEqual(self.sweep(), {TARGET: "finished"})
                 self.assertEqual(self.phase(), "RUNNING")
 
-    def test_a_result_that_cannot_be_read_waits(self):
+    def test_a_result_that_is_blank_unreadable_or_still_being_written_waits(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
         (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
-        (self.ws / "results" / f"{TARGET}.txt").write_text("the real answer")
-        real = Path.read_text
-        with mock.patch.object(Path, "read_text", autospec=True, side_effect=lambda p, *a, **k: (
-                (_ for _ in ()).throw(PermissionError(13, "denied")) if p.name == f"{TARGET}.txt" else real(p, *a, **k))):
-            self.assertEqual(self.sweep(), {})
+        res = self.ws / "results" / f"{TARGET}.txt"
+        res.write_text("  ")
+        self.assertEqual(self.sweep(), {}, "blank: no delivery yet, and no ruling either")
+        res.write_text("the real answer")
+        res.chmod(0)
+        self.addCleanup(res.chmod, 0o644)
+        self.assertEqual(self.sweep(), {}, "unreadable: an answer may be there")
+        res.chmod(0o644)
         self.assertEqual(self.sweep(), {TARGET: "finished"})
+        self.assertEqual(self.phase(), "RUNNING")
+
+    def test_a_blank_result_still_there_after_the_hour_is_ruled_a_stop(self):
+        si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
+        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        (self.ws / "results" / f"{TARGET}.txt").write_text("")
+        self.assertEqual(self.sweep(si.CONFIRM_MAX_S), {TARGET: "cancelled"})
+        self.assertEqual(self.phase(), "CANCELLED")
+
+    def test_a_placeholder_control_answer_is_not_an_answer(self):
+        si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
+        (self.ws / "results" / "task-ctl-1.txt").write_text("")
+        self.assertEqual(self.sweep(), {})
+        self.assertEqual(self.phase(), "RUNNING")
+
+    def test_a_wake_turn_is_ruled_on_its_own_result_not_an_earlier_turns(self):
+        old = self.ws / "results" / "archive"
+        old.mkdir()
+        (old / f"{TARGET}.txt").write_text("the first turn's answer")
+        os.utime(old / f"{TARGET}.txt", (self.now - 600, self.now - 600))
+        (self.tasks / f"{TARGET}.txt").write_text(f"id: {TARGET}\nwake_episode: e1\ntask: go\n")
+        si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
+        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        self.assertEqual(self.sweep(), {TARGET: "cancelled"}, "the old answer is not this turn's")
+
+    def test_a_ruling_record_not_as_written_is_left_alone_and_never_used(self):
+        d = self.ws / "state" / "stop-interrupts"
+        d.mkdir(parents=True, exist_ok=True)
+        (self.ws / "results" / "task-ctl.txt").write_text("ok")
+        bad = {"x.ruling.json": {"target": "../../escaped", "control": "task-ctl", "at": 0},
+               "task-a.ruling.json": {"target": "task-b", "control": "task-ctl", "at": 0},
+               "task-c.ruling.json": {"target": "task-c", "control": "task-ctl", "at": "0"},
+               "task-e.ruling.json": {"target": "task-e", "control": "task-ctl", "at": 0, "x": 1}}
+        for name, rec in bad.items():
+            (d / name).write_text(json.dumps(rec))
+        self.assertEqual(self.sweep(si.CONFIRM_MAX_S), {})
+        self.assertEqual(sorted(p.name for p in d.glob("*.ruling.json")), sorted(bad))
+        self.assertFalse((self.ws / "escaped.json").exists())
+        self.assertFalse(list(self.ws.rglob("escaped*")))
 
     def test_an_unanswered_stop_is_cancelled_after_the_hour_as_with_the_switch_off(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-none", now=self.now)

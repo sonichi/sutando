@@ -76,10 +76,9 @@ skill hook. The hook never depends on the agent remembering anything:
   (`@sutando_turn`), cleared by that turn's own `Stop`.
 - **Stop interrupt** (`SUTANDO_STOP_INTERRUPT=1`, off by default). The skill's `on_stop_requested`
   handler (`scripts/stop_interrupt.py`) takes each Stop the watcher reads. It sends one Escape, fenced
-  on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog), or
-  is on no task and parked on a dialog naming the task's file. It then rules the stop from
+  on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog); a turn on no task never gets one. It then rules the stop from
   `state/stop-interrupts/<task>.ruling.json`, which the hook re-checks at every turn end: no result once
-  the control task is answered, CANCELLED; any result, left to delivery; unanswered for an hour,
+  the control task is answered, CANCELLED; a ready result, left to delivery; one being written, wait; unanswered for an hour,
   CANCELLED. Off, the handler declines and the watcher cancels the task at once.
 - **Scope of task ids.** `task-<hex>` and `task-chat-…` files are tasks; `task-cron-*`, `task-bench-*`,
   `task-workstream-*` and `task-project-grouping-*` are the core's own bookkeeping and produce no rows.

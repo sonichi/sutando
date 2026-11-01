@@ -121,6 +121,16 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
         self.assertEqual(created_before, self.h.watcher_created(),
                          "an idempotent re-run replaced the watcher session")
 
+    def test_turning_the_stop_interrupt_on_and_back_off_replaces_the_watcher(self):
+        for wanted in ("1", ""):
+            created_before = self.h.watcher_created()
+            time.sleep(1.1)   # session_created has 1 s resolution
+            run = self.h.launch(extra_env={"SUTANDO_STOP_INTERRUPT": wanted} if wanted else None)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            _, _, env = self.h.watcher()
+            self.assertNotEqual(created_before, self.h.watcher_created(), f"switch {wanted!r}: a new watcher")
+            self.assertEqual("SUTANDO_STOP_INTERRUPT=1" in env, wanted == "1", "and it carries the switch, or not")
+
     def test_restart_tears_the_watcher_down_with_the_core(self):
         created_before = self.h.watcher_created()
         time.sleep(1.1)

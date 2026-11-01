@@ -5,8 +5,8 @@ is read when the turn ends).
 
 The pane names its open turn (`turns.PANE_OPTION`, stamped by this skill's hook), and the turn's
 record says which tasks its prompt named and which dialog it is parked on. The Escape goes when
-the turn is on the stopped task alone and the pane is mid-turn or showing a dialog, or when a turn
-on no task is parked on a dialog that names the task's file. Anything unreadable or unrecorded
+the turn is on the stopped task alone and the pane is mid-turn or showing a dialog. Anything
+unreadable or unrecorded
 sends nothing. The key is fenced on the same turn id, so a turn that ended meanwhile gets no key.
 One Escape per task, ever; each decision is logged to stderr and as an owner row.
 
@@ -14,7 +14,7 @@ The stop is then ruled, from a durable record this skill's hook re-checks at eve
 the core has answered the control task, a stopped task with no result is CANCELLED and one with a
 result is left to delivery. Unanswered for an hour, it is CANCELLED as it would be with the switch off.
 
-A `task_hooks` handler for `stop_requested`: exit 0 takes the stop, 1 leaves it to the watcher.
+The skill's `on_stop_requested` handler: exit 0 takes the stop, 1 leaves it to the watcher.
 """
 from __future__ import annotations
 
@@ -37,7 +37,8 @@ from activity_rows import task_from_file
 from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
 from delivery.task_dispatch import worker_holds
 from file_lock import locked_file
-from local_task_protocol import find_archived_result, valid_local_task_id
+from delivery.task_dispatch import _mtime, has_ready_result, is_wake_turn
+from local_task_protocol import iter_result_candidates, valid_local_task_id
 from skill_config import enabled as config_enabled
 from tmux_pane_keys import fence_keys_argv
 from workspace_default import resolve_workspace
@@ -49,7 +50,6 @@ MARKER_DIR = ("state", "stop-interrupts")
 RULING = ".ruling.json"
 ENABLE_KEY = "SUTANDO_STOP_INTERRUPT"
 MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
-UNREADABLE = "<unreadable>"                 # a result that exists but cannot be read: never "no result"
 CONFIG_SH = Path(__file__).resolve().parents[3] / "scripts" / "sutando-config.sh"
 
 
@@ -69,12 +69,6 @@ def mid_turn(pane_text: str | None) -> bool:
 def live_dialog(pane_text: str | None) -> bool:
     """A dialog below the pane's last turn row is waiting for a key."""
     return bool(pane_text) and any(AWAIT_HINT.search(ln) for ln in live_tail(pane_text.splitlines()))
-
-
-def names_task(dialog, target: str) -> bool:
-    """The parked tool call names the task's file."""
-    inp = dialog.get("input") if isinstance(dialog, dict) else None
-    return isinstance(inp, str) and re.search(rf"(?<![\w~.-]){re.escape(target)}\.txt\b", inp) is not None
 
 
 def _session() -> str:
@@ -123,15 +117,13 @@ def decide(target: str, *, turn, pane_text: str | None, held_elsewhere: bool = F
     others = [t for t in tasks if t != target]
     if others:
         return False, f"the turn is on {others[0]}" + (" too" if target in tasks else "")
-    if tasks:
-        if live_dialog(pane_text):
-            return True, "a dialog in the pane holds this task's turn"
-        if mid_turn(pane_text):
-            return True, "the pane is mid-turn on this task"
-        return False, "no turn is running in the pane"
-    if names_task(turn.get("dialog"), target) and live_dialog(pane_text):
-        return True, "the turn's dialog names this task"
-    return False, "the turn is on no task"
+    if not tasks:
+        return False, "the turn is on no task"  # a dialog naming the file may be any turn's
+    if live_dialog(pane_text):
+        return True, "a dialog in the pane holds this task's turn"
+    if mid_turn(pane_text):
+        return True, "the pane is mid-turn on this task"
+    return False, "no turn is running in the pane"
 
 
 def _held_elsewhere(workspace: Path, tasks_dir: Path, target: str) -> bool:
@@ -206,15 +198,15 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     if not sock:
         log(f"stop-interrupt: {target}: no tmux socket resolved; left the turn to finish")
         return False
-    finished = ("it already has its result, or one that cannot be read"
-                if _result_body(workspace / "results", target) is not None else None)
+    finished = ("it already has its result, or one being written"
+                if _result_state(workspace, target) is not None else None)
     held = _held_elsewhere(workspace, tasks_dir, target)
     pane = _pane_target(sock, run) if not (finished or held) else None
     pid = _pane_turn(sock, pane, run) if pane else None
     turn = _turn(workspace, pid) if pane else None
     text = run(["tmux", "-S", sock, "capture-pane", "-p", "-J", "-t", pane]) if pane else None
     send, why = decide(target, turn=turn, pane_text=text, held_elsewhere=held, finished=finished)
-    if send and (_turn(workspace, pid) != turn or _result_body(workspace / "results", target) is not None):
+    if send and (_turn(workspace, pid) != turn or _result_state(workspace, target) is not None):
         send, why = False, "its turn changed while the pane was read"
     if send and not _claim(workspace, target):
         send, why = False, "already interrupted once for this task"
@@ -244,20 +236,19 @@ def _log_row(workspace: Path, tasks_dir: Path, target: str, line: str, now: floa
         pass
 
 
-def _result_body(results_dir: Path, task_id: str) -> "str | None":
-    """The task's result, live or archived; None when it has none; UNREADABLE when one exists and
-    cannot be read."""
-    path = results_dir / f"{task_id}.txt"
-    try:
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
-            path = find_archived_result(results_dir, task_id)
-        return path.read_text(encoding="utf-8", errors="replace") if path else None
-    except FileNotFoundError:
-        return None                         # gone between the look and the read
-    except OSError:
-        return UNREADABLE
+def _result_state(workspace: Path, task_id: str) -> "str | None":
+    """"ready" when the task has a deliverable result (the shared readiness walk, live or archived,
+    a wake turn's own only), "pending" when one of its turn exists but is not ready yet (blank,
+    being written, or unreadable), None when it has none."""
+    results, task_file = workspace / "results", workspace / "tasks" / f"{task_id}.txt"
+    if has_ready_result(results, f"{task_id}.txt", task_file=task_file):
+        return "ready"
+    since = _mtime(task_file) if is_wake_turn(task_file) else None
+    for c in iter_result_candidates(results, task_id):
+        written = _mtime(c)
+        if since is None or written is None or written >= since:
+            return "pending"
+    return None
 
 
 def _rulings(workspace: Path) -> Path:
@@ -274,18 +265,26 @@ def open_ruling(workspace: Path, target: str, control_id: str, now: float | None
     os.replace(tmp, d / f"{target}{RULING}")
 
 
+def _valid_ruling(rec, f: Path) -> bool:
+    """Exactly the record open_ruling writes, under its own task's name."""
+    return (type(rec) is dict and set(rec) == {"target", "control", "at"}
+            and type(rec["target"]) is str and valid_local_task_id(rec["target"])
+            and type(rec["control"]) is str and valid_local_task_id(rec["control"])
+            and type(rec["at"]) in (int, float) and f.name == f"{rec['target']}{RULING}")
+
+
 def rule(workspace: Path, rec: dict, now: float,
          log: Callable[[str], None] = lambda m: print(m, file=sys.stderr)) -> "str | None":
     """"cancelled" (CANCELLED on the bus), "finished" (left to delivery), or None to wait."""
-    results, target = workspace / "results", rec["target"]
-    body = _result_body(results, target)
-    if body is UNREADABLE:
-        return None                         # a result exists: never ruled a stop on one not read
-    if body is not None:
+    target = rec["target"]
+    state = _result_state(workspace, target)
+    if state == "ready":
         log(f"stop-interrupt: {target}: the core finished it despite the Stop")
         return "finished"
     late = now - rec["at"] >= CONFIRM_MAX_S
-    if _result_body(results, rec["control"]) is None and not late:
+    if state == "pending" and not late:
+        return None                         # an answer may be on its way: never ruled a stop yet
+    if _result_state(workspace, rec["control"]) != "ready" and not late:
         return None
     if not late and _held_elsewhere(workspace, workspace / "tasks", target):
         return None                         # a pool worker may still answer it
@@ -306,11 +305,13 @@ def sweep(workspace: Path, now: float | None = None, only: str | None = None,
         for f in sorted(d.glob(f"*{RULING}")):
             try:
                 rec = json.loads(f.read_text(encoding="utf-8"))
+                if not _valid_ruling(rec, f):
+                    raise ValueError("not a ruling this skill wrote")
                 if only is not None and rec["target"] != only:
                     continue
                 verdict = rule(workspace, rec, now, log)
-            except (OSError, ValueError, KeyError, TypeError) as e:
-                log(f"stop-interrupt: {f.name}: not ruled ({e})")
+            except (OSError, ValueError) as e:
+                log(f"stop-interrupt: {f.name}: not ruled, left as it is ({e})")
                 continue
             if verdict:
                 out[rec["target"]] = verdict

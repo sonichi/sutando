@@ -31,7 +31,7 @@ activity_transition() {
 	( "${SUTANDO_PY_BIN:-python3}" "$bus" transition "$to" --task-file "$task_file" --ts "$(date +%s)" >/dev/null 2>&1 & ) 2>/dev/null || true
 	return 0
 }
-# The same true values as src/skill_config.py; anything else, unset included, is off.
+# The task a CANCEL_INSTRUCTION names: a stop request when a skill's handler takes it, else CANCELLED.
 activity_cancel_target() {
 	local filename="$1" target task_file
 	task_file="$(_activity_task_file "$filename")"

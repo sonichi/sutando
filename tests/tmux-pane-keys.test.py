@@ -86,6 +86,14 @@ class RealTmux(unittest.TestCase):
         r = subprocess.run(argv[:argv.index("--")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2, "fenced keys need keys")
 
+    def test_a_false_fence_leaves_the_pane_exactly_as_it_was(self):
+        self.tmux("set-option", "-p", "-t", "=core:0", "@turn", "P1")
+        self.tmux("copy-mode", "-t", "=core:0")
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P2}", "Escape")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, tmux_pane_keys.WITHHELD, r.stderr)
+        self.assertEqual(self.in_mode(), "1", "a stale request never touches the pane, its mode included")
+
     def test_without_the_helper_the_same_send_blocks(self):
         # The control: plain send-keys into copy mode waits on "(jump to forward)".
         self.tmux("copy-mode", "-t", "=core:0")

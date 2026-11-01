@@ -394,7 +394,7 @@ ensure_task_notifier() {
   # operator pin (if one is already set) and nothing computed.
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
-  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')"
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
   if watcher_session_exists; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -423,7 +423,7 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
-  # The watcher's emit decides whether a Stop interrupts the core's turn.
+  # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
   [ -n "${SUTANDO_STOP_INTERRUPT:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=$SUTANDO_STOP_INTERRUPT")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_WINDOW=${CORE_WINDOW:-0}")

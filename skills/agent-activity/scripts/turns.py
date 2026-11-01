@@ -27,7 +27,8 @@ INPUT_MAX = 2000
 PANE_TIMEOUT_S = 3
 PROMPT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # A Monitor notification wraps each watcher event in <event>…</event>, its lines inside.
-TASK_LINE = re.compile(r"^\s*(?:<event>)?TASK_FILE:\s*(?:[^\s<]*/)?(task-[^\s/<]+?)\.txt\s*(?:</event>)?\s*$", re.M)
+# The name may follow any path, spaces included (a worker seat's inbox under "Application Support").
+TASK_LINE = re.compile(r"^\s*(?:<event>)?TASK_FILE:\s*(?:.*/)?(task-[^\s/<]+?)\.txt\s*(?:</event>)?\s*$", re.M)
 
 
 def path(ws: Path) -> Path:
