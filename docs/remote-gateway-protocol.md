@@ -993,3 +993,38 @@ New activity rows expose `task.origins` when IDs are available, merging the
 header with the latest sidecar at append time; `task.event` keeps its original
 meaning. Existing activity rows are not rewritten. Clients that ignore the new
 field retain their current behavior.
+
+### Local hook activity attribution
+
+The agent-activity hook attributes working and turn-end thinking rows to the
+most recently picked-up (`processing`) task bound to that session in the live
+activity log. Later working or queued rows cannot change that selection. A done
+row closes a task until a later processing row explicitly picks up the same ID
+again; late working rows cannot reopen it. Results older than that renewed pickup
+do not close the resumed task. Otherwise, an existing result (including archived
+results) excludes the task even when its session binding remains. Without an eligible
+pickup in the live log, the hook emits no working or thinking row.
+
+Result lookups are cached per task, session and pickup in
+`state/agent-activity.answers.json`, under a lock with atomic replacement. Each
+hook invocation checks only result-directory, archive-root and live-result
+modification times before reusing a cached answer. A changed stamp, session or
+pickup triggers a new archive lookup; cache writes prune unbound task IDs. Normal
+result publication and archival invalidate the stamps. Direct edits inside an
+existing nested archive directory without a live-result transition are not a
+cache invalidation signal.
+
+### Local activity row room scope
+
+The agent-activity CLI assigns a room only from explicit `--room` or the
+task file's `channel_id` (explicit wins). Without either, the JSON row omits
+`room`; it never reads the owner's last activity to infer a destination.
+This keeps background health-check and cron activity from acquiring the
+owner's latest DM or room. Task rows retain their own room.
+
+A roomless ordinary activity row belongs in the dock, not every room's drawer.
+Only `kind: wedge` represents a global blocker: it always omits `room`, even
+when a task file supplies one, and the CLI rejects an explicit `--room`.
+Clients must distinguish a roomless wedge from other roomless kinds; missing
+`room` alone does not mean global. This is a writer contract, not a change to
+client rendering. No historical rows are rewritten.
