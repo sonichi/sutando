@@ -165,6 +165,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the store adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by the path an edge injects — core names no skill, scans no root and carries no question schema.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`phase_line.py`** — The phase word and status line for a task's live status, written to a sidecar the publisher reads.
 - **`platform.ts`** — Cross-platform OS abstraction layer.
 - **`pool_suspension.py`** — Shared reader for the worker pool's suspension marker, `state/pool-suspended`.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).

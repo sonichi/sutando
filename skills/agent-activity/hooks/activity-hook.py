@@ -347,6 +347,15 @@ def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subpr
     run(cmd, capture_output=True)
 
 
+def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> None:
+    """The phase sidecar's rules record (and, when switched on, the detached model call); never raises."""
+    try:
+        import phase_line
+        phase_line.on_step(ws, task_id, tool, inp, line)
+    except Exception:  # noqa: BLE001 - the live status must never break a tool call
+        pass
+
+
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
     sid = payload.get("session_id")
@@ -385,11 +394,12 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         if result_file_refs(blob):
             return out  # the result write itself is not "working"; PostToolUse decides whether it closed the task
         line = working_line(tool, inp) if isinstance(tool, str) else None
-        if line:
-            task, room = bound_task(p, sid)
-            if task:
-                emit("working", line, task, room, p["ws"], run)
-                out.append(("working", line))
+        task, room = bound_task(p, sid)
+        if task and isinstance(tool, str):
+            step_phase(p["ws"], task["id"], tool, inp, line)
+        if line and task:
+            emit("working", line, task, room, p["ws"], run)
+            out.append(("working", line))
     elif event == "PostToolUse":
         inp = payload.get("tool_input")
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
