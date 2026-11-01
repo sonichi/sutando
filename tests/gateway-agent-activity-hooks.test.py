@@ -1359,19 +1359,20 @@ class Hooks(unittest.TestCase):
             {"task_id": tid, "error_code": code}]}}))
         gw._post_task_beats({tid}, force=True)
 
-    def test_an_ack_first_task_recovers_from_one_failed_contract_write(self):
+    def test_an_ack_first_task_recovers_from_one_failed_ack_write_with_its_contract(self):
         tid = "task-af-contract"
         data = ledger()
         data.pop("contract", None)
         write_ledger(data)
         fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
         inflight = set()
-        with self.failing_save("relay-broker-contract"):
+        with failing_commit("commit of ack-"):
             self.assertFalse(gw._take_ack_first(_task(tid, ack_first=True), inflight, {}))
-        self.assertNotIn("contract", ledger())
-        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1, "the generation is saved")
+        self.assertNotIn("contract", ledger(), "the contract rides the ack's own write: neither is saved")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("execution_generation"))
         self.assertIsNot((gw._load_held() or {})[tid].get("accepted"), True, "kept staged")
-        self.assertTrue(gw._advance_held_tasks(inflight), "the same-generation re-ack repairs the contract")
+        self.assertTrue(gw._advance_held_tasks(inflight), "the re-ack saves both together")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
         self.assertIn("contract", ledger())
         self.assertNotIn(tid, gw._load_held() or {})
         self.ran(tid)
@@ -3486,7 +3487,7 @@ class Hooks(unittest.TestCase):
     def test_an_earlier_run_aged_out_of_the_ledger_is_unknown_never_known_non_delivery(self):
         rules = gw.task_attempts.RERUN_RULES
         for case, verdict in (("pruned", "unknown"), ("delivered", "answered"), ("refused", "not_delivered"),
-                              ("malformed", "answered")):
+                              ("malformed", "unknown")):
             with self.subTest(case=case):
                 tid = f"task-aged-{case}"
                 fake = self.served_acked(tid)
@@ -3510,13 +3511,7 @@ class Hooks(unittest.TestCase):
                 run = f"{tid}~~2"
                 if case == "malformed":
                     with txn(tid) as t:
-                        kept = dict(ledger()["runs"][tid])
                         t._change(lambda d, r: (d["runs"].__setitem__(tid, "junk"), r)[1], "damage")
-                    gw._post_task_beats(inflight, force=True)
-                    self.assertFalse((gw.TASKS_DIR / f"{run}.txt").exists(), "a malformed entry is never empty")
-                    self.assertEqual(gw._ATTEMPTS.get(tid)["owed_publish"], run, "the debt is kept")
-                    with txn(tid) as t:
-                        t._change(lambda d, r: (d["runs"].__setitem__(tid, kept), r)[1], "repair")
                 gw._post_task_beats(inflight, force=True)
                 text = (gw.TASKS_DIR / f"{run}.txt").read_text()
                 self.assertEqual([r for r in rules.values() if r in text], [rules[verdict]])

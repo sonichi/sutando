@@ -104,8 +104,6 @@ FORMAT = 3
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
-# A run the ledger no longer keeps (its entry pruned with age): what became of it is not known.
-PRUNED = "<pruned>"
 # Work a record owes until it is done; each is stamped with the generation it belongs to.
 DEBTS = ("owed_ctl", "owed_close", "dispatch_lost", "owed_publish")
 # What one attempt is: a record that differs in any of these has moved on to another attempt.
@@ -367,7 +365,7 @@ class TaskAttempts:
     def owed_view(self, wire_tid: str):
         """From one read of the ledger: the record, and what it keeps of the run the record's run
         replaced (its lease, generation and whether its answer was delivered), None when it replaced
-        none, PRUNED when its entry is no longer kept; UNKNOWN when either cannot be read."""
+        none, UNKNOWN when that entry is pruned or damaged; UNKNOWN alone when the record cannot be read."""
         data = self._read()
         rec = _freeze_entry(_entry_of(data, wire_tid))
         if rec is UNKNOWN:
@@ -376,9 +374,7 @@ class TaskAttempts:
         if not earlier:
             return rec, None
         run = _at(data, "runs", earlier)
-        if run is None:
-            return rec, PRUNED
-        return (rec, dict(run)) if isinstance(run, dict) else UNKNOWN
+        return rec, (dict(run) if isinstance(run, dict) else UNKNOWN)   # pruned or damaged: unknown
 
     def run_item(self, local_tid: str):
         """The outbox item of a run's own result, the one name every reader and the delivery use: its
@@ -690,19 +686,19 @@ class Transition:
                         used: Callable[[str], bool] = lambda _local: False):
         """A serve under a lease other than the one the task's last run finished under, or for a run
         whose details were pruned: restore that run's record, finished, so the serve is held until
-        its ack names the generation. True when restored, False when it does not apply, None when it
-        could not be saved."""
+        its ack names the generation. True when restored, False when it does not apply, UNKNOWN when
+        the ledger cannot be read, None when it could not be saved."""
         if self.rec is UNKNOWN or self.rec or not lease:
             return False
         last = self.last_run(first_run)
         if last is UNKNOWN:
-            return None
+            return UNKNOWN
         last = last or (first_run if used(first_run) else None)
         if last is None:
             return False
         run = _at(self.owner._read(), "runs", last)
         if run is UNKNOWN or run is not None and not isinstance(run, dict):
-            return None
+            return UNKNOWN
         if isinstance(run, dict) and run.get("lease") == lease:
             return False                        # the same serve redelivered
         known = run or {}
@@ -720,9 +716,8 @@ class Transition:
         """The pending serve is the run's own generation: rotate the lease onto the run, then commit
         the ack as the run's own. One run, never re-executed."""
         pending = self.rec.get("pending_serve") or {}
-        if not self.put(lease_id=pending.get("lease"), pending_serve=None):
-            return None
-        return self.record_ack(c, response, agent_mxid, open_turn)
+        return self.record_ack(c, response, agent_mxid, open_turn,
+                               extra={"lease_id": pending.get("lease"), "pending_serve": None})
 
     def switch_run(self, c: Claim, response, context: dict, agent_mxid: "str | None" = None,
                    open_turn: bool = True):
@@ -734,9 +729,6 @@ class Transition:
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if not self.holds_claim(c) or not isinstance(pending, dict) or type(gen) is not int:
             return None
-        if self.owner.broker_names_leases() is not True:
-            self.owner._commit(lambda d: d.setdefault("contract", {}).update(names_lease_generation=True),
-                               why="the broker's lease contract")
         if rec.get("turn_id"):
             self.close_turn(rec["turn_id"])
         fields = {**context, "run": pending["run"], "lease_id": pending.get("lease"), "pending_serve": None,
@@ -750,7 +742,7 @@ class Transition:
                   "owed_publish": pending["run"], "finished": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
-        return self.rec if self._change(lambda _d, r: {**r, **fields, "claims": None},
+        return self.rec if self._change(lambda d, r: (_note_contract(d), {**r, **fields, "claims": None})[1],
                                         f"the switch to run {pending['run']}")[0] else None
 
     # ── claims ───────────────────────────────────────────────────────────
@@ -804,12 +796,17 @@ class Transition:
         ok, _ = self._change(lambda _d, r: {**r, "claims": {**r["claims"], c["op"]: noted}}, f"item of {c['op']}")
         return Claim({**noted, "op": c["op"]}) if ok else None
 
-    def commit_claim(self, c: Claim, **fields) -> bool:
-        """Close the claim and write `fields`, only while it holds."""
+    def commit_claim(self, c: Claim, *, names_leases: bool = False, **fields) -> bool:
+        """Close the claim and write `fields`, only while it holds. With `names_leases`, the broker's
+        lease contract is recorded in the same write."""
         if not self.holds_claim(c):
             return False
-        return self._change(lambda _d, r: {**r, **fields, "claims": _without(r.get("claims"), c["op"])},
-                            f"commit of {c['op']}")[0]
+
+        def edit(data, r):
+            if names_leases:
+                _note_contract(data)
+            return {**r, **fields, "claims": _without(r.get("claims"), c["op"])}
+        return self._change(edit, f"commit of {c['op']}")[0]
 
     def release_claim(self, c: Claim) -> bool:
         """Drop the claim without its effect's outcome: the effect is known not to have happened, or
@@ -839,7 +836,8 @@ class Transition:
         return self.put(**serve_context(task), awaiting_ack=True, lease_id=lease,
                         published_at=published or self.now())
 
-    def record_ack(self, c: Claim, response, agent_mxid: "str | None" = None, open_turn: bool = True):
+    def record_ack(self, c: Claim, response, agent_mxid: "str | None" = None, open_turn: bool = True,
+                   extra: "dict | None" = None):
         """Commit the ack claimed by `c`: the generation it reported, and the turn file when turn
         context is on and `open_turn`. "stale" when the claim no longer owns the attempt (another serve
         or a retirement came between); None when it could not be recorded; else the record."""
@@ -848,13 +846,10 @@ class Transition:
         if not self.holds_claim(c):
             self.release_claim(c)
             return "stale"
+        extra = extra or {}
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if type(gen) is not int or gen < 1:
-            return self.rec if self.commit_claim(c, awaiting_ack=False) else None
-        if self.owner.broker_names_leases() is not True:
-            # Before the same-generation return, so a re-ack repairs a contract write that failed.
-            self.owner._commit(lambda d: d.setdefault("contract", {}).update(names_lease_generation=True),
-                               why="the broker's lease contract")
+            return self.rec if self.commit_claim(c, awaiting_ack=False, **extra) else None
         rec = self.rec
         if type(rec.get("execution_generation")) is int and rec["execution_generation"] != gen:
             # A run's generation never changes in place; a newer one gets a run of its own.
@@ -863,7 +858,7 @@ class Transition:
             return "generation"
         if rec.get("execution_generation") == gen and (rec.get("turn_id") or not self.owner.turn_context
                                                        or not open_turn):
-            return self.rec if self.commit_claim(c, awaiting_ack=False) else None
+            return self.rec if self.commit_claim(c, names_leases=True, awaiting_ack=False, **extra) else None
         fields = {"execution_generation": gen, "attempt": response.get("attempt"),
                   "lease_expires_at": response.get("lease_expires_at"),
                   "acked_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None,
@@ -871,7 +866,7 @@ class Transition:
                   "stop_requested": None, "stop_confirmed": None, "missing_since": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, rec, agent_mxid))
-        return self.rec if self.commit_claim(c, **fields) else None
+        return self.rec if self.commit_claim(c, names_leases=True, **fields, **extra) else None
 
     def ack_settled(self, lease: "str | None" = None) -> bool:
         """The ack of the serve under `lease` is answered without a generation (a legacy broker, or
@@ -1347,6 +1342,14 @@ def _at(data, *keys):
             return None
         cur = cur[k]
     return cur
+
+
+def _note_contract(data: dict) -> None:
+    """Inside a ledger write: this broker names lease generations."""
+    contract = data.setdefault("contract", {})
+    if not isinstance(contract, dict):
+        raise _Refused
+    contract["names_lease_generation"] = True
 
 
 def _wake_item(wire_tid: str, rec) -> "str | None":

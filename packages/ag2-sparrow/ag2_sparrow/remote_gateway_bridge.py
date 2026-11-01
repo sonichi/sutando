@@ -5800,7 +5800,7 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
                 return None
             woken, tid = opened
         else:
-            if t.revive_finished(first, lease, used=_run_id_used) is None:
+            if t.revive_finished(first, lease, used=_run_id_used) in (None, task_attempts.UNKNOWN):
                 _log_backoff((first, "unrecorded"), f"task {first}: its attempt could not be recorded "
                              "— left unacked for a re-serve")
                 return None
@@ -8753,6 +8753,7 @@ def _really_delivered(record) -> bool:
 
 
 def _earlier_attempt(wire_tid: str, rec, earlier) -> "str | None":
+    # `earlier`: the replaced run's entry, None when it replaced none, UNKNOWN when pruned or damaged.
     """What became of the attempt a newer generation's run replaced, from what this bridge recorded
     (`rec` and the replaced run's `earlier` entry, read together): its answer delivered, its result
     undelivered but its own room messages sent, or neither; None for a run that replaced nothing."""
@@ -8760,8 +8761,8 @@ def _earlier_attempt(wire_tid: str, rec, earlier) -> "str | None":
         return None
     if rec.get("earlier_delivered"):
         return "answered"
-    if earlier is task_attempts.PRUNED:
-        return "unknown"                        # its record aged out: never taken for known non-delivery
+    if earlier is task_attempts.UNKNOWN:
+        return "unknown"                        # aged out or damaged: never taken for known non-delivery
     if earlier.get("delivered") is True:
         return "answered"
     records = task_attempts.agent_turn.read_turn_records(_STATE, "", task_id=wire_tid)
