@@ -486,9 +486,50 @@ def _public_address(ip: str) -> bool:
     return True
 
 
+def _local_address(ip: str) -> bool:
+    """Whether `ip` may be a declared local homeserver's (`allow_local`): loopback, private
+    (RFC 1918, IPv6 ULA fc00::/7) or shared (100.64/10, a tailnet range), in its own form or as
+    the IPv4 an IPv6 address maps. Never link-local (169.254/16, where cloud metadata answers),
+    unspecified, multicast, reserved or public: a declared local server is on this machine or
+    the owner's own network."""
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    if addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        return False
+    if addr.is_loopback:
+        return True
+    if addr.version == 4:
+        shared = addr in ipaddress.ip_network("100.64.0.0/10")
+        rfc1918 = any(addr in ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+        return shared or rfc1918
+    return addr in ipaddress.ip_network("fc00::/7")
+
+
+def _loopback_host(host: str) -> bool:
+    """Whether a gateway host names this machine itself: localhost (or a name under .localhost),
+    or a loopback address literal. A name that merely resolves to loopback today is not."""
+    h = (host or "").strip().lower().rstrip(".").strip("[]")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    return _loopback_address(h)
+
+
+def _loopback_address(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(addr.is_loopback or (getattr(addr, "ipv4_mapped", None) or addr).is_loopback)
+
+
 def _gateway_port(url: str) -> Optional[int]:
-    """The gateway URL's port (443 when absent); None when the URL carries userinfo, a port
-    outside 1..65535, or a port that is not a number, all of which refuse the token."""
+    """The gateway URL's port (443 when absent, 80 for http); None when the URL carries userinfo,
+    a port outside 1..65535, or a port that is not a number, all of which refuse the token."""
     try:
         parts = urllib.parse.urlsplit(url)
         if parts.username is not None or parts.password is not None or "@" in parts.netloc:
@@ -497,13 +538,15 @@ def _gateway_port(url: str) -> Optional[int]:
     except ValueError:
         return None
     if port is None:
-        return 443
+        return 80 if parts.scheme.lower() == "http" else 443
     return port if 1 <= port <= 65535 else None
 
 
-def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
+def vetted_address(host: str, port: int, getaddrinfo=None, *, allow_private: bool = False) -> Optional[str]:
     """Resolve `host` once; the first address when every answer is public, '' when any is not,
-    None when the name does not resolve. The caller pins the connection to the address it got."""
+    None when the name does not resolve. The caller pins the connection to the address it got.
+    `allow_private` (a declared local server only) requires every answer to be loopback, private
+    or shared instead (`_local_address`): never link-local, unspecified or public."""
     getaddrinfo = getaddrinfo or DEFAULT_GETADDRINFO or socket.getaddrinfo
     try:
         infos = getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -512,7 +555,8 @@ def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
     addresses = [str(info[4][0]) for info in infos if info and info[4]]
     if not addresses:
         return None
-    if not all(_public_address(ip) for ip in addresses):
+    allowed = _local_address if allow_private else _public_address
+    if not all(allowed(ip) for ip in addresses):
         return ""
     return addresses[0]
 
@@ -540,16 +584,23 @@ def _fetch_whoami(gateway_url: str, token: str, address: str, *, connect=None) -
     return _fetch_json(gateway_url, token, address, "/v1/whoami", connect=connect)
 
 
+def _connect_plain(address: str, port: int, host: str, timeout: float):
+    """Plain TCP to the address: only for a gateway the owner declared local (`allow_local`)."""
+    return socket.create_connection((address, port), timeout=timeout)
+
+
 def _fetch_json(gateway_url: str, token: str, address: str, path: str, *, connect=None) -> dict:
     parts = urllib.parse.urlsplit(gateway_url)
     host = parts.hostname or ""
-    port = parts.port or 443
-    sock = (connect or _connect)(address, port, host, PROBE_TIMEOUT_S)
+    plain = parts.scheme.lower() == "http"
+    port = parts.port or (80 if plain else 443)
+    sock = (connect or (_connect_plain if plain else _connect))(address, port, host, PROBE_TIMEOUT_S)
     conn = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_S)
     conn.sock = sock  # the transport is the pinned one; connect() is never reached
     try:
         conn.request("GET", parts.path.rstrip("/") + path, headers={
-            "Host": f"{parts.hostname}:{port}" if parts.port else parts.hostname,
+            "Host": (lambda h: f"{h}:{port}" if parts.port else h)(
+                f"[{parts.hostname}]" if ":" in (parts.hostname or "") else parts.hostname),
             "Authorization": f"Bearer {secret_of(token)}",
             "Accept": "application/json", "User-Agent": "sutando-gateway-client/1.0"})
         resp = conn.getresponse()
@@ -590,6 +641,37 @@ def resolve_server(host: str, resolver=None) -> str:
     if not server or getattr(found, "source", "none") == "none":
         return ""
     return server
+
+
+def local_server_for(host: str, config=None, port: Optional[int] = None) -> str:
+    """The server of a `core.dotspace.instances` entry with `allow_local: true` whose
+    gateway_host (its server when it names no gateway_host) is `host`; '' for every other host.
+    An entry that names a port covers that port only; one without covers every port on the host.
+    Only such an entry, written by the owner for a self-hosted homeserver on this machine or
+    their own network (#3165), lets a gateway name a single-label host such as localhost or
+    resolve to a loopback, private or shared address, and lets it be plain http when that
+    address is loopback; nothing a token or a server says can turn it on."""
+    try:
+        import dotspace  # type: ignore
+        entries = dotspace._config_entries(config)
+        host_only = dotspace._host_only
+    except Exception:  # noqa: BLE001 - without the resolver there is no declared local server
+        return ""
+    want = (host or "").strip().lower().rstrip(".").strip("[]")
+    for e in entries:
+        if e.get("allow_local") is not True:
+            continue
+        gateway = str(e.get("gateway_host") or e.get("server") or "").strip().lower().rstrip(".")
+        if not want or host_only(gateway) != want:
+            continue
+        try:
+            named = urllib.parse.urlsplit(f"//{gateway}").port if gateway.count(":") == 1 or "]:" in gateway else None
+        except ValueError:  # a malformed port in the owner's entry matches nothing
+            continue
+        if named is not None and named != port:
+            continue
+        return host_only(str(e.get("server") or ""))
+    return ""
 
 
 def gateway_host_ok(host: str) -> bool:
@@ -633,15 +715,23 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
     host = server_of_token(token)
     port = _gateway_port(url)
-    if not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
+    local = local_server_for(host, port=port)
+    if local:
+        if not url.lower().startswith(("https://", "http://")) or port is None:
+            raise InvalidToken("invalid_gateway")
+    elif not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
         raise InvalidToken("invalid_gateway")
-    registered = resolve_server(host, resolver)
+    registered = local or resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
            "verified": False, "authenticated": None, "error": None}
     out.update({k: None for k in IDENTITY_FIELDS})
-    address = vetted_address(host, port, getaddrinfo)
+    address = vetted_address(host, port, getaddrinfo, allow_private=bool(local))
     if address == "":
+        raise InvalidToken("invalid_gateway")
+    if url.lower().startswith("http://") and not (_loopback_host(host) and (not address or _loopback_address(address))):
+        # Cleartext bearer only to this machine: the host must name loopback, since the bridge
+        # re-resolves it every poll.
         raise InvalidToken("invalid_gateway")
     if address is None:
         out["error"] = "unreachable (resolution)"
