@@ -672,10 +672,11 @@ class Transition:
         return pending.get("lease") if isinstance(pending, dict) else None
 
     def hold_serve(self, lease: "str | None", run: str, source: "str | None",
-                   wake_episode: "str | None" = None) -> bool:
+                   wake_episode: "str | None" = None, reserve: "dict | None" = None) -> bool:
         """Record a serve under a new lease for a run that may already execute: the run keeps its
-        generation and nothing is published until the serve's ack names one."""
-        return self.put(pending_serve={"lease": lease, "run": run, "source": source,
+        generation and nothing is published until the serve's ack names one. `reserve` names the
+        serve's own saved copy."""
+        return self.put(pending_serve={"lease": lease, "run": run, "source": source, "reserve": reserve,
                                        "wake_episode": wake_episode, "at": self.now()})
 
     def serve_adoptable(self, gen) -> bool:
@@ -760,7 +761,7 @@ class Transition:
                   "missing_since": None, "hold_reported": None,
                   "wake_episode": episode if type(episode) is str else None,
                   "cancel_requested_generation": None, "cancel_requested_attempt": None,
-                  "owed_publish": pending["run"], "finished": None}
+                  "owed_publish": pending["run"], "owed_reserve": pending.get("reserve"), "finished": None}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
         return self.rec if self._change(lambda d, r: (_note_contract(d), {**r, **fields, "claims": None})[1],

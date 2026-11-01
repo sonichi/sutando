@@ -134,6 +134,16 @@ class Hooks(unittest.TestCase):
         mock.patch.object(gw, "_req", fake).start()
         return fake
 
+    def saved(self, tid):
+        """The saved serve the task's record names: its held serve's, else its owed run's."""
+        rec = gw._ATTEMPTS.get(tid)
+        ref = (rec.get("pending_serve") or {}).get("reserve") or rec.get("owed_reserve")
+        return gw._reserve_dir() / f"{ref['id']}.json"
+
+    def envelopes(self, tid):
+        """Every saved serve owned by the task."""
+        return [p for p in gw._reserve_dir().glob("v1-*.json") if f'"task": "{tid}"' in p.read_text()]
+
     def controls(self, tid):
         return [p for p in gw.TASKS_DIR.glob("task-ctl-*.txt") if f"stop processing {tid} " in p.read_text()]
 
@@ -355,7 +365,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual((rec["run"], rec["lease_id"], rec["execution_generation"], rec.get("pending_serve")),
                          (tid, "L2", 1, None), "the same run: the lease moved onto it")
         self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.glob(f"{tid}*")), [f"{tid}.txt"], "one run, never re-run")
-        self.assertFalse(gw._reserve_path(tid).exists())
+        self.assertEqual(self.envelopes(tid), [])
         posted = len(fake.posted(f"/v1/tasks/{tid}/ack"))
         gw._retry_pending_acks(inflight)
         self.assertEqual(len(fake.posted(f"/v1/tasks/{tid}/ack")), posted, "L1's ack, superseded, is not sent")
@@ -3192,7 +3202,7 @@ class Hooks(unittest.TestCase):
                 self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L2"))
                 rec = gw._ATTEMPTS.get(tid)
                 self.assertEqual((rec.get("pending_serve"), rec["run"], rec.get("fenced")), (None, tid, fenced))
-                self.assertFalse(gw._reserve_path(tid).exists())
+                self.assertEqual(self.envelopes(tid), [])
                 self.assertNotIn(tid, gw._load_pending_acks())
 
     def test_a_held_serves_ack_that_cannot_be_read_or_no_longer_holds_moves_nothing(self):
@@ -3227,7 +3237,7 @@ class Hooks(unittest.TestCase):
     def test_a_held_serve_whose_saved_task_is_lost_fails_its_generation_rather_than_run_nothing(self):
         tid = "task-held-lost"
         fake, inflight = self.held(tid)
-        gw._reserve_path(tid).write_text("{not json")
+        self.saved(tid).write_text("{not json")
         self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
         run = f"{tid}~~2"
         self.assertEqual(gw._ATTEMPTS.get(tid)["owed_publish"], run)
@@ -3290,7 +3300,7 @@ class Hooks(unittest.TestCase):
         self.served_acked(other)
         with failing_commit("a new run"):
             self.assertIsNone(gw._write_task(_task(other, lease_id="L2")), "its run cannot be allocated")
-        with mock.patch.object(gw, "_durable_write", return_value=False):
+        with mock.patch.object(gw.task_attempts, "write_if_absent", side_effect=OSError("disk")):
             self.assertIsNone(gw._write_task(_task(other, lease_id="L2")), "its task cannot be saved")
         self.assertIsNone(gw._ATTEMPTS.get(other).get("pending_serve"))
 
@@ -3583,7 +3593,7 @@ class Hooks(unittest.TestCase):
                     self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e")), (tid, True))
                     fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
                     self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
-                    run, reserve = f"{tid}~~2", gw._reserve_path(tid)
+                    run, reserve = f"{tid}~~2", self.saved(tid)
                     real_read = gw.Path.read_text
                     real_view = gw._ATTEMPTS.owed_view
 
