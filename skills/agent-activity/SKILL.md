@@ -55,8 +55,8 @@ are for anything extra the owner asks to see.
 
 ## Working and Thinking rows, automatically (hooks)
 
-The skill declares three Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
-`PreToolUse`, `PostToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
+The skill declares Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
+`PreToolUse`, `PostToolUse`, `Stop`, `UserPromptSubmit` and `PermissionRequest`); `bash src/install-claude-hooks.sh` registers them like every other
 skill hook. The hook never depends on the agent remembering anything:
 
 - **Processing, automatically.** The first `PreToolUse` in a session whose input names a task file
@@ -70,6 +70,16 @@ skill hook. The hook never depends on the agent remembering anything:
   `working` row for the open task bound to it: the description's first sentence, 100 characters.
 - **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`
   (complete lines only, so a row mid-write is never split) and writes it as `thinking`.
+- **Turns.** Every event also folds into `state/agent-activity.turns.json`, keyed by the turn's
+  `prompt_id`: the tasks its prompt named (the watcher's `TASK_FILE:` lines), the dialog it is parked
+  on (`PermissionRequest`), and its end (`Stop`). The hook stamps its tmux pane with the open turn
+  (`@sutando_turn`), cleared by that turn's own `Stop`.
+- **Stop interrupt** (`SUTANDO_STOP_INTERRUPT=1`, off by default). The skill's `on_stop_requested`
+  handler (`scripts/stop_interrupt.py`) takes each Stop the watcher reads. It sends one Escape, fenced
+  on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog); a turn on no task never gets one. It then rules the stop from
+  `state/stop-interrupts/<task>.ruling.json`, which the hook re-checks at every turn end: no result once
+  the control task is answered, CANCELLED; a ready result, left to delivery; one being written, wait; unanswered for an hour,
+  CANCELLED. A stop for a task a pool worker holds is routed to that worker's inbox (`pool_router.stop_holder`), so the worker's own watcher runs this. Off, the handler declines and the watcher cancels the task at once.
 - **Scope of task ids.** `task-<hex>` and `task-chat-…` files are tasks; `task-cron-*`, `task-bench-*`,
   `task-workstream-*` and `task-project-grouping-*` are the core's own bookkeeping and produce no rows.
   A result whose body starts with `[no-send]` or `[REPLIED]` closes the task with

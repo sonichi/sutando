@@ -353,7 +353,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler=""):
+    def _notifier_version(self, handler="", stop=""):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -369,7 +369,9 @@ exit 0
         handler_cksum = subprocess.run(
             ["cksum"], input=handler.encode(), capture_output=True,
             check=True, text=False).stdout.decode().split()[0]
-        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}"
+        stop_cksum = subprocess.run(["cksum"], input=stop.encode(), capture_output=True,
+                                    check=True, text=False).stdout.decode().split()[0]
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -1004,6 +1006,18 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._tmux_calls()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_turning_the_stop_interrupt_on_or_off_replaces_the_watcher(self):
+        for running, wanted in (("", "1"), ("1", ""), ("1", "1")):
+            with self.subTest(running=running, wanted=wanted):
+                self.log.unlink(missing_ok=True)
+                result = self.run_launcher(env_extra={
+                    "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+                    "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(stop=running),
+                    "SUTANDO_STOP_INTERRUPT": wanted})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                replaced = "kill-session -t =sutando-core-watcher" in self._tmux_calls()
+                self.assertEqual(replaced, running != wanted, "activation and rollback both take effect")
 
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
