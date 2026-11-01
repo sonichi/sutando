@@ -1,4 +1,8 @@
 """Task correlation contracts, including concurrent production sidecar writers."""
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+isolate_os_environ()
+
 import ast
 import concurrent.futures
 import json
@@ -93,7 +97,7 @@ assert 'origin_message_ids: $standalone\\n' in text, text
         for path in ('src/local_task_protocol.py',
                      'packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py'):
             proc = subprocess.run([sys.executable, '-I', '-c', script, str(REPO / path)],
-                                  cwd=self.ws, capture_output=True, text=True)
+                                  cwd=self.ws, env=hermetic_env(), capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_failure_preserves_old_record_and_cleans_stage(self):
