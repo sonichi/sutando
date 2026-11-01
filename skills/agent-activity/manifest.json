@@ -19,6 +19,10 @@
       "command": "./hooks/activity-hook.py"
     },
     {
+      "event": "PostToolUseFailure",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
       "event": "Stop",
       "command": "./hooks/activity-hook.py"
     }

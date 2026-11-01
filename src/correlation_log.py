@@ -5,6 +5,12 @@ Every record is one JSON line with a `kind`; this module owns the schema of each
 bounds, the locked append, rotation, and the failure semantics, and every writer calls it. A
 record names exact ids only; nothing here infers a link.
 
+    kind "handoff": part of a task given to someone else (a pool worker, a subagent, an asked agent),
+    so the parent task can show it as delegated and know when it comes back
+        {kind, at, handoff_id, parent_task_id, path, child_ref, delegate_label, holds?, parent_generation?}
+    kind "handoff_closed": that work came back, failed, or timed out
+        {kind, at, handoff_id, outcome}
+
     kind "interaction": an ask we made, so the answer can be joined back by its id, with where it
     happened, captured when it happens and by id only (no names)
         {kind, at, interaction_id, object, counterpart, counterpart_kind?, counterpart_scope?,
@@ -67,15 +73,26 @@ PATTERNS = {
     "object": re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#\d{1,9}$"),
     "interaction_id": INTERACTION_RE,
 }
-CHECKS = {"task_id": is_task_id, "run_id": is_run_id}
+HANDOFF_RE = re.compile(r"^ho_[0-9a-f]{12}$")
+PATTERNS["handoff_id"] = HANDOFF_RE
+PATTERNS["parent_generation"] = re.compile(r"^\d{1,9}$")
+# A role or worker name a person picked for the pool, never a person: letters, digits, spaces, `._-`.
+PATTERNS["delegate_label"] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$")
+CHILD_REF = {"pool": is_task_id, "agent": re.compile(r"^toolu_[A-Za-z0-9]{8,64}$").match,
+             "message": INTERACTION_RE.match}
+CHECKS = {"task_id": is_task_id, "run_id": is_run_id, "parent_task_id": is_task_id}
 
 KINDS = {
+    "handoff": {"required": ("handoff_id", "parent_task_id", "path", "child_ref", "delegate_label"),
+                "optional": ("holds", "parent_generation")},
+    "handoff_closed": {"required": ("handoff_id", "outcome"), "optional": ()},
     "interaction": {"required": ("interaction_id", "object", "counterpart"),
                     "optional": ("counterpart_kind", "counterpart_scope", "room_id", "room_kind",
                                  "task_id", "run_id", "channel", "event_id")},
 }
 ENUMS = {"counterpart_kind": ("person", "agent", "owner"), "counterpart_scope": ("internal", "external", "unknown"),
-         "room_kind": ("dm", "room", "unknown"), "channel": ("room", "dm", "thread")}
+         "room_kind": ("dm", "room", "unknown"), "channel": ("room", "dm", "thread"),
+         "path": tuple(CHILD_REF), "holds": ("yes", "no"), "outcome": ("done", "failed", "timeout")}
 
 _warned = False
 
@@ -89,6 +106,10 @@ def log_path(workspace: "str | Path | None" = None) -> Path:
 
 def mint_interaction_id() -> str:
     return "ix_" + secrets.token_hex(6)
+
+
+def mint_handoff_id() -> str:
+    return "ho_" + secrets.token_hex(6)
 
 
 def validate(kind: str, fields: dict) -> dict:
@@ -119,6 +140,8 @@ def validate(kind: str, fields: dict) -> dict:
     for key, ok in list(PATTERNS.items()) + list(CHECKS.items()):
         if key in rec and not (ok.match(rec[key]) if hasattr(ok, "match") else ok(rec[key])):
             raise ValueError(f"{key} is not a valid id for that field")
+    if kind == "handoff" and not CHILD_REF[rec["path"]](rec["child_ref"]):
+        raise ValueError(f"child_ref is not a valid id for a {rec['path']} handoff")
     return rec
 
 
