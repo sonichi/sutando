@@ -42,7 +42,7 @@ OLD_SECTIONS = [
             "Open {name} under Your agents at the top of the sidebar and ask:",
             "What can you do for me today?", "dm"),
     Section("rooms", "Rooms",
-            "You, your teammates and your agents meet in one room. Invite your team: everyone brings their own agents, and each agent works for its owner.",
+            "You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.",
             "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}.",
             images=(("room-list-add-room.jpg", "Press + in the room list, then Room"), ("new-room-dialog.jpg", "The New Chat Room dialog, with your agent under AI stands you own"), ("room-menu-invite.jpg", "The room menu, with Invite"))),
     Section("commons", "Commons",
@@ -109,6 +109,7 @@ RENDERED_AT = {
     "tutorial.2026-10-30.5": "cc82abc3094ed9f03a298c412f19b5cdf38f1253da042ee978dcea7ce0a6d122",
     "tutorial.2026-10-30.6": "a699783d9c31d1cd9fbd73efa3738a4f4fbdfabbf9757d7cf5ba4b1067aab5d6",
     "tutorial.2026-10-31.1": "f853324233e497e1203eb784b804167445f3418eab2ff9500ac364be0667ff0f",
+    "tutorial.2026-10-31.2": "d0be214f205df52c62f9dd2dec0267b49676dc80ba8ca9fea084ffae4614c728",
 }
 STEP_IDS = ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "phone", "mobile"]
 ASSET_CAP = 60_000

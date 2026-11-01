@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-10-31.1",
+  "revision": "tutorial.2026-10-31.2",
   "steps": [
     {
       "id": "dm",
@@ -18,7 +18,7 @@
       "id": "rooms",
       "title": "Rooms",
       "body": [
-        "You, your teammates and your agents meet in one room. Invite your team: everyone brings their own agents, and each agent works for its owner.",
+        "You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.",
         "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}."
       ],
       "surface": "room",
