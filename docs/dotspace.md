@@ -80,8 +80,10 @@ instance is a config entry.
    For that entry's gateway host only (its `gateway_host`; its `server` when it names none), a
    connect code may name a single-label host and must resolve to a loopback, private (RFC 1918,
    IPv6 ULA) or shared (100.64/10) address, never link-local, unspecified or public
-   (`connections._local_address`). Plain `http` is allowed only when that address is loopback:
-   the bearer rides every poll, ack and result, so a LAN server needs `https`. A `gateway_host`
+   (`connections._local_address`). Plain `http` is allowed only when the gateway host itself names
+   loopback (`localhost`, a `*.localhost` name, a 127/8 or `::1` literal), not merely resolves to
+   it: the bearer rides every poll, ack and result, and the bridge re-resolves the name each time,
+   so a LAN server needs `https`. A `gateway_host`
    with a port (`"localhost:8008"`) covers that port only; without one it covers every port on
    the host. The probe and its identity check are otherwise unchanged: the gateway's agent
    listing or `whoami` must still name an agent of the declared server. Nothing a token or a

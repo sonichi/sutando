@@ -730,9 +730,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     if address == "":
         raise InvalidToken("invalid_gateway")
     if url.lower().startswith("http://") and not (_loopback_host(host) and (not address or _loopback_address(address))):
-        # The bearer rides every poll, ack and result: in cleartext only to this machine itself.
-        # The host must BE loopback (localhost, 127/8, ::1), not merely resolve to it now: the
-        # bridge resolves the name again on every poll.
+        # Cleartext bearer only to this machine: the host must name loopback, since the bridge
+        # re-resolves it every poll.
         raise InvalidToken("invalid_gateway")
     if address is None:
         out["error"] = "unreachable (resolution)"
