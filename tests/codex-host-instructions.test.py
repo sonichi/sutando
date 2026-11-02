@@ -344,28 +344,26 @@ class EnsureLinked(unittest.TestCase):
             self.assertFalse(self.target.exists())
             self.assertEqual(self.link(), "linked")
 
-    def test_a_link_through_a_missing_component_is_invalid_and_creates_nothing(self):
+    def _untraversable(self, name, target, error):
         root = Path(self.tmp.name).resolve()
-        (root / "surprise").mkdir()
-        alias = root / "alias-missing"
-        alias.symlink_to("missing/../surprise")
+        (root / "target").mkdir()
+        (root / "a-file").write_text("x\n")
+        alias = root / name
+        alias.symlink_to(target)
+        with self.assertRaises(error):
+            os.stat(alias)  # the OS cannot traverse it
         before = self.tree()
         self.assertEqual(self.link(codex_home=alias), "invalid-home")
         self.assertEqual(self.link(codex_home=alias / "deeper"), "invalid-home")
         self.assertTrue(chi.is_owner_codex_home(alias, self.home))
         self.assertEqual(self.tree(), before)
-        self.assertEqual(os.listdir(root / "surprise"), [])
+        self.assertFalse(os.path.lexists(root / "target" / "AGENTS.md"))
+
+    def test_a_link_through_a_missing_component_is_invalid_and_creates_nothing(self):
+        self._untraversable("alias-missing", "missing/../target", FileNotFoundError)
 
     def test_a_link_through_a_file_is_invalid_and_creates_nothing(self):
-        root = Path(self.tmp.name).resolve()
-        (root / "surprise").mkdir()
-        (root / "a-file").write_text("x\n")
-        alias = root / "alias-file"
-        alias.symlink_to("a-file/../surprise")
-        before = self.tree()
-        self.assertEqual(self.link(codex_home=alias), "invalid-home")
-        self.assertEqual(self.tree(), before)
-        self.assertEqual(os.listdir(root / "surprise"), [])
+        self._untraversable("alias-file", "a-file/../target", NotADirectoryError)
 
     def test_a_home_below_a_regular_file_is_invalid(self):
         (Path(self.tmp.name).resolve() / "a-file").write_text("x\n")
@@ -387,7 +385,8 @@ class EnsureLinked(unittest.TestCase):
             with self.subTest(spelled=spelled):
                 self.assertEqual(chi._resolve_strict(spelled), os.path.realpath(spelled))
 
-    def test_an_unreadable_owner_identity_fails_closed(self):
+    def test_an_unreadable_owner_identity_fails_closed_without_any_mutation(self):
+        """EIO where samefile() would stat: the candidate is the existing ~/.codex itself."""
         owner = self.home / ".codex"
         owner.mkdir(parents=True)
         real_stat = os.stat
@@ -396,12 +395,21 @@ class EnsureLinked(unittest.TestCase):
             if os.fspath(path) == os.fspath(owner):
                 raise OSError(errno.EIO, "I/O error", os.fspath(path))
             return real_stat(path, *a, **k)
-        with patch.object(os, "stat", eio_for_owner):
+        with self.assertRaises(OSError):
+            with patch.object(os, "stat", eio_for_owner):
+                os.path.samefile(owner, owner)
+        before = self.tree()
+        mutation = AssertionError("mutated the filesystem")
+        with patch.object(os, "stat", eio_for_owner), \
+                patch.object(os, "mkdir", side_effect=mutation) as mkdir, \
+                patch.object(os, "open", side_effect=mutation) as opened, \
+                patch.object(os, "symlink", side_effect=mutation) as symlink:
             self.assertEqual(self.link(codex_home=owner), "owner-home")
-            self.assertTrue(chi.is_owner_codex_home(self.codex_home, self.home))
             self.assertEqual(self.link(), "owner-home")
-        self.assertEqual(os.listdir(owner), [])
-        self.assertFalse(self.target.exists())
+            self.assertTrue(chi.is_owner_codex_home(self.codex_home, self.home))
+        for call in (mkdir, opened, symlink):
+            call.assert_not_called()
+        self.assertEqual(self.tree(), before)
 
     def test_an_unreadable_candidate_identity_fails_closed(self):
         real_stat = os.stat
@@ -418,23 +426,45 @@ class EnsureLinked(unittest.TestCase):
         self.assertFalse(chi._maybe_same(self.host, self.home / ".codex"))
         self.assertTrue(chi._maybe_same(self.host, self.host))
 
-    def test_a_dangling_or_directory_override_does_not_override(self):
-        for name, make in (("dangling", lambda p: p.symlink_to(p.parent / "gone.md")),
-                           ("directory", lambda p: p.mkdir())):
+    def test_only_a_regular_override_file_overrides(self):
+        def regular(p):
+            p.write_text("owner\n")
+
+        def link_to_regular(p):
+            (p.parent / "real.md").write_text("owner\n")
+            p.symlink_to(p.parent / "real.md")
+
+        def directory(p):
+            p.mkdir()
+
+        def dangling(p):
+            p.symlink_to(p.parent / "gone.md")
+
+        def link_to_directory(p):
+            (p.parent / "real-dir").mkdir()
+            p.symlink_to(p.parent / "real-dir")
+        for name, make, expected in (("regular", regular, "overridden"),
+                                     ("link-to-regular", link_to_regular, "overridden"),
+                                     ("directory", directory, "linked"),
+                                     ("dangling", dangling, "linked"),
+                                     ("link-to-directory", link_to_directory, "linked")):
             with self.subTest(override=name):
                 home = Path(self.tmp.name).resolve() / f"home-{name}"
                 home.mkdir()
-                make(home / "AGENTS.override.md")
-                self.assertEqual(self.link(codex_home=home), "linked")
-                self.assertEqual(Path(os.readlink(home / "AGENTS.md")), self.host)
-
-    def test_a_link_to_a_regular_override_file_overrides(self):
-        self.codex_home.mkdir(parents=True)
-        real = self.codex_home / "real-override.md"
-        real.write_text("owner\n")
-        (self.codex_home / "AGENTS.override.md").symlink_to(real)
-        self.assertEqual(self.link(), "overridden")
-        self.assertFalse(os.path.lexists(self.target))
+                override = home / "AGENTS.override.md"
+                make(override)
+                shape = (os.path.islink(override), os.readlink(override) if os.path.islink(override)
+                         else None, os.path.isdir(override), override.read_text()
+                         if override.is_file() else None)
+                self.assertEqual(self.link(codex_home=home), expected)
+                self.assertEqual((os.path.islink(override), os.readlink(override)
+                                  if os.path.islink(override) else None, os.path.isdir(override),
+                                  override.read_text() if override.is_file() else None),
+                                 shape, "the override was touched")
+                if expected == "linked":
+                    self.assertEqual(Path(os.readlink(home / "AGENTS.md")), self.host)
+                else:
+                    self.assertFalse(os.path.lexists(home / "AGENTS.md"))
 
     def test_an_unreadable_override_is_treated_as_present(self):
         self.codex_home.mkdir(parents=True)
