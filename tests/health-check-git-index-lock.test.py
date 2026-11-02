@@ -15,6 +15,11 @@ import time
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(_spec)
@@ -202,6 +207,34 @@ class GitIndexLock(unittest.TestCase):
             r = hc.check_git_index_lock(a)
         self.assertEqual(r["status"], "ok")
         self.assertNotIn(str(b), r["detail"])
+
+    def test_an_inherited_GIT_INTERNAL_SUPER_PREFIX_does_not_hide_the_lock(self):
+        """Inherited, it made Apple Git's resolver fail, and the probe read "not a git checkout"."""
+        lock = self._lock(9 * 3600)
+        with unittest.mock.patch.dict(os.environ, {"GIT_INTERNAL_SUPER_PREFIX": "outer/"}):
+            r = hc.check_git_index_lock(self.repo)
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn(str(lock.resolve()), r["detail"])
+
+    def test_git_is_handed_none_of_the_inherited_selection_variables(self):
+        """Whatever the runner's git honours: every stripped variable, inherited, never reaches git."""
+        real_run, seen = subprocess.run, []
+
+        def spy(argv, *a, **k):
+            if "--absolute-git-dir" in argv:  # the probe's resolver call
+                seen.append(k.get("env"))
+            return real_run(argv, *a, **k)
+        # Named here, not read from the module: a variable dropped from its set must still be inherited.
+        must_strip = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                      "GIT_INTERNAL_SUPER_PREFIX", "GIT_CEILING_DIRECTORIES", "GIT_PREFIX"}
+        inherited = {name: "/nonexistent/inherited" for name in must_strip | hc.GIT_REPO_SELECTION_ENV}
+        with unittest.mock.patch.dict(os.environ, inherited), \
+                unittest.mock.patch.object(subprocess, "run", side_effect=spy):
+            hc.check_git_index_lock(self.repo)
+        self.assertTrue(seen, "the probe ran git")
+        for env in seen:
+            self.assertIsNotNone(env, "git must get an explicit environment, not the inherited one")
+            self.assertEqual(sorted(set(env) & set(inherited)), [])
 
     def test_the_stripped_set_covers_gits_own_local_env_list(self):
         """Git enumerates its repository-selection variables itself; the
