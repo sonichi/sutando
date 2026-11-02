@@ -30,7 +30,7 @@ class WorkerChannelLaunchTests(unittest.TestCase):
             def __getitem__(self, key):
                 raise AssertionError("credential value read")
 
-        env = NamesOnly(AG2_DEVICE_ENV=None, AG2_REMOTE_TOKEN_S_SPACE=None,
+        env = NamesOnly(AG2_DEVICE_ENV=None, SUTANDO_APP_SUPPORT=None, AG2_REMOTE_TOKEN_S_SPACE=None,
                         REMOTE_TASK_TOKEN=None, REMOTE_TASK_URL_S_SPACE=None,
                         REMOTE_TASK_CHANNEL_DIR_S_SPACE=None, UNRELATED_SECRET=None)
         with mock.patch.object(Path, "read_text", side_effect=AssertionError("file read")):

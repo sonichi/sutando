@@ -67,7 +67,7 @@ def launch_env_names(environ: Optional[Mapping[str, str]] = None) -> list[str]:
     """Names to carry across a session launcher; never open files or inspect values."""
     from connections import connection_env_names
     env = os.environ if environ is None else environ
-    names = {DEVICE_ENV_VAR, "CLAUDE_CONFIG_DIR", *TOKEN_VARS,
+    names = {DEVICE_ENV_VAR, "CLAUDE_CONFIG_DIR", "SUTANDO_APP_SUPPORT", *TOKEN_VARS,
              "REMOTE_TASK_URL", "AG2_GATEWAY_URL"}
     return sorted((names & env.keys()) | set(connection_env_names(env)))
 
