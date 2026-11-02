@@ -4434,9 +4434,9 @@ def _held_serve(rec, claim) -> bool:
 
 def _ack_recorded_by_its_twin(rec, claim, gen) -> bool:
     """Whether another post of this same claim (same operation id) already recorded its serve's ack,
-    for the generation this answer names."""
+    for the generation this answer names; an answer naming none keeps the bound one, as record_ack does."""
     return (isinstance(rec, dict) and rec.get("ack_op") == claim["op"] and rec.get("lease_id") == claim.get("serve")
-            and rec.get("awaiting_ack") is False and rec.get("execution_generation") == gen)
+            and rec.get("awaiting_ack") is False and (gen is None or rec.get("execution_generation") == gen))
 
 
 def _commit_ack(wire_tid: str, claim, doc, open_turn: bool = True) -> str:

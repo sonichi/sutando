@@ -534,6 +534,15 @@ class Hooks(unittest.TestCase):
         self.forget(gone)
         self.assertEqual(gw._commit_ack(gone, stale, _ack(gone, 1)), "stale")
         self.assertTrue([m for m in self.logs if f"{gone}: ack for a serve this attempt no longer holds" in m])
+        legacy = "task-twin-legacy"
+        self.addCleanup(self.forget, legacy)
+        self.assertTrue(gw._take_served_task(_task(legacy, lease_id="L1", source_event_id="$e"), set(), []))
+        claim, twin = (gw._claim_ack(legacy, "L1", local=legacy, durable=True) for _ in range(2))
+        self.assertEqual(gw._commit_ack(legacy, claim, _ack(legacy, 1)), "recorded")
+        no_gen = {k: v for k, v in _ack(legacy, 1).items() if k != "execution_generation"}
+        self.assertEqual(gw._commit_ack(legacy, twin, no_gen), "stale")
+        self.assertFalse([m for m in self.logs if f"{legacy}: ack for a serve" in m],
+                         "an answer naming no generation keeps the bound one: still its twin")
         settled = "task-twin-settled"
         self.addCleanup(self.forget, settled)
         self.assertTrue(gw._take_served_task(_task(settled, lease_id="L1", source_event_id="$e"), set(), []))
