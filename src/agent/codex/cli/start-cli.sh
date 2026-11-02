@@ -309,6 +309,7 @@ ensure_task_notifier() {
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
     "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/notifier-guard.sh"
     "$REPO/src/watcher_identity.py"
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json

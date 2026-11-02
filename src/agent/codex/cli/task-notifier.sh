@@ -24,6 +24,8 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+# shellcheck source=../../../notifier-guard.sh
+. "$REPO/src/notifier-guard.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
 # shellcheck source=../../../delivery/worker-stage.sh
 source "$REPO/src/delivery/worker-stage.sh"
@@ -50,12 +52,10 @@ workstream_context_file=""
 # head) -- not a bash array, since bash 3.2's `set -u` errors on an empty one.
 queue_dir=""
 
+# Bounded: a watcher stuck mid-exit must not hold this notifier's exit forever.
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
-  kill -TERM "-$watcher_pid" 2>/dev/null \
-    || kill -TERM "$watcher_pid" 2>/dev/null \
-    || true
-  wait "$watcher_pid" 2>/dev/null || true
+  stop_group_bounded "$watcher_pid"
   watcher_pid=""
 }
 
@@ -573,7 +573,7 @@ process_announced_queue() {
 # `read || rc=$?`, NOT `read; rc=$?` -- under `set -e` the bare form dies before
 # the assignment runs, leaving the timeout branch below unreachable.
 while :; do
-  event="" rrc=0
+  event="" rrc=0 read_at=$SECONDS
   IFS= read -r -t "$RETRY_INTERVAL" event || rrc=$?
   if [ "$rrc" -eq 0 ]; then
     case "$event" in
@@ -584,11 +584,16 @@ while :; do
     esac
     continue
   fi
-  # macOS's /bin/bash (3.2) returns 1 for a read TIMEOUT and for EOF alike, so
-  # the code cannot tell them apart -- ask whether the watcher is still alive.
-  if kill -0 "$watcher_pid" 2>/dev/null; then
+  # macOS's /bin/bash (3.2) returns 1 for a read TIMEOUT and for EOF alike: a live
+  # writer and a read that waited out its timeout mean a timeout; anything else is
+  # EOF (notifier-guard.sh).
+  if ! events_stream_ended "$watcher_pid" "$((SECONDS - read_at))" "$RETRY_INTERVAL"; then
+    # Never round again without a pause: a sub-2s timeout cannot be told from EOF by time.
+    [ $((SECONDS - read_at)) -gt 0 ] || sleep 1
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
-  break   # the watcher died -- genuine EOF, stop the notifier
+  notifier_proc_live "$watcher_pid" \
+    && log_notifier "standby watcher (pid $watcher_pid) closed its events pipe but is still running; stopping it and this notifier"
+  break   # the events stream ended -- stop the notifier
 done < "$event_dir/events"

@@ -156,6 +156,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/runtime-api/rundir.py",
             "src/watch-tasks-stream.sh",
             "src/tasks-dir-resolve.sh",
+            "src/notifier-guard.sh",
             "src/watcher_identity.py",
             "src/workspace_default.py",
             "src/shutdown.py",
@@ -360,6 +361,7 @@ exit 0
             str(self.root / "src/agent/codex/cli/task-notifier.sh"),
             str(self.root / "src/watch-tasks-stream.sh"),
             str(self.root / "src/tasks-dir-resolve.sh"),
+            str(self.root / "src/notifier-guard.sh"),
             str(self.root / "src/watcher_identity.py"),
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,

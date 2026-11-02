@@ -387,6 +387,7 @@ ensure_task_notifier() {
     "$REPO/src/core-input-watch.py"
     "$REPO/src/delivery/task_dispatch.py"
     "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/notifier-guard.sh"
     "$REPO/src/watcher_identity.py"
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json

@@ -30,6 +30,8 @@ INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 PARTIAL_DIR="$WORKSPACE_DIR/state/task-notifier-partial-paste"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+# shellcheck source=../../../notifier-guard.sh
+. "$REPO/src/notifier-guard.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
@@ -62,10 +64,10 @@ event_dir=""
 # head) -- not a bash array, since bash 3.2's `set -u` errors on an empty one.
 queue_dir=""
 
+# Bounded: a watcher stuck mid-exit must not hold this notifier's exit forever.
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
-  kill -TERM "-$watcher_pid" 2>/dev/null || kill -TERM "$watcher_pid" 2>/dev/null || true
-  wait "$watcher_pid" 2>/dev/null || true
+  stop_group_bounded "$watcher_pid"
   watcher_pid=""
 }
 
@@ -985,7 +987,7 @@ process_announced_queue() {
 # `read || rc=$?`, NOT `if read; then ...; fi; rc=$?` -- the latter's own
 # exit status is 0 whenever the then-branch never ran, erasing read's real one.
 while :; do
-  event="" rc=0
+  event="" rc=0 read_at=$SECONDS
   IFS= read -r -t "$RETRY_POLL_SEC" event || rc=$?
   if [ "$rc" -eq 0 ]; then
     case "$event" in
@@ -997,11 +999,20 @@ while :; do
     continue
   fi
   # macOS's own /bin/bash (3.2) returns 1 for a read TIMEOUT too, same as EOF
-  # (unlike a modern bash's >128) -- ask if the watcher's alive instead.
-  if kill -0 "$watcher_pid" 2>/dev/null; then
+  # (unlike a modern bash's >128): a live writer and a read that waited out its
+  # timeout mean a timeout; anything else is EOF (notifier-guard.sh).
+  if ! events_stream_ended "$watcher_pid" "$((SECONDS - read_at))" "$RETRY_POLL_SEC"; then
+    # Never round again without a pause: a sub-2s timeout cannot be told from EOF by time.
+    [ $((SECONDS - read_at)) -gt 0 ] || sleep 1
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
-  STANDBY_END_WHY="standby watcher exited"; STANDBY_END_TRIES=10
-  break   # the watcher died -- genuine EOF, stop the notifier
+  if notifier_proc_live "$watcher_pid"; then
+    log_notifier "standby watcher (pid $watcher_pid) closed its events pipe but is still running; stopping it and this notifier"
+    STANDBY_END_WHY="standby watcher closed its events pipe"
+  else
+    STANDBY_END_WHY="standby watcher exited"
+  fi
+  STANDBY_END_TRIES=10
+  break   # the events stream ended -- stop the notifier
 done < "$event_dir/events"

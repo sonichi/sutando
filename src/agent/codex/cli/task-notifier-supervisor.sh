@@ -15,6 +15,8 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # shellcheck source=../../../tasks-dir-resolve.sh
 source "$REPO/src/tasks-dir-resolve.sh"
+# shellcheck source=../../../notifier-guard.sh
+source "$REPO/src/notifier-guard.sh"
 # No positional inbox arg for a supervisor invocation -- SUTANDO_TASKS_DIR (if
 # set) or the canonical loader, same as the watcher it's standing in for would
 # resolve. A resolution failure leaves TASKS_DIR empty: role_present() then
@@ -126,6 +128,11 @@ health_alert() {
     && osascript -e 'display notification "A Sutando session looks idle but its heartbeat is stale. It may need a restart." with title "Sutando"' >/dev/null 2>&1 || true
 }
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
+# A notifier that keeps dying soon after start backs off, doubling up to this cap;
+# one that ran at least RESTART_HEALTHY_S starts the next streak from RESTART_DELAY.
+RESTART_DELAY_MAX="${SUTANDO_NOTIFIER_RESTART_DELAY_MAX:-60}"
+RESTART_HEALTHY_S="${SUTANDO_NOTIFIER_RESTART_HEALTHY_S:-30}"
+restart_streak=0
 TARGET_POLL="${SUTANDO_NOTIFIER_TARGET_POLL:-2}"
 NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}"
 # Standby gating. GRACE_PERIOD: how long "no session-role watcher for
@@ -164,13 +171,71 @@ stop_child() {
   [ -n "$child_pid" ] || return 0
   # The Python child calls setsid(), so its PID is also the notifier process
   # group's ID. Stop the whole group; fall back to the leader during the tiny
-  # pre-setsid race.
-  kill -TERM "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
-  wait "$child_pid" 2>/dev/null || true
+  # pre-setsid race. Bounded: a notifier ignoring TERM is killed rather than
+  # holding this supervisor alive past its tmux session (notifier-guard.sh).
+  stop_group_bounded "$child_pid"
   child_pid=""
 }
 
+# The delay before restarting a notifier that lived $1 seconds, in NEXT_DELAY:
+# RESTART_DELAY, doubling for each consecutive short life, up to RESTART_DELAY_MAX.
+# Set, not echoed: a $( ) call would run in a subshell and lose the streak.
+# A fractional RESTART_DELAY (a test's 0.01) is used as given: bash has no float math.
+NEXT_DELAY=""
+next_restart_delay() {
+  local d="$RESTART_DELAY" i=0
+  if [ "$1" -ge "$RESTART_HEALTHY_S" ]; then
+    restart_streak=0
+  else
+    restart_streak=$((restart_streak + 1))
+  fi
+  case "$d$RESTART_DELAY_MAX" in
+    *[!0-9]*) NEXT_DELAY="$d"; return 0 ;;
+  esac
+  while [ "$i" -lt "$restart_streak" ] && [ "$d" -lt "$RESTART_DELAY_MAX" ]; do
+    d=$((d * 2)); i=$((i + 1))
+  done
+  [ "$d" -le "$RESTART_DELAY_MAX" ] || d="$RESTART_DELAY_MAX"
+  NEXT_DELAY="$d"
+}
+
+# One supervisor per inbox. The pidfile names the supervisor that owns this inbox;
+# a launcher starts a new one when it means to replace the old, so the newest wins:
+# an older live supervisor for the same inbox is stopped, its notifier with it.
+# A recorded pid is acted on only when it still runs this script for this inbox.
+SLOT_FILE=""
+supervisor_slot_file() {
+  [ -n "$TASKS_DIR" ] || return 0
+  printf '%s/state/notifier-supervisors/%s.pid\n' "$(workspace_dir_for_inbox "$TASKS_DIR")" \
+    "$(printf '%s' "$TASKS_DIR" | cksum | awk '{print $1}')"
+}
+
+claim_supervisor_slot() {
+  local old old_inbox kids k
+  SLOT_FILE="$(supervisor_slot_file)"
+  [ -n "$SLOT_FILE" ] || return 0
+  mkdir -p "$(dirname "$SLOT_FILE")" 2>/dev/null || { SLOT_FILE=""; return 0; }
+  old="$(sed -n 1p "$SLOT_FILE" 2>/dev/null)"
+  old_inbox="$(sed -n 2p "$SLOT_FILE" 2>/dev/null)"
+  if [ -n "$old" ] && [ "$old" != "$$" ] && [ "$old_inbox" = "$TASKS_DIR" ] && notifier_proc_live "$old" \
+      && ps -o command= -p "$old" 2>/dev/null | grep -q 'task-notifier-supervisor\.sh'; then
+    echo "task-notifier-supervisor: replacing the older supervisor (pid $old) for $TASKS_DIR" >&2
+    kids="$(pgrep -P "$old" 2>/dev/null || true)"
+    stop_group_bounded "$old"
+    for k in $kids; do stop_group_bounded "$k"; done
+  fi
+  printf '%s\n%s\n' "$$" "$TASKS_DIR" > "$SLOT_FILE.$$" 2>/dev/null && mv -f "$SLOT_FILE.$$" "$SLOT_FILE" 2>/dev/null \
+    || { rm -f "$SLOT_FILE.$$" 2>/dev/null; SLOT_FILE=""; }
+}
+
+release_supervisor_slot() {
+  [ -n "$SLOT_FILE" ] || return 0
+  [ "$(sed -n 1p "$SLOT_FILE" 2>/dev/null)" = "$$" ] && rm -f "$SLOT_FILE" 2>/dev/null
+  return 0
+}
+
 trap 'stop_child; exit 0' HUP INT TERM
+trap 'release_supervisor_slot' EXIT
 
 # One notifier lifetime while armed. Returns 0 when it crashed and should be
 # restarted (caller's armed-loop continues), 1 when the target died (caller's
@@ -184,6 +249,7 @@ run_notifier_once() {
     'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
     "$NOTIFIER" &
   child_pid=$!
+  local started=$SECONDS
   # Watch the role verdict while the child runs, UNCONDITIONALLY -- a
   # session-role watcher can arm at any moment and must end this notifier's
   # turn whether or not a pane/window was declared. Target liveness is only
@@ -203,14 +269,17 @@ run_notifier_once() {
   child_pid=""
   target_alive || return 1
   [ "$(session_role_verdict)" = "yes" ] && return 2
-  echo "task-notifier-supervisor: notifier exited with status $status; restarting" >&2
-  sleep "$RESTART_DELAY"
+  next_restart_delay $((SECONDS - started))
+  echo "task-notifier-supervisor: notifier exited with status $status; restarting in ${NEXT_DELAY}s" >&2
+  sleep "$NEXT_DELAY"
   return 0
 }
 
 # Sourced by a test to exercise the helpers in isolation: stop here, before the
 # standby loop, so decide_action and its callees can be invoked directly.
 if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+claim_supervisor_slot
 
 # "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
 # nothing is running to keep, and a host whose ps never answers would otherwise
