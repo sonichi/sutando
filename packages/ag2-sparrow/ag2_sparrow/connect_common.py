@@ -1233,7 +1233,7 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
 
 
 _PENDING: dict = {}
-START_SEEN_S = 5.0      # launchd may report no pid just after a bootstrap it accepted
+START_SEEN_S = 5.0      # a manager may report no main pid just after a start it accepted
 
 
 def _start_pending(shape: Shape, root: str, before: dict, restart: bool, unit: str, root_id, holder,
@@ -1254,11 +1254,14 @@ def _start_pending(shape: Shape, root: str, before: dict, restart: bool, unit: s
 
 
 def _own_run(shape: Shape, prior: "dict | None", seen: dict) -> "tuple[dict | None, str]":
-    """(the run, '') only when it provably began inside this operation's own start call: launchd's
-    bootstrap loaded the job (it refuses a loaded one); systemd's run is a new invocation whose main
-    process started between the call's two clocks. Anything ambiguous is (None, why), never ours."""
+    """(the run, '') only when it provably began inside this operation's own start call. launchd: our
+    bootstrap loaded the job (it refuses a loaded one), so the registration, and every run KeepAlive gives
+    it, is ours whatever pid it shows yet. systemd: a new invocation whose main process started between
+    the call's two clocks. Anything ambiguous is (None, why), never ours."""
     if not seen.get("by_call"):
         return None, "was already running when this operation asked for it"
+    if is_macos():
+        return job_identity(shape) or {"pid": None, "start": None, "invocation": "", "since": None}, ""
     deadline = time.monotonic() + START_SEEN_S
     while True:
         now = job_identity(shape)
@@ -1267,8 +1270,6 @@ def _own_run(shape: Shape, prior: "dict | None", seen: dict) -> "tuple[dict | No
         if time.monotonic() >= deadline:
             return None, f"showed no process within {START_SEEN_S:.0f} s of this operation's start"
         time.sleep(POLL_S)
-    if is_macos():
-        return now, ""
     fresh = now["invocation"] and now["invocation"] != (prior or {}).get("invocation")
     if fresh and now["since"] is not None and seen["t0"] <= now["since"] <= seen["t1"]:
         return now, ""
@@ -1358,8 +1359,10 @@ def _same_run(now: "dict | None", ident: dict) -> bool:
 
 
 def _undo_start(p: dict) -> str:
-    """Under the agent lock only: stop the run this operation's own start began, by the identity the manager
-    issued for it, re-verified just before the signal; anything else is left. The line saying what was done."""
+    """Under the agent lock only, and only while the unit on disk is the one this operation published: stop
+    what its own start began. launchd: `bootout` of the registration our bootstrap loaded (a pid respawned
+    under it is ours too, and bootout ends the respawning); systemd: the run by its manager-issued identity,
+    re-verified just before the signal. Anything else is left. The line saying what was done."""
     shape = p["shape"]
     by_hand = f"stop it by hand ({stop_command(shape)})"
     if not agent_lock_held(p["root"]):
@@ -1372,15 +1375,17 @@ def _undo_start(p: dict) -> str:
         unit_now = supervisor_path(shape).read_bytes()
     except OSError:
         unit_now = None
-    if unit_now != p["unit"] or not _same_run(job_identity(shape), p["ident"]):
+    launchd = is_macos()
+    if unit_now != p["unit"] or (not launchd and not _same_run(job_identity(shape), p["ident"])):
         return (f"{job_name(shape)} is no longer the job this connect started (its unit or launcher changed), so "
                 f"it was left as it is: {by_hand}")
     for undo in p["undo"]:
         undo()
-    problem = _stop_run(shape, p["ident"])
+    problem = stop_supervisor(shape) if launchd else _stop_run(shape, p["ident"])
     if problem:
         return f"{job_name(shape)} could not be stopped ({problem}): {by_hand}"
-    print(f"stopped: {job_name(shape)} (the job this operation started, pid {p['ident']['pid']})")
+    print(f"stopped: {job_name(shape)} (the job this operation started"
+          + ("" if launchd else f", pid {p['ident']['pid']}") + ")")
     return f"{job_name(shape)}, the job this operation started, was stopped"
 
 

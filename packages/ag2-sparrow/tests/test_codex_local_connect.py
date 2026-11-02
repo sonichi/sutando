@@ -225,10 +225,24 @@ class Runner:
         self.session, self.enabled, self.real = None, False, False
         self.invocation, self.since = "", 0
         self.pause, self.acted, self.shim, self.spawned, self.stop_timeout = "", "", False, [], 10
+        self.keep_alive, self.loaded, self.throttle, self.started_at, self.respawns = False, False, 30.0, 0.0, 0
+
+    def respawn_if_due(self):
+        """launchd's KeepAlive, when `keep_alive` models it: a loaded job whose run ended is spawned again
+        once `throttle` has passed since that run started (at once for a run that lasted longer)."""
+        if not (self.keep_alive and self.loaded and self.session is not None and self.session.poll() is not None):
+            return
+        if time.monotonic() - self.started_at >= self.throttle:
+            old, self.session = self.session, None
+            for pipe in (old.stdin, old.stdout):
+                pipe.close()
+            self.respawns += 1
+            self.start_session(by_manager=True)
 
     def start_session(self, by_manager=False):
         self.stop_session()
         self.invocation, self.since = secrets.token_hex(16), int(time.monotonic() * 1_000_000)
+        self.started_at = time.monotonic()
         self.session = launched(self.root, self.adapter, real=self.real, pause=self.pause, acted=self.acted,
                                 shim=self.shim) if by_manager else hold(self.root, self.adapter)
         self.spawned.append(self.session)
@@ -264,6 +278,8 @@ class Runner:
 
     def answer(self, verb, cmd):
         if verb == "print":
+            if self.keep_alive and self.loaded and not self.alive():
+                return (0, "\tstate = spawn scheduled\n", "")
             return (0, f"\tpid = {self.session.pid}\n\tstate = running\n", "") if self.alive() else NOT_LOADED
         if verb == "show":
             loaded = cm.service_path(L).exists()
@@ -279,14 +295,19 @@ class Runner:
     def __call__(self, cmd, timeout=30):
         self.calls.append(list(cmd))
         verb = self.verb(cmd)
+        if cmd[0] == "launchctl":
+            self.respawn_if_due()
         loaded = (37, "", "Bootstrap failed: 37: Operation already in progress\n")   # launchd, on a loaded job
+        held = self.alive() or (self.keep_alive and self.loaded)
         got = self.table[(cmd[0], verb)] if (cmd[0], verb) in self.table else \
-            loaded if verb == "bootstrap" and self.alive() else self.answer(verb, cmd)
+            loaded if verb == "bootstrap" and held else self.answer(verb, cmd)
         if got is None:
             return None
         rc, out, err = got if isinstance(got, tuple) else (got, "", "exit %s" % got)
         if rc == 0 and verb in ("enable", "disable"):
             self.enabled = verb == "enable"
+        if rc == 0 and verb in ("bootstrap", "bootout"):
+            self.loaded = verb == "bootstrap"
         if self.root and rc == 0:
             if verb in START_VERBS and not (verb == "start" and self.alive()):     # start is a no-op when active
                 self.start_session(by_manager=True)

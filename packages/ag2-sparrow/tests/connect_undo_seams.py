@@ -22,6 +22,8 @@ isolate_os_environ()
 from ag2_sparrow import connect_bridge as cb, connect_common as cm, service_manager as sm, task_io  # noqa: E402
 
 MANAGERS = (("systemd", False), ("launchd", True))
+SYSTEMD = MANAGERS[:1]      # launchd's undo signals no pid: it boots out the registration its bootstrap loaded
+FOREIGN_PLIST = b"<?xml version='1.0'?>\n<!-- another writer's plist -->\n<plist><dict/></plist>\n"
 STOPS = {"stop", "bootout", "disable"}
 STARTS = {"restart", "start", "bootstrap"}
 
@@ -46,6 +48,7 @@ class UndoSeams:
         fake = self.seam_fake()
         fake.runner.real, fake.runner.shim = True, mac
         fake.runner.pause, fake.runner.acted = "", str(self.home / f"acted-{tag}-{int(mac)}")
+        fake.runner.keep_alive, fake.runner.throttle = mac, 0.0     # launchd: a run that ends respawns at once
         return fake
 
     def _done(self, fake):
@@ -151,7 +154,7 @@ class UndoSeams:
 
     def test_seam_a_successor_between_the_identity_check_and_the_signal_is_never_signalled(self):
         for how in ("connect", "install"):
-            for name, mac in MANAGERS:
+            for name, mac in SYSTEMD:
                 with self.subTest(how=how, manager=name):
                     fake, real, successor = self._real(mac, f"check-{how}"), cm._signal_exact, []
 
@@ -178,7 +181,7 @@ class UndoSeams:
 
     def test_seam_a_successor_after_the_signal_is_never_stopped(self):
         for how in ("connect", "install"):
-            for name, mac in MANAGERS:
+            for name, mac in SYSTEMD:
                 with self.subTest(how=how, manager=name):
                     fake, real, successor = self._real(mac, f"after-{how}"), cm._signal_exact, []
 
@@ -216,7 +219,10 @@ class UndoSeams:
                     verbs = [fake.runner.verb(c) for c in fake.runner.calls]
                     try:
                         self.assertTrue(rc or refused, out + err)
-                        self.assertEqual(signalled.call_args_list[0].args[2], signal.SIGTERM)
+                        if mac:
+                            signalled.assert_not_called()
+                        else:
+                            self.assertEqual(signalled.call_args_list[0].args[2], signal.SIGTERM)
                         self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned), "its run is gone")
                         self.assertIn("bootout" if mac else "stop", verbs, "and the manager will not respawn it")
                         self.assertFalse(Path(fake.runner.acted).exists(), "it never acted on the root")
@@ -237,6 +243,8 @@ class UndoSeams:
                             if changed:
                                 fake.runner.start_session(by_manager=True)   # the manager's run is no longer ours
                                 successor.append(fake.runner.session)
+                                if mac:                 # launchd: a pid under our registration is still ours
+                                    cm.supervisor_path(self.local).write_bytes(FOREIGN_PLIST)
                             with cm.agent_lock(str(self.root)), contextlib.redirect_stdout(io.StringIO()), \
                                     mock.patch.object(sm, "_run", side_effect=fake):
                                 line = cm.stop_started(self.local, str(self.root))
@@ -256,9 +264,74 @@ class UndoSeams:
                                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                             cm.uninstall(self.local)
 
-    def test_a_launchd_pid_shown_late_after_our_bootstrap_is_still_ours(self):
+    def test_a_launchd_run_respawned_under_our_registration_is_booted_out(self):
+        for how in ("connect", "install"):
+            for due in (True, False):
+                with self.subTest(how=how, throttle_due=due):
+                    fake, ended = self._real(True, f"respawn-{how}-{int(due)}"), []
+                    r = fake.runner
+                    r.throttle = 0.0 if due else 600.0
+
+                    def run_ended_then_refused(*a, **kw):
+                        ended.append(r.session.pid)
+                        os.kill(r.session.pid, signal.SIGTERM)  # the run ends; launchd answers per its throttle
+                        r.session.wait(timeout=30)
+                        if how == "install":
+                            raise OSError("bridge write failed")
+                        return "the bridge was refused"
+                    with mock.patch.object(cm, "is_macos", return_value=True), \
+                            mock.patch.object(cb, "wire_bridge", side_effect=run_ended_then_refused), \
+                            mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
+                        try:
+                            rc, out, err = self.connect(self.backend(), fake) if how == "connect" else \
+                                self.install_seat(fake)
+                        except OSError:
+                            rc, out, err = 1, "", ""
+                    try:
+                        self.assertTrue(ended, "the run ended before the undo")
+                        self.assertEqual(r.respawns, 1 if due else 0, "launchd respawned it only past its throttle")
+                        self.assertNotEqual(rc, 0, out + err)
+                        if how == "connect":
+                            self.assertIn("the job its install started, was stopped", err)
+                            self.assertNotIn("not provably", err)
+                        self.assertFalse(r.loaded, "the registration was booted out")
+                        self.assertIsNone(r.pid(), "and no run of it is left")
+                        self.assertTrue(all(p.poll() is not None for p in r.spawned))
+                        self.assertIn("bootout", after_start(fake))
+                        signalled.assert_not_called()
+                    finally:
+                        self._done(fake)
+
+    def test_a_launchd_registration_whose_plist_is_not_ours_is_left(self):
+        for how in ("connect", "install"):
+            with self.subTest(how):
+                fake = self._real(True, f"foreign-{how}")
+
+                def replaced_then_refused(*a, **kw):
+                    cm.supervisor_path(self.local).write_bytes(FOREIGN_PLIST)   # another writer's plist now
+                    if how == "install":
+                        raise OSError("bridge write failed")
+                    return "the bridge was refused"
+                with mock.patch.object(cm, "is_macos", return_value=True), \
+                        mock.patch.object(cb, "wire_bridge", side_effect=replaced_then_refused):
+                    try:
+                        rc, out, err = self.connect(self.backend(), fake) if how == "connect" else self.install_seat(fake)
+                    except OSError:
+                        rc, out, err = 1, "", ""
+                try:
+                    self.assertNotEqual(rc, 0, out + err)
+                    if how == "connect":
+                        self.assertIn("is no longer the job this connect started", err)
+                    self.assertIsNotNone(fake.runner.pid(), "the job is left, as reported")
+                    self.assertTrue(fake.runner.loaded)
+                    self.assertFalse(STOPS & after_start(fake), "nothing was booted out")
+                finally:
+                    self._done(fake)
+                    cm.plist_path(self.local).unlink(missing_ok=True)
+
+    def test_a_launchd_registration_that_shows_no_pid_is_still_ours(self):
         fake = self._real(True, "late")
-        r, blank, real = fake.runner, [3], fake.runner.answer
+        r, blank, real = fake.runner, [10 ** 6], fake.runner.answer     # launchd never shows its pid
 
         def late_pid(verb, cmd):
             if verb == "print" and r.alive() and blank[0] > 0:
@@ -270,7 +343,7 @@ class UndoSeams:
             rc, out, err = self._fail("connect", fake, [])
         try:
             self.assertNotEqual(rc, 0, out + err)
-            self.assertEqual(blank[0], 0, "the first reads showed no pid")
+            self.assertLess(blank[0], 10 ** 6, "the undo read the job while it showed no pid")
             self.assertIn("the job its install started, was stopped", err)
             self.assertTrue(all(p.poll() is not None for p in r.spawned), "its run is gone")
         finally:

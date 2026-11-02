@@ -175,6 +175,12 @@ class UndoUnits(ConnectBase):
             got = cm._own_run(L, self.ident(), {"by_call": True, "t0": 10, "t1": 20})
         self.assertEqual(got, (None, "runs an invocation (pid 4242) that did not begin inside this operation's start"))
 
+    def test_a_systemd_start_that_never_shows_a_main_pid_is_not_ours(self):
+        idle = {"pid": None, "start": None, "invocation": "", "since": None}
+        with mock.patch.object(cm, "job_identity", return_value=idle), mock.patch.object(cm, "START_SEEN_S", 0):
+            got = cm._own_run(L, None, {"by_call": True, "t0": 0, "t1": 1})
+        self.assertEqual(got, (None, "showed no process within 0 s of this operation's start"))
+
     def test_the_undo_outside_the_agent_lock_stops_nothing(self):
         p = {"shape": L, "root": str(self.work), "owned": True, "why": "", "unit": b"", "undo": [], "ident": self.ident()}
         with mock.patch.object(cm, "_stop_run") as stop:
