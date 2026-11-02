@@ -592,6 +592,31 @@ class Hooks(unittest.TestCase):
         self.assertTrue(set(types) <= set(found) and "vault-set command" in found)
         self.assertNotIn(gw.QUESTION_REDACTED, out)
 
+    def test_an_owners_vault_command_is_stored_once_when_a_crash_left_only_its_held_copy(self):
+        tid = "task-reserve-crash-vault"
+        self.addCleanup(self.forget, tid)
+        stored = []
+
+        def intercept(text):
+            stored.append(text)
+            return mock.Mock(text=text.replace("hunter2secret", "[STORED-IN-KEYCHAIN]"), stored=["K"], failed=[])
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2), "/v1/tasks/heartbeat": {"ok": True}}))
+        body = "please vault set K hunter2secret"
+        with mock.patch.object(gw, "_vault_intercept_fns", return_value=(intercept, None)):
+            self.assertIsNotNone(gw._serve_attempt(tid, tid, _task(tid, lease_id="L1", source_event_id="$e", task=body),
+                                                   False))         # recorded; a crash before the task file
+            self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists())
+            self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task=body)), (tid, True))
+            self.assertNotIn("hunter2secret", self.saved(tid).read_text())
+            self.assertEqual(len(stored), 1, "the owner's command is stored when its copy is saved")
+            self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+            gw._ATTEMPTS.take_ownership()                               # a restart before it runs
+            gw._post_task_beats({tid}, force=True)
+        text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
+        self.assertIn("vault set K [STORED-IN-KEYCHAIN]", text, "the run says it was stored")
+        self.assertNotIn("hunter2secret", text)
+        self.assertEqual(len(stored), 1, "and never intercepted again")
+
     def test_a_same_lease_redelivery_of_an_earlier_bridges_v1_held_serve_is_accepted(self):
         for lost in (False, True):
             with self.subTest(lost=lost):
