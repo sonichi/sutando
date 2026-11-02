@@ -272,20 +272,12 @@ class Enrich(unittest.TestCase):
         self.assertEqual(user.count("[working] Fetch origin"), 1)
         self.assertTrue(pl.allowed(user))
 
-    def test_the_models_phase_is_the_rooms_working_row_once(self):
-        import activity_rows
-        activity_rows.append("picked up", kind="processing", room="!r:x", task={"id": "task-a", "from": "@o:x"},
-                             workspace=Path(self.ws))
+    def test_the_models_refinement_writes_no_room_row(self):
         with patch.dict(os.environ, ON):
             pl.enrich(self.ws, "task-a", call=self._call({"phase": "Editing code"}))
-            pl.enrich(self.ws, "task-a", call=self._call({"phase": "Editing code"}))
         rows = [json.loads(l) for l in (Path(self.ws) / "state" / "agent-activity.jsonl").read_text().splitlines()]
-        shown = [r for r in rows if r.get("kind") == "working" and r.get("room") == "!r:x"]
-        self.assertEqual([(r["line"], r["task"]["id"]) for r in shown], [("Editing code", "task-a")])
-
-    def test_a_task_with_no_room_gets_no_row(self):
-        self.assertFalse(pl.show_phase(self.ws, "task-a", "Editing code"))
-        self.assertFalse(pl.show_phase(self.ws, "task-unknown", "Editing code"))
+        self.assertFalse([r for r in rows if r.get("line") == "Editing code"],
+                         "the room row is the rules phase only: a refinement would flap with it")
 
     def test_a_newer_step_during_the_call_gets_its_own_answer(self):
         def call(project, model, system, user):
@@ -862,6 +854,11 @@ class Markers(unittest.TestCase):
         self.assertTrue(pl.records(ws, "task-a")[-1].get("first"))
 
 
+def _race_show(ws, barrier, wins):
+    barrier.wait()
+    wins.put(pl.show_phase_if_new(ws, "task-a", "Running tests", lambda: True))
+
+
 class Hook(unittest.TestCase):
     def _hook(self):
         spec = importlib.util.spec_from_file_location("activity_hook_pl", REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
@@ -884,13 +881,17 @@ class Hook(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("append") + 1], "Reading files", "the phase word alone, never step text")
         self.assertEqual((cmd[cmd.index("--kind") + 1], cmd[cmd.index("--room") + 1]), ("working", "!r:x"))
 
-    def test_the_row_is_written_once_per_phase_change(self):
+    def test_one_row_per_call_its_step_line_else_a_phase_the_room_does_not_show(self):
         hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
-        self.assertEqual(self._step(hook, ws, "Read", {"file_path": "/a"}, calls=calls), [("working", "Reading files")])
-        self.assertEqual(self._step(hook, ws, "Read", {"file_path": "/b"}, calls=calls), [], "the same phase again")
-        self.assertEqual(self._step(hook, ws, "Bash", {"command": "python3 tests/x.test.py"}, calls=calls),
-                         [("working", "Running tests")])
-        self.assertEqual(len(calls), 2)
+        steps = [("Read", {"file_path": "/a"}, [("working", "Reading files")]),
+                 ("Read", {"file_path": "/b"}, []),
+                 ("Bash", {"command": "python3 tests/x.test.py"}, [("working", "Running tests")]),
+                 ("Bash", {"command": "python3 tests/x.test.py", "description": "Run the x tests"},
+                  [("working", "Run the x tests")]),
+                 ("Bash", {"command": "python3 tests/y.test.py"}, [("working", "Running tests")])]
+        for tool, inp, want in steps:
+            self.assertEqual(self._step(hook, ws, tool, inp, calls=calls), want, (tool, inp))
+        self.assertEqual(len(calls), 4, "after a step line, the same phase is the room's row again")
 
     def test_no_row_without_a_room_but_the_phase_is_still_recorded(self):
         hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
@@ -898,10 +899,30 @@ class Hook(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(pl.latest(ws, "task-a")["phase"], "Reading files")
 
-    def test_a_step_line_from_the_same_call_follows_the_phase_row(self):
+    def test_a_failed_write_is_retried_on_the_next_step(self):
         hook, ws = self._hook(), Path(tempfile.mkdtemp())
-        out = self._step(hook, ws, "Bash", {"command": "python3 tests/x.test.py", "description": "Run the x tests"})
-        self.assertEqual(out, [("working", "Running tests"), ("working", "Run the x tests")])
+
+        class Failed:
+            returncode = 1
+        with patch.object(hook, "bound_task", return_value=({"id": "task-a"}, "!r:x")), patch.dict(os.environ, OFF):
+            out = hook.handle({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Read",
+                               "tool_input": {"file_path": "/x"}}, {"ws": ws, "bind": ws / "bind.json"},
+                              run=lambda cmd, **k: Failed())
+        self.assertEqual(out, [])
+        self.assertEqual(self._step(hook, ws, "Read", {"file_path": "/y"}), [("working", "Reading files")])
+
+    def test_racing_steps_write_one_row(self):
+        ctx = multiprocessing.get_context("spawn")
+        for n in range(5):
+            ws = tempfile.mkdtemp()
+            barrier, wins = ctx.Barrier(4), ctx.Queue()
+            procs = [ctx.Process(target=_race_show, args=(ws, barrier, wins)) for _ in range(4)]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(30)
+            got = [wins.get(timeout=5) for _ in procs]
+            self.assertEqual(sum(got), 1, f"round {n}: {got}")
 
     def test_the_hook_survives_a_broken_phase_module(self):
         hook = self._hook()

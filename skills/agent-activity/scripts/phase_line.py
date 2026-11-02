@@ -236,35 +236,50 @@ def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | No
     return phase
 
 
-def phase_shown(workspace, task_id: str, phase: str) -> bool:
-    """Whether `phase` is new for the task's room row: True once per change (recorded in its `.shown` marker),
-    False for the same phase again or when the marker cannot be written, so a row is never repeated per step."""
-    marker = _marker(workspace, task_id, "shown")
-    try:
-        if marker.read_text(encoding="utf-8") == phase:
-            return False
-    except OSError:
-        pass
+# What the task's room row shows now, besides a phase word: a step line the hook wrote.
+SHOWN_LINE = "\x00line"
+
+
+def _shown_marker(workspace, task_id: str) -> Path:
+    return _marker(workspace, task_id, "shown")
+
+
+def _record_shown(marker: Path, value: str) -> bool:
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         tmp = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
-        tmp.write_text(phase, encoding="utf-8")
+        tmp.write_text(value, encoding="utf-8")
         os.replace(tmp, marker)
+        return True
     except OSError:
         return False
-    return True
 
 
-def show_phase(workspace, task_id: str, phase: str) -> bool:
-    """Append the phase word as the task's working row in its room, once per change: the room and task fields
-    come from the open-task index. False when the phase is not new or the task has no room there."""
-    import activity_rows
-    entry = activity_rows.open_task_index(Path(workspace)).get(task_id) or {}
-    room, task = entry.get("room"), entry.get("task")
-    if not (isinstance(room, str) and room and isinstance(task, dict)) or not phase_shown(workspace, task_id, phase):
-        return False
-    activity_rows.append(phase, kind="working", room=room, task=task, workspace=Path(workspace))
-    return True
+def show_phase_if_new(workspace, task_id: str, phase: str, write_row) -> bool:
+    """Write `phase` as the task's room row through `write_row()` (True when it landed) unless the room
+    already shows it. Compare, write and record run under one non-blocking lock: a racing caller skips,
+    and a write that failed is not recorded, so the next step tries again."""
+    marker = _shown_marker(workspace, task_id)
+    with _try_locked(marker.with_name(marker.name + ".lock")) as got:
+        if not got:
+            return False
+        try:
+            if marker.read_text(encoding="utf-8") == phase:
+                return False
+        except OSError:
+            pass
+        if not write_row():
+            return False
+        _record_shown(marker, phase)
+        return True
+
+
+def note_line_shown(workspace, task_id: str) -> None:
+    """The room now shows a step line, so the task's next phase row is due whatever its phase."""
+    marker = _shown_marker(workspace, task_id)
+    with _try_locked(marker.with_name(marker.name + ".lock")) as got:
+        if got:
+            _record_shown(marker, SHOWN_LINE)
 
 
 def _marker_dir(workspace) -> Path:
@@ -625,8 +640,6 @@ def enrich(workspace, task_id: str, call=None) -> "dict | None":
             new.update(line=red.restore(line), line_source="model")
         if write(workspace, new):
             rec = new
-            with contextlib.suppress(Exception):
-                show_phase(workspace, task_id, phase)
         if latest(workspace, task_id)["seq"] == now["seq"]:
             return rec
     return rec
