@@ -71,6 +71,7 @@ class WatcherNotReady(Fixture):
         sig = self.probe(ps)
         self.assertEqual(sig.kind, wp.WATCHER_NOT_READY)
         self.assertIn("running but not ready", sig.reason)
+        self.assertEqual(sig.visibility, wp.ROOM)
         self.assertEqual((sig.subject, sig.unblock), (self.inbox, "re-arm the core's streaming task watcher"))
         self.stamp(100)
         self.assertIsNone(self.probe(ps), "recovery clears it")
@@ -139,12 +140,14 @@ class PanePromptBlocked(Fixture):
         sig = wp.pane_prompt_blocked(self.ws)
         self.assertEqual(sig.kind, wp.PANE_PROMPT_BLOCKED)
         self.assertEqual(sig.reason, "sutando-core is waiting on a prompt: Allow edit?")
+        self.assertEqual(sig.visibility, wp.OWNER_DM, "a pane excerpt can carry paths: never room-visible")
         self.write("core-supervisor.json", {"state": "running", "session": "sutando-core"})
         self.assertIsNone(wp.pane_prompt_blocked(self.ws), "recovery clears it")
 
     def test_signed_out_fires_with_its_own_remedy(self):
         self.write("core-supervisor.json", {"state": "logged-out", "session": "sutando-core"})
-        self.assertIn("/login", wp.pane_prompt_blocked(self.ws).unblock)
+        sig = wp.pane_prompt_blocked(self.ws)
+        self.assertEqual((sig.visibility, "/login" in sig.unblock), (wp.OWNER_DM, True))
 
     def test_a_prompt_with_no_text_uses_the_detail(self):
         self.write("core-supervisor.json", {"state": "blocked-human", "detail": "selection prompt"})
@@ -154,6 +157,10 @@ class PanePromptBlocked(Fixture):
         self.assertIsNone(wp.pane_prompt_blocked(self.ws))
         self.write("core-supervisor.json", {"state": "blocked-human"}, age=wp.SUPERVISOR_FRESH_S + 5)
         self.assertIsNone(wp.pane_prompt_blocked(self.ws), "an old verdict says nothing about the pane now")
+        self.write("core-supervisor.json", {"state": "blocked-human"}, age=-(wp.FUTURE_TOLERANCE_S + 60))
+        self.assertIsNone(wp.pane_prompt_blocked(self.ws), "a verdict dated in the future is not fresh")
+        self.write("core-supervisor.json", {"state": "blocked-human"}, age=-1)
+        self.assertIsNotNone(wp.pane_prompt_blocked(self.ws), "within the tolerance it still counts")
         self.write("core-supervisor.json", ["not", "an", "object"])
         self.assertIsNone(wp.pane_prompt_blocked(self.ws))
 

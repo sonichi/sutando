@@ -42,18 +42,23 @@ CORE_STATUS_STALE_S = 600
 NEEDS_USER = frozenset({"blocked-human", "logged-out"})
 # The supervisor rewrites its verdict every tick; an older one says nothing about the pane now.
 SUPERVISOR_FRESH_S = 60
+# A verdict dated ahead of now (a clock step, a bad write) is not fresh: past this it is refused.
+FUTURE_TOLERANCE_S = 5
+ROOM, OWNER_DM = "room", "owner-dm"
 
 
 @dataclass(frozen=True)
 class Signature:
     """`reason`: one line the owner can read; `unblock`: what clears it; `subject`: the inbox, session or
-    file it is about; `since`: the epoch the wedge began, when a signal dates it."""
+    file it is about; `since`: the epoch the wedge began, when a signal dates it; `visibility`: where the
+    detector may show it (OWNER_DM when the reason quotes the pane, which can carry paths)."""
     kind: str
     reason: str
     unblock: str
     subject: str
     since: Optional[float] = None
     task_id: Optional[str] = None
+    visibility: str = ROOM
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -129,9 +134,10 @@ def pane_prompt_blocked(workspace: Path, now: Optional[float] = None,
     path = status_read_path("core-supervisor.json", workspace)
     now = time.time() if now is None else now
     try:
-        if now - path.stat().st_mtime > fresh_s:
-            return None
+        age = now - path.stat().st_mtime
     except OSError:
+        return None
+    if not -FUTURE_TOLERANCE_S <= age <= fresh_s:
         return None
     data = _read_json(path)
     if not isinstance(data, dict) or data.get("state") not in NEEDS_USER:
@@ -141,9 +147,9 @@ def pane_prompt_blocked(workspace: Path, now: Optional[float] = None,
     session = str(data.get("session") or "the core")
     if data["state"] == "logged-out":
         return Signature(PANE_PROMPT_BLOCKED, f"{session} is signed out and cannot run tasks",
-                         "sign the core in again (/login in its pane)", session)
+                         "sign the core in again (/login in its pane)", session, visibility=OWNER_DM)
     return Signature(PANE_PROMPT_BLOCKED, f"{session} is waiting on a prompt: {excerpt}",
-                     "answer the prompt in the core's pane", session)
+                     "answer the prompt in the core's pane", session, visibility=OWNER_DM)
 
 
 def _core_alive_default(workspace: Path) -> bool:
