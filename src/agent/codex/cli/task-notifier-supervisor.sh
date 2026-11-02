@@ -209,11 +209,13 @@ next_restart_delay() {
 # One supervisor per inbox: notifier_slot.py holds a lock on the inbox directory for this process's life.
 # A live holder is never signalled; a newcomer waits SLOT_WAIT_S for it to exit, then stands down.
 SLOT_WAIT_S="${SUTANDO_NOTIFIER_SLOT_WAIT_S:-15}"
+SLOT_RETRY_S="${SUTANDO_NOTIFIER_SLOT_RETRY_S:-5}"
+SLOT_UNDECIDED=""
 SLOT_PID=""
 claim_supervisor_slot() {
   local out verdict deadline wait_s="${1:-$SLOT_WAIT_S}"
   [ -n "$TASKS_DIR" ] || return 0
-  out="$(mktemp "${TMPDIR:-/tmp}/notifier-slot.XXXXXX")" || return 0
+  out="$(mktemp "${TMPDIR:-/tmp}/notifier-slot.XXXXXX")" || return 2
   "$PY" "$REPO/src/notifier_slot.py" hold --inbox "$TASKS_DIR" --parent "$$" --wait "$wait_s" >"$out" 2>/dev/null &
   SLOT_PID=$!
   deadline=$((SECONDS + wait_s + 10))
@@ -221,28 +223,42 @@ claim_supervisor_slot() {
   verdict="$(head -1 "$out" 2>/dev/null)"
   rm -f "$out"
   case "$verdict" in
-    held) return 0 ;;
+    held) SLOT_UNDECIDED=""; return 0 ;;
     busy\ *)
       echo "task-notifier-supervisor: another supervisor holds ${TASKS_DIR} (pid start: ${verdict#busy }); standing down" >&2
       SLOT_PID=""
       return 1 ;;
   esac
-  echo "task-notifier-supervisor: the slot for ${TASKS_DIR} is undecided (${verdict:-no answer}); running without it" >&2
+  [ "$SLOT_UNDECIDED" = "${verdict:-no answer}" ] ||
+    echo "task-notifier-supervisor: the slot for ${TASKS_DIR} is undecided (${verdict:-no answer}); not serving it until it is held" >&2
+  SLOT_UNDECIDED="${verdict:-no answer}"
   release_supervisor_slot
-  return 0
+  return 2
 }
 
-# The slot is this supervisor's only while its helper lives: a dead helper released the lock. Reclaim it at
-# once, or, when another supervisor holds it now, stop this one's notifier and exit.
+# Serve nothing until the slot is held: an undecided slot is retried, a busy one or a dead target stands down.
+await_slot() {
+  local rc
+  while :; do
+    claim_supervisor_slot "${1:-$SLOT_WAIT_S}"
+    rc=$?
+    [ "$rc" -eq 2 ] || return "$rc"
+    target_alive || return 1
+    sleep "$SLOT_RETRY_S"
+  done
+}
+
+# The slot is this supervisor's only while its helper lives. A dead helper stops the notifier first, then the
+# slot is reclaimed (returns 3: start a fresh one) or, held by another supervisor now, this one exits.
 fence_slot() {
   [ -n "$SLOT_PID" ] || return 0
   notifier_proc_live "$SLOT_PID" && return 0
   wait "$SLOT_PID" 2>/dev/null || true
-  echo "task-notifier-supervisor: the slot helper for ${TASKS_DIR} is gone; reclaiming the slot" >&2
+  echo "task-notifier-supervisor: the slot helper for ${TASKS_DIR} is gone; stopping the notifier and reclaiming the slot" >&2
   SLOT_PID=""
-  claim_supervisor_slot 0 && return 0
   stop_child
-  exit 0
+  await_slot 0 || exit 0
+  return 3
 }
 
 release_supervisor_slot() {
@@ -272,7 +288,7 @@ run_notifier_once() {
   # behavior); undeclared, it's still caught at the outer `while target_alive`
   # once this notifier lifetime ends, same as before this change.
   while kill -0 "$child_pid" 2>/dev/null; do
-    fence_slot
+    fence_slot || return 0
     if declared_target && ! target_alive; then
       stop_child
       return 1
@@ -297,7 +313,7 @@ run_notifier_once() {
 if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
 target_alive || exit 0
-claim_supervisor_slot || exit 0
+await_slot || exit 0
 
 # "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
 # nothing is running to keep, and a host whose ps never answers would otherwise

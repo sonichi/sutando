@@ -56,16 +56,21 @@ notifier_proc_start() {
 
 # The notifier's watcher leads a session of its own; recording it lets the supervisor stop it after a KILL.
 notifier_record_watcher() {
+  local start
   [ -n "${2:-}" ] || return 0
-  printf '%s %s\n' "$1" "$(notifier_proc_start "$1")" > "$2" 2>/dev/null || true
+  start="$(notifier_proc_start "$1")"
+  [ -n "$start" ] || return 0   # an unverifiable record is never written, so never acted on
+  printf '%s %s\n' "$1" "$start" > "$2" 2>/dev/null || true
 }
 
 # Stop the watcher recorded in $1, only while that pid is still the process recorded (pid and start time).
 stop_recorded_watcher() {
-  local pid start
+  local pid start now
   [ -n "${1:-}" ] && [ -s "$1" ] || return 0
   read -r pid start < "$1" || true
   rm -f "$1"
-  [ -n "$pid" ] && notifier_proc_live "$pid" && [ "$(notifier_proc_start "$pid")" = "$start" ] || return 0
+  [ -n "$pid" ] && [ -n "$start" ] && notifier_proc_live "$pid" || return 0
+  now="$(notifier_proc_start "$pid")"
+  [ -n "$now" ] && [ "$now" = "$start" ] || return 0
   stop_group_bounded "$pid"
 }

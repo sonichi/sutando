@@ -202,6 +202,20 @@ events_stream_ended "" 30 30 && echo no-writer
 kill $live""")
         self.assertEqual(r.stdout.split(), ["early-eof", "timeout", "short-timeout-undecidable", "dead-writer", "no-writer"])
 
+    def test_a_watcher_is_signalled_only_on_a_verified_identity(self):
+        rec = Path(tempfile.mkdtemp(prefix="watcher-rec.")) / "rec"
+        self.addCleanup(shutil.rmtree, rec.parent, True)
+        r = bash(f""". "{GUARD}"
+probe() {{ sleep 30 & c=$!; "$@"; sleep 0.3; if kill -0 $c 2>/dev/null; then echo kept; kill $c; else echo signalled; fi; wait $c 2>/dev/null; }}
+no_start() {{ ps() {{ return 1; }}; notifier_record_watcher $c "{rec}"; unset -f ps; [ -e "{rec}" ] && echo written || echo refused; }}
+empty_record() {{ printf '%s \n' $c > "{rec}"; stop_recorded_watcher "{rec}"; }}
+unverifiable_now() {{ notifier_record_watcher $c "{rec}"; ps() {{ [ "$2" = stat= ] && command ps "$@" || return 1; }}; stop_recorded_watcher "{rec}"; unset -f ps; }}
+blind() {{ ps() {{ [ "$2" = stat= ] && command ps "$@" || return 1; }}; }}
+empty_and_blind() {{ printf '%s \n' $c > "{rec}"; blind; stop_recorded_watcher "{rec}"; unset -f ps; }}
+verified() {{ notifier_record_watcher $c "{rec}"; stop_recorded_watcher "{rec}"; }}
+probe no_start; probe empty_record; probe unverifiable_now; probe empty_and_blind; probe verified""")
+        self.assertEqual(r.stdout.split(), ["refused", "kept", "kept", "kept", "kept", "signalled"], r.stdout + r.stderr)
+
     def test_a_zombie_is_not_live_though_it_answers_kill_0(self):
         # This test process forks a child and does not reap it, so the child is a zombie meanwhile.
         pid = os.fork()
@@ -326,6 +340,26 @@ exit 0
 IDLE_NOTIFIER = "#!/bin/bash\nwhile :; do sleep 1; done\n"
 
 
+# The slot helper answers "unknown" while the flag file exists (the fault the other calls never see).
+UNDECIDED_PY = """#!/bin/bash
+for a in "$@"; do
+  case "$a" in */notifier_slot.py) [ -e "$SLOT_UNKNOWN_FLAG" ] && { echo "unknown injected"; exit 4; } ;; esac
+done
+exec "$REAL_PY" "$@"
+"""
+COUNTED_NOTIFIER = '#!/bin/bash\necho $$ >> "$NOTIFIER_STARTS"\nwhile :; do sleep 1; done\n'
+
+
+def hcg_alive(pid: int) -> bool:
+    """A live, non-zombie process."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
+
+
 class SupervisorSlot(unittest.TestCase):
     """The real supervisor, standing by (a long grace), so only its slot is under test."""
 
@@ -358,13 +392,13 @@ class SupervisorSlot(unittest.TestCase):
             pass
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def start(self, inbox: Path, wait_s: int = 2) -> "tuple[subprocess.Popen, Path]":
+    def start(self, inbox: Path, wait_s: int = 2, **extra: str) -> "tuple[subprocess.Popen, Path]":
         err = self.tmp / f"sup{len(self.procs)}.err"
-        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", SUTANDO_TASKS_DIR=str(inbox),
-                                 SUTANDO_WORKSPACE_DIR=str(self.ws), SUTANDO_TMUX_SOCKET=str(self.tmp / "t.sock"),
-                                 SUTANDO_NOTIFIER_SCRIPT=str(self.notifier), SUTANDO_NOTIFIER_GRACE_PERIOD="600",
-                                 SUTANDO_NOTIFIER_ROLE_POLL="1", SUTANDO_NOTIFIER_SLOT_WAIT_S=str(wait_s),
-                                 SUTANDO_NOTIFIER_PY=sys.executable)
+        env = isolated_child_env(**{**dict(
+            PATH=f"{self.bin}:/usr/bin:/bin", SUTANDO_TASKS_DIR=str(inbox), SUTANDO_WORKSPACE_DIR=str(self.ws),
+            SUTANDO_TMUX_SOCKET=str(self.tmp / "t.sock"), SUTANDO_NOTIFIER_SCRIPT=str(self.notifier),
+            SUTANDO_NOTIFIER_GRACE_PERIOD="600", SUTANDO_NOTIFIER_ROLE_POLL="1",
+            SUTANDO_NOTIFIER_SLOT_WAIT_S=str(wait_s), SUTANDO_NOTIFIER_PY=sys.executable), **extra})
         with open(err, "w") as e:
             p = popen_bound(["bash", str(SUPERVISOR)], env=env, stdout=subprocess.DEVNULL, stderr=e)
         self.procs.append(p)
@@ -416,6 +450,66 @@ class SupervisorSlot(unittest.TestCase):
         time.sleep(3)
         alive = [p for p in (first, second) if p.poll() is None]
         self.assertEqual(len(alive), 1, "exactly one supervisor serves the inbox")
+        self.assertEqual(self.occupancy("held"), "held")
+
+    def armed(self, wait_s: int = 1) -> "tuple[subprocess.Popen, Path]":
+        """A supervisor that arms its (counted) notifier after a 1 s grace, behind the fault-injecting python."""
+        self.flag, self.starts = self.tmp / "slot-unknown", self.tmp / "starts"
+        py = self.tmp / "py"
+        py.write_text(UNDECIDED_PY)
+        py.chmod(0o755)
+        self.notifier.write_text(COUNTED_NOTIFIER)
+        return self.start(self.ws / "tasks", wait_s=wait_s, SUTANDO_NOTIFIER_PY=str(py), REAL_PY=sys.executable,
+                          SLOT_UNKNOWN_FLAG=str(self.flag), NOTIFIER_STARTS=str(self.starts),
+                          SUTANDO_NOTIFIER_GRACE_PERIOD="1", SUTANDO_NOTIFIER_TARGET_POLL="0.5",
+                          SUTANDO_NOTIFIER_SLOT_RETRY_S="1")
+
+    def started(self) -> "list[int]":
+        try:
+            return [int(x) for x in self.starts.read_text().split()]
+        except (OSError, ValueError):
+            return []
+
+    def running(self) -> "list[int]":
+        return [p for p in self.started() if hcg_alive(p)]
+
+    def until(self, cond, timeout: float = 30) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.2)
+        return cond()
+
+    def test_an_undecided_slot_serves_nothing_until_one_supervisor_holds_it(self):
+        self.flag = self.tmp / "slot-unknown"
+        self.flag.write_text("")
+        (a, a_err), (b, b_err) = self.armed(), self.armed()
+        time.sleep(6)
+        self.assertEqual(self.started(), [], "no notifier while the slot is undecided")
+        self.assertEqual((a.poll(), b.poll()), (None, None), "both keep retrying")
+        for err in (a_err, b_err):
+            self.assertEqual(err.read_text().count("not serving it until it is held"), 1, err.read_text())
+        self.flag.unlink()
+        self.assertTrue(self.until(lambda: len(self.running()) == 1 and (a.poll() is None) != (b.poll() is None)),
+                        f"{self.started()} {a.poll()} {b.poll()}")
+        time.sleep(3)
+        self.assertEqual(len(self.running()), 1, "exactly one notifier serves the inbox")
+        self.assertEqual(len(self.started()), 1)
+
+    def test_an_undecided_reclaim_stops_the_notifier_and_serves_nothing(self):
+        sup, err = self.armed()
+        self.assertTrue(self.until(lambda: len(self.running()) == 1), err.read_text())
+        first = self.running()[0]
+        self.flag.write_text("")
+        os.kill(self.helper_pid(), signal.SIGKILL)
+        self.assertTrue(self.until(lambda: not hcg_alive(first), 15), "the unfenced notifier is stopped")
+        time.sleep(4)
+        self.assertIsNone(sup.poll(), err.read_text())
+        self.assertEqual(self.running(), [], "nothing serves the inbox while its slot is undecided")
+        self.assertIn("stopping the notifier and reclaiming the slot", err.read_text())
+        self.flag.unlink()
+        self.assertTrue(self.until(lambda: len(self.running()) == 1), err.read_text())
         self.assertEqual(self.occupancy("held"), "held")
 
     def test_a_waiter_takes_the_slot_when_the_holder_exits(self):
