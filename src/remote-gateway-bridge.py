@@ -484,6 +484,34 @@ def _ag2space_lane_server() -> str:
 
 
 LANE_SERVER = _ag2space_lane_server
+
+
+def _lane_worker() -> str:
+    """The pool worker whose own agent this lane runs as (its connection row's `worker`), or ""."""
+    from connections import lane_worker
+    return lane_worker(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+def _worker_lane_claims_nothing(path: Path) -> bool:
+    """A worker's own lane is reply-only: it shares results/ with the core's lanes, so a proactive
+    file there is the core's, and posting it would speak as the worker."""
+    return False
+
+
+def _install_worker_lane(worker: str) -> None:
+    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
+    and it claims no proactive file."""
+    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE
+    TASK_ADDRESSEE = lambda: worker  # noqa: E731
+    PROACTIVE_CLAIM_GATE = _worker_lane_claims_nothing
+
+
+# Read once: a lane's row names its worker for the life of the process (a change relaunches it).
+_LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
+if _LANE_WORKER:
+    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
+         "and it posts no proactive messages")
+    _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 

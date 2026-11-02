@@ -2066,6 +2066,10 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected () -> the recipient every task this lane queues is addressed to (its
+# `requested_worker`), or "": a lane that runs as one worker's own agent hands that worker all it
+# receives. None (standalone default) leaves each task's own field as the gateway sent it.
+TASK_ADDRESSEE: Callable[[], str] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.
 LANE_SERVER: Callable[[], str] | None = None
@@ -5940,6 +5944,12 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if TASK_ADDRESSEE is not None:
+        # The lane's own recipient, whatever the gateway's copy says: an addressee this lane did
+        # not name never reaches the router through it.
+        task["requested_worker"] = TASK_ADDRESSEE() or task.get("requested_worker")
+        if not task["requested_worker"]:
+            task.pop("requested_worker")
     if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
         task["task_id"] = broker_tid
     question_found: tuple = ()

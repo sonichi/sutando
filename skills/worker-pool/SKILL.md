@@ -19,6 +19,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
 - `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
+- `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `worker_identity.py` — worker / session / incarnation records.
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
@@ -125,6 +126,31 @@ later poll can apply it after registration. Other roster compiles preserve
 these fields. A broker label edit can persist without a version bump, so a
 repeat of the current version follows the owner's complete map and repairs
 local label drift.
+
+## A worker's own agent
+
+By default a worker answers through the core's agent. A worker can instead run as an agent of its own: the owner
+creates that agent in AG2 Space, and its access token becomes a connection row naming the worker
+(`src/connections.py`, "a pool worker's own identity"). That row runs a lane of its own:
+- It answers only what is addressed to that agent.
+- It hands every task it queues to the worker (`requested_worker`).
+- It posts nothing proactively.
+- It never becomes primary.
+
+```bash
+python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
+python3 skills/worker-pool/scripts/pool_identity.py show <worker>
+python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --repo . --logs-dir <logs dir>
+python3 skills/worker-pool/scripts/pool_identity.py remove <worker>
+```
+
+`add` asks for the token at a hidden prompt (`-` reads it from stdin), then shows what the token's gateway says and
+asks before saving. It refuses an agent the gateway does not name (`worker_identity_unverified`) and one that another
+row already runs as (`worker_identity_shared`). The token goes into the secret vault. It never goes into a file and is
+never printed. `rotate` accepts a new token only for the same agent.
+
+`pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
+itself stays on its server until the owner deletes it there.
 
 ## Binding a room to an existing worker
 
