@@ -273,6 +273,10 @@ class Enrich(unittest.TestCase):
         self.assertTrue(pl.allowed(user))
 
     def test_the_models_refinement_writes_no_room_row(self):
+        import activity_rows
+        # A task with a room: the prior head would have shown the refinement there.
+        activity_rows.append("picked up", kind="processing", room="!r:x", task={"id": "task-a", "from": "@o:x"},
+                             workspace=Path(self.ws))
         with patch.dict(os.environ, ON):
             pl.enrich(self.ws, "task-a", call=self._call({"phase": "Editing code"}))
         rows = [json.loads(l) for l in (Path(self.ws) / "state" / "agent-activity.jsonl").read_text().splitlines()]
@@ -910,6 +914,26 @@ class Hook(unittest.TestCase):
                               run=lambda cmd, **k: Failed())
         self.assertEqual(out, [])
         self.assertEqual(self._step(hook, ws, "Read", {"file_path": "/y"}), [("working", "Reading files")])
+
+    def test_a_step_line_racing_a_phase_write_is_still_recorded(self):
+        import threading
+        ws, entered, release = tempfile.mkdtemp(), threading.Event(), threading.Event()
+
+        def slow_write():
+            entered.set()
+            release.wait(5)
+            return True
+        t = threading.Thread(target=pl.show_phase_if_new, args=(ws, "task-a", "Reading files", slow_write))
+        t.start()
+        entered.wait(5)
+        noted = threading.Thread(target=pl.note_line_shown, args=(ws, "task-a"))
+        noted.start()
+        time.sleep(0.3)
+        release.set()
+        t.join(5)
+        noted.join(5)
+        self.assertEqual(pl._shown_marker(ws, "task-a").read_text(), pl.SHOWN_LINE, "the line waits, then is recorded")
+        self.assertTrue(pl.show_phase_if_new(ws, "task-a", "Reading files", lambda: True), "so the phase shows again")
 
     def test_racing_steps_write_one_row(self):
         ctx = multiprocessing.get_context("spawn")
