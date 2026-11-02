@@ -89,6 +89,11 @@ def rules_phase(tool_name: str, tool_input) -> str:
         return "Asking someone"
     if tool_name == "Monitor":
         return "Waiting"
+    action = inp.get("action") if tool_name.startswith("mcp__") else None
+    if isinstance(action, str) and action.startswith("room.question."):
+        return "Asking someone"
+    if isinstance(action, str) and action.startswith(("room.message.", "room.commons.comments.")):
+        return "Writing a reply"
     if tool_name.startswith("mcp__") and "message" in tool_name:
         return "Writing a reply"
     if tool_name == "Bash":
@@ -725,6 +730,18 @@ def _picked_up_at(workspace, task_id: str, now: float) -> "float | None":
     return started if started and now - started <= PICKUP_WINDOW_S else None
 
 
+PERMISSION_LINE = "Waiting for your approval"
+
+
+def _open_dialog(workspace, task_id: str) -> "dict | None":
+    """The permission dialog this task's turn is parked on (turns.py), or None; never raises."""
+    try:
+        import turns
+        return turns.open_dialog(Path(workspace), task_id)
+    except Exception:  # noqa: BLE001 - the dialog is optional status, never a crash
+        return None
+
+
 def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = None,
                now: "float | None" = None) -> "dict | None":
     """{phase, line, since} saying why the task is where it is, or None for a finished or unknown
@@ -748,6 +765,12 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
                      if (t := _ts(h.get("at"))) is not None), default=now)
         return {"phase": "Delegated", "line": delegated["line"], "since": since, "waiting": {"reason": "delegated"}}
     st = latest(workspace, task_id)
+    dialog = _open_dialog(workspace, task_id)
+    if dialog is not None:
+        stepped = [_ts(r.get("at")) for r in records(workspace, task_id)]
+        at = _ts(dialog.get("at"), now)
+        if not any(t is not None and t > at for t in stepped):  # a later step means the turn moved on
+            return {"phase": "Waiting", "line": PERMISSION_LINE, "since": at, "waiting": {"reason": "permission"}}
     if st is not None:
         rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
         line = st.get("line") or st.get("step") or st["phase"]

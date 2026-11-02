@@ -562,6 +562,58 @@ class Typed(unittest.TestCase):
             self.assertIn(phase_line.rules_phase(tool, inp), tsp.PHASES, tool)
         self.assertTrue(set(phase_line.MODEL_PHASES) <= set(tsp.PHASES))
 
+    def test_room_actions_called_through_mcp_get_their_own_phase(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        run = "mcp__s-space__room_action_execute"
+        self.assertEqual(phase_line.rules_phase(run, {"action": "room.question.ask"}), "Asking someone")
+        self.assertEqual(phase_line.rules_phase(run + "_safe", {"action": "room.message.send"}), "Writing a reply")
+        self.assertEqual(phase_line.rules_phase(run + "_safe", {"action": "room.commons.comments.reply"}),
+                         "Writing a reply")
+        self.assertEqual(phase_line.rules_phase(run, {"action": "room.task.update"}), "Running a command")
+        self.assertEqual(phase_line.rules_phase("Bash", {"action": "room.question.ask"}), "Running a command")
+
+    def test_a_turn_parked_on_a_permission_dialog_reads_as_waiting_for_approval(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        import turns
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        prompt = "TASK_FILE: /x/tasks/task-a.txt"
+        turns.record({"hook_event_name": "UserPromptSubmit", "prompt_id": "p1", "prompt": prompt}, ws, now=100.0)
+        phase_line.on_step(ws, "task-a", "Bash", {"command": "make"}, "Build", spawn=lambda *a: None)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command")
+        turns.record({"hook_event_name": "PermissionRequest", "prompt_id": "p1", "tool_name": "Bash"},
+                     ws, now=time.time() + 1)
+        st = phase_line.status_for(ws, "task-a")
+        self.assertEqual((st["phase"], st["line"], st["waiting"]),
+                         ("Waiting", "Waiting for your approval", {"reason": "permission"}))
+        self.assertIsNone(phase_line.status_for(ws, "task-b"), "only the turn's own task waits")
+        self.assertEqual(phase_line.published_status(ws, "task-a"),
+                         {"phase": "Waiting", "summary": "Waiting", "since": st["since"],
+                          "waiting": {"reason": "permission"}})
+        self.assertEqual(progress_arguments(phase_line.published_status(ws, "task-a")),
+                         {"summary": "Waiting", "phase": "Waiting",
+                          "since": progress_arguments(phase_line.published_status(ws, "task-a"))["since"]},
+                         "the wire carries the phase; a reason the server does not know yet is not sent")
+        turns.record({"hook_event_name": "PreToolUse", "prompt_id": "p1", "tool_name": "Bash"}, ws)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "approval clears it")
+        turns.record({"hook_event_name": "PermissionRequest", "prompt_id": "p1", "tool_name": "Bash"}, ws, now=50.0)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command",
+                         "a dialog older than the task's newest step is stale")
+        turns.record({"hook_event_name": "PermissionRequest", "prompt_id": "p1"}, ws, now=time.time() + 5)
+        turns.record({"hook_event_name": "Stop", "prompt_id": "p1"}, ws)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "an ended turn waits on nothing")
+        (ws / "state" / "agent-activity.turns.json").write_text("{not json")
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "unreadable reads as not waiting")
+        (ws / "state" / "agent-activity.turns.json").write_text('{"turns": []}')
+        self.assertIsNone(turns.open_dialog(ws, "task-a"), "a damaged record (turns not a map) is no dialog")
+        with patch.object(turns, "open_dialog", side_effect=OSError("boom")):
+            self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command",
+                             "a dialog read that raises is no dialog, never a crash")
+
     def test_a_refusal_logs_its_code_and_never_payload_text(self):
         self.status["task-dev~task-a"] = {"phase": "Thinking", "summary": "Thinking"}
         self.pub.send = lambda body: {"is_error": True, "code": "task_already_terminal", "message": "secret text"}
