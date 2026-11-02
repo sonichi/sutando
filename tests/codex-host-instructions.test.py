@@ -4,7 +4,9 @@
 Run: python3 tests/codex-host-instructions.test.py
 """
 import contextlib
+import errno
 import io
+import types
 import os
 import subprocess
 import sys
@@ -212,6 +214,111 @@ class EnsureLinked(unittest.TestCase):
                 self.assertEqual(self.link(codex_home=alias), "owner-home")
                 self.assertEqual(self.link(codex_home=alias / "deeper"), "owner-home")
                 self.assertFalse(os.path.lexists(owner), f"{name} created the owner's home")
+
+    def test_an_alias_then_dotdot_to_the_owners_codex_home_is_refused(self):
+        """alias/../.codex resolves the alias first, as the OS does: it is ~/.codex."""
+        (self.home / ".codex").mkdir(parents=True)
+        (self.home / "child").mkdir()
+        elsewhere = Path(self.tmp.name).resolve() / "elsewhere"
+        elsewhere.mkdir()
+        alias = elsewhere / "alias"
+        alias.symlink_to(self.home / "child")
+        spelled = f"{alias}/../.codex"
+        self.assertTrue(os.path.samefile(spelled, self.home / ".codex"))
+        self.assertEqual(self.link(codex_home=spelled), "owner-home")
+        self.assertEqual(os.listdir(self.home / ".codex"), [])
+        self.assertFalse(os.path.lexists(elsewhere / ".codex"))
+
+    def test_an_alias_then_dotdot_links_into_the_directory_the_os_resolves(self):
+        root = Path(self.tmp.name).resolve()
+        real_parent = root / "real-parent"
+        (real_parent / "child").mkdir(parents=True)
+        (real_parent / "codex-home").mkdir()
+        elsewhere = root / "elsewhere"
+        elsewhere.mkdir()
+        alias = elsewhere / "alias"
+        alias.symlink_to(real_parent / "child")
+        spelled = f"{alias}/../codex-home"
+        self.assertEqual(self.link(codex_home=spelled), "linked")
+        self.assertEqual(Path(os.readlink(real_parent / "codex-home" / "AGENTS.md")), self.host)
+        self.assertFalse(os.path.lexists(elsewhere / "codex-home"))
+
+    def test_a_relative_codex_home_is_resolved_against_the_cwd(self):
+        root = Path(self.tmp.name).resolve()
+        with patch.object(os, "getcwd", return_value=str(root)):
+            self.assertEqual(self.link(codex_home="rel-home"), "linked")
+        self.assertTrue((root / "rel-home" / "AGENTS.md").is_symlink())
+
+    def test_dotdot_below_a_missing_directory_is_refused(self):
+        spelled = f"{self.codex_home}/missing/../x"
+        self.assertEqual(self.link(codex_home=spelled), "invalid-home")
+        self.assertTrue(chi.is_owner_codex_home(spelled, self.home))
+        self.assertFalse(self.codex_home.exists())
+
+    def test_fd_path_reads_f_getpath(self):
+        fake = types.SimpleNamespace(F_GETPATH=50, fcntl=lambda fd, op, buf: b"/some/dir\0junk")
+        with patch.dict(sys.modules, {"fcntl": fake}):
+            self.assertEqual(chi._fd_path(3), Path("/some/dir"))
+
+        def broken(fd, op, buf):
+            raise OSError(errno.EBADF, "bad fd")
+        with patch.dict(sys.modules, {"fcntl": types.SimpleNamespace(F_GETPATH=50, fcntl=broken)}):
+            self.assertIsNone(chi._fd_path(3))
+
+    def test_fd_path_falls_back_to_proc_then_to_none(self):
+        with patch.dict(sys.modules, {"fcntl": types.SimpleNamespace()}):
+            with patch.object(os, "readlink", return_value="/proc/dir"):
+                self.assertEqual(chi._fd_path(3), Path("/proc/dir"))
+            with patch.object(os, "readlink", side_effect=OSError(errno.ENOENT, "no proc")):
+                self.assertIsNone(chi._fd_path(3))
+
+    def test_a_directory_created_concurrently_is_opened(self):
+        real_mkdir = os.mkdir
+
+        def raced(name, *a, **k):
+            real_mkdir(name, *a, **k)
+            raise FileExistsError(name)
+        with patch.object(os, "mkdir", raced):
+            self.assertEqual(self.link(), "linked")
+        self.assertTrue(self.target.is_symlink())
+
+    def test_a_failed_open_closes_the_parent_and_raises(self):
+        real_open, real_close, closed = os.open, os.close, []
+
+        def fail_child(path, flags, *a, **k):
+            if k.get("dir_fd") is not None:
+                raise PermissionError(errno.EACCES, "denied")
+            return real_open(path, flags, *a, **k)
+
+        def track(fd):
+            closed.append(fd)
+            real_close(fd)
+        with patch.object(os, "open", fail_child), patch.object(os, "close", track):
+            with self.assertRaises(PermissionError):
+                self.link()
+        self.assertEqual(len(closed), 1)
+
+    def test_a_component_that_became_a_symlink_is_foreign_and_other_errors_raise(self):
+        with patch.object(chi, "_open_home", side_effect=OSError(errno.ELOOP, "loop")):
+            self.assertEqual(self.link(), "foreign")
+        with patch.object(chi, "_open_home", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(OSError):
+                self.link()
+
+    def test_the_opened_directory_is_rechecked_against_the_owners_home(self):
+        owner = self.home / ".codex"
+        owner.mkdir(parents=True)
+        with patch.object(chi, "_fd_path", return_value=owner):
+            self.assertEqual(self.link(), "owner-home")
+        self.assertEqual(os.listdir(owner), [])
+        self.assertFalse(self.target.exists())
+
+    def test_without_an_fd_path_the_opened_directory_must_match_by_identity(self):
+        with patch.object(chi, "_fd_path", return_value=None):
+            with patch.object(os.path, "samestat", return_value=False):
+                self.assertEqual(self.link(), "foreign")
+            self.assertFalse(self.target.exists())
+            self.assertEqual(self.link(), "linked")
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()

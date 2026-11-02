@@ -29,8 +29,8 @@ def host_instructions(repo):
 
 
 def _nearest_existing(path):
-    """The nearest existing ancestor of `path` (itself included) and the parts below it."""
-    path, rest = Path(os.path.abspath(path)), []
+    """The nearest existing ancestor of an absolute, `..`-free `path` and the parts below it."""
+    path, rest = Path(path), []
     while not os.path.lexists(path) and path != path.parent:
         rest.insert(0, path.name)
         path = path.parent
@@ -38,9 +38,22 @@ def _nearest_existing(path):
 
 
 def canonical(path):
-    """`path` with every symlink in its existing part resolved; the missing rest kept as given."""
-    have, rest = _nearest_existing(path)
-    return Path(os.path.realpath(have)).joinpath(*rest)
+    """`path` as the OS resolves it: symlinks before `..`, then the missing rest appended.
+
+    Raises ValueError when the missing rest holds `..`, which has no physical meaning yet.
+    """
+    raw = os.fspath(path)
+    if not os.path.isabs(raw):
+        raw = os.path.join(os.getcwd(), raw)  # joined, never normalized
+    parts = raw.split(os.sep)
+    for cut in range(len(parts), 0, -1):
+        prefix = os.sep.join(parts[:cut]) or os.sep
+        if os.path.lexists(prefix):
+            break
+    rest = [p for p in parts[cut:] if p not in ("", ".")]
+    if ".." in rest:
+        raise ValueError(f"{raw}: '..' below a directory that does not exist")
+    return Path(os.path.realpath(prefix)).joinpath(*rest)
 
 
 def _same(a, b):
@@ -56,7 +69,10 @@ def is_owner_codex_home(codex_home, home):
     Compared on the physical path by filesystem identity, so an alias or case variant counts.
     """
     owner = Path(home) / ".codex"
-    path = canonical(codex_home)
+    try:
+        path = canonical(codex_home)
+    except ValueError:
+        return True
     for candidate in (path, *path.parents):
         if os.path.exists(candidate) and _same(candidate, owner):
             return True
@@ -112,14 +128,18 @@ def _lexists(name, fd):
 
 
 def ensure_linked(codex_home, repo, home):
-    """Returns "no-host", "owner-home", "overridden", "foreign", "dangling", "already-set" or "linked".
+    """Returns "no-host", "invalid-home", "owner-home", "overridden", "foreign", "dangling",
+    "already-set" or "linked".
 
     Never removes or replaces anything already at the target: only a missing target is linked.
     """
     source = host_instructions(repo)
     if source is None:
         return "no-host"
-    path = canonical(Path(codex_home).expanduser())
+    try:
+        path = canonical(os.path.expanduser(os.fspath(codex_home)))
+    except ValueError:
+        return "invalid-home"
     if is_owner_codex_home(path, home):
         return "owner-home"
     try:

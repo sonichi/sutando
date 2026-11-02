@@ -86,7 +86,8 @@ The Codex implementation:
   root down, so without the link a Codex core never sees the host's first-contact
   and Getting started instructions that a Claude core reads from the parent
   directory. The owner's `~/.codex` is never written: `CODEX_HOME` is resolved to its
-  physical path and refused when that is, or is inside, `~/.codex` by filesystem identity
+  physical path the way the OS resolves it (symlinks before `..`; a `..` below a missing
+  directory is refused) and refused when that is, or is inside, `~/.codex` by filesystem identity
   (symlink aliases, `..` detours and case variants count), and every check and write then
   goes through the opened, re-verified directory, never the alias. Anything already at
   `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
