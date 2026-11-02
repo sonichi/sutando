@@ -185,7 +185,7 @@ class RenderTest(unittest.TestCase):
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini Spark", by["agents"].how)
+        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
         self.assertNotIn("import", by)
