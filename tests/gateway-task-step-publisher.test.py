@@ -613,6 +613,46 @@ class Typed(unittest.TestCase):
             self.assertIn(phase_line.rules_phase(tool, inp), tsp.PHASES, tool)
         self.assertTrue(set(phase_line.MODEL_PHASES) <= set(tsp.PHASES))
 
+    def test_steps_from_another_runtime_record_rules_phases_without_text(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        # Three good steps (a missing or non-dict input is an empty one); the rest are skipped.
+        batch = [{"task": "task-a", "tool": "Bash", "input": {"command": "pytest -q"}},
+                 {"task": "task-a", "tool": "Monitor"},
+                 {"task": "task-a", "tool": "Bash", "input": "not a dict"},
+                 {"task": "../evil", "tool": "Bash", "input": {}},
+                 {"task": "task-a", "tool": "", "input": {}},
+                 {"task": 7, "tool": "Bash"}, "junk", None]
+        self.assertEqual(phase_line.record_steps(ws, json.dumps(batch)), 3)
+        recs = [json.loads(l) for l in (ws / "state" / "agent-activity.phase.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["task_id"], r["phase"], r["step"]) for r in recs],
+                         [("task-a", "Running tests", None), ("task-a", "Waiting", None), ("task-a", "Running a command", None)])
+        self.assertNotIn("pytest", (ws / "state" / "agent-activity.phase.jsonl").read_text(), "no command text is stored")
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command")
+        self.assertEqual(phase_line.record_steps(ws, "{not json"), -1)
+        self.assertEqual(phase_line.record_steps(ws, '{"not": "a list"}'), -1)
+        self.assertEqual(phase_line.record_steps(ws, "[]"), 0)
+        many = [{"task": "task-b", "tool": "Read", "input": {}}] * (phase_line.STEPS_MAX + 5)
+        self.assertEqual(phase_line.record_steps(ws, json.dumps(many)), phase_line.STEPS_MAX, "a batch is capped")
+
+    def test_the_steps_command_reads_stdin_and_needs_no_task(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        import io
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        with patch.object(sys, "stdin", io.StringIO('[{"task": "task-c", "tool": "Edit", "input": {}}]')):
+            self.assertEqual(phase_line.main(["steps", "--workspace", str(ws)]), 0)
+        self.assertEqual(phase_line.status_for(ws, "task-c")["phase"], "Editing code")
+        with patch.object(sys, "stdin", io.StringIO("{}")):
+            self.assertEqual(phase_line.main(["steps", "--workspace", str(ws)]), 1)
+        with self.assertRaises(SystemExit):
+            phase_line.main(["status", "--workspace", str(ws)])  # every other command still needs --task
+
     def test_room_actions_called_through_mcp_get_their_own_phase(self):
         repo = Path(__file__).resolve().parent.parent
         sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
