@@ -407,6 +407,21 @@ class OwnerGuard(Base):
         self.assertEqual(self.at_pre_symlink(lambda: None), "linked")
         self.assertEqual(Path(os.readlink(self.target)), self.host)
 
+    def test_an_owner_link_to_the_missing_app_home_is_refused_before_any_mkdir(self):
+        app_home = self.root / "app" / "workspace" / ".codex-sutando"
+        self.owner.symlink_to(app_home)
+        self.assert_refused_unchanged(app_home, "owner-home")
+        self.assertFalse(os.path.lexists(self.root / "app"))
+
+    def test_an_owner_link_chain_relative_and_too_long_is_handled(self):
+        (self.root / "app").mkdir()
+        self.owner.symlink_to("../hop")
+        (self.root / "hop").symlink_to("app/.codex-sutando")
+        self.assert_refused_unchanged(self.root / "app" / ".codex-sutando" / "x", "owner-home")
+        self.owner.unlink()
+        self.owner.symlink_to(self.owner.name)
+        self.assert_refused_unchanged(self.codex_home, "owner-home")
+
     def test_a_stable_owner_link_to_the_candidate_is_refused(self):
         candidate = self.root / "candidate"
         candidate.mkdir()
@@ -421,6 +436,16 @@ class OwnerGuard(Base):
                 self.assertFalse(chi.is_owner_codex_home(sibling, self.home))
                 self.assertEqual(self.link(codex_home=sibling), "linked")
         self.assertEqual(os.listdir(self.owner), [])
+
+    def test_the_identity_layer_matches_a_missing_owner_by_case_folded_suffix(self):
+        """The identity layer alone: reached when a path names ~/.codex by another route."""
+        anchor, missing = chi._owner_anchor(self.home)
+        fd = os.open(self.home, os.O_RDONLY)
+        try:
+            self.assertTrue(chi._at_owner(fd, anchor, missing, [".CODEX", "sub"]))
+            self.assertFalse(chi._at_owner(fd, anchor, missing, [".codex-other"]))
+        finally:
+            os.close(fd)
 
     def test_the_owner_anchor_walks_up_to_an_existing_ancestor(self):
         anchor, missing = chi._owner_anchor(self.root / "no" / "such-home")
@@ -608,11 +633,23 @@ class Overrides(Base):
             os.link(p.parent / "real.md", p)
         self.check("hardlink", make, "overridden")
 
-    def test_content_found_late_or_past_the_read_cap_still_overrides(self):
-        with patch.object(chi, "_OVERRIDE_READ_CAP", 70000):
-            self.check("late", lambda p: p.write_bytes(b" " * 65536 + b"x"), "overridden")
-            self.check("past-cap", lambda p: p.write_bytes(b" " * 80000 + b"x"), "overridden")
-            self.check("ws-long", lambda p: p.write_bytes(b" " * 66000), "linked")
+    def test_the_whole_override_is_read_with_no_cap(self):
+        # Codex then loads neither file; linking AGENTS.md is the closest safe match.
+        self.check("ws-1mib-plus-1", lambda p: p.write_bytes(b" " * (1024 * 1024 + 1)), "linked")
+        self.check("late", lambda p: p.write_bytes(b" " * (1024 * 1024 + 1) + b"x"), "overridden")
+        split = "\u00a0".encode()  # a multi-byte character straddling a read boundary
+        self.check("split", lambda p: p.write_bytes(b" " * 65535 + split + b"\n"), "linked")
+        self.check("truncated", lambda p: p.write_bytes(b" " + split[:1]), "overridden")
+
+    def test_only_unicode_white_space_is_blank(self):
+        for code in range(0x1C, 0x20):
+            with self.subTest(char=f"U+{code:04X}"):
+                self.check(f"sep-{code:x}", lambda p, c=code: p.write_bytes(chr(c).encode()), "overridden")
+        for char in ("\u0085", "\u1680", "\u2000", "\u200a", "\u2028", "\u2029", "\u202f",
+                     "\u205f", "\u3000"):
+            with self.subTest(char=f"U+{ord(char):04X}"):
+                self.check(f"ws-{ord(char):x}", lambda p, c=char: p.write_bytes(c.encode()), "linked")
+        self.check("zwsp", lambda p: p.write_bytes("\u200b".encode()), "overridden")
 
     def test_a_read_error_on_the_override_does_not_block_the_link(self):
         home, override = self.make_home("eio-read")

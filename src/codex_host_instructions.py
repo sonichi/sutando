@@ -15,6 +15,7 @@ directory identity. Nothing already at
 `$CODEX_HOME/AGENTS.md` is removed or replaced.
 """
 import argparse
+import codecs
 import errno
 import os
 import stat
@@ -45,15 +46,35 @@ def _parts(codex_home):
     return parts
 
 
-def _lexically_owner(parts, home):
-    """True when `parts`, case-folded, are `$HOME/.codex` or `realpath($HOME)/.codex` or below.
+_OWNER_LINK_HOPS = 32
 
-    The walk follows no link, so the path it opens is this lexical one; this check cannot race.
-    """
-    folded = [p.casefold() for p in parts]
+
+def _owner_spellings(home):
+    """Every path `~/.codex` names, created or not: `$HOME/.codex`, `realpath($HOME)/.codex`,
+    and each target its symlink chain names, read textually; ValueError past the hop cap."""
+    found = []
     for base in (os.fspath(home), os.path.realpath(home)):
-        owner = [p.casefold() for p in os.path.normpath(os.path.join(base, ".codex")).split(os.sep)
-                 if p not in ("", ".")]
+        path = os.path.normpath(os.path.join(base, ".codex"))
+        for _ in range(_OWNER_LINK_HOPS):
+            found += [path, os.path.realpath(path)]
+            if not os.path.islink(path):
+                break
+            path = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+        else:
+            raise ValueError("~/.codex: too many symlinks to follow")
+    return found
+
+
+def _lexically_owner(parts, home):
+    """True when `parts`, case-folded, are any spelling of `~/.codex` or below, or the
+    spellings cannot be read. The walk follows no link, so the path it opens is this one."""
+    folded = [p.casefold() for p in parts]
+    try:
+        spellings = _owner_spellings(home)
+    except (ValueError, OSError):
+        return True
+    for spelled in spellings:
+        owner = [p.casefold() for p in spelled.split(os.sep) if p not in ("", ".")]
         if folded[:len(owner)] == owner:
             return True
     return False
@@ -148,36 +169,36 @@ def is_owner_codex_home(codex_home, home):
     return status in ("owner-home", "invalid-home")
 
 
-_OVERRIDE_READ_CAP = 1 << 20
+# Rust's char::is_whitespace (Unicode White_Space), which Codex uses to call a file blank.
+_WHITE_SPACE = frozenset(map(chr, [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680,
+                                   *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F,
+                                   0x3000]))
 
 
 def _active_override(fd):
-    """Codex honours AGENTS.override.md only as a regular file it can open whose text is not
-    blank: undecodable bytes count as content, whitespace (str.strip) does not. A file past
-    the read cap counts as an override."""
+    """Codex honours AGENTS.override.md only as a regular file it can open whose whole text is
+    not blank; bytes that are not UTF-8 count as content. Read to EOF in chunks."""
     try:
         probe = os.open("AGENTS.override.md", os.O_RDONLY | os.O_NONBLOCK, dir_fd=fd)
     except OSError:
         return False
+    decoder = codecs.getincrementaldecoder("utf-8")()
     try:
         if not stat.S_ISREG(os.fstat(probe).st_mode):
             return False
-        data = b""
-        while len(data) <= _OVERRIDE_READ_CAP:
+        while True:
             chunk = os.read(probe, 65536)
+            text = decoder.decode(chunk, final=not chunk)
+            if any(c not in _WHITE_SPACE for c in text):
+                return True
             if not chunk:
-                break
-            data += chunk
-        if len(data) > _OVERRIDE_READ_CAP:
-            return True
+                return False
+    except UnicodeDecodeError:
+        return True
     except OSError:
         return False
     finally:
         os.close(probe)
-    try:
-        return bool(data.decode("utf-8").strip())
-    except UnicodeDecodeError:
-        return True
 
 
 def ensure_linked(codex_home, repo, home):

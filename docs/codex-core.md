@@ -90,21 +90,27 @@ The Codex implementation:
   non-directory component anywhere. Otherwise the helper refuses it as `invalid-home`,
   creates nothing and the launcher warns; a symlinked `CODEX_HOME` is never followed.
   (The launcher's own earlier `mkdir -p` of the configured `CODEX_HOME` is separate and
-  unchanged.) A `CODEX_HOME` that is, case-folded, `$HOME/.codex` or
-  `realpath($HOME)/.codex` or below is refused as `owner-home` from its path alone. The helper walks down from `/`
+  unchanged.) A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
+  is refused as `owner-home` from its path alone, before anything is created. The
+  spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
+  chain names, read textually whether or not the target exists; a chain past 32 hops
+  refuses. The helper walks down from `/`
   one real directory at a time (`O_DIRECTORY|O_NOFOLLOW`, relative to the parent's
   descriptor). Before each step and before each directory it creates, it compares the
   open directory's identity with the owner's `~/.codex`, or, while that does not exist
   yet, with its nearest existing ancestor plus the case-folded missing names. A match,
   or an identity it cannot read, refuses the link. That owner record is read again before
   every directory it creates and right before the link: any change (created, removed,
-  replaced, retargeted) refuses with no further write. Anything already at
+  replaced, retargeted) refuses with no further write. The threat model assumes no
+  untrusted process is rewriting the owner's `$HOME` concurrently: a retarget during the
+  `mkdir`/`symlink` call itself cannot be closed with path APIs. Anything already at
   `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
   Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` only when it can
-  open it as a regular file whose whole content is not blank: content that is not valid
-  UTF-8 (a NUL included) counts, and only Unicode whitespace as Python's `str.strip`
-  removes it is blank. Codex was observed to treat space, tab, CR, LF, VT, FF, NBSP and
-  EM SPACE that way. So an empty or whitespace-only file, a directory, FIFO, dangling or looping link, or an unreadable
+  open it as a regular file whose whole content (read to EOF, no cap) is not blank:
+  content that is not valid UTF-8 (a NUL included) counts, and blank means only Unicode
+  White_Space characters, as Rust's `char::is_whitespace` (U+0009 to U+000D, U+0020,
+  U+0085, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000).
+  So an empty or whitespace-only file, a directory, FIFO, dangling or looping link, or an unreadable
   file there does not count and the link is made. When a readable override
   exists, the launcher links nothing, leaves it as it is and warns that the core reads
   it instead of the host's file;
