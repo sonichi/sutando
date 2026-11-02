@@ -520,6 +520,52 @@ class Hooks(unittest.TestCase):
         self.assertEqual([p.get("lease_id") for p, _op in self.acks(fake, leased)], ["L7"],
                          "the sidecar lost its lease: the attempt's own record proves it")
 
+    def test_a_twin_post_of_one_ack_is_quiet_and_a_superseded_ack_is_logged(self):
+        tid, gone = "task-twin-ack", "task-twin-gone"
+        self.addCleanup(self.forget, tid, gone)
+        for t in (tid, gone):
+            self.assertTrue(gw._take_served_task(_task(t, lease_id="L1", source_event_id="$e"), set(), []))
+        claim, twin = (gw._claim_ack(tid, "L1", local=tid, durable=True) for _ in range(2))
+        self.assertEqual(claim["op"], twin["op"], "both posts carry the one open claim")
+        self.assertEqual(gw._commit_ack(tid, claim, _ack(tid, 1)), "recorded")
+        self.assertEqual(gw._commit_ack(tid, twin, _ack(tid, 1)), "stale")
+        self.assertFalse([m for m in self.logs if "no longer holds" in m], "its twin recorded it: nothing to say")
+        for label, other, answer in (("another op", gw.task_attempts.Claim({**claim, "op": "ack-other"}), _ack(tid, 1)),
+                                     ("another generation", twin, _ack(tid, 3))):
+            self.logs.clear()
+            self.assertEqual(gw._commit_ack(tid, other, answer), "stale")
+            self.assertTrue([m for m in self.logs if "no longer holds" in m], f"{label} is no twin: it is logged")
+        stale = gw._claim_ack(gone, "L1", local=gone, durable=True)
+        self.forget(gone)
+        self.assertEqual(gw._commit_ack(gone, stale, _ack(gone, 1)), "stale")
+        self.assertTrue([m for m in self.logs if f"{gone}: ack for a serve this attempt no longer holds" in m])
+        legacy = "task-twin-legacy"
+        self.addCleanup(self.forget, legacy)
+        self.assertTrue(gw._take_served_task(_task(legacy, lease_id="L1", source_event_id="$e"), set(), []))
+        claim, twin = (gw._claim_ack(legacy, "L1", local=legacy, durable=True) for _ in range(2))
+        self.assertEqual(gw._commit_ack(legacy, claim, _ack(legacy, 1)), "recorded")
+        no_gen = {k: v for k, v in _ack(legacy, 1).items() if k != "execution_generation"}
+        self.assertEqual(gw._commit_ack(legacy, twin, no_gen), "stale")
+        self.assertFalse([m for m in self.logs if f"{legacy}: ack for a serve" in m],
+                         "an answer naming no generation keeps the bound one: still its twin")
+        switched = "task-twin-switch"
+        self.addCleanup(self.forget, switched)
+        self.held(switched, gen_answer=2)                               # generation 1 under L1, L2 held
+        claim, twin = (gw._claim_ack(switched, "L2", local=switched, durable=True) for _ in range(2))
+        self.assertEqual(claim["op"], twin["op"])
+        self.assertEqual(gw._commit_ack(switched, claim, _ack(switched, 2)), "recorded", "the switch to generation 2")
+        self.assertEqual(gw._commit_ack(switched, twin, _ack(switched, 2)), "stale")
+        self.assertFalse([m for m in self.logs if f"{switched}: ack for a serve" in m],
+                         "the switch recorded this op: its twin is quiet")
+        settled = "task-twin-settled"
+        self.addCleanup(self.forget, settled)
+        self.assertTrue(gw._take_served_task(_task(settled, lease_id="L1", source_event_id="$e"), set(), []))
+        claim = gw._claim_ack(settled, "L1", local=settled, durable=True)
+        self.assertTrue(gw._ack_settled(settled, claim), "the ack wait ended without an accepted ack")
+        self.assertEqual(gw._commit_ack(settled, claim, _ack(settled, 1)), "stale")
+        self.assertTrue([m for m in self.logs if f"{settled}: ack for a serve this attempt no longer holds" in m],
+                        "a settled claim is no twin: it is logged")
+
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
         self.addCleanup(self.forget, tid)

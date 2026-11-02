@@ -834,7 +834,8 @@ class Transition:
                   "missing_since": None, "hold_reported": None,
                   "wake_episode": episode if type(episode) is str else None,
                   "cancel_requested_generation": None, "cancel_requested_attempt": None,
-                  "owed_publish": pending["run"], "owed_reserve": pending.get("reserve"), "finished": None}
+                  "owed_publish": pending["run"], "owed_reserve": pending.get("reserve"), "finished": None,
+                  "ack_op": c["op"]}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
         qid = rec.get("answer_offered")
@@ -951,7 +952,8 @@ class Transition:
         if not self.holds_claim(c):
             self.release_claim(c)
             return "stale"
-        extra = extra or {}
+        # Which operation recorded the ack: another post of the same claim can tell it was its twin.
+        extra = {**(extra or {}), "ack_op": c["op"]}
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if type(gen) is not int or gen < 1:
             return self.rec if self.commit_claim(c, awaiting_ack=False, **extra) else None
