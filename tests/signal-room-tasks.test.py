@@ -92,9 +92,12 @@ with tempfile.TemporaryDirectory() as td:
     ck(ok is True and reason is None, "a writable task dir -> available")
     ck(not list(Path(td).glob(".signal-room-probe-*")), "the write probe cleans up after itself")
 
-ok, reason = S.submission_status("/proc/nonexistent/cannot-create")
-ck(ok is False and reason == "task_dir_unwritable",
-   f"an unwritable task dir -> unavailable with a reason ({reason})")
+with tempfile.TemporaryDirectory() as td:
+    blocked = Path(td) / "not-a-directory"
+    blocked.write_text("x")
+    ok, reason = S.submission_status(blocked / "tasks")
+    ck(ok is False and reason == "task_dir_unwritable",
+       f"an unwritable task dir -> unavailable with a reason ({reason})")
 
 print("== the lane is bounded, and the bound is not permanent ==")
 with tempfile.TemporaryDirectory() as td:

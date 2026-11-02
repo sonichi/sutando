@@ -161,8 +161,8 @@ try:
     else:
         print("SKIP: no writable allowed root on this host for the SEND case")
 
-    # dm-fallback: tier is read off the ORIGINATING TASK FILE, so a result
-    # with no matching task defaults to "other" and is dropped.
+    # dm-fallback: tier is read off the ORIGINATING TASK FILE (the
+    # missing-task case is driven below).
     (tasks / "question-attach.txt").write_text(
         "id: question-attach\naccess_tier: owner\ntask: probe\n")
     fb = results / "question-attach.txt"
@@ -196,6 +196,22 @@ try:
           "dm-fallback: an EMPTY attachment path is LOGGED")
     check(any("had no path" in str(a) for a, _ in sends),
           "dm-fallback: and the malformed marker is SURFACED")
+
+    # dm-fallback MISSING TASK: no originating task file anywhere, so the tier
+    # read raises and falls to "guest"; the redirect must be dropped, not sent.
+    fm = results / "question-missing.txt"
+    fm.write_text(f"[channel: {TARGET}]\nbody\n")
+    os.utime(fm, (aged, aged))
+    sends.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        with contextlib.suppress(Exception):
+            asyncio.run(asyncio.wait_for(bridge.poll_dm_fallback(), timeout=3.0))
+    fmout = buf.getvalue()
+    check("[dm-fallback channel-redirect] dropped — tier 'guest'" in fmout,
+          "dm-fallback: a result with NO task file falls to guest and is dropped")
+    check(not any(str(TARGET) in str(k) for _, k in sends) and "sent question-missing.txt" not in fmout,
+          "dm-fallback: and nothing reached the redirect target")
 
     # Control: the refused-branch probe must be able to score zero.
     check("REJECTED file" not in "", "control: the probe matches nothing on empty output")

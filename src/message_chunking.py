@@ -152,8 +152,13 @@ def chunk_message(text: str, max_len: int = 1900):
         # treat as closing (we don't require exact length match for close).
 
         line_overhead = len(line) + 1  # +1 for newline
+        # The line that CLOSES the fence needs no reserve: after it the fence is
+        # shut, so charging for a synthetic closer splits a body that already fits.
+        closes_here = (fence_opener is not None and opener_on_line is not None
+                       and _closes_fence(opener_on_line, fence_opener))
         # Reserve space for closing fence if we'd cut mid-fence
-        reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
+        reserve = 0 if closes_here else (
+            (len(fence_closer(fence_opener)) + 1) if fence_opener else 0)
 
         if buf_len + line_overhead + reserve > max_len and buf:
             # Outside a fence, prefer the last blank line in the lookback

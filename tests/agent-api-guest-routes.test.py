@@ -17,6 +17,7 @@ Run: `python3 tests/agent-api-guest-routes.test.py`
 """
 import importlib.util
 import json
+from unittest.mock import patch
 import os
 import sys
 import tempfile
@@ -26,6 +27,9 @@ from pathlib import Path
 # tempdir instead of the live workspace.
 _TEST_WS = tempfile.mkdtemp()
 os.environ["SUTANDO_TEST_MODE"] = "1"
+# A standalone run must never reach product telemetry: opt out before the
+# import, in addition to the emitter stub the accepted-object controls need.
+os.environ.setdefault("SUTANDO_TELEMETRY", "0")
 os.environ["SUTANDO_WORKSPACE"] = _TEST_WS
 SRC = Path(__file__).resolve().parent.parent / "src"
 _spec = importlib.util.spec_from_file_location("agent_api", str(SRC / "agent-api.py"))
@@ -291,8 +295,85 @@ def run() -> None:
         check(f"every Signal Room task is team tier, never owner (saw {tiers})", tiers == {"team"})
     finally:
         agent_api.submit_signal_room_task = orig_submit
-        if orig_emit is not None:
-            agent_api._emit_task_processed = orig_emit
+        # The emitter stays stubbed: the accepted-object controls below reach
+        # the normal accept path and would call the production emitter.
+
+    # ── JSON bodies that parse but are not objects, and bodies the decoder
+    #    cannot finish at all, must be 400s on BOTH lanes ──
+    def raw(path: str, body: bytes):
+        h = make_handler(path, {"Content-Length": str(len(body))}, body, auth=True)
+        try:
+            h.do_POST()
+        except Exception as e:  # the parent 500s here; report it as a value
+            return (f"raised {type(e).__name__}", None)
+        return h._responses[0] if h._responses else (None, None)
+    NOT_OBJECT = (400, {"error": "body must be a JSON object"})
+    BAD_JSON = (400, {"error": "invalid JSON"})
+    # 20,001 bytes: under the route's 65,536-byte cap, past the decoder's depth.
+    DEEP = b"[" * 10000 + b"]" * 10000 + b" "
+    check("/guest-task: a JSON array body is a 400, not a 500", raw("/guest-task", b"[1]") == NOT_OBJECT)
+    check("/guest-task: a JSON string body is a 400, not a 500", raw("/guest-task", b'"hi"') == NOT_OBJECT)
+    # NEGATIVE CONTROL: the guest lane already catches bare Exception around the
+    # decode, so this is green before AND after — it pins that the lanes differ.
+    check("/guest-task: invalid UTF-8 is a 400 (negative control)", raw("/guest-task", b"\xff\xfe{") == BAD_JSON)
+    # Whether the decoder finishes DEEP is a platform limit: 3.13.5 raises
+    # RecursionError, other builds decode it to a list. Both must be a 400.
+    check("/guest-task: a 20,001-byte nested array is a 400 (negative control)",
+          raw("/guest-task", DEEP) in (NOT_OBJECT, BAD_JSON))
+    check("/task: a JSON array body is a 400, not a 500", raw("/task", b"[1]") == NOT_OBJECT)
+    # UnicodeDecodeError is not a JSONDecodeError subclass; this one was a 500.
+    check("/task: invalid UTF-8 is a 400, not a 500", raw("/task", b"\xff\xfe{") == BAD_JSON)
+    check("/task: a 20,001-byte nested array is a 400, not a 500",
+          raw("/task", DEEP) in (NOT_OBJECT, BAD_JSON))
+
+    # Deterministic control for the RecursionError arm: whether json.loads
+    # raises it is a build property, so the decoder is made to raise it here.
+    def raw_forced(path: str, body: bytes):
+        real = agent_api.json.loads
+        def boom(b, *a, **k):
+            if isinstance(b, (bytes, bytearray, str)) and len(b) == len(DEEP):
+                raise RecursionError("maximum recursion depth exceeded")
+            return real(b, *a, **k)
+        with patch.object(agent_api.json, "loads", boom):
+            return raw(path, body)
+    check("/task: decoder RecursionError is the invalid-JSON 400 (forced)", raw_forced("/task", DEEP) == BAD_JSON)
+    check("/guest-task: decoder RecursionError is the invalid-JSON 400 (negative control, forced)",
+          raw_forced("/guest-task", DEEP) == BAD_JSON)
+
+    # Past the digit limit json.loads raises plain ValueError. The natural case
+    # needs an ACTIVE limit under the 64 KiB cap (3.9 has none; a raised one 413s).
+    import sys as _sys
+    _digits = getattr(_sys, "get_int_max_str_digits", lambda: 0)()
+    _natural = 0 < _digits and _digits + 64 <= 65536
+    if _natural:
+        BIG = b'{"task":"x","padding":' + b"9" * (_digits + 1) + b"}"
+        OK_BIG = b'{"task":"x","padding":' + b"9" * max(_digits - 1, 1) + b"}"
+        check("/task: an integer past the digit limit is the invalid-JSON 400 (natural)", raw("/task", BIG) == BAD_JSON)
+        check("/guest-task: an integer past the digit limit is the invalid-JSON 400 (natural, negative control)",
+              raw("/guest-task", BIG) == BAD_JSON)
+        check("/task: an integer within the digit limit is not rejected as JSON (control)",
+              raw("/task", OK_BIG)[0] != 400 or raw("/task", OK_BIG) != BAD_JSON)
+    else:
+        print(f"  (natural digit-limit case skipped: limit={_digits}, not active or over the 64 KiB cap)")
+
+    # Forced control: a FIXED small valid object, matched exactly, so the patched
+    # decoder is always reached regardless of interpreter or configuration.
+    SMALL = b'{"task":"x","n":1}'
+    def raw_forced_value_error(path: str, body: bytes):
+        real = agent_api.json.loads
+        def boom(b, *a, **k):
+            raw_b = b.encode() if isinstance(b, str) else bytes(b)
+            if raw_b == SMALL:
+                raise ValueError("Exceeds the limit (4300 digits) for integer string conversion")
+            return real(b, *a, **k)
+        with patch.object(agent_api.json, "loads", boom):
+            return raw(path, body)
+    check("/task: decoder ValueError is the invalid-JSON 400 (forced)", raw_forced_value_error("/task", SMALL) == BAD_JSON)
+    check("/guest-task: decoder ValueError is the invalid-JSON 400 (negative control, forced)",
+          raw_forced_value_error("/guest-task", SMALL) == BAD_JSON)
+    check("/task: the forced control's object is accepted when the decoder is real (control)", raw("/task", SMALL) != BAD_JSON)
+    if orig_emit is not None:
+        agent_api._emit_task_processed = orig_emit
 
     print()
     if failures:

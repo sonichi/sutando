@@ -6,9 +6,12 @@ never answered; adapters keep only their routing and notification.
 """
 from __future__ import annotations
 
+import ast
+import io
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -67,11 +70,74 @@ class _Space:
 
 
 class PlanTest(unittest.TestCase):
+    def test_destination_provider_namespace(self):
+        for source, expected in (("telegram", "requeue"), ("discord", "honour"),
+                                 ("DISCORD", "honour")):
+            for count in (0, 1):
+                with self.subTest(source=source, count=count), tempfile.TemporaryDirectory() as td:
+                    sp = _Space(td); sp.holder("[REPLIED]")
+                    sp.orig(f"id: {TID}\nsource: discord\nchannel_id: 4242\nuser_id: 9001\n"
+                            f"dedup_requeue_count: {count}\ntask: answer here\n")
+                    (sp.tasks / f"{HOLDER}.txt").write_text(
+                        f"source: {source}\nchat_id: 4242\nuser_id: 9001\n")
+                    action, _ = plan_dedup_recovery(sp.results, sp.tasks, TID, HOLDER, "4242", NEW)
+                    self.assertEqual(action, "report" if count and expected == "requeue" else expected)
+                    self.assertEqual((sp.tasks / f"{NEW}.txt").exists(),
+                                     expected == "requeue" and count == 0)
+
     def test_holder_answered_is_honoured(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.holder("the full answer"); sp.orig()
             self.assertEqual(sp.plan(), ("honour", None))
             self.assertFalse((sp.tasks / f"{NEW}.txt").exists(), "honour must not re-ask")
+
+    def test_replied_holder_is_honoured_in_live_and_archive_layouts(self):
+        for layout in ("live", "flat", "month"):
+            for count in (0, 1):
+                with self.subTest(layout=layout, count=count), tempfile.TemporaryDirectory() as td:
+                    sp = _Space(td)
+                    sp.orig(ORIG + f"dedup_requeue_count: {count}\n")
+                    if layout == "live":
+                        (sp.results / f"{HOLDER}.txt").write_text("[REPLIED]")
+                    else:
+                        sp.holder("[REPLIED]", month=layout == "month")
+                    self.assertEqual(sp.plan(), ("honour", None))
+                    self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
+
+    def test_replied_destination_boundary(self):
+        for field, asking, other in (("channel_id", "C1", "C2"),
+                                      ("chat_id", "-1001", "-1002")):
+            for count in (0, 1):
+                for destination in (asking, other):
+                    with self.subTest(field=field, count=count, destination=destination):
+                        with tempfile.TemporaryDirectory() as td:
+                            sp = _Space(td)
+                            sp.holder("[REPLIED]")
+                            sp.orig(ORIG + f"{field}: {asking}\nuser_id: alice\n"
+                                    f"dedup_requeue_count: {count}\n")
+                            (sp.tasks / f"{HOLDER}.txt").write_text(
+                                f"id: {HOLDER}\n{field}: {destination}\nuser_id: alice\n")
+                            action, payload = plan_dedup_recovery(
+                                sp.results, sp.tasks, TID, HOLDER, asking, NEW)
+                            expected = "honour" if destination == asking else (
+                                "requeue" if count == 0 else "report")
+                            self.assertEqual(action, expected)
+                            new = sp.tasks / f"{NEW}.txt"
+                            self.assertEqual(new.exists(), expected == "requeue")
+                            if expected == "requeue":
+                                self.assertIn(f"{field}: {asking}", new.read_text())
+                                self.assertIn("DIFFERENT channel", new.read_text())
+                            elif expected == "report":
+                                self.assertIn("different room", payload)
+                                self.assertNotIn("delivered nothing", payload)
+
+    def test_destination_falls_back_to_task_when_route_map_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder("[REPLIED]")
+            sp.orig(ORIG + "channel_id: C1\nuser_id: alice\n")
+            (sp.tasks / f"{HOLDER}.txt").write_text("channel_id: C2\nuser_id: alice\n")
+            self.assertEqual(plan_dedup_recovery(
+                sp.results, sp.tasks, TID, HOLDER, "", NEW)[0], "requeue")
 
     def test_empty_holder_is_requeued_and_the_task_is_written(self):
         with tempfile.TemporaryDirectory() as td:
@@ -153,6 +219,44 @@ class PlanTest(unittest.TestCase):
                              "an unsafe id must not produce a re-ask")
 
 
+class ArchivedOriginalTest(unittest.TestCase):
+    """The core archives a task once its result is written, so the deduped
+    task is usually gone from tasks/ when the gateway verifies its holder."""
+
+    def test_archived_original_and_holder_with_accepted_delivery_are_honoured(self):
+        task = "source: ag2space\nchannel_id: !room:ag2.space\nuser_id: @owner:ag2.space\n"
+        for layout in ("flat", "month"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder("[REPLIED]")
+                arc = sp.tasks / "archive" / ("2026-10" if layout == "month" else "")
+                arc.mkdir(parents=True, exist_ok=True)
+                (arc / f"{TID}.txt").write_text(f"id: {TID}\n{task}task: q\n")
+                (arc / f"{HOLDER}.txt").write_text(f"id: {HOLDER}\n{task}task: q\n")
+                self.assertEqual(plan_dedup_recovery(
+                    sp.results, sp.tasks, TID, HOLDER, "!room:ag2.space", NEW,
+                    holder_delivery_state=lambda _h: "accepted"), ("honour", None))
+                self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
+
+    def test_bridge_path_reads_the_archived_original(self):
+        """Discord/Slack/Telegram pass no holder_delivery_state."""
+        for holder_body, holder_user, expected in (("", "9001", "requeue"),
+                                                   ("the answer", "7777", "requeue"),
+                                                   ("the answer", "9001", "honour")):
+            with self.subTest(holder_body=holder_body, holder_user=holder_user), \
+                    tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder(holder_body)
+                arc = sp.tasks / "archive"; arc.mkdir()
+                (arc / f"{TID}.txt").write_text(
+                    f"id: {TID}\nsource: discord\nchannel_id: 4242\nuser_id: 9001\ntask: q\n")
+                (arc / f"{HOLDER}.txt").write_text(
+                    f"id: {HOLDER}\nsource: discord\nchannel_id: 4242\nuser_id: {holder_user}\n")
+                action, payload = plan_dedup_recovery(sp.results, sp.tasks, TID, HOLDER, "4242", NEW)
+                self.assertEqual(action, expected)
+                if expected == "requeue":
+                    self.assertEqual(payload, NEW)
+                    self.assertIn("task: q", (sp.tasks / f"{NEW}.txt").read_text())
+
+
 class CommitIdentityTest(unittest.TestCase):
     """Routing must be committed before the re-ask becomes visible."""
 
@@ -185,6 +289,111 @@ class CommitIdentityTest(unittest.TestCase):
             sp.plan_with(_commit)
             self.assertFalse(observed["existed"],
                              "task file existed before its routing was committed")
+
+
+class PublishOnceTest(unittest.TestCase):
+    """A caller retrying with the same re-ask id gets the same re-ask."""
+
+    def _first_publication(self, sp):
+        """The body this plan publishes for NEW, as a first call would leave it."""
+        self.assertEqual(sp.plan(), ("requeue", NEW))
+        body = (sp.tasks / f"{NEW}.txt").read_text()
+        (sp.tasks / f"{NEW}.txt").unlink()
+        return body
+
+    def test_the_same_reask_already_published_is_not_written_again(self):
+        for where in ("live", "archived"):
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder(""); sp.orig()
+                body = self._first_publication(sp)
+                d = sp.tasks if where == "live" else sp.tasks / "archive"
+                d.mkdir(exist_ok=True)
+                (d / f"{NEW}.txt").write_text(body)
+                self.assertEqual(sp.plan(), ("requeue", NEW))
+                self.assertEqual(sorted(p.name for p in sp.tasks.glob(f"{NEW}*")),
+                                 [f"{NEW}.txt"] if where == "live" else [],
+                                 "a re-ask already published was written again")
+
+    def test_an_id_held_by_anything_else_is_never_claimed(self):
+        for where in ("another re-ask", "archived other", "answer only", "unreadable"):
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder(""); sp.orig()
+                if where == "another re-ask":
+                    (sp.tasks / f"{NEW}.txt").write_text("id: x\nchannel_id: room-OTHER\ntask: another question\n")
+                elif where == "archived other":
+                    (sp.tasks / "archive").mkdir()
+                    (sp.tasks / "archive" / f"{NEW}.txt").write_text("another question")
+                elif where == "answer only":
+                    (sp.results / f"{NEW}.txt").write_text("an answer whose task is unknown")
+                else:
+                    (sp.tasks / f"{NEW}.txt").mkdir()          # present, but no body can be read
+                committed = []
+                self.assertEqual(sp.plan_with(lambda i: committed.append(i) or True), ("defer", None))
+                self.assertEqual(committed, [], "routing was committed for an id that is someone else's")
+
+    def test_two_originals_colliding_on_one_id_never_share_it(self):
+        """Two different tasks in different rooms handed the same candidate id."""
+        with tempfile.TemporaryDirectory() as td:
+            results, tasks = Path(td) / "results", Path(td) / "tasks"
+            (results / "archive").mkdir(parents=True); tasks.mkdir()
+            a, b = "task-aaaaaaaaaaaaaaaaaa", "task-bbbbbbbbbbbbbbbbbb"
+            for tid, room, ask in ((a, "room-A", "PRIVATE QUESTION A"), (b, "room-B", "question B")):
+                (tasks / f"{tid}.txt").write_text(
+                    f"id: {tid}\nsource: slack\nchannel_id: {room}\naccess_tier: owner\ntask: {ask}\n")
+            first = plan_dedup_recovery(results, tasks, a, HOLDER, "room-A", NEW)
+            second = plan_dedup_recovery(results, tasks, b, HOLDER, "room-B", NEW)
+            self.assertEqual(first, ("requeue", NEW))
+            self.assertEqual(second, ("defer", None), "B was handed A's re-ask")
+            kept = (tasks / f"{NEW}.txt").read_text()
+            self.assertIn("room-A", kept)
+            self.assertNotIn("room-B", kept)
+
+    def test_a_concurrent_publisher_wins_without_being_overwritten(self):
+        import dedup_recovery
+        for same in (True, False):
+            with self.subTest(same=same), tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder(""); sp.orig()
+                body = self._first_publication(sp) if same else "the other pass's re-ask"
+                real = dedup_recovery._published_as
+                first = []
+
+                def racing(tasks_dir, results_dir, task_id, b):
+                    seen = real(tasks_dir, results_dir, task_id, b)
+                    if not first:
+                        first.append(1)
+                        (sp.tasks / f"{NEW}.txt").write_text(body)
+                    return seen
+                with unittest.mock.patch.object(dedup_recovery, "_published_as", racing):
+                    self.assertEqual(sp.plan(), ("requeue", NEW) if same else ("defer", None))
+                self.assertEqual((sp.tasks / f"{NEW}.txt").read_text(), body)
+                self.assertEqual([p.name for p in sp.tasks.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_a_cleanup_error_after_the_link_is_still_a_publication(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder(""); sp.orig()
+            real = Path.unlink
+
+            def unlink(path, *a, **k):
+                if path.name.endswith(".tmp"):
+                    raise OSError(5, "EIO")
+                return real(path, *a, **k)
+            with unittest.mock.patch.object(Path, "unlink", unlink), \
+                    unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(sp.plan(), ("requeue", NEW))
+            self.assertTrue((sp.tasks / f"{NEW}.txt").exists())
+            self.assertIn("was not removed", err.getvalue())
+
+
+class FreshReaskIdTest(unittest.TestCase):
+    def test_ids_minted_in_one_millisecond_differ_and_keep_the_parsed_shape(self):
+        import dedup_recovery
+        from local_task_protocol import TASK_ID_RE
+        with unittest.mock.patch.object(dedup_recovery.time, "time", return_value=1791600000.0):
+            ids = {dedup_recovery.fresh_reask_id() for _ in range(200)}
+        self.assertEqual(len(ids), 200, "two calls in one millisecond were handed one id")
+        for i in ids:
+            self.assertTrue(TASK_ID_RE.match(i), i)
+            self.assertEqual(int(i.split("-")[1]), 1791600000000, "readers parse the millisecond part")
 
 
 class UnreadableInputTest(unittest.TestCase):
@@ -248,15 +457,35 @@ class DelegationTest(unittest.TestCase):
                     f"{name}: calls dedup_decision directly — the plan owns that",
                 )
 
+    def test_adapters_do_not_import_or_call_private_policy(self):
+        forbidden = {"dedup_decision", "dedup_cross_channel_target", "dedup_cross_sender_target",
+                     "dedup_destination_mismatch", "dedup_requeue_count", "build_requeued_task"}
+        for name, path in CONSUMERS.items():
+            tree = ast.parse(path.read_text())
+            used = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    used.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        used.add(node.func.id)
+                    elif isinstance(node.func, ast.Attribute):
+                        used.add(node.func.attr)
+            with self.subTest(consumer=name):
+                self.assertFalse(used & forbidden, f"{name} bypasses shared planner: {used & forbidden}")
+
     def test_result_lookup_is_not_reimplemented(self):
         """Live-then-archive is one policy: an archive-only copy reads a
-        delivered-but-unarchived result as never delivered."""
+        delivered-but-unarchived result as never delivered. A consumer either
+        calls `find_result` or delegates to `task_dispatch.py has-result`, the
+        completion owner that walks the same candidates to a ready body."""
         for name, path in LOOKUP_CONSUMERS.items():
             with self.subTest(consumer=name):
                 src = path.read_text()
-                self.assertIn(
-                    "find_result", src,
-                    f"{name}: must use local_task_protocol.find_result",
+                self.assertTrue(
+                    "find_result" in src or "task_dispatch.py\" has-result" in src,
+                    f"{name}: must use local_task_protocol.find_result or "
+                    f"delegate to task_dispatch.py has-result",
                 )
                 self.assertNotIn(
                     "find_archived_result", src,

@@ -12,6 +12,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
@@ -100,10 +101,50 @@ const HTML = /* html */ `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sutando Web UI</title>
 <style>
+  /* Surface tokens. The page shipped hardcoded dark; the app that embeds it is
+   * light, so ground/text/line are named here and the dark values move into a
+   * prefers-color-scheme block. Accent hues are unchanged. */
+  :root {
+    --ui-bg: #ffffff;
+    --ui-raised: #f7f7f9;
+    --ui-sunken: #f1f1f4;
+    --ui-line: #e4e4e9;
+    --ui-line-soft: #ededf1;
+    --ui-text: #1f1f25;
+    --ui-text-hi: #101014;
+    --ui-text-2: #5f5f6b;
+    --ui-text-3: #8b8b97;
+    --ui-chip: #eeeef2;
+    --ui-chip-hover: #e3e3e9;
+    --ui-live-bg: #e6f4ec;
+    --ui-live-fg: #1e5128;
+    --ui-accent: #2563eb;
+    --ui-code-bg: #f4f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ui-bg: #0a0a12;
+      --ui-raised: #0e0e18;
+      --ui-sunken: #12121e;
+      --ui-line: #1e1e30;
+      --ui-line-soft: #1a1a2e;
+      --ui-text: #c0c0d0;
+      --ui-text-hi: #ffffff;
+      --ui-text-2: #888888;
+      --ui-text-3: #555555;
+      --ui-chip: #2a2a3e;
+      --ui-chip-hover: #3a3a4e;
+      --ui-live-bg: #1a2e24;
+      --ui-live-fg: #4ecca3;
+      --ui-accent: #66aaff;
+      --ui-code-bg: #0a0a12;
+    }
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: text; user-select: text; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0a0a12; color: #c0c0d0;
+    background: var(--ui-bg); color: var(--ui-text);
     display: flex; flex-direction: column; align-items: center;
     min-height: 100vh; padding: 0 0 60px 0;
   }
@@ -111,7 +152,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .header {
     width: 100%; padding: 16px 20px;
     display: flex; align-items: center; gap: 14px;
-    background: #0e0e18; border-bottom: 1px solid #1a1a2e;
+    background: var(--ui-raised); border-bottom: 1px solid var(--ui-line);
   }
   .header .avatar-wrap {
     position: relative; width: 60px; height: 60px; flex-shrink: 0;
@@ -284,16 +325,16 @@ const HTML = /* html */ `<!DOCTYPE html>
   .hero-svg-wrap { width: 80px; height: 80px; margin-bottom: 16px; display: none; }
 
   .header .info { flex: 1; }
-  .header h1 { color: #fff; font-size: 1.15em; font-weight: 500; }
-  .header .meta { font-size: 16px; color: #888; display: flex; gap: 14px; align-items: center; margin-top: 4px; }
-  .header .meta a { color: #999; text-decoration: none; border-bottom: 1px dotted #555; }
-  .header .meta a:hover { color: #bbb; }
+  .header h1 { color: var(--ui-text-hi); font-size: 1.15em; font-weight: 500; }
+  .header .meta { font-size: 16px; color: var(--ui-text-2); display: flex; gap: 14px; align-items: center; margin-top: 4px; }
+  .header .meta a { color: var(--ui-text-2); text-decoration: none; border-bottom: 1px dotted var(--ui-text-3); }
+  .header .meta a:hover { color: var(--ui-text); }
   .status-pill {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 4px 12px; border-radius: 12px; font-size: 16px; font-weight: 500;
   }
-  .status-pill.voice-on { background: #1a2e24; color: #4ecca3; }
-  .status-pill.voice-off { background: #1a1a2e; color: #666; }
+  .status-pill.voice-on { background: var(--ui-live-bg); color: var(--ui-live-fg); }
+  .status-pill.voice-off { background: var(--ui-chip); color: var(--ui-text-3); }
   .status-pill .dot {
     width: 6px; height: 6px; border-radius: 50%; background: #333;
   }
@@ -312,12 +353,12 @@ const HTML = /* html */ `<!DOCTYPE html>
   .btn-voice:hover { background: #277334; box-shadow: 0 0 16px rgba(78, 204, 163, 0.25); }
   .btn-voice.active { background: #8b1a1a; border-color: #a52222; box-shadow: none; }
   .btn-voice.active:hover { background: #a52222; }
-  .btn-mute { background: #2a2a3e; color: #888; }
-  .btn-mute:hover { background: #3a3a4e; color: #fff; }
+  .btn-mute { background: var(--ui-chip); color: var(--ui-text-2); }
+  .btn-mute:hover { background: var(--ui-chip-hover); color: var(--ui-text-hi); }
   .btn-mute.muted { background: #4a1a1a; color: #e94560; }
   /* Watch (vision streaming) — matches the avatar 'seeing' palette (#fbbf24). */
-  .btn-watch { background: #2a2a3e; color: #888; }
-  .btn-watch:hover { background: #3a3a4e; color: #fff; }
+  .btn-watch { background: var(--ui-chip); color: var(--ui-text-2); }
+  .btn-watch:hover { background: var(--ui-chip-hover); color: var(--ui-text-hi); }
   .btn-watch.watching {
     background: #3a2e10; color: #fbbf24; border: 1px solid #7a5a14;
     box-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
@@ -328,8 +369,8 @@ const HTML = /* html */ `<!DOCTYPE html>
     0%, 100% { box-shadow: 0 0 8px rgba(251, 191, 36, 0.3); }
     50%      { box-shadow: 0 0 16px rgba(251, 191, 36, 0.55); }
   }
-  .btn-subtle { background: transparent; color: #444; font-size: 11px; padding: 5px 8px; }
-  .btn-subtle:hover { color: #888; }
+  .btn-subtle { background: transparent; color: var(--ui-text-3); font-size: 11px; padding: 5px 8px; }
+  .btn-subtle:hover { color: var(--ui-text-2); }
 
   /* Main content */
   .main { width: 100%; max-width: 960px; flex: 1; display: flex; flex-direction: column; padding: 12px 24px 80px; margin: 0 auto; }
@@ -337,14 +378,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Conversation */
   #transcript {
     min-height: 80px; max-height: 50vh;
-    background: #0e0e18; border-radius: 12px; padding: 10px 14px;
+    background: var(--ui-raised); border-radius: 12px; padding: 10px 14px;
     overflow-y: auto; font-size: 16px; line-height: 1.6;
     margin-bottom: 6px;
   }
   .t-entry { margin-bottom: 8px; position: relative; user-select: text; }
   .t-entry .copy-btn {
     display: none; position: absolute; right: 0; top: 0;
-    background: #1e1e30; border: 1px solid #2a2a40; color: #666; font-size: 10px;
+    background: var(--ui-chip); border: 1px solid var(--ui-line); color: var(--ui-text-3); font-size: 10px;
     padding: 2px 6px; border-radius: 4px; cursor: pointer;
   }
   .t-entry:hover .copy-btn { display: inline-block; }
@@ -356,15 +397,15 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-working { opacity: 0.6; font-style: italic; }
   @keyframes t-working-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
   .t-working { animation: t-working-pulse 1.4s ease-in-out infinite; }
-  .t-system { color: #888; font-size: 14px; }
+  .t-system { color: var(--ui-text-2); font-size: 14px; }
   .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 16px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
 
   /* Input bar */
   #bottom-panel {
     position: fixed; bottom: 0; left: 0; right: 0; max-width: 960px; margin: 0 auto;
-    background: #12121e; z-index: 10;
-    border-top: 1px solid #1e1e30;
+    background: var(--ui-sunken); z-index: 10;
+    border-top: 1px solid var(--ui-line);
     padding: 8px 16px 12px;
   }
   .input-bar {
@@ -372,17 +413,17 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   .input-bar input {
     flex: 1; padding: 12px 16px; border-radius: 10px;
-    border: 1px solid #1e1e30; background: #0e0e18; color: #fff; font-size: 16px;
+    border: 1px solid var(--ui-line); background: var(--ui-raised); color: var(--ui-text); font-size: 16px;
     outline: none;
   }
   .input-bar input:focus { border-color: #4ecca3; }
-  .input-bar input::placeholder { color: #444; }
+  .input-bar input::placeholder { color: var(--ui-text-3); }
   .btn-send { background: #1a2e24; color: #4ecca3; border: 1px solid #2a4a36; }
   .btn-send:hover { background: #243e30; }
 
   /* Tasks */
   #tasks {
-    background: #0e0e18; border-radius: 10px; padding: 8px 14px;
+    background: var(--ui-raised); border-radius: 10px; padding: 8px 14px;
     margin-bottom: 10px; font-size: 12px;
   }
   #tasks:empty { display: none; }
@@ -459,10 +500,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Dynamic region */
   #dynamic-region { padding: 26px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
   #dynamic-region:empty { display: none; }
-  #core-status-bar { font-size: 16px; color: #888; }
+  #core-status-bar { font-size: 16px; color: var(--ui-text-2); }
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
-  #core-status-bar .core-idle { color: #444; }
+  #core-status-bar .core-idle { color: var(--ui-text-3); }
   /* Presenter-mode badge — only visible when the /presenter same-origin
      endpoint reports active:true. The endpoint reads state/presenter-mode.sentinel
      (written by scripts/presenter-mode.sh). Mirrors the Swift menu-bar HUD's
@@ -497,6 +538,15 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
   #dynamic-region .dr-questions .q-item { color: #ddd; padding: 10px 0; border-bottom: 1px solid #2e281844; }
   #dynamic-region .dr-questions .q-item:last-child { border-bottom: none; }
+  #dynamic-region .q-queue-meta { display: flex; gap: 10px; align-items: baseline; font-size: 11px; color: #8a8a99; margin-bottom: 6px; }
+  #dynamic-region .q-wait { color: #f0ad4e; font-weight: 600; }
+  #dynamic-region .q-blocks { color: #7c83ff; }
+  #dynamic-region .q-recheck { font-size: 11px; margin: 6px 0; padding: 5px 8px; border-radius: 6px; background: #2e281844; color: #f0ad4e; }
+  #dynamic-region .q-recheck.q-stale { background: #1d3a2a; color: #4ecca3; }
+  #dynamic-region .q-nav { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  #dynamic-region .q-nav .q-btn { flex: 0 0 auto; }
+  #dynamic-region .q-empty { color: #666; font-size: 12px; text-align: center; padding: 12px; }
+  #dynamic-region .q-unknown { font-size: 11px; margin-bottom: 6px; padding: 5px 8px; border-radius: 6px; background: #3a1d1d; color: #e8a0a0; }
   #dynamic-region .q-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #dynamic-region .q-btn {
     padding: 6px 16px; border-radius: 14px; font-size: 15px; cursor: pointer;
@@ -516,21 +566,21 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .dr-chips { text-align: center; }
   #dynamic-region .dr-chips .suggestions-label { margin-bottom: 8px; }
   #dynamic-region .dr-chips .suggestion {
-    display: inline-block; background: #1a1a2e; border: 1px solid #2a2a4e;
+    display: inline-block; background: var(--ui-chip); border: 1px solid var(--ui-line);
     border-radius: 16px; padding: 7px 15px; margin: 4px; font-size: 15px;
     color: #8899a6; cursor: pointer; transition: all 0.2s;
   }
-  #dynamic-region .dr-chips .suggestion:hover { background: #2a2a4e; color: #ccc; border-color: #4a4a6e; }
+  #dynamic-region .dr-chips .suggestion:hover { background: var(--ui-chip-hover); color: var(--ui-text); border-color: var(--ui-line); }
   #dynamic-region .dr-media {
-    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px;
+    background: var(--ui-raised); border: 1px solid var(--ui-line); border-radius: 10px;
     padding: 12px 16px; text-align: center;
   }
-  #dynamic-region .dr-media-title { color: #ccc; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
-  #dynamic-region .dr-media-caption { color: #666; font-size: 11px; margin-top: 6px; }
+  #dynamic-region .dr-media-title { color: var(--ui-text); font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  #dynamic-region .dr-media-caption { color: var(--ui-text-3); font-size: 11px; margin-top: 6px; }
   #dynamic-region .dr-document {
-    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px; padding: 12px 16px;
+    background: var(--ui-raised); border: 1px solid var(--ui-line); border-radius: 10px; padding: 12px 16px;
   }
-  #dynamic-region .dr-doc-body { color: #ccc; font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
+  #dynamic-region .dr-doc-body { color: var(--ui-text); font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
 
   /* Section labels */
   .section-label {
@@ -562,10 +612,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   .d-entry.audio { color: #4db6ac; }
   .btn-download {
     display: inline-block; margin-top: 6px; padding: 4px 10px;
-    border-radius: 6px; border: 1px solid #1e1e30; background: #0e0e18;
+    border-radius: 6px; border: 1px solid var(--ui-line); background: var(--ui-raised);
     color: #555; font-size: 11px; cursor: pointer; text-decoration: none;
   }
-  .btn-download:hover { background: #1a1a2e; color: #aaa; }
+  .btn-download:hover { background: var(--ui-chip); color: var(--ui-text); }
 
   /* Hidden URL input */
   #wsUrl { display: none; }
@@ -594,8 +644,8 @@ const HTML = /* html */ `<!DOCTYPE html>
     box-shadow: 0 0 16px rgba(251,191,36,0.55);
     animation: avatar-see 1.2s ease-in-out infinite;
   }
-  .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
-  .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
+  .hero h2 { color: var(--ui-text-hi); font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
+  .hero .tagline { color: var(--ui-text-3); font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
   @keyframes avatar-glow {
     0% { box-shadow: 0 0 0 rgba(78,204,163,0); transform: scale(0.9); opacity: 0; }
     40% { box-shadow: 0 0 40px rgba(78,204,163,0.7); transform: scale(1.05); opacity: 1; }
@@ -620,24 +670,24 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Capabilities panel — shown on idle, hidden when voice is active */
   .caps-panel {
     max-width: 480px; margin: 0 auto 20px; padding: 12px 18px;
-    border: 1px solid #252540; border-radius: 8px;
-    background: rgba(26,26,60,0.4);
+    border: 1px solid var(--ui-line); border-radius: 8px;
+    background: var(--ui-raised);
   }
   body.voice-active .caps-panel { display: none; }
   .caps-panel .caps-heading {
     font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
-    color: #444; margin-bottom: 8px;
+    color: var(--ui-text-3); margin-bottom: 8px;
   }
   .caps-panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
-  .caps-panel dt { color: #6af; font-size: 12px; white-space: nowrap; padding: 2px 0; }
-  .caps-panel dd { color: #555; font-size: 12px; margin: 0; padding: 2px 0; }
+  .caps-panel dt { color: var(--ui-accent); font-size: 12px; white-space: nowrap; padding: 2px 0; }
+  .caps-panel dd { color: var(--ui-text-3); font-size: 12px; margin: 0; padding: 2px 0; }
   /* Toast notifications */
   .toast-container {
     position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
     z-index: 100; display: flex; flex-direction: column; gap: 6px; align-items: center;
   }
   .toast {
-    background: #1a2e24; border: 1px solid #2a4a36; color: #c0c0d0;
+    background: var(--ui-live-bg); border: 1px solid var(--ui-line); color: var(--ui-text);
     padding: 10px 16px; border-radius: 10px; font-size: 12px;
     box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     animation: toastIn 0.3s ease, toastOut 0.3s ease 3.7s forwards;
@@ -657,15 +707,15 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-assistant p { margin: 0.4em 0; }
   .t-assistant ul, .t-assistant ol { margin: 0.4em 0; padding-left: 1.6em; }
   .t-assistant li { margin: 0.2em 0; }
-  .t-assistant code { background: #0a0a12; padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.88em; color: #f8b878; }
-  .t-assistant pre { background: #0a0a12; padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; border: 1px solid #1e1e2a; }
-  .t-assistant pre code { background: none; padding: 0; color: #d0d0e0; font-size: 0.9em; }
+  .t-assistant code { background: var(--ui-code-bg); padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.88em; color: #f8b878; }
+  .t-assistant pre { background: var(--ui-code-bg); padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; border: 1px solid var(--ui-line); }
+  .t-assistant pre code { background: none; padding: 0; color: var(--ui-text); font-size: 0.9em; }
   .t-assistant a { color: #6ea3ff; text-decoration: none; }
   .t-assistant a:hover { text-decoration: underline; }
   .t-assistant strong { color: #f0f0f8; font-weight: 700; }
   .t-assistant table { border-collapse: collapse; margin: 0.4em 0; font-size: 0.95em; }
-  .t-assistant th, .t-assistant td { border: 1px solid #1e1e2a; padding: 4px 8px; }
-  .t-assistant th { background: #14141e; }
+  .t-assistant th, .t-assistant td { border: 1px solid var(--ui-line); padding: 4px 8px; }
+  .t-assistant th { background: var(--ui-sunken); }
   .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
@@ -1866,6 +1916,7 @@ function startTaskPolling() {
       if (sysEl) sysEl.innerHTML = statusParts.length ? statusParts.join(' · ') : '';
       // Update dynamic region with latest data
       window._drQuestions = data.questions || [];
+      window._drQuestionsUnavailable = data.questions_unavailable || null;
       updateDynamicRegion();
     } catch {}
   }, 3000);
@@ -2894,10 +2945,7 @@ function answerQuestion(qid, answer) {
         if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim()) + '</span>';
       }
       // Remove after brief delay so user sees confirmation
-      setTimeout(function() {
-        window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
-        updateDynamicRegion();
-      }, 1500);
+      setTimeout(function() { dropQuestionFromQueue(qid); }, 1500);
       // Show in transcript too
       var el = document.createElement('div');
       el.className = 't-entry t-system';
@@ -3123,6 +3171,7 @@ try { resumePendingChatSends(); } catch {}
 // Priority: dynamic-content.json > pending questions > proactive status > chips
 // Supports: audio, image, video, document, html, and fallback chips
 window._drQuestions = [];
+window._drQuestionsUnavailable = null;
 window._drProactive = null;
 window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
@@ -3208,6 +3257,7 @@ window._drTaskCount = 0;
 window._drTabsRendered = false;
 
 function switchDRTab(tab) {
+  window._drQueueChecked = false;
   window._drActiveTab = tab;
   window._drLocalContent = true; // prevent poll from clearing content
   updateTabHighlights();
@@ -3346,25 +3396,15 @@ function renderTabContent() {
     });
 
   } else if (tab === 'questions') {
-    var questions = window._drQuestions || [];
-    if (questions.length === 0) {
-      container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No pending questions</div>';
-    } else {
-      container.innerHTML = '<div class="dr-questions">' +
-        questions.map(function(q) {
-          return '<div class="q-item"><b>' + esc(q.id) + '</b>: ' + esc(q.text) +
-            (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + esc(q.detail) + '</div>' : '') +
-            '<div class="q-actions">' +
-            (q.options ? q.options.map(function(opt) {
-              return '<button class="q-btn" data-qid="' + q.id + '" data-ans="' + esc(opt) + '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
-            }).join('') :
-            '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
-            '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>') +
-            '<input class="q-input" data-qid="' + q.id + '" placeholder="Or type a response...">' +
-            '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
-            '</div></div>';
-        }).join('') + '</div>';
+    // Re-check immediately before display, once per visit rather than per re-render.
+    // Renders directly on completion — updateDynamicRegion() would refuse while
+    // this tab is still the locally-set one, which is the entire time it's open.
+    if (!window._drQueueChecked) {
+      window._drQueueChecked = true;
+      refreshQuestionQueue().then(function() { updateTabHighlights(); renderTabContent(); });
     }
+    if (!window._drQueue) window._drQueue = window._drQuestions || [];
+    container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0, window._drQuestionsUnavailable);
 
   } else if (tab === 'activity') {
     fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
@@ -3513,12 +3553,163 @@ function updateDynamicRegion() {
   }
 }
 
+// ─── Pending-question triage queue helpers
+// Pure: they take rows and a cursor and return HTML. The queue shows ONE question,
+// so every fact the owner needs to rank it has to be on the card itself.
+function questionWaitLabel(q) {
+  var age = q && q.age_days;
+  if (age === null || age === undefined) return 'age unknown';
+  if (age === 0) return 'asked today';
+  return 'waiting ' + age + (age === 1 ? ' day' : ' days');
+}
+
+function questionBlocksLabel(q) {
+  var refs = (q && q.refs) || [];
+  var blocks = (q && q.blocks) || 0;
+  if (!refs.length) return '';
+  if (!blocks) return 'nothing still blocked';
+  return 'blocking ' + blocks + (blocks === 1 ? ' item' : ' items');
+}
+
+// A re-check that could not decide returns nothing rather than a reassuring note:
+// silence here means "not checked", never "checked and fine".
+function questionRecheckHtml(q) {
+  var rc = q && q.recheck;
+  if (!rc || !rc.note) return '';
+  var stale = rc.status === 'stale';
+  var lead = stale ? 'Re-checked just now: everything this blocks is done ('
+                   : 'Re-checked just now: partly resolved (';
+  return '<div class="q-recheck' + (stale ? ' q-stale' : '') + '">' +
+    esc(lead + rc.note + ')') + '</div>';
+}
+
+function questionQueueCursor(rows, index) {
+  var n = (rows || []).length;
+  if (!n) return 0;
+  return ((index % n) + n) % n;
+}
+
+// With the room unreachable the rows are only what is held locally: the remote queue
+// is unknown, so the banner stays and the counter never claims the rows are all there is.
+function questionUnknownHtml(rows, unavailable) {
+  if (!unavailable) return '';
+  var n = (rows || []).length;
+  return '<div class="q-unknown">Pending questions unknown — room unreachable (' + esc(unavailable) + ')' +
+    (n ? ': showing ' + n + ' held locally; the remote queue is unknown' : '') + '</div>';
+}
+
+function renderQuestionQueue(rows, index, unavailable) {
+  rows = rows || [];
+  // An unreachable room is not an empty queue: the count is unknown, say so.
+  if (!rows.length && unavailable) {
+    return '<div class="q-empty">' + questionUnknownHtml(rows, unavailable) + '</div>';
+  }
+  if (!rows.length) {
+    return '<div class="q-empty">No pending questions</div>';
+  }
+  var i = questionQueueCursor(rows, index);
+  var q = rows[i];
+  var blocks = questionBlocksLabel(q);
+  var position = (i + 1) + ' of ' + rows.length + (unavailable ? ' held locally' : '');
+  var answerBtns = q.options
+    ? q.options.map(function(opt) {
+        return '<button class="q-btn" data-qid="' + esc(q.id) + '" data-ans="' + esc(opt) +
+          '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
+      }).join('')
+    : '<button class="q-btn q-yes" data-qid="' + esc(q.id) + '" data-ans="Approved">Approve</button>' +
+      '<button class="q-btn q-no" data-qid="' + esc(q.id) + '" data-ans="Rejected">Reject</button>';
+  return '<div class="dr-questions">' + questionUnknownHtml(rows, unavailable) + '<div class="q-item">' +
+    '<div class="q-queue-meta">' +
+      '<span>' + esc(position) + '</span>' +
+      '<span class="q-wait">' + esc(questionWaitLabel(q)) + '</span>' +
+      (blocks ? '<span class="q-blocks">' + esc(blocks) + '</span>' : '') +
+    '</div>' +
+    '<b>' + esc(q.text) + '</b>' +
+    questionRecheckHtml(q) +
+    (q.detail && q.detail !== q.text
+      ? '<div style="color:#999;font-size:11px;margin-top:4px;white-space:pre-wrap">' + esc(q.detail) + '</div>'
+      : '') +
+    '<div class="q-actions">' + answerBtns +
+      '<input class="q-input" data-qid="' + esc(q.id) + '" placeholder="Or type a response...">' +
+      '<button class="q-btn q-send" data-qid="' + esc(q.id) + '">Send</button>' +
+    '</div>' +
+    '<div class="q-nav">' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="reply">Reply in chat</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="next">Next</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="dismiss" style="border-color:#66333366;color:#c77">Dismiss</button>' +
+    '</div>' +
+    '</div></div>';
+}
+// ─── End pending-question triage queue helpers
+
+// Re-check runs when the queue is shown or advanced — human cadence, not the 3s poll.
+function refreshQuestionQueue() {
+  return fetch(API_BASE + '/questions/queue')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data && data.questions) {
+        window._drQueue = data.questions;
+        window._drQuestions = data.questions;
+        window._drQuestionsUnavailable = data.questions_unavailable || null;
+      }
+      return window._drQueue;
+    })
+    .catch(function() { return window._drQueue; });
+}
+
+// Renders directly rather than via updateDynamicRegion(): that gate skips
+// rendering for as long as the questions tab is open (see PR body).
+function advanceQuestionQueue(step) {
+  window._drQueueIndex = questionQueueCursor(
+    window._drQueue || [], (window._drQueueIndex || 0) + step);
+  updateTabHighlights();
+  renderTabContent();
+}
+
+function dropQuestionFromQueue(qid) {
+  window._drQueue = (window._drQueue || []).filter(function(q) { return q.id !== qid; });
+  window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
+  window._drQueueIndex = questionQueueCursor(window._drQueue, window._drQueueIndex || 0);
+  updateTabHighlights();
+  renderTabContent();
+}
+
+function dismissQuestion(qid) {
+  fetch(API_BASE + '/question/dismiss', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: qid})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d && d.ok) dropQuestionFromQueue(qid);
+    else alert('Failed: ' + ((d && d.error) || 'unknown error'));
+  }).catch(function() { alert('Could not reach agent API'); });
+}
+
+function replyToQuestionInChat(qid) {
+  var rows = window._drQueue || [];
+  var q = null;
+  for (var i = 0; i < rows.length; i++) { if (rows[i].id === qid) { q = rows[i]; break; } }
+  var input = document.getElementById('textInput');
+  if (!input) return;
+  input.value = 'Re: ' + ((q && q.text) || qid) + ' — ';
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
 // Event delegation for question actions
 document.addEventListener('click', function(e) {
   var btn = e.target.closest && e.target.closest('[data-qid]');
   if (!btn) return;
   var qid = btn.dataset.qid;
-  if (btn.dataset.ans) {
+  var qact = btn.dataset.qact;
+  if (qact === 'next') {
+    // Free by construction: no request, no write. The row stays and comes back round.
+    advanceQuestionQueue(1);
+  } else if (qact === 'dismiss') {
+    dismissQuestion(qid);
+  } else if (qact === 'reply') {
+    replyToQuestionInChat(qid);
+  } else if (btn.dataset.ans) {
     answerQuestion(qid, btn.dataset.ans);
   } else if (btn.classList.contains('q-send')) {
     var inp = document.querySelector('.q-input[data-qid="' + qid + '"]');
@@ -4071,6 +4262,39 @@ function isLoopbackAddress(address: string | undefined): boolean {
 	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+/** /voice-tasks/view: the task table on one page, refreshed every second from /voice-tasks. */
+const VOICE_TASKS_VIEW_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice tasks</title>
+<style>
+body{font:14px/1.4 -apple-system,system-ui,sans-serif;margin:16px;background:#111;color:#eee}
+h1{font-size:18px;margin:0 0 4px}.sub{color:#999;margin-bottom:12px}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #333;vertical-align:top}
+th{color:#999;font-weight:normal}.pending td{color:#fff}.done td{color:#777}
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;background:#333}
+.tag.working{background:#1d4ed8}.tag.queued{background:#6d28d9}.tag.unheard{background:#b45309}.tag.heard{background:#166534}.tag.retired{background:#444}.tag.cancelled{background:#444}.tag.dm{background:#7c2d12}
+</style></head><body>
+<h1>Pending (the core is still working on): <span id="pending">…</span></h1>
+<div class="sub" id="sub"></div>
+<table><thead><tr><th>time</th><th>request</th><th>core</th><th>heard</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+const esc=(s)=>String(s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function tick(){
+  try{
+    const d=await (await fetch('/voice-tasks',{cache:'no-store'})).json();
+    document.getElementById('pending').textContent=d.pending==null?'?':d.pending;
+    document.getElementById('sub').textContent=d.pending==null?(d.note||''):('the core is working on '+d.working+' · done, waiting to be read: '+d.doneNotHeard+' · '+new Date(d.at).toLocaleTimeString());
+    document.getElementById('rows').innerHTML=(d.tasks||[]).map((t)=>{
+      const time=new Date(t.submittedAt).toLocaleTimeString();
+      const core=t.retired?'<span class="tag retired">ended, nothing to say</span>':t.state==='started'?'<span class="tag working">working</span>':t.state==='queued'?'<span class="tag queued">queued</span>':t.state==='cancelled'?'<span class="tag cancelled">cancelled</span>':'<span class="tag">done</span>';
+      const heard=t.heard?'<span class="tag heard">heard ('+esc(t.delivery)+')</span>':t.delivery==='dm'?'<span class="tag dm">DM copy, not heard</span>':t.retired||t.state==='cancelled'?'':'<span class="tag unheard">not heard</span>';
+      return '<tr class="'+(t.pending?'pending':'done')+'"><td>'+time+'</td><td>'+esc(t.text)+'</td><td>'+core+'</td><td>'+heard+'</td></tr>';
+    }).join('');
+  }catch(e){document.getElementById('sub').textContent='cannot reach /voice-tasks: '+e;}
+}
+tick();setInterval(tick,1000);
+</script></body></html>`;
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -4213,6 +4437,28 @@ const server = createServer((req, res) => {
 	// on switch_mode / zoom-auto-flip). Returns "active" or "meeting".
 	// Falls back to "active" if the file is missing. Combined with the
 	// presenter badge poll to render the composite 3-mode badge in the UI.
+	// The relay agent's task table, live: what the voice agent last wrote to state/voice-task-status.json
+	// (every row with where the core stands and whether the user heard the answer, plus the pending count
+	// get_task_status reports). /voice-tasks is the JSON; /voice-tasks/view is a page that refreshes itself.
+	// The rows are the owner's spoken requests: local-only, like /api/task-history (review of #5348, B2).
+	if ((url.pathname === '/voice-tasks' || url.pathname === '/voice-tasks/view') && !LAN_SHARE && !isLoopbackAddress(req.socket.remoteAddress)) {
+		res.writeHead(403, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ error: 'voice tasks are local-only' }));
+		return;
+	}
+	if (url.pathname === '/voice-tasks') {
+		let body = '{"at":0,"pending":null,"working":0,"doneNotHeard":0,"tasks":[],"note":"the voice agent has not written state/voice-task-status.json yet"}';
+		try { body = readFileSync(join(STATE_DIR, 'voice-task-status.json'), 'utf-8'); } catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+		res.end(body);
+		return;
+	}
+	if (url.pathname === '/voice-tasks/view') {
+		res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+		res.end(VOICE_TASKS_VIEW_HTML);
+		return;
+	}
+
 	if (url.pathname === '/voice-mode') {
 		let mode = 'active';
 		try {
@@ -4420,7 +4666,7 @@ const server = createServer((req, res) => {
 					return;
 				}
 				const event = { slug: body.slug, content: body.content, ts: new Date().toISOString() };
-				writeFileSync('/tmp/sutando-note-viewing.json', JSON.stringify(event));
+				writeFileSync(join(tmpdir(), 'sutando-note-viewing.json'), JSON.stringify(event));
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true }));
 			} catch (e) {

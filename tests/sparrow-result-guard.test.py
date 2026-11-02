@@ -16,9 +16,15 @@ import sys
 import tempfile
 import urllib.error
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+_guard = importlib.import_module("ag2_sparrow.team_result_guard")
 
 fail = 0
 
@@ -154,12 +160,16 @@ with tempfile.TemporaryDirectory() as td:
     write_task(tasks, "task-notice-one", "team", **notice_fields)
     first_notice, first_reason = m._guarded_result_body(
         "task-notice-one", BODY_WITH_MARKERS)
+    # task-team1 above was withheld too, so two records exist here; glob order
+    # is the filesystem's, so the record must be addressed by its own id.
     review_files = list((m._STATE / "withheld-team-results").glob("wr_*.json"))
+    review_file = (m._STATE / "withheld-team-results"
+                   / f"{_guard.withheld_review_id('task-notice-one')}.json")
     check(first_reason is not None
           and any(a.kind == "skip" for a in m.parse_markers(first_notice).actions),
           "first withhold closes the lease without posting into the shared room")
-    check(bool(review_files), "first withhold persists an owner-review artifact")
-    review_record = json.loads(review_files[0].read_text(encoding="utf-8"))
+    check(review_file.is_file(), "first withhold persists an owner-review artifact")
+    review_record = json.loads(review_file.read_text(encoding="utf-8"))
     check(review_record.get("context", {}).get("room_name") == "Design Room",
           "the bridge retains the human-readable room name for private review")
 
@@ -306,7 +316,7 @@ i = src.find(anchor)
 check(i != -1, "the drain anchor is still present in remote_gateway_bridge.py")
 if i != -1:
     drain = src[i:]
-    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
+    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body")
     check(gi != -1 and pi != -1 and gi < pi,
           "in the drain, _guarded_result_body precedes parse_markers")
 
@@ -413,14 +423,16 @@ def drain_two_pass():
     posted = []
     real_req = m._req
     attempts = {"n": 0}
+    now = [1000.0]
+    core = m._delivery_core()
+    real_clock = core.backend.clock
+    core.backend.clock = lambda: now[0]
 
     def flaky(meth, path, payload=None, **kw):
         if path != "/v1/results":
             return {}
         attempts["n"] += 1
-        # The drain's idempotent re-send retries ambiguity once IN-pass, so a
-        # genuinely failed pass must fail both the send and its re-send.
-        if attempts["n"] <= 2:
+        if attempts["n"] == 1:
             raise urllib.error.URLError("transient")
         posted.append(payload)
         return {}
@@ -430,11 +442,16 @@ def drain_two_pass():
         inflight = {tid}
         m._post_ready_results(inflight)      # pass 1: POST raises
         first = (tid in m._REDELIVERED, tid in inflight, list(posted))
-        m._post_ready_results(inflight)      # pass 2: POST succeeds
+        m._post_ready_results(inflight)
+        check(attempts["n"] == 1 and tid in m._REDELIVERED and tid in inflight,
+              "before the retry is due no POST occurs and provenance survives")
+        now[0] = m.read_item(core.backend.root, tid)["retry"]["next_attempt_at"]
+        m._post_ready_results(inflight)      # due retry: POST succeeds
         second = (tid in m._REDELIVERED, tid in inflight, list(posted))
         return first, second
     finally:
         m._req = real_req
+        core.backend.clock = real_clock
         _undo_two()
 
 

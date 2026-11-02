@@ -20,7 +20,7 @@
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { statSync } from 'node:fs';
+import { copyFileSync, statSync } from 'node:fs';
 import {
   BROWSER_TRANSPORT_ARTIFACT,
   BROWSER_TRANSPORT_ENTRY,
@@ -96,6 +96,13 @@ for (const entry of ENTRYPOINTS) {
     console.error(`  ✗ ${BROWSER_TRANSPORT_ENTRY} (browser) — ${err.message}`);
     failed = true;
   }
+}
+
+try {
+  copyFileSync(join(repo, 'src', 'windows-app-launcher.ps1'), join(repo, 'dist', 'windows-app-launcher.ps1'));
+} catch (err) {
+  console.error(`  ✗ Windows app launcher asset — ${err.message}`);
+  failed = true;
 }
 
 if (failed) {

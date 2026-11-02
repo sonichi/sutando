@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,9 +20,10 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SKILL_DIR.parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 from util_paths import claude_home_path  # noqa: E402
+import skill_install  # noqa: E402
 
 MANIFEST = SKILL_DIR / "manifest.json"
-METADATA = ".sutando-source.json"
+METADATA = skill_install.PROVENANCE_FILE
 MAX_FILES = 500
 MAX_BYTES = 25 * 1024 * 1024
 TEXT_LIMIT = 512 * 1024
@@ -196,11 +196,9 @@ def install_skill(
     dest_root: Path,
 ) -> Path:
     slug = slug_for(path)
-    dest_root.mkdir(parents=True, exist_ok=True)
-    target = dest_root / slug
-    temp = Path(tempfile.mkdtemp(prefix=f".{slug}.", dir=dest_root))
-    try:
-        prefix = clean_repo_path(path) + "/"
+    prefix = clean_repo_path(path) + "/"
+
+    def populate(temp: Path) -> None:
         for entry in entries:
             relative = PurePosixPath(entry["path"][len(prefix) :])
             if relative.is_absolute() or ".." in relative.parts:
@@ -208,31 +206,15 @@ def install_skill(
             output = temp.joinpath(*relative.parts)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(contents[entry["path"]])
-        metadata = {
-            "schema_version": 1,
-            "source": source.id,
-            "repo": source.repo,
-            "path": clean_repo_path(path),
-            "commit": commit,
-        }
-        (temp / METADATA).write_text(json.dumps(metadata, indent=2) + "\n")
-        backup = target.with_name(f".{slug}.previous")
-        if backup.exists():
-            shutil.rmtree(backup)
-        if target.exists():
-            os.replace(target, backup)
-        try:
-            os.replace(temp, target)
-        except BaseException:
-            if backup.exists() and not target.exists():
-                os.replace(backup, target)
-            raise
-        if backup.exists():
-            shutil.rmtree(backup)
-        return target
-    finally:
-        if temp.exists():
-            shutil.rmtree(temp)
+
+    metadata = {
+        "schema_version": 1,
+        "source": source.id,
+        "repo": source.repo,
+        "path": clean_repo_path(path),
+        "commit": commit,
+    }
+    return skill_install.atomic_install(slug, dest_root, populate, metadata)
 
 
 def resolve_source(source_id: str) -> Source:

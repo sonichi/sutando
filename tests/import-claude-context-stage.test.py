@@ -1,0 +1,1460 @@
+#!/usr/bin/env python3
+"""Tests for the review-and-approve gate in skills/import-claude-context/scripts/finalize.py.
+
+Pins: a bare run (neither --stage nor --commit) stages under <data-dir>/staged/
+and leaves memory_dir(), <workspace>/notes and MEMORY.md untouched; review.md
+names every project with its threads and decisions, the people it would add
+(with citation counts) and ends with the reply footer; --commit moves the
+staged set into the sinks with the memory cap and the budget guard (subprocess
+patched) and sets phase `done`; --commit --projects lands one project and keeps
+the other staged (people restricted to what landed); --discard --projects drops
+one; a stale staged set, an empty one and an ambiguous selector are refused;
+--forget re-renders a pending review; the deterministic people/company merge
+(shared email, first name -> its unique full name, never two multi-token
+names, companies by name) and its `people_merged` count in the JSON; the
+memory file and overview are rebuilt from the approved snapshots
+(`approved/<slug>.json`) — a landed roll-up that changed on disk is named
+"changed since approval" in the digest and never refreshed by another
+project's commit; the approved People export likewise: a commit takes the
+projects it lands from the reviewed entities and every other landed project
+from `approved/people-inputs.json` (its `people_hashes` tell the digest which
+landed project's people changed), so an entities re-run between two commits
+never adds an unreviewed citation to people.json.
+
+Run: python3 tests/import-claude-context-stage.test.py
+"""
+from __future__ import annotations
+
+import copy
+import importlib.util
+import io
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+REPO = Path(__file__).resolve().parent.parent
+SCRIPTS = REPO / "skills" / "import-claude-context" / "scripts"
+os.environ.setdefault("SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER", "1")
+
+# The fixture (two projects, three sessions, 30 people) and the patched budget
+# runners are the finalize test's; the gate is tested on the same data.
+_spec = importlib.util.spec_from_file_location("ici_finalize_test", REPO / "tests" / "import-claude-context-finalize.test.py")
+_fx = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fx)
+make_data, _ok, _refuse, _cite = _fx.make_data, _fx._ok, _fx._refuse, _fx._cite
+SLUG_A, SLUG_B, U1, U2, U3 = _fx.SLUG_A, _fx.SLUG_B, _fx.U1, _fx.U2, _fx.U3
+
+FOOTER = ("Reply 'bring it in' to save this to your Sutando, 'bring in <slug>' "
+          "for one project, or 'forget <slug>' to drop one.")
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("ici_finalize", SCRIPTS / "finalize.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.m = _load()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ws = self.tmp / "ws"
+        self.data = self.ws / "data" / "claude-import"
+        self.mem = self.tmp / "memory"
+        self.mem.mkdir()
+        (self.mem / "MEMORY.md").write_text("- [Existing lesson](existing.md) — keep me\n")
+        make_data(self.data, self.ws)
+        # a roll-up summary + a decision so the digest has a paragraph and a decision to show
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc["summary"] = "Alpha is where the owner built the widget builder across two sessions."
+        doc["key_decisions"] = [{"decision": "write the core in Rust", "why": "startup time"}]
+        doc["open_threads"] = ["ship the widget", "write the launch post"]
+        p.write_text(json.dumps(doc))
+        self.staged = self.data / "staged"
+        self.ndir = self.ws / "notes" / "claude-import"
+
+    def _run(self, *args, runner=_ok):
+        """finalize.py <args> with the budget script patched; returns (rc, stdout JSON or text, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--json", *args]
+        with patch.object(self.m.subprocess, "run", side_effect=runner), \
+                redirect_stdout(out), redirect_stderr(err):
+            rc = self.m.main(argv)
+        text = out.getvalue()
+        try:
+            return rc, json.loads(text), err.getvalue()
+        except ValueError:
+            return rc, text, err.getvalue()
+
+    def _refused(self, *args, runner=_ok):
+        with patch.object(self.m.subprocess, "run", side_effect=runner), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--json", *args])
+        return str(cm.exception.code)
+
+    def assertSinksUntouched(self):
+        self.assertFalse((self.mem / "claude_import.md").exists())
+        self.assertEqual((self.mem / "MEMORY.md").read_text(), "- [Existing lesson](existing.md) — keep me\n")
+        self.assertFalse(self.ndir.exists())
+        self.assertEqual(sorted(p.name for p in (self.ws / "notes").iterdir()), [])
+
+    def _status(self):
+        return json.loads((self.data / "status.json").read_text())
+
+    def _manifest(self):
+        return json.loads((self.staged / "manifest.json").read_text())
+
+
+class TestStage(Base):
+    def test_skipped_empty_session_is_neither_counted_nor_pending(self):
+        # extract.py skipped an aborted session (no dump, no summary): the
+        # digest and the sinks count what was summarised, and --commit is not blocked
+        U4 = "44444444-dddd-4ddd-8ddd-dddddddddddd"
+        p = self.data / "index.json"
+        doc = json.loads(p.read_text())
+        doc["counts"]["sessions"] = 4
+        doc["projects"][SLUG_A]["session_count"] = 3
+        doc["projects"][SLUG_A]["sessions"].append(
+            {"uuid": U4, "title": "aborted session", "first_ts": "2026-08-06T09:00:00Z",
+             "last_ts": "2026-08-06T09:00:00Z", "user_msgs": 1, "assistant_msgs": 0})
+        p.write_text(json.dumps(doc))
+        (self.data / "state.json").write_text(json.dumps({"sessions": {
+            f"{SLUG_A}/{U4}": {"extracted_at": "2026-09-10T00:00:00Z", "chunks": 0, "chars": 0,
+                               "skipped_empty": True}}, "projects": {}}))
+        rc, c, _err = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["summarized"], c["projects"]), (3, 3, 2))
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("3 sessions across 2 projects", review)
+        self.assertIn("2 sessions (2026-08-01 → 2026-08-05)", review)      # Alpha: 3 indexed, 1 skipped
+        self.assertNotIn("aborted", review)
+        self.assertNotIn(U4[:8], (self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").read_text())
+        overview = (self.staged / "notes" / "claude-import" / "overview.md").read_text()
+        self.assertIn("Imported 3 sessions across 2 projects", overview)
+        self.assertIn("2 sessions (2026-08-01", overview)
+        rc, c, _err = self._run("--commit")
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["summarized"], c["committed"]), (3, 3, 2))
+        self.assertIn("Imported 3 sessions / 2 projects on ", (self.mem / "claude_import.md").read_text())
+        state = json.loads((self.data / "state.json").read_text())
+        rec = state["sessions"][f"{SLUG_A}/{U4}"]
+        self.assertTrue(rec["skipped_empty"])
+        self.assertNotIn("summarized_at", rec)
+        for u in (U1, U2):
+            self.assertIn("summarized_at", state["sessions"][f"{SLUG_A}/{u}"])
+        self.assertEqual(self._status()["phase"], "done")
+
+    def test_default_run_stages_and_touches_no_sink(self):
+        rc, c, _err = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["projects"], c["people"], c["sessions"], c["summarized"]), (2, 25, 3, 3))
+        self.assertEqual((c["notes_created"], c["notes_updated"], c["notes_unchanged"]), (2, 0, 0))
+        self.assertEqual((c["people_merged"], c["companies_merged"]), (0, 0))
+        self.assertLessEqual(c["memory_bytes"], 2000)
+        for rel in ("memory/claude_import.md", f"notes/claude-import/{SLUG_A}.md",
+                    f"notes/claude-import/{SLUG_B}.md", "notes/claude-import/overview.md",
+                    "people.json", "review.md", "manifest.json"):
+            self.assertTrue((self.staged / rel).is_file(), rel)
+        self.assertEqual(stat.S_IMODE(self.staged.stat().st_mode), 0o700)
+        self.assertSinksUntouched()
+        self.assertFalse((self.data / "state.json").exists())   # summarized_at is a commit's job
+        self.assertEqual(self._status()["phase"], "staged")
+        self.assertEqual(self._status()["projects"], 2)
+        mem = (self.staged / "memory" / "claude_import.md").read_text()
+        self.assertLessEqual(len(mem.encode()), 2000)
+        self.assertIn("- Alpha — A widget builder; active; open: ship the widget", mem)
+        note = (self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").read_text()
+        self.assertTrue(note.startswith("---\ntitle: Claude Code history — Alpha\ndate: "))
+        self.assertIn("*[imported, claude-code] — import-claude-context | 2026-08-01 → 2026-08-05 | user*", note)
+        self.assertEqual(len(json.loads((self.staged / "people.json").read_text())), 25)
+        man = self._manifest()
+        self.assertEqual(man["projects"], [SLUG_A, SLUG_B])
+        self.assertEqual(man["run_kind"], "user")
+        self.assertEqual(man["fingerprint"], self.m.inputs_fingerprint(self.data))
+        # a second stage replaces the pending set (no leftovers, same result)
+        rc, c2, _ = self._run("--stage", "--run-kind", "onboarding")
+        self.assertEqual(c2, c)
+        self.assertEqual(self._manifest()["run_kind"], "onboarding")
+        self.assertSinksUntouched()
+
+    def test_review_digest_lists_projects_people_and_footer(self):
+        self._run()
+        review = (self.staged / "review.md").read_text()
+        self.assertTrue(review.startswith("# Claude Code import — review before it lands\n"))
+        self.assertIn("3 sessions across 2 projects, 2026-07-20 → 2026-08-05", review)
+        self.assertIn("Nothing below has been written to your memory, notes or People store yet.", review)
+        self.assertIn(f"### Alpha (`{SLUG_A}`)\n", review)
+        self.assertIn("dir `/Users/o/Projects/alpha` · 2 sessions (2026-08-01 → 2026-08-05) · status: active · note: new", review)
+        self.assertIn("Alpha is where the owner built the widget builder across two sessions.", review)
+        self.assertIn("Open threads:\n- ship the widget\n- write the launch post\n", review)
+        self.assertIn("Decisions:\n- write the core in Rust — because startup time\n", review)
+        self.assertIn(f"### Beta (`{SLUG_B}`)\n", review)
+        self.assertIn("A launch plan", review)              # no summary: falls back to what_it_is
+        self.assertIn("Open threads: none recorded.\nDecisions: none recorded.", review)
+        people_section = review.split("## People\n", 1)[1]
+        self.assertIn("_Store not checked (People tool unavailable)", people_section)   # no --known-people
+        self.assertIn("New — will be added (25):\n", people_section)
+        self.assertNotIn("Already in your People store", people_section)
+        self.assertIn("- Ada Lovelace — investor; CTO · Analytical (3 citations)\n", people_section)
+        self.assertIn("- Only Alpha — colleague (2 citations)\n", people_section)
+        self.assertIn("- Person 00 — contact (2 citations)\n", people_section)
+        self.assertNotIn("One Citation", review)
+        self.assertIn("_Left out: 1 with a single mention only (2 citations needed)._", review)
+        self.assertIn("## Memory\n\n", review)
+        self.assertIn("B summary (cap 2,000 B) covering 2 projects for the agent's core memory, plus one MEMORY.md row if the index budget allows.", review)
+        self.assertIn("## Held back as personal (0)\n\nNone. Say 'hold <date>' to hold a session the classifier missed; "
+                      "held sessions are never quoted.\n", review)
+        self.assertTrue(review.rstrip().endswith("---\n" + FOOTER))
+        self.assertEqual(review.count(FOOTER), 1)
+        self.assertEqual(self._manifest()["known_people"], "not checked")
+        self.assertEqual(self._manifest()["held"], [])
+
+    def test_stage_needs_a_rollup(self):
+        for p in (self.data / "projects").glob("*.json"):
+            p.unlink()
+        msg = self._refused()
+        self.assertIn("nothing to stage", msg)
+        self.assertFalse(self.staged.exists())
+        self.assertSinksUntouched()
+
+
+class TestCommit(Base):
+    def test_commit_moves_everything_with_the_guards(self):
+        self._run()
+        staged_note = (self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").read_text()
+        rc, c, err = self._run("--commit")
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["committed"], c["staged_remaining"], c["projects"]), (2, 0, 2))
+        self.assertEqual((c["sessions"], c["summarized"], c["people"], c["people_merged"]), (3, 3, 25, 0))
+        self.assertEqual((c["notes_created"], c["notes_updated"], c["notes_unchanged"]), (2, 0, 0))
+        self.assertTrue(c["memory_row"])
+        self.assertIn("row appended", err)
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertLessEqual(len(mem.encode()), 2000)
+        self.assertEqual(c["memory_bytes"], len(mem.encode()))
+        self.assertIn("Imported 3 sessions / 2 projects on ", mem)
+        self.assertIn("- Beta — A launch plan; paused", mem)
+        index = (self.mem / "MEMORY.md").read_text()
+        self.assertIn("keep me", index)
+        self.assertEqual(index.count("- [Claude Code history import](claude_import.md) — 2 projects, open threads, people"), 1)
+        self.assertEqual((self.ndir / f"{SLUG_A}.md").read_text(), staged_note)   # reviewed text lands verbatim
+        self.assertTrue((self.ndir / f"{SLUG_B}.md").is_file())
+        self.assertIn(f"- [Beta]({SLUG_B}.md)", (self.ndir / "overview.md").read_text())
+        self.assertFalse(self.staged.exists())
+        self.assertEqual(self._status()["phase"], "done")
+        state = json.loads((self.data / "state.json").read_text())
+        for slug, u in ((SLUG_A, U1), (SLUG_A, U2), (SLUG_B, U3)):
+            self.assertIn("summarized_at", state["sessions"][f"{slug}/{u}"])
+        self.assertEqual(sorted(state["projects"]), [SLUG_A, SLUG_B])
+        # a second commit has nothing to commit
+        self.assertIn("nothing is staged", self._refused("--commit"))
+        # re-run with a changed roll-up: staged as an update, committed as a dated section
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc["note_markdown"] = "Alpha shipped the widget."
+        p.write_text(json.dumps(doc))
+        rc, c, _ = self._run()
+        self.assertEqual((c["notes_created"], c["notes_updated"], c["notes_unchanged"]), (0, 1, 1))
+        self.assertIn("note: update to the existing note", (self.staged / "review.md").read_text())
+        self.assertIn("note: unchanged (nothing new)", (self.staged / "review.md").read_text())
+        self.assertNotIn("Alpha shipped the widget.", (self.ndir / f"{SLUG_A}.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["notes_created"], c["notes_updated"], c["notes_unchanged"]), (0, 1, 1))
+        note = (self.ndir / f"{SLUG_A}.md").read_text()
+        self.assertEqual(note.count("## Update "), 1)
+        self.assertIn(f"## Update {self.m.today()}\n\nAlpha shipped the widget.", note)
+        self.assertIn("Alpha builds widgets.", note)
+        self.assertEqual((self.mem / "MEMORY.md").read_text().count("](claude_import.md)"), 1)
+
+    def test_commit_row_skipped_on_budget_refusal_file_kept(self):
+        self._run()
+        rc, c, err = self._run("--commit", runner=_refuse)
+        self.assertEqual(rc, 0)
+        self.assertFalse(c["memory_row"])
+        self.assertIn("refused", err)
+        self.assertTrue((self.mem / "claude_import.md").is_file())
+        self.assertEqual((self.mem / "MEMORY.md").read_text(), "- [Existing lesson](existing.md) — keep me\n")
+        self.assertEqual(self._status()["phase"], "done")
+        self.assertFalse(self._status()["memory_row"])
+
+    def test_commit_applies_the_memory_cap(self):
+        index = json.loads((self.data / "index.json").read_text())
+        for i in range(60):
+            slug = f"-Users-o-Projects-long{i:02d}"
+            index["projects"][slug] = {"slug": slug, "cwd": f"/Users/o/Projects/long{i:02d}", "session_count": 60 - i,
+                                       "first_ts": "2026-06-01T00:00:00Z", "last_ts": "2026-06-02T00:00:00Z", "sessions": []}
+            (self.data / "projects" / f"{slug}.json").write_text(json.dumps({
+                "project": slug, "name": f"Project number {i:02d} with a long name", "status": "active",
+                "what_it_is": "what it is " * 12, "top_open_thread": "open thread " * 12,
+                "note_markdown": "long " * 50}))
+        index["counts"] = {"sessions": 500, "projects": 62}
+        (self.data / "index.json").write_text(json.dumps(index))
+        rc, c, _ = self._run()
+        self.assertEqual(c["projects"], 62)
+        self.assertLessEqual(c["memory_bytes"], 2000)
+        rc, c, _ = self._run("--commit")
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertLessEqual(len(mem.encode()), 2000)
+        self.assertIn("Imported 500 sessions / 62 projects", mem)
+        self.assertIn("more projects in notes/claude-import/overview.md", mem)
+        self.assertEqual(len(list(self.ndir.glob("*.md"))), 63)
+
+    def test_commit_projects_lands_one_and_keeps_the_other_staged(self):
+        self._run()
+        rc, c, _ = self._run("--commit", "--projects", "alpha")       # a unique part of the slug
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["committed"], c["staged_remaining"], c["projects"]), (1, 1, 1))
+        self.assertEqual((c["sessions"], c["summarized"]), (2, 2))
+        self.assertEqual(c["people"], 2)      # Ada + Only Alpha: >= 2 citations inside Alpha; the "Person NN"s have one
+        self.assertTrue((self.ndir / f"{SLUG_A}.md").is_file())
+        self.assertFalse((self.ndir / f"{SLUG_B}.md").exists())
+        overview = (self.ndir / "overview.md").read_text()
+        self.assertIn("[Alpha]", overview)
+        self.assertNotIn("[Beta]", overview)
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertIn("Imported 2 sessions / 1 projects", mem)
+        self.assertIn("- Alpha —", mem)
+        self.assertNotIn("- Beta", mem)
+        self.assertIn("](claude_import.md) — 1 projects", (self.mem / "MEMORY.md").read_text())
+        self.assertEqual(self._manifest()["projects"], [SLUG_B])
+        self.assertTrue((self.staged / "notes" / "claude-import" / f"{SLUG_B}.md").is_file())
+        self.assertFalse((self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").exists())
+        review = (self.staged / "review.md").read_text()
+        self.assertIn(f"### Beta (`{SLUG_B}`)", review)
+        self.assertNotIn("### Alpha", review)
+        self.assertIn("covering 2 projects", review)         # the memory file spans landed + pending
+        self.assertEqual(self._status()["phase"], "staged")
+        self.assertEqual(self._status()["staged_remaining"], 1)
+        state = json.loads((self.data / "state.json").read_text())
+        self.assertIn("summarized_at", state["sessions"][f"{SLUG_A}/{U1}"])
+        self.assertNotIn(f"{SLUG_B}/{U3}", state["sessions"])
+        # people for the landed project only, quoting nothing from the pending one
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertEqual([p["name"] for p in payloads], ["Ada Lovelace", "Only Alpha"])
+        self.assertNotIn("b3b3b3b3", payloads[0]["doc"])
+        self.assertIn("a1a1a1a1", payloads[0]["doc"])
+        # plain --people-json while a review is pending prints the staged copy
+        rc, pending, _ = self._run("--people-json")
+        self.assertEqual(pending, json.loads((self.staged / "people.json").read_text()))
+        # ...then the rest
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["committed"], c["staged_remaining"], c["projects"], c["sessions"]), (1, 0, 2, 3))
+        self.assertIn("Imported 3 sessions / 2 projects", (self.mem / "claude_import.md").read_text())
+        index = (self.mem / "MEMORY.md").read_text()
+        self.assertIn("](claude_import.md) — 2 projects", index)
+        self.assertEqual(index.count("](claude_import.md)"), 1)
+        self.assertTrue((self.ndir / f"{SLUG_B}.md").is_file())
+        self.assertFalse(self.staged.exists())
+        self.assertEqual(self._status()["phase"], "done")
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(len(payloads), 25)
+
+    def test_commit_selector_must_match_exactly_one(self):
+        self._run()
+        self.assertIn("matches 2 staged projects", self._refused("--commit", "--projects", "Projects"))
+        self.assertIn("no staged project matches 'nope'", self._refused("--commit", "--projects", "nope"))
+        self.assertSinksUntouched()
+        self.assertEqual(self._manifest()["projects"], [SLUG_A, SLUG_B])
+        # the exact slug, typed with its leading dash, is accepted
+        rc, c, _ = self._run("--commit", "--projects", SLUG_B)
+        self.assertEqual((c["committed"], c["staged_remaining"]), (1, 1))
+
+    def test_stale_staged_set_is_refused(self):
+        self._run()
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc["note_markdown"] = "Alpha changed after the owner read the digest."
+        p.write_text(json.dumps(doc))
+        msg = self._refused("--commit")
+        self.assertIn("stale", msg)
+        self.assertSinksUntouched()
+        self.assertTrue((self.staged / "review.md").is_file())
+        self.assertFalse((self.data / "state.json").exists())
+        # a summary change alone is enough
+        self._run()
+        (self.data / "summaries" / SLUG_B / f"{U3}.json").write_text(json.dumps({"session": U3, "summary": "new"}))
+        self.assertIn("stale", self._refused("--commit"))
+        # staging again clears it
+        self._run()
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(c["committed"], 2)
+        self.assertIn("Alpha changed after the owner read the digest.", (self.ndir / f"{SLUG_A}.md").read_text())
+
+    def test_commit_with_nothing_staged_is_refused(self):
+        msg = self._refused("--commit")
+        self.assertIn("nothing is staged", msg)
+        self.assertSinksUntouched()
+        self.assertFalse((self.data / "status.json").exists())
+        # a discarded set is not a staged set either
+        self._run()
+        self._run("--discard")
+        self.assertIn("nothing is staged", self._refused("--commit"))
+        self.assertSinksUntouched()
+
+    def test_finalize_helper_is_stage_plus_commit(self):
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stderr(io.StringIO()):
+            c = self.m.finalize(data_dir=self.data, ws=self.ws, memory_dir=self.mem, run_kind="onboarding")
+        self.assertEqual((c["committed"], c["projects"], c["people_merged"]), (2, 2, 0))
+        self.assertFalse(self.staged.exists())
+        self.assertIn("| onboarding*", (self.ndir / f"{SLUG_A}.md").read_text())
+
+
+class TestDiscardAndForget(Base):
+    def test_discard_projects_drops_one(self):
+        self._run()
+        rc, r, _ = self._run("--discard", "--projects", "beta")
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"discarded": 1, "staged_remaining": 1})
+        self.assertEqual(self._manifest()["projects"], [SLUG_A])
+        self.assertFalse((self.staged / "notes" / "claude-import" / f"{SLUG_B}.md").exists())
+        self.assertTrue((self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").is_file())
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn("### Beta", review)
+        self.assertIn("### Alpha", review)
+        self.assertEqual(self._status()["phase"], "staged")
+        self.assertSinksUntouched()
+        self.assertTrue((self.data / "projects" / f"{SLUG_B}.json").is_file())   # only the staged copy went
+        rc, r, _ = self._run("--discard")
+        self.assertEqual(r, {"discarded": 1, "staged_remaining": 0})
+        self.assertFalse(self.staged.exists())
+        self.assertEqual(self._status()["phase"], "discarded")
+        self.assertSinksUntouched()
+        self.assertIn("nothing is staged", self._refused("--discard"))
+
+    def test_forget_rerenders_a_pending_review(self):
+        self._run()
+        rc, r, _ = self._run("--forget", SLUG_A)
+        self.assertEqual(rc, 0)
+        self.assertEqual((r["rollup"], r["staged"], r["note"]), (1, 1, 0))
+        self.assertEqual(self._manifest()["projects"], [SLUG_B])
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn("### Alpha", review)
+        self.assertNotIn("Only Alpha", review)
+        self.assertNotIn("Ada Lovelace", review)          # one citation left after Alpha went
+        self.assertSinksUntouched()
+        rc, c, _ = self._run("--commit")                  # not stale: the review was re-rendered
+        self.assertEqual((c["committed"], c["projects"]), (1, 1))
+        self.assertTrue((self.ndir / f"{SLUG_B}.md").is_file())
+
+
+class TestMerge(unittest.TestCase):
+    def setUp(self):
+        self.m = _load()
+
+    def test_shared_email_is_one_person(self):
+        people = [
+            {"name": "Michael", "email": "michael@actoneventures.com", "role": "Partner",
+             "citations": [_cite(SLUG_A, U1, "intro call")]},
+            {"name": "Michael Silton", "email": "michael@actoneventures.com", "role": "General Partner",
+             "company": "Act One Ventures", "citations": [_cite(SLUG_A, U2, "term sheet")]},
+        ]
+        merged, n = self.m.merge_people(people)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(merged), 1)
+        m = merged[0]
+        self.assertEqual(m["name"], "Michael Silton")
+        self.assertEqual(m["email"], "michael@actoneventures.com")
+        self.assertEqual(m["role"], "General Partner")          # the more specific one
+        self.assertEqual(m["company"], "Act One Ventures")
+        self.assertEqual([c["quote_or_context"] for c in m["citations"]], ["intro call", "term sheet"])
+        self.assertNotIn("emails", m)                          # one address: no list
+        # a second address on either side is unioned; identifiers too
+        people[1]["emails"] = ["Michael@ActOne.vc"]
+        people[1]["identifiers"] = {"x": "@silton"}
+        m = self.m.merge_people(people)[0][0]
+        self.assertEqual(m["emails"], ["michael@actoneventures.com", "Michael@ActOne.vc"])
+        self.assertEqual(m["identifiers"], {"x": "@silton", "emails": ["michael@actoneventures.com", "Michael@ActOne.vc"]})
+
+    def test_first_name_folds_into_its_unique_full_name(self):
+        people = [
+            {"name": "Qingyun", "citations": [_cite(SLUG_A, U1, "q1")]},
+            {"name": "Qingyun Wu", "citations": [_cite(SLUG_A, U2, "q2")]},
+            {"name": "Chi", "citations": [_cite(SLUG_B, U3, "c1")]},
+            {"name": "Chi Wang", "role": "advisor", "citations": [_cite(SLUG_A, U1, "c2")]},
+            {"name": "Alejandro", "citations": [_cite(SLUG_A, U1, "a1")]},
+            {"name": "Alejandro Guerrero", "citations": [_cite(SLUG_A, U2, "a2"), _cite(SLUG_A, U1, "a1")]},
+            {"name": "John", "citations": [_cite(SLUG_A, U1, "j0")]},
+            {"name": "John Smith", "citations": [_cite(SLUG_A, U1, "j1")]},
+            {"name": "John Doe", "citations": [_cite(SLUG_A, U2, "j2")]},
+        ]
+        before = copy.deepcopy(people)
+        merged, n = self.m.merge_people(people)
+        self.assertEqual(n, 3)
+        self.assertEqual([p["name"] for p in merged],
+                         ["Qingyun Wu", "Chi Wang", "Alejandro Guerrero", "John", "John Smith", "John Doe"])
+        chi = merged[1]
+        self.assertEqual(chi["role"], "advisor")
+        self.assertEqual([c["quote_or_context"] for c in chi["citations"]], ["c2", "c1"])
+        self.assertEqual([c["quote_or_context"] for c in merged[2]["citations"]], ["a2", "a1"])
+        self.assertEqual(people, before)                                                        # pure
+        self.assertEqual(self.m.merge_people(people), (merged, n))                             # deterministic
+
+    def test_case_insensitive_fold_keeps_the_fuller_spelling(self):
+        merged, n = self.m.merge_people([{"name": "qingyun", "citations": []}, {"name": "Qingyun  Wu", "citations": []}])
+        self.assertEqual((n, [p["name"] for p in merged]), (1, ["Qingyun Wu"]))
+
+    def test_conflicting_emails_block_the_fold(self):
+        people = [{"name": "Chi", "email": "chi@a.example", "citations": []},
+                  {"name": "Chi Wang", "email": "chi.wang@b.example", "citations": []}]
+        merged, n = self.m.merge_people(people)
+        self.assertEqual((n, len(merged)), (0, 2))
+        # one side without an email is not a conflict
+        del people[0]["email"]
+        merged, n = self.m.merge_people(people)
+        self.assertEqual((n, merged[0]["name"], merged[0]["email"]), (1, "Chi Wang", "chi.wang@b.example"))
+
+    def test_multi_token_names_never_merge_by_name(self):
+        people = [{"name": "Chi Wang", "citations": [_cite(SLUG_A, U1)]},
+                  {"name": "Chi Wang", "citations": [_cite(SLUG_A, U2)]}]
+        self.assertEqual(self.m.merge_people(people)[1], 0)
+        people[0]["email"] = people[1]["email"] = "chi@example.com"
+        merged, n = self.m.merge_people(people)              # ...but a shared email still does
+        self.assertEqual((n, len(merged), len(merged[0]["citations"])), (1, 1, 2))
+        # a bare token with two fuller matches stays, and so do both matches
+        people = [{"name": "Ada"}, {"name": "Ada Lovelace"}, {"name": "Ada Byron"}]
+        self.assertEqual(self.m.merge_people(people)[1], 0)
+        # junk entries are dropped, not merged
+        self.assertEqual(self.m.merge_people([None, "x", {"name": "Solo"}])[0], [{"name": "Solo"}])
+
+    def test_email_inside_a_name_is_an_identifier_not_a_name(self):
+        # Seen on the owner's real history: the summariser wrote "Cyrus (cyrus@x.com)".
+        people = [{"name": "Cyrus (cyrus@onspark.com)", "citations": [_cite(SLUG_A, U1)]},
+                  {"name": "Cyrus", "email": "cyrus@onspark.com", "citations": [_cite(SLUG_A, U2)]},
+                  {"name": "Rui <rui@ag2.ai>", "citations": [_cite(SLUG_B, U3)]}]
+        merged, n = self.m.merge_people(people)
+        names = sorted(p["name"] for p in merged)
+        self.assertEqual((n, names), (1, ["Cyrus", "Rui"]))
+        cyrus = next(p for p in merged if p["name"] == "Cyrus")
+        self.assertEqual(len(cyrus["citations"]), 2)
+        self.assertIn("cyrus@onspark.com", [e.lower() for e in self.m._emails_of(cyrus)])
+        rui = next(p for p in merged if p["name"] == "Rui")
+        self.assertIn("rui@ag2.ai", [e.lower() for e in self.m._emails_of(rui)])
+
+    def test_companies_merge_by_name(self):
+        companies = [{"name": "Analytical", "citations": [_cite(SLUG_A, U1, "x")]},
+                     {"name": "analytical ", "what": "engines", "relationship": "customer",
+                      "citations": [_cite(SLUG_B, U3, "y"), _cite(SLUG_A, U1, "x")]},
+                     {"name": "Other Co", "citations": []}]
+        merged, n = self.m.merge_companies(companies)
+        self.assertEqual(n, 1)
+        self.assertEqual([c["name"] for c in merged], ["Analytical", "Other Co"])
+        self.assertEqual(merged[0]["what"], "engines")
+        self.assertEqual([c["quote_or_context"] for c in merged[0]["citations"]], ["x", "y"])
+        self.assertEqual(self.m.merge_companies(companies), (merged, n))
+        ents, counts = self.m.merge_entities({"people": [], "companies": companies, "deals": []})
+        self.assertEqual(counts, {"people_merged": 0, "companies_merged": 1})
+        self.assertEqual(ents["deals"], [])
+
+
+class TestMergeInTheFlow(Base):
+    def test_duplicates_are_folded_before_selection_and_reported(self):
+        ents_path = self.data / "entities.json"
+        ents = json.loads(ents_path.read_text())
+        ents["people"].append({"name": "Ada", "email": "ADA@example.com",
+                               "citations": [_cite(SLUG_B, U3, "asked about the bridge round")]})
+        ents["people"].append({"name": "Only", "citations": [_cite(SLUG_A, U1, "standup")]})   # -> "Only Alpha"
+        ents["companies"].append({"name": "ANALYTICAL", "citations": [_cite(SLUG_B, U3)]})
+        ents_path.write_text(json.dumps(ents))
+        raw = ents_path.read_bytes()
+        rc, c, _ = self._run()
+        self.assertEqual((c["people_merged"], c["companies_merged"], c["people"]), (2, 1, 25))
+        self.assertEqual(ents_path.read_bytes(), raw)         # never written back
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("- Ada Lovelace — investor; CTO · Analytical (4 citations)\n", review)
+        self.assertIn("- Only Alpha — colleague (3 citations)\n", review)
+        self.assertNotIn("- Ada —", review)
+        self.assertIn("_2 duplicate people entries were merged first", review)
+        ada = json.loads((self.staged / "people.json").read_text())[0]
+        self.assertEqual(ada["name"], "Ada Lovelace")
+        self.assertIn("asked about the bridge round", ada["doc"])
+        self.assertEqual(ada["identifiers"], {"emails": ["ada@example.com"]})
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people_merged"], c["companies_merged"]), (2, 1))
+        self.assertEqual(self._status()["people_merged"], 2)
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads[0]["name"], "Ada Lovelace")
+        self.assertEqual(sum(1 for p in payloads if p["name"].startswith("Ada")), 1)
+
+
+
+class TestCliEdges(Base):
+    def test_string_selectors_and_purge(self):
+        rc, doc, _ = self._run("--stage", "--projects", "alpha", "--purge-dumps")
+        self.assertEqual((rc, doc["projects"], doc["purged_files"]), (0, 1, 2))
+        c = self.m.stage(data_dir=self.data, ws=self.ws, projects="alpha,beta")
+        self.assertEqual(c["projects"], 2)
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stderr(io.StringIO()):
+            c = self.m.commit(data_dir=self.data, ws=self.ws, memory_dir=self.mem, projects=SLUG_A)
+        self.assertEqual((c["committed"], c["staged_remaining"]), (1, 1))
+        r = self.m.discard(data_dir=self.data, ws=self.ws, projects=SLUG_B)
+        self.assertEqual(r, {"discarded": 1, "staged_remaining": 0})
+        self.assertEqual(self._status()["phase"], "discarded")
+
+    def test_human_output_lines(self):
+        out = io.StringIO()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--stage"])
+            self.m.main(["--workspace", str(self.ws), "--memory-dir", str(self.mem), "--commit", "--purge-dumps"])
+        text = out.getvalue()
+        self.assertIn("staged 2 projects (3/3 sessions summarised", text)
+        self.assertIn("nothing saved yet", text)
+        self.assertIn("committed 2 projects (0 still staged): 3/3 sessions summarised, 2 projects in", text)
+        self.assertIn("MEMORY.md row written", text)
+        self.assertFalse((self.data / "dumps").exists())
+
+    def test_purge_dumps_alone_from_the_cli(self):
+        rc, doc, _ = self._run("--purge-dumps")
+        self.assertEqual((rc, doc), (0, {"purged_files": 2}))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = self.m.main(["--workspace", str(self.ws), "--purge-dumps"])
+        self.assertEqual((rc, out.getvalue().strip()), (0, "purged 0 dump files"))
+        self.assertSinksUntouched()
+
+    def test_commit_refuses_when_a_rollup_vanished_after_staging(self):
+        self._run("--stage")
+        fp = self._manifest()["fingerprint"]
+        (self.data / "projects" / f"{SLUG_B}.json").unlink()
+        with patch.object(self.m, "inputs_fingerprint", return_value=fp):
+            msg = self._refused("--commit")
+        self.assertIn("no roll-up any more", msg)
+        self.assertSinksUntouched()
+
+    def test_commit_refreshes_a_summarized_at_older_than_the_extraction(self):
+        self._run("--stage")
+        state = {"sessions": {f"{SLUG_A}/{U1}": {"extracted_at": "2026-09-01T00:00:00Z",
+                                                  "summarized_at": "2026-08-01T00:00:00Z"}}, "projects": {}}
+        (self.data / "state.json").write_text(json.dumps(state))
+        rc, _doc, _ = self._run("--commit")
+        self.assertEqual(rc, 0)
+        rec = json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_A}/{U1}"]
+        self.assertGreater(rec["summarized_at"], rec["extracted_at"])
+
+
+KNOWN_ADA = {"id": "k1", "slug": "ada-lovelace", "name": "A. Lovelace", "email": "Ada@Example.com",
+             "identifiers": {"emails": ["ada.l@other.example"]}}
+HIDDEN = "Hidden"      # every string a held session carries starts with this; none may surface
+
+
+class TestKnownPeople(Base):
+    """Part 1: a person the store already has is never overwritten or duplicated."""
+
+    def _known(self, entries):
+        path = self.tmp / "known-people.json"
+        path.write_text(json.dumps(entries))
+        return str(path)
+
+    def test_email_match_gives_an_update_payload_without_a_doc(self):
+        rc, c, _ = self._run("--stage", "--known-people", self._known([KNOWN_ADA]))
+        self.assertEqual(rc, 0)
+        # the cap of 25 applies to NEW people only: Ada rides on top of it
+        self.assertEqual((c["people"], c["people_existing"], c["people_new"], c["people_ambiguous"]), (26, 1, 25, 0))
+        self.assertEqual(self._manifest()["known_people"], "checked")
+        self.assertEqual(self._status()["people_existing"], 1)
+        people = json.loads((self.staged / "people.json").read_text())
+        ada = people[0]
+        self.assertEqual(ada["existing"], {"id": "k1", "slug": "ada-lovelace", "name": "A. Lovelace", "matched_on": "email"})
+        self.assertNotIn("doc", ada)
+        self.assertEqual((ada["id"], ada["slug"], ada["source"]), ("k1", "ada-lovelace", "claude-import"))
+        self.assertEqual(ada["email"], "Ada@Example.com")                                   # the store's spelling stays primary
+        self.assertEqual(ada["identifiers"], {"emails": ["Ada@Example.com", "ada.l@other.example"]})   # merged, case-insensitive
+        self.assertEqual(ada["last_interaction_at"], "2026-08-05T10:00:00Z")
+        self.assertTrue(ada["doc_append"].startswith(f"## Imported from Claude Code ({self.m.today()})\n\n"))
+        self.assertIn("Recent interactions:\n- 2026-08-05 — Widget polish: talked about the raise\n", ada["doc_append"])
+        self.assertIn("Claims and citations:\n", ada["doc_append"])
+        self.assertEqual(ada["doc_append"].count("## "), 1)
+        for p in people[1:]:
+            self.assertIsNone(p["existing"])
+            self.assertIn("doc", p)
+            self.assertNotIn("doc_append", p)
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("Already in your People store — will gain new interactions (1):\n"
+                      "- Ada Lovelace — matched on email (3 citations)\n", review)
+        self.assertIn("New — will be added (25):\n", review)
+        self.assertNotIn("Store not checked", review)
+        self.assertTrue((self.staged / "known-people.json").is_file())
+        self.assertEqual(stat.S_IMODE((self.staged / "known-people.json").stat().st_mode), 0o600)
+
+    def test_name_match_folds_diacritics_and_two_entries_are_ambiguous(self):
+        known = [{"id": "k2", "slug": "only-alpha", "name": " Ónly  Álpha "},
+                 {"id": "k3", "slug": "person-00", "name": "Person 00"},
+                 {"id": "k4", "slug": "person-00-2", "name": "PERSON 00"}]
+        rc, c, _ = self._run("--stage", "--known-people", self._known(known))
+        self.assertEqual((c["people_existing"], c["people_ambiguous"]), (1, 1))
+        people = json.loads((self.staged / "people.json").read_text())
+        only = next(p for p in people if p["name"] == "Only Alpha")
+        self.assertEqual(only["existing"]["matched_on"], "name")
+        self.assertEqual(only["slug"], "only-alpha")
+        self.assertNotIn("doc", only)
+        self.assertNotIn("email", only)                                    # no address on either side
+        self.assertNotIn("Person 00", [p["name"] for p in people])         # ambiguous: never upserted from here
+        self.assertEqual(self._manifest()["people_ambiguous"], [{
+            "name": "Person 00", "citations": 2,
+            "matches": [{"id": "k3", "slug": "person-00", "name": "Person 00"},
+                        {"id": "k4", "slug": "person-00-2", "name": "PERSON 00"}]}])
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("Needs your call (1) — not upserted until you say who they are:\n"
+                      "- Person 00 (2 citations) — your store has 2 entries with this name: "
+                      "Person 00 (person-00), PERSON 00 (person-00-2)\n", review)
+        self.assertIn("- Only Alpha — matched on name (2 citations)\n", review)
+
+    def test_unchecked_store_marks_every_payload_new(self):
+        rc, c, _ = self._run("--stage")
+        self.assertEqual((c["people_existing"], c["people_new"], c["people_ambiguous"]), (0, 25, 0))
+        self.assertEqual(self._manifest()["known_people"], "not checked")
+        self.assertFalse((self.staged / "known-people.json").exists())
+        self.assertTrue(all(p["existing"] is None and "doc" in p
+                            for p in json.loads((self.staged / "people.json").read_text())))
+        self.assertIn("_Store not checked (People tool unavailable)", (self.staged / "review.md").read_text())
+
+    def test_store_listing_survives_restage_commit_and_people_json(self):
+        kp = self._known([KNOWN_ADA])
+        self._run("--stage", "--known-people", kp)
+        rc, c, _ = self._run("--commit", "--projects", "beta")          # Alpha is re-staged without the flag
+        self.assertEqual(self._manifest()["known_people"], "checked")
+        ada = json.loads((self.staged / "people.json").read_text())[0]
+        self.assertEqual(ada["existing"]["matched_on"], "email")
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")     # recomputed from the staged copy
+        self.assertEqual(payloads[0]["existing"]["id"], "k1")
+        self.assertNotIn("doc", payloads[0])
+        self.assertIn("a2a2a2a2", payloads[0]["doc_append"])
+        self.assertNotIn("b3b3b3b3", payloads[0]["doc_append"])
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], c["people_existing"]), (26, 1))
+        approved = self.data / "people.json"
+        self.assertEqual(stat.S_IMODE(approved.stat().st_mode), 0o600)
+        rc, payloads, _ = self._run("--people-json")                          # the last commit's approved copy
+        self.assertEqual(payloads, json.loads(approved.read_text()))
+        self.assertEqual(payloads[0]["existing"]["slug"], "ada-lovelace")
+        # a recompute with an explicit listing, and one with none at all
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha", "--known-people", kp)
+        self.assertEqual(payloads[0]["existing"]["id"], "k1")
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertIsNone(payloads[0]["existing"])
+        self.assertIn("doc", payloads[0])
+
+    def test_forget_keeps_the_store_match_in_the_revoked_export(self):
+        self._run("--stage", "--known-people", self._known([KNOWN_ADA]))
+        self._run("--commit")
+        inputs = json.loads((self.data / "approved" / "people-inputs.json").read_text())
+        self.assertEqual(inputs["known_people"], [KNOWN_ADA])
+        rc, r, _ = self._run("--forget", "beta")
+        self.assertEqual(r["people_revoked"], 24)                              # the "Person NN"s: one citation left
+        export = json.loads((self.data / "people.json").read_text())
+        self.assertEqual([p["name"] for p in export], ["Ada Lovelace", "Only Alpha"])
+        ada = export[0]
+        self.assertEqual((ada["existing"]["id"], ada["existing"]["matched_on"], ada["slug"]), ("k1", "email", "ada-lovelace"))
+        self.assertNotIn("doc", ada)                                           # still an UPDATE, never a fresh dossier
+        self.assertNotIn(U3[:8], ada["doc_append"])
+        self.assertIn(U1[:8], ada["doc_append"])
+        self.assertEqual(ada["identifiers"], {"emails": ["Ada@Example.com", "ada.l@other.example"]})
+
+    def test_people_doc_merge_cli_is_idempotent(self):
+        existing = self.tmp / "existing.md"
+        existing.write_text("# Ada Lovelace\n\n## Contact\n- Email: ada@example.com\n\n"
+                            "## Imported from Claude Code (2026-01-01)\n\nold import\n\n## Notes\n- keep me\n")
+        append = self.tmp / "append.md"
+        append.write_text("## Imported from Claude Code (2026-01-01)\n\nRecent interactions:\n- new line\n")
+        rc, out, _ = self._run("--people-doc-merge", "--existing-doc", str(existing), "--append", str(append))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "# Ada Lovelace\n\n## Contact\n- Email: ada@example.com\n\n"
+                              "## Imported from Claude Code (2026-01-01)\n\nRecent interactions:\n- new line\n\n"
+                              "## Notes\n- keep me\n")
+        self.assertNotIn("old import", out)
+        existing.write_text(out)
+        rc, again, _ = self._run("--people-doc-merge", "--existing-doc", str(existing), "--append", str(append))
+        self.assertEqual(again, out)
+        self.assertIn("needs --existing-doc", self._refused("--people-doc-merge", "--append", str(append)))
+        self.assertIn("cannot read --known-people", self._refused("--stage", "--known-people", str(self.tmp / "nope.json")))
+
+
+UNREVIEWED = "Unreviewed"     # every string a changed-but-not-approved roll-up carries starts with this
+
+
+class TestApprovedSnapshots(Base):
+    """PR #4127 review: committing B rebuilt the memory file and overview from
+    A's CURRENT roll-up, so a re-run of A's roll-up that nobody reviewed landed
+    in shared memory. Both are now rebuilt from the approved snapshots."""
+
+    def _rewrite_alpha_unreviewed(self):
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc.update({"what_it_is": f"{UNREVIEWED} widget text", "top_open_thread": f"{UNREVIEWED} thread",
+                    "summary": f"{UNREVIEWED} summary", "note_markdown": f"{UNREVIEWED} body"})
+        p.write_text(json.dumps(doc))
+        return doc
+
+    def _snapshot(self, slug):
+        return json.loads((self.data / "approved" / f"{slug}.json").read_text())
+
+    def test_committing_beta_never_refreshes_alpha_from_an_unreviewed_rollup(self):
+        self._run("--stage", "--projects", "alpha")
+        rc, c, _ = self._run("--commit")
+        snap = self._snapshot(SLUG_A)
+        self.assertEqual(snap["rollup"]["what_it_is"], "A widget builder")
+        self.assertEqual(snap["rollup_hash"], self.m.rollup_hash(json.loads((self.data / "projects" / f"{SLUG_A}.json").read_text())))
+        self.assertEqual(stat.S_IMODE((self.data / "approved").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.data / "approved" / f"{SLUG_A}.json").stat().st_mode), 0o600)
+        self.assertEqual(c["changed_since_approval"], 0)
+        # the coordinator re-runs Alpha's roll-up; nobody has reviewed the new text
+        self._rewrite_alpha_unreviewed()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((rc, c["changed_since_approval"], c["projects"]), (0, 1, 1))
+        self.assertEqual(self._manifest()["changed_since_approval"], [SLUG_A])
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn(UNREVIEWED, review)
+        self.assertIn(f"Changed since approval (1) — kept in memory and the overview as you approved them:\n"
+                      f"- Alpha (`{SLUG_A}`) — changed since approval — bring in {SLUG_A} to refresh\n", review)
+        self.assertIn("covering 2 projects", review)
+        for rel in ("memory/claude_import.md", "notes/claude-import/overview.md"):
+            text = (self.staged / rel).read_text()
+            self.assertNotIn(UNREVIEWED, text, rel)
+            self.assertIn("A widget builder", text, rel)                       # the approved text, previewed
+        rc, c, _ = self._run("--commit")                                       # "bring it in" for Beta
+        self.assertEqual((c["committed"], c["projects"]), (1, 2))
+        mem = (self.mem / "claude_import.md").read_text()
+        overview = (self.ndir / "overview.md").read_text()
+        for text in (mem, overview, (self.ndir / f"{SLUG_A}.md").read_text()):
+            self.assertNotIn(UNREVIEWED, text)
+        self.assertIn("- Alpha — A widget builder; active; open: ship the widget", mem)
+        self.assertIn("- Beta — A launch plan; paused", mem)
+        self.assertIn(f"- [Alpha]({SLUG_A}.md) — A widget builder · active", overview)
+        self.assertEqual(self._snapshot(SLUG_A)["rollup"]["what_it_is"], "A widget builder")
+        # only "bring in alpha" refreshes it: the digest then shows the new text as an update to review
+        rc, c, _ = self._run("--stage", "--projects", "alpha")
+        self.assertEqual(c["changed_since_approval"], 0)
+        review = (self.staged / "review.md").read_text()
+        self.assertIn(f"{UNREVIEWED} summary", review)
+        self.assertIn("note: update to the existing note", review)
+        self.assertNotIn("changed since approval", review)
+        rc, c, _ = self._run("--commit", "--projects", "alpha")
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertIn(f"- Alpha — {UNREVIEWED} widget text; active; open: {UNREVIEWED} thread", mem)
+        self.assertIn(f"{UNREVIEWED} widget text", (self.ndir / "overview.md").read_text())
+        self.assertIn(f"## Update {self.m.today()}\n\n{UNREVIEWED} body", (self.ndir / f"{SLUG_A}.md").read_text())
+        self.assertEqual(self._snapshot(SLUG_A)["rollup"]["what_it_is"], f"{UNREVIEWED} widget text")
+
+    def test_a_landed_project_without_a_readable_snapshot_is_never_rebuilt_from_disk(self):
+        self._run()
+        self._run("--commit")
+        (self.data / "approved" / f"{SLUG_A}.json").write_text("[]")          # not a snapshot any more
+        self._rewrite_alpha_unreviewed()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((c["changed_since_approval"], self._manifest()["changed_since_approval"]), (1, [SLUG_A]))
+        self.assertIn(f"bring in {SLUG_A} to refresh", (self.staged / "review.md").read_text())
+        self.assertIn("covering 1 projects", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        mem = (self.mem / "claude_import.md").read_text()
+        self.assertNotIn(UNREVIEWED, mem)
+        self.assertNotIn("- Alpha", mem)
+        self.assertNotIn(UNREVIEWED, (self.ndir / "overview.md").read_text())
+        self.assertEqual(self.m.approved_rollups(self.data, {"projects": {SLUG_A: {}, SLUG_B: {}}}).keys(), {SLUG_B})
+        self.assertEqual(self.m.changed_since_approval(self.data, {}, {"projects": {SLUG_A: {}}}), [])
+
+
+class TestApprovedPeopleInputs(Base):
+    """PR #4127 review, the same class as the snapshots: --commit recomputed
+    every landed project's people from the live entities.json, so an entities
+    re-run between two commits put citations nobody had reviewed into
+    people.json. Now a landed project outside the commit keeps the citations
+    it was approved with, and the digest names it until it is brought in."""
+
+    def _rerun_entities_for_alpha(self):
+        """What a second entities pass leaves behind: Alpha gains a person and Ada a citation."""
+        p = self.data / "entities.json"
+        ents = json.loads(p.read_text())
+        ents["people"][0]["citations"].append(_cite(SLUG_A, U2, f"{UNREVIEWED} ada citation"))
+        ents["people"].append({"name": f"Aaron {UNREVIEWED}", "relationship": "advisor",
+                               "citations": [_cite(SLUG_A, U1, "one"), _cite(SLUG_A, U2, "two")]})
+        p.write_text(json.dumps(ents))
+
+    def _inputs(self):
+        return json.loads((self.data / "approved" / "people-inputs.json").read_text())
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def test_committing_beta_never_lands_alphas_unreviewed_people(self):
+        self._run("--stage", "--projects", "alpha")
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], c["people_changed_since_approval"]), (2, 0))
+        inputs = self._inputs()
+        self.assertEqual(list(inputs["people_hashes"]), [SLUG_A])
+        self.assertEqual(inputs["people_hashes"][SLUG_A], self.m.project_people_hash(inputs["entities"], SLUG_A))
+        # the coordinator re-runs the entities pass; nobody has reviewed what it added to Alpha
+        self._rerun_entities_for_alpha()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((rc, c["people_changed_since_approval"], c["changed_since_approval"]), (0, 1, 0))
+        self.assertEqual(self._manifest()["people_changed_since_approval"], [SLUG_A])
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn(UNREVIEWED, review)
+        self.assertIn(f"Changed since approval (1) — kept in your People export as you approved them:\n"
+                      f"- Alpha (`{SLUG_A}`) — changed since approval — bring in {SLUG_A} to refresh\n\n## Memory\n", review)
+        self.assertNotIn("kept in memory and the overview", review)
+        rc, c, _ = self._run("--commit")                                       # "bring it in" for Beta
+        self.assertEqual((c["committed"], c["projects"], c["people_changed_since_approval"]), (1, 2, 1))
+        export = self._export()
+        self.assertNotIn(UNREVIEWED, json.dumps(export))
+        ada = next(p for p in export if p["name"] == "Ada Lovelace")
+        self.assertEqual(ada["doc"].count("Claude Code session"), 3)         # Alpha's two as approved + Beta's one
+        self.assertIn(U3[:8], ada["doc"])
+        self.assertNotIn(UNREVIEWED, json.dumps(self._inputs()))
+        self.assertEqual(sorted(self._inputs()["people_hashes"]), [SLUG_A, SLUG_B])
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads, export)
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")   # a landed project: its approved payloads
+        self.assertEqual([p["name"] for p in payloads], ["Ada Lovelace", "Only Alpha"])
+        self.assertNotIn(UNREVIEWED, json.dumps(payloads))
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])                                         # nobody has two citations inside Beta
+        # only "bring in alpha" lands the additions: the digest shows them first
+        rc, c, _ = self._run("--stage", "--projects", "alpha")
+        self.assertEqual(c["people_changed_since_approval"], 0)
+        review = (self.staged / "review.md").read_text()
+        self.assertIn(f"- Aaron {UNREVIEWED} — advisor (2 citations)\n", review)
+        self.assertNotIn("changed since approval", review)
+        rc, c, _ = self._run("--commit", "--projects", "alpha")
+        self.assertEqual(c["people_changed_since_approval"], 0)
+        export = self._export()
+        self.assertIn(f"Aaron {UNREVIEWED}", [p["name"] for p in export])
+        ada = next(p for p in export if p["name"] == "Ada Lovelace")
+        self.assertIn(f"{UNREVIEWED} ada citation", ada["doc"])
+        self.assertEqual(ada["doc"].count("Claude Code session"), 4)
+        self.assertIn(UNREVIEWED, json.dumps(self._inputs()))
+
+    def test_a_landed_project_without_approved_inputs_is_flagged_and_lands_nothing(self):
+        self._run("--stage", "--projects", "alpha")
+        self._run("--commit")
+        (self.data / "approved" / "people-inputs.json").unlink()
+        self._rerun_entities_for_alpha()
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        self.assertEqual((c["people_changed_since_approval"], self._manifest()["people_changed_since_approval"]), (1, [SLUG_A]))
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], c["people_changed_since_approval"]), (0, 1))
+        self.assertEqual(self._export(), [])
+        self.assertNotIn(UNREVIEWED, json.dumps(self._inputs()))
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertEqual(payloads, [])
+        self.assertIsNone(self.m.approved_people_entities(self.data, None))
+        self.assertIsNone(self.m.approved_people_entities(self.data, {"-nope"}))
+
+    def test_union_keeps_the_reviewed_fields_and_adds_the_approved_citations(self):
+        m = self.m
+        live = {"generated_at": "now", "people": [
+            {"name": "Ada L.", "email": "", "role": "CEO", "citations": [_cite(SLUG_B, U3, "b")]},
+            {"name": "Only Alpha", "email": "only@a.example", "citations": [_cite(SLUG_B, U3, "b2")]},
+            {"name": "Grace (grace@h.example)", "citations": [_cite(SLUG_B, U3, "g")]}],
+            "companies": [{"name": "analytical", "what": "", "citations": [_cite(SLUG_B, U3)]}],
+            "deals": [], "open_threads": [],
+            "decisions": [{"decision": "d", "project": SLUG_B, "citations": [_cite(SLUG_B, U3)]}]}
+        prev = {"people": [
+            {"name": "Ada Lovelace", "email": "ada@example.com", "role": "Chief Technology Officer",
+             "citations": [_cite(SLUG_A, U1, "a")]},
+            {"name": "Only Alpha", "email": "other@a.example", "citations": [_cite(SLUG_A, U1, "a2")]},
+            {"name": "ada l.", "role": "Chief Executive Officer", "company": "Analytical",
+             "citations": [_cite(SLUG_A, U2, "a3"), _cite(SLUG_B, U3, "b")]},
+            {"name": "Grace Hopper", "email": "grace@h.example", "role": "Admiral",
+             "identifiers": {"emails": ["g@navy.example"], "x": "@grace"}, "citations": [_cite(SLUG_A, U1, "ga")]},
+            "junk"],
+            "companies": [{"name": "Analytical", "what": "a firm", "citations": [_cite(SLUG_A, U1)]}],
+            "deals": [], "open_threads": [],
+            "decisions": [{"decision": "d", "project": SLUG_B, "citations": [_cite(SLUG_A, U1)]},
+                          {"decision": "e", "project": SLUG_A, "citations": [_cite(SLUG_A, U1)]}]}
+        out = m.union_entities(live, prev)
+        self.assertEqual(out["generated_at"], "now")
+        self.assertEqual([p["name"] for p in out["people"]],
+                         ["Ada L.", "Only Alpha", "Grace", "Ada Lovelace", "Only Alpha"])
+        ada = out["people"][0]                        # "ada l." is the same person by name: fields stay as reviewed
+        self.assertEqual((ada["email"], ada["role"], ada.get("company")), ("", "CEO", None))
+        self.assertEqual([c["quote_or_context"] for c in ada["citations"]], ["b", "a3"])
+        self.assertEqual(out["people"][1]["citations"], [_cite(SLUG_B, U3, "b2")])   # two addresses: not the same
+        grace = out["people"][2]                      # matched on the email inside the name; gains the rest
+        self.assertEqual(grace, {"name": "Grace", "email": "grace@h.example",
+                                 "emails": ["grace@h.example", "g@navy.example"],
+                                 "identifiers": {"emails": ["grace@h.example", "g@navy.example"], "x": "@grace"},
+                                 "citations": [_cite(SLUG_B, U3, "g"), _cite(SLUG_A, U1, "ga")]})
+        self.assertEqual(out["companies"], [{"name": "analytical", "what": "",
+                                             "citations": [_cite(SLUG_B, U3), _cite(SLUG_A, U1)]}])
+        self.assertEqual([len(d["citations"]) for d in out["decisions"]], [2, 1])
+        self.assertFalse(m._same_person({"name": ""}, {"name": ""}))
+        # the fingerprint: this project's citations and the reviewed fields, never an email
+        h = m.project_people_hash(out, SLUG_B)
+        self.assertEqual(h, m.project_people_hash(live, SLUG_B))
+        self.assertNotEqual(h, m.project_people_hash(prev, SLUG_B))
+        self.assertEqual(m.project_people_hash({"people": ["junk", {"name": "x", "citations": [{"project": SLUG_B}]}]}, SLUG_B),
+                         m.project_people_hash({"people": [{"name": "X", "citations": [{"project": SLUG_B, "session": 7}]}]}, SLUG_B))
+        self.assertEqual(m.load_people_inputs(self.data), {})
+        self.assertEqual(m.people_changed_since_approval(self.data, out, {"projects": {SLUG_B: {}}}), [SLUG_B])
+
+
+class TestStagedPeopleMatchTheDigest(Base):
+    """PR #4127 review, `finalize.py` `approved_entities_after` / `_absorb`: with a
+    person cited twice by an approved project and once by the selected one, `--stage`
+    computed a selected-only people set (below the floor -> absent from staged
+    people.json and review.md), yet `--commit` unioned in the approved project's
+    citations and published a role change nobody reviewed. Now `--stage` computes the
+    published post-union set, the digest previews the concrete field change, and a
+    full `--commit` publishes the staged set verbatim."""
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def test_stage_previews_a_shared_persons_role_change_and_commit_publishes_it(self):
+        self._run("--stage", "--projects", "alpha")          # Ada lands via alpha: role CTO, 2 alpha cites
+        self._run("--commit")
+        self.assertIn("Role: CTO", next(p for p in self._export() if p["name"] == "Ada Lovelace")["doc"])
+        # the coordinator re-runs entities and Ada's role changes; only beta is staged and
+        # beta cites Ada once — below the floor alone, over it after the union with alpha
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"][0]["role"] = "Principal Engineer"
+        (self.data / "entities.json").write_text(json.dumps(ents))
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("Updates to people already in your export", review)
+        self.assertIn("Ada Lovelace — role: CTO → Principal Engineer", review)
+        staged_ada = next(p for p in json.loads((self.staged / "people.json").read_text())
+                          if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: Principal Engineer", staged_ada["doc"])
+        self.assertNotIn("Role: CTO", staged_ada["doc"])
+        rc, c, _ = self._run("--commit")                     # "bring it in" for beta
+        published_ada = next(p for p in self._export() if p["name"] == "Ada Lovelace")
+        self.assertEqual(published_ada["doc"], staged_ada["doc"])     # exactly what the digest showed
+        self.assertIn("Role: Principal Engineer", published_ada["doc"])
+        self.assertNotIn("Role: CTO", published_ada["doc"])
+
+    def test_a_change_the_digest_does_not_show_keeps_the_approved_fields(self):
+        self._run("--stage", "--projects", "alpha")
+        self._run("--commit")
+        # Ada's role changes live AND beta no longer cites her: beta contributes nothing, so
+        # the published Ada comes entirely from alpha's approved fields — nothing to review
+        ents = json.loads((self.data / "entities.json").read_text())
+        ents["people"][0]["role"] = "VP Engineering"
+        ents["people"][0]["citations"] = [_cite(SLUG_A, U1), _cite(SLUG_A, U2)]
+        (self.data / "entities.json").write_text(json.dumps(ents))
+        rc, c, _ = self._run("--stage", "--projects", "beta")
+        review = (self.staged / "review.md").read_text()
+        self.assertNotIn("VP Engineering", review)
+        staged_ada = next(p for p in json.loads((self.staged / "people.json").read_text())
+                          if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: CTO", staged_ada["doc"])        # the approved role, not the live one
+        self.assertNotIn("VP Engineering", staged_ada["doc"])
+        rc, c, _ = self._run("--commit")
+        published_ada = next(p for p in self._export() if p["name"] == "Ada Lovelace")
+        self.assertIn("Role: CTO", published_ada["doc"])
+        self.assertNotIn("VP Engineering", published_ada["doc"])
+
+    def _known(self, entries):
+        path = self.tmp / "known-people.json"
+        path.write_text(json.dumps(entries))
+        return str(path)
+
+    def test_a_subset_commit_cuts_a_shown_person_to_the_landed_citations(self):
+        # Ada 2×Alpha + 1×Beta (in the store), Only Alpha 2×Alpha, 27 "Person NN" 1×Alpha + 1×Beta
+        self._run("--stage", "--known-people", self._known([KNOWN_ADA]))
+        shown = [p["name"] for p in json.loads((self.staged / "people.json").read_text())]
+        self.assertEqual(len(shown), 26)                                    # Ada (existing) + 25 new
+        rc, c, _ = self._run("--commit", "--projects", "alpha")            # "bring in alpha"
+        export = self._export()
+        self.assertEqual([p["name"] for p in export], ["Ada Lovelace", "Only Alpha"])   # the staged order
+        self.assertLessEqual({p["name"] for p in export}, set(shown))
+        ada = export[0]
+        self.assertEqual((ada["existing"]["id"], ada["slug"]), ("k1", "ada-lovelace"))     # still the UPDATE payload
+        self.assertNotIn("doc", ada)
+        self.assertIn(U1[:8], ada["doc_append"])
+        self.assertNotIn(U3[:8], json.dumps(export))                       # Beta's citation waits for Beta
+        rc, payloads, _ = self._run("--people-json", "--projects", "alpha")
+        self.assertEqual([p["name"] for p in payloads], ["Ada Lovelace", "Only Alpha"])
+        # the "Person NN"s fell under the floor inside Alpha: Beta's re-staged digest shows them again
+        self.assertIn("Person 00", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(c["people"], 26)
+
+
+U4 = "b4b4b4b4-0000-4000-8000-000000000004"
+AAA = [f"Aaa Person {i:02d}" for i in range(25)]     # 25 Alpha-only people whose names sort first;
+ZED = "Zed Hidden"                                   # the one Beta-only person the cap pushes out
+
+
+class TestSubsetCommitStaysInsideTheDigest(Base):
+    """PR #4127 review, `finalize.py` `commit()` `--projects` branch: a subset commit
+    recomputed the capped top-25 over the narrowed projects, so with 25 Alpha-only
+    people and one Beta-only person (two citations each; the Alpha names sort ahead)
+    a full stage showed only the 25 Alpha names, yet `--commit --projects beta`
+    published the Beta-only person nobody had seen. Now a subset publishes only the
+    people staged/people.json lists, cut to the landed projects' citations; the
+    project-only view needs `--stage --projects <slug>` and that digest's yes."""
+
+    def setUp(self):
+        super().setUp()
+        p = self.data / "index.json"
+        index = json.loads(p.read_text())
+        index["projects"][SLUG_B]["sessions"].append(
+            {"uuid": U4, "title": "Beta retro", "first_ts": "2026-07-21T08:00:00Z", "last_ts": "2026-07-21T09:00:00Z"})
+        index["projects"][SLUG_B]["session_count"] = 2
+        p.write_text(json.dumps(index))
+        (self.data / "summaries" / SLUG_B / f"{U4}.json").write_text(
+            json.dumps({"session": U4, "project": SLUG_B, "title": "t", "summary": "s"}))
+        p = self.data / "projects" / f"{SLUG_B}.json"
+        doc = json.loads(p.read_text())
+        doc["sessions"] = [U3, U4]
+        p.write_text(json.dumps(doc))
+        people = [{"name": n, "relationship": "contact", "citations": [_cite(SLUG_A, U1), _cite(SLUG_A, U2)]}
+                  for n in AAA]
+        people.append({"name": ZED, "relationship": "advisor", "citations": [_cite(SLUG_B, U3), _cite(SLUG_B, U4)]})
+        (self.data / "entities.json").write_text(json.dumps(
+            {"people": people, "companies": [], "deals": [], "decisions": [], "open_threads": []}))
+
+    def _export(self):
+        return json.loads((self.data / "people.json").read_text())
+
+    def _staged_names(self):
+        return [p["name"] for p in json.loads((self.staged / "people.json").read_text())]
+
+    def test_bring_in_beta_publishes_nobody_the_full_digest_did_not_list(self):
+        rc, c, _ = self._run("--stage")                                   # Alpha + Beta
+        self.assertEqual((c["people"], self._staged_names()), (25, AAA))  # the cap: Zed is not shown
+        self.assertNotIn(ZED, (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit", "--projects", "beta")            # "bring in beta"
+        self.assertEqual((rc, c["committed"], c["staged_remaining"], c["people"]), (0, 1, 1, 0))
+        self.assertEqual(self._export(), [])                               # nobody shown has a Beta citation
+        self.assertNotIn(ZED, json.dumps(self._export()))
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])                    # a landed project's payloads: never one the export lacks
+        # Alpha is re-staged: the cap still hides Zed behind the 25 names, so the next commit cannot land them
+        self.assertEqual(self._manifest()["projects"], [SLUG_A])
+        self.assertEqual(self._staged_names(), AAA)
+        self.assertNotIn(ZED, (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual([p["name"] for p in self._export()], AAA)
+        self.assertNotIn(ZED, json.dumps(self._export()))
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])
+
+    def test_staging_beta_alone_shows_the_hidden_person_and_then_publishes_them(self):
+        rc, c, _ = self._run("--stage", "--projects", "beta")             # the control: a project-only digest
+        self.assertEqual((c["people"], self._staged_names()), (1, [ZED]))
+        self.assertIn(f"- {ZED} — advisor (2 citations)", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit", "--projects", "beta")
+        self.assertEqual((c["people"], [p["name"] for p in self._export()]), (1, [ZED]))
+        zed = self._export()[0]
+        self.assertIn(U3[:8], zed["doc"])
+        self.assertIn(U4[:8], zed["doc"])
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual([p["name"] for p in payloads], [ZED])
+
+    # Revocation (--forget-session / --forget / --hold) shrinks the published set and adds nobody: the
+    # three tests below fail on 9c437622, where the shrink re-ranked people-inputs.json and surfaced Zed.
+
+    def _publish_the_capped_set(self, sticky=5):
+        """Stage + commit Alpha and Beta; the first `sticky` Aaa people carry a second Alpha-U2 citation,
+        so they survive the loss of U1 while the other Aaa people fall to one citation.
+
+        PR #4127 review, `refresh_people_export`: after the full commit published the 25 Aaa names,
+        revoking the first Alpha session re-cut approved/people-inputs.json from scratch — every approved
+        person, the cap included — so the freed slots went to Zed, whom no digest had ever shown, and the
+        export became [Zed] with `people_revoked=24`. A revocation now starts from people.json, drops the
+        revoked citations and whoever falls under the floor, and never adds a person or a citation."""
+        p = self.data / "entities.json"
+        ents = json.loads(p.read_text())
+        for person in ents["people"][:sticky]:
+            person["citations"].append(_cite(SLUG_A, U2, "a second polish thread"))
+        p.write_text(json.dumps(ents))
+        self._run("--stage")
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["people"], [q["name"] for q in self._export()]), (25, AAA))
+        return AAA[:sticky]
+
+    def assertRevokedWithin(self, before, r, expect):
+        """The export after a revocation: exactly `expect` (an order-preserving subset of `before`),
+        `people_revoked` the removals, and --people-json printing that export verbatim."""
+        after = [q["name"] for q in self._export()]
+        self.assertEqual(after, expect)
+        self.assertEqual([n for n in before if n in after], after)       # a subset, in the published order
+        self.assertNotIn(ZED, json.dumps(self._export()))
+        self.assertEqual(r["people_revoked"], len(before) - len(expect))
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads, self._export())
+        rc, payloads, _ = self._run("--people-json", "--projects", "beta")
+        self.assertEqual(payloads, [])                                   # Beta never published anyone
+
+    def test_forget_session_never_surfaces_a_person_the_cap_hid(self):
+        sticky = self._publish_the_capped_set()
+        rc, r, _ = self._run("--forget-session", U1)                      # the first Alpha session
+        self.assertEqual((rc, r["landed"], r["entities_dropped"]), (0, True, 0))
+        self.assertRevokedWithin(AAA, r, sticky)
+        for q in self._export():                                          # the revoked citation is gone from every dossier
+            self.assertNotIn(U1[:8], q["doc"])
+            self.assertIn(U2[:8], q["doc"])
+        rc, r, _ = self._run("--forget-session", U2)                      # now everyone shown is under the floor
+        self.assertRevokedWithin(sticky, r, [])
+
+    def test_forget_a_project_never_surfaces_a_person_the_cap_hid(self):
+        self._publish_the_capped_set()
+        rc, r, _ = self._run("--forget", "alpha")                         # Beta stays landed; Zed stays unseen
+        self.assertEqual((rc, r["approved"]), (0, 1))
+        self.assertRevokedWithin(AAA, r, [])
+        self.assertEqual(json.loads((self.data / "approved" / "people-inputs.json").read_text())["projects"], [SLUG_B])
+
+    def test_hold_never_surfaces_a_person_the_cap_hid(self):
+        sticky = self._publish_the_capped_set()
+        # a re-extraction rewrote U1's state record without its summarized_at, so a hold is not refused as "landed"
+        p = self.data / "state.json"
+        state = json.loads(p.read_text())
+        state["sessions"][f"{SLUG_A}/{U1}"] = {"extracted_at": "2026-09-02T00:00:00Z"}
+        p.write_text(json.dumps(state))
+        rc, r, _ = self._run("--hold", U1)
+        self.assertEqual((rc, r["held"]), (0, 1))
+        self.assertRevokedWithin(AAA, r, sticky)
+
+    def test_within_reviewed_matches_by_email_then_name_in_the_reviewed_order(self):
+        within = self.m.within_reviewed
+        a = {"name": "Ada Lovelace", "email": "ada@example.com", "doc": "a"}
+        a2 = {"name": "A. Lovelace", "identifiers": {"emails": ["ADA@example.com"]}, "doc": "a2"}   # same email
+        b = {"name": "Grace Hopper", "doc": "b"}
+        b2 = {"name": "grace  hopper", "doc": "b2"}                                                 # same name
+        c = {"name": "Grace Hopper", "email": "other@example.com", "doc": "c"}
+        c2 = {"name": "Grace Hopper", "email": "third@example.com", "doc": "c2"}                     # emails never meet
+        self.assertEqual(within([b, a, "junk", {"name": "Nobody"}], [a2, b2, 7]), [b2, a2])
+        self.assertEqual(within([c], [c2]), [])
+        self.assertEqual(within([c], [b2]), [b2])                          # one side without an email: by name
+        self.assertEqual(within([], [a]), [])
+        self.assertEqual(self.m._payload_person({"name": "X", "identifiers": "junk"}),
+                         {"name": "X", "email": None, "identifiers": {}})
+
+
+class HeldBase(Base):
+    def _mark_personal(self, slug, uuid, reason="family matter", drop_from_rollup=True):
+        """What the classifier + coordinator leave behind: a `personal` summary
+        whose every string is a canary, and a roll-up written without it."""
+        p = self.data / "summaries" / slug / f"{uuid}.json"
+        doc = json.loads(p.read_text())
+        doc.update({"personal": True, "personal_reason": reason, "title": f"{HIDDEN} title",
+                    "summary": f"{HIDDEN} summary text", "people": [{"name": f"{HIDDEN} Person"}]})
+        p.write_text(json.dumps(doc))
+        if drop_from_rollup:
+            r = self.data / "projects" / f"{slug}.json"
+            rd = json.loads(r.read_text())
+            rd["sessions"] = [u for u in rd["sessions"] if u != uuid]
+            r.write_text(json.dumps(rd))
+        ents_path = self.data / "entities.json"
+        ents = json.loads(ents_path.read_text())
+        ents["people"].append({"name": f"{HIDDEN} Person", "relationship": "relative",
+                               "citations": [_cite(slug, uuid, f"{HIDDEN} quote"), _cite(slug, uuid, f"{HIDDEN} quote two")]})
+        ents["open_threads"].append({"thread": f"{HIDDEN} thread", "project": slug, "citations": [_cite(slug, uuid)]})
+        ents_path.write_text(json.dumps(ents))
+
+    def _held_section(self):
+        review = (self.staged / "review.md").read_text()
+        return review.split("## Held back as personal", 1)[1]
+
+    def assertNothingHidden(self):
+        for path in list(self.staged.rglob("*")) + list(self.ndir.glob("*.md")) + list(self.mem.glob("*.md")):
+            if path.is_file():
+                self.assertNotIn(HIDDEN, path.read_text(errors="replace"), path.name)
+
+
+class TestHeld(HeldBase):
+    """Part 2: a personal session contributes nothing and is never quoted."""
+
+    def test_held_session_is_absent_from_every_sink_and_the_review_body(self):
+        self._mark_personal(SLUG_B, U3)
+        rc, c, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["summarized"], c["held"], c["stale_rollups"]), (2, 2, 1, 0))
+        self.assertEqual(c["people"], 2)                    # the "Person NN"s lost their Beta citation
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("2 sessions across 2 projects", review)
+        self.assertIn(f"### Beta (`{SLUG_B}`)\n\ndir `/Users/o/Projects/beta` · 0 sessions", review)
+        self.assertIn("A launch plan", review)              # the roll-up was written without it: not stale
+        self.assertIn("## Held back as personal (1)\n\n2026-07-20 · family matter\n\n"
+                      "Say 'include <date>' to add one, 'include personal' for all, or 'hold <date>' to hold one "
+                      "the classifier missed; held sessions are never quoted.\n", review)
+        self.assertTrue(review.rstrip().endswith("---\n" + FOOTER))
+        self.assertNothingHidden()
+        self.assertEqual(self._manifest()["held"], [{"project": SLUG_B, "session": U3, "date": "2026-07-20",
+                                                     "reason": "family matter", "held": "personal"}])
+        self.assertNotIn(HIDDEN, (self.staged / "manifest.json").read_text())
+        self.assertNotIn(U3[:8], (self.staged / "notes" / "claude-import" / f"{SLUG_B}.md").read_text())
+        self.assertIn("Imported 2 sessions across 2 projects", (self.staged / "notes" / "claude-import" / "overview.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(rc, 0)
+        self.assertEqual((c["sessions"], c["held"], c["committed"]), (2, 1, 2))
+        self.assertIn("Imported 2 sessions / 2 projects", (self.mem / "claude_import.md").read_text())
+        state = json.loads((self.data / "state.json").read_text())
+        self.assertNotIn(f"{SLUG_B}/{U3}", state["sessions"])              # never landed
+        for u in (U1, U2):
+            self.assertIn("summarized_at", state["sessions"][f"{SLUG_A}/{u}"])
+        self.assertNothingHidden()
+        rc, payloads, _ = self._run("--people-json")
+        self.assertNotIn(HIDDEN, json.dumps(payloads))
+        rc, rows, _ = self._run("--held-json")
+        self.assertEqual(rows, [{"project": SLUG_B, "session": U3, "date": "2026-07-20",
+                                 "reason": "family matter", "held": "personal"}])
+
+    def test_include_round_trip_marks_the_rollup_stale_until_it_is_rerun(self):
+        self._mark_personal(SLUG_B, U3)
+        self._run()
+        rc, r, _ = self._run("--include", "2026-07-20")
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"included": 1, "held_remaining": 0, "stale_rollups": 1, "staged_remaining": 2})
+        self.assertEqual(json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_B}/{U3}"],
+                         {"personal_override": "include"})
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("3 sessions across 2 projects", review)
+        self.assertIn("## Held back as personal (0)", review)
+        self.assertIn("roll-up: stale (written without an included session) — re-run before it can land", review)
+        self.assertIn(self.m.STALE_ROLLUP_TEXT, review)
+        self.assertNotIn("A launch plan", review)                     # a stale roll-up shows nothing it wrote
+        self.assertIn(self.m.STALE_ROLLUP_TEXT, (self.staged / "notes" / "claude-import" / f"{SLUG_B}.md").read_text())
+        self.assertEqual(self._manifest()["stale_rollups"], {SLUG_B: "written without an included session"})
+        self.assertEqual(self._status()["stale_rollups"], 1)
+        self.assertIn("stale roll-up", self._refused("--commit"))
+        self.assertIn("stale roll-up", self._refused("--commit", "--projects", "beta"))
+        self.assertSinksUntouched()
+        # the coordinator re-runs Beta's roll-up over its sessions, now including U3
+        p = self.data / "projects" / f"{SLUG_B}.json"
+        doc = json.loads(p.read_text())
+        doc["sessions"] = [U3]
+        p.write_text(json.dumps(doc))
+        rc, c, _ = self._run()
+        self.assertEqual((c["sessions"], c["held"], c["stale_rollups"]), (3, 0, 0))
+        self.assertIn("A launch plan", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual((c["committed"], c["sessions"]), (2, 3))
+        self.assertIn("summarized_at", json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_B}/{U3}"])
+        # a re-summarisation that flags it again does not override the owner's call
+        self._mark_personal(SLUG_B, U3, drop_from_rollup=False)
+        rc, rows, _ = self._run("--held-json")
+        self.assertEqual(rows, [])
+
+    def test_include_personal_lifts_every_hold(self):
+        self._mark_personal(SLUG_A, U1, reason="health")
+        self._mark_personal(SLUG_B, U3, reason="one two three four five six seven")
+        rc, c, _ = self._run()
+        self.assertEqual((c["sessions"], c["held"]), (1, 2))
+        self.assertIn("2026-07-20 · one two three four five six, 2026-08-01 · health", self._held_section())
+        self.assertIn("no held session matches '2026-01-01'", self._refused("--include", "2026-01-01"))
+        rc, r, _ = self._run("--include-personal")
+        self.assertEqual((r["included"], r["held_remaining"], r["stale_rollups"]), (2, 0, 2))
+        self.assertIn("nothing is held", self._refused("--include-personal"))
+        self.assertIn("## Held back as personal (0)", (self.staged / "review.md").read_text())
+
+    def test_hold_a_session_the_classifier_missed(self):
+        self._run()
+        rc, r, _ = self._run("--hold", "2026-08-05")                        # U2, listed in Alpha's roll-up
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"held": 1, "held_total": 1, "stale_rollups": 1, "staged_remaining": 2,
+                             "people_revoked": 0})
+        self.assertEqual(json.loads((self.data / "state.json").read_text())["sessions"][f"{SLUG_A}/{U2}"],
+                         {"personal_override": "hold"})
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("2 sessions across 2 projects", review)
+        self.assertIn(f"### Alpha (`{SLUG_A}`)\n\ndir `/Users/o/Projects/alpha` · 1 sessions", review)
+        self.assertIn("roll-up: stale (written with a held session)", review)
+        self.assertNotIn("Alpha is where the owner built", review)
+        self.assertNotIn("Widget polish", (self.staged / "notes" / "claude-import" / f"{SLUG_A}.md").read_text())
+        self.assertIn("## Held back as personal (1)\n\n2026-08-05 · held by you\n", review)
+        self.assertIn("no session matches '2026-08-05'", self._refused("--hold", "2026-08-05"))   # already held
+        self.assertIn("stale roll-up", self._refused("--commit"))
+        rc, r, _ = self._run("--include", U2[:8])                              # a uuid prefix works too
+        self.assertEqual((r["included"], r["held_remaining"], r["stale_rollups"]), (1, 0, 0))
+        self.assertIn("Alpha is where the owner built", (self.staged / "review.md").read_text())
+        rc, c, _ = self._run("--commit")
+        self.assertEqual(c["committed"], 2)
+        msg = self._refused("--hold", "2026-08-01")                          # landed: the note is on disk
+        self.assertIn("already landed", msg)
+        self.assertIn(f"--forget-session {U1}", msg)
+
+    def test_a_date_shared_by_two_sessions_is_refused_with_the_uuids(self):
+        U4 = "44444444-dddd-4ddd-8ddd-dddddddddddd"
+        p = self.data / "index.json"
+        doc = json.loads(p.read_text())
+        doc["counts"]["sessions"] = 4
+        doc["projects"][SLUG_A]["session_count"] = 3
+        doc["projects"][SLUG_A]["sessions"].append({"uuid": U4, "title": "Widget docs", "first_ts": "2026-08-05T14:00:00Z",
+                                                    "last_ts": "2026-08-05T15:00:00Z"})
+        p.write_text(json.dumps(doc))
+        (self.data / "summaries" / SLUG_A / f"{U4}.json").write_text(json.dumps({"session": U4, "project": SLUG_A}))
+        self._run()
+        msg = self._refused("--hold", "2026-08-05")
+        self.assertIn("'2026-08-05' matches 2 sessions — name one by uuid: ", msg)
+        self.assertIn(U2, msg)
+        self.assertIn(U4, msg)
+        self.assertFalse((self.data / "state.json").exists())
+        rc, r, _ = self._run("--hold", U4)
+        self.assertEqual(r["held"], 1)
+        self.assertIn("no session matches 'a2a2'", self._refused("--forget-session", "a2a2"))   # a prefix needs 8 chars
+
+    def test_forget_session_deletes_summary_dumps_and_state(self):
+        (self.data / "dumps" / SLUG_A / f"{U2}.1.txt").write_text("dump")
+        (self.data / "state.json").write_text(json.dumps({"sessions": {
+            f"{SLUG_A}/{U2}": {"extracted_at": "2026-09-01T00:00:00Z", "chunks": 1, "chars": 500}}, "projects": {}}))
+        self._run()
+        rc, r, _ = self._run("--forget-session", "2026-08-05")
+        self.assertEqual(rc, 0)
+        self.assertEqual(r, {"summaries": 2, "dumps": 1, "state_entry": 1, "landed": False,
+                             "entity_citations": 2, "entities_dropped": 0, "people_revoked": 0,
+                             "stale_rollups": 1, "staged_remaining": 2})
+        ents = json.loads((self.data / "entities.json").read_text())
+        self.assertNotIn(U2, json.dumps(ents))                        # its citations went with it
+        self.assertEqual(len(next(p for p in ents["people"] if p["name"] == "Only Alpha")["citations"]), 1)
+        self.assertFalse((self.data / "summaries" / SLUG_A / f"{U2}.json").exists())
+        self.assertFalse((self.data / "summaries" / SLUG_A / f"{U2}.1.json").exists())      # the partial too
+        self.assertTrue((self.data / "summaries" / SLUG_A / f"{U1}.json").exists())
+        self.assertFalse((self.data / "dumps" / SLUG_A / f"{U2}.1.txt").exists())
+        self.assertNotIn(f"{SLUG_A}/{U2}", json.loads((self.data / "state.json").read_text())["sessions"])
+        review = (self.staged / "review.md").read_text()
+        self.assertIn("roll-up: stale (lists a forgotten session)", review)
+        self.assertNotIn("Alpha is where the owner built", review)
+        self.assertIn("stale roll-up", self._refused("--commit"))
+        rc, r, _ = self._run("--forget-session", U2)                  # again: nothing left, nothing refused
+        self.assertEqual((r["summaries"], r["dumps"], r["state_entry"], r["stale_rollups"]), (0, 0, 0, 1))
+        self.assertEqual((r["entity_citations"], r["entities_dropped"]), (0, 0))
+        # a session that already landed can be forgotten too; the note stays
+        p = self.data / "projects" / f"{SLUG_A}.json"
+        doc = json.loads(p.read_text())
+        doc["sessions"] = [U1]
+        p.write_text(json.dumps(doc))
+        self._run()
+        self._run("--commit")
+        self.assertEqual(len(json.loads((self.data / "people.json").read_text())), 25)
+        rc, r, _ = self._run("--forget-session", U1)
+        self.assertEqual((r["landed"], r["summaries"], r["staged_remaining"]), (True, 1, 0))
+        self.assertTrue((self.ndir / f"{SLUG_A}.md").is_file())
+        # the approved People export loses the session's citations: everyone left had one
+        self.assertEqual((r["people_revoked"], r["entities_dropped"]), (25, 2))
+        self.assertEqual(json.loads((self.data / "people.json").read_text()), [])
+        rc, payloads, _ = self._run("--people-json")
+        self.assertEqual(payloads, [])
+
+    def test_human_output_for_the_session_commands(self):
+        self._mark_personal(SLUG_B, U3)
+        self._run()
+        out = io.StringIO()
+        with patch.object(self.m.subprocess, "run", side_effect=_ok), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            base = ["--workspace", str(self.ws), "--memory-dir", str(self.mem)]
+            self.m.main(base + ["--stage"])
+            self.m.main(base + ["--include", "2026-07-20"])
+            self.m.main(base + ["--hold", U3])
+            self.m.main(base + ["--forget-session", U3])
+        text = out.getvalue()
+        self.assertIn("2 people (0 already in the store), 1 held as personal", text)
+        self.assertIn("included 1 held session(s), 0 still held; 1 roll-up(s) now stale, 2 projects staged", text)
+        self.assertIn("held 1 session (1 held in all); 0 roll-up(s) now stale, 2 projects staged", text)
+        self.assertIn("forgot 1 session (1 summary files, 0 dumps); 0 roll-up(s) now stale, 2 projects staged", text)
+        self.assertNotIn(HIDDEN, text)
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False).result
+    sys.exit(0 if result.wasSuccessful() else 1)

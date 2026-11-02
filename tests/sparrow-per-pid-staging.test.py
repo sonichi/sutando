@@ -24,6 +24,11 @@ import sys
 import tempfile
 import unittest
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SPARROW_PY = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
 
@@ -43,15 +48,40 @@ class TestSparrowPerPidStaging(unittest.TestCase):
 
     def test_all_four_state_files_use_per_pid(self):
         code = SPARROW_PY.read_text()
-        # The three single-writer state files (gateway-status / task-rooms /
-        # inflight) are written only by the single-threaded poll loop, so a
-        # per-PID temp name is sufficient.
-        for var in ("GATEWAY_STATUS_FILE", "TASK_ROOMS_FILE", "INFLIGHT_FILE"):
+        # The two single-writer state files (gateway-status / task-rooms) are
+        # written only by the single-threaded poll loop, so per-PID is enough.
+        for var in ("GATEWAY_STATUS_FILE", "TASK_ROOMS_FILE"):
             pat = rf'{var}\.with_suffix\(\s*f["\']\.json\.\{{os\.getpid\(\)\}}\.tmp["\']'
             self.assertRegex(
                 code, pat,
                 f"{var} does not stage under a per-PID temp name",
             )
+        # The durable writer (INFLIGHT_FILE + the task-media / pending-ack sidecars)
+        # is used by two THREADS, so PID-only staging is not enough for it either.
+        self.assertRegex(
+            code, r'_durable_write\(INFLIGHT_FILE,',
+            "INFLIGHT_FILE no longer publishes through the durable writer",
+        )
+        # _stage_durable stages through the shared publisher, whose name is per call.
+        stage_body = code.split("def _stage_durable(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_stage_text(path, text)", stage_body,
+                      "_stage_durable no longer stages through the shared publisher")
+        publisher = (SPARROW_PY.parent / "result_publish.py").read_text()
+        self.assertRegex(
+            publisher,
+            r'tmp = target\.with_name\(f["\']\.\{target\.name\}\.\{os\.getpid\(\)\}'
+            r'\.\{secrets\.token_hex\(8\)\}\{STAGED_SUFFIX\}["\']\)',
+            "the publisher must stage per-invocation (PID + random), not PID-only",
+        )
+        # The ledgers the durable writer serves are read-modify-written from both
+        # threads, so each mutation runs under its own lock (like _INFLIGHT_MUTEX).
+        for fn, mutex in (("_record_task_media", "_TASK_MEDIA_MUTEX"),
+                          ("_forget_task_media", "_TASK_MEDIA_MUTEX"),
+                          ("_record_pending_acks", "_PENDING_ACK_MUTEX"),
+                          ("_forget_pending_ack", "_PENDING_ACK_MUTEX")):
+            body = code.split(f"def {fn}(", 1)[1].split("\ndef ", 1)[0]
+            self.assertIn(f"with {mutex}:", body,
+                          f"{fn} mutates its ledger without holding {mutex}")
         # OWNER_ACTIVITY_FILE is written by FIVE processes AND (for Slack Bolt)
         # multiple threads within one process, so PID-only is NOT enough — it must
         # stage per-INVOCATION (PID + uuid4), unique across processes and threads.

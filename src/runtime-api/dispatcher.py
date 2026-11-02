@@ -84,18 +84,18 @@ EXECUTORS = {
 # real credentials, so an ungated socket client must never reach the gateway
 # (review P1: omitting approvalRequestId silently skipped the gate).
 GOVERNED_ACTIONS = frozenset({"message.send"})
+MIRRORED_REQUEST_TYPES = frozenset({"approval", "elicitation", "human_action"})
 
 
-def _fingerprint(params: dict) -> str:
-    """Canonical identity of an execution: action + resource + input. An
-    idempotency key may only replay a request with the SAME fingerprint —
-    a reused key with different content must be rejected, never report a
-    different side effect as complete (review P1)."""
+def _fingerprint(params: dict, *, include_task: bool = True) -> str:
+    """Bind the exact effect and any supplied task context."""
     import hashlib
-    canon = json.dumps({"action": params.get("action"),
-                        "resource": params.get("resource"),
-                        "input": params.get("input")},
-                       sort_keys=True, ensure_ascii=False)
+    bound = {"action": params.get("action"),
+             "resource": params.get("resource"),
+             "input": params.get("input")}
+    if include_task and params.get("taskId") is not None:
+        bound["taskId"] = params["taskId"]
+    canon = json.dumps(bound, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
@@ -117,7 +117,7 @@ class RuntimeDispatcher:
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
                  agents_view=None, identity_view=None, tasks_view=None,
-                 runtime_view=None, schedules_view=None,
+                 runtime_view=None, schedules_view=None, connections_view=None,
                  capability_registry: Optional[EphemeralCapabilityRegistry] = None,
                  granted_methods: frozenset = frozenset()):
         self.store = store
@@ -134,6 +134,7 @@ class RuntimeDispatcher:
         self.tasks = tasks_view
         self.runtime = runtime_view
         self.schedules = schedules_view
+        self.connections = connections_view
         self.capability_registry = (
             capability_registry if capability_registry is not None
             else EphemeralCapabilityRegistry())
@@ -154,7 +155,7 @@ class RuntimeDispatcher:
         approval by design."""
         n = relinked = 0
         for rec in self.store.pending():
-            if rec["requestType"] in ("approval", "elicitation", "human_action"):
+            if rec["requestType"] in MIRRORED_REQUEST_TYPES:
                 self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
                 relinked += 1
             elif rec["requestType"] == "capability":
@@ -174,6 +175,7 @@ class RuntimeDispatcher:
                                      "needs a new approval)"},
                     resolved_by="daemon-recovery")
                 n += 1
+        self._reconcile_expired()
         if relinked or n:
             _log(f"recovered {relinked} pending request(s)"
                  + (f", failed {n} interrupted capability execution(s)" if n else ""))
@@ -289,6 +291,34 @@ class RuntimeDispatcher:
                 raise ProtocolError(-32601,
                                     "schedule surface is not configured on this daemon")
             return self.schedules.list_schedules()
+        if method.startswith("connection."):
+            if self.connections is None:
+                raise ProtocolError(-32601,
+                                    "connections surface is not configured on this daemon")
+            if method == "connection.list":
+                return self.connections.list_connections()
+            if method == "connection.known_servers":
+                return self.connections.known_servers()
+            if method == "connection.add":
+                return self.connections.add(params)
+            if method == "connection.remove":
+                return self.connections.remove(params)
+            if method == "connection.set_primary":
+                return self.connections.set_primary(params)
+            if method == "connection.promote":
+                return self.connections.promote(params)
+            if method == "connection.unpark":
+                return self.connections.unpark(params)
+            if method == "connection.park":
+                return self.connections.park(params)
+            if method == "connection.park_legacy":
+                return self.connections.park_legacy(params)
+            if method == "connection.disconnect":
+                return self.connections.disconnect(params)
+            if method == "connection.reconnect":
+                return self.connections.reconnect(params)
+            if method == "connection.update_token":
+                return self.connections.update_token(params)
         if method.startswith("task."):
             return self._task(method, params)
         raise ProtocolError(-32601, f"unknown method {method}")
@@ -301,10 +331,17 @@ class RuntimeDispatcher:
             if method == "task.submit":
                 if not params.get("task"):
                     raise ProtocolError(-32602, "missing required param: task")
+                if "idempotencyKey" in params:
+                    return self.tasks.submit_idempotent(
+                        params["task"], idempotency_key=params["idempotencyKey"],
+                        priority=params.get("priority") or "normal")
                 return self.tasks.submit(params["task"],
                                          priority=params.get("priority") or "normal")
             if method == "task.list":
-                return self.tasks.list_tasks()
+                unfinished_only = params.get("unfinishedOnly", False)
+                if not isinstance(unfinished_only, bool):
+                    raise ProtocolError(-32602, "unfinishedOnly must be a boolean")
+                return self.tasks.list_tasks(unfinished_only=unfinished_only)
             if method == "task.list_results":
                 return self.tasks.list_results()
             if method == "task.get_result":
@@ -436,10 +473,16 @@ class RuntimeDispatcher:
             # A key replays ONLY the identical execution — a different
             # fingerprint under the same key is a caller bug and must not
             # report the earlier side effect as this call's result.
-            if existing.get("fingerprint") != fp:
+            persisted = existing.get("fingerprint")
+            original = existing.get("params")
+            replay_match = (isinstance(original, dict)
+                            and _fingerprint(original) == fp
+                            and persisted in (_fingerprint(original),
+                                              _fingerprint(original, include_task=False)))
+            if not replay_match:
                 raise ProtocolError(-32602,
                                     f"idempotencyKey {idem_key!r} was used for a "
-                                    "different action/resource/input — keys are "
+                                    "different action/resource/input or task — keys are "
                                     "per-execution, pick a new one")
             return {"requestId": existing["requestId"],
                     "status": existing["status"],
@@ -482,7 +525,7 @@ class RuntimeDispatcher:
             if _fingerprint(ap) != fp:
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} is bound to a different "
-                                    "resource/input than this execution — the owner "
+                                    "resource/input or task than this execution — the owner "
                                     "approves the exact effect, payload included")
         # Record creation + approval consumption are ONE durable transaction
         # (review P1: consume-then-create left a window where a crash between
@@ -560,7 +603,12 @@ class RuntimeDispatcher:
         rec = self._require(params)
         self.store.transition(rec["requestId"], "cancelled",
                               resolved_by=self.actor_id)
-        return self._public(self.store.get(rec["requestId"]))
+        rec = self.store.get(rec["requestId"])
+        if rec["status"] == "cancelled" and rec["requestType"] in MIRRORED_REQUEST_TYPES:
+            # A previous mirror write may have failed, even before a restart.
+            self.ha.cancel(self._ha_of.get(rec["requestId"])
+                           or ha_action_id(rec["requestId"]))
+        return self._public(rec)
 
     def _require(self, params: dict) -> dict:
         rid = params.get("requestId")
@@ -581,6 +629,10 @@ class RuntimeDispatcher:
     # ── resolution mapping (ha decision → runtime terminal state) ──────────
     def _settle(self, request_id: str) -> None:
         rec = self.store.get(request_id)
+        if (rec and rec["status"] == "expired"
+                and rec["requestType"] in MIRRORED_REQUEST_TYPES):
+            self.ha.expire(request_id)
+            return
         if not rec or rec["status"] != "pending":
             return
         aid = self._ha_of.get(request_id)
@@ -622,9 +674,17 @@ class RuntimeDispatcher:
                                   result={"answer": answer},
                                   resolved_by=resolved_by)
 
+    def _reconcile_expired(self) -> None:
+        for rec in self.store.expired(MIRRORED_REQUEST_TYPES):
+            try:
+                self._settle(rec["requestId"])
+            except Exception as e:  # A failed mirror remains eligible on the next pass.
+                _log(f"requirement expiry error for {rec['requestId']} (isolated): {e}")
+
     async def resolver_loop(self) -> None:
         while True:
             try:
+                self._reconcile_expired()
                 for rec in self.store.pending():
                     self._settle(rec["requestId"])
             except Exception as e:  # noqa: BLE001 — resolver must never die

@@ -72,11 +72,28 @@ WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
 mkdir -p "$STATE_DIR" "$WORKSPACE/results"
 MARKER="$STATE_DIR/$CHANNEL.started"
+# A deliberate restart (src/restart.sh) stamps this; an exit inside the window is
+# not a crash and gets no owner alert. Same channel alerted within the cooldown: one line, not a stream.
+DELIBERATE="$STATE_DIR/deliberate-restart"
+DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
+ALERT_STAMP="$STATE_DIR/$CHANNEL.last-alert"
+ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
+_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
 emit_restart_alert() {
   NOW="$(date +%s)"
-  RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt"
   echo "[$CHANNEL-bridge-wrapper] previous process exited; automatically restarting" >&2
-  printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." > "$RESULT"
+  if [ -f "$DELIBERATE" ] && [ "$(_age "$DELIBERATE")" -lt "$DELIBERATE_WINDOW_S" ]; then
+    echo "[$CHANNEL-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
+    return 0
+  fi
+  if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
+    echo "[$CHANNEL-bridge-wrapper] alert cooldown active; not repeating" >&2
+    return 0
+  fi
+  echo "$NOW" > "$ALERT_STAMP"
+  printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." \
+    | "$PYTHON" "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt" \
+    || echo "[$CHANNEL-bridge-wrapper] could not publish the restart alert" >&2
   osascript -e "display notification \"The $CHANNEL bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
@@ -96,7 +113,9 @@ _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
 if [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
-  evict_own_bridge "$CHANNEL" "$REPO"
+  # Best-effort HERE by design: a discovery failure (nonzero return) must not
+  # set -e-abort the wrapper and park the bridge; the singleton lock still holds.
+  evict_own_bridge "$CHANNEL" "$REPO" || echo "[$CHANNEL-bridge-wrapper] eviction skipped (rc=$?)" >&2
 fi
 sleep 0.3
 

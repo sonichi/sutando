@@ -25,12 +25,12 @@ function extractBlock(startMarker: string, endMarker: string): string {
 }
 
 const INLINE_TOOLS_BLOCK = extractBlock(
-	'export const inlineTools = assertUniqueToolNames(',
-	']);',
+	'export const inlineTools = forHostPlatform(assertUniqueToolNames(',
+	']));',
 );
 const OWNER_ONLY_BLOCK = extractBlock(
-	'export const ownerOnlyTools = [',
-	'];',
+	'export const ownerOnlyTools = forHostPlatform([',
+	']);',
 );
 
 describe('inline-tools — presenter-mode sentinel gate (#1171)', () => {

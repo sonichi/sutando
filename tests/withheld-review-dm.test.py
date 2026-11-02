@@ -7,6 +7,11 @@ import pathlib
 import sys
 import tempfile
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
@@ -44,6 +49,8 @@ with tempfile.TemporaryDirectory() as td:
         if (method, path) == ("GET", "/v1/agents"):
             return {"agents": [{"id": "@agent:ag2.space", "owner": "@owner:ag2.space",
                                 "owner_dm_room": "!owner-dm:ag2.space"}]}
+        if path == "/v1/room" and payload.get("op") == "members":
+            return {"members": [{"user_id": "@agent:ag2.space"}, {"user_id": "@owner:ag2.space"}]}
         if path == "/v1/room" and payload.get("op") == "create":
             return {"ok": True, "room_id": "!owner-dm:ag2.space"}
         if path == "/v1/room" and payload.get("op") == "message":
@@ -76,7 +83,7 @@ with tempfile.TemporaryDirectory() as td:
     check(record["status"] == "awaiting_owner" and record["dm_event_id"] == "$review-2",
           "review must bind to the delivered DM event")
     dm_posts = [p for m, u, p in calls
-                if u == "/v1/room" and p.get("room_id") == "!owner-dm:ag2.space"]
+                if u == "/v1/room" and p.get("op") == "message" and p.get("room_id") == "!owner-dm:ag2.space"]
     candidate_dm, decision_dm = dm_posts
     check("sensitive candidate" in candidate_dm["body"]
           and candidate_dm["mentions"] == [],
@@ -152,7 +159,7 @@ with tempfile.TemporaryDirectory() as td:
     room_post = next(p for m, u, p in calls
                      if u == "/v1/room" and p.get("room_id") == "!shared:ag2.space")
     check(room_post["body"] == "sensitive candidate"
-          and room_post["dedupe_key"].startswith("withheld-publish:wr_"),
+          and room_post["dedupe_key"] == f"{published['review_id']}.{published['decision_claim_id']}#0",
           "publication restores the exact body with idempotency")
     control_path = bridge._control_result_path("decision-no")
     check(control_path.is_file(),
@@ -181,8 +188,10 @@ with tempfile.TemporaryDirectory() as td:
     bridge._retry_review_control_results()
     bridge._req = fake_req
     control_posts = [p for _m, u, p in calls if u == "/v1/results"]
+    # Every result carries the voice-outcome contract (docs/remote-gateway-protocol.md).
     check(not control_path.exists() and control_posts[-1] == {
-        "id": "decision-no", "body": "[no-send]"},
+        "id": "decision-no", "body": "[no-send]",
+        "capabilities": ["voice-outcome-v1"], "dm_only": False},
         "the owner decision is consumed without becoming an ordinary agent task")
 
     guard.materialize_withheld_verdict(
@@ -263,6 +272,47 @@ with tempfile.TemporaryDirectory() as td:
           and (retry_path.parent / "archive" / retry_path.name).is_file(),
           "the retry loop must resolve and archive the kept-private review")
 
+    local_path = "/Users/owner/Library/Application Support/app/workspace/data/images/pic.png"
+    marked_body = (
+        "[channel: !elsewhere:ag2.space]\n"
+        "Here is the picture.\n\n"
+        f"[file: {local_path}]\n\n"
+        "A marker shown in code stays: `[file: /tmp/example.png]`")
+    guard.materialize_withheld_verdict(
+        leak, marked_body, bridge._STATE, "task-markers", context,
+        "@agent:ag2.space", now=1003)
+    marked_path = guard.withheld_review_path(bridge._STATE, "task-markers")
+    bridge._route_withheld_review(marked_path)
+    marked_record = json.loads(marked_path.read_text())
+    marked_dm = [p for _m, u, p in calls
+                 if u == "/v1/room" and p.get("room_id") == "!owner-dm:ag2.space"
+                 and marked_record["review_id"] in (p.get("body") or "")]
+    check(any(local_path in p["body"] for p in marked_dm),
+          "the owner's private review still shows the raw candidate, path included")
+    calls_before = len(calls)
+    check(bridge._handle_review_decision({
+        **no_task, "id": "decision-markers", "task": f"No {marked_record['review_id']}"}),
+        "an owner No on a marker-bearing result must be consumed")
+    marked_archive = marked_path.parent / "archive" / marked_path.name
+    check(json.loads(marked_archive.read_text())["status"] == "published",
+          "a marker-bearing result still publishes")
+    new_calls = calls[calls_before:]
+    shared_posts = [p for _m, u, p in new_calls
+                    if u == "/v1/room" and p.get("op") == "message"
+                    and p.get("room_id") == "!shared:ag2.space"]
+    check(len(shared_posts) == 1, "exactly one post to the original room")
+    released = shared_posts[0]["body"]
+    check(local_path not in released and "[file:" not in released.split("`")[0]
+          and "[channel:" not in released,
+          "released text carries no local path and no unparsed control marker")
+    check(released.startswith("Here is the picture.")
+          and "`[file: /tmp/example.png]`" in released
+          and "(1 attachment not published)" in released,
+          "prose and shown-in-code markers survive; the dropped file is noted without its path")
+    check(not any(p and p.get("room_id") == "!elsewhere:ag2.space" for _m, _u, p in new_calls)
+          and not any("/media" in u for _m, u, _p in new_calls),
+          "a release never executes a redirect or uploads a file")
+
     bridge._tier_for = lambda *_args: "team"
     check(not bridge._handle_review_decision({**yes_task, "id": "team-forgery"}),
           "a collaborator cannot release a pending review")
@@ -271,10 +321,10 @@ with tempfile.TemporaryDirectory() as td:
     starvation.mkdir(parents=True)
     for index in range(512):
         (starvation / f"wr_{index:016x}.json").write_text(json.dumps({
-            "review_id": f"wr_{index:016x}", "status": "published"}))
+            "review_id": f"wr_{index:016x}", "status": "published", "withheld_body": "resolved"}))
     target_id = "wr_ffffffffffffffff"
     (starvation / f"{target_id}.json").write_text(json.dumps({
-        "review_id": target_id, "status": "awaiting_owner"}))
+        "review_id": target_id, "status": "awaiting_owner", "withheld_body": "live"}))
     bridge._STATE = root / "starvation"
     check(any(record.get("review_id") == target_id
               for _path, record in bridge._pending_review_records()),
@@ -283,12 +333,15 @@ with tempfile.TemporaryDirectory() as td:
     check(len(list(starvation.glob("wr_*.json"))) == 1
           and len(list((starvation / "archive").glob("wr_*.json"))) == 512,
           "resolved audit records must leave the hot scan without being deleted")
-    original_read = bridge._read_private_json
-    hot_reads = []
-    bridge._read_private_json = lambda p: (hot_reads.append(p), original_read(p))[1]
-    pending_after_archive = bridge._pending_review_records()
-    bridge._read_private_json = original_read
-    check(len(hot_reads) == 1 and pending_after_archive[0][1].get("review_id") == target_id,
+    original_read = pathlib.Path.read_text
+    reads = []
+    pathlib.Path.read_text = lambda p, *a, **k: (reads.append(p), original_read(p, *a, **k))[1]
+    try:
+        pending_after_archive = bridge._pending_review_records()
+    finally:
+        pathlib.Path.read_text = original_read
+    check(not any("archive" in p.parts for p in reads)
+          and pending_after_archive[0][1].get("review_id") == target_id,
           "archived history must add no reads to the hot pending scan")
 
     bridge._STATE = old["state"]

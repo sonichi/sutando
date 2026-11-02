@@ -43,35 +43,14 @@ if [ ! -f "$SETTINGS" ]; then
   echo '{"hooks":{}}' > "$SETTINGS"
 fi
 
-# Use Python to do the idempotent merge (avoids jq dependency)
-python3 /dev/stdin "$SETTINGS" "$HOOK_CMD" <<'PYEOF'
-import json, sys
-
-settings_path = sys.argv[1]
-hook_cmd = sys.argv[2]
-
-with open(settings_path) as f:
-    settings = json.load(f)
-
-hooks = settings.setdefault("hooks", {})
-session_start = hooks.setdefault("SessionStart", [])
-
-# Check if our hook command is already present in any entry
-for entry in session_start:
-    for h in entry.get("hooks", []):
-        if h.get("command", "") == hook_cmd:
-            print("  ✓ schedule-crons SessionStart hook (already installed)")
-            sys.exit(0)
-
-# Not found — prepend our entry so it fires first
-session_start.insert(0, {
-    "matcher": "",
-    "hooks": [{"type": "command", "command": hook_cmd}]
-})
-
-with open(settings_path, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("  ✓ schedule-crons SessionStart hook (installed)")
-PYEOF
+# One merge for every Sutando hook installer (src/claude_hooks_settings.py): adds this
+# entry once, first so it fires first, and removes dead copies of the same hook.
+PY=""
+if [ -r "$REPO/scripts/python-binary.sh" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  PY="$(resolve_python "$REPO")"
+fi
+[ -n "$PY" ] && [ -x "$PY" ] || PY="python3"
+"$PY" "$REPO/src/claude_hooks_settings.py" install --settings "$SETTINGS" \
+  --event SessionStart --command "$HOOK_CMD" --matcher "" --prepend \
+  --label "schedule-crons SessionStart hook"

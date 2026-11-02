@@ -43,40 +43,9 @@ if [ ! -f "$SETTINGS" ]; then
   echo '{"hooks":{}}' > "$SETTINGS"
 fi
 
-# Idempotent merge (avoids jq dependency). `python3 -` (not `/dev/stdin`):
-# /dev/stdin is a silent no-op under some sandboxed environments (caught in
-# review on this PR — the merge never ran and settings.json stayed {"hooks":{}}),
-# while `-` reads the program from stdin portably and matches the hint
-# script's own pattern.
-"$PY" - "$SETTINGS" "$HOOK_CMD" <<'PYEOF'
-import json, sys
-
-settings_path = sys.argv[1]
-hook_cmd = sys.argv[2]
-
-with open(settings_path) as f:
-    settings = json.load(f)
-
-hooks = settings.setdefault("hooks", {})
-session_start = hooks.setdefault("SessionStart", [])
-
-# Already present in any entry → no-op
-for entry in session_start:
-    for h in entry.get("hooks", []):
-        if h.get("command", "") == hook_cmd:
-            print("  ✓ PERSONAL_CLAUDE compact-reinject hook (already installed)")
-            sys.exit(0)
-
-# "compact" matcher: fire ONLY after context compaction, not on
-# startup/resume/clear — those paths already Read the file per CLAUDE.md.
-session_start.append({
-    "matcher": "compact",
-    "hooks": [{"type": "command", "command": hook_cmd}]
-})
-
-with open(settings_path, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("  ✓ PERSONAL_CLAUDE compact-reinject hook (installed)")
-PYEOF
+# One merge for every Sutando hook installer (src/claude_hooks_settings.py): adds this
+# entry once and removes dead copies of the SAME hook — entries whose script no longer
+# exists, e.g. left by a test run from a temp copy of the repo. Other hooks are untouched.
+"$PY" "$REPO/src/claude_hooks_settings.py" install --settings "$SETTINGS" \
+  --event SessionStart --command "$HOOK_CMD" --matcher compact \
+  --label "PERSONAL_CLAUDE compact-reinject hook"

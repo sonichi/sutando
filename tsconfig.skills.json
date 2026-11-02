@@ -6,5 +6,8 @@
   "include": [
     "skills/**/*.ts",
     "src"
+  ],
+  "exclude": [
+    "skills/pr-watch/mod/**"
   ]
 }

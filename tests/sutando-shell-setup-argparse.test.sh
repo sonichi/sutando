@@ -23,6 +23,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 SETUP="$REPO/src/agent/claude/cli/sutando-shell-setup.sh"
 
+# The script resolves this checkout's target before it parses --from, so the
+# suite provides it: created only when absent, removed again at exit.
+_target="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
+_made_target=""
+if [ -n "$_target" ] && [ ! -d "$_target" ]; then
+  mkdir -p "$_target" && _made_target="$_target"
+fi
+trap '[ -n "$_made_target" ] && rm -rf "$_made_target"; true' EXIT
+
 pass=0
 fail=0
 

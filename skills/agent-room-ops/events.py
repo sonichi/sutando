@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · events — client half of Agent Event Subscription & Delivery (#184).
 
 Four surfaces, all speaking the FIXED #184 contract (the server half is built
@@ -7,7 +9,7 @@ server implementation):
 
   - subscription management — `events_subscribe` / `events_unsubscribe` /
     `events_subscriptions` ops on the generic `POST {base}/v1/room` envelope
-    (one privileged endpoint, many ops — same shape as doc/mention).
+    (one privileged endpoint, many ops — same shape as mention).
   - typed emit — the `event` op on that same envelope: send one typed
     `space.ag2.*` TIMELINE event as this agent. The receive half above had no
     counterpart, so an agent could subscribe to typed events it had no way to
@@ -32,7 +34,7 @@ import time
 import urllib.request
 
 from _gateway import (HTTP_TIMEOUT, gate_allows, load_gate, gateway, http_json,
-                      degrade_reason, urlencode, HTTPError, URLError)
+                      degrade_reason_from, urlencode, HTTPError, URLError)
 import receipt as _receipt
 
 DEFAULT_WAIT = 30
@@ -65,7 +67,7 @@ def _result(ok, *, room_id=None, subscription_id=None, subscriptions=None, reaso
 # --------------------------------------------------------------------------- #
 def _op_call(op, room_id, agent_mxid, gate, extra=None, *, gated=True):
     """Gate check (room-scoped ops only) → op-envelope POST → response dict or
-    a degraded _result. Mirrors doc._call — same envelope, same degrade map."""
+    a degraded _result."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if gated:
         if not room_id:
@@ -74,14 +76,14 @@ def _op_call(op, room_id, agent_mxid, gate, extra=None, *, gated=True):
         if not gate_allows(agent_mxid, room_id, gate):
             return _result(False, room_id=room_id,
                            reason=f"client gate denied for {agent_mxid}")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, reason="no gateway configured")
     payload = {"op": op, **({"room_id": room_id} if room_id else {}), **(extra or {})}
     try:
         _status, res = http_json("POST", f"{base}/v1/room", headers, payload)
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        return _result(False, room_id=room_id, reason=degrade_reason_from(e))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
     if not isinstance(res, dict):
@@ -179,7 +181,7 @@ def pull(cursor=0, wait=DEFAULT_WAIT):
         # empty-events response.
         res = _http_get_json(url, headers, wait + HTTP_TIMEOUT)
     except HTTPError as e:
-        return {"ok": False, "events": [], "cursor": cursor, "reason": degrade_reason(e.code)}
+        return {"ok": False, "events": [], "cursor": cursor, "reason": degrade_reason_from(e)}
     except (URLError, TimeoutError, OSError) as e:
         return {"ok": False, "events": [], "cursor": cursor, "reason": f"network error: {e}"}
     except ValueError as e:
@@ -272,7 +274,7 @@ def stream(cursor=None, on_event=None, keepalive_cb=None, *, stop=None, max_even
         resp = _open_stream(f"{base}/v1/events/stream", h)
     except HTTPError as e:
         if e.code in (401, 403, 404):
-            raise RuntimeError(degrade_reason(e.code)) from e
+            raise RuntimeError(degrade_reason_from(e)) from e
         raise StreamDisconnected(f"HTTP {e.code} opening stream") from e
     except (URLError, TimeoutError, OSError) as e:
         raise StreamDisconnected(f"connect failed: {e}") from e
