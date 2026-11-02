@@ -534,5 +534,85 @@ class TestRoomRouting(_Base):
             self.assertEqual(r.stdout, "")
 
 
+class TestActiveLane(_Base):
+    """An install signed in only on a secondary homeserver: the device file holds only the lane's
+    suffixed launch key, and the usable primary token lives in that lane's own channel dir."""
+
+    LANE_TOKEN = 'AG2_REMOTE_TOKEN_S_DSPACE="https://chat.example.test/relay|lane-secret"\n'
+
+    def _install(self, lane="s_dspace", dir_line=True, lane_env=TOKEN_LINE):
+        app = self._tmpdir()
+        channels = app / "channels"
+        (channels / "ag2space").mkdir(parents=True)
+        device = channels / "ag2space" / ".env"
+        device.write_text(self.LANE_TOKEN
+                          + ("REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n" if dir_line else ""))
+        (channels / "s.space").mkdir()
+        if lane_env is not None:
+            (channels / "s.space" / ".env").write_text(lane_env)
+        (channels / "active-gateway-lane").write_text(lane + "\n")
+        os.environ["SUTANDO_APP_SUPPORT"] = str(app)
+        os.environ["AG2_DEVICE_ENV"] = str(device)
+        return channels
+
+    def test_device_file_with_only_the_lane_key_follows_the_lane_dir(self):
+        channels = self._install()
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
+
+    def test_lane_name_decodes_to_its_dir_without_a_dir_line(self):
+        channels = self._install(dir_line=False)
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
+
+    def test_lane_dir_decoding(self):
+        self.assertEqual(m.lane_channel_dir("s_dspace"), "s.space")
+        self.assertEqual(m.lane_channel_dir("a_hb_uc_dd"), "a-b_c.d")
+        self.assertEqual(m.lane_channel_dir("plain"), "plain")
+
+    def test_a_primary_token_in_the_device_file_still_wins(self):
+        channels = self._install()
+        device = channels / "ag2space" / ".env"
+        device.write_text(TOKEN_LINE + device.read_text())
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), device)
+
+    def test_lane_dir_without_a_token_resolves_nothing(self):
+        channels = self._install(lane_env="AGENT_MXID=@a:example.test\n")
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+
+    def test_no_lane_file_resolves_nothing(self):
+        channels = self._install()
+        (channels / "active-gateway-lane").unlink()
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+
+    def test_all_and_primary_are_not_lanes(self):
+        for lane in ("all", "primary"):
+            channels = self._install(lane=lane, dir_line=False)
+            self.assertIsNone(m.resolve_channel_env(channels, "ag2space"), lane)
+
+    def test_a_dir_line_that_escapes_the_channels_tree_is_refused(self):
+        channels = self._install(dir_line=False, lane_env=None)
+        device = channels / "ag2space" / ".env"
+        outside = channels.parent / "outside"
+        outside.mkdir()
+        (outside / ".env").write_text(TOKEN_LINE)
+        device.write_text(self.LANE_TOKEN + "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=../outside\n")
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+
+    def test_launch_keys_are_still_read_from_the_device_file(self):
+        channels = self._install()
+        self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), channels / "ag2space" / ".env")
+
+    def test_other_sources_never_follow_the_lane(self):
+        channels = self._install()
+        (channels / "other").mkdir()
+        self.assertIsNone(m.resolve_channel_env(channels, "other"))
+
+    def test_the_wrapper_prints_the_lane_file(self):
+        channels = self._install()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(m.main(["x", str(channels), "ag2space"]), 0)
+        self.assertEqual(out.getvalue().strip(), str(channels / "s.space" / ".env"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

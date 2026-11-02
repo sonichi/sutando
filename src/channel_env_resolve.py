@@ -15,6 +15,11 @@ This module owns the SELECTION, including the candidate ORDER:
      through. The gateway bridge's `_channel_env_candidates` keeps the same
      first entry (pinned by tests/channel-env-order-contract.test.py).
   2. The `channels/<source>` candidates, which must satisfy both rules below.
+  3. For `ag2space` only, when neither holds a primary token: the desktop's active sign-in lane
+     ($SUTANDO_APP_SUPPORT/channels/active-gateway-lane). A host signed in only on a secondary
+     homeserver keeps just `AG2_REMOTE_TOKEN_<LANE>` in the device file; the usable token is in
+     the lane's own channel dir, named by `REMOTE_TASK_CHANNEL_DIR_<LANE>` or decoded from the
+     lane name (`s_dspace` -> `s.space`), and must pass the same two rules.
 
 The channels dir is the caller's input; this module never guesses a home dir.
 The two rules a channels-tree candidate must satisfy are each answered by
@@ -83,15 +88,7 @@ def candidates(channel_dir: Path) -> list[Path]:
     return seen
 
 
-def resolve_channel_env(channels_dir, source: str) -> Path | None:
-    """The usable launcher-named file, else the first channels-tree candidate
-    that is BOTH contained and holds a non-empty token.
-
-    None when neither the launcher-named file nor any candidate qualifies.
-    """
-    named = device_env(source)
-    if named is not None:
-        return named
+def _resolve_in(channels_dir, source: str) -> Path | None:
     channel_dir = Path(channels_dir) / source
     if not channel_dir.is_dir():
         return None
@@ -101,6 +98,72 @@ def resolve_channel_env(channels_dir, source: str) -> Path | None:
         if _has_token(candidate):
             return candidate
     return None
+
+
+LANE_CHANNEL_DIR_PREFIX = "REMOTE_TASK_CHANNEL_DIR_"
+_LANE_ESCAPES = {"d": ".", "h": "-", "u": "_"}
+# One path segment under channels/, the charset scripts/channel-env.sh accepts.
+_CHANNEL_DIR_RE = re.compile(r"^[a-z0-9._-]+$")
+
+
+def lane_channel_dir(lane: str) -> str:
+    """The channels/ dir a desktop sign-in lane is named for: `_d` '.', `_h` '-', `_u` '_'."""
+    return re.sub(r"_([dhu])", lambda m: _LANE_ESCAPES[m.group(1)], lane)
+
+
+def _active_lane() -> str | None:
+    try:
+        from gateway_serving import active_lane
+    except ImportError:
+        return None
+    return active_lane()
+
+
+def lane_channel_dirs(lane: str) -> list[str]:
+    """Where `lane`'s channel env lives: `REMOTE_TASK_CHANNEL_DIR_<LANE>` from the environment, then
+    from the launcher-named file, then the decoded lane name; only single, safe path segments."""
+    var = LANE_CHANNEL_DIR_PREFIX + lane.upper().replace("-", "_")
+    named = (os.environ.get(DEVICE_ENV_VAR) or "").strip()
+    found = [os.environ.get(var, "").strip(),
+             token_from_env_file(var, Path(named)) if named else "",
+             lane_channel_dir(lane)]
+    dirs: list[str] = []
+    for d in found:
+        if d and d not in (".", "..") and _CHANNEL_DIR_RE.fullmatch(d) and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def resolve_active_lane_env(channels_dir) -> Path | None:
+    """The active lane's own channel env file holding a primary token, under the same rules."""
+    lane = _active_lane()
+    if not lane:
+        return None
+    for d in lane_channel_dirs(lane):
+        if d == DEVICE_ENV_SOURCE:
+            continue
+        picked = _resolve_in(channels_dir, d)
+        if picked is not None:
+            return picked
+    return None
+
+
+def resolve_channel_env(channels_dir, source: str) -> Path | None:
+    """The usable launcher-named file, else the first channels-tree candidate
+    that is BOTH contained and holds a non-empty token, else (for `ag2space`)
+    the active sign-in lane's file.
+
+    None when neither the launcher-named file nor any candidate qualifies.
+    """
+    picked = _resolve_primary(channels_dir, source)
+    if picked is None and source == DEVICE_ENV_SOURCE:
+        picked = resolve_active_lane_env(channels_dir)
+    return picked
+
+
+def _resolve_primary(channels_dir, source: str) -> Path | None:
+    named = device_env(source)
+    return named if named is not None else _resolve_in(channels_dir, source)
 
 
 LAUNCH_KEY_RE = re.compile(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", re.M)
@@ -115,10 +178,11 @@ def _has_launch_key(path: Path) -> bool:
 
 
 def resolve_launch_key_env(channels_dir, source: str) -> Path | None:
-    """`resolve_channel_env`'s pick, else the first file in the same order and under the same
+    """`resolve_channel_env`'s pick short of the active lane, else the first file in the same order and under the same
     containment that holds a launch key: a host signed in only on a secondary homeserver writes
-    `AG2_REMOTE_TOKEN_<INST>` and no primary token."""
-    picked = resolve_channel_env(channels_dir, source)
+    `AG2_REMOTE_TOKEN_<INST>` and no primary token. Never the active lane's own file, which
+    holds no launch keys."""
+    picked = _resolve_primary(channels_dir, source)
     if picked is not None:
         return picked
     named = (os.environ.get(DEVICE_ENV_VAR) or "").strip() if source == DEVICE_ENV_SOURCE else ""
