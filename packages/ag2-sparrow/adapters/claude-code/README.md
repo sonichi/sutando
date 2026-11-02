@@ -344,7 +344,7 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url>   # asks for the code; or, by hand:
+ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks for the code; or, by hand:
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
@@ -362,7 +362,7 @@ working tree under edit, say).
 are the agent's whole setup:
 
 ```bash
-ag2-sparrow-claude-local connect --base <s.space backend URL>
+ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent's Matrix ID>
 # asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
 
@@ -410,7 +410,7 @@ or the `ai.ag2.sparrow.claude-local-bridge` agent): `ag2-sparrow` with
 Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
-one bridge).
+one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the
