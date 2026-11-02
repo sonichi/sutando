@@ -185,9 +185,9 @@ class NotifierHonoursTerm(unittest.TestCase):
     def test_the_codex_notifier(self):
         self.run_case("codex/cli/task-notifier.sh")
 
-    def run_prompt(self, notifier: str):
+    def run_prompt(self, notifier: str, watcher: str = RESPONSIVE_WATCHER):
         # The default 30 s read: a TERM that waited for the read to return would take up to 30 s.
-        f = FakeRepo(notifier, RESPONSIVE_WATCHER)
+        f = FakeRepo(notifier, watcher)
         proc = f.start(poll="30")
         wpid = f.watcher_pid()
         self.addCleanup(kill_quietly, proc.pid, wpid)
@@ -206,6 +206,11 @@ class NotifierHonoursTerm(unittest.TestCase):
 
     def test_the_codex_notifier_promptly_at_the_default_read(self):
         self.run_prompt("codex/cli/task-notifier.sh")
+
+    def test_a_writer_that_ignores_term_still_ends_the_read_promptly(self):
+        for notifier in ("claude/cli/task-notifier.sh", "codex/cli/task-notifier.sh"):
+            with self.subTest(notifier=notifier):
+                self.run_prompt(notifier, DEAF_WATCHER)
 
 
 def bash(script: str, cwd=None, **env) -> subprocess.CompletedProcess:

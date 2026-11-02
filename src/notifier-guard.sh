@@ -46,11 +46,12 @@ stop_group_bounded() {
 NOTIFIER_IN_READ=0
 NOTIFIER_STOP=""
 NOTIFIER_WAKE_PID=""
-# In the read, only record the signal, and end the read now: stopping the events writer's group gives it EOF.
+# In the read, only record the signal, and end the read now: a bounded stop (KILL for a writer that
+# ignores TERM) of the events writer's group gives the read EOF within the stop's grace.
 notifier_signal() {
   if [ "$NOTIFIER_IN_READ" = 1 ]; then
     NOTIFIER_STOP="$1"
-    [ -z "$NOTIFIER_WAKE_PID" ] || kill -TERM "-$NOTIFIER_WAKE_PID" 2>/dev/null || kill -TERM "$NOTIFIER_WAKE_PID" 2>/dev/null || true
+    [ -z "$NOTIFIER_WAKE_PID" ] || stop_group_bounded "$NOTIFIER_WAKE_PID"
   else exit "$1"; fi
 }
 
