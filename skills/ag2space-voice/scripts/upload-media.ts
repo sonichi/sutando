@@ -83,7 +83,7 @@ async function execute(client: McpClient, room: string, action: string, args: Re
 }
 
 export async function uploadMedia(opts: { room: string; file: string; name?: string; folder?: string; post?: boolean }, client: McpClient, check: PathCheck = sendablePath): Promise<UploadResult> {
-	if (!/^![^:\s]+:\S+$/.test(opts.room)) return { ok: false, error: 'bad_room', detail: 'pass the room id, e.g. !abc:ag2.space' };
+	if (!/^![^:\s]+:\S+$/.test(opts.room)) return { ok: false, error: 'bad_room', detail: 'pass the room id, e.g. !abc:example.org' };
 	if (opts.folder && !/^[a-z0-9]{8}$/.test(opts.folder)) return { ok: false, error: 'bad_folder', detail: 'a folder id is 8 lowercase letters or digits' };
 	const allowed = check(opts.file);
 	if (!allowed.ok) return allowed;

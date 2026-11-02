@@ -41,7 +41,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[2] / "src"))  # lint-workspace-resolution: allow-repo-root (engine src, not a data root)
-from file_lock import try_lock_fd, unlock_fd  # noqa: E402
+from file_lock import locked_file, try_lock_fd, unlock_fd  # noqa: E402
 
 SIDECAR = "agent-activity.phase.jsonl"
 MANIFEST = HERE.parent / "manifest.json"
@@ -275,11 +275,14 @@ def show_phase_if_new(workspace, task_id: str, phase: str, write_row) -> bool:
 
 
 def note_line_shown(workspace, task_id: str) -> None:
-    """The room now shows a step line, so the task's next phase row is due whatever its phase."""
+    """The room now shows a step line, so the task's next phase row is due whatever its phase. Waits for
+    the lock (held only across one row write): a skipped record would leave that phase suppressed."""
     marker = _shown_marker(workspace, task_id)
-    with _try_locked(marker.with_name(marker.name + ".lock")) as got:
-        if got:
+    try:
+        with locked_file(marker.with_name(marker.name + ".lock")):
             _record_shown(marker, SHOWN_LINE)
+    except OSError:
+        pass
 
 
 def _marker_dir(workspace) -> Path:

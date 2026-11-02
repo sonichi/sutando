@@ -245,8 +245,8 @@ def _gateway_configured():
     # Delegated so this surface agrees with startup and health-check; imported here because
     # the resolver pulls in shared/, which a helper loading this file from a bare src copy lacks.
     try:
-        from channel_env_resolve import resolve_channel_env
-        return resolve_channel_env(os.path.join(cfg, "channels"), "ag2space") is not None
+        from channel_env_resolve import channel_configured
+        return channel_configured(os.path.join(cfg, "channels"), "ag2space")
     except (OSError, ImportError):
         return None
 

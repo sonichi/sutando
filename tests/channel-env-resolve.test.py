@@ -268,6 +268,156 @@ class TestLaunchKeyEnv(_Base):
         self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), named)
 
 
+class TestActiveLane(_Base):
+    """A device file holding only the desktop's active lane's own keys resolves that lane's token,
+    by key name in that same file; no other lane's key is read and a primary token still wins."""
+
+    LANE_TOKEN = "https://gw.example/relay|lane-secret"
+    NAMES = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
+    def _install(self, device_body: str, lane: str = "s_dspace") -> Path:
+        root = self._tmpdir()
+        channels = root / "channels"
+        (channels / "ag2space").mkdir(parents=True)
+        (channels / "active-gateway-lane").write_text(lane + "\n")
+        device = channels / "ag2space" / ".env"
+        device.write_text(device_body)
+        os.environ["SUTANDO_APP_SUPPORT"] = str(root)
+        os.environ["AG2_DEVICE_ENV"] = str(device)
+        return channels
+
+    def _lane_only(self, lane: str = "s_dspace") -> Path:
+        return self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
+                             "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=s.space\n", lane)
+
+    def test_a_lane_only_device_file_resolves_the_active_lanes_token(self):
+        channels = self._lane_only()
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"), "the sourced-path contract is unchanged")
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+        self.assertEqual(m.channel_values(channels, "ag2space", ("REMOTE_TASK_CHANNEL_DIR",)),
+                         {"REMOTE_TASK_CHANNEL_DIR": "s.space"})
+        self.assertTrue(m.channel_configured(channels, "ag2space"))
+
+    def test_a_key_of_a_lane_that_is_not_active_is_never_used(self):
+        channels = self._install(f'AG2_REMOTE_TOKEN_OTHER_LANE="{self.LANE_TOKEN}"\n')
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+        self.assertFalse(m.channel_configured(channels, "ag2space"))
+
+    def test_no_active_lane_reads_no_suffixed_key(self):
+        channels = self._lane_only()
+        os.environ.pop("SUTANDO_APP_SUPPORT")
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+        for lane in ("all", "primary", "../x"):
+            with self.subTest(lane=lane):
+                channels = self._lane_only(lane)
+                self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+
+    def test_a_primary_token_in_the_device_file_still_wins(self):
+        channels = self._install(f'AG2_REMOTE_TOKEN="https://gw.example/relay|primary"\n'
+                                 f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n')
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES),
+                         {"AG2_REMOTE_TOKEN": "https://gw.example/relay|primary"})
+
+    def test_a_primary_token_in_the_channels_tree_still_wins(self):
+        channels = self._lane_only()
+        (channels / "ag2space" / "relay-client.env").write_text(TOKEN_LINE)
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {"REMOTE_TASK_TOKEN": "real-token"})
+
+    def test_the_lane_key_name_follows_the_launch_key_rule(self):
+        for lane, key in (("s_dspace", "AG2_REMOTE_TOKEN_S_DSPACE"),
+                          ("s_hspace_dfoo", "AG2_REMOTE_TOKEN_S_HSPACE_DFOO"),
+                          ("my-lane", "AG2_REMOTE_TOKEN_MY_LANE")):
+            with self.subTest(lane=lane):
+                self.assertEqual(m.lane_var("AG2_REMOTE_TOKEN", lane), key)
+                channels = self._install(f'{key}="{self.LANE_TOKEN}"\n'
+                                         'AG2_REMOTE_TOKEN_OTHER="https://gw.example/relay|wrong"\n', lane)
+                self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES),
+                                 {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+
+    def test_an_identity_comes_from_the_lanes_declared_channel_dir(self):
+        channels = self._lane_only()
+        (channels / "s.space").mkdir()
+        (channels / "s.space" / ".env").write_text('AGENT_MXID=@lane.agent:example.test\n'
+                                                   'AG2_REMOTE_TOKEN="https://gw.example/relay|dir-token"\n')
+        got = m.channel_values(channels, "ag2space", ("AGENT_MXID", "AG2_REMOTE_TOKEN"))
+        self.assertEqual(got, {"AGENT_MXID": "@lane.agent:example.test", "AG2_REMOTE_TOKEN": self.LANE_TOKEN},
+                         "the token is the device file's lane key alone")
+
+    def test_a_lane_token_pairs_only_with_the_lanes_own_url_key(self):
+        names = ("REMOTE_TASK_URL", "AG2_REMOTE_TOKEN")
+        channels = self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
+                                 "REMOTE_TASK_URL=https://leftover.example/relay\n"
+                                 "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=s.space\n")
+        (channels / "s.space").mkdir()
+        (channels / "s.space" / ".env").write_text("REMOTE_TASK_URL=https://lane-dir.example/relay\n")
+        self.assertEqual(m.channel_values(channels, "ag2space", names), {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+        device = channels / "ag2space" / ".env"
+        device.write_text(device.read_text() + "REMOTE_TASK_URL_S_DSPACE=https://gw.example/relay\n")
+        self.assertEqual(m.channel_values(channels, "ag2space", names),
+                         {"AG2_REMOTE_TOKEN": self.LANE_TOKEN, "REMOTE_TASK_URL": "https://gw.example/relay"})
+
+    def test_a_doubly_quoted_lane_key_reads_as_the_clean_relay_token(self):
+        channels = self._install(f'''AG2_REMOTE_TOKEN_S_DSPACE="'{self.LANE_TOKEN}'"\n''')
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+
+    def test_a_lane_identity_key_in_the_device_file_wins(self):
+        channels = self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
+                                 "AGENT_MXID_S_DSPACE=@key.agent:example.test\n")
+        self.assertEqual(m.channel_values(channels, "ag2space", ("AGENT_MXID",)),
+                         {"AGENT_MXID": "@key.agent:example.test"})
+
+    def test_a_lane_dir_outside_the_tree_or_naming_ag2space_is_never_read(self):
+        for line in ("REMOTE_TASK_CHANNEL_DIR_S_DSPACE=../outside", "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=ag2space"):
+            with self.subTest(line=line):
+                channels = self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
+                                         f'AGENT_MXID=@device.agent:example.test\n{line}\n')
+                (channels.parent / "outside").mkdir(exist_ok=True)
+                (channels.parent / "outside" / ".env").write_text("AGENT_MXID=@out.agent:example.test\n")
+                self.assertEqual(m.channel_values(channels, "ag2space", ("AGENT_MXID",)), {})
+
+    def test_a_signed_out_lane_reads_nothing(self):
+        channels = self._install("REMOTE_TASK_CHANNEL_DIR_S_DSPACE=s.space\n")
+        (channels / "s.space").mkdir()
+        (channels / "s.space" / ".env").write_text("AGENT_MXID=@lane.agent:example.test\n")
+        self.assertEqual(m.channel_values(channels, "ag2space", ("AGENT_MXID", *self.NAMES)), {})
+        self.assertFalse(m.channel_configured(channels, "ag2space"))
+
+    def test_no_lane_reader_reads_nothing(self):
+        channels = self._lane_only()
+        with unittest.mock.patch.dict(sys.modules, {"gateway_serving": None}):
+            self.assertIsNone(m._active_lane())
+            self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+
+    def test_the_sourced_path_and_launch_key_file_are_unchanged(self):
+        channels = self._lane_only()
+        self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), channels / "ag2space" / ".env")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(m.main(["x", str(channels), "ag2space"]), 1)
+
+    def test_room_lookups_never_decode_a_lane(self):
+        import connections
+        channels = self._lane_only()
+        legacy = {"instance": "", "server": "ag2.example.test"}
+        with unittest.mock.patch.object(connections, "connection_for_room", return_value=legacy):
+            self.assertIsNone(m.resolve_room_channel_env(channels, "ag2space", "!r:ag2.example.test"))
+        (channels / "s.space").mkdir()
+        (channels / "s.space" / ".env").write_text(TOKEN_LINE)
+        row = {"instance": "s_dspace", "server": "s.example.test"}
+        with unittest.mock.patch.object(connections, "connection_for_room", return_value=row):
+            self.assertEqual(m.resolve_room_channel_env(channels, "ag2space", "!r:s.example.test"),
+                             channels / "s.space" / ".env", "the declared dir line, not a decoded name")
+        (channels / "ag2space" / ".env").write_text(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n')
+        with unittest.mock.patch.object(connections, "connection_for_room", return_value=row), \
+                self.assertRaises(connections.NoConnectionForRoom):
+            m.resolve_room_channel_env(channels, "ag2space", "!r:s.example.test")
+
+    def test_other_sources_never_follow_the_lane(self):
+        channels = self._lane_only()
+        (channels / "discord").mkdir()
+        self.assertEqual(m.channel_values(channels, "discord", self.NAMES), {})
+        self.assertIsNone(m.active_lane_env(channels, "discord"))
+
+
 class TestCli(_Base):
     """`main()` in-process. The wrapper cases below cover the same paths through
     bash, but only as a subprocess — which no coverage run can see."""
@@ -532,124 +682,6 @@ class TestRoomRouting(_Base):
             r = self._wrapper(*args)
             self.assertEqual(r.returncode, 2, args)
             self.assertEqual(r.stdout, "")
-
-
-class TestActiveLane(_Base):
-    """An install signed in only on a secondary homeserver: the device file holds only the lane's
-    suffixed launch key, and the usable primary token lives in that lane's own channel dir."""
-
-    LANE_TOKEN = 'AG2_REMOTE_TOKEN_S_DSPACE="https://chat.example.test/relay|lane-secret"\n'
-
-    def _install(self, lane="s_dspace", dir_line=True, lane_env=TOKEN_LINE):
-        app = self._tmpdir()
-        channels = app / "channels"
-        (channels / "ag2space").mkdir(parents=True)
-        device = channels / "ag2space" / ".env"
-        device.write_text(self.LANE_TOKEN
-                          + ("REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n" if dir_line else ""))
-        (channels / "s.space").mkdir()
-        if lane_env is not None:
-            (channels / "s.space" / ".env").write_text(lane_env)
-        (channels / "active-gateway-lane").write_text(lane + "\n")
-        os.environ["SUTANDO_APP_SUPPORT"] = str(app)
-        os.environ["AG2_DEVICE_ENV"] = str(device)
-        return channels
-
-    def test_device_file_with_only_the_lane_key_follows_the_lane_dir(self):
-        channels = self._install()
-        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
-
-    def test_lane_name_decodes_to_its_dir_without_a_dir_line(self):
-        channels = self._install(dir_line=False)
-        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
-
-    def test_a_primary_token_in_the_device_file_still_wins(self):
-        channels = self._install()
-        device = channels / "ag2space" / ".env"
-        device.write_text(TOKEN_LINE + device.read_text())
-        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), device)
-
-    def test_lane_dir_without_a_token_resolves_nothing(self):
-        channels = self._install(lane_env="AGENT_MXID=@a:example.test\n")
-        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
-
-    def test_no_lane_file_resolves_nothing(self):
-        channels = self._install()
-        (channels / "active-gateway-lane").unlink()
-        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
-
-    def test_all_and_primary_are_not_lanes(self):
-        for lane in ("all", "primary"):
-            channels = self._install(lane=lane, dir_line=False)
-            self.assertIsNone(m.resolve_channel_env(channels, "ag2space"), lane)
-
-    def test_a_dir_line_that_escapes_the_channels_tree_is_refused(self):
-        channels = self._install(dir_line=False, lane_env=None)
-        device = channels / "ag2space" / ".env"
-        outside = channels.parent / "outside"
-        outside.mkdir()
-        (outside / ".env").write_text(TOKEN_LINE)
-        device.write_text(self.LANE_TOKEN + "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=../outside\n")
-        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
-
-    def test_a_dir_line_naming_the_device_channel_is_refused(self):
-        channels = self._install(dir_line=False)
-        (channels / "ag2space" / "relay-client.env").write_text(TOKEN_LINE)
-        os.environ["AG2_DEVICE_ENV"] = str(channels / "ag2space" / ".env")
-        with unittest.mock.patch.dict(os.environ, {"REMOTE_TASK_CHANNEL_DIR_S_DSPACE": "ag2space"}):
-            # The ag2space dir is the primary's; a lane never resolves back into it.
-            self.assertIsNone(m.resolve_active_lane_env(channels))
-
-    def test_a_signed_out_lane_is_not_followed(self):
-        channels = self._install()
-        (channels / "ag2space" / ".env").write_text("REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n")
-        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
-
-    def test_a_lane_key_in_the_environment_counts_as_signed_in(self):
-        channels = self._install()
-        (channels / "ag2space" / ".env").unlink()
-        with unittest.mock.patch.dict(os.environ, {"AG2_REMOTE_TOKEN_S_DSPACE": "https://x.test|y"}):
-            self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
-
-    def test_no_lane_reader_resolves_nothing(self):
-        channels = self._install()
-        with unittest.mock.patch.dict(sys.modules, {"gateway_serving": None}):
-            self.assertIsNone(m._active_lane())
-            self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
-        with unittest.mock.patch.dict(sys.modules, {"connections": None}), \
-                unittest.mock.patch.object(m, "_active_lane", return_value="s_dspace"):
-            self.assertIsNone(m.resolve_active_lane_env(channels))
-
-    def test_a_legacy_row_room_lookup_never_gets_the_lane_file(self):
-        import connections
-        channels = self._install()
-        legacy = {"instance": "", "server": "ag2.example.test"}
-        with unittest.mock.patch.object(connections, "connection_for_room", return_value=legacy):
-            self.assertIsNone(m.resolve_room_channel_env(channels, "ag2space", "!r:ag2.example.test"))
-
-    def test_a_lane_row_room_lookup_gets_the_lane_dir(self):
-        import connections
-        channels = self._install(dir_line=False)
-        row = {"instance": "s_dspace", "server": "s.example.test"}
-        with unittest.mock.patch.object(connections, "connection_for_room", return_value=row):
-            self.assertEqual(m.resolve_room_channel_env(channels, "ag2space", "!r:s.example.test"),
-                             channels / "s.space" / ".env")
-
-    def test_launch_keys_are_still_read_from_the_device_file(self):
-        channels = self._install()
-        self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), channels / "ag2space" / ".env")
-
-    def test_other_sources_never_follow_the_lane(self):
-        channels = self._install()
-        (channels / "other").mkdir()
-        self.assertIsNone(m.resolve_channel_env(channels, "other"))
-
-    def test_the_wrapper_prints_the_lane_file(self):
-        channels = self._install()
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(m.main(["x", str(channels), "ag2space"]), 0)
-        self.assertEqual(out.getvalue().strip(), str(channels / "s.space" / ".env"))
 
 
 if __name__ == "__main__":
