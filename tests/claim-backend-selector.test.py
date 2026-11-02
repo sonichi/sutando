@@ -573,6 +573,43 @@ check(kind_ok == "DesignCClaimBackend",
       f"control: the SAME activated root without the staged temp must still "
       f"select C — the pair differs only by the fault (got {kind_ok})")
 
+# An interrupted first fence write must preserve queued bodies through claim().
+with tempfile.TemporaryDirectory() as td:
+    from unittest.mock import patch
+    root = Path(td)
+    backend_root = root / ".outbox-discord-proactive"
+    cb = DesignCClaimBackend(backend_root, activate=True)
+    cb.publish("queued", b"converted payload")
+    with patch("ag2_sparrow.delivery_core.migration.os.replace", side_effect=OSError("fault")):
+        try:
+            write_fence(backend_root, "C")
+        except OSError:
+            pass
+    check(not (backend_root / EPOCH_FILE).exists(), "first fence write fault leaves no final epoch")
+    saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
+    saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
+    try:
+        os.environ["SUTANDO_CLAIM_BACKEND"] = "c"
+        db.RESULTS_DIR, db._PROACTIVE_FENCE = root, None
+        body = root / "proactive-staged.txt"
+        body.write_text("queued body")
+        before = {str(p.relative_to(backend_root)): p.read_bytes()
+                  for p in backend_root.rglob("*") if p.is_file()}
+        with contextlib.redirect_stdout(io.StringIO()):
+            fence = db._proactive_fence()
+        check(fence.claim(body) is None, "staged migration with C state refuses the real adapter claim")
+        check(body.read_text() == "queued body" and not list(root.glob("*.sending")),
+              "refusal retains the .txt body and creates no .sending")
+        after = {str(p.relative_to(backend_root)): p.read_bytes()
+                 for p in backend_root.rglob("*") if p.is_file()}
+        check(before == after, "refused claim preserves converted state and retry accounting")
+    finally:
+        db.RESULTS_DIR, db._PROACTIVE_FENCE = saved_results, saved_fence
+        if saved_env is None:
+            os.environ.pop("SUTANDO_CLAIM_BACKEND", None)
+        else:
+            os.environ["SUTANDO_CLAIM_BACKEND"] = saved_env
+
 # kewei r-latest P2: a Protocol class attribute is a REQUIRED structural member.
 
 from ag2_sparrow.delivery_core.contract import ClaimBackend  # noqa: E402

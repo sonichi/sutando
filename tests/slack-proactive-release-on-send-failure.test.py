@@ -5,6 +5,11 @@ Drives the real `result_watcher` loop, so the failure path actually executes.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -213,4 +218,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    rc = main()
+    # The bridge's result_watcher runs as a daemon thread with no stop condition;
+    # interpreter finalization racing one of its stdout writes aborts the process.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

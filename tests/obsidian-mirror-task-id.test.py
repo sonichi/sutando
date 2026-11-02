@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`_task_id_from_path` must yield the CANONICAL id for a claimed file.
+r"""`_task_id_from_path` must yield the CANONICAL id for a claimed file.
 
 Its old greedy `^task-(.+)\.txt$` returned `task-x.claimed-core-2`, so a claimed
 task and its reply mirrored to two different notes.

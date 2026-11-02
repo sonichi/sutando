@@ -184,16 +184,21 @@ class InstanceRegistryTests(unittest.TestCase):
         envdump = Path(self.tmp.name) / "env.txt"
         import stat as _stat
         launcher = Path(self.tmp.name) / "dump-env"
-        launcher.write_text("#!/bin/sh\nenv > \"%s\"\n" % envdump)
+        # Atomic: the readiness predicate below is exists(), and a bare `>` creates
+        # the file EMPTY before env writes, so a rename is what makes existence imply content.
+        launcher.write_text('#!/bin/sh\nenv > "%s.part" && mv "%s.part" "%s"\n'
+                            % (envdump, envdump, envdump))
         launcher.chmod(launcher.stat().st_mode | _stat.S_IXUSR)
         reg.write_manifest("q-1", endpoint=str(sock), instance="q-1",
                            tmux_socket="/run/q-1/tmux.sock", session="core-q1",
                            config_dir="/cfg/q-1",
                            launcher={"type": "process", "executable": str(launcher),
                                      "args": [], "working_directory": self.tmp.name})
-        # readiness true once the env dump exists
+        # readiness true once the env dump has CONTENT — exists() alone flips
+        # the instant the shell opens the file, before a byte is written.
         reg.start_instance("q-1", wait_s=5, instance="q-1",
-                           _ready=lambda m: {"attachable": envdump.exists()})
+                           _ready=lambda m: {"attachable": envdump.exists()
+                                            and envdump.stat().st_size > 0})
         text = envdump.read_text()
         self.assertIn("SUTANDO_INSTANCE_ID=q-1", text)
         self.assertIn("SUTANDO_TMUX_SOCKET=/run/q-1/tmux.sock", text)

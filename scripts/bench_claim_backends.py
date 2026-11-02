@@ -302,8 +302,12 @@ def main(argv=None) -> int:
         for w in proc_counts:
             s[f"procs_{w}"] = bench_procs(kind, proc_items, w, k1)
         s["unknown_recover"] = bench_unknown_recover(kind, 100, k1)
+        # archive_* is a throughput number no caller asserts, and 2000 history is
+        # ~4000 claims at ~16ms each — 60% of the --quick smoke run.
+        _arch_hist = 20 if args.quick else 2000
         s["archive_0"] = bench_archive_scale(kind, 0, 50, k1)
-        s["archive_2k"] = bench_archive_scale(kind, 2000, 50, k1)
+        s[f"archive_{_arch_hist}"] = bench_archive_scale(kind, _arch_hist, 50, k1)
+        s["archive_2k"] = s[f"archive_{_arch_hist}"]
         s["crash"] = bench_crash_injection(kind, k1)
         s["conflict"] = bench_publish_inflight_conflict(kind, k1)
         cpu1 = resource.getrusage(resource.RUSAGE_SELF)
@@ -333,7 +337,7 @@ def main(argv=None) -> int:
               f"{pc['per_item_us']:26.0f}   exactly-once A={pa['exactly_once']} C={pc['exactly_once']}")
     print(f"{'UNKNOWN complete (us/item)':34} {a['unknown_recover']['unknown_us']:26.0f} "
           f"{c['unknown_recover']['unknown_us']:26.0f}")
-    print(f"{'complete @ 2k archive (us/item)':34} "
+    print(f"{f'complete @ {_arch_hist} archive (us/item)':34} "
           f"{a['archive_2k']['complete_us_at_history']:26.0f} "
           f"{c['archive_2k']['complete_us_at_history']:26.0f}")
     for label in ("crash", "conflict"):

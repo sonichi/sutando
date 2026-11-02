@@ -148,7 +148,7 @@ access_scope: room-id | private | organization | public
 
 Per-record `observed_at` says how old a fact you *have* is. It cannot say anything about a fact you do **not** have — and an empty result is the most common thing a map returns. Without store-level freshness, "this person is not in the map" and "the map has not looked since Tuesday" are the same answer, and the second one silently reads as the first.
 
-Record it per source, not once for the whole store: sources go stale independently, and a store that swept AG2 Space an hour ago and GitHub last week is fresh and stale at the same time.
+Record it per source, not once for the whole store: sources go stale independently, and a store that swept s.space an hour ago and GitHub last week is fresh and stale at the same time.
 
 ```yaml
 store_freshness:
@@ -270,3 +270,15 @@ Treat these as defaults, not truth:
 | Explicit identity / ownership | 180 days |
 
 Explicit end dates and newer contradictory evidence override these windows.
+
+## Roster refusal keys
+
+`allowlisted` (bool | null) — whether a mention to this Stand has been observed to
+trigger it. `false` REFUSES the send. **It records an observation, not a cause**:
+nothing in the tree sets it after a detected bounce, so no message may claim one.
+`null`/absent means never observed — send, then record.
+
+`refusal_basis` / `note` (string) — the entry's own words for why it refuses, printed
+verbatim by `notify_reviewers.resolve()`. Required whenever a blank `stand`/`room` is
+DELIBERATE: without it the refusal reads as missing data and the obvious repair —
+populating the fields — silently overrides it (#3468). `refusal_basis` wins over `note`.

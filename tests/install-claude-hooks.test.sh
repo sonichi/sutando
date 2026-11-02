@@ -23,12 +23,18 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP — jq not installed"; exit 0; }
 
 # --- build a fake clone whose path contains spaces ---------------------------
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks test.XXXXXX")"
+# The installer creates the archive hook's destination under $HOME, so every
+# invocation below must run against a throwaway home, not the developer's.
+export HOME="$ROOT/home"; mkdir -p "$HOME"
 REPO="$ROOT/repo with spaces"
 mkdir -p "$REPO/src" "$REPO/.claude"
 cp "$INSTALLER" "$REPO/src/install-claude-hooks.sh"
 # Stub the hook targets so an executed command can prove WHICH file it reached.
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n'      > "$REPO/src/session-handoff.sh"
 printf '#!/bin/bash\necho "PENDING-RAN"\n'      > "$REPO/src/check-pending-tasks.sh"
+# The archiver is exercised for real below, so copy it and its resolver rather
+# than stubbing: a stub would assert the hook string, not that it archives.
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$REPO/src/"
 chmod +x "$REPO/src/"*.sh
 SETTINGS="$REPO/.claude/settings.json"
 
@@ -79,6 +85,20 @@ RUN_OUT3="$(TRANSCRIPT_PATH=/dev/null bash -c "$PC_CMD" 2>&1)"
 ok "PreCompact handoff stored command executes the intended script" \
    "$([ "$RUN_OUT3" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 
+# The archiver makes its own destination on first use, so a managed install must
+# leave no empty ~/Desktop/sutando-conversations behind.
+ok "installer leaves no empty archive folder behind" \
+   "$([ ! -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+
+AR_CMD="$(cmds PreCompact | grep sutando-conversations || true)"
+printf 'transcript\n' > "$ROOT/transcript.jsonl"
+# Drive it the way Claude Code does — transcript_path on stdin JSON, no env var.
+# Feeding $TRANSCRIPT_PATH instead passed only while the legacy `cp` co-existed.
+printf '{"transcript_path": "%s"}' "$ROOT/transcript.jsonl" \
+  | bash -c "$AR_CMD" >/dev/null 2>&1
+ok "PreCompact archive stored command actually writes a transcript" \
+   "$([ "$(ls "$HOME/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
+
 # --- 2. legacy Desktop repo hooks are migrated away -------------------------
 ok "legacy Desktop session-handoff hook removed (PreCompact)" \
    "$(cmds PreCompact | grep -q 'Desktop/sutando/src/session-handoff.sh' && echo 1 || echo 0)"
@@ -88,8 +108,10 @@ ok "legacy Desktop check-pending-tasks hook removed (Stop)" \
    "$(cmds Stop | grep -q 'Desktop/sutando/src/check-pending-tasks.sh' && echo 1 || echo 0)"
 
 # --- 3. things that must SURVIVE the sweep ----------------------------------
-ok "transcript-archive hook preserved (different marker)" \
-   "$(cmds PreCompact | grep -q 'sutando-conversations/' && echo 0 || echo 1)"
+# The fixture seeds the legacy bare-`cp` archiver, which this PR migrates rather
+# than sweeps — so name the surviving form, or the grep passes on either one.
+ok "an archive hook on PreCompact, in the archive-transcript.sh form" \
+   "$(cmds PreCompact | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
 ok "operator-added unrelated hook preserved" \
    "$(cmds Stop | grep -q 'operator-added-keepme' && echo 0 || echo 1)"
 
@@ -305,7 +327,10 @@ json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command", "command":
     'cp "$CUSTOM_TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'
 }]}]}}, open(os.environ["C_SETTINGS"], "w"), indent=2)
 PY
-bash "$CREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+# A fresh HOME: the shared one already holds the folder from section 1, so a
+# check against it would pass whether or not the installer made it.
+mkdir -p "$CROOT/home"
+HOME="$CROOT/home" bash "$CREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
 CCMDS="$(python3 -c "
 import json, os
 d = json.load(open(os.environ['C_SETTINGS']))
@@ -313,11 +338,98 @@ print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', []) for h 
 ")"
 ok "operator's custom transcript-archive command survives re-run" \
    "$(echo "$CCMDS" | grep -q 'CUSTOM_TRANSCRIPT_PATH' && echo 0 || echo 1)"
+# A bare `cp` cannot create its destination, so a kept custom archiver needs the
+# installer to make the folder — otherwise every compaction archive is lost silently.
+ok "the kept custom bare-cp archiver gets its destination folder" \
+   "$([ -d "$CROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+printf 'custom\n' > "$CROOT/custom.jsonl"
+HOME="$CROOT/home" CUSTOM_TRANSCRIPT_PATH="$CROOT/custom.jsonl" \
+  bash -c "$(echo "$CCMDS" | grep 'CUSTOM_TRANSCRIPT_PATH')" >/dev/null 2>&1
+ok "and the custom archiver's stored command actually archives a file" \
+   "$([ "$(ls "$CROOT/home/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
+# Match OUR script, not just the destination: the operator's custom command above
+# also names sutando-conversations, so a destination-only grep passes vacuously.
 ok "our archive hook is still installed alongside it" \
-   "$(echo "$CCMDS" | grep -q '"\$TRANSCRIPT_PATH".*sutando-conversations' && echo 0 || echo 1)"
+   "$(echo "$CCMDS" | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
 ok "and the repo-path hook is still installed on the same event" \
    "$(echo "$CCMDS" | grep -q 'session-handoff' && echo 0 || echo 1)"
 rm -rf "$CROOT"
+
+# --- 11. the LEGACY archive command is migrated, but never under the omit flag -
+# This PR changed the archiver from a bare `cp` to archive-transcript.sh. Phase 0
+# cannot migrate the old form (no repo path, see 10) and phase 1 matches the exact
+# command, so a host that had opted in would keep BOTH — the stale one failing on
+# every compaction. Under the omit flag the same migration would turn an inert
+# opt-in into live ~/Desktop egress, which an unattended re-run must not decide.
+LEG_CMD='cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'
+seed_legacy_repo() {  # $1 = destination repo dir
+  mkdir -p "$1/src" "$1/.claude"
+  cp "$INSTALLER" "$1/src/install-claude-hooks.sh"
+  printf '#!/bin/bash\n:\n' > "$1/src/session-handoff.sh"
+  printf '#!/bin/bash\n:\n' > "$1/src/check-pending-tasks.sh"
+  printf '#!/bin/bash\n:\n' > "$1/src/archive-transcript.sh"
+  chmod +x "$1/src/"*.sh
+  LEG_SETTINGS="$1/.claude/settings.json" LEG_CMD="$LEG_CMD" python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command",
+    "command": os.environ["LEG_CMD"]}]}]}},
+    open(os.environ["LEG_SETTINGS"], "w"), indent=2)
+PY
+}
+archive_cmds() {  # $1 = settings path -> one command per line, archiver-targeting only
+  LEG_SETTINGS="$1" python3 -c "
+import json, os
+d = json.load(open(os.environ['LEG_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', [])
+                   for h in g['hooks'] if 'sutando-conversations' in h['command']))
+"
+}
+
+LROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy.XXXXXX")"
+seed_legacy_repo "$LROOT/repo with spaces"
+mkdir -p "$LROOT/home"
+HOME="$LROOT/home" bash "$LROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+LCMDS="$(archive_cmds "$LROOT/repo with spaces/.claude/settings.json")"
+ok "migrating to the archive-transcript.sh form makes no eager folder" \
+   "$([ ! -d "$LROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+ok "legacy bare-cp archiver is removed on upgrade" \
+   "$(echo "$LCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 1 || echo 0)"
+ok "and replaced by the archive-transcript.sh form" \
+   "$(echo "$LCMDS" | grep -q 'archive-transcript\.sh' && echo 0 || echo 1)"
+ok "leaving exactly one archiver hook, not two" \
+   "$([ "$(echo "$LCMDS" | grep -c 'sutando-conversations')" = 1 ] && echo 0 || echo 1)"
+rm -rf "$LROOT"
+
+OROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy omit.XXXXXX")"
+seed_legacy_repo "$OROOT/repo with spaces"
+mkdir -p "$OROOT/home"
+HOME="$OROOT/home" SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$OROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+OCMDS="$(archive_cmds "$OROOT/repo with spaces/.claude/settings.json")"
+ok "under the omit flag the opt-in survives untouched" \
+   "$(echo "$OCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 0 || echo 1)"
+ok "and no archiver is installed in its place" \
+   "$(echo "$OCMDS" | grep -q 'archive-transcript\.sh' && echo 1 || echo 0)"
+# The kept legacy `cp` is what the unattended health-check repair leaves in place;
+# it still has to archive, so its destination must exist after the run.
+ok "the kept legacy bare-cp archiver gets its destination folder" \
+   "$([ -d "$OROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+printf 'legacy\n' > "$OROOT/transcript.jsonl"
+HOME="$OROOT/home" TRANSCRIPT_PATH="$OROOT/transcript.jsonl" bash -c "$OCMDS" >/dev/null 2>&1
+ok "and the legacy archiver's stored command actually archives a file" \
+   "$([ "$(ls "$OROOT/home/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
+rm -rf "$OROOT"
+
+# No bare `cp` registered and the archiver omitted: the run must leave no folder.
+NROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks none.XXXXXX")"
+seed_legacy_repo "$NROOT/repo with spaces"
+echo '{}' > "$NROOT/repo with spaces/.claude/settings.json"
+mkdir -p "$NROOT/home"
+HOME="$NROOT/home" SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$NROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "an omit-flag run with no bare-cp archiver registered makes no folder" \
+   "$([ ! -d "$NROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+rm -rf "$NROOT"
 
 # ---- upgrade path: a pre-existing runner-first skill hook must be MIGRATED ----
 # The outage case: a re-run must replace the old `python3 <path>` entry, not add beside it.
@@ -400,6 +512,50 @@ ok "path containing 'exec ': legacy entry is REMOVED, not left blocking" \
 ok "path containing 'exec ': guarded hook registered exactly once" \
    "$([ "$(echo "$ECMDS" | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
 rm -rf "$EROOT"
+
+# ---- the other revision's spelling of the SAME skill hook is swept, not doubled ----
+# fix/start-cli-installs-claude-hooks (#3997) and fix/core-only-hook-scope (#4309) write the
+# guard and then resolve the interpreter at event time (`. scripts/python-binary.sh …
+# exec "$_py" <hook>`). Its tail after the marker differs from main's `exec python3 <hook>`,
+# so the exact-tail sweep left both registered and every activity row was written twice.
+VROOT="$(mktemp -d)"; VREPO="$VROOT/repo"
+mkdir -p "$VREPO/.claude" "$VREPO/src" "$VREPO/skills/demo/hooks"
+cp "$HERE/../src/install-claude-hooks.sh" "$VREPO/src/"
+cp "$HERE/../src/skill_hooks.py" "$VREPO/src/"
+printf '#!/bin/bash\n:\n' > "$VREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$VREPO/src/check-pending-tasks.sh"
+chmod +x "$VREPO/src/"*.sh
+printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"},{"event":"Stop","command":"./hooks/g.py"}]}\n' \
+    > "$VREPO/skills/demo/manifest.json"
+printf 'import sys; sys.exit(0)\n' > "$VREPO/skills/demo/hooks/g.py"
+VPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$VREPO/skills/demo/hooks/g.py")"
+VQ="$(python3 -c "import shlex,sys;print(shlex.quote(sys.argv[1]))" "$VPATH")"
+export V_SETTINGS="$VREPO/.claude/settings.json"
+export V_OTHER="[ -f $VQ ] || exit 0; . $VREPO/scripts/python-binary.sh 2>/dev/null || exit 0; _py=\"\$(resolve_python $VREPO)\"; [ -n \"\$_py\" ] || exit 0; exec \"\$_py\" $VQ"
+# An operator's own hook that merely runs the same script, without our guard, is NOT ours.
+export V_OPERATOR="python3 $VQ --mine"
+python3 - <<'PY'
+import json, os
+row = lambda c: {"type": "command", "command": c}
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [row(os.environ["V_OTHER"]), row(os.environ["V_OPERATOR"])]}],
+                     "Stop": [{"matcher": "", "hooks": [row(os.environ["V_OTHER"])]}]}},
+          open(os.environ["V_SETTINGS"], "w"), indent=2)
+PY
+bash "$VREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+vcmds() { python3 -c "
+import json, os, sys
+d = json.load(open(os.environ['V_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get(sys.argv[1], []) for h in g['hooks']))
+" "$1"; }
+ok "other spelling: PreToolUse has exactly one guarded entry for the hook" \
+   "$([ "$(vcmds PreToolUse | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
+ok "other spelling: Stop has exactly one guarded entry for the hook" \
+   "$([ "$(vcmds Stop | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
+ok "other spelling: the surviving entry is this installer's" \
+   "$(vcmds PreToolUse | grep -qF "exec python3 $VQ" && echo 0 || echo 1)"
+ok "other spelling: the operator's own unguarded hook survives" \
+   "$(vcmds PreToolUse | grep -qxF "$V_OPERATOR" && echo 0 || echo 1)"
+rm -rf "$VROOT"
 
 rm -rf "$ROOT"
 echo "---"

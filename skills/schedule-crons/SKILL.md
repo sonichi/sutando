@@ -25,6 +25,7 @@ Each entry has:
 - `artifact` (optional string) — the filename STEM of the dated output this job produces, e.g. `"fleet-growth"` for `fleet-growth-2026-08-18.mp4`. Read by `health-check.py`'s `daily-cron-punctuality` probe. Without it the probe infers a stem from the last hyphenated token of the job name, so `talk-events-nightly` looks for `nightly-<date>.*`, never observes the real artifact, and reports the job UNCHECKED forever. Declare it whenever the name does not already equal the stem.
 - `conditional` (optional bool) — set `true` when the job runs on schedule but produces output only if there is new input (a nightly render with no new beats). The punctuality probe then treats "no artifact today" as evidence of nothing rather than a miss; lateness is still measured from the artifacts that do exist.
   On macOS, the Codex core launcher automatically reconciles ordinary fixed-interval entries to this owner because Codex has no session `CronCreate` surface. It preserves `main-loop`, dynamic loops, and entries already owned by `execution: "codex-task"`, and initializes the runner boundary before changing ownership so activation never replays an old action backlog.
+- `owner` (optional string) — which session's `CronCreate` registration this entry belongs to: absent means the core (today's only behavior, unchanged). A worker-pool worker's bare id (the same id `pool_roster.py`/`worker_identity.py` use, e.g. `"d1fc9b10050b490d894947f96627447f"`) pins the entry to that worker instead — that worker's own `/startup` registers it (see `skills/startup/SKILL.md`'s worker section), and step 3 below must skip it here so the two registrations never double-fire the same job. Set this by hand when moving a job that a pinned room's cron output belongs to from the core onto its worker, per `src/cron_ownership.py` (the one shared filter both registration passes call — see `docs/architecture-boundaries.md` "Shared adapter policy").
 
 ### Durable Codex schedules
 
@@ -45,7 +46,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
 1.5. **Start the streaming task watcher NOW, before registering any cron jobs.** This step used to run last (as step 5, after every `CronCreate` round-trip below) — moved here so an incoming task isn't queued unprocessed for the entire registration loop. Measured impact (startup-latency post-mortem, 2026-08-24, RC9 onboarding): with N session crons the old ordering left the watcher unarmed for ~76 seconds on a fresh boot (one `CronCreate` round-trip per entry, 9 entries measured), during which a brand-new user's first onboarding ping sat unprocessed — the single biggest contributor to "Sutando took a while to respond" reports on first boot.
 
-   Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **Gate on running watcher TREES, not on the sentinel** — if one is already running, skip the Monitor call; the existing one continues. Reuse the shared enumerator rather than restating its rules here (the copies drift, and step 5 used to be one of the copies that did):
+   Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (an instance whose inbox isn't `<workspace>/tasks/` substitutes `$SUTANDO_TASKS_DIR` for the resolved path instead: that variable, when set, is what the watcher and its supervisor both resolve to, so the tag must carry it, not the workspace default; every reader compares inboxes by their real path, so a trailing slash or a `/private` prefix does not split one inbox into two), `timeout_ms: 1800000`, `description: 'Streaming task watcher'`. **`Monitor` has no `persistent` option** (passing one does not keep the command alive; without `timeout_ms` the command is killed at the 5-minute default and the standby takes over until the next pass re-arms it). It kills the command at `timeout_ms` (30 min is the maximum) and sends one expiry notice; on that notice, run this step again — a start on a watched inbox exits 0. A notice that the command exited early is the same instruction (re-arm first, investigate second: the standby only covers after its 45 s grace); on macOS Claude Code reports a watcher killed by SIGTERM as `exit code 144`, which is not SIGURG and not the watcher's own crash. `--role session --inbox <value>` is what makes this an in-session watcher CODE can tell apart from an external one for the SAME inbox (#4477) — the watcher itself, on seeing `--role session`, proves readiness, stamps its sentinel, then waits up to 15 s for any external standby on this exact inbox to leave before its sweep (it kills nothing: #4585), and `task-notifier-supervisor.sh` (if one is running externally) polls the same inbox-scoped, sentinel-gated signal and stands the standby down; neither needs an instruction here to tear the other down, so there is no teardown step in this skill. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **The watcher checks its own inbox at startup** (`watcher_identity.py inbox-holders`): if a session watcher already covers it, the new one exits 0 naming the holder, so the Monitor call is safe to make whenever the per-inbox verdict says no session watcher is ready; never start it untagged, and use `--force-restart` only on the owner's word. The host-wide enumerator below stays for the STOP decision (which pids are ownerless), never for the start:
 
    ```bash
    python3 -c "
@@ -94,14 +95,34 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    Then respond to task notifications as they land: send the fail-open progress ack first (`python3 skills/task-progress/scripts/notify.py ...` — one subprocess, no state mutation, cannot derail anything), and use judgment on handling — a short waiting owner task may simply be served before registration continues; anything substantial gets the ack and is handled when the agent is next free. Either way registration cannot be silently dropped: if it slips, the watchdog emits a nag every 60s until step 5.7's completion stamp lands, and the terminal `CRONS-STAMPED` line confirms the guard saw the stamp — which is also why that stamp write is not optional bookkeeping; it is what releases the watchdog. The 90s grace means a normal boot never hears from it, and the 1-hour cap bounds noise if a boot dies (an unregistered state dies with its session). Detection and re-prompt share one source of truth: the same stamp `health-check.py`'s `session-crons` probe already reads. `stat -f %m` is the darwin form; swap for a `python3 -c` mtime read on linux. **Resolve the workspace INSIDE the command** — a Monitor is a fresh shell and the loop's `WORKSPACE` is a per-command local that is never exported, so an inherited `$WORKSPACE` is empty there and the stamp path silently becomes `/hosts/<label>/...`, which never exists: the guard would then nag on every healthy boot (~58 times before the cap) and never print `CRONS-STAMPED`. That failure looks like the watchdog working hard, which is why the empty-`WS` refusal above is loud instead: an unarmed guard must announce itself rather than pass as a busy one.
 
 2. Check existing cron jobs with CronList
-3. For each job in the config:
+   - **Claude quota-aware main-loop cadence:** before registering jobs, run
+     `python3 skills/proactive-loop/scripts/claude-quota-cadence.py --json` when the selected core
+     is Claude. For the canonical `main-loop` entry, use its `effective_cron` instead of the raw
+     `cron` field. The helper returns the configured cron below 80% 7-day utilization and
+     `*/30 * * * *` at/above 80% or when quota telemetry is missing, stale, rejected, or not
+     authoritative for this routed core. This is a registration
+     override only; never rewrite `crons.json`, because that configured value is the restoration
+     target after quota resets. Codex keeps using its own quota telemetry and durable scheduler.
+3. **Filter to entries the core owns before iterating.** This step always runs as the core, never a worker (workers never call `/schedule-crons`; see `skills/startup/SKILL.md`'s worker section). Skip any entry whose `owner` names a worker — it belongs to that worker's own registration, and registering it here too double-fires it (this closed a real incident: a room's `event-mining-hourly` posted from both the core and its pinned worker until the entry was marked `owner`-pinned). Absent `owner` is unaffected — that is still every entry today.
+   ```bash
+   python3 -c "
+   import json, sys
+   sys.path.insert(0, 'src')
+   from cron_ownership import entries_for_owner, CORE
+   cfg = json.load(open('$CF'))
+   print(json.dumps(entries_for_owner(cfg, CORE)))"
+   ```
+   Iterate the filtered list below, not the raw file.
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
    - **For a `CronCreate`-registered entry (one visible as a job in `CronList`): if a job for this
-     entry already exists, RE-REGISTER it rather than skipping** — `CronDelete` the existing job,
-     then `CronCreate` from the current `crons.json` text, and confirm the replacement in
-     `CronList`. This bullet does **not** apply to the dynamic-loop branch below (`loop: "dynamic"`),
+     entry already exists, RE-REGISTER it rather than skipping** — capture every existing job ID,
+     `CronCreate` the replacement from the current `crons.json` text, and confirm its new ID in
+     `CronList` before deleting any captured old ID. Then delete the old IDs and confirm exactly one
+     replacement remains. If creation or confirmation fails, retain the old job and stop loudly;
+     a brief duplicate preserves liveness, while delete-first can strand a session with no driver.
+     This bullet does **not** apply to the dynamic-loop branch below (`loop: "dynamic"`),
      which is never `CronCreate`d and keeps its own freshness-sentinel guard — re-launching one
      mid-session would re-run the loop body immediately, the exact failure that guard prevents. A session cron is a **snapshot of the prompt taken at registration
      time**; editing `crons.json` afterwards does not reach it. The former rule here was "skip if a
@@ -120,15 +141,16 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      above sat past the truncation point. Unconditional re-registration is the only reliable form.
      This does not risk the inline-fire failure described at the end of this step: `CronCreate`
      schedules the next fire time and never runs the prompt on registration.
-   - Call `CronCreate` with the cron expression and prompt:
+   - Call `CronCreate` with the cron expression and prompt (using the quota-aware effective cron
+     above for the Claude `main-loop` entry):
      - If `prompt_skill` is set, pass `prompt: "/skill-name"` (the leading slash makes the scheduled cron fire the skill as a slash command at its scheduled time).
      - Otherwise pass `prompt: <prompt-string-from-config>`.
      - **If the entry is a dynamic loop** (`loop: "dynamic"` / no interval), do NOT `CronCreate` it. Instead invoke the built-in **`/loop` with no interval** (the adaptive/self-pacing mode), passing the entry's prompt (`/skill-name` or `prompt`) plus any `loop_hint` as the loop body, and append to that body: "on each re-arm, also stamp `state/dynamic-loop-<entry-name>.alive` with `{ts, next_delay_s}`". `/loop`-no-interval then self-paces via ScheduleWakeup by its own judgment — no min/max/signal needed. **Durability comes from schedule-crons re-launching it on every boot.** Double-launch guard: a dynamic loop is NOT visible in `CronList` (ScheduleWakeup schedules a wakeup, not a cron job), and it isn't an OS process either, so neither the cron check nor a PID sentinel can see it. Use the mtime-freshness heartbeat pattern instead (same shape as `state/cores/<hostname>.alive`): the loop stamps its `.alive` sentinel on every re-arm (per the body clause above). On **boot** (first `/schedule-crons` of a new session), always launch — wakeups are session-scoped and died with the old session, so any leftover sentinel is definitionally stale. On a **mid-session re-run**, skip the launch if the sentinel's `ts` is younger than `next_delay_s + 120` seconds (loop still armed); launch only if stale or absent. This guard is also what prevents the inline-fire failure mode below for dynamic loops: launching `/loop` runs the body's first iteration immediately, which is intended at boot but must not repeat on a mid-session `/schedule-crons` re-invocation.
    - **Do NOT invoke the skill or run the prompt body inline during /schedule-crons.** Crons fire at their scheduled cron expression, never on registration. (Exception: a dynamic-loop entry's first iteration runs at launch by design — at boot only; the freshness-sentinel guard above is what keeps a mid-session re-run from repeating it.) (Past bug 2026-06-03T16:52Z: a mid-session `/schedule-crons` re-invocation inline-fired every entry — `/morning-briefing` plus 5 cron-body prompts — at one instant, dropping 8 spurious prompts atop legit watcher TASK_FILE events. The long-running session drowned and ended at 16:54 without processing queued owner DMs.)
-4. **Fallback — ensure `/proactive-loop` is scheduled.** After step 3, check whether any job in `crons.json` references `/proactive-loop` (either `"prompt_skill": "proactive-loop"` or a `"prompt"` whose body invokes the loop). If none does, call `CronCreate` directly with `cron: "*/10 * * * *"` and `prompt: "/proactive-loop"` as a bootstrap-safety net. Rationale: post-#954 the CLI boots with `-- "/schedule-crons"` and exits once registration finishes, so if `crons.json` is missing/empty/forgot-to-include-the-loop-entry the session goes idle with no recurring work driver. The fallback guarantees the loop runs at least every 10 min regardless of config state. Idempotent: if the user has a custom `*/5 * * * *` or `*/15 * * * *` entry, that satisfies the check and the fallback is skipped (no duplicate cron).
+4. **Fallback — ensure `/proactive-loop` is scheduled.** After step 3, check whether any job in `crons.json` references `/proactive-loop` (either `"prompt_skill": "proactive-loop"` or a `"prompt"` whose body invokes the loop). If none does, call `CronCreate` directly with the Claude quota helper's `effective_cron` (`*/10 * * * *` is its normal missing-config fallback) and `prompt: "/proactive-loop"` as a bootstrap-safety net. Rationale: post-#954 the CLI boots with `-- "/schedule-crons"` and exits once registration finishes, so if `crons.json` is missing/empty/forgot-to-include-the-loop-entry the session goes idle with no recurring work driver. The fallback guarantees the loop runs at least every 10 min when quota telemetry is healthy and below threshold, while preserving the same 30-minute protection near quota exhaustion. Idempotent: if the user has a custom `*/5 * * * *` or `*/15 * * * *` entry, that satisfies the check and the fallback is skipped (no duplicate cron).
 5. **Streaming task watcher — already started in step 1.5, before this step's registration loop ran.** (Moved 2026-08-24: previously ran here, after every `CronCreate` round-trip in steps 2-4, leaving the watcher unarmed for the whole registration window — see step 1.5 for the measured impact and the gate logic, which is unchanged, just earlier.) No action needed here on a normal pass; nothing in steps 2-4 above needs the watcher running to complete.
 
-5.4. **Arm `monitor`-type entries (durable Monitors).** For each crons.json entry carrying a `monitor` object, arm its persistent driver via the `Monitor` tool — `command`: the entry's `monitor.command`, `persistent: true`, `description`: the entry's `monitor.description` — UNLESS a process matching `monitor.match` is already running. Gate exactly like step 1.5's watcher: on a running PROCESS, never on a sentinel. At boot (a fresh session) nothing is running so it always arms; on a mid-session re-run it skips if the driver is live, so it never double-drives. Use a check whose own process tree can NEVER contain the match string (the same self-match trap step 1.5 warns about — do NOT use `pgrep -f`, and do NOT pass the match string as a literal anywhere on the command line: not as an argv to the checker, and not via a `printf | python` pipe either — the `bash -c` wrapper running the pipeline carries the WHOLE command text, match literal included, in its own argv, and it is alive during the scan, so excluding only the checker's pid still false-matches and reports `skip` while the monitor never arms). The checker must read the match from the crons.json FILE, keyed by entry NAME — the entry name is the only literal on the command line, and no driver's argv contains entry names. AND ITS FAILURES MUST NOT ARM: a two-way `&& skip || arm` maps every checker failure (resolver error, missing/malformed crons.json, ps failure, exception) to `arm`, duplicating the monitor exactly when the host is least healthy. Three-way exit semantics — 0 = driver RUNNING (skip), 1 = VERIFIED absent (arm), 2 = CHECK FAILED (do NOT arm; post the failure like a loud-stop):
+5.4. **Arm `monitor`-type entries (durable Monitors).** For each crons.json entry carrying a `monitor` object, arm its persistent driver via the `Monitor` tool — `command`: the entry's `monitor.command`, `timeout_ms: 1800000` (the tool's maximum; there is no `persistent` option, so re-arm on the expiry notice exactly as step 1.5 does), `description`: the entry's `monitor.description` — UNLESS a process matching `monitor.match` is already running. Gate exactly like step 1.5's watcher: on a running PROCESS, never on a sentinel. At boot (a fresh session) nothing is running so it always arms; on a mid-session re-run it skips if the driver is live, so it never double-drives. Use a check whose own process tree can NEVER contain the match string (the same self-match trap step 1.5 warns about — do NOT use `pgrep -f`, and do NOT pass the match string as a literal anywhere on the command line: not as an argv to the checker, and not via a `printf | python` pipe either — the `bash -c` wrapper running the pipeline carries the WHOLE command text, match literal included, in its own argv, and it is alive during the scan, so excluding only the checker's pid still false-matches and reports `skip` while the monitor never arms). The checker must read the match from the crons.json FILE, keyed by entry NAME — the entry name is the only literal on the command line, and no driver's argv contains entry names. AND ITS FAILURES MUST NOT ARM: a two-way `&& skip || arm` maps every checker failure (resolver error, missing/malformed crons.json, ps failure, exception) to `arm`, duplicating the monitor exactly when the host is least healthy. Three-way exit semantics — 0 = driver RUNNING (skip), 1 = VERIFIED absent (arm), 2 = CHECK FAILED (do NOT arm; post the failure like a loud-stop):
    ```bash
    python3 -c "
    import subprocess,sys,json,os
@@ -148,7 +170,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    case $rc in 0) echo skip;; 1) echo arm;; *) echo "CHECK-FAILED rc=$rc — do NOT arm";; esac
    ```
    (No pid-exclusion is needed: the match literal exists only inside crons.json and the python process's HEAP, never in any argv in the checker's ancestry — so any `ps` hit is a genuine driver process. Requirement on `monitor.match`: pick a substring of the driver's command path that no entry NAME collides with, e.g. `personal-content-loop/scripts/content-driver.sh`.)
-   `arm` → call the `Monitor` tool with the entry's `command`/`description` and `persistent: true`. These entries are Monitors, not crons: do NOT `CronCreate` them and do NOT count them in step 5.7's `registered`. This is the durable-Monitor mechanism — a Monitor declared in crons.json and re-armed on every boot, the same shape the task watcher (step 1.5) uses, but data-driven.
+   `arm` → call the `Monitor` tool with the entry's `command`/`description` and `timeout_ms: 1800000`. These entries are Monitors, not crons: do NOT `CronCreate` them and do NOT count them in step 5.7's `registered`. This is the durable-Monitor mechanism — a Monitor declared in crons.json and re-armed on every boot, the same shape the task watcher (step 1.5) uses, but data-driven.
 5.5. **Ensure the core heartbeat is running (sonichi/sutando#2198 prerequisite).** `src/core_heartbeat.py` (the writer of `state/cores/<hostname>.alive`) is started by `src/startup.sh` — but the CLI boot path lands here without ever running startup.sh (observed 2026-07-20: desktop-supervised core running for 20+ min with `state/cores/` empty, so the dashboard/health-check read the core as dead and the stop-path had no pid/socket target). Check freshness of `"$WORKSPACE/state/cores/$(bash scripts/sutando-config.sh host-label).alive"` — if the file is missing or its mtime is older than 90 seconds (the documented staleness threshold), start the heartbeat: `nohup python3 src/core_heartbeat.py > /tmp/core-heartbeat.log 2>&1 &`. Freshness-of-.alive is the running-check by design — do NOT use `pgrep -f core_heartbeat` (same wrapper-argv self-match anti-pattern as step 1.5's watcher note), and a fresh mtime is exactly the signal every other reader of the file trusts. Idempotent on mid-session re-runs: a live heartbeat keeps the mtime younger than 90s, so the start is skipped.
 
 5.6. **Auto session-recap on boot (owner directive 2026-07-13).** When more than one session transcript exists (i.e. there is a previous session to recap), run the `session-recap` skill's boot recap over the previous session. Per the recap contract (`skills/session-recap/SKILL.md` "Automatic recap on restart"), this is **two behaviors with different gates** — do NOT gate the whole step on `recap_room`:
@@ -174,6 +196,14 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    with no digest map at all. Omitting the field is safe (the probe skips the check); a WRONG map
    would report drift that is not there.
 
+   Then publish this host's schedule to the owner's **Crons** room database, so anyone can see what
+   every agent has scheduled: `python3 skills/schedule-crons/scripts/crons_table.py sync`. It is
+   fail-open (one line and a non-zero exit when the room is unreachable) and never blocks
+   registration; an unchanged `crons.json` writes nothing, so rows deleted in the room come back
+   only with `sync --force`. A cron may end its prompt with
+   `python3 skills/schedule-crons/scripts/crons_table.py touch <name> "<one-line result>"` to stamp
+   its row's Last ran (UTC) and Last result.
+
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
 ## Adding New Crons
@@ -194,19 +224,23 @@ Wrap **sub-daily** non-`main-loop` cron `prompt` bodies (e.g. `*/N`, `*/30`, hou
 
 `cron-gate.sh <reason> <command...>` either `exec`s the command (queue empty) or prints `cron-gate: owner tasks queued — deferring <reason>` and exits 0. See `crons.example.json` for canonical wrapped forms.
 
-## Attaching cron output to an AG2 Space room (if connected)
+## Attaching cron output to an s.space room (if connected)
 
-When the agent is connected to AG2 Space, an output-producing cron can post its results into its **own dedicated room** instead of a shared channel — one room per cron, so the owner can monitor each stream separately. This is **opt-in and connectivity-gated**: a cron with no `room` field, or an agent with no gateway token, is unaffected.
+When the agent is connected to s.space, an output-producing cron can post its results into its **own dedicated room** instead of a shared channel — one room per cron, so the owner can monitor each stream separately. This is **opt-in and connectivity-gated**: a cron with no `room` field, or an agent with no gateway token, is unaffected.
 
 **Opt in** by adding `"room": "auto"` to a cron entry in `crons.json`. On `/schedule-crons` activation (after step 3), run the helper once:
 
 ```bash
 WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"
+OWNER="$(python3 scripts/connections.py list --json \
+  | python3 -c 'import json,sys; print(next((r["owner_mxid"] or "" for r in json.load(sys.stdin) if r["primary"]), ""))')"
 python3 skills/schedule-crons/ensure-cron-room.py \
-  --crons-file "$WS/hosts/$H/crons.json" --owner "@<owner>:ag2.space" --repo .
+  --crons-file "$WS/hosts/$H/crons.json" --owner "$OWNER" --repo .
 ```
 
-`ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:ag2.space`**. Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
+`OWNER` is the primary connection row's `owner_mxid`: the owner's account on the homeserver the agent is on, whichever server that is. When the row has not learned it yet the value is empty; pass the owner's mxid yourself.
+
+`ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:<server>`** (the homeserver it was created on). Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
 
 **Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback) stay room-less — a room each would be clutter.
 
@@ -241,6 +275,14 @@ This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner
 
 ### Mechanical shell jobs
 
+A session cron runs its body inside the core's turn, so owner tasks queue
+behind it until it finishes. Choose by what the body needs:
+
+- **Mechanical** (runs scripts, no judgment): make it a `"launchd": true` entry
+  with `"shell_command"`. It runs outside the core session entirely.
+- **Needs LLM judgment**: keep it a prompt, and have the prompt dispatch the
+  work to a background subagent instead of running it inline.
+
 Launchd-owned entries may set `"shell_command"` for work that should not wake a
 model session (for example, a polling or sync script):
 
@@ -253,10 +295,15 @@ model session (for example, a polling or sync script):
 }
 ```
 
-`src/cron-runner.py` executes the command from the repository root, logs its
-command, stdout, stderr, and exit code to `<workspace>/logs/cron-runner.log`,
-and reports non-zero exits on stderr. A shell job runs even when the core
-heartbeat is absent and never creates a `tasks/` file. If an entry contains
+`src/cron-runner.py` starts the command in a detached child from the repository
+root and returns without waiting, so a slow job never delays other launchd
+crons. The child holds a per-job lock: a fire that lands while the previous run
+is still going is skipped and logged. It enforces `shell_timeout_s` (default
+300) by killing the process tree, and appends command, stdout, stderr and exit
+code to `<workspace>/logs/cron/<name>.log`. A shell job runs even when the core
+heartbeat is absent and never creates a `tasks/` file. A job with something for
+the owner writes `results/proactive-*.txt` itself, as `src/morning-briefing.py`
+does (see "Digest cron delivery" below). If an entry contains
 more than one execution form, precedence is `shell_command` > `prompt_skill` >
 `prompt`; use only one form in new configuration.
 

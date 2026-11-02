@@ -28,6 +28,11 @@ import unittest
 import urllib.parse
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOM_OPS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
 sys.path.insert(0, str(_ROOM_OPS))
 import read as rd  # noqa: E402
@@ -75,6 +80,10 @@ class ReadLimitCountsMessages(unittest.TestCase):
                 os.environ[k] = v
             else:
                 os.environ.pop(k, None)
+
+    def test_max_limit_matches_the_gateway_ceiling(self):
+        """A lowered ceiling loses history without making the existing tests fail."""
+        self.assertEqual(rd.MAX_LIMIT, 1000)
 
     def test_small_limit_does_not_report_an_empty_room(self):
         """The regression: limit=3 returned ZERO from a room holding fourteen."""
@@ -167,6 +176,23 @@ class ReadLimitCountsMessages(unittest.TestCase):
         self.assertLessEqual(max(seen), rd.MAX_LIMIT, "never request beyond MAX_LIMIT")
         self.assertFalse(res["complete"], "stopped early -> NOT complete")
 
+    def test_widening_reaches_the_cap_in_a_bounded_number_of_calls(self):
+        """Raising MAX_LIMIT must actually widen the reach AND stay cheap.
+
+        The schedule is geometric with a `_MAX_WIDENINGS` guard, so a bigger
+        cap could in principle be unreachable (guard truncates before the top)
+        or reachable only via many round trips. Pin both: the widest window IS
+        the cap, and getting there costs a handful of calls, not dozens.
+        """
+        for cap in (100, 1000):
+            w = rd._windows(rd.DEFAULT_LIMIT, cap)
+            self.assertEqual(w[-1], cap, f"schedule must reach cap {cap}")
+            self.assertEqual(sorted(set(w)), w, "strictly increasing, no repeats")
+            self.assertLessEqual(len(w), 8, f"too many round trips for cap {cap}")
+        # The floor start is the worst case — smallest first window, so the
+        # most doublings to climb. It is the one that would blow the budget.
+        self.assertLessEqual(len(rd._windows(1, rd.MAX_LIMIT)), 8)
+
     def test_leading_noise_wider_than_the_first_windows(self):
         """Two consecutive ZERO windows must not be read as an empty room.
 
@@ -239,6 +265,20 @@ class NormalizeMediaRefTests(unittest.TestCase):
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertEqual(out[0]["msgtype"], "m.file")
 
+    def test_broker_shaped_media_event_keeps_its_handle(self):
+        # The broker names the handle `mxc` and adds `mimetype` (room_ops `_media_fields`).
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "guide.md",
+                              "msgtype": "m.file", "mxc": "mxc://hs/abc123",
+                              "mimetype": "text/markdown"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
+        self.assertEqual(out[0]["msgtype"], "m.file")
+        self.assertEqual(out[0]["mimetype"], "text/markdown")
+
+    def test_media_ref_wins_when_both_names_arrive(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "a.pdf",
+                              "media_ref": "mxc://hs/ref", "mxc": "mxc://hs/other"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/ref")
+
     def test_media_without_msgtype_grows_no_null(self):
         # Third case: media present, msgtype absent. The gateway is external, so this
         # cannot be ruled out from here — keep the same additive shape as plain text.
@@ -246,6 +286,7 @@ class NormalizeMediaRefTests(unittest.TestCase):
                               "media_ref": "mxc://hs/abc123"}])
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertNotIn("msgtype", out[0])
+        self.assertNotIn("mimetype", out[0])
 
     def test_no_media_ref_key_for_plain_message(self):
         # A text message must not grow a null media_ref — keep the shape additive.

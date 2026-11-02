@@ -84,13 +84,13 @@ def c_selection_allowed(root: Path, root_is_clean: bool) -> "tuple[bool, str]":
             return (True, "clean-root bootstrap (no fence, no A entries)")
         return (False, "no fence and the root holds A entries")
     if state == EPOCH_STAGED:
-        return (False, "an interrupted epoch write is staged; not a clean root")
+        return (False, "an interrupted epoch write is staged; rerun the quiescent migration before selecting C")
     return (False, f"epoch {state}")
 
 
 def write_fence(root: Path, epoch: str) -> None:
     p = Path(root) / EPOCH_FILE
-    tmp = p.with_name(p.name + ".tmp")
+    tmp = staged_fence_path(root)
     tmp.write_text(epoch, encoding="utf-8")
     os.replace(tmp, p)
 
@@ -204,6 +204,12 @@ class TransitionRefusalBackend:
 
     def claim(self, item_id, worker):
         return None                        # nothing is ever processed
+
+    def release(self, token):
+        return False
+
+    def resend_epoch(self, item_id):
+        return 0
 
     def complete(self, token, outcome, **kw):
         return False

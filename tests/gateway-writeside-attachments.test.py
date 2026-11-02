@@ -19,6 +19,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -55,8 +60,9 @@ TAG = rgb.MEDIA_MARKER_TAG  # default "remote-media"
 
 
 def _write_and_parse(task):
-    tid = rgb._write_task(task)
-    assert tid, f"_write_task rejected {task!r}"
+    written = rgb._write_task(task)
+    assert written, f"_write_task rejected {task!r}"
+    tid = written[0]
     text = (rgb.TASKS_DIR / f"{tid}.txt").read_text()
     return text, ltp.parse_task_headers_trusted(text)
 

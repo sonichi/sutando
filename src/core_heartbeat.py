@@ -43,10 +43,13 @@ Runs forever until killed. Exit codes:
 """
 from __future__ import annotations
 import argparse
+import errno
 import json
 import os
+import re
 import signal
 import subprocess
+import shutil
 import socket
 import sys
 import time
@@ -61,6 +64,9 @@ from pathlib import Path
 # is worse than no heartbeat (supervisor restarts on crash; see module header).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from tmux_probe import classify as _classify_session_probe  # noqa: E402
+import core_lineage  # noqa: E402
+import session_runtime  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 
@@ -113,6 +119,83 @@ def _socket_path() -> str:
     return os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
 
 
+_MAX_FIELD = 64
+_CLIENT_TTL_S = 10.0
+_CLIENT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _tmux_candidates() -> list[str]:
+    seen: list[str] = []
+    for c in (shutil.which("tmux"), os.environ.get("SUTANDO_TMUX_BIN")):
+        if c and c not in seen:
+            seen.append(c)
+    return seen
+
+
+def _same_socket(reported: str, sock: str) -> bool:
+    try:
+        return bool(reported) and os.path.realpath(reported) == os.path.realpath(sock)
+    except Exception:
+        return False
+
+
+def _client_for(sock: str) -> str | None:
+    """The first candidate that PROVABLY talked to this server: it must list the server's own
+    socket path back. A hit is kept for one beat; a miss is retried on every call."""
+    hit = _CLIENT_CACHE.get(sock)
+    if hit and time.monotonic() - hit[0] < _CLIENT_TTL_S:
+        return hit[1]
+    for binary in _tmux_candidates():
+        try:
+            r = subprocess.run([binary, "-S", sock, "list-sessions", "-F", "#{socket_path}"],
+                               capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        if r.returncode == 0 and lines and all(_same_socket(ln, sock) for ln in lines):
+            _CLIENT_CACHE[sock] = (time.monotonic(), binary)
+            return binary
+    return None
+
+
+def _tmux_backend(sock: str | None = None, sess: str | None = None) -> dict:
+    """A client verified to speak to THIS server about the OBSERVED session — it must answer
+    with the server's socket path and the session name, so exit 0 alone proves nothing."""
+    sock = sock or _socket_path()
+    sess = sess or _observed_session(sock)
+    seen = _tmux_candidates()
+    chosen, server_version = None, None
+    for binary in seen:
+        try:
+            # Bounded (a hung binary must not eat the beat). The server proves itself by socket path; tmux
+            # renders #{session_name} EMPTY under -t, so the session is RESOLVED by has-session, not rendered.
+            r = subprocess.run([binary, "-S", sock, "display-message", "-p", "-t", f"={sess}",
+                                "#{version}|#{socket_path}"], capture_output=True, text=True, timeout=2)
+            parts = (r.stdout or "").strip().split("|")
+            if not (r.returncode == 0 and len(parts) >= 2 and parts[0] and " " not in parts[0]
+                    and _same_socket(parts[1], sock)):
+                continue
+            h = subprocess.run([binary, "-S", sock, "has-session", "-t", f"={sess}"],
+                               capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        if h.returncode == 0:
+            chosen, server_version = binary, parts[0][:_MAX_FIELD]
+            break
+    version = None
+    if chosen:
+        try:
+            r = subprocess.run([chosen, "-V"], capture_output=True, text=True, timeout=2)
+            out = (r.stdout or r.stderr or "").strip()
+            if r.returncode == 0 and out.lower().startswith("tmux "):
+                version = out.split(None, 1)[1][:_MAX_FIELD]
+        except Exception:
+            version = None
+    return {"backend": "tmux", "tmux_binary": chosen, "tmux_version": version,
+            "tmux_server_version": server_version, "tmux_verified": chosen is not None,
+            "tmux_candidates": seen}
+
+
 def core_session() -> str:
     """The tmux session the core runs in, per the env/default contract.
     NOT authoritative: this is an unverified claim from the environment, not a
@@ -145,10 +228,14 @@ def _observed_session(sock: str) -> str:
 
 
 def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:
+    """Every probe goes through the client that can reach this server; only when none can is
+    the PATH tmux used, so its refusal is classified rather than mistaken for an absent core."""
+    binary = _client_for(sock) or "tmux"
     try:
-        return subprocess.run(["tmux", "-S", sock, *args],
+        return subprocess.run([binary, "-S", sock, *args],
                               capture_output=True, text=True, timeout=5)
     except Exception:
+        _CLIENT_CACHE.pop(sock, None)
         return None
 
 
@@ -170,6 +257,31 @@ def _argv_names_session(args: str, sess: str) -> bool:
         elif tok.startswith("--name=") and tok[len("--name="):] == sess:
             return True
     return False
+
+
+# The last has-session tri-state core_pid() observed. run_forever() resets it
+# before each read so a stubbed core_pid (tests) counts as an observed answer.
+_LAST_SESSION_PROBE: bool | None = False
+
+
+def _session_present(sock: str, sess: str) -> bool | None:
+    """True / False / None for the exact session, via the shared classifier."""
+    global _LAST_SESSION_PROBE
+    has = _tmux(sock, "has-session", "-t", f"={sess}")
+    _LAST_SESSION_PROBE = (None if has is None
+                           else _classify_session_probe(has.returncode, has.stderr))
+    return _LAST_SESSION_PROBE
+
+
+def _session_pane_pid(sock: str, sess: str) -> int | None:
+    """Return a pane PID only from the exact socket/session."""
+    lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
+    if lp is None or lp.returncode != 0:
+        return None
+    for line in lp.stdout.split():
+        if line.strip().isdigit():
+            return int(line.strip())
+    return None
 
 
 def core_pid(socket_path: str | None = None, session: str | None = None) -> int | None:
@@ -198,9 +310,13 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     sock = socket_path or _socket_path()
     sess = session or core_session()
 
-    has = _tmux(sock, "has-session", "-t", f"={sess}")
-    if has is None or has.returncode != 0:
+    if not _session_present(sock, sess):
         return None
+
+    runtime = (_session_runtime(sock, sess) or "").lower()
+    # A known non-Claude core cannot be identified by a machine-wide Claude name.
+    if runtime and runtime != "claude":
+        return _session_pane_pid(sock, sess)
 
     # SESSION-SCOPED FIRST, then the process-name sweep as a fallback.
     #
@@ -309,13 +425,7 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     # it, a core in a non-selected window is invisible and this returns None for
     # a live core. Same one-token correction, same guard: `-t "={sess}"` keeps it
     # scoped to the exact session.
-    lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
-    if lp is None or lp.returncode != 0:
-        return None
-    for line in lp.stdout.split():
-        if line.strip().isdigit():
-            return int(line.strip())
-    return None
+    return _session_pane_pid(sock, sess)
 
 
 def _session_runtime(sock: str, sess: str) -> "str | None":
@@ -329,13 +439,9 @@ def _session_runtime(sock: str, sess: str) -> "str | None":
     Returns None rather than guessing: callers must treat unknown as "no
     discrimination possible" and keep their pre-existing behaviour.
     """
-    r = _tmux(sock, "show-environment", "-t", f"={sess}", "SUTANDO_CORE_RUNTIME")
-    if r is not None and r.returncode == 0:
-        line = r.stdout.strip()
-        if line.startswith("SUTANDO_CORE_RUNTIME=") and not line.startswith("-"):
-            val = line.split("=", 1)[1].strip()
-            if val:
-                return val
+    val = session_runtime.read(sess, lambda *a: _tmux(sock, *a))
+    if val:
+        return val
     # Config fallback. Import `resolve_core_runtime` directly rather than
     # shelling out to `scripts/sutando-config.sh` — that shell-out had to walk
     # two levels up from `__file__` to locate the script, which is the repo-root
@@ -358,9 +464,14 @@ def _session_runtime(sock: str, sess: str) -> "str | None":
 def write_beat(status: str = "running") -> None:
     """Write one heartbeat record. Atomic-via-tmp-then-rename so a concurrent
     reader never sees a partial file."""
+    if _SIGNALLED:
+        return  # the handler already unlinked .alive; a beat in flight must not republish it
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     target = _alive_path()
-    cpid = core_pid()
+    sock = _socket_path()
+    observed_session = _observed_session(sock)
+    # The pid of the session the record NAMES, not of whatever the env claims.
+    cpid = core_pid(sock, observed_session)
     payload = {
         "host": _hostname(),
         # The CORE's pid — what this file has always claimed to carry. Falls
@@ -378,32 +489,47 @@ def write_beat(status: str = "running") -> None:
         # launch env (e.g. `sutando-config.sh runtime` invoked by the desktop
         # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
         # socket). Mirrors start-cli.sh's resolution exactly.
-        "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+        "socket": sock,
         # Same runtime-authored argument as `socket`, but the env cannot be
         # trusted here: the Claude launcher hardcodes the session, so ask tmux.
-        "session": _observed_session(
-            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")),
+        "session": observed_session,
         # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
         "locality": _locality(),
-        "schema_version": 3,
+        # A client verified to speak this server and this (observed) session, plus the
+        # server's own version: a compatible client for readers, not the creator.
+        **_tmux_backend(sock=sock, sess=observed_session),
+        "schema_version": 4,
     }
     tmp = target.with_suffix(".alive.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(target)
+    # Liveness is not lineage: .alive says a core runs, not WHICH conversation
+    # it is having, so a reboot cannot resume the core the way it resumes workers.
+    try:
+        core_lineage.record_run(
+            CORES_DIR.parent.parent, _hostname(),
+            os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+            runtime="claude", cwd=os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "")
+            or str(Path(__file__).resolve().parents[1]),
+            tmux_socket=sock, tmux_session=observed_session or "")
+    except Exception:
+        pass  # a lineage write must never take the heartbeat down
 
 
 _STARTED_AT: float = time.time()
 _SHUTDOWN_REQUESTED = False
+_SIGNALLED = False  # set only by the signal handler; the loop flag alone is also set by harnesses
 
 
 def _handle_signal(signum: int, frame) -> None:
     """Mark shutdown so the loop exits at the top of the next sleep; also
     unlink the .alive file so peers see this core leave immediately rather
     than wait for mtime staleness."""
-    global _SHUTDOWN_REQUESTED
+    global _SHUTDOWN_REQUESTED, _SIGNALLED
     _SHUTDOWN_REQUESTED = True
+    _SIGNALLED = True
     try:
         # Tombstone BEFORE the unlink: recover-core must not read a graceful
         # stop as death and relaunch a core someone stopped on purpose (#2160).
@@ -434,21 +560,27 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # a failed boot as healthy. Keep waiting (so a late core can still arm the
     # gate), but remove any stale prior record until the real core is observed.
     saw_core = False
+    _record_writer_pid()
     try:
         # A new run supersedes any prior graceful-stop tombstone.
         _alive_path().with_suffix(".stopped").unlink(missing_ok=True)
     except Exception:  # pragma: no cover — best-effort
         pass
     absent_streak = 0
+    global _LAST_SESSION_PROBE
     while not _SHUTDOWN_REQUESTED:
+        if not _SCRIPT.exists():
+            # Checkout removed (a scratch copy): nothing can re-ensure this writer, so leave.
+            return 0
+        _LAST_SESSION_PROBE = False
         present = core_pid() is not None
         saw_core = saw_core or present
-        # `core_pid()` returns None for BOTH "the core is gone" and "I could not
-        # tell" (tmux timeout, transient exec failure) — the values are
-        # indistinguishable. Acting on a single None turns one flaky read into a
-        # removed `.alive`, i.e. a false death reported to every peer. Require
-        # CONSECUTIVE absences; any single present read resets the streak.
-        absent_streak = 0 if present else absent_streak + 1
+        # An unobserved probe (tmux missing/hung, or a refused client) is not an
+        # absence: it neither resets nor advances the streak of observed misses.
+        if present:
+            absent_streak = 0
+        elif _LAST_SESSION_PROBE is not None:
+            absent_streak += 1
         if saw_core and absent_streak >= ABSENT_BEATS_BEFORE_DEATH:
             print("core_heartbeat: core pane is gone — stopping beat and "
                   "removing .alive so readers see it leave", file=sys.stderr, flush=True)
@@ -460,6 +592,8 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
         if saw_core:
             try:
                 write_beat(status=status)
+                if not _PID_RECORDED:
+                    _record_writer_pid()
             except Exception as e:
                 # Don't die on transient FS hiccups — log + retry next tick.
                 print(f"core_heartbeat: write failed: {e}", file=sys.stderr, flush=True)
@@ -476,7 +610,115 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
         while slept < interval and not _SHUTDOWN_REQUESTED:
             time.sleep(slice_s)
             slept += slice_s
+    if _SIGNALLED:
+        try:
+            # A beat that was mid-write when the signal landed may have republished the file.
+            _alive_path().unlink(missing_ok=True)
+        except Exception:  # pragma: no cover — best-effort
+            pass
     return 0
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        return not (st.stdout or "").strip().startswith("Z")
+    except Exception:
+        return True
+
+
+def _pidfile() -> Path:
+    return _alive_path().with_suffix(".heartbeat.pid")
+
+
+_PID_RECORDED = False
+
+
+def _record_writer_pid() -> None:
+    """The writer's own record of itself, beside the .alive. Never creates the directory: only a beat
+    may bring state/cores into existence (a harness that stubs write_beat must leave no trace)."""
+    global _PID_RECORDED
+    try:
+        if CORES_DIR.is_dir():
+            _pidfile().write_text(f"{os.getpid()} {Path(__file__).resolve()}\n")
+            _PID_RECORDED = True
+    except Exception:  # pragma: no cover — best-effort
+        pass
+
+
+def _recorded_writer_pids() -> list[int]:
+    """Pids this checkout's records name: the pidfile and .alive's heartbeat_pid. Never a sweep."""
+    pids: list[int] = []
+    try:
+        head, _, path = _pidfile().read_text().strip().partition(" ")
+        if head.isdigit() and path == str(Path(__file__).resolve()):
+            pids.append(int(head))
+    except Exception:
+        pass
+    try:
+        hp = json.loads(_alive_path().read_text()).get("heartbeat_pid")
+        if isinstance(hp, int) and hp not in pids:
+            pids.append(hp)
+    except Exception:
+        pass
+    return pids
+
+
+def _is_writer_argv(args: str, script: str) -> bool:
+    """`<python> <this script> [flags]` and nothing else: a `-c` program that mentions the path is not a writer."""
+    i = args.find(script)
+    if i < 0:
+        return False
+    prefix = args[:i].rstrip()
+    after = args[i + len(script):]
+    # Apple's framework interpreter reports itself as `.../Python.app/Contents/MacOS/Python`.
+    return (bool(re.search(r"python[0-9.]*$", prefix, re.IGNORECASE)) and " -c" not in f" {prefix}"
+            and (after == "" or after[0] == " "))
+
+
+def stop_other_writers(timeout_s: float = 5.0) -> int:
+    """SIGTERM the heartbeat writer(s) this checkout's own records name — after proving each pid is an
+    interpreter running exactly this script — and wait for exit (SIGKILL past the timeout). Nothing
+    is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
+    me, parent = os.getpid(), os.getppid()
+    pids = []
+    for pid in _recorded_writer_pids():
+        if pid in (me, parent) or pid <= 1:
+            continue
+        try:
+            r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+        if r.returncode == 0 and _this_checkouts_writer(pid, (r.stdout or "").strip()):
+            pids.append(pid)
+    _terminate(pids, timeout_s)
+    return len(pids)
+
+
+def _terminate(pids: list[int], timeout_s: float) -> None:
+    """SIGTERM, wait for exit, SIGKILL past the timeout."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + timeout_s
+    left = list(pids)
+    while left and time.monotonic() < deadline:
+        left = [p for p in left if _pid_running(p)]
+        if left:
+            time.sleep(0.1)
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def mark_stopped() -> None:
@@ -493,6 +735,187 @@ def mark_stopped() -> None:
     _alive_path().with_suffix(".stopped").write_text(str(time.time()))
 
 
+_SCRIPT = Path(__file__).resolve()
+# The writer's own argv carries no flags (every launcher starts it bare); one-shot CLI calls do.
+_ONE_SHOT_FLAGS = ("--ensure", "--stop", "--once", "--mark-stopped", "--helper-receipt-dir")
+ENSURE_LOG = Path("/tmp/core-heartbeat.log")
+
+
+def _writer_argv(args: str) -> bool:
+    """`<python> <...>core_heartbeat.py` with no one-shot flag, whatever path form launched it."""
+    forms = [str(_SCRIPT), os.path.abspath(__file__)]  # absolute paths may hold spaces
+    forms += [tok for tok in args.split() if tok.endswith(_SCRIPT.name)]
+    for form in forms:
+        if form in args and _is_writer_argv(args, form):
+            return not any(f in args.split(form, 1)[1] for f in _ONE_SHOT_FLAGS)
+    return False
+
+
+def _pid_cwd(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return next((line[1:] for line in (r.stdout or "").splitlines() if line.startswith("n")), None)
+
+
+def _this_checkouts_writer(pid: int, args: str) -> bool:
+    """A writer argv whose script is THIS file: an absolute form directly, a relative one
+    (`python3 src/core_heartbeat.py`) only when it resolves here from the pid's own cwd."""
+    if not _writer_argv(args):
+        return False
+    if any(_is_writer_argv(args, s) for s in (str(_SCRIPT), os.path.abspath(__file__))):
+        return True
+    rel = [t for t in args.split() if t.endswith(_SCRIPT.name) and not os.path.isabs(t)]
+    cwd = _pid_cwd(pid) if rel else None
+    return bool(cwd) and any(_is_writer_argv(args, t) and Path(cwd, t).resolve() == _SCRIPT for t in rel)
+
+
+def running_writer_pids() -> list[int]:
+    """Live heartbeat writers of THIS checkout: the pids its own records name (any argv form,
+    e.g. a relative `python3 src/core_heartbeat.py`), plus writers launched by this exact path."""
+    me = os.getpid()
+    candidates = set(_recorded_writer_pids())
+    scripts = sorted({str(_SCRIPT), os.path.abspath(__file__)})
+    pattern = "|".join(re.sub(r"([.\\[\](){}*+?|^$])", r"\\\1", s) for s in scripts)
+    try:
+        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            if not (r.stdout or "").strip():
+                return [0]  # pgrep matched but named nothing to inspect: never start a second writer
+            candidates.update(int(t) for t in r.stdout.split() if t.isdigit())
+    except Exception:
+        pass
+    found = []
+    for pid in sorted(candidates - {me}):
+        if pid <= 1:
+            continue
+        try:
+            args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+        except Exception:
+            continue
+        if _this_checkouts_writer(pid, args):
+            found.append(pid)
+    return found
+
+
+def ensure_running(log_path: Path = ENSURE_LOG) -> tuple[bool, int]:
+    """Start a detached writer unless this checkout already has one. Returns (started, pid).
+
+    Every core launch path calls this: the writer exits by design when its core pane is gone,
+    so a core relaunched without startup.sh would otherwise run with no .alive at all."""
+    lock_dir = WORKSPACE / "state" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    from file_lock import lock_fd, unlock_fd
+    with open(lock_dir / "core-heartbeat-ensure.lock", "w") as handle:
+        lock_fd(handle.fileno())
+        try:
+            existing = running_writer_pids()
+            if existing:
+                return False, existing[0]
+            _take_over_from_another_checkout()
+            with open(log_path, "ab") as log:
+                child = subprocess.Popen([sys.executable, str(_SCRIPT)], stdin=subprocess.DEVNULL,
+                                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            # Hold the lock until the child's argv is its own, so a racing ensure sees it.
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and child.pid not in running_writer_pids():
+                if child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            # Started means the child holds the writer lock, not merely that it was spawned.
+            deadline = time.monotonic() + 5
+            while child.poll() is None and time.monotonic() < deadline:
+                if _writer_lock_holder() == child.pid:
+                    return True, child.pid
+                time.sleep(0.05)
+            if child.poll() is None:
+                return True, child.pid
+            if child.returncode == 0:
+                return False, _writer_lock_holder() or 0
+            raise RuntimeError(f"writer exited {child.returncode} at start; see {log_path}")
+        finally:
+            unlock_fd(handle.fileno())
+
+
+_WRITER_LOCK = None
+
+
+def _writer_lock_path() -> Path:
+    return WORKSPACE / "state" / "locks" / f"core-heartbeat-{_hostname()}.lock"
+
+
+def _writer_lock_holder() -> int | None:
+    """The pid the current lock holder wrote into the lock file; read-only, so it never contends."""
+    try:
+        head = _writer_lock_path().read_text().strip()
+    except OSError:
+        return None
+    return int(head) if head.isdigit() else None
+
+
+def _is_contention(exc: OSError) -> bool:
+    """Only a lock someone else holds; ENOLCK, EOPNOTSUPP and the like are errors, not contention."""
+    return isinstance(exc, BlockingIOError) or (os.name == "nt" and exc.errno in (errno.EACCES, errno.EDEADLK))
+
+
+def _take_over_from_another_checkout(timeout_s: float = 5.0) -> int | None:
+    """No writer of this checkout runs, so a held lock is another checkout's writer beating this
+    host and workspace: the launching checkout stops it, then starts its own. Returns the pid stopped."""
+    from file_lock import lock_fd, unlock_fd
+    path = _writer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as probe:
+        try:
+            lock_fd(probe.fileno(), blocking=False)
+        except OSError as exc:
+            if not _is_contention(exc):
+                return None
+        else:
+            unlock_fd(probe.fileno())
+            return None
+    pid = _writer_lock_holder()
+    if not pid or pid <= 1 or pid in (os.getpid(), os.getppid()):
+        return None
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None
+    if not _writer_argv(args):
+        return None
+    _terminate([pid], timeout_s)
+    return pid
+
+
+def _take_writer_lock() -> bool:
+    """One beating writer per host and workspace, held until exit (the OS releases it on any death).
+    False only on real contention; any other lock error propagates."""
+    global _WRITER_LOCK
+    from file_lock import lock_fd
+    path = _writer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a")
+    try:
+        lock_fd(handle.fileno(), blocking=False)
+    except OSError as exc:
+        handle.close()
+        if _is_contention(exc):
+            return False
+        raise
+    handle.truncate(0)
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    _WRITER_LOCK = handle
+    return True
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--interval", type=float, default=30.0, help="seconds between beats (default: 30)")
@@ -500,13 +923,48 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--once", action="store_true", help="write a single beat and exit (for tests/debugging)")
     p.add_argument("--mark-stopped", action="store_true",
                    help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
+    p.add_argument("--stop", action="store_true",
+                   help="stop every other heartbeat writer of this checkout and wait for it to exit (restart handoff)")
+    p.add_argument("--ensure", action="store_true",
+                   help="start a detached writer unless this checkout already runs one, then exit")
+    p.add_argument("--log", default=str(ENSURE_LOG), help="where an --ensure-started writer logs")
+    p.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    writer = not (args.once or args.stop or args.mark_stopped or args.ensure)
+    if writer:
+        try:
+            held = _take_writer_lock()
+        except OSError as exc:
+            print(f"core_heartbeat: cannot take the writer lock {_writer_lock_path()}: {exc}",
+                  file=sys.stderr, flush=True)
+            return 1
+        if not held:
+            print(f"core_heartbeat: another writer already beats {_hostname()} for this workspace; exiting",
+                  file=sys.stderr, flush=True)
+            return 0
+    if args.helper_receipt_dir:
+        from external_core_helpers import publish
+        publish(args.helper_receipt_dir, "heartbeat", __file__, WORKSPACE,
+                _socket_path(), _observed_session(_socket_path()),
+                passive=not (args.once or args.stop or args.mark_stopped))
     if args.mark_stopped:
         mark_stopped()
+        return 0
+    if args.stop:
+        print(f"core_heartbeat: stopped {stop_other_writers()} writer(s)", flush=True)
+        return 0
+    if args.ensure:
+        try:
+            started, pid = ensure_running(Path(args.log))
+        except RuntimeError as exc:
+            print(f"core_heartbeat: {exc}", file=sys.stderr, flush=True)
+            return 1
+        print(f"core_heartbeat: {'started writer' if started else 'writer already running'}"
+              f" (pid {pid})", flush=True)
         return 0
     if args.once:
         write_beat(status=args.status)

@@ -81,7 +81,8 @@ export interface SessionStartHook extends HookCommon {
 
 export interface SessionEndHook extends HookCommon {
 	hook_event_name: 'SessionEnd';
-	end_reason?: string;
+	// Real payload field (clear | resume | logout | prompt_input_exit | other).
+	reason?: string;
 }
 
 export interface PreCompactHook extends HookCommon {

@@ -25,6 +25,10 @@
 #   bash scripts/coverage-gate.sh                 # gate vs origin/main
 #   BASE_REF=<ref> bash scripts/coverage-gate.sh  # gate vs another base
 #   COVERAGE_GATE_FAIL_UNDER=90 bash scripts/coverage-gate.sh  # override bar
+#   COVERAGE_GATE_PRECOMPUTED=1 bash scripts/coverage-gate.sh
+#       # skip step 1: gate an existing .coverage + coverage.xml in cwd (what
+#       # ci.yml does — its python-standalone-tests job is the one instrumented
+#       # run, and the coverage-gate job downloads its data rather than run again)
 #
 # Deps (dev-only, mirrors detect-secrets handling in ci.yml):
 #   python3 -m pip install coverage diff-cover
@@ -32,8 +36,8 @@
 
 set -euo pipefail
 
-# Tests must never emit product telemetry. The suite runs real code paths and
-# an unstubbed one would hit PostHog from CI/dev; opt out for every test here.
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 export SUTANDO_TELEMETRY=0
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -79,6 +83,25 @@ if ! git diff --name-only "$BASE"...HEAD -- '*.py' | grep -q .; then
     exit 0
 fi
 
+# ci.yml runs the suite under instrumentation exactly once and hands the
+# combined data here, so the gate never runs the suite a second time.
+if [ -n "${COVERAGE_GATE_PRECOMPUTED:-}" ]; then
+# The instrumented run hands over either one merged .coverage (+ its xml) or
+# one fragment per shard, `.coverage.<name>`, which are combined here.
+if [ ! -f .coverage ] && ls .coverage.* >/dev/null 2>&1; then
+    python3 -m coverage combine --quiet
+fi
+if [ -f .coverage ] && [ ! -f coverage.xml ]; then
+    python3 -m coverage xml --quiet
+fi
+if [ ! -f .coverage ] || [ ! -f coverage.xml ]; then
+    echo "coverage-gate: COVERAGE_GATE_PRECOMPUTED is set but neither .coverage / coverage.xml nor any .coverage.* fragment is present." >&2
+    echo "  The instrumented suite run must produce and hand over its data." >&2
+    exit 2
+fi
+echo "coverage-gate: using precomputed coverage data (.coverage, coverage.xml)."
+rm -f diff-cover.md
+else
 echo "coverage-gate: running Python suite under instrumentation..."
 rm -f .coverage coverage.xml diff-cover.md
 find . -maxdepth 1 -name '.coverage.*' -delete
@@ -105,15 +128,26 @@ trap 'rm -rf "$RECDIR"' EXIT
 
 # `timeout` is coreutils and absent on stock macOS, where this also runs by
 # hand; degrade to no cap rather than failing the local path.
+#
+# 240s, not 120s: instrumentation slows race/bench-style tests well past their
+# uninstrumented runtime, so a cap sized for a bare run fails them here and the
+# red reads as the PR's fault (#3630). Defaulted ONCE -- the fallback used to be
+# written inline at both the cap and the timeout message, so changing one left
+# the other reporting a bound that was no longer enforced.
+COVERAGE_GATE_FILE_TIMEOUT="${COVERAGE_GATE_FILE_TIMEOUT:-240}"
 COVGATE_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then
-    COVGATE_TIMEOUT="timeout -k 5 ${COVERAGE_GATE_FILE_TIMEOUT:-120}"
+    # ABRT, not the default TERM: with PYTHONFAULTHANDLER=1 the dying process
+    # prints every thread's stack, so a capped file names WHERE it sat. rc stays 124.
+    COVGATE_TIMEOUT="timeout -k 5 -s ABRT $COVERAGE_GATE_FILE_TIMEOUT"
 else
     echo "coverage-gate: no \`timeout\` binary — per-file cap disabled (local run)." >&2
 fi
 export RECDIR COVGATE_TIMEOUT
 
-find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+# `skills` too: a skill owns its own tests/ and the gate must measure them; the
+# root is optional, so it is added only when present.
+bash "$(dirname "${BASH_SOURCE[0]}")/discover-python-tests.sh" > "$RECDIR/files"
 # Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
 # tests/a/b and tests/a_b alike), letting a failing rc be overwritten.
 _covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
@@ -123,7 +157,7 @@ _covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 # It also brings the worktrees' .coverage.* fragments home for the combine.
 # shellcheck disable=SC2086
 bash "$(dirname "$0")/parallel-suite-lane.sh" "$COVGATE_WORKERS" "$RECDIR/files" "$RECDIR" \
-    env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc
+    env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 PYTHONFAULTHANDLER=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc
 
 _covgate_idx=0
 while IFS= read -r f; do
@@ -133,7 +167,7 @@ while IFS= read -r f; do
     output="$(cat "$rec.out" 2>/dev/null || true)"
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT:-120}s): $f"
+            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT}s): $f"
         else
             echo "✖ test failed under instrumentation: $f"
         fi
@@ -180,6 +214,7 @@ fi
 
 python3 -m coverage combine --quiet
 python3 -m coverage xml --quiet
+fi
 
 echo
 echo "── whole-tree coverage (informational) ─────────────────────────"

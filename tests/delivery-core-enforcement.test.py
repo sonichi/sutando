@@ -4,7 +4,9 @@ seam doc v0.2.1 riders):
 
 1. Cross-incarnation key identity — recovery/re-claim must not mint a new
    delivery idempotency key: the provider sees the SAME key from a second
-   incarnation (different worker/pid) as from the first.
+   incarnation (different worker/pid) as from the first. A DELIBERATE operator
+   requeue is the one sanctioned exception (contract rule 1 binds claim,
+   restart and migration; resend_epoch is the stated variation point).
 2. Static no-claim-material-in-key scan — AST over delivery_core: the
    idempotency_key function may reference only item_id + resend_epoch, and
    every provider.deliver call site passes a key derived from it.
@@ -92,7 +94,7 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
                 self.assertNotIn(material, provider.keys[0],
                                  "claim material leaked into the key")
 
-    def test_key_stable_across_park_and_redrive(self):
+    def test_operator_requeue_mints_a_new_key(self):
         with tempfile.TemporaryDirectory(prefix="enf-key2-") as td:
             backend = DesignAClaimBackend(Path(td), reclaim_ttl_s=0.0)
             backend.publish(ITEM, b"x")
@@ -110,8 +112,13 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
             self.assertTrue(p1.keys and p2.keys,
                             "neither provider was called — the comparison "
                             "below would pass on two empty lists")
-            self.assertEqual(p1.keys, p2.keys,
-                             "park -> re-drive changed the idempotency key")
+            self.assertNotEqual(
+                p1.keys, p2.keys,
+                "an operator requeue must present a NEW key: reusing the parked "
+                "attempt's key lets the provider dedupe the re-send away, which "
+                "is the silent non-delivery requeue exists to fix")
+            self.assertEqual(p1.keys, [f"{ITEM}#0"])
+            self.assertEqual(p2.keys, [f"{ITEM}#1"])
 
 
 class StaticKeyScan(unittest.TestCase):
@@ -426,6 +433,36 @@ class CreateExclusive(unittest.TestCase):
                                  "destination must hold the winner's bytes")
 
 
+HISTORICAL_FIXTURE = "tests/fixtures/old_main/tutorial_cf87f324/getting_started.py"
+HISTORICAL_REASON = (
+    "cf87f324's getting_started.py, byte for byte: the deployed writer the tutorial's rollout fence is "
+    "measured against (tests/tutorial-deployed-fence.test.py pins its SHA-256 and runs it as its own "
+    "process). Its Commons.reconcile(pages, agent) is not a delivery provider and can't be changed in place.")
+# Preserves the deployed parent's state as evidence: only these exact defs, as (line, column, qualified name, arguments),
+# only in that one file; the same token anywhere else is reported.
+HISTORICAL = {HISTORICAL_FIXTURE: frozenset({(383, 4, "Commons.reconcile", ("pages", "agent"))})}
+
+
+def reconcile_offenders(rel: str, source: str, permitted: "frozenset | None" = None) -> "tuple[list, int]":
+    """Each `reconcile` def in one file's source that doesn't take (self, attempt), and how many it saw."""
+    allowed = HISTORICAL.get(rel, frozenset()) if permitted is None else permitted
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return [], 0
+    offenders, scanned = [], 0
+    owners = {c: n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef) for c in n.body}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "reconcile":
+            continue
+        scanned += 1
+        args = tuple(a.arg for a in node.args.args if a.arg != "self")
+        qual = f"{owners[node]}.{node.name}" if node in owners else node.name
+        if args != ("attempt",) and (node.lineno, node.col_offset, qual, args) not in allowed:
+            offenders.append(f"{rel}:{node.lineno} takes {list(args)}")
+    return offenders, scanned
+
+
 class ReconcileSignatureAgreesWithContract(unittest.TestCase):
     """Every `reconcile` in the tree takes the DeliveryAttempt the contract declares.
 
@@ -444,24 +481,38 @@ class ReconcileSignatureAgreesWithContract(unittest.TestCase):
         for root in roots:
             for path in root.rglob("*.py"):
                 try:
-                    tree = ast.parse(path.read_text(encoding="utf-8"))
-                except (SyntaxError, UnicodeDecodeError):
+                    text = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
                     continue
-                for node in ast.walk(tree):
-                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        continue
-                    if node.name != "reconcile":
-                        continue
-                    scanned += 1
-                    args = [a.arg for a in node.args.args if a.arg != "self"]
-                    if args != ["attempt"]:
-                        offenders.append(
-                            f"{path.relative_to(repo)}:{node.lineno} takes {args}")
+                found, seen = reconcile_offenders(str(path.relative_to(repo)), text)
+                offenders += found
+                scanned += seen
         # A zero scan would pass vacuously; the contract itself is one definition.
         self.assertGreater(scanned, 1,
                            "scanner found almost no reconcile defs — it narrowed")
         self.assertEqual(offenders, [],
                          "reconcile must take (self, attempt): " + "; ".join(offenders))
+
+    def test_the_historical_fixture_is_scanned_and_only_its_exact_def_is_permitted(self):
+        self.assertTrue(HISTORICAL_REASON)
+        text = (Path(__file__).resolve().parent.parent / HISTORICAL_FIXTURE).read_text()
+        self.assertEqual(reconcile_offenders(HISTORICAL_FIXTURE, text), ([], 1))
+        bare = f"{HISTORICAL_FIXTURE}:383 takes ['pages', 'agent']"
+        self.assertEqual(reconcile_offenders(HISTORICAL_FIXTURE, text, frozenset())[0], [bare])
+        # The same def anywhere else is a finding.
+        elsewhere = "tests/fixtures/old_main/planted.py"
+        self.assertEqual(reconcile_offenders(elsewhere, text)[0], [f"{elsewhere}:383 takes ['pages', 'agent']"])
+        # A second real violation in the same file is still reported: in the same class (two defs
+        # can't share a line), and the permitted def's own text in another class.
+        lines = text.split("\n")
+        self.assertTrue(lines[382].startswith("    def reconcile(self, pages"))
+        at = lines.index("    def listed_pages(self) -> List[dict]:")
+        same_class = lines[:at] + ["    def reconcile(self, item_id, key): return None"] + lines[at:]
+        self.assertEqual(reconcile_offenders(HISTORICAL_FIXTURE, "\n".join(same_class)),
+                         ([f"{HISTORICAL_FIXTURE}:{at + 1} takes ['item_id', 'key']"], 2))
+        other = text + "\n\nclass Other:\n    def reconcile(self, pages, agent):\n        return None\n"
+        self.assertEqual(reconcile_offenders(HISTORICAL_FIXTURE, other)[0],
+                         [f"{HISTORICAL_FIXTURE}:{len(lines) + 3} takes ['pages', 'agent']"])
 
 
 if __name__ == "__main__":

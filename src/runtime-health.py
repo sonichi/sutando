@@ -11,7 +11,9 @@ made concrete when a core sat unresponsive at claude's `/login` (locked keychain
     python3 src/runtime-health.py           # prints JSON; also writes state/runtime-health.json
 
 Output (single JSON object on stdout):
-    health           working | idle | needs_login | offline | unknown
+    health           working | idle | blocked | needs_login | offline | unknown
+                     (blocked: tasks are queued but the pane holds them — a draft the
+                     dispatcher will not type over, or an abnormal frame)
     authenticated    bool | null  (false when the core is sitting at claude's login prompt;
                      null when we can't tell, e.g. the core is offline)
     core_running     bool   (a `sutando-core` tmux session exists on the socket)
@@ -33,8 +35,45 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import connections  # noqa: E402 — the install's gateway rows and which one is primary
+import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
+import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
+from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
+
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+
+
+def _tmux_socket():
+    """The socket the core ACTUALLY launched on, not the one this process can guess.
+
+    The launcher may override SUTANDO_TMUX_SOCKET (the desktop app runs the core on
+    <app-support>/run/tmux.sock), and a detached probe does not inherit it — so the
+    module-level default above targets a socket that does not exist and a live core
+    reads as offline. core_heartbeat records the real one in its own environment;
+    prefer that when it is fresh. An explicit SUTANDO_TMUX_SOCKET always wins."""
+    if os.environ.get("SUTANDO_TMUX_SOCKET"):
+        return TMUX_SOCKET
+    try:
+        host = _host_label_safe()
+        if host:
+            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            alive = os.path.join(_resolve_workspace(repo), "state", "cores", f"{host}.alive")
+            # Bounded BOTH ways: a crashed core leaves a stale record, and a clock step
+            # leaves a future-dated one that a one-sided test accepts forever.
+            age = time.time() - os.path.getmtime(alive)
+            if age >= HEARTBEAT_STALE_SECONDS or age < -HEARTBEAT_FUTURE_TOLERANCE_SECONDS:
+                return TMUX_SOCKET
+            with open(alive, "r", encoding="utf-8") as fh:
+                sock = (json.load(fh) or {}).get("socket")
+            if isinstance(sock, str) and sock:
+                return sock
+    except Exception:
+        pass  # a probe must never fail on its own socket lookup
+    return TMUX_SOCKET
 
 # A `core-status.json` claiming "running" is only trustworthy if its `ts` is
 # recent — a crashed/wedged loop can leave it stuck on "running" indefinitely.
@@ -50,6 +89,10 @@ STALE_STATUS_SECONDS = 90
 # Matches the documented staleness threshold every other reader of that file uses.
 HEARTBEAT_STALE_SECONDS = 90
 
+# A far-future .alive has a NEGATIVE age, which a one-sided `age >= max` test reads
+# as fresh. A tolerance, not zero, so an atomic rewrite mid-stat is not discarded.
+HEARTBEAT_FUTURE_TOLERANCE_SECONDS = 5
+
 # ── Severity layer (design: docs/design-core-health-verdict.md) ──────────────
 # One authoritative, severity-tagged verdict every consumer reads, so "report
 # vs restart" is decided in ONE place instead of re-derived per consumer. This
@@ -57,12 +100,13 @@ HEARTBEAT_STALE_SECONDS = 90
 # severity + signals + the gate are layered on top.
 #
 #   ok        working | idle           → no action
+#   warn      blocked                  → surface it; a restart is not the remedy
 #   escalate  needs_login              → tell the human; NEVER auto-restart
 #   critical  unknown(wedged) | offline→ restart, but only through severity_gate
-#   warn      (reserved: 'degraded' soft-warnings folded in a later slice)
 _SEVERITY = {
     "working": "ok",
     "idle": "ok",
+    "blocked": "warn",
     "degraded": "warn",
     "needs_login": "escalate",
     "unknown": "critical",   # status-stale wedge
@@ -158,19 +202,8 @@ def severity_gate(verdict, *, confirm_min=2, freshly_booted=False):
     return "report"
 
 
-# Markers that mean the bundled claude CLI is sitting at its auth prompt and the
-# core therefore cannot act. Kept broad on purpose — the failure mode is a user
-# staring at an unresponsive agent, so a false "needs_login" (rare) is far less
-# costly than missing a real one.
-_LOGIN_MARKERS = (
-    "not logged in",
-    "please run /login",
-    "run `claude login`",
-    "run 'claude login'",
-    "unlock-keychain",
-    "invalid api key",
-    "authentication_error",
-)
+# Which pane lines mean the CLI needs /login is cli_wedge's (`login_marker_line`): the
+# needs-login banner grammar plus its auxiliary keychain / legacy-CLI hints.
 
 
 def _run(cmd):
@@ -190,35 +223,32 @@ def _run(cmd):
 
 
 def _core_running():
-    # rc None = the probe itself could not run (tmux absent / PATH broken) → that
-    # is UNKNOWN, not "not running". A real has-session miss returns rc 1, which
-    # stays False. (qingyun CR on #2527: probe-unavailable must not be a down-vote.)
-    rc, _ = _run(["tmux", "-S", TMUX_SOCKET, "has-session", "-t", SESSION])
-    if rc is None:
-        return None
-    return rc == 0
+    # None = unobserved (tmux absent, hung, or a client the server refused) and
+    # never a down-vote; only a server that answered "no session" is False.
+    return _tmux_has_session(_tmux_socket(), SESSION, timeout=8)
 
 
 def _gateway_configured():
-    """Whether the ag2.space mobile gateway is provisioned on THIS host.
+    """Whether a gateway is provisioned on THIS host.
 
-    The gateway bridge only runs where a remote task token is configured (env or
-    channels/ag2space/.env). Returns True (configured), False (config readable,
-    no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    The gateway bridge only runs where an enabled connection row exists or a remote task
+    token is configured (env, or any contained file under channels/ag2space/). Returns True
+    (configured), False (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR).
     Mirrors health-check.check_gateway_bridge's detection."""
+    if connections.enabled_rows():
+        return True
     if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
         return True
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return None
+    # Delegated so this surface agrees with startup and health-check; imported here because
+    # the resolver pulls in shared/, which a helper loading this file from a bare src copy lacks.
     try:
-        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
-            for ln in f:
-                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
-                    return True
-    except OSError:
+        from channel_env_resolve import channel_configured
+        return channel_configured(os.path.join(cfg, "channels"), "ag2space")
+    except (OSError, ImportError):
         return None
-    return False
 
 
 def _gateway_running():
@@ -234,7 +264,7 @@ def _gateway_running():
     if rc == 0:
         return True
     # Fallback: a window named "gateway" in the core session.
-    rc2, out = _run(["tmux", "-S", TMUX_SOCKET, "list-windows", "-t", SESSION, "-F", "#{window_name}"])
+    rc2, out = _run(["tmux", "-S", _tmux_socket(), "list-windows", "-t", f"={SESSION}", "-F", "#{window_name}"])
     if rc2 == 0 and any(w.strip() == "gateway" for w in out.splitlines()):
         return True
     # Neither probe confirmed the gateway. Only report "down" if at least one
@@ -248,12 +278,13 @@ def _gateway_running():
 
 # The AG2 Space desktop app runs its own engine runtime under
 # `space.ag2.app/engine`, and that engine is what serves the Station connector
-# gateway (sutando.ag2.space). Station connectors are therefore available only
+# gateway (the DotSpace's cloud origin). Station connectors are therefore available only
 # while AG2 Space is running; when it is not, Station calls fail with a bare
 # ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
 # attribute a Station failure to "AG2 Space not running" rather than guess.
 _AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
-_STATION_GATEWAY_HOST = "sutando.ag2.space"
+_STATION_GATEWAY_HOST = dotspace.server_of_gateway_url(
+    dotspace.default_cloud_origin(primary_server=connections.primary_server()))
 
 
 def _ag2space_app_running():
@@ -471,16 +502,66 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
     return result
 
 
+def _session_runtime():
+    """The core session's stamped runtime, or None when it cannot be read."""
+    try:
+        return session_runtime.parse(*_run(["tmux", "-S", _tmux_socket(), *session_runtime.argv(SESSION)]))
+    except Exception:  # noqa: BLE001 — unreadable: the default (Claude) reading applies
+        return None
+
+
 def _pane_text():
-    rc, out = _run(["tmux", "-S", TMUX_SOCKET, "capture-pane", "-p", "-t", SESSION])
-    return out if rc == 0 else ""
+    sock = _tmux_socket()
+    target = cli_wedge.core_target(sock, SESSION)
+    return (cli_wedge.capture_pane(sock, target) or "") if target else ""
 
 
-def needs_login(pane_text):
+def _queued_tasks(workspace):
+    """How many core tasks still owe a result, by task_dispatch's one reading; 0 when unreadable."""
+    try:
+        from delivery.task_dispatch import pending_candidates
+        return sum(1 for _ in pending_candidates(
+            os.path.join(workspace, "tasks"), os.path.join(workspace, "results"),
+            claims_dir=os.path.join(workspace, "state", "task-event-handler-claims"),
+            deliveries_dir=os.path.join(workspace, "deliveries")))
+    except Exception:  # noqa: BLE001 — a failed read is no evidence of a queue
+        return 0
+
+
+def _pane_blocks_dispatch(workspace, queued=True):
+    """The pane gate's verdict when it holds queued tasks, or (queued or not) when a dialog
+    only a person can answer holds it; else None. The adapter is the session's own
+    runtime; a session that cannot name it is not judged."""
+    try:
+        from delivery import pane_gate
+        sock = _tmux_socket()
+        runtime = session_runtime.parse(*_run(["tmux", "-S", sock, *session_runtime.argv(SESSION)]))
+        adapter = pane_gate.ADAPTERS.get(runtime or "")
+        target = cli_wedge.core_target(sock, SESSION)
+        if adapter is None or target is None:
+            return None
+        verdict = pane_gate.classify_pane(cli_wedge.capture_pane(sock, target, escapes=True),
+                                          adapter, workspace, sock, SESSION)
+        if pane_gate.waits_for_a_person(verdict):
+            return verdict
+        return verdict if queued and pane_gate.blocks_dispatch(verdict, adapter) else None
+    except Exception:  # noqa: BLE001 — best-effort: an unreadable pane keeps the prior verdict
+        return None
+
+
+def needs_login(pane_text, runtime=None):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
-    without a live tmux — this is the load-bearing 'stuck vs thinking' decision."""
-    low = pane_text.lower()
-    return any(m in low for m in _LOGIN_MARKERS)
+    without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
+    Only the latest marker counts, and only while nothing after it shows the CLI
+    signed in again. The marker set is cli_wedge's `login_marker_line`; the
+    "signed in after it" reading is worker_auth_state's, the one the seat monitor
+    uses, so both readers give one answer for one pane."""
+    lines = pane_text.splitlines()
+    last = max((i for i, ln in enumerate(lines) if cli_wedge.login_marker_line(ln)),
+               default=None)
+    if last is None:
+        return False
+    return not signed_in_since("\n".join(lines[last + 1:]), runtime)
 
 
 def _core_status(workspace):
@@ -550,7 +631,7 @@ def derive():
         # so it must NOT license overriding a login marker — that would be the
         # same absence-of-evidence mistake in the other direction.
         acting = status in ("running", "idle") and ts is not None and not stale
-        login = needs_login(_pane_text())
+        login = needs_login(_pane_text(), _session_runtime())
         # status_fresh: True = advanced within the window, False = stale,
         # None = no record to judge (can't prove either way).
         status_fresh = None if ts is None else (not stale)
@@ -587,6 +668,21 @@ def derive():
                 health, detail = "unknown", "Status stale (still 'running', not updated recently) — possibly wedged"
             elif status == "idle":
                 health, detail = "idle", "Agent is online and idle"
+                # core-status is a self-report; queued work the pane is holding is not idle.
+                queued = _queued_tasks(workspace)
+                # Checked with nothing queued too: a trust or login dialog at startup holds
+                # the next task as surely as the current one (2026-10-22: hours of "idle").
+                held = _pane_blocks_dispatch(workspace, queued=bool(queued))
+                if held is not None:
+                    if held.state == "pending":
+                        what = f"unsent text in the composer: {held.pending!r}"
+                    elif held.state == "busy":
+                        what = f"the core is waiting on a {held.reason} prompt only a person can answer"
+                    else:
+                        what = f"{held.state} ({held.reason})"
+                    health = "blocked"
+                    detail = (f"{queued} task(s) queued but not dispatched — {what}" if queued
+                              else f"Agent cannot take tasks — {what}")
             else:
                 health, detail = "unknown", "Agent is running (status unknown)"
 
@@ -599,7 +695,7 @@ def derive():
         "ag2space_app_running": ag2space_app,
         # Real reachability of the Station gateway (tri-state); None = unknown.
         "station_available": station,
-        "tmux_socket": TMUX_SOCKET,
+        "tmux_socket": _tmux_socket(),
         "session": SESSION,
         "detail": detail,
         # Raw inputs behind the verdict, so a wrong call is auditable instead of

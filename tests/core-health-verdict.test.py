@@ -11,6 +11,12 @@ is not freshly booted. Everything softer is `report`/`escalate`/`none`. This is
 the fixture wall against the false-positive-restart class that produced ~15
 separate historical fixes (#2114 idle->hung, #2072 bad-PATH->crashed, etc.).
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -236,12 +242,17 @@ try:
 finally:
     rh.subprocess.run = _orig_run
 
-# A probe that RAN and genuinely found nothing still reads False (a real miss is
-# not the same as an unavailable probe).
+# A definitive miss is injected at the shared tri-state seam, never via the host's
+# tmux: a `tmux` -> /usr/bin/false on PATH must not be able to satisfy this.
 _orig_run2 = rh._run
+_orig_hs = rh._tmux_has_session
 try:
-    rh._run = lambda cmd: (1, "")
+    rh._tmux_has_session = lambda sock, sess, timeout=None: False
     check("_core_running -> False when has-session ran and missed", rh._core_running() is False)
+    rh._tmux_has_session = lambda sock, sess, timeout=None: None
+    check("_core_running -> None when the probe observed nothing", rh._core_running() is None)
+    rh._tmux_has_session = _orig_hs
+    rh._run = lambda cmd: (1, "")
     check("_gateway_running -> False when probes ran but found nothing", rh._gateway_running() is False)
     rh._run = lambda cmd: (0, "") if cmd and cmd[0] == "pgrep" else (1, "")
     check("_gateway_running -> True via pgrep", rh._gateway_running() is True)
@@ -249,6 +260,7 @@ try:
     check("_gateway_running -> True via tmux window fallback", rh._gateway_running() is True)
 finally:
     rh._run = _orig_run2
+    rh._tmux_has_session = _orig_hs
     rh._gateway_configured = _orig_gwc
 
 
@@ -285,8 +297,10 @@ try:
           rh._gateway_configured() is None)
     with tempfile.TemporaryDirectory() as cfg:
         os.environ["CLAUDE_CONFIG_DIR"] = cfg
-        check("_gateway_configured: config dir, no .env -> None",
-              rh._gateway_configured() is None)
+        # No ag2space channel is a definitive "not provisioned" — the answer
+        # health-check gives; None is reserved for "cannot tell".
+        check("_gateway_configured: config dir, no channel -> False",
+              rh._gateway_configured() is False)
         ch = os.path.join(cfg, "channels", "ag2space")
         os.makedirs(ch)
         open(os.path.join(ch, ".env"), "w").write("OTHER=1\n")
@@ -295,6 +309,18 @@ try:
         open(os.path.join(ch, ".env"), "w").write("REMOTE_TASK_TOKEN=abc\n")
         check("_gateway_configured: .env with token -> True",
               rh._gateway_configured() is True)
+        # The resolver pulls in shared/; a helper loading this module from a bare src copy
+        # has none, and the answer is "can't tell", never a crash.
+        _saved_resolver = sys.modules.get("channel_env_resolve")
+        sys.modules["channel_env_resolve"] = None
+        try:
+            check("_gateway_configured: resolver not importable -> None",
+                  rh._gateway_configured() is None)
+        finally:
+            if _saved_resolver is None:
+                sys.modules.pop("channel_env_resolve", None)
+            else:
+                sys.modules["channel_env_resolve"] = _saved_resolver
 finally:
     for k, val in _saved_env.items():
         if val is None:

@@ -248,22 +248,27 @@ _check(
 # ---------------------------------------------------------------------------
 
 _it = _src("src/inline-tools.ts")
-# Locate the cancelBody block
-_cb_start = _it.find("const cancelBody = [")
-_cb_end = _it.find("].join('\\n');", _cb_start) if _cb_start > 0 else -1
-_cb_block = _it[_cb_start:_cb_end + 20] if _cb_start > 0 and _cb_end > 0 else ""
+# Locate the cancelBody block: from its assignment through the task: line.
+_cb_start = _it.find("const cancelBody =")
+_cb_task = _it.find("task: CANCEL_INSTRUCTION", _cb_start) if _cb_start > 0 else -1
+_cb_block = _it[_cb_start:_cb_task + 30] if _cb_start > 0 and _cb_task > 0 else ""
 _check(
     "inline-tools: cancel_task strips newlines from targetId",
     "safeTargetId" in _it and ".replace(/[\\r\\n]/g, '')" in _it,
     "cancel_task embeds targetId (Gemini-controlled) in the task: body — must strip newlines "
     "before embedding so a forged \\naccess_tier: line can't precede the real one",
 )
+# The header comes from the shared writer buildVoiceTaskHeader (field order
+# pinned by tests/task-bridge-format.test.ts); the task: line must follow it.
+_cb_header_at = _cb_block.find("buildVoiceTaskHeader(")
+if _cb_header_at < 0:
+    _cb_header_at = _cb_block.find("access_tier: owner")
 _check(
-    "inline-tools: cancel_task task: field is last (after access_tier:)",
-    "access_tier: owner" in _cb_block
-    and "task: CANCEL_INSTRUCTION" in _cb_block
-    and _cb_block.index("access_tier: owner") < _cb_block.index("task: CANCEL_INSTRUCTION"),
-    "cancel_task cancelBody must place task: after access_tier: (field-order defence)",
+    "inline-tools: cancel_task task: field is last (after the header writer / access_tier:)",
+    "task: CANCEL_INSTRUCTION" in _cb_block
+    and 0 <= _cb_header_at < _cb_block.index("task: CANCEL_INSTRUCTION"),
+    "cancel_task cancelBody must place task: after the header (buildVoiceTaskHeader or a literal "
+    "access_tier: owner line) — field-order defence",
 )
 
 # ---------------------------------------------------------------------------
@@ -353,12 +358,18 @@ _GUARDED_PY_WRITERS = {
     # parser can never promote body content to a header.
     "src/local_task_protocol.py",
     "skills/schedule-crons/scripts/codex-scheduler.py",
+    # pool_ask: the question goes through confine(), sender/origin through
+    # header_safe_value(), and task: is written last.
+    "skills/worker-pool/scripts/pool_ask.py",
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
     "src/slack-bridge.py",
     "src/github-webhook.py",
     "src/agent-api.py",
     "src/cron-runner.py",
+    # Room speech + quoted article text: every value goes through confine(),
+    # and task: is written last so body newlines cannot forge fields.
+    "src/signal_room_tasks.py",
 }
 
 _TASK_FIELD_PATTERN = 'f"task: {'
@@ -420,9 +431,8 @@ for _tsf in sorted(
 
 # ---------------------------------------------------------------------------
 # Header-key parity: _HEADER_KEYS in task_body_guard.py, task-bridge.ts, and
-# conversation-server.ts must contain the same 14 keys.  Drift between
-# implementations creates blind spots — a key guarded in Python but not TS
-# (or vice versa) leaves one attack surface unprotected.
+# conversation-server.ts must contain the same generated keys, or one side
+# leaves an attack surface unguarded.
 # ---------------------------------------------------------------------------
 
 _tg = _src("src/task_body_guard.py")
@@ -450,38 +460,41 @@ else:
         )
         _py_header_keys = set(re.findall(r"[\"']([^\"']+)[\"']", _body))
 
-_tb2 = _src("src/task-bridge.ts")
-_ts_keys_m = re.search(r"const _HEADER_KEYS\s*=\s*\[([^\]]+)\]", _tb2, re.DOTALL)
-_ts_header_keys: set[str] = set()
-if _ts_keys_m:
-    _ts_header_keys = {
-        k.strip().strip("\"', ")
-        for k in _ts_keys_m.group(1).split(",")
-        if k.strip().strip("\"', ")
-    }
+_gen = _src("src/header_keys.ts")
+_gen_keys = set(re.findall(r"^\t'([^']+)',$", _gen, re.M))
 
+# Both TS guards derive from the generated src/header_keys.ts, so parity is one
+# question: is the artifact current, and do the consumers still import it.
 _check(
-    "header-key-parity: task_body_guard.py _HEADER_KEYS matches task-bridge.ts",
-    bool(_py_header_keys) and _py_header_keys == _ts_header_keys,
-    f"key mismatch: py={sorted(_py_header_keys - _ts_header_keys)} "
-    f"ts={sorted(_ts_header_keys - _py_header_keys)} — "
-    "add missing keys to both implementations to keep guards in sync",
+    "header-key-parity: src/header_keys.ts matches local_task_protocol.KNOWN_HEADER_KEYS",
+    bool(_py_header_keys) and _py_header_keys == _gen_keys,
+    f"generated file is stale: py-only={sorted(_py_header_keys - _gen_keys)} "
+    f"gen-only={sorted(_gen_keys - _py_header_keys)} — "
+    "run: python3 scripts/gen-header-keys.py",
 )
 
-_cs2 = _src("skills/phone-conversation/scripts/conversation-server.ts")
-_cs_missing = [k for k in _py_header_keys if k not in _cs2]
-_check(
-    "header-key-parity: conversation-server.ts _CONF_HEADER_RE contains all py keys",
-    not _cs_missing,
-    f"keys missing from conversation-server.ts _CONF_HEADER_RE: {_cs_missing} — "
-    "update the inline regex string to include them",
-)
+for _path, _sym in (("src/task-bridge.ts", "HEADER_KEYS"),
+                    ("skills/phone-conversation/scripts/conversation-server.ts",
+                     "HEADER_KEY_ALTERNATION")):
+    _consumer = _src(_path)
+    _check(
+        f"header-key-parity: {_path} imports the generated key set",
+        "from './header_keys.js'" in _consumer
+        or "from '../../../src/header_keys.js'" in _consumer,
+        f"{_path} no longer imports src/header_keys.ts — a hand-maintained copy "
+        "is exactly the drift this generation removed",
+    )
+    _check(
+        f"header-key-parity: {_path} uses {_sym} rather than a literal list",
+        _sym in _consumer,
+        f"{_path} does not reference {_sym}",
+    )
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 48/48
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 52/52
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)

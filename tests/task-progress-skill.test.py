@@ -2,6 +2,11 @@
 """Tests for skills/task-progress/scripts/notify.py."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
@@ -236,6 +241,67 @@ class TestSendSlack(unittest.TestCase):
             self.mod.send_slack("D123", "update", thread_ts="1234.56")
         self.assertEqual(captured.get("thread_ts"), "1234.56")
 
+    def _captured_payload(self, message):
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured.update(payload)
+            return True
+
+        with patch.object(self.mod, "_token", return_value="xoxb-fake"), \
+             patch.object(self.mod, "_post", side_effect=fake_post):
+            self.mod.send_slack("D123", message)
+        return captured
+
+    def test_single_link_note_keeps_its_preview(self):
+        # The preview IS the value when a note carries exactly one link.
+        captured = self._captured_payload("see https://example.com/a")
+        self.assertIs(captured.get("unfurl_links"), True)
+        self.assertIs(captured.get("unfurl_media"), True)
+
+    def test_link_dense_note_suppresses_unfurling(self):
+        # Two or more links would arrive as a stack of preview cards.
+        captured = self._captured_payload(
+            "see https://example.com/a and https://example.com/b")
+        self.assertIs(captured.get("unfurl_links"), False)
+        self.assertIs(captured.get("unfurl_media"), False)
+
+
+class TestUnfurlFallback(unittest.TestCase):
+    """notify.py reaches the shared threshold through a core-tree import.
+
+    The skill must still run where that tree is absent, and it must degrade to
+    suppression rather than to unfurling everything.
+    """
+
+    def test_missing_core_module_degrades_to_suppression(self):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def blocked(name, *args, **kwargs):
+            if name == "policy.egress.unfurl":
+                raise ImportError("core tree unavailable (test)")
+            return real_import(name, *args, **kwargs)
+
+        saved = {k: v for k, v in sys.modules.items() if k.startswith("policy")}
+        for k in saved:
+            del sys.modules[k]
+        try:
+            with patch.object(builtins, "__import__", side_effect=blocked):
+                mod = _load()
+            # Constant by design: with no threshold available, never unfurl.
+            self.assertIs(mod._should_unfurl("no links at all"), False)
+            self.assertIs(mod._should_unfurl("one https://example.com/a link"), False)
+        finally:
+            sys.modules.update(saved)
+
+    def test_control_the_real_import_does_not_fall_back(self):
+        # Without the block, the same load must reach the real predicate — so
+        # the test above cannot pass merely because _load() always degrades.
+        mod = _load()
+        self.assertIs(mod._should_unfurl("one https://example.com/a link"), True)
+
 
 class TestSendDiscord(unittest.TestCase):
     """send_discord routes through the shared src/channels/discord/client.py
@@ -457,7 +523,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             captured["payload"] = json.loads(req.data)
             return mock_resp
 
-        clean_env = {k: v for k, v in os.environ.items()
+        clean_env = {k: v for k, v in isolated_child_env().items()
                      if k not in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN")}
         with patch.object(self.mod, "_env_file",
                           return_value={"REMOTE_TASK_URL": "https://gw.example/relay",
@@ -475,7 +541,7 @@ class TestSendRemoteGateway(unittest.TestCase):
         # AG2_REMOTE_TOKEN=url|secret, so a genuine "no creds anywhere" case must
         # clear them too (else an ambient AG2_REMOTE_TOKEN resolves and this passes).
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         # Pin the containment guard to a temp tree — see _hermetic_channels_root.
         clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
         clean_env.pop("CLAUDE_HOME", None)
@@ -529,7 +595,7 @@ class TestSendRemoteGateway(unittest.TestCase):
         desktop app's core session has the real one exported."""
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
                  "AG2_REMOTE_URL", "CLAUDE_HOME", "SUTANDO_APP_SUPPORT")
-        env = {k: v for k, v in os.environ.items() if k not in _drop}
+        env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         env["CLAUDE_CONFIG_DIR"] = config_dir
         if app_support is not None:
             env["SUTANDO_APP_SUPPORT"] = app_support
@@ -643,7 +709,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             return mock_resp
 
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         # Pin the containment guard to a temp tree — see _hermetic_channels_root.
         clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
         clean_env.pop("CLAUDE_HOME", None)
@@ -712,7 +778,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             return mock_resp
 
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         # Pin the containment guard to a temp tree — see _hermetic_channels_root.
         clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
         clean_env.pop("CLAUDE_HOME", None)
@@ -763,7 +829,7 @@ class TestGatewaySourceTraversal(unittest.TestCase):
             [sys.executable, str(SCRIPT), "--source", "../evil",
              "--channel-id", "!room:server", "--message", "hi"],
             capture_output=True, text=True,
-            env={**os.environ, "CLAUDE_CONFIG_DIR": str(self.cfg)},
+            env={**isolated_child_env(), "CLAUDE_CONFIG_DIR": str(self.cfg)},
         )
         self.assertEqual(r.returncode, 1)
         self.assertIn("invalid gateway source", r.stderr)
@@ -819,12 +885,12 @@ class TestCLI(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
     def test_unconfigured_gateway_source_fails_open(self):
-        # A source outside the built-ins routes to the remote-gateway sender;
+        # A non-built-in source with a gateway room id routes to the gateway sender;
         # with no channels/<source>/.env it must fail (exit 1) with a hint —
         # never traceback, never block.
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--source", "whatsapp",
-             "--channel-id", "D123", "--message", "hi"],
+             "--channel-id", "!room:server", "--message", "hi"],
             capture_output=True, text=True,
             env={"PATH": "/usr/bin:/bin", "CLAUDE_CONFIG_DIR": "/nonexistent"},
         )

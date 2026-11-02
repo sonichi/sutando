@@ -27,8 +27,8 @@ import os
 import sys
 import time
 from datetime import datetime
-from urllib.parse import urlparse
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Canonical (and only) home is <workspace>/state/quota-state.json, written by
 # the credential proxy. The skill-dir / cwd fallbacks were removed: a stale
@@ -42,6 +42,14 @@ from pathlib import Path
 # regardless of where the proxy wrote. Walk up four to reach <repo>/src.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from quota_availability import (  # noqa: E402
+    PROXY_PORT as _PROXY_PORT,
+    PROXY_SCHEME as _PROXY_SCHEME,
+    availability_decision,
+    points_at_credential_proxy,
+    resolve_available as _resolve_available,
+)
 try:
     from workspace_default import status_read_path  # noqa: E402
     _canonical = status_read_path("quota-state.json")
@@ -70,11 +78,6 @@ _MIN_SAMPLES = 2
 
 # The credential proxy writes quota-state.json; 7846 is its port everywhere else
 # in the tree (restart.sh, health-check.py, services_status.py).
-_PROXY_PORT = 7846
-_PROXY_SCHEME = "http"          # the proxy speaks plain HTTP; https/ftp do not reach it
-_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
-
-
 def _redacted_endpoint(base_url: str) -> str:
     """scheme://host:port only — userinfo, path, query and fragment carry secrets.
 
@@ -92,24 +95,8 @@ def _redacted_endpoint(base_url: str) -> str:
 
 
 def _points_at_credential_proxy(base_url: "str | None") -> bool:
-    """True only when base_url is THIS host's credential proxy.
-
-    Fails closed: anything unset, unparseable or elsewhere is not routed.
-    """
-    if not base_url:
-        return False
-    try:
-        u = urlparse(base_url if "//" in base_url else "//" + base_url)
-    except ValueError:
-        return False
-    host = (u.hostname or "").strip().lower()
-    try:
-        port = u.port
-    except ValueError:      # non-numeric port in the authority
-        return False
-    scheme = (u.scheme or _PROXY_SCHEME).lower()
-    return (scheme == _PROXY_SCHEME and host in _PROXY_HOSTS
-            and port == _PROXY_PORT)
+    """Compatibility wrapper for tests and callers of the historic helper."""
+    return points_at_credential_proxy(base_url)
 
 def _load_burn_history() -> dict:
     if not BURN_HISTORY_FILE:
@@ -265,13 +252,8 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
 
 
 def resolve_available(status: str, proxy_available) -> bool:
-    """Trust the proxy's `available` bool over the status string, whose vocabulary
-    grows; explicit "rejected" still wins, and absent a bool require "allowed"."""
-    if status == "rejected":
-        return False
-    if isinstance(proxy_available, bool):
-        return proxy_available
-    return status == "allowed"
+    """Compatibility wrapper around the shared availability policy owner."""
+    return _resolve_available(status, proxy_available)
 
 
 def main():
@@ -287,19 +269,28 @@ def main():
 
     # Presence is not destination: the launcher honours a caller-set URL verbatim,
     # so only the proxy's own host:port proves these numbers describe this session.
-    routed = _points_at_credential_proxy(os.environ.get("ANTHROPIC_BASE_URL"))
-
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     util_5h = float(headers.get("anthropic-ratelimit-unified-5h-utilization", 0))
     util_7d = float(headers.get("anthropic-ratelimit-unified-7d-utilization", 0))
     reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
     reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
+    # The API also meters a top-tier-model weekly lane (`7d_oi`); a pinned
+    # Opus/Fable core can exhaust it while the all-model windows read fine.
+    util_7d_oi_raw = headers.get("anthropic-ratelimit-unified-7d_oi-utilization")
+    util_7d_oi = float(util_7d_oi_raw) if util_7d_oi_raw is not None else None
+    reset_7d_oi = headers.get("anthropic-ratelimit-unified-7d_oi-reset", "")
 
     # Stated once: a second copy of this predicate drifts the moment either is
     # extended, and the two fields then contradict each other in one payload.
     # Fails closed on unrouted or stale: a routed proxy that stopped writing keeps
     # `routed` true while every number is a fossil.
-    available = resolve_available(status, data.get("available")) and routed and not stale
+    decision = availability_decision(
+        data,
+        base_url=os.environ.get("ANTHROPIC_BASE_URL"),
+        stale=stale,
+    )
+    routed = decision["routed"]
+    available = decision["available"]
 
     result = {
         "status": status,
@@ -315,15 +306,18 @@ def main():
         "routed": routed,
         # Three unavailable states, three different remedies; not-routed outranks
         # stale because a foreign file's age says nothing about this session.
-        "unavailable_reason": None if available
-                              else ("not-routed" if not routed
-                                    else "stale" if stale else "exhausted"),
+        "unavailable_reason": decision["unavailable_reason"],
     }
 
     if reset_5h:
         result["reset_5h"] = datetime.fromtimestamp(int(reset_5h)).isoformat()
     if reset_7d:
         result["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).isoformat()
+    if util_7d_oi is not None:
+        result["utilization_7d_oi"] = util_7d_oi
+        result["remaining_7d_oi_pct"] = round((1 - util_7d_oi) * 100)
+        if reset_7d_oi:
+            result["reset_7d_oi"] = datetime.fromtimestamp(int(reset_7d_oi)).isoformat()
 
     # Unrouted: the utilization delta is another session's, and _update_burn_rate
     # ends in _save_burn_history — a foreign sample outlives the banner flagging it.
@@ -375,6 +369,11 @@ def main():
     print(f"7d window: {int(util_7d * 100)}% used, {result['remaining_7d_pct']}% remaining")
     if reset_7d:
         print(f"  Resets: {datetime.fromtimestamp(int(reset_7d)).strftime('%H:%M %b %d')}")
+    if util_7d_oi is not None:
+        print(f"7d-oi window (top-tier models): {int(util_7d_oi * 100)}% used, "
+              f"{result['remaining_7d_oi_pct']}% remaining")
+        if reset_7d_oi:
+            print(f"  Resets: {datetime.fromtimestamp(int(reset_7d_oi)).strftime('%H:%M %b %d')}")
     if not routed:
         print("Burn rate / passes-left: SUPPRESSED — computed from traffic that is not "
               "this session's.")

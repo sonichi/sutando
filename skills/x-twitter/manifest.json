@@ -15,7 +15,8 @@
   "config": {
     "X_BROWSER_PROFILE": "",
     "X_LOGIN_DONE_SENTINEL": "/tmp/x-login-done",
-    "X_LOGIN_TIMEOUT_ITERS": "120"
+    "X_LOGIN_TIMEOUT_ITERS": "120",
+    "X_PROFILE_GRACE_MS": "10000"
   },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"

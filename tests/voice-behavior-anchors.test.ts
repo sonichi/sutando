@@ -93,12 +93,19 @@ function stableInstructions(text: string): string {
 	return text.split('\n').filter(l =>
 		!(l.startsWith('- ') && l.endsWith(' — call these directly, not through work. Instant.'))
 		&& !(l.startsWith('- ') && l.endsWith('. Instant.'))
+		&& !l.startsWith('You run entirely on the owner\'s local ')
 	).join('\n');
 }
 
 // The tuned static entries, in order (multi-line entries appear as their
 // constituent lines; conditional/dynamic segments are asserted separately).
 const va = readFileSync(join(REPO, 'src', 'voice-agent.ts'), 'utf-8');
+function toolTableRegionHash(source: string): string {
+	const normalized = source.replace(/\r\n/g, '\n');
+	const start = normalized.indexOf('const mainAgentTools');
+	const line = normalized.slice(start, normalized.indexOf('\n', start));
+	return createHash('sha256').update(line).digest('hex');
+}
 const anchors = {
 	note: 'Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.',
 	tools: importableTools.map(toolAnchor)
@@ -106,8 +113,7 @@ const anchors = {
 	instructions_hash_fixed_env: createHash('sha256').update(stableInstructions(instructions)).digest('hex'),
 	meeting_greeting: cfg.buildGreeting(ctx({ meeting: true })),
 	regions: {
-		tool_table: createHash('sha256').update(
-			(() => { const i = va.indexOf('const mainAgentTools'); return va.slice(i, va.indexOf('\n', i)); })()).digest('hex'),
+		tool_table: toolTableRegionHash(va),
 	},
 };
 
@@ -141,17 +147,24 @@ test('instructions: injected seams land where tuned', () => {
 	assert.ok(instructions.includes('- Google Search for current-info queries'), 'googleSearch=true line');
 });
 
+test('instructions identify the actual host platform', () => {
+	const expectedHost = process.platform === 'darwin' ? 'Mac' : process.platform === 'win32' ? 'Windows' : process.platform;
+	assert.ok(instructions.includes(`owner's local ${expectedHost}`));
+});
+
 test('instructions: googleSearch=false omits the search line (capability honesty)', () => {
 	const off = cfg.buildInstructions(ctx({ googleSearch: false }), OVERRIDES);
 	assert.ok(!off.includes('- Google Search for current-info queries'));
 });
 
-test('instructions: meeting-active swaps BOTH conditional rules', () => {
+test('instructions: meeting mode is dictation, with no prompt-only meeting rules', () => {
 	const meeting = cfg.buildInstructions(ctx({ meeting: true }), OVERRIDES);
-	assert.ok(meeting.includes('⚠️ MEETING MODE IS CURRENTLY ACTIVE.'));
-	assert.ok(meeting.includes('- IN MEETING MODE: When addressed by name, answer DIRECTLY'));
-	assert.ok(!meeting.includes('- When in doubt, call work.'));
-	assert.ok(instructions.includes('- When in doubt, call work.'), 'non-meeting keeps the default rule');
+	assert.strictEqual(meeting, instructions.replace(MODE.marker, MEETING_MODE.marker), 'only the mode marker differs');
+	for (const text of [meeting, instructions]) {
+		assert.ok(text.includes('- MEETING MODE: Call switch_mode("meeting")'));
+		assert.ok(!text.includes('save_meeting_note'));
+		assert.ok(text.includes('- When in doubt, call work.'));
+	}
 });
 
 test('greeting: meeting-mode string is exact', () => {
@@ -173,6 +186,13 @@ test('greeting: reconnect replay guard preserved', () => {
 
 test('source tripwire: tool-table composition line unchanged', () => {
 	assert.deepStrictEqual(anchors.regions, expected.regions);
+});
+
+test('source tripwire: line endings do not change the hash', () => {
+	assert.strictEqual(
+		toolTableRegionHash('const mainAgentTools = [];\nnext'),
+		toolTableRegionHash('const mainAgentTools = [];\r\nnext'),
+	);
 });
 
 test('anchor breadth: importable tool table is non-trivial', () => {

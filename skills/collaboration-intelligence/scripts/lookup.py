@@ -27,9 +27,15 @@ def load(d):
     # Each store loads on its OWN existence check — either may exist alone.
     yp = d / "quick-lookup.yaml"
     if yp.exists():
-        import yaml
+        # The import belongs INSIDE the try: an interpreter without PyYAML is the same
+        # degradation as an unparseable file, and outside it the ImportError crashes.
         try:
+            import yaml
             raw = yaml.safe_load(yp.read_text()) or {}
+        except ImportError:
+            print(f"warning: PyYAML missing under {sys.executable} — using roster only",
+                  file=sys.stderr)
+            raw = {}
         except Exception as e:
             print(f"warning: {yp} unparseable ({type(e).__name__}) — using roster only",
                   file=sys.stderr)
@@ -37,9 +43,15 @@ def load(d):
         q = raw.get("quick_lookup") or raw if isinstance(raw, dict) else {}
     ep = d / "entities.yaml"
     if ep.exists():
-        import yaml
         try:
+            import yaml
             ents = yaml.safe_load(ep.read_text()).get("entities") or []
+        except ImportError:
+            # Silently empty entities reads as "no entities", which is a different
+            # fact from "this interpreter cannot parse them".
+            print(f"warning: PyYAML missing under {sys.executable} — {ep.name} not read",
+                  file=sys.stderr)
+            ents = []
         except Exception:
             ents = []
     return q, ents
@@ -48,35 +60,61 @@ def load(d):
 def load_roster(d):
     """reviewer-stands.json rows, normalised to the quick-lookup row shape.
 
-    The roster is keyed by short name with the GitHub login in the `github`
-    FIELD; a key-equality lookup queries the wrong axis and reads a mapped
-    reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
-    `get("john-the-dev")` missed the entry keyed `rui`).
+    The roster is keyed by short name with the GitHub login in a FIELD; a
+    key-equality lookup queries the wrong axis and reads a mapped reviewer as
+    absent (measured twice: 2026-08-27, 2026-08-28 — both times
+    `get("john-the-dev")` missed the entry keyed `rui`). Which field spells that
+    login is roster_union.roster_login's call, shared with the other reader.
     """
-    import json
-    p = d / "reviewer-stands.json"
-    if not p.exists():
+    # Same union, same collision semantics as notify_reviewers: both readers of
+    # this store delegate to roster_union so they cannot drift apart.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from roster_union import host_rosters, roster_login, roster_union
+    # The file this reader was pointed at is its LOCAL and goes first: on a
+    # legacy host it is the shared file, which host_rosters lists LAST.
+    local = d / "reviewer-stands.json"
+    paths = [("local", local)] if local.is_file() else []
+    paths += [(h, p) for h, p in host_rosters(d.parent.parent) if p != local]
+    merged = roster_union(paths)
+    if not merged:
         return []
     rows = []
-    for key, r in json.loads(p.read_text()).items():
+    for key, r in merged.items():
         if not isinstance(r, dict):
             continue
+        gh = roster_login(r)[0]
         rows.append({
             "entity_id": key,
             "agent_mxid": r.get("stand") or "",
-            "github": r.get("github") or "",
+            "github": gh,
             "human": r.get("human") or "",
             "allowlisted": r.get("allowlisted"),
-            "one_line": f"github={r.get('github','')} human={r.get('human','')} stand={r.get('stand','')}",
+            "one_line": f"github={gh} human={r.get('human','')} stand={r.get('stand','')}",
         })
     return rows
+
+def _name_of(r):
+    """quick-lookup.yaml keys people as `id`/`who`, the roster as `entity_id`/
+    `one_line`; match() reads both, so every render site must too."""
+    return r.get("entity_id") or r.get("id") or ""
+
+
+def _role_of(r):
+    return str(r.get("one_line") or r.get("who") or "")
+
+
+def _identity_id(i):
+    # schema.md names this field `user_id`; this reader only ever read
+    # `provider_id`, so a schema-faithful store matched nothing.
+    return str(i.get("provider_id") or i.get("user_id") or "")
+
 
 def match(rows, needle, ents=()):
     n = needle.lower().lstrip("@")
     # an entity whose GitHub/slack/discord id matches, even if the name does not
     by_ident = {e.get("entity_id") for e in ents
                 for i in (e.get("identities") or [])
-                if n in str(i.get("provider_id", "")).lower()}
+                if n in _identity_id(i).lower()}
     # Identity matches OUTRANK role text and never mix with it: role text names
     # other people and repos, so a hit there is about the subject, not the person.
     strong = [r for r in rows
@@ -128,7 +166,7 @@ def main():
         print(f"KNOWN ENTITIES ({len(rows)})\n{stale}")
         for r in rows:
             st = r.get("agent_mxid") or "-- no Stand recorded --"
-            print(f"  {r.get('entity_id',''):<28} {r.get('kind',''):<6} {st}")
+            print(f"  {_name_of(r):<28} {r.get('kind',''):<6} {st}")
         return 0
 
     hits = match(rows, a.query, ents)
@@ -139,14 +177,14 @@ def main():
         return 0
 
     for r in hits:
-        eid = r.get("entity_id", "")
+        eid = _name_of(r)
         stand = r.get("agent_mxid")
         print(f"\n  {eid}  [{r.get('kind','?')}]")
-        print(f"    role: {str(r.get('one_line',''))[:150]}")
+        print(f"    role: {_role_of(r)[:150]}")
         if stand:
             print(f"    ADDRESS THIS -> {stand}")
         else:
-            loose = re.findall(r"@[\w.\-]+", str(r.get("one_line", "")))
+            loose = re.findall(r"@[\w.\-]+", _role_of(r))
             if loose:
                 print(f"    ⚠ NO STRUCTURED Stand, but the role text names: {', '.join(loose)}")
                 print("      UNVERIFIED -- prose is not a resolved id. Use it, and say it is unconfirmed.")
@@ -160,7 +198,7 @@ def main():
             print("    ⚠ NO cross-platform ids in the store for this entity (discord/slack/github unknown).")
             print("      The SCRIPT cannot invent them -- the map was never given them.")
         for i in idents:
-            print(f"    id: {i.get('provider')}={i.get('provider_id')} verified={i.get('verified')}")
+            print(f"    id: {i.get('provider')}={_identity_id(i)} verified={i.get('verified')}")
         ev = str(r.get("evidence", ""))
         for kw in ("⚠", "Do NOT", "do NOT", "CORRECTED", "WRONG"):
             if kw in ev:

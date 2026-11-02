@@ -15,7 +15,7 @@
 import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
@@ -34,6 +34,10 @@ const UPSTREAM_IDLE_TIMEOUT_MS = Number(process.env.SUTANDO_PROXY_TIMEOUT_MS) ||
 // Historically written into the skill dir; readers (dashboard.py, read-quota.py)
 // keep the skill-dir path as a last-resort fallback for one release.
 const QUOTA_FILE = statusPath('quota-state.json');
+// Bounded ledger of upstream rejections (4xx/5xx other than the handled 401),
+// persisted in quota-state.json so health-check can page on a transient one.
+export const MAX_RECENT_REJECTIONS = 20;
+const REJECTION_SNIPPET_BYTES = 2048;
 
 // OAuth self-refresh. A namespaced CLAUDE_CONFIG_DIR uses a namespaced keychain
 // item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
@@ -61,6 +65,41 @@ const REFRESH_FAIL_BACKOFF_BASE_MS =
 	Number(process.env.SUTANDO_PROXY_REFRESH_BACKOFF_BASE_MS) || 30 * 1000; // 30s
 const REFRESH_FAIL_BACKOFF_MAX_MS =
 	Number(process.env.SUTANDO_PROXY_REFRESH_BACKOFF_MAX_MS) || 15 * 60 * 1000; // 15 min
+
+// A wedge (refresh fails, process stays up and keeps serving 502s) never asks
+// a supervisor for help, because the process never exits. After this many
+// CONSECUTIVE failures (reset to 0 on any success — see runSingleFlightRefresh)
+// the proxy gives up and exits non-zero instead of retrying forever, so
+// whichever supervisor is watching (launchd, a process manager) gets a real
+// signal to act on. At the default backoff schedule (30s · 2^(n-1), capped at
+// 15min) the waits before attempts 2..6 sum to 930s -- ~15.5 min of continuous
+// failure before giving up, not 35 (an earlier, uncorrected estimate) — and
+// that is a LOWER bound: a refresh is only attempted when a request arrives,
+// so an idle host takes longer to reach the threshold.
+//
+// Giving up is only safe where something restarts the process. Set by the
+// launchd wrapper (src/launchd/credential-proxy-wrapper.sh), never by the
+// legacy `run_node_service ... &` fallback in startup.sh, which has no
+// restart loop — there, exiting would turn a self-healing 502 wedge into a
+// permanent outage.
+const PROXY_IS_SUPERVISED = process.env.SUTANDO_PROXY_SUPERVISED === '1';
+
+// `Number(env) || 6` would silently turn an explicit "0" into 6 (0 is falsy);
+// parse explicitly so 0 (give up on the very first failure) takes effect.
+// Unset AND unsupervised defaults to Infinity (never give up) — see
+// PROXY_IS_SUPERVISED above; an explicit env override always applies
+// regardless of supervision, since that's a deliberate operator choice.
+export function parseGiveUpAfter(raw: string | undefined, supervised: boolean): number {
+	const unsupervisedDefault = supervised ? 6 : Infinity;
+	if (raw === undefined || raw === "") return unsupervisedDefault;
+	const n = Number(raw);
+	if (!Number.isFinite(n)) return unsupervisedDefault;
+	// A negative value would behave like 0 (refreshFailCount >= n is true
+	// immediately) but unintentionally, since nothing chose that -- clamp
+	// rather than let a typo silently double as "give up on the first failure".
+	return n < 0 ? 0 : n;
+}
+const REFRESH_GIVE_UP_AFTER = parseGiveUpAfter(process.env.SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER, PROXY_IS_SUPERVISED);
 
 // Pure: how long to wait before the next refresh attempt after `failCount`
 // consecutive failures. 0 failures → 0 (attempt immediately). Exponential
@@ -109,30 +148,45 @@ export function keychainServiceCandidates(configDir = process.env.CLAUDE_CONFIG_
 	return [...new Set(services)];
 }
 
+function readKeychainSecret(service: string): string {
+	return execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+		encoding: 'utf-8',
+		timeout: 5000,
+	});
+}
+
 // Read the full cred object from one keychain service (not just accessToken).
-function readCredFromService(service: string): StoredClaudeOAuth | null {
+// A blank accessToken counts as absent, so it cannot eclipse a later candidate.
+export function readCredFromService(
+	service: string,
+	readSecret: (service: string) => string = readKeychainSecret,
+): StoredClaudeOAuth | null {
 	try {
-		const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-			encoding: 'utf-8',
-			timeout: 5000,
-		}).trim();
-		const parsed = JSON.parse(raw);
+		const parsed = JSON.parse(readSecret(service).trim());
 		const oauth = parsed?.claudeAiOauth;
-		return oauth && typeof oauth.accessToken === 'string' ? { service, oauth: oauth as ClaudeOAuth } : null;
+		return oauth && typeof oauth.accessToken === 'string' && oauth.accessToken.trim() !== ''
+			? { service, oauth: oauth as ClaudeOAuth }
+			: null;
 	} catch {
 		return null;
 	}
 }
 
 // All keychain candidates that currently hold a credential, scoped item first.
-function readCredCandidates(): StoredClaudeOAuth[] {
-	return keychainServiceCandidates()
-		.map(readCredFromService)
+export function readCredCandidates(
+	services: string[] = keychainServiceCandidates(),
+	readSecret: (service: string) => string = readKeychainSecret,
+): StoredClaudeOAuth[] {
+	return services
+		.map((service) => readCredFromService(service, readSecret))
 		.filter((s): s is StoredClaudeOAuth => s !== null);
 }
 
-function readCred(): StoredClaudeOAuth | null {
-	return readCredCandidates()[0] ?? null;
+export function readCred(
+	services: string[] = keychainServiceCandidates(),
+	readSecret: (service: string) => string = readKeychainSecret,
+): StoredClaudeOAuth | null {
+	return readCredCandidates(services, readSecret)[0] ?? null;
 }
 
 // Pure: pick the credential to serve. First candidate whose token is usable
@@ -302,15 +356,99 @@ export function authUnavailableBody(verdict: 'expired' | 'rejected'): string {
 
 // Injectable seams (keychain, refresh, upstream, clock) so the proxy's failure
 // semantics are testable hermetically; defaults are the production bindings.
+export interface RejectionRecord {
+	ts: string;
+	status: number;
+	path: string;
+	snippet: string;
+	// The proxy serves every seat on a host, so a rejection is attributable only
+	// by what the request carried: the model, the CLI's user-agent, the peer port.
+	model?: string;
+	user_agent?: string;
+	peer_port?: number;
+}
+
+/** The `model` field of a JSON request body, or "" when absent or unparsable. */
+export function requestModel(body: Buffer): string {
+	try {
+		const m = JSON.parse(body.toString('utf8'))?.model;
+		return typeof m === 'string' ? m : '';
+	} catch {
+		return '';
+	}
+}
+
+function isRejectionRecord(x: unknown): x is RejectionRecord {
+	return !!x && typeof x === 'object'
+		&& typeof (x as RejectionRecord).ts === 'string'
+		&& typeof (x as RejectionRecord).status === 'number';
+}
+
+/** Append one rejection to a (possibly foreign/corrupt) prior ledger, keeping the newest `max`. */
+export interface LastRequest { model: string; at: string }
+
+/** The model that last consumed quota through this proxy, carried across
+ *  requests that name none (a non-messages call must not blank the tile). */
+export function withLastRequest(prev: unknown, model: string, at: string): LastRequest | undefined {
+	if (model) return { model, at };
+	const old = (prev as { last_request?: unknown } | null)?.last_request;
+	if (old && typeof old === 'object' && typeof (old as LastRequest).model === 'string' && (old as LastRequest).model
+		&& typeof (old as LastRequest).at === 'string') return old as LastRequest;
+	return undefined;
+}
+
+export function appendRejection(prev: unknown, rej: RejectionRecord, max: number = MAX_RECENT_REJECTIONS): RejectionRecord[] {
+	const list = Array.isArray(prev) ? prev.filter(isRejectionRecord) : [];
+	list.push(rej);
+	return list.slice(-max);
+}
+
+export type LimitState = 'allowed' | 'overage' | 'rejected';
+
+/** Same rule as `classify_limit_state` in src/quota_availability.py; both run
+ *  tests/fixtures/quota-limit-state.parity.json. `overage` is served, not paused. */
+export function limitState(record: unknown): LimitState {
+	const rec = (record && typeof record === 'object' && !Array.isArray(record)) ? record as Record<string, unknown> : {};
+	const h = (rec.headers && typeof rec.headers === 'object' && !Array.isArray(rec.headers)) ? rec.headers as Record<string, unknown> : {};
+	const prefix = 'anthropic-ratelimit-unified-';
+	const limited = h[`${prefix}status`] === 'rejected' || Object.entries(h).some(([k, v]) => {
+		if (!k.startsWith(prefix) || !k.endsWith('-status')) return false;
+		const w = k.slice(prefix.length, -'-status'.length);
+		return w !== '' && w !== 'overage' && v === 'rejected';
+	});
+	if (!limited) return 'allowed';
+	const overage = h[`${prefix}overage-status`];
+	if (overage !== 'allowed' && overage !== 'allowed_warning') return 'rejected';
+	const checked = typeof rec.last_checked === 'string' ? Date.parse(rec.last_checked) : NaN;
+	const ledger = Array.isArray(rec.recent_rejections) ? rec.recent_rejections : [];
+	for (const r of ledger) {
+		if (!r || typeof r !== 'object' || (r as RejectionRecord).status !== 429) continue;
+		const at = typeof (r as RejectionRecord).ts === 'string' ? Date.parse((r as RejectionRecord).ts) : NaN;
+		// An unordered 429 (either stamp unreadable) is not known to be older.
+		if (Number.isNaN(checked) || Number.isNaN(at) || at >= checked) return 'rejected';
+	}
+	return 'overage';
+}
+
+export type CredentialState = 'ok' | 'exhausted';
+
 export interface ProxyDeps {
 	readCredCandidates: () => StoredClaudeOAuth[];
 	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
 	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
-	updateQuotaState: (headers: Record<string, string>) => void;
+	updateQuotaState: (headers: Record<string, string>, model?: string) => void;
+	recordRejection: (rej: RejectionRecord) => void;
+	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
 	idleTimeoutMs: number;
+	exitProcess: (code: number) => void;
+	// Consecutive refresh-failure threshold before giving up (see
+	// parseGiveUpAfter). Injectable so tests can exercise the
+	// supervised/unsupervised default without process-env/import-order
+	// tricks; production always gets the env-derived value below.
+	giveUpAfter: number;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -321,8 +459,12 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		request: httpsRequest,
 		upstreamUrl: new URL(UPSTREAM),
 		updateQuotaState,
+		recordRejection,
+		recordCredentialState,
 		now: Date.now,
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+		exitProcess: (code) => process.exit(code),
+		giveUpAfter: REFRESH_GIVE_UP_AFTER,
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -351,8 +493,16 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
 				} else {
 					refreshFailCount += 1;
+					// Set the backoff before the give-up check: in production process.exit
+					// ends the process either way, but an injected exitProcess (tests) that
+					// doesn't exit must not leave the next request retrying with no backoff.
 					const backoff = nextRefreshBackoffMs(refreshFailCount);
 					nextRefreshAllowedAt = deps.now() + backoff;
+					if (refreshFailCount >= deps.giveUpAfter) {
+						console.error(`${ts()} [Proxy] refresh failed ${refreshFailCount} consecutive times (give-up threshold ${deps.giveUpAfter}) — exiting so a supervisor can restart; serving 502s forever hides a wedge as "up"`);
+						deps.exitProcess(1);
+						return;
+					}
 					console.error(`${ts()} [Proxy] refresh failed (failure ${refreshFailCount}, next attempt allowed in ${Math.round(backoff / 1000)}s)`);
 				}
 			})().finally(() => { refreshInFlight = null; });
@@ -448,6 +598,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					if (headers['authorization']) {
 						headers['authorization'] = `Bearer ${stored.oauth.accessToken}`;
 						injectedToken = stored.oauth.accessToken;
+						deps.recordCredentialState('ok');
 					}
 				} else if (hasClientAuth) {
 					// Never inject a known-dead token over a client credential that may
@@ -455,6 +606,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					console.log(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable — pass-through engaged (client credential forwarded untouched)`);
 				} else {
 					console.error(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable, no client credential — failing fast (401)`);
+					deps.recordCredentialState('exhausted', `stored token ${verdict}, refresh unavailable`);
 					res.writeHead(401, { 'content-type': 'application/json' });
 					res.end(authUnavailableBody(verdict));
 					return;
@@ -483,7 +635,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						}
 						if (Object.keys(quotaHeaders).length > 0) {
 							console.log(`${ts()} [Quota]`, quotaHeaders);
-							deps.updateQuotaState(quotaHeaders);
+							deps.updateQuotaState(quotaHeaders, requestModel(body));
 						}
 
 						if (upRes.statusCode === 401 && injectedToken && attempt === 0) {
@@ -502,6 +654,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 									return;
 								}
 								console.error(`${ts()} [Proxy] credential recovery failed — forwarding the upstream 401 (re-auth with /login)`);
+								deps.recordCredentialState('exhausted', 'post-401 recovery failed (reload + refresh)');
 								const h = { ...upRes.headers };
 								delete h['content-length'];
 								delete h['transfer-encoding'];
@@ -513,9 +666,31 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						if (upRes.statusCode === 401 && injectedToken && attempt > 0) {
 							console.error(`${ts()} [Proxy] reloaded credential also rejected (401) — giving up`);
 							rejectedToken = injectedToken;
+							deps.recordCredentialState('exhausted', 'reloaded credential rejected upstream');
 						}
 
-						res.writeHead(upRes.statusCode!, upRes.headers);
+						const code = upRes.statusCode ?? 0;
+						if (code >= 400 && code !== 401) {
+							// The only component that sees a credits/overage rejection is this
+							// proxy; without a record the dropped request is invisible upstream.
+							const rejChunks: Buffer[] = [];
+							let seen = 0;
+							upRes.on('data', (c: Buffer) => {
+								if (seen < REJECTION_SNIPPET_BYTES) { rejChunks.push(c); seen += c.length; }
+							});
+							upRes.on('end', () => {
+								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
+								const model = requestModel(body);
+								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
+								try {
+									deps.recordRejection({
+										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
+										model, user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
+									});
+								} catch { /* best effort */ }
+							});
+						}
+						res.writeHead(code, upRes.headers);
 						upRes.pipe(res);
 					},
 				);
@@ -561,34 +736,100 @@ function getOAuthToken(): string | null {
 	return readCred()?.oauth.accessToken ?? null;
 }
 
-function updateQuotaState(headers: Record<string, string>): void {
+function readQuotaFile(): Record<string, unknown> {
 	try {
-		const state: Record<string, unknown> = {
-			available: true,
-			last_checked: new Date().toISOString(),
-			headers,
-		};
+		const parsed = JSON.parse(readFileSync(QUOTA_FILE, 'utf8'));
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
 
-		// Parse specific headers
-		const status5h = headers['anthropic-ratelimit-unified-5h-status'];
-		const util5h = headers['anthropic-ratelimit-unified-5h-utilization'];
-		const reset5h = headers['anthropic-ratelimit-unified-5h-reset'];
-		const util7d = headers['anthropic-ratelimit-unified-7d-utilization'];
-		const reset7d = headers['anthropic-ratelimit-unified-7d-reset'];
-		const overallStatus = headers['anthropic-ratelimit-unified-status'];
+function writeQuotaFile(state: Record<string, unknown>): void {
+	mkdirSync(dirname(QUOTA_FILE), { recursive: true });
+	writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2));
+}
 
-		if (util5h) state.utilization_5h = parseFloat(util5h);
-		if (util7d) state.utilization_7d = parseFloat(util7d);
-		if (reset5h) state.resets_at_5h = new Date(parseInt(reset5h) * 1000).toISOString();
-		if (reset7d) state.resets_at_7d = new Date(parseInt(reset7d) * 1000).toISOString();
+/** The record after one rejection is appended. A 429 after the headers ends an
+ *  overage reading, which the header write cannot see. */
+export function recordWithRejection(prev: Record<string, unknown>, rej: RejectionRecord): Record<string, unknown> {
+	const next: Record<string, unknown> = { ...prev, recent_rejections: appendRejection(prev.recent_rejections, rej) };
+	if (prev.limit_state === 'overage' && limitState(next) === 'rejected') {
+		next.limit_state = 'rejected';
+		next.available = false;
+	}
+	return next;
+}
 
-		if (overallStatus === 'rejected' || status5h === 'rejected') {
-			state.available = false;
-			state.exhausted_since = new Date().toISOString();
-		}
+function recordRejection(rej: RejectionRecord): void {
+	try {
+		writeQuotaFile(recordWithRejection(readQuotaFile(), rej));
+	} catch { /* best effort */ }
+}
 
-		mkdirSync(dirname(QUOTA_FILE), { recursive: true });
-		writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2));
+// Terminal credential health for the desktop app's banner: 'exhausted' means
+// every recovery path (keychain re-read, refresh, retry) failed and only a
+// human /login restores service. Change-only write, so per-request 'ok'
+// confirmations cost nothing.
+function recordCredentialState(state: CredentialState, detail = ''): void {
+	try {
+		const prev = readQuotaFile();
+		if (prev.credential_state === state) return;
+		writeQuotaFile({
+			...prev,
+			credential_state: state,
+			credential_state_detail: detail,
+			credential_state_at: new Date().toISOString(),
+		});
+	} catch { /* best effort */ }
+}
+
+/** The record one header-bearing response writes; it replaces the file. */
+export function quotaStateFromHeaders(
+	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string,
+): Record<string, unknown> {
+	// The header write replaces the file, so carry the rejection ledger across it.
+	const prevLedger = prev.recent_rejections;
+	const lastRequest = withLastRequest(prev, model, nowIso);
+	const state: Record<string, unknown> = {
+		available: true,
+		last_checked: nowIso,
+		headers,
+		recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
+		...(lastRequest ? { last_request: lastRequest } : {}),
+		// The header write replaces the file — carry credential health across it
+		// the same way as the rejection ledger.
+		...(typeof prev.credential_state === 'string' ? {
+			credential_state: prev.credential_state,
+			credential_state_detail: prev.credential_state_detail,
+			credential_state_at: prev.credential_state_at,
+		} : {}),
+	};
+
+	// Parse specific headers
+	const status5h = headers['anthropic-ratelimit-unified-5h-status'];
+	const util5h = headers['anthropic-ratelimit-unified-5h-utilization'];
+	const reset5h = headers['anthropic-ratelimit-unified-5h-reset'];
+	const util7d = headers['anthropic-ratelimit-unified-7d-utilization'];
+	const reset7d = headers['anthropic-ratelimit-unified-7d-reset'];
+	const overallStatus = headers['anthropic-ratelimit-unified-status'];
+
+	if (util5h) state.utilization_5h = parseFloat(util5h);
+	if (util7d) state.utilization_7d = parseFloat(util7d);
+	if (reset5h) state.resets_at_5h = new Date(parseInt(reset5h) * 1000).toISOString();
+	if (reset7d) state.resets_at_7d = new Date(parseInt(reset7d) * 1000).toISOString();
+
+	state.limit_state = limitState(state);
+	if (state.limit_state !== 'overage' && (overallStatus === 'rejected' || status5h === 'rejected')) {
+		state.available = false;
+		state.exhausted_since = nowIso;
+	}
+	return state;
+}
+
+function updateQuotaState(headers: Record<string, string>, model = ''): void {
+	try {
+		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString()));
 	} catch { /* best effort */ }
 }
 
