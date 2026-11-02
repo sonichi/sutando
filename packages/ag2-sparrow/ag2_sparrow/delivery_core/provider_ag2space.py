@@ -13,7 +13,10 @@ is a refusal (the message never reached the room), and anything else — still
 sending, no delivery state, an unreadable answer — stays CONFIRMED on the
 accept with provider_ref ``accepted``/``duplicate``: recorded, delivery
 unconfirmed. An accept without the flag (an older broker) is exactly that,
-with no read at all.
+with no read at all. A provider built with ``read_back=False`` reads nothing
+either: the lane that builds it owns the send downstream (a relay ask's
+result, posted to the room by the broker with its own dead letter), so the
+accept is final for it.
 
 idempotent_send is licensed by the gateway's rid-keyed done-window dedup,
 live-verified on prod 2026-08-18: re-POSTing an already-recorded result id
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 from collections import OrderedDict
 import time
 import urllib.error
@@ -57,6 +61,24 @@ CONFIRM_WAITS = (0.25, 0.5, 1.0, 2.0, 2.0)
 DEAD_MEMORY_LIMIT = 512
 
 
+# Answers on /v1/results that close the item: the lease ended, the task is terminal, or a
+# waiting release found no blocker left (the lease lapses and the broker re-serves).
+SETTLED_RESULT_CODES = {409: frozenset({"task_already_terminal", "stale_execution_generation",
+                                        "task_cancelled"}),
+                        400: frozenset({"waiting_input_without_blocker"})}
+
+
+def _settled_result_code(e: urllib.error.HTTPError) -> str:
+    if e.code not in SETTLED_RESULT_CODES:
+        return ""
+    try:
+        body = json.loads((e.read() or b"").decode("utf-8", "replace") or "{}")
+    except (OSError, ValueError):
+        return ""
+    code = body.get("error_code") if isinstance(body, dict) else None
+    return code if code in SETTLED_RESULT_CODES[e.code] else ""
+
+
 class AG2SpaceResultProvider:
     """``request``: ``(method, path, payload_dict) -> parsed-json dict``,
     raising urllib errors on failure — the bridge's ``_req`` signature."""
@@ -66,8 +88,10 @@ class AG2SpaceResultProvider:
 
     def __init__(self, request: Callable[..., dict], *,
                  confirm_waits=CONFIRM_WAITS,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 read_back: bool = True):
         self._request = request
+        self.read_back = read_back
         self._confirm_waits = tuple(confirm_waits)
         self._sleep = sleep
         # rid -> reason for each readable send failure seen here, newest last, capped:
@@ -104,6 +128,12 @@ class AG2SpaceResultProvider:
         try:
             resp = self._request("POST", RESULTS_PATH, envelope) or {}
         except urllib.error.HTTPError as e:
+            settled = _settled_result_code(e)
+            if settled:
+                # The task closed or moved on server-side: nothing is left to deliver.
+                return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                                       provider_ref=f"settled:{settled}",
+                                       detail=f"broker answered {e.code} {settled}")
             # The bridge refreshes credentials through its polling loop.
             if not is_retryable_http_status(e.code, auth_recoverable=True):
                 raise ProviderPermanentRefused(
@@ -120,10 +150,12 @@ class AG2SpaceResultProvider:
         if resp.get("ok") is False or resp.get("error") or resp.get("errcode"):
             raise ProviderPermanentRefused(f"gateway declined {item_id}: {str(resp)[:200]}")
         ref = "duplicate" if resp.get("duplicate") else "accepted"
-        if envelope.get("no_send") or not resp.get("delivery_readable"):
+        if envelope.get("no_send") or not self.read_back or not resp.get("delivery_readable"):
             return DeliveryReceipt(
                 outcome=DeliveryOutcome.CONFIRMED, provider_ref=ref,
                 detail="no_send" if envelope.get("no_send")
+                else "delivery unconfirmed (this lane takes the accept as final)"
+                if not self.read_back
                 else "delivery unconfirmed (broker exposes no delivery read)")
         rid = str(envelope["id"])
         st = self._settled(rid)
@@ -165,13 +197,20 @@ def room_response_refused(resp) -> bool:
                                            or resp.get("errcode"))
 
 
+def _never_connected(exc: BaseException) -> bool:
+    """A failure urllib can only raise before the request was written: no connection was made."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+
+
 class AG2SpaceRoomMessageProvider:
-    """Sends one message to an AG2 Space room through the injected room sender. Only a Matrix
-    event id proves delivery, and it is durably recorded before the send counts as delivered."""
+    """Sends one message to an AG2 Space room, optionally inside a thread (`thread_root`), through
+    the injected room sender. Only a Matrix event id proves delivery, and it is durably recorded
+    before the send counts as delivered."""
 
     capabilities = ProviderCapabilities(reconcile_capable=False, idempotent_send=False)
 
-    def __init__(self, send: Callable[[str, str, str], dict],
+    def __init__(self, send: Callable[..., dict],
                  record_receipt: Callable[[str, str], None]):
         self._send = send
         self._record_receipt = record_receipt
@@ -181,10 +220,15 @@ class AG2SpaceRoomMessageProvider:
         try:
             message = json.loads(payload.decode("utf-8"))
             room, body = message["room_id"], message["body"]
-        except (UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
+            thread_root = message.get("thread_root")
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError) as e:
             raise ProviderPermanentRefused(f"malformed room message for {item_id}: {e}") from e
+        if thread_root is not None and not (isinstance(thread_root, str) and thread_root.startswith("$")
+                                            and len(thread_root.strip()) > 1):
+            raise ProviderPermanentRefused(f"malformed thread root for {item_id}")
         try:
-            resp = self._send(room, body, idempotency_key)
+            resp = (self._send(room, body, idempotency_key, thread_root) if thread_root
+                    else self._send(room, body, idempotency_key))
         except urllib.error.HTTPError as e:
             if 500 <= e.code <= 599:
                 raise ProviderIndeterminate(f"gateway error for {item_id}: HTTP {e.code}") from e
@@ -192,6 +236,8 @@ class AG2SpaceRoomMessageProvider:
                 raise ProviderRefused(f"gateway refused {item_id} for now: HTTP {e.code}") from e
             raise ProviderPermanentRefused(f"gateway refused {item_id}: HTTP {e.code}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if _never_connected(e):
+                raise ProviderRefused(f"gateway unreachable for {item_id}: {e}") from e
             raise ProviderIndeterminate(f"transport failure for {item_id}: {e}") from e
         if room_response_refused(resp):
             raise ProviderPermanentRefused(f"gateway declined {item_id}: {str(resp)[:200]}")

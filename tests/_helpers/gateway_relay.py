@@ -23,6 +23,8 @@ from pathlib import Path
 
 CONTRACT = "voice-outcome-v1"
 _TESTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_TESTS))
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
 
 
 class Relay:
@@ -31,7 +33,10 @@ class Relay:
     poll without it the tasks behind that ask. It keeps each task's state for
     `GET /v1/tasks/<id>/status`. The ack of a task in `withdrawn` is refused as not leased,
     and so is any ack of a task in `lease_ended` (an acknowledged lease the broker ended),
-    whose state stays as it was. Results get a 503 while `refusing`."""
+    whose state stays as it was. Results get a 503 while `refusing`. With `token` set, a
+    request with any other bearer is refused with `auth_code`; `on_result`, given the
+    payload, may answer a result itself (a status and a body), or return None; `on_post`, given
+    the path and payload, may answer any POST the same way, ahead of every other rule."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -47,6 +52,12 @@ class Relay:
         self.results: "list[dict]" = []
         self.refused = 0
         self.refusing = False
+        self.token = ""
+        self.auth_code = 401
+        self.on_result = None
+        self.on_post = None
+        self.post_paths: "list[tuple[str, dict]]" = []
+        self.posted: "list[tuple[dict, str]]" = []     # every result POST and its bearer
         relay = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -61,7 +72,15 @@ class Relay:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _authorized(self) -> bool:
+                if relay.token and self.headers.get("Authorization") != f"Bearer {relay.token}":
+                    self._send(relay.auth_code, {"error": "unauthorized"})
+                    return False
+                return True
+
             def do_GET(self):
+                if not self._authorized():
+                    return
                 if self.path.startswith("/v1/tasks/") and self.path.endswith("/status"):
                     tid = urllib.parse.unquote(self.path.split("/")[-2])
                     with relay.lock:
@@ -92,9 +111,20 @@ class Relay:
             def do_POST(self):
                 size = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(size)) if size else None
+                if self.path == "/v1/results":
+                    with relay.lock:
+                        relay.posted.append((payload, self.headers.get("Authorization", "")))
+                if not self._authorized():
+                    return
                 code, doc = 200, {"ok": True, "delivery_readable": True}
                 with relay.lock:
-                    if self.path == "/v1/results":
+                    relay.post_paths.append((self.path, payload))
+                    answer = relay.on_post(self.path, payload) if relay.on_post else None
+                    if answer is None and self.path == "/v1/results" and relay.on_result:
+                        answer = relay.on_result(payload)
+                    if answer is not None:
+                        code, doc = answer
+                    elif self.path == "/v1/results":
                         if relay.refusing:
                             relay.refused += 1
                             code, doc = 503, {"error": "unavailable"}
@@ -177,6 +207,23 @@ def publish_at(tmp, path):
 
 gw._post_ack_first, gw._publish_staged, gw._put_held, gw._record_ack_first = (
     ack_at, publish_at, put_at, mark_at)
+
+# A relay result's end cut short at a step: before it, after it, or after it succeeded.
+END_STEPS = {"end:before-quarantine": ("_dispose_terminal", "before"),
+             "end:before-settle": ("_settle_task", "before"), "end:after-settle": ("_settle_task", "after"),
+             "end:before-mark": ("_forget_ack_first", "before"),
+             "withdrawn:after-failed": ("_relay_failed_sent", "after-true"),
+             "start:after-mark-sweep": ("_retire_delivered_marks", "after")}
+if crash in END_STEPS:
+    step, when = END_STEPS[crash]
+    real_step = getattr(gw, step)
+
+    def step_at(*a, **k):
+        out = None if when == "before" else real_step(*a, **k)
+        if when != "after-true" or out:
+            os._exit(17)
+        return out
+    setattr(gw, step, step_at)
 gw.main()
 """
 
@@ -199,8 +246,7 @@ class Bridges:
         self.runs += 1
         log = open(self.root / f"bridge-{self.runs}.log", "w")
         self.test.addCleanup(log.close)
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SUTANDO_") and k != "GATEWAY_INSTANCE"}
+        env = hermetic_env(self.root / "home")
         proc = subprocess.Popen(
             [sys.executable, "-c", _BRIDGE, str(_TESTS), str(self.ws), self.relay.url, crash,
              json.dumps(self.env)],

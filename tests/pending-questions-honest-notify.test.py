@@ -6,6 +6,12 @@ bridge was draining results/proactive-*.txt. The DM never reached the owner; onl
 a local macOS notification did. A notifier that reports success regardless of
 outcome is how a blocked decision sits unseen for a day.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import time
 import re

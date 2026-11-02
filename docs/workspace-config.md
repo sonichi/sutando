@@ -50,6 +50,28 @@ A sample is shipped as `sutando.config.local.json.example`. Copy + edit, or star
 
 Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation, so the `.example` file can carry inline documentation without affecting runtime.
 
+## The `env` stanza
+
+Non-secret settings that code reads with `config_get(KEY)` (`src/sutando_config.py`) live under `env` in
+these files, as strings. They are config keys, not environment variables: `config_get` reads the file
+layers first and falls back to the process environment only as a deprecated path that prints a one-time
+warning. Secrets never go here; they stay in `.env` / the vault.
+
+```json
+{ "env": { "SUTANDO_HEALTH_LOAD_RATIO": "2.0" } }
+```
+
+Known keys (`docs/sutando-config.schema.json` → `env.properties` is the reference):
+
+| Key | Default | Read by | Meaning |
+|---|---|---|---|
+| `SUTANDO_HEALTH_LOOP_STALE_SEC` | `600` | health-check `core-proactive-loop` | seconds `core-status.json` may read `running` without advancing before it warns |
+| `SUTANDO_HEALTH_QUEUE_AGE_SEC` | `300` | health-check `task-queue` | age of the oldest pending task that, with the count below, warns |
+| `SUTANDO_HEALTH_QUEUE_COUNT` | `3` | health-check `task-queue` | pending-task count that, with the age above, warns |
+| `SUTANDO_HEALTH_LOAD_RATIO` | `1.5` | health-check `system-load` | a pass is high when the 1-min load exceeds this times the core count |
+| `SUTANDO_HEALTH_LOAD_PASSES` | `3` | health-check `system-load` | consecutive high passes before it warns |
+| `SUTANDO_HEALTH_LOAD_REAP` | `0` (unset is off) | health-check `system-load` | only exactly `1` lets every `--fix` run (the desktop app runs one every 30 min) reap leftover test processes automatically, at most once per episode; anything else is off |
+
 ## Three common overrides
 
 ```json

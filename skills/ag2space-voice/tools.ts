@@ -5,8 +5,8 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-setup-runner.js';
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
-import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE, createCurrentRoomTool, createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
+import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createNavigateSpaceTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool, armSpeechGate, noteUserSpoke } from './room-actions.js';
 
 export const tools: ToolDefinition[] = [];
@@ -32,7 +32,7 @@ export async function handleSessionContextFrame(ctx: Pick<SkillSetupCtx, 'sendCl
 }
 
 export function setup(ctx: SkillSetupCtx): void {
-	// A change held for a spoken yes needs the user to have spoken since it was held.
+	// A destructive change held for a spoken yes needs the user to have spoken since it was held.
 	if (typeof ctx?.onUserSpoke === 'function') {
 		ctx.onUserSpoke(noteUserSpoke);
 		armSpeechGate();
@@ -93,11 +93,12 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 	const write = createWritePageTool(deps);
 	const comment = createAddCommentTool(deps);
 	const message = createSendMessageTool(deps);
+	const navigate = createNavigateSpaceTool(deps);
 	const list = createListRoomsTool({ index, log });
 	// Any other catalog action: found, described and run by name, gated by the server's own effect and risk.
 	const open = [createFindActionsTool(deps), createDescribeActionTool(deps), createRunActionTool(deps)];
 	return {
-		tools: [read, search, commons, page, write, comment, message, list, ...open],
+		tools: [read, search, commons, page, write, comment, message, navigate, list, ...open],
 		promptRules: [ROOM_READ_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
 		turnCheckRules: [ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
 		contextLines: () => roomIndexContextLines(index),
@@ -105,14 +106,15 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 }
 
 export function voiceSurface(): VoiceSurfaceContribution {
-	// navigate_ui is declared only where a client can answer it: the gateway channel is provisioned.
+	// navigate_ui and current_room are declared only where a client can answer and bind: the gateway channel is provisioned.
 	const navigate = navigateUiAvailable();
+	const where = navigate ? createCurrentRoomTool(() => _binding?.current() ?? null) : null;
 	const roomRead = roomReadSurface();
 	return {
-		tools: [...(navigate ? [navigateUiTool] : []), ...roomRead.tools],
-		promptRules: [...(navigate ? [NAVIGATION_PROMPT_RULE] : []), ...roomRead.promptRules],
+		tools: [...(where ? [navigateUiTool, where] : []), ...roomRead.tools],
+		promptRules: [...(where ? [NAVIGATION_PROMPT_RULE, CURRENT_ROOM_PROMPT_RULE] : []), ...roomRead.promptRules],
 		contextLines: () => [...roomContextLines(_binding?.current() ?? null), ...roomRead.contextLines()],
-		answeringTools: roomRead.tools.map((t) => t.name),
-		turnCheckRules: roomRead.turnCheckRules,
+		answeringTools: [...(where ? [where.name] : []), ...roomRead.tools.map((t) => t.name)],
+		turnCheckRules: [...(where ? [CURRENT_ROOM_TURN_CHECK_RULE] : []), ...roomRead.turnCheckRules],
 	};
 }

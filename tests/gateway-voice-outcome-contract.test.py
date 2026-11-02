@@ -29,6 +29,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 _TESTS = Path(__file__).resolve().parent
@@ -36,8 +39,6 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 sys.path.insert(0, str(_TESTS))
-from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
 from ag2_sparrow import outbox, remote_gateway_bridge as gw  # noqa: E402
@@ -500,8 +501,8 @@ class NamedInstance(_Bridge):
              "dm_only": False}])
 
     def test_a_private_answer_the_orphan_sweep_recovers_carries_dm_only(self):
-        # The sweep reads only `task-*` names, so a relay ask reaches it on a named instance.
-        ask = self.serve(voice_ask(ASK_A))
+        # A voice task served without `ack_first`: a relay ask's result is never the sweep's.
+        ask = self.serve(voice_ask(ASK_A, ack_first=None))
         gw._save_inflight(set())                     # the ledger lost it; only the sweep looks
         self.answer(ask, "[dm-only]\nYour 3pm is with Dana.")
         landed = time.time() - 3600                  # past the sweep's grace, under a day
@@ -511,7 +512,6 @@ class NamedInstance(_Bridge):
         self.assertEqual(self.broker.results(), [
             {"id": ASK_A, "body": gw._RECOVERED_LABEL + "Your 3pm is with Dana.",
              "capabilities": CONTRACT, "dm_only": True}])
-        self.assertEqual(gw._load_ack_first(), {}, "the recovered result kept its mark")
 
 
 class AfterARestart(unittest.TestCase):
@@ -571,9 +571,9 @@ class AfterARestart(unittest.TestCase):
         self.serve_once(ASK_A, ASK_B)
         (self.ws / "results" / f"{ASK_A}.txt").write_text("[REPLIED]")
         (self.ws / "results" / f"{ASK_B}.txt").write_text(f"[deduped: {ASK_A}]")
-        # Only the asker in flight: a room-less holder whose own close is accepted first
-        # is no longer verifiable, and the planner reports instead.
-        (self.ws / "state" / "remote-task-inflight.json").write_text(json.dumps([ASK_B]))
+        # The holder's close is not accepted: a room-less holder whose own close is accepted
+        # first is no longer verifiable, and the planner reports instead.
+        self.relay.on_result = lambda p: (503, {"error": "busy"}) if p.get("id") == ASK_A else None
         second = self.bridges.start()
         self.bridges.wait_for(lambda: self.relay.results, second, "the restarted bridge's fold")
         marks = self.ws / "state" / "remote-task-ack-first.json"

@@ -7,7 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, isEntrypoint, lineChange, lsofRollouts, newState, parseArgs,
-  pickRollout, rolloutPaths, runLoop,
+  pickRollout, rolloutPaths, runLoop, taskTouched, toolStep,
 } from '../src/agent/codex/cli/codex-observer.mjs';
 
 const ev = (type, extra = {}, ts = '2026-10-06T02:57:50.000Z') => ({timestamp: ts, type: 'event_msg', payload: {type, ...extra}});
@@ -90,14 +90,27 @@ test('process tree and lsof parsing', () => {
     ['/x/sessions/2026/10/06/rollout-a.jsonl']);
 });
 
+test('the record is written for the seat the observer was given', () => {
+  const o = new Observer({session: 'w1', seat: '0123456789abcdef0123456789abcdef'}, fake({}).deps);
+  assert.equal(buildRecord(o.state, o.ident, 1).seat, '0123456789abcdef0123456789abcdef');
+  assert.equal(buildRecord(newState(), {observerId: 'x', startedAt: 1, session: 's'}, 1).seat, 'core', 'unset: the core');
+  const base = ['--engine', '/e', '--tmux-socket', '/s', '--session', 'w1'];
+  assert.equal(parseArgs(base).seat, 'core');
+  assert.equal(parseArgs([...base, '--seat', '0123456789abcdef0123456789abcdef']).seat, '0123456789abcdef0123456789abcdef');
+  for (const bad of ['worker', '0123', 'CORE', '0123456789abcdef0123456789abcdeg']) {
+    assert.throws(() => parseArgs([...base, '--seat', bad]), /bad --seat/, bad);
+  }
+});
+
 test('arguments are required', () => {
   assert.throws(() => parseArgs(['--engine', '/e']), /missing --tmux-socket/);
   assert.deepEqual(parseArgs(['--engine', '/e', '--tmux-socket', '/s', '--session', 'c']),
-    {engine: '/e', tmuxSocket: '/s', session: 'c', workspace: ''});
+    {engine: '/e', tmuxSocket: '/s', session: 'c', workspace: '', seat: 'core'});
 });
 
 function fake(files, opts = {}) {
   const writes = [];
+  const stepped = [];
   const timers = [];
   const deps = {
     now: () => 1_791_000_000,
@@ -109,8 +122,10 @@ function fake(files, opts = {}) {
     readFrom: (p, off) => { const t = files[p].text.slice(off); return t ? {text: t, bytes: Buffer.byteLength(t)} : null; },
     resolvePython: async () => (opts.python === undefined ? '/py' : opts.python),
     write: async (py, rec) => { writes.push({py, rec}); },
+    steps: async (py, batch) => { stepped.push(...batch); },
+    taskOpen: (id) => !(opts.closed || new Set()).has(id),
   };
-  return {deps, writes, flush: async () => { for (const fn of timers.splice(0)) fn(); await new Promise((r) => setTimeout(r, 5)); }};
+  return {deps, writes, stepped, flush: async () => { for (const fn of timers.splice(0)) fn(); await new Promise((r) => setTimeout(r, 5)); }};
 }
 const jl = (...lines) => lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
 
@@ -389,4 +404,116 @@ test('fileDeps.write runs the engine writer with the workspace and the record on
   assert.deepEqual(fs.readFileSync(out, 'utf8').split('\n'),
     ['/eng/src/runtime_observation.py', 'write', '--workspace', '/ws dir', '{"seat":"core"}']);
   fs.rmSync(dir, {recursive: true});
+});
+
+
+const call = (name, input, ts) => item('custom_tool_call', ts, {name, input});
+const fcall = (name, args, ts) => item('function_call', ts, {name, arguments: JSON.stringify(args)});
+
+test('a Codex tool call maps to the tool vocabulary phase_line reads', () => {
+  assert.deepEqual(toolStep({type: 'custom_tool_call', name: 'exec', input: 'await sh("pytest -q")'}),
+    {tool: 'Bash', input: {command: 'await sh("pytest -q")'}});
+  assert.deepEqual(toolStep({type: 'function_call', name: 'shell', arguments: JSON.stringify({command: ['git', 'diff']})}),
+    {tool: 'Bash', input: {command: 'git diff'}});
+  assert.equal(toolStep({type: 'custom_tool_call', name: 'apply_patch', input: '*** Begin Patch'}).tool, 'Edit');
+  assert.equal(toolStep({type: 'function_call', name: 'sleep', arguments: '{"duration_ms":5}'}).tool, 'Monitor');
+  assert.equal(toolStep({type: 'function_call', name: 'request_user_input_async', arguments: '{}'}).tool, 'AskUserQuestion');
+  assert.equal(toolStep({type: 'function_call', name: 'spawn_agent', arguments: '{}'}).tool, 'Agent');
+  assert.equal(toolStep({type: 'web_search_call'}).tool, 'WebSearch');
+  assert.deepEqual(toolStep({type: 'function_call', name: 'shell', arguments: 'not json'}), {tool: 'Bash', input: {command: ''}});
+  assert.equal(toolStep({type: 'message', role: 'assistant'}), null);
+  assert.equal(toolStep({type: 'function_call_output'}), null);
+});
+
+test('the task a call opens is the last task file it names, never a result', () => {
+  assert.equal(taskTouched({input: 'cat "$WS/tasks/task-ab12.txt"'}), 'task-ab12');
+  assert.equal(taskTouched({input: 'cat /w/tasks/task-a.txt /w/tasks/task-b.txt'}), 'task-b');
+  assert.equal(taskTouched({input: 'echo x > /w/results/task-a.txt'}), null);
+  assert.equal(taskTouched({input: 'mytasks/task-a.txt'}), null);
+  assert.equal(taskTouched({arguments: JSON.stringify({command: ['cat', '/w/tasks/task-c.txt']})}), 'task-c');
+  assert.equal(taskTouched({}), null);
+});
+
+test('steps after the start are recorded for the bound task; history only binds', async () => {
+  const files = {'/r/main': {meta: {}, text: jl(ev('task_started'), call('exec', 'cat /w/tasks/task-old.txt'), call('exec', 'make'))}};
+  const f = fake(files);
+  const o = new Observer({session: 's'}, f.deps);
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped, [], 'history records no step');
+  assert.deepEqual(o.bound, ['task-old'], 'history binds the task the core is on');
+  files['/r/main'].text += jl(call('exec', 'pytest -q'), call('exec', 'cat /w/tasks/task-new.txt'), fcall('sleep', {duration_ms: 1}));
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped.map((s) => [s.task, s.tool]),
+    [['task-old', 'Bash'], ['task-new', 'Bash'], ['task-new', 'Monitor']]);
+  assert.equal(f.stepped[0].input.command, 'pytest -q');
+});
+
+test('a mention of a task that is not open never binds; a re-mention never rebinds', async () => {
+  const files = {'/r/main': {meta: {}, text: jl(ev('task_started'), call('exec', 'cat /w/tasks/task-a.txt'))}};
+  const f = fake(files, {closed: new Set(['task-gone'])});
+  const o = new Observer({session: 's'}, f.deps);
+  await o.tick();
+  files['/r/main'].text += jl(call('exec', 'grep x /w/tasks/task-gone.txt'), call('exec', 'make'),
+    call('exec', 'cat /w/tasks/task-b.txt'), call('exec', 'grep y /w/tasks/task-a.txt'), call('exec', 'pytest'));
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped.map((s) => s.task), ['task-a', 'task-a', 'task-b', 'task-b', 'task-b'],
+    'a closed task is never bound; naming task-a again does not take the work back from task-b');
+});
+
+test('a finished task hands its later steps back to the task bound before it', async () => {
+  const closed = new Set();
+  const files = {'/r/main': {meta: {}, text: jl(ev('task_started'))}};
+  const f = fake(files, {closed});
+  const o = new Observer({session: 's'}, f.deps);
+  await o.tick();
+  files['/r/main'].text += jl(call('exec', 'cat /w/tasks/task-a.txt'), call('exec', 'cat /w/tasks/task-b.txt'), call('exec', 'make'));
+  await o.tick();
+  closed.add('task-b');
+  files['/r/main'].text += jl(call('exec', 'pytest'));
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped.map((s) => [s.task, s.input.command]),
+    [['task-a', 'cat /w/tasks/task-a.txt'], ['task-b', 'cat /w/tasks/task-b.txt'], ['task-b', 'make'], ['task-a', 'pytest']]);
+  assert.deepEqual(o.bound, ['task-a']);
+});
+
+test('the file deps read a task as open only with its task file and no result', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-open-'));
+  fs.mkdirSync(path.join(ws, 'tasks')); fs.mkdirSync(path.join(ws, 'results'));
+  fs.writeFileSync(path.join(ws, 'tasks', 'task-a.txt'), 'x'); fs.writeFileSync(path.join(ws, 'tasks', 'task-b.txt'), 'x');
+  fs.writeFileSync(path.join(ws, 'results', 'task-b.txt'), 'done');
+  const d = fileDeps({engine: '/e', workspace: ws});
+  assert.deepEqual([d.taskOpen('task-a'), d.taskOpen('task-b'), d.taskOpen('task-c')], [true, false, false]);
+  assert.equal(fileDeps({engine: '/e'}).taskOpen('task-z'), true, 'no workspace: nothing to check against');
+  fs.rmSync(ws, {recursive: true, force: true});
+});
+
+test('a tool call before any task is bound records nothing', async () => {
+  const files = {'/r/main': {meta: {}, text: jl(ev('task_started'))}};
+  const f = fake(files);
+  const o = new Observer({session: 's'}, f.deps);
+  await o.tick();
+  files['/r/main'].text += jl(call('exec', 'ls'));
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped, []);
+});
+
+test('the steps command records rules phases through the resolved python', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-steps-'));
+  fs.mkdirSync(path.join(ws, 'state'));
+  const script = REPO + 'skills/agent-activity/scripts/phase_line.py';
+  const batch = [{task: 'task-a', tool: 'Bash', input: {command: 'pytest -q'}}, {task: 'task-a', tool: 'Monitor', input: {}},
+    {task: '../evil', tool: 'Bash', input: {}}, {task: 'task-a', tool: '', input: {}}, 'junk'];
+  execFileSync(PY, [script, 'steps', '--workspace', ws], {input: JSON.stringify(batch)});
+  const recs = fs.readFileSync(path.join(ws, 'state', 'agent-activity.phase.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(recs.map((r) => [r.task_id, r.phase, r.step]), [['task-a', 'Running tests', null], ['task-a', 'Waiting', null]]);
+  assert.ok(recs.every((r) => !JSON.stringify(r).includes('pytest')), 'no command text is stored');
+  const status = JSON.parse(execFileSync(PY, [script, 'status', '--task', 'task-a', '--workspace', ws]).toString());
+  assert.equal(status.phase, 'Waiting');
+  assert.throws(() => execFileSync(PY, [script, 'steps', '--workspace', ws], {input: '{"not": "a list"}', stdio: 'pipe'}));
+  fs.rmSync(ws, {recursive: true, force: true});
 });

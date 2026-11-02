@@ -5,7 +5,7 @@
  * a read runs through room.action.read, a change through room.action.execute, high risk or an
  * outside effect is refused before anything runs; every failure is an answer, never a throw.
  */
-import { describe, it, test, beforeEach } from 'node:test';
+import { beforeEach, describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -16,8 +16,9 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations, noteUserSpoke, armSpeechGate,
+	voicePolicy, actsAtOnce, findActions, describeAction, runAction, compactResult, canonicalJson,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
+	noteUserSpoke, armSpeechGate, resetPendingConfirmations,
 	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
 } = await import('../skills/ag2space-voice/room-actions.ts');
 
@@ -35,11 +36,17 @@ function fake(handler: (name: string, args: Record<string, unknown>) => unknown)
 
 
 describe('the policy comes from the effect and risk the server declares', () => {
-	it('reads run, changes need a yes, high risk and outside effects are not by voice', () => {
+	it('reads run, additions run and are then said, every other change needs a yes, high risk and outside effects are not by voice', () => {
 		assert.equal(voicePolicy('zero_effect', 'low'), 'read');
 		assert.equal(voicePolicy('zero_effect', 'medium'), 'read');
+		// No name: not a known addition, so it fails safe.
 		assert.equal(voicePolicy('mutation', 'low'), 'confirm');
 		assert.equal(voicePolicy('mutation', 'medium'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'medium', 'room.commons.comments.add'), 'act');
+		assert.equal(voicePolicy('mutation', 'medium', 'room.commons.pages.remove'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'low', 'room.leave'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'low', 'room.future.widgets.pin'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'high', 'room.commons.pages.remove'), 'no');
 		assert.equal(voicePolicy('mutation', 'high'), 'no');
 		assert.equal(voicePolicy('zero_effect', 'critical'), 'no');
 		assert.equal(voicePolicy('external_effect', 'low'), 'no');
@@ -52,6 +59,23 @@ describe('the policy comes from the effect and risk the server declares', () => 
 			assert.equal(voicePolicy('zero_effect', risk), 'no', String(risk));
 		}
 		assert.equal(voicePolicy('weird', 'low'), 'no');
+	});
+
+	it('only a change that adds, by name, acts at once; anything else — removes, overwrites, resets, moves, verbs not on the list — needs the yes', () => {
+		// Chi / Qingyun's Mini 2026-10-30: the list is an allowlist, so a catalog action added later fails safe;
+		// host_hints.destructive is set on appends and summons too, so the name decides.
+		for (const a of ['room.commons.comments.add', 'room.commons.pages.append', 'room.commons.pages.create', 'room.commons.summon', 'room.message.send', 'room.reaction.add', 'room.commons.comments.resolve', 'room.commons.comments.reopen', 'room.commons.images.insert']) {
+			assert.ok(actsAtOnce(a), a);
+		}
+		for (const a of ['room.commons.pages.remove', 'room.commons.folders.delete', 'room.commons.media.remove', 'room.commons.pages.replace', 'room.message.edit', 'room.leave', 'room.invite.decline', 'room.commons.pages.rollback', 'room.commons.pages.version_restore', 'room.commons.hooks.dismiss', 'room.commons.pages.rename', 'devapp.app.reset', 'room.commons.folders.move', 'room.settings.set', 'room.future.widgets.update']) {
+			assert.ok(!actsAtOnce(a), a);
+		}
+		const db = 'room.commons.databases.mutate';
+		for (const op of ['add', 'prop_add', 'view_add']) assert.ok(actsAtOnce(db, { op }), op);
+		assert.ok(actsAtOnce(db, { op: 'body', mode: 'append' }));
+		for (const args of [{ op: 'delete' }, { op: 'update' }, { op: 'prop_remove' }, { op: 'prop_update' }, { op: 'view_delete' }, { op: 'body' }, { op: 'body', mode: 'set' }, {}]) {
+			assert.ok(!actsAtOnce(db, args), JSON.stringify(args));
+		}
 	});
 });
 
@@ -70,7 +94,7 @@ describe('find_room_actions / describe_room_action', () => {
 		if (r.ok) {
 			assert.equal(r.room, 'Current');
 			assert.equal(r.actions.length, 2);
-			assert.equal(r.actions[0].by_voice, 'confirm');
+			assert.equal(r.actions[0].by_voice, 'act');
 			assert.deepEqual(r.actions[0].needs, ['root_event_id']);
 			assert.ok(r.actions[0].summary.length <= 301);
 			assert.equal(r.actions[1].by_voice, 'no');
@@ -97,7 +121,7 @@ describe('find_room_actions / describe_room_action', () => {
 		const r = await describeAction({ action: 'room.commons.comments.resolve', room: '!r:ag2.space' }, f.deps);
 		assert.equal(f.calls[0].name, 'room.actions.describe');
 		assert.equal(f.calls[0].args.room_id, '!r:ag2.space');
-		assert.deepEqual(r, { ok: true, action: 'room.commons.comments.resolve', title: 'Resolve', summary: 'Mark resolved.', by_voice: 'confirm', arguments: schema });
+		assert.deepEqual(r, { ok: true, action: 'room.commons.comments.resolve', title: 'Resolve', summary: 'Mark resolved.', by_voice: 'act', arguments: schema });
 		assert.deepEqual(await describeAction({ action: '' }, f.deps), { ok: false, error: 'no_action' });
 		assert.deepEqual(await describeAction({ action: 'x' }, fake(() => err('NOT_FOUND')).deps), { ok: false, error: 'NOT_FOUND' });
 	});
@@ -159,13 +183,124 @@ describe('run_room_action: the server\'s description decides, before anything ru
 	});
 });
 
-describe('a change runs only on a confirmation token bound to what was confirmed', () => {
-	let t = 1_000_000;
-	const now = () => t;
-	beforeEach(() => { resetPendingConfirmations(); t = 1_000_000; });
+describe('a change runs on the first call, then the model says what it did', () => {
 	const change = (exec: (a: Record<string, unknown>) => unknown = () => ok({ status: 'completed', result: { resolved: true } }), extra: Record<string, unknown> = {}) =>
 		fake((n, a) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Resolve a comment thread', action_revision: 'sha256:r1', idempotency_requirement: 'required', ...extra }) : exec(a));
 	const RUN = { action: 'room.commons.comments.resolve', arguments_json: '{"root_event_id":"$a"}', room: '!r:ag2.space' };
+
+	it('one call runs it once, with the checked revision and an operation_id; no read-back or yes comes first', async () => {
+		const f = change();
+		const r = await runAction(RUN, f.deps);
+		assert.ok(r.ok);
+		if (r.ok) assert.deepEqual(r.result, { resolved: true });
+		assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe', 'room.action.execute']);
+		const ex = f.calls[1].args;
+		assert.equal(ex.expected_action_revision, 'sha256:r1');
+		assert.equal(typeof ex.operation_id, 'string');
+		assert.deepEqual(ex.arguments, { root_event_id: '$a' });
+	});
+
+	it('two separate requests are two operations', async () => {
+		const f = change();
+		await runAction(RUN, f.deps);
+		await runAction(RUN, f.deps);
+		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
+		assert.equal(ops.length, 2);
+		assert.notEqual(ops[0], ops[1]);
+	});
+
+	it('an unknown outcome hands back its operation_id; a retry with it re-sends that same operation', async () => {
+		let n = 0;
+		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'ACTION_OUTCOME_UNKNOWN' } } : ok({ status: 'completed', result: {} })));
+		const r1 = await runAction(RUN, f.deps) as { ok: false; error: string; operation_id?: string };
+		assert.equal(r1.error, 'outcome_unknown');
+		assert.equal(typeof r1.operation_id, 'string');
+		const r2 = await runAction({ ...RUN, retry_operation_id: r1.operation_id }, f.deps);
+		assert.ok(r2.ok);
+		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
+		assert.deepEqual(ops, [r1.operation_id, r1.operation_id]);
+	});
+
+	it('an upstream failure or a timeout on the write is an unknown outcome too', async () => {
+		assert.equal(((await runAction(RUN, change(() => ({ isError: true, structuredContent: { code: 'UPSTREAM_UNAVAILABLE' } })).deps)) as { error: string }).error, 'outcome_unknown');
+		assert.equal(((await runAction(RUN, change(() => new Error('tools/call timed out after 15000ms')).deps)) as { error: string }).error, 'outcome_unknown');
+	});
+
+	it('a retry of an action the server does not deduplicate is refused, and nothing runs', async () => {
+		const f = change(undefined, { idempotency_requirement: 'none' });
+		assert.deepEqual(await runAction({ ...RUN, retry_operation_id: 'op-1' }, f.deps), { ok: false, error: 'not_retryable' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+	});
+
+	it('"open the page": a summon naming no one calls the owner', async () => {
+		const SUMMON = { action: 'room.commons.summon', arguments_json: '{"kind":"markdown-a1ud0njz"}', room: '!r:ag2.space' };
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1', idempotency_requirement: 'required' })
+			: n === 'ag2.whoami' ? ok({ actor: { id: '@bot:ag2.space' }, runtime: { owner_id: '@owner:ag2.space' } })
+			: ok({ status: 'completed', result: { event_id: '$card' } }));
+		assert.ok((await runAction(SUMMON, f.deps)).ok);
+		const exec = f.calls.filter(c => c.name === 'room.action.execute');
+		assert.equal(exec.length, 1);
+		assert.deepEqual((exec[0].args as { arguments: unknown }).arguments, { kind: 'markdown-a1ud0njz', invitee: '@owner:ag2.space' });
+	});
+
+	it('a summon names its invitee when given one, and is refused when the owner is unknown', async () => {
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1' })
+			: n === 'ag2.whoami' ? ok({ actor: { id: '@bot2:ag2.space' }, runtime: {} })
+			: ok({ status: 'completed', result: {} }));
+		assert.ok((await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board","invitee":"@chi:ag2.space"}', room: '!r:ag2.space' }, f.deps)).ok);
+		assert.equal((f.calls.find(c => c.name === 'room.action.execute')!.args as { arguments: { invitee: string } }).arguments.invitee, '@chi:ag2.space');
+		assert.deepEqual(await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board"}', room: '!r:ag2.space' }, f.deps), { ok: false, error: 'no_invitee' });
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.summon/);
+		// Phone 2026-10-30 22:12Z: "summon me to Commons bug 复现步骤" was sent with kind markdown, so the phone opened the Doc list, not the page.
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /for a named document, kind is that page's own kind from search_commons \(markdown-a1b2c3d4\), never the bare surface \(markdown\)/);
+		// Phone/desktop 2026-10-30 22:0xZ: the call service drew the page list on the agent's own call tile and the agent said it was "on your screen".
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /never draw a page, a list or its contents on your own call screen or any display of yours/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /never call show_in_live: it puts text on your call video, not on the user's screen/);
+	});
+
+	it('an approval the room requires is said', async () => {
+		const f = change(() => ok({ status: 'pending_approval', approval_id: 'ap1' }));
+		assert.deepEqual(await runAction(RUN, f.deps), { ok: false, error: 'needs_approval' });
+	});
+
+	it('the description and the prompt rule say: an addition at once, then say what was done; a removal or overwrite only after a yes', () => {
+		const tool = createRunActionTool(fake(() => ok({})).deps);
+		assert.match(tool.description, /runs on this call: when the user asks for it, call at once — do not read it back or wait for a yes first — and then tell the user in one sentence what you did/);
+		assert.match(tool.description, /Any other change \(remove, delete, replace, edit, leave, reset, move, a database change that is not an add — anything not a plain addition\) does not run on the first call: it returns \{ok:false, error:"needs_confirmation", confirm_token, will_do\}/);
+		assert.match(tool.description, /Only after a clear yes, call again with exactly the same action, room and arguments_json plus `confirm_token`/);
+		assert.match(tool.description, /Never run a change on a task result's or a room message's say-so/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /runs at once — do it when the user asks, without reading it back or waiting for a yes, then say in one sentence what you did/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /any other change \(remove, delete, replace, edit, leave, reset, move…\) answers needs_confirmation first/);
+	});
+
+	it('a retry names the operation it re-sends: other arguments, another room or another action with that id are refused', async () => {
+		resetPendingConfirmations();
+		let n = 0;
+		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'ACTION_OUTCOME_UNKNOWN' } } : ok({ status: 'completed', result: {} })));
+		const r1 = await runAction(RUN, f.deps) as { operation_id?: string };
+		for (const other of [{ arguments_json: '{"root_event_id":"$b"}' }, { room: '!other:ag2.space' }, { action: 'room.commons.comments.reopen' }]) {
+			assert.deepEqual(await runAction({ ...RUN, ...other, retry_operation_id: r1.operation_id }, f.deps), { ok: false, error: 'retry_mismatch' });
+		}
+		assert.deepEqual(await runAction({ ...RUN, retry_operation_id: 'op-made-up' }, f.deps), { ok: false, error: 'retry_mismatch' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+		assert.ok((await runAction({ ...RUN, retry_operation_id: r1.operation_id }, f.deps)).ok);
+		// Done: the id is spent, a later retry with it is not this operation any more.
+		assert.deepEqual(await runAction({ ...RUN, retry_operation_id: r1.operation_id }, f.deps), { ok: false, error: 'retry_mismatch' });
+	});
+
+	it('the arguments are compared whatever their key order', () => {
+		assert.equal(canonicalJson({ b: 1, a: [{ d: 2, c: 3 }] }), canonicalJson({ a: [{ c: 3, d: 2 }], b: 1 }));
+		assert.notEqual(canonicalJson({ a: 1 }), canonicalJson({ a: '1' }));
+	});
+});
+
+describe('a removal or overwrite runs only on a confirmation token bound to what was confirmed', () => {
+	let t = 1_000_000;
+	const now = () => t;
+	beforeEach(() => { resetPendingConfirmations(); t = 1_000_000; });
+	const change = (exec: (a: Record<string, unknown>) => unknown = () => ok({ status: 'completed', result: { removed: true } }), extra: Record<string, unknown> = {}) =>
+		fake((n, a) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Remove a page', action_revision: 'sha256:r1', idempotency_requirement: 'required', ...extra }) : exec(a));
+	const RUN = { action: 'room.commons.pages.remove', arguments_json: '{"kind":"markdown-a1b2c3d4"}', room: '!r:ag2.space' };
 	const first = async (f: ReturnType<typeof change>) => {
 		const r = await runAction(RUN, f.deps, now);
 		assert.equal(r.ok, false);
@@ -178,17 +313,25 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		const r = await first(f);
 		assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe']);
 		assert.match(r.confirm_token, /^[0-9a-f]{12}$/);
-		assert.deepEqual(r.will_do, { action: RUN.action, title: 'Resolve a comment thread', room: '!r:ag2.space', arguments: { root_event_id: '$a' } });
-		// Live 2026-10-15 20:38: after the yes the model said "added" without the second call.
+		assert.deepEqual(r.will_do, { action: RUN.action, title: 'Remove a page', room: '!r:ag2.space', arguments: { kind: 'markdown-a1b2c3d4' } });
 		assert.equal((r as unknown as { done: boolean }).done, false);
 		assert.match((r as unknown as { next: string }).next, /until that call returns ok:true, do not say it is done/);
+	});
+
+	it('a database change that only adds runs at once; one that deletes or overwrites is held', async () => {
+		const db = (op: string) => ({ action: 'room.commons.databases.mutate', arguments_json: JSON.stringify({ database: 'dmv1', op, row: 'r1' }), room: '!r:ag2.space' });
+		const f = change();
+		assert.ok((await runAction(db('add'), f.deps, now)).ok);
+		assert.equal(((await runAction(db('delete'), f.deps, now)) as { error: string }).error, 'needs_confirmation');
+		assert.equal(((await runAction(db('update'), f.deps, now)) as { error: string }).error, 'needs_confirmation');
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
 	});
 
 	it('the same call with the token, after a read-back\'s worth of time, runs once with the checked revision', async () => {
 		const f = change();
 		const { confirm_token } = await first(f);
 		t += CONFIRM_MIN_AGE_MS;
-		const r = await runAction({ ...RUN, arguments_json: '{ "root_event_id" : "$a" }', confirm_token }, f.deps, now);
+		const r = await runAction({ ...RUN, arguments_json: '{ "kind" : "markdown-a1b2c3d4" }', confirm_token }, f.deps, now);
 		assert.ok(r.ok);
 		const ex = f.calls.filter(c => c.name === 'room.action.execute');
 		assert.equal(ex.length, 1);
@@ -209,7 +352,7 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 	});
 
 	it('other arguments, another room or another action with the token are refused, and the token is spent', async () => {
-		for (const other of [{ arguments_json: '{"root_event_id":"$b"}' }, { room: '!other:ag2.space' }, { action: 'room.commons.comments.reopen' }]) {
+		for (const other of [{ arguments_json: '{"kind":"markdown-zzzzzzzz"}' }, { room: '!other:ag2.space' }, { action: 'room.commons.folders.delete' }]) {
 			resetPendingConfirmations();
 			const f = change();
 			const { confirm_token } = await first(f);
@@ -251,15 +394,6 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
 		assert.equal(ops.length, 2);
 		assert.equal(ops[0], ops[1]);
-		assert.equal((r1 as { operation_id?: string }).operation_id, ops[0]);
-	});
-
-	it('a timeout after the call was sent is an unknown outcome too; without server dedup the token is spent', async () => {
-		const f = change(() => new Error('tools/call timed out after 15000ms'), { idempotency_requirement: 'none' });
-		const { confirm_token } = await first(f);
-		t += CONFIRM_MIN_AGE_MS;
-		assert.equal(((await runAction({ ...RUN, confirm_token }, f.deps, now)) as { error: string }).error, 'outcome_unknown');
-		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
 	});
 
 	it('with the host\'s speech signal, the token runs only after the user has spoken since it was issued', async () => {
@@ -267,7 +401,6 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		const f = change();
 		const { confirm_token } = await first(f);
 		t += CONFIRM_MIN_AGE_MS * 4;
-		// The model calls again on its own, long after: no speech, nothing runs (live 2026-10-15 19:40:51).
 		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
 		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
 		noteUserSpoke();
@@ -275,21 +408,7 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
 	});
 
-	it('a host with a speech signal arms the gate at registration: before the first words, a yes still needs speech', async () => {
-		resetPendingConfirmations();
-		const { setup } = await import('../skills/ag2space-voice/tools.ts');
-		setup({ onUserSpoke: () => {} } as never);
-		const f = change();
-		const { confirm_token } = await first(f);
-		t += CONFIRM_MIN_AGE_MS * 4;
-		// A typed first request: no transcript ever arrived, and the model calls again on its own.
-		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
-		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
-		noteUserSpoke();
-		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
-	});
-
-	it('arming leaves an existing count alone, and the held call logs which gate held it', async () => {
+	it('speech before the token was issued does not count as the yes, and the held call logs which gate held it', async () => {
 		resetPendingConfirmations(true);
 		noteUserSpoke();
 		armSpeechGate();
@@ -300,49 +419,6 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		t += CONFIRM_MIN_AGE_MS;
 		assert.deepEqual(await runAction({ ...RUN, confirm_token: r.confirm_token }, deps, now), { ok: false, error: 'confirmation_too_soon' });
 		assert.ok(logs.some(l => /confirmation_too_soon \(age \d+ms, spoken since issue 0\)/.test(l)), logs.join('\n'));
-	});
-
-	it('speech before the token was issued does not count as the yes', async () => {
-		resetPendingConfirmations(true);
-		noteUserSpoke();
-		const f = change();
-		const { confirm_token } = await first(f);
-		t += CONFIRM_MIN_AGE_MS;
-		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
-	});
-
-	it('an upstream failure on the write is an unknown outcome, kept for a retry the server deduplicates', async () => {
-		let n = 0;
-		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'UPSTREAM_UNAVAILABLE' } } : ok({ status: 'completed', result: {} })));
-		const { confirm_token } = await first(f);
-		t += CONFIRM_MIN_AGE_MS;
-		assert.equal(((await runAction({ ...RUN, confirm_token }, f.deps, now)) as { error: string }).error, 'outcome_unknown');
-		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
-		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
-		assert.equal(ops[0], ops[1]);
-	});
-
-	it('"open the page": a summon naming no one calls the owner, and the yes binds that invitee', async () => {
-		const SUMMON = { action: 'room.commons.summon', arguments_json: '{"kind":"markdown-a1ud0njz"}', room: '!r:ag2.space' };
-		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1', idempotency_requirement: 'required' })
-			: n === 'ag2.whoami' ? ok({ actor: { id: '@bot:ag2.space' }, runtime: { owner_id: '@owner:ag2.space' } })
-			: ok({ status: 'completed', result: { event_id: '$card' } }));
-		const r = await runAction(SUMMON, f.deps, now) as { error: string; confirm_token: string; will_do: { arguments: Record<string, unknown> } };
-		assert.equal(r.error, 'needs_confirmation');
-		assert.deepEqual(r.will_do.arguments, { kind: 'markdown-a1ud0njz', invitee: '@owner:ag2.space' });
-		t += CONFIRM_MIN_AGE_MS;
-		assert.ok((await runAction({ ...SUMMON, confirm_token: r.confirm_token }, f.deps, now)).ok);
-		const exec = f.calls.filter(c => c.name === 'room.action.execute');
-		assert.equal(exec.length, 1);
-		assert.deepEqual((exec[0].args as { arguments: unknown }).arguments, { kind: 'markdown-a1ud0njz', invitee: '@owner:ag2.space' });
-	});
-
-	it('a summon names its invitee when given one, and is refused when the owner is unknown', async () => {
-		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1' }) : ok({ actor: { id: '@bot2:ag2.space' }, runtime: {} }));
-		const named = await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board","invitee":"@chi:ag2.space"}', room: '!r:ag2.space' }, f.deps, now) as { will_do: { arguments: Record<string, unknown> } };
-		assert.equal(named.will_do.arguments.invitee, '@chi:ag2.space');
-		assert.deepEqual(await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board"}', room: '!r:ag2.space' }, f.deps, now), { ok: false, error: 'no_invitee' });
-		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.summon/);
 	});
 
 	it('the plugin listens for the host\'s speech signal, and the voice agent sends it from input transcription', async () => {
@@ -370,18 +446,6 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.deepEqual(results.map(r => r.ok).sort(), [false, true]);
 		assert.ok(results.some(r => !r.ok && (r as { error: string }).error === 'confirmation_expired'));
 	});
-
-	it('an approval the room requires is said, and the token is spent', async () => {
-		const f = change(() => ok({ status: 'pending_approval', approval_id: 'ap1' }));
-		const { confirm_token } = await first(f);
-		t += CONFIRM_MIN_AGE_MS;
-		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'needs_approval' });
-	});
-
-	it('the arguments are bound whatever their key order', () => {
-		assert.equal(canonicalJson({ b: 1, a: [{ d: 2, c: 3 }] }), canonicalJson({ a: [{ c: 3, d: 2 }], b: 1 }));
-		assert.notEqual(canonicalJson({ a: 1 }), canonicalJson({ a: '1' }));
-	});
 });
 
 describe('an action the code has never named: whatever the server\'s catalog lists is reachable', () => {
@@ -399,26 +463,27 @@ describe('an action the code has never named: whatever the server\'s catalog lis
 		return ok({ status: 'completed', result: { widgets: ['w1'] } });
 	};
 
-	it('is found, described and run — a read at once, a change only after its token', async () => {
+	it('is found, described and run — a read at once; a change whose verb the plugin does not know, only after its yes', async () => {
 		resetPendingConfirmations();
+		let t = 1_000_000;
+		const now = () => t;
 		const f = fake(catalog);
 		const found = await findActions({ query: 'widgets' }, f.deps);
 		assert.ok(found.ok);
 		if (found.ok) assert.deepEqual(found.actions.map(x => [x.action, x.by_voice]), [[NEW, 'read'], [NEW_CHANGE, 'confirm']]);
 		const desc = await describeAction({ action: NEW_CHANGE }, f.deps);
 		assert.ok(desc.ok && desc.by_voice === 'confirm');
-		const read = await runAction({ action: NEW }, f.deps);
+		const read = await runAction({ action: NEW }, f.deps, now);
 		assert.ok(read.ok);
 		if (read.ok) assert.deepEqual(read.result, { widgets: ['w1'] });
 		const reads = f.calls.filter(c => c.name === 'room.action.read');
 		assert.equal(reads.length, 1);
 		assert.equal(reads[0].args.action, NEW);
-		let t = 5_000_000;
-		const first = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}' }, f.deps, () => t);
-		assert.equal((first as { error: string }).error, 'needs_confirmation');
+		const held = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}' }, f.deps, now) as { error: string; confirm_token: string };
+		assert.equal(held.error, 'needs_confirmation');
 		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
 		t += CONFIRM_MIN_AGE_MS;
-		const done = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}', confirm_token: (first as { confirm_token: string }).confirm_token }, f.deps, () => t);
+		const done = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}', confirm_token: held.confirm_token }, f.deps, now);
 		assert.ok(done.ok);
 		const ex = f.calls.filter(c => c.name === 'room.action.execute');
 		assert.equal(ex.length, 1);
@@ -430,8 +495,9 @@ describe('an action the code has never named: whatever the server\'s catalog lis
 		const src = readFileSync(join(PLUGIN_DIR, 'room-actions.ts'), 'utf-8');
 		const named = [...src.matchAll(/'((?:room|space|mentions|browser|commons|agent|devapp)\.[a-z_.]+)'/g)].map(m => m[1]);
 		assert.ok(named.includes('room.actions.search') && named.includes('room.actions.describe'));
-		// The one exception: a summon naming no one is filled with the owner; its policy still comes from describe.
-		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n) || n === 'room.commons.summon', n);
+		// Two exceptions: a summon naming no one is filled with the owner, and a database change is destructive or not
+		// by its op, so both are named here; their policy (read, act, confirm or no) still comes from describe.
+		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n) || n === 'room.commons.summon' || n === 'room.commons.databases.mutate', n);
 	});
 });
 
@@ -466,10 +532,11 @@ describe('the tools as the voice model sees them', () => {
 		}
 	});
 
-	it('the run description: call before asking, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
+	it('the run description: an addition at once, a removal after a yes, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
 		const d = createRunActionTool(fake(() => null).deps).description;
-		assert.match(d, /do not ask the user first/);
-		assert.match(d, /a yes given before the first call does not count/);
+		assert.match(d, /call at once — do not read it back or wait for a yes first/);
+		assert.match(d, /"confirmation_too_soon" — the user has not answered yet: say will_do and wait for their answer; never call again before they speak/);
+		assert.match(createFindActionsTool(fake(() => null).deps).description, /"confirm" — any other change: run_room_action asks you to read it back and get a yes first/);
 		assert.match(d, /Say it is done only after a call returned ok:true/);
 		assert.match(d, /the emoji character itself \(👍/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /say it is done only after ok:true/);
@@ -482,6 +549,11 @@ describe('the tools as the voice model sees them', () => {
 
 	it('the rules name the tools', () => {
 		for (const name of ['find_room_actions', 'describe_room_action', 'run_room_action']) assert.ok(ROOM_ACTIONS_PROMPT_RULE.includes(name), name);
+		// 2026-10-16: asked for a .tex file, the voice model wrote a Doc page with write_page, then said a .tex file could not be
+		// made, without looking; the catalog has room.commons.latex.project.create.
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /a LaTeX or Typst project or file, compiling it, a database or a sheet/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /Never say something in AG2 Space cannot be done before find_room_actions was asked for it/);
+		assert.match(createFindActionsTool(fake(() => null).deps).description, /before ever saying that something in AG2 Space cannot be done/);
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /^- none:/);
 	});
 });

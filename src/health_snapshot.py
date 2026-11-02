@@ -49,7 +49,7 @@ GATEWAY_STALE_S = 180.0
 
 # Pane-derived claims a later completed model request disproves; every other reason stands.
 PANE_SUPERSEDABLE = frozenset({"needs-login", "login", "quota-limit", "out-of-credits", "session-limit",
-                               "api-error", "network-error"})
+                               "usage-limit", "api-error", "network-error"})
 
 # Observation phases with no model request in flight.
 RETRY_DISPROVING_PHASES = frozenset({"idle", "waiting", "failed"})
@@ -341,7 +341,8 @@ def _workers(ws: Path):
         row = row if isinstance(row, dict) else {}
         if row.get("state") == "retired":
             continue
-        label = row.get("label")
+        # The name people see: the display label the pool applies, else the base label.
+        label = row.get("display_label") or row.get("label")
         out.append((wid, label if isinstance(label, str) and label != wid else None, row.get("state")))
     return out
 
