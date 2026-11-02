@@ -253,7 +253,11 @@ and 1 when Sparrow refused or withheld it or the task already has a result; exit
 `[REPLIED]`, `[channel:]`, `[thread]` or `[file:]`, which a reply may not use).
 Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
 in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
-with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
+with `ag2-sparrow-hatch reply --no-send <result_file>`. An agent that answers
+outside the wake (no worker_note) ends it with `ag2-sparrow-hatch no-reply
+<result_file> [--reason TEXT]`, which writes `[no-send]` the same way and waits
+like `reply`: exit 0 once Sparrow has settled the task with the gateway, 1 when
+it was not, 3 when it is queued but not confirmed. Work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
 main session. An item that waits for the owner's go is parked with
 `ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
