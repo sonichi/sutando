@@ -39,6 +39,15 @@ class EnsureLinked(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def tree(self):
+        """Every path under the temp root, links included, as a sorted list."""
+        root = Path(self.tmp.name).resolve()
+        found = []
+        for top, dirs, files in os.walk(root):
+            for name in dirs + files:
+                found.append(os.path.relpath(os.path.join(top, name), root))
+        return sorted(found)
+
     def link(self, codex_home=None, repo=None):
         return chi.ensure_linked(codex_home or self.codex_home, repo or self.repo, self.home)
 
@@ -224,10 +233,13 @@ class EnsureLinked(unittest.TestCase):
         alias = elsewhere / "alias"
         alias.symlink_to(self.home / "child")
         spelled = f"{alias}/../.codex"
-        self.assertTrue(os.path.samefile(spelled, self.home / ".codex"))
+        resolved = Path(os.path.realpath(spelled))
+        self.assertTrue(os.path.samefile(resolved, self.home / ".codex"))
+        before = self.tree()
         self.assertEqual(self.link(codex_home=spelled), "owner-home")
-        self.assertEqual(os.listdir(self.home / ".codex"), [])
-        self.assertFalse(os.path.lexists(elsewhere / ".codex"))
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(os.listdir(resolved), [])
+        self.assertFalse(os.path.lexists(elsewhere / ".codex"), "lexical location created")
 
     def test_an_alias_then_dotdot_links_into_the_directory_the_os_resolves(self):
         root = Path(self.tmp.name).resolve()
@@ -239,9 +251,14 @@ class EnsureLinked(unittest.TestCase):
         alias = elsewhere / "alias"
         alias.symlink_to(real_parent / "child")
         spelled = f"{alias}/../codex-home"
+        resolved = Path(os.path.realpath(spelled))
+        self.assertEqual(resolved, real_parent / "codex-home")
         self.assertEqual(self.link(codex_home=spelled), "linked")
-        self.assertEqual(Path(os.readlink(real_parent / "codex-home" / "AGENTS.md")), self.host)
-        self.assertFalse(os.path.lexists(elsewhere / "codex-home"))
+        self.assertTrue((resolved / "AGENTS.md").is_symlink())
+        self.assertEqual(Path(os.readlink(resolved / "AGENTS.md")), self.host)
+        self.assertEqual((resolved / "AGENTS.md").read_text(), "host\n")
+        self.assertFalse(os.path.lexists(elsewhere / "codex-home"), "lexical location created")
+        self.assertEqual(sorted(os.listdir(elsewhere)), ["alias"])
 
     def test_a_relative_codex_home_is_resolved_against_the_cwd(self):
         root = Path(self.tmp.name).resolve()
@@ -249,11 +266,13 @@ class EnsureLinked(unittest.TestCase):
             self.assertEqual(self.link(codex_home="rel-home"), "linked")
         self.assertTrue((root / "rel-home" / "AGENTS.md").is_symlink())
 
-    def test_dotdot_below_a_missing_directory_is_refused(self):
+    def test_dotdot_below_a_missing_directory_is_refused_before_anything_is_created(self):
         spelled = f"{self.codex_home}/missing/../x"
+        before = self.tree()
         self.assertEqual(self.link(codex_home=spelled), "invalid-home")
         self.assertTrue(chi.is_owner_codex_home(spelled, self.home))
-        self.assertFalse(self.codex_home.exists())
+        self.assertEqual(self.tree(), before)
+        self.assertFalse(os.path.lexists(self.codex_home.parent))
 
     def test_fd_path_reads_f_getpath(self):
         fake = types.SimpleNamespace(F_GETPATH=50, fcntl=lambda fd, op, buf: b"/some/dir\0junk")
