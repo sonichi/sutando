@@ -824,11 +824,11 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
     except (TypeError, ValueError):
         silence_s = 180.0
     try:
-        tool_max_s = float(setting("WEDGE_TOOL_MAX_SECONDS", "1800"))
+        tool_max_s = float(setting("WEDGE_TOOL_MAX_SECONDS", "900"))
         if not math.isfinite(tool_max_s) or tool_max_s < 1:
-            tool_max_s = 1800.0
+            tool_max_s = 900.0
     except (TypeError, ValueError):
-        tool_max_s = 1800.0
+        tool_max_s = 900.0
     import turns
     return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s,
                                      active_tool=turns.has_open_tool(Path(workspace), task_id,
