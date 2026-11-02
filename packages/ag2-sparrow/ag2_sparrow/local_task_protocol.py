@@ -228,6 +228,9 @@ KNOWN_HEADER_KEYS = (
     "task_layout",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
+    # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
+    # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
+    "parent_task", "parent_generation",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
