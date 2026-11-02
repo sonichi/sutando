@@ -1,4 +1,3 @@
-# shellcheck shell=bash
 # Shell adapter for src/codex_home.py, the one owner of the Codex core's home: resolve it,
 # check it, create it only when permitted. Every launcher sources this; none creates the home.
 #
@@ -8,6 +7,7 @@
 #   and SUTANDO_CODEX_HOME_REFUSED=1 on a refusal.
 #   Returns 1 when the configuration cannot be read.
 
+# shellcheck shell=bash
 sutando_codex_desktop_hosted() {
   local real parent
   real="$(cd "$1" 2>/dev/null && pwd -P)" || return 1

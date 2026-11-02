@@ -52,6 +52,9 @@ NEEDED = (
     "src/watch-tasks-stream.sh",
     "scripts/python-binary.sh",
     "scripts/sutando-config.sh",
+    "src/agent/codex/codex-home.sh",
+    "src/codex_home.py",
+    "src/codex_host_instructions.py",
     # without these the launcher aborts before tmux and the assert is vacuous
     "scripts/install-personal-claude-hook.sh",
 )
