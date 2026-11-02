@@ -193,6 +193,16 @@ class ThreeServers(unittest.TestCase):
         self.assertEqual(dotspace.default_link_via({}, primary_server=primary), "dev.s.space")
 
 
+class PrimaryChannelSource(unittest.TestCase):
+    def test_a_named_primary_reads_its_lane_dir_and_the_legacy_row_the_source(self):
+        Install(self, [row("s.space", "s-space", primary=True)])
+        with mock.patch.object(connections, "lane_channel_dir", return_value="lane-dir") as lane:
+            self.assertEqual(hc._primary_channel_source(), "lane-dir")
+        lane.assert_called_once_with("s-space")
+        Install(self, [row("ag2.space", "", primary=True)])
+        self.assertEqual(hc._primary_channel_source("ag2space"), "ag2space")
+
+
 class Configured(unittest.TestCase):
     def _env(self):
         return mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": "", "AG2_REMOTE_TOKEN": ""})

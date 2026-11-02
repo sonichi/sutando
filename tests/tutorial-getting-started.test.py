@@ -642,6 +642,26 @@ class CredentialTest(unittest.TestCase):
         self.assertTrue(env["AG2_REMOTE_TOKEN"].endswith("|not-a-real-secret"))
         self.assertNotIn("OTHER", env)
 
+    def test_a_secondary_lane_only_install_finds_the_lane_token(self):
+        # The device file holds only the lane's suffixed launch key; publish must still get a token.
+        app = self.tmp / "app"
+        channels = app / "channels"
+        (channels / "ag2space").mkdir(parents=True)
+        (channels / "s.space").mkdir()
+        device = channels / "ag2space" / ".env"
+        device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n")
+        (channels / "s.space" / ".env").write_text(
+            "AG2_REMOTE_TOKEN=https://relay.test.invalid/relay|lane-secret\n"
+            "AGENT_MXID=@lane.agent:example.test\n")
+        (channels / "active-gateway-lane").write_text("s_dspace\n")
+        env = {"CLAUDE_CONFIG_DIR": str(app), "SUTANDO_APP_SUPPORT": str(app),
+               "AG2_DEVICE_ENV": str(device), "PATH": os.environ.get("PATH", "")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            got = gs.commons_env(self.script)
+            mxid = gs.agent_mxid()
+        self.assertTrue(got.get("AG2_REMOTE_TOKEN", "").endswith("|lane-secret"))
+        self.assertEqual(mxid, "@lane.agent:example.test")
+
     def test_an_env_credential_wins_and_nothing_is_mixed_in(self):
         with mock.patch.dict(os.environ, {**self.base, "AG2_API_ROOT": "https://other.test.invalid"},
                              clear=True):
