@@ -30,6 +30,9 @@ from local_task_protocol import find_result, valid_local_task_id  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import turns  # noqa: E402
+
 WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # lint-workspace-resolution: allow-repo-root (sibling script, not a data root)
 SKIP_TOOLS = {"Read", "Glob", "Grep", "TodoWrite"}
 MAXLEN = 100
@@ -52,10 +55,11 @@ def load_json(path: Path, default):
     return v if isinstance(v, type(default)) else default
 
 
-def open_tasks(log: Path) -> dict[str, dict]:
-    """{task_id: {"task", "room"}} for tasks with a row and no later done row; malformed rows skipped."""
+def open_tasks(log: Path, *, processing_only: bool = False) -> dict[str, dict]:
+    """{task_id: {"task", "room"}} for unfinished tasks, optionally ordered only by pickup rows."""
     out: dict[str, dict] = {}
     done: set[str] = set()
+    picked_up: set[str] = set()
     try:
         lines = log.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -68,8 +72,18 @@ def open_tasks(log: Path) -> dict[str, dict]:
         t = r.get("task") if isinstance(r, dict) else None
         if not isinstance(t, dict) or not isinstance(t.get("id"), str):
             continue
-        if r.get("done"):
+        if r.get("done") or r.get("kind") == "done":
             done.add(t["id"])
+            if t["id"] in picked_up and t["id"] in out:
+                out[t["id"]]["reopened"] = True
+            else:
+                out.pop(t["id"], None)
+        elif r.get("kind") == "processing" and t["id"] not in done:
+            picked_up.add(t["id"])
+            if processing_only or t["id"] not in out:
+                out.setdefault(t["id"], {"task": t, "room": r.get("room") if isinstance(r.get("room"), str) else None, "pickup": r.get("ts")})
+        elif processing_only and r.get("kind") != "processing":
+            continue
         elif t["id"] not in done and t["id"] not in out:
             out[t["id"]] = {"task": t, "room": r.get("room") if isinstance(r.get("room"), str) else None}
     return out
@@ -94,11 +108,50 @@ def indexed_open_tasks(ws: Path) -> dict[str, dict]:
 def bound_task(p: dict, session_id: str) -> tuple[dict | None, str | None]:
     """The open task this session is bound to; None when none is (fail closed)."""
     binds = load_json(p["bind"], {})
-    opened = open_tasks(p["log"])
-    for tid in opened:  # open_tasks() yields newest first; the newest open task wins
-        if binds.get(tid) == session_id:
+    opened = open_tasks(p["log"], processing_only=True)
+    for tid in opened:
+        if binds.get(tid) == session_id and not cached_answered(p, session_id, tid, opened[tid]):
             return opened[tid]["task"], opened[tid]["room"]
     return None, None
+
+
+def _atomic_json(path: Path, value: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
+    try:
+        tmp.write_text(json.dumps(value, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _mtime(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def cached_answered(p: dict, session_id: str, task_id: str, entry: dict) -> bool:
+    """Persist result lookups across hook processes, scoped to the session and pickup."""
+    results = p["ws"] / "results"
+    stamp = [_mtime(results), _mtime(results / "archive"), _mtime(results / f"{task_id}.txt")]
+    key = [session_id, entry.get("pickup"), bool(entry.get("reopened")), stamp]
+    path = p["bind"].with_name("agent-activity.answers.json")
+    with locked_file(path.with_suffix(".lock"), create_mode=0o600):
+        cache = load_json(path, {})
+        hit = cache.get(task_id)
+        if isinstance(hit, dict) and hit.get("key") == key:
+            return bool(hit.get("answered"))
+        result = find_result(results, task_id)
+        answer = result is not None
+        if answer and entry.get("reopened") and isinstance(entry.get("pickup"), (int, float)):
+            modified = _mtime(result)
+            answer = modified is not None and modified >= entry["pickup"] * 1_000_000_000
+        binds = load_json(p["bind"], {})
+        cache = {tid: value for tid, value in cache.items() if tid in binds}
+        cache[task_id] = {"key": key, "answered": answer}
+        _atomic_json(path, cache)
+        return answer
 
 
 def processing_task_id(command: str, ws: Path) -> str | None:
@@ -139,9 +192,7 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
         alive = open_tasks(p["log"])
         alive.update(indexed_open_tasks(p["ws"]))
         binds = {t: sid for t, sid in binds.items() if t in alive or t == task_id}
-        tmp = p["bind"].with_name(f".{p['bind'].name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
-        tmp.write_text(json.dumps(binds, indent=1), encoding="utf-8")
-        os.replace(tmp, p["bind"])
+        _atomic_json(p["bind"], binds)
 
 
 TASK_FILE = re.compile(rf"tasks[\\/]+({TASK_ID})\.txt\b")  # tasks/archive/… has no direct match
@@ -299,8 +350,85 @@ def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subpr
     run(cmd, capture_output=True)
 
 
+_IX = re.compile(r"Interaction-Id: (ix_[0-9a-f]{12})")
+DELEGATING = ("Agent", "Workflow", "SendMessage")
+
+
+def handoff_pre(ws: Path, task_id: str, tool: str, inp, tool_use_id) -> None:
+    """Record work given away from a bound task: a subagent call, or a SendMessage ask with an id.
+    Silent: a record that cannot be written must never surface as a hook error."""
+    try:
+        import contextlib
+        import io
+        import handoffs
+        inp = inp if isinstance(inp, dict) else {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str):
+                handoffs.open_handoff(ws, task_id, "agent", tool_use_id,
+                                      handoffs.label_for("agent", inp.get("subagent_type")),
+                                      holds=not inp.get("run_in_background"))
+            elif tool == "SendMessage":
+                m = _IX.search(str(inp.get("message") or ""))
+                if m:
+                    handoffs.open_handoff(ws, task_id, "message", m.group(1), handoffs.label_for("message", None),
+                                          holds=False)
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a tool call
+        pass
+
+
+def handoff_post(ws: Path, tool, inp, tool_use_id, outcome: str = "done") -> None:
+    """A foreground subagent's call returning (done) or failing (failed) is its work coming back.
+    One index-file lookup; the log is not read unless a handoff is open for this call."""
+    try:
+        if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str) \
+                and not (isinstance(inp, dict) and inp.get("run_in_background")):
+            import contextlib
+            import io
+            import handoffs
+            with contextlib.redirect_stderr(io.StringIO()):
+                handoffs.close_by_child(ws, "agent", tool_use_id, outcome)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> None:
+    """The phase sidecar's rules record (and, when switched on, the detached model call); never raises."""
+    try:
+        scripts = str(Path(__file__).resolve().parents[1] / "scripts")  # lint-workspace-resolution: allow-repo-root (sibling skill scripts, not a data root)
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import phase_line
+        phase_line.on_step(ws, task_id, tool, inp, line)
+    except Exception:  # noqa: BLE001 - the live status must never break a tool call
+        pass
+
+
+def stop_rulings(ws: Path) -> None:
+    """Rule any stop still waiting on its answer: a turn ending is when the core may have given it."""
+    if any(ws.joinpath("state", "stop-interrupts").glob("*.ruling.json")):
+        import stop_interrupt
+        log = ws / "logs" / "stop-interrupt.log"
+
+        def note(line: str) -> None:            # never stderr: a hook's stderr reads as a hook error
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+        stop_interrupt.sweep(ws, log=note)
+
+
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
+    # The pane stamp moves first: the fenced key reads only the stamp, so a turn that ended or began
+    # is never stamped as one the record no longer shows open.
+    for step in (lambda: turns.stamp_pane(payload), lambda: turns.record(payload, p["ws"]),
+                 lambda: payload.get("hook_event_name") == "Stop" and stop_rulings(p["ws"])):
+        try:
+            step()
+        except Exception:  # noqa: BLE001 — turn records and stop rulings never hold up the rows below
+            pass
     sid = payload.get("session_id")
     if not isinstance(sid, str) or not sid:
         return []
@@ -336,14 +464,22 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             return out
         if result_file_refs(blob):
             return out  # the result write itself is not "working"; PostToolUse decides whether it closed the task
+        if tool in DELEGATING:
+            owner, _room = bound_task(p, sid)
+            if owner:
+                handoff_pre(p["ws"], owner["id"], tool, inp, payload.get("tool_use_id"))
         line = working_line(tool, inp) if isinstance(tool, str) else None
-        if line:
-            task, room = bound_task(p, sid)
-            if task:
-                emit("working", line, task, room, p["ws"], run)
-                out.append(("working", line))
+        task, room = bound_task(p, sid)
+        if task and isinstance(tool, str):
+            step_phase(p["ws"], task["id"], tool, inp, line)
+        if line and task:
+            emit("working", line, task, room, p["ws"], run)
+            out.append(("working", line))
+    elif event == "PostToolUseFailure":
+        handoff_post(p["ws"], payload.get("tool_name"), payload.get("tool_input"), payload.get("tool_use_id"), "failed")
     elif event == "PostToolUse":
         inp = payload.get("tool_input")
+        handoff_post(p["ws"], payload.get("tool_name"), inp, payload.get("tool_use_id"))
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
         binds = load_json(p["bind"], {})
         opened = open_tasks(p["log"])
