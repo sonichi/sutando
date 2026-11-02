@@ -237,9 +237,9 @@ def connect_agent_problem(agent_id) -> str:
     """'' when connect names its agent (--agent, the agent's Matrix ID), else why: the code names its
     agent only once redeemed, which spends it."""
     if not agent_id:
-        return "connect needs --agent <the agent's Matrix ID>; copy the connect command from the s.space app again"
+        return "connect needs --agent <the agent's Matrix ID>; copy the connect command from the app again"
     if not AGENT_ID_RE.fullmatch(agent_id):
-        return (f"--agent {agent_id} is not a Matrix ID (@name:server); copy the connect command from the s.space "
+        return (f"--agent {agent_id} is not a Matrix ID (@name:server); copy the connect command from the "
                 "app again")
     return ""
 
