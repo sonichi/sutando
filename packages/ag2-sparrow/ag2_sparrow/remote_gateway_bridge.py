@@ -2591,7 +2591,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
-                "platform_card")
+                "platform_card",
+                # A room question this agent is asked: one line of quoted room data (branch below).
+                "room_question")
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
@@ -5012,12 +5014,50 @@ def _withdraw_closed(t, why: str) -> None:
         _log(f"task {tid}: {why} — its untaken task file was withdrawn")
         t.put(owed_close=None)
         return
+    if t.rec.get("answer_offered"):
+        answered = t.answered_here()
+        if answered is None:
+            return                              # cannot be told: its marker stays for the next pass
+        if answered:
+            t.settle_answer(owed_close=None)    # closed by its own answer: recorded, no stop
+            return
     ctl = _new_ctl_id()
     if t.put(owed_close=None, owed_ctl={"id": ctl, "reason": why}, fence_ctl=ctl):
         _log(f"task {tid}: {why} — the core has taken it up and is asked to stop")
 
 
 _last_task_beat_at = 0.0
+
+# The fields that name the question: one a redaction would change is not the question it names.
+_QUESTION_IDENTITY = ("question_id", "expected_revision")
+
+
+def _redacted_question(question) -> "tuple[dict | None, tuple]":
+    """(the question with every string redacted, the secret types found); (None, found) when a
+    redaction would change a field that identifies it, so it is withheld whole."""
+    if not isinstance(question, dict):
+        return None, ()
+    found: set = set()
+    # Quoted room data: the vault grammar only redacts here, never intercepts or stores.
+    redact_vault = _vault_intercept_fns()[1] or _local_redact_vault_set
+
+    def clean(v):
+        if isinstance(v, str):
+            unvaulted = redact_vault(v)
+            if unvaulted != v:
+                found.add("vault-set command")
+            r = filter_chat_secrets(unvaulted)
+            found.update(r.secret_types)
+            return r.text
+        if isinstance(v, dict):
+            return {clean(k): clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+    out = clean(question)
+    if any(out.get(k) != question.get(k) for k in _QUESTION_IDENTITY):
+        return None, tuple(sorted(found))
+    return out, tuple(sorted(found))
 
 
 def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
@@ -5902,6 +5942,11 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     task = {**task, "id": tid}
     if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
         task["task_id"] = broker_tid
+    question_found: tuple = ()
+    if "room_question" in task:
+        # Sanitized before any durable writer, a held serve's saved copy included; unused when off.
+        task["room_question"], question_found = (_redacted_question(task["room_question"])
+                                                 if TURN_CONTEXT else (None, ()))
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication
         task = {**task, "id": tid}
@@ -6017,7 +6062,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # with the discord/slack/telegram bridges): a token pasted into a
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
-                _secret_types = tuple(_filtered.secret_types)
+                _secret_types = tuple(sorted(set(_secret_types) | set(_filtered.secret_types)))
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
@@ -6056,6 +6101,14 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f == "room_question":
+            question = task.get(f)
+            if question_found:
+                _secret_types = tuple(sorted(set(_secret_types) | set(question_found)))
+                _log(f"redacted pasted secret(s) in {tid} room question: {', '.join(question_found)}")
+            rq_line = task_attempts.render_room_question(question)
+            if rq_line:
+                lines.append(rq_line)
         elif f == "picker_command":
             # Present but unusable (empty OR null) reaches the parser as a
             # refused stamp; dropping it lets prose decide an unstamped action.
@@ -6084,6 +6137,13 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         if woken:
             lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
+        # An answer is an irreversible room write, which every non-owner rulebook forbids.
+        if sender_tier != "owner":
+            if task_attempts.render_room_question(task.get("room_question")):
+                lines.append(task_attempts.NOT_YOURS_TO_ANSWER_NOTE)
+        elif _ATTEMPTS is not None and task_attempts.answer_in_room_rule(broker_tid, task.get("room_question")):
+            with _ATTEMPTS.transition(broker_tid) as t:
+                lines.append(t.answer_rule(task.get("room_question")))
     # A relay-stamped Signal task may attach from ITS OWN output directory only;
     # name it here (absolute) so the marker written is the one the guard confines.
     if sender_tier == "team" and isinstance(task.get("signal"), dict):
