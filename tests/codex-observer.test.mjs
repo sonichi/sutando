@@ -90,10 +90,22 @@ test('process tree and lsof parsing', () => {
     ['/x/sessions/2026/10/06/rollout-a.jsonl']);
 });
 
+test('the record is written for the seat the observer was given', () => {
+  const o = new Observer({session: 'w1', seat: '0123456789abcdef0123456789abcdef'}, fake({}).deps);
+  assert.equal(buildRecord(o.state, o.ident, 1).seat, '0123456789abcdef0123456789abcdef');
+  assert.equal(buildRecord(newState(), {observerId: 'x', startedAt: 1, session: 's'}, 1).seat, 'core', 'unset: the core');
+  const base = ['--engine', '/e', '--tmux-socket', '/s', '--session', 'w1'];
+  assert.equal(parseArgs(base).seat, 'core');
+  assert.equal(parseArgs([...base, '--seat', '0123456789abcdef0123456789abcdef']).seat, '0123456789abcdef0123456789abcdef');
+  for (const bad of ['worker', '0123', 'CORE', '0123456789abcdef0123456789abcdeg']) {
+    assert.throws(() => parseArgs([...base, '--seat', bad]), /bad --seat/, bad);
+  }
+});
+
 test('arguments are required', () => {
   assert.throws(() => parseArgs(['--engine', '/e']), /missing --tmux-socket/);
   assert.deepEqual(parseArgs(['--engine', '/e', '--tmux-socket', '/s', '--session', 'c']),
-    {engine: '/e', tmuxSocket: '/s', session: 'c', workspace: ''});
+    {engine: '/e', tmuxSocket: '/s', session: 'c', workspace: '', seat: 'core'});
 });
 
 function fake(files, opts = {}) {

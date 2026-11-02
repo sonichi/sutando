@@ -107,6 +107,17 @@ if ! tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
   exit 1
 fi
 
+# The worker's observer, as the core's (start-cli.sh ensure_codex_observer): its tool calls become
+# phase records for the task it is on, and its runtime record is written for this worker's seat.
+# A fresh worker session always gets a fresh observer; it exits by itself once the session is gone.
+if node_bin="$(command -v node 2>/dev/null)"; then
+  tmux -S "$SOCKET" kill-session -t "=${SESSION}-observer" 2>/dev/null || true
+  tmux -S "$SOCKET" new-session -d -s "${SESSION}-observer" \
+    "$node_bin" "$REPO/src/agent/codex/cli/codex-observer.mjs" --engine "$REPO" --tmux-socket "$SOCKET" \
+    --session "$SESSION" --workspace "$SUTANDO_WORKSPACE_DIR" --seat "$SUTANDO_INSTANCE_ID" 2>/dev/null \
+    || echo "launch-codex-worker-session: observer for $SESSION did not start; phases stay lifecycle-only" >&2
+fi
+
 if [ "$(uname -s)" = "Darwin" ]; then
   reset_timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
   if [ -f "$reset_timer" ] && ! "$WORKER_PY" "$reset_timer" ensure \
