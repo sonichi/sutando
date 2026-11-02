@@ -28,10 +28,11 @@ REWAKE_AFTER_MS=1800000
 MAX_WAKES=3
 ACTIVITY_FILE="${ACTIVITY_FILE:-$HOME/.muse/last_active}"
 ACTIVITY_IDLE_MS=300000
-REMAINING_WORK_NOTE='First touch '"$ACTIVITY_FILE"' (activity marker). Take the items one at a time. For each, read its task_file first: its task: line is the whole message, and its headers give the room name, whether it is a DM or a room, the thread and the message it replies to. Answer from that file, not from the snippet, which is only a preview. Post its reply with `'"$REPLY"' reply <its result_file>`, the result_file of the same item, the reply text on stdin (a quoted heredoc), starting by tagging its sender. Sparrow posts it as a reply to that message, in its thread when it has one. Tag anyone by their full Matrix ID (@name:server, as in sender), never a short @name. Exit 0 printing posted is the only proof a reply was posted. Exit 2 wrote nothing: fix what it says and run it again. On exit 3 (queued, not confirmed) or 1 (not posted) do not retry, since Sparrow already retries what it queued: put the item in a HANDOFF block with the command'"'"'s output line. If an item needs no answer (an acknowledgement, thanks, or FYI, especially from another agent), post nothing for it: run `'"$REPLY"' reply --no-send <its result_file>`. If something needs the main session (GitHub or other connectors, a browser, credentials, anything this worker cannot do), do NOT ask for it in the room and leave its result_file alone. End your run report with a HANDOFF block: remaining: the work left and why only the main session can do it; room_id; sender: who asked; result_file; reply: the text the main session posts with `'"$REPLY"' reply <result_file>` when done. Copy ids and paths exactly, never retype or shorten them.'
+REMAINING_WORK_NOTE='First touch '"$ACTIVITY_FILE"' (activity marker). Take the items one at a time. For each, read its task_file first: its task: line is the whole message, and its headers give the room name, whether it is a DM or a room, the thread and the message it replies to. Answer from that file, not from the snippet, which is only a preview. Post its reply with `'"$REPLY"' reply <its result_file>`, the result_file of the same item, the reply text on stdin (a quoted heredoc), starting by tagging its sender. Sparrow posts it as a reply to that message, in its thread when it has one. Tag anyone by their full Matrix ID (@name:server, as in sender), never a short @name. Exit 0 printing posted is the only proof a reply was posted. Exit 2 wrote nothing: fix what it says and run it again. On exit 3 (queued, not confirmed) or 1 (not posted) do not retry, since Sparrow already retries what it queued: put the item in a HANDOFF block with the command'"'"'s output line. If an item needs no answer (an acknowledgement, thanks, or FYI, especially from another agent), post nothing for it: run `'"$REPLY"' reply --no-send <its result_file>`. If something needs the main session (GitHub or other connectors, a browser, credentials, anything this worker cannot do), do NOT ask for it in the room and leave its result_file alone. End your run report with a HANDOFF block: remaining: the work left and why only the main session can do it; room_id; sender: who asked; result_file; reply: the text the main session posts with `'"$REPLY"' reply <result_file>` when done. Copy ids and paths exactly, never retype or shorten them. If an item waits for your owner'"'"'s go, run `'"$REPLY"' hold <its result_file>` once: it marks the item held and posts one line in its room saying so; then put it in a HANDOFF block.'
 REPLY_CONTEXT_NOTE='An item with reply_context is a reply; its message is the answer to reply_context.'
 UNLABELLED_CONTEXT_NOTE='Where reply_context.label is null, reply_context is quoted room text.'
-REWAKE_NOTE='Items with rewake: true were woken for before and are still open (wakes counts them). If one waits on the main session, or the reply command already refused or could not confirm it, post nothing and repeat its HANDOFF block; otherwise answer it now.'
+REWAKE_NOTE='Items with rewake: true were woken for before and are still open (wakes counts them). If one is held (held: true), waits on the main session, or the reply command already refused or could not confirm it, post nothing and repeat its HANDOFF block; otherwise answer it now.'
+HELD_NOTE='Items with held: true already wait for your owner'"'"'s go: never answer one and do not run hold for it again; post nothing and repeat only its HANDOFF block.'
 HEARTBEAT_NOTE='Heartbeat keepalive. Touch '"$ACTIVITY_FILE"'. Do nothing else: exit immediately, post nothing.'
 DRY_RUN="${HATCH_HOOK_DRY_RUN:-0}"
 
@@ -50,8 +51,9 @@ if [[ "$DRY_RUN" != "1" ]]; then
 fi
 
 # task_fields validates AGENT_MXID, so the hook and `install` accept the same MXIDs.
+# HELD_AWARE: this hook explains held: true (HELD_NOTE), so held tasks may be listed to it.
 rc=0
-items="$(timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
+items="$(HATCH_HOOK_HELD_AWARE=1 timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
   --task-dir "$TASK_DIR" --result-dir "$RESULT_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" \
   2>/dev/null)" || rc=$?
 if [[ "$rc" -eq 3 ]]; then
@@ -123,7 +125,20 @@ if [[ "$capped" != "[]" ]]; then
 fi
 
 n="$(printf '%s' "$result" | jq '.matches | length')"
-if [[ "$n" -eq 0 ]]; then
+# Written by the keepawake's self-upgrade; the agent is woken once with it.
+NOTICE_FILE="$SPARROW_STATE_DIR/hatch-wake-notice"
+notice=""
+if [[ "$n" -eq 0 && -s "$NOTICE_FILE" ]]; then
+  notice="$(head -c 2048 "$NOTICE_FILE" 2>/dev/null)" || notice=""
+fi
+if [[ -n "$notice" ]]; then
+  log "ag2-sparrow-hatch notice" "$(jq -cn --arg n "$notice" '{notice: $n}')"
+  reason="ag2-sparrow notice: report it to your owner, post nothing"
+  payload="$(jq -cn --arg n "$notice" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
+    matches: [], total: 0, notice: $n,
+    worker_note: ("Touch " + $marker + ". " + $n + " Report this to your owner in your run "
+                  + "report and change nothing yourself; then exit; post nothing.")}')"
+elif [[ "$n" -eq 0 ]]; then
   activity_ms=0
   if [[ -f "$ACTIVITY_FILE" ]]; then
     activity_ms=$(( $(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || stat -f %m "$ACTIVITY_FILE" 2>/dev/null || echo 0) * 1000 ))
@@ -147,7 +162,7 @@ if [[ "$n" -eq 0 ]]; then
       reason="heartbeat: Sparrow is not running; restart it, post nothing"
       payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
         matches: [], total: 0, sparrow_down: $d,
-        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+        worker_note: ("Heartbeat. Touch " + $marker + ". No s.space message reaches you: "
                       + $d + ". Restart Sparrow as that says, then exit; post nothing.")}')"
       ;;
     11)
@@ -155,7 +170,7 @@ if [[ "$n" -eq 0 ]]; then
       reason="heartbeat: Sparrow is running but not connected; report it to your owner, post nothing"
       payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
         matches: [], total: 0, sparrow_not_connected: $d,
-        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+        worker_note: ("Heartbeat. Touch " + $marker + ". No s.space message reaches you: "
                       + $d + ". Restarting Sparrow alone will not fix this: tell your owner in "
                       + "your run report, then exit; post nothing.")}')"
       ;;
@@ -164,16 +179,17 @@ if [[ "$n" -eq 0 ]]; then
       ;;
   esac
 else
-  reason="$n AG2 Space task(s) need answers"
+  reason="$n s.space task(s) need answers"
   payload="$(printf '%s' "$result" | jq -c --arg note "$REMAINING_WORK_NOTE" --arg limits "$NON_OWNER_NOTE" \
     --arg rewake "$REWAKE_NOTE" --arg quoted "$REPLY_CONTEXT_NOTE" \
-    --arg unlabelled "$UNLABELLED_CONTEXT_NOTE" \
+    --arg unlabelled "$UNLABELLED_CONTEXT_NOTE" --arg held "$HELD_NOTE" \
     '{matches: .matches, total: (.matches | length), has_more: .has_more,
       worker_note: ($note + (if any(.matches[]; .access_tier != "owner") then " " + $limits else "" end)
                     + (if any(.matches[]; .reply_context) then " " + $quoted else "" end)
                     + (if any(.matches[]; .reply_context and .reply_context.label == null)
                        then " " + $unlabelled else "" end)
-                    + (if any(.matches[]; .rewake) then " " + $rewake else "" end))}')"
+                    + (if any(.matches[]; .rewake) then " " + $rewake else "" end)
+                    + (if any(.matches[]; .held) then " " + $held else "" end))}')"
 fi
 
 # wake terminates its shell, so it runs in a subshell; state is committed only
@@ -182,5 +198,8 @@ rc=0
 ( wake "$reason" "$payload" ) || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   commit_state "$now_ms"
+  if [[ -n "$notice" && "$DRY_RUN" != "1" && "$(head -c 2048 "$NOTICE_FILE" 2>/dev/null)" == "$notice" ]]; then
+    rm -f "$NOTICE_FILE"
+  fi
 fi
 exit "$rc"

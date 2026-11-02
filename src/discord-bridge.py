@@ -119,6 +119,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+import gateway_sessions  # noqa: E402
 from access_store import (  # noqa: E402  — single locked writer for access.json (#3318)
     mutate_access_file,
     read_access_for_transaction,
@@ -160,7 +161,7 @@ def _is_discord_channel_id(value: str) -> bool:
 from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from result_publish import publish_text  # noqa: E402
@@ -2731,6 +2732,48 @@ async def _supervise_loop(coro_fn, name):
         await asyncio.sleep(POLL_LOOP_RESTART_SEC)
 
 
+# discord.py's DEBUG records that say why a session ended; every other DEBUG record (raw gateway
+# payloads among them, which carry message content) stays out of the log.
+GATEWAY_REASON_TEMPLATES = frozenset({
+    "Shard ID %s has sent the IDENTIFY payload.",
+    "Shard ID %s has sent the RESUME payload.",
+    "Received RECONNECT opcode.",
+    "Timed out receiving packet. Attempting a reconnect.",
+    "Websocket closed with %s, attempting a reconnect.",
+    "Websocket closed with %s, cannot reconnect.",
+    "Got a request to %s the websocket.",
+})
+GATEWAY_SESSIONS_FILE = REPO / "state" / "discord-bridge.sessions.json"
+
+
+def _gateway_reason_filter(record) -> bool:
+    import logging
+    return record.levelno >= logging.INFO or record.msg in GATEWAY_REASON_TEMPLATES
+
+
+def _log_gateway_reasons(stream=None) -> None:
+    """Send discord.py's gateway and client records to the bridge log: they alone say why a session
+    ended (close code, timeout, invalidated session, missed heartbeat)."""
+    import logging
+    handler = logging.StreamHandler(stream or sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s",
+                                           "%Y-%m-%dT%H:%M:%S"))
+    handler.addFilter(_gateway_reason_filter)
+    for name in ("discord.gateway", "discord.client"):
+        log = logging.getLogger(name)
+        log.setLevel(logging.DEBUG)
+        log.addHandler(handler)
+        # On the logger, not only this handler: any handler on it or above sees only the filtered records.
+        log.addFilter(_gateway_reason_filter)
+        log.propagate = False
+
+
+def _run_bridge() -> None:
+    _single_instance_acquire("discord-bridge")
+    _log_gateway_reasons()
+    client.run(TOKEN, log_handler=None)
+
+
 @client.event
 async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
     global _resume_count
@@ -2758,6 +2801,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
+    gateway_sessions.record(GATEWAY_SESSIONS_FILE, time.time())
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
@@ -4988,10 +5032,7 @@ async def poll_results():
                 # skipped the cleanup block at the bottom of this loop.
                 # Non-owner results are scanned before ANY marker below. The tier
                 # map dies on restart, so unknown is re-read from the task file.
-                _guard_tier = _task_tier
-                if _guard_tier == "unknown":
-                    _guard_tf = find_task_file(TASKS_DIR, task_id)
-                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                _guard_tier = resolve_route_tier(_task_tier, TASKS_DIR, task_id)
                 # A Discord channel is a human surface: the suppression is journaled
                 # under STATE_DIR and closed silently rather than posted as prose.
                 try:
@@ -6251,5 +6292,4 @@ if __name__ == "__main__":
                              "<body|--body-file PATH>")
         _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
-        _single_instance_acquire("discord-bridge")
-        client.run(TOKEN, log_handler=None)
+        _run_bridge()

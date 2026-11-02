@@ -99,32 +99,31 @@ def _run_applescript(script: str, timeout: int = 8) -> tuple[str | None, str]:
         return None, ""
 
 
-def weather_location_configured() -> bool:
-    """Are WEATHER_LAT/WEATHER_LON set for this install?
-
-    `config_get` reads the config stanza before os.environ, so an env-only
-    check answers a different question than the one get_weather() asks.
-    """
+def weather_coordinates() -> Optional[tuple[float, float]]:
+    """Return configured, valid coordinates without assuming a location."""
     from sutando_config import config_get
-    return bool(config_get("WEATHER_LAT") and config_get("WEATHER_LON"))
-
-
-def get_weather() -> str:
-    """Fetch current conditions from Open-Meteo (no key needed)."""
     try:
-        # Default to SF; override via TZ if possible
-        lat, lon = 37.77, -122.42
-        tz_result, _ = _run_applescript(
-            'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
-            timeout=3
-        )
-        # Use lat/lon from config (env legacy fallback) if set
-        from sutando_config import config_get
-        configured = weather_location_configured()
-        if configured:
-            lat = float(config_get("WEATHER_LAT"))
-            lon = float(config_get("WEATHER_LON"))
+        lat = float(config_get("WEATHER_LAT"))
+        lon = float(config_get("WEATHER_LON"))
+    except (TypeError, ValueError):
+        return None
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
 
+
+def weather_location_configured() -> bool:
+    return weather_coordinates() is not None
+
+
+def get_weather() -> Optional[str]:
+    """Fetch current conditions only for a configured location."""
+    coordinates = weather_coordinates()
+    if coordinates is None:
+        return None
+    lat, lon = coordinates
+    try:
+        from sutando_config import config_get
         unit = (config_get("WEATHER_UNIT", "fahrenheit") or "fahrenheit").strip().lower()
         if unit not in ("fahrenheit", "celsius"):
             unit = "fahrenheit"
@@ -148,9 +147,7 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        # Spoken aloud, so the label stays short and the remedy goes to the log.
-        where = "" if configured else " in San Francisco (default location)"
-        return f"{temp}{unit_symbol} and {desc}{where}, high of {high}, low of {low}{rain_note}"
+        return f"{temp}{unit_symbol} and {desc}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
@@ -746,7 +743,8 @@ def get_health_issues() -> "list[str] | None":
         return None
 
 
-def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues) -> str:
+def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues,
+               *, weather_location_known=True) -> str:
     now = datetime.now()
     hour = now.hour
     if hour < 12:
@@ -759,7 +757,9 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     parts = [f"{greeting}."]
 
     # Weather
-    if weather:
+    if not weather_location_known:
+        parts.append("What city or town should I use for your weather forecast?")
+    elif weather:
         parts.append(f"It's {weather}.")
 
     # Calendar — None means the query failed (distinct from verified empty).
@@ -822,7 +822,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     # returning [] at the time) produced a confident "Everything looks clean"
     # over two questions nobody had answered.
     if (events == [] and reminders == [] and health_issues == []
-            and not pq_line):
+            and not pq_line and weather_location_known):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -858,8 +858,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
-    if weather and not weather_location_configured():
-        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
+    location_known = weather_location_configured()
+    if not location_known:
+        print("    (location unknown; asking the owner for their city or town)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
@@ -878,7 +879,8 @@ def main():
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
-    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues)
+    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues,
+                           weather_location_known=location_known)
 
     # Write voice result
     ts = int(time.time() * 1000)

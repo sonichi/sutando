@@ -16,12 +16,16 @@ CLAUDE = (REPO / "CLAUDE.md").read_text()
 AGENTS = (REPO / "AGENTS.md").read_text()
 
 failures = []
+passed = 0
 
 
 def check(name: str, condition: bool) -> None:
+    global passed
     print(("  ok  " if condition else "  FAIL ") + name)
     if not condition:
         failures.append(name)
+    else:
+        passed += 1
 
 
 sync = subprocess.run(
@@ -46,6 +50,16 @@ check(
     "For the Claude runtime" in AGENTS
     and "For the Codex runtime" in AGENTS
     and "refresh-skill.sh` does not update Codex" in AGENTS,
+)
+
+DELEGATION_DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
+check(
+    "delegation doc names each runtime's mechanism",
+    "run_in_background: true" in DELEGATION_DOC and "`spawn_agent`" in DELEGATION_DOC,
+)
+check(
+    "CLAUDE.md and AGENTS.md pointers name the delegation doc",
+    all("docs/subagent-delegation.md" in f and "per-runtime mechanism" in f for f in (CLAUDE, AGENTS)),
 )
 
 # Execute the documented import setup from a nested, repo-contained script.
@@ -78,6 +92,27 @@ finally:
 
 check("documented vault import works from a nested script", vault_import.returncode == 0)
 
+DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
+check(
+    "anti-deferral wording stays in CLAUDE.md",
+    "not a licence to defer to a later session" in CLAUDE
+    and "Too large for your remaining context is the\nreason TO delegate" in CLAUDE,
+)
+check(
+    "heavy-work default takes the quota tier into account",
+    "with the quota tier in mind" in CLAUDE,
+)
+check(
+    "doc says the loop tiers gate the loop, not owner-requested work",
+    "gate the autonomous loop; for work the owner\n  asked for, the tier is guidance to weigh here, not a gate." in DOC,
+)
+check(
+    "heavy is defined once in the doc and CLAUDE.md points to it",
+    "single definition of \"heavy\"" in DOC
+    and "Heavy work (defined in `docs/subagent-delegation.md`)" in CLAUDE
+    and "defined in the doc" not in DOC,
+)
+
 if failures:
     if sync.returncode != 0:
         print(sync.stderr)
@@ -86,4 +121,4 @@ if failures:
     print(f"Results: {len(failures)} failed")
     raise SystemExit(1)
 
-print("Results: 5 passed")
+print(f"Results: {passed} passed")

@@ -275,6 +275,20 @@ class DesignCClaimBackend:
                 self._quarantine(src, key, "collision", str(time.time_ns()))
             return True
 
+    def release(self, token: ClaimToken) -> bool:
+        parts = token.incarnation.split(SEP)
+        if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker) \
+                or _safe_key(token.item_id) != parts[0]:
+            return False
+        key, src = parts[0], self.root / INFLIGHT / token.incarnation
+        with self._lock(key):
+            if not src.exists():
+                return False
+            # Back to the single ready slot, no attempt counted; a racing re-publish wins it.
+            if not _move(src, self._d(READY) / key) and src.exists():
+                self._quarantine(src, key, "collision", str(time.time_ns()))
+            return True
+
     def _attempts_path(self, key: str) -> Path:
         return self._d(ATTEMPTS) / key
 

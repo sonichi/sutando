@@ -58,10 +58,12 @@ class _Base(unittest.TestCase):
         def request(method, path, payload=None, **_kwargs):
             if (method, path) == ("GET", "/v1/agents"):
                 return {"agents": [{
-                    "id": "agent-test",
+                    "id": "@agent-test:example.test",
                     "owner": "@owner:example.test",
                     "owner_dm_room": "!owner:example.test",
                 }]}
+            if (method, path) == ("POST", "/v1/room") and (payload or {}).get("op") == "members":
+                return {"members": [{"user_id": "@agent-test:example.test"}, {"user_id": "@owner:example.test"}]}
             if (method, path) == ("POST", "/v1/room"):
                 self.room_posts.append(payload)
                 return {"ok": True, "event_id": "$owner-review"}
@@ -69,7 +71,7 @@ class _Base(unittest.TestCase):
             return {"ok": True}
 
         gw._req = request
-        gw._reenroll_identity = lambda: "agent-test"
+        gw._reenroll_identity = lambda: "@agent-test:example.test"
         gw._delivery_tid = lambda tid: tid
         gw._broker_tid = lambda tid: tid
         gw._log = lambda m: None

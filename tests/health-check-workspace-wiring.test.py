@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """workspace-wiring probe contract: fail on stranded data, warn on recoverable
 breaks, silent when healthy, and registered in run_all_checks()."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile

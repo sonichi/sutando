@@ -15,13 +15,14 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher; refuses before any side effect, rolls back on a launcher failure.
 - `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale.
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
-- `apply_profile_label_overrides.py` — apply an AG2 Space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
+- `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
-- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write.
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
+- `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
 - `worker_identity.py` — worker / session / incarnation records.
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
-- `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags.
+- `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
@@ -30,6 +31,55 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 ```
 
 Suites live at `tests/skills/worker-pool/`.
+
+## Managing workers: stop, retire, enable, remove
+
+Killing a worker's tmux session does not stop it: the remedy timer's next sweep
+(every 5 minutes) sees a dead session and resumes it on the same conversation.
+Use `pool_manage.py`, which records the owner's decision where the remedy, the
+sweep and the router read it. Run from the repo root; `--workspace` defaults to
+the resolved workspace. Each verb prints one JSON line; exit 0 done, 1 failed,
+2 refused (unknown or ambiguous name, `core`, the caller's own worker, a bound
+worker, or a worker that still owes work).
+
+```bash
+python3 skills/worker-pool/scripts/pool_manage.py list [--json]
+python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label> [--force]
+python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind] [--hand-off]
+python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
+python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
+```
+
+- `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
+  lock, then kills its `-watcher` supervisor, `-input` watcher and seat sessions
+  on the socket it last ran on, and closes its open run as `killed`. A paused
+  worker is not restarted by a sweep, `--resume` or `--restart`. Routing does
+  not change: bound-room and requested-worker tasks keep arriving in its inbox
+  and wait for `enable`. A worker that owes a delivery is refused unless
+  `--force`; the owed work stays its own and resumes after `enable`.
+- `retire` fences the worker first: roster state `retired`, so the router sends
+  work addressed to it to the core, and every delivery re-checks that state under
+  the folder lock the hand-off takes, so a pass that read the roster earlier cannot
+  commit a new task to it either; once `remove`d, the tombstone it leaves in the
+  roster's `removed` list keeps that fence. Then it is taken down like `stop`, then owed work
+  is handed off, then its bindings are dropped. Refused before any write while a
+  room is bound to it (unless `--unbind`) and while it owes a delivery, pending or
+  accepted (unless `--hand-off`). The hand-off (`pool_delivery.hand_off_to_core`)
+  runs once its sessions are confirmed gone and repeats until a listing under the
+  folder lock finds nothing left. It withdraws the sentinel, the `.pending` record
+  and the attribution together, so a replay is declined to the core and the
+  core's queue counts the task. A task whose result already landed is kept as the
+  worker's reply, never run again. If tmux cannot confirm the sessions gone, the
+  worker stays retired (routing closed) and paused and keeps its work: re-run
+  `retire`, or `enable` it.
+- `enable` sets a retired worker back to `live`, lifts the pause, and runs the
+  owner restart (`pool_remedy --restart`), which resumes its conversation.
+  With `--no-start` it only lifts them; the sweep's death ladder then restarts
+  the dead session like any other, after its sustained ticks.
+- `remove` drops a retired worker's roster row (same `--hand-off` rule), leaving
+  its id in the roster's `removed` list so late deliveries stay fenced. Its
+  records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
+  history.
 
 ## Codex CLI workers
 
@@ -52,7 +102,7 @@ The 32-hex `worker_id` is stable and is the roster key, delivery recipient, and
 room binding target. The roster's base `label` is a routing alias.
 `rename_worker` changes it without changing the ID.
 
-AG2 Space can set an optional `display_label` override for a worker. It appears
+s.space can set an optional `display_label` override for a worker. It appears
 in the picker, session list, pool advertisement, and human status. An exact
 full ID or `core` always selects that recipient. A unique base or display label
 can address a worker in `pool_ask --to`, room binding, and task requests; a
@@ -63,7 +113,7 @@ status uses `name (full worker_id)`, for example
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`. The `pool_ask --who`
 JSON keeps `label` as the base routing alias and adds `display_label` as the
 effective name; text adds `alias=<base label>` when the names differ. Removing
-an AG2 Space override restores the base label as the visible name.
+an s.space override restores the base label as the visible name.
 
 `apply_profile_label_overrides.py` reads the complete override map, keyed by
 full worker ID, under the roster lock. It tracks the broker snapshot in
@@ -164,7 +214,7 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
   rooms and session liveness; `(you)` marks the caller. It shows the base routing
-  alias separately when an AG2 Space display override differs.
+  alias separately when an s.space display override differs.
 - `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
   `requested_worker: <id>` (never for the core, which is the default recipient) and
   `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like

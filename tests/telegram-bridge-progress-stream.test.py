@@ -8,6 +8,12 @@ edit-rate / delete-on-done / flag-off behaviors match the Discord parity contrac
 Run: python3 tests/telegram-bridge-progress-stream.test.py
 """
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

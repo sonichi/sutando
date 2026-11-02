@@ -26,7 +26,7 @@ one that does not run this skill.
   consult as `closed_unrelayed`, and you tell the owner that the answer may not have been
   delivered (at least once: a second crash may repeat the notice). The owner's next message is a
   new task.
-- **AG2 Space origins only.** `ask` accepts only an owner task with `source: ag2space`, whose
+- **s.space origins only.** `ask` accepts only an owner task with `source: ag2space`, whose
   conversation the relay can reach with `[channel:]` and `[thread:]`. A task from another source
   is refused; answer it without consulting.
 - **Exact mxid only.** An ask is recognised only when its plain body starts with the asked
@@ -60,7 +60,7 @@ one question out to several agents.
 | `OWNER_AGENT_CONSULT_ENABLED` | `1` | `0`/`false`/`off` makes it inert. |
 
 On a desktop install prefer env overrides: the engine tree, manifest included, is replaced on
-update. In AG2 Space, give the owner's agents **Owner** access in the consult room (or Team with
+update. In s.space, give the owner's agents **Owner** access in the consult room (or Team with
 Agent Native **Collaborator access**); with plain Team access the asks and answers reach each
 agent on the read-only path, which cannot run `consult.py`.
 

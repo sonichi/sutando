@@ -2,6 +2,14 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+**Voice room tools** — the optional `ag2space-voice` skill reads, searches and writes
+s.space rooms through the registered MCP connection. A `no_credential` or
+`credential_refused` answer means the owner must reconnect through Connect in the app;
+say that instead of saying the room is unavailable or does not exist. This applies to
+name lookup with an empty room index as well as direct reads and writes. These credential
+failures happen before dispatch. Other write failures can still return `outcome_unknown`
+with an operation ID: do not claim nothing ran or retry automatically.
+
 **Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
 connector tools, first:
 - `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`
@@ -271,7 +279,7 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 - Setup from the chat: `skills/phone-conversation/scripts/twilio-setup.py status|numbers|buy|set-webhook` buys the number and points its webhook here; only the Twilio sign-up + card are manual (SKILL.md "Setup from the chat")
 
-**Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to AG2 Space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
+**Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to s.space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
 
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
@@ -332,7 +340,7 @@ python3 "$C" rearm                      # restart waiters of pending waits (star
 ```
 The skill's precheck hook adds a `connect-apps precheck:` line on your first touch of a task naming an
 app: which apps it needs, which are connected (from the cache), and the room kind from the task's
-`channel_kind:` header. The owner sees, switches and disconnects connected apps in AG2 Space →
+`channel_kind:` header. The owner sees, switches and disconnects connected apps in s.space →
 Settings → Integrations; `card --switch` (or `await --switch`) arms a wait that resumes only once the
 app is signed in with a new account.
 

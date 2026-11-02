@@ -102,9 +102,9 @@ and loads whichever repo it reviews.
    to tell "these are blockers" from "these are notes and I would merge it", so say which,
    and for anything short of ready, name the one thing that would change it.
    The verdict is a **recommendation, never a gate**: it does not substitute for the merge
-   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, two recorded
-   approvals). *Grounded by:* a #2824 review that listed one clarity question and two minor
-   notes and never said it was ready; the owner had to ask "do you recommend approval?".
+   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, and the approvals
+   the `main` ruleset requires). *Grounded by:* a #2824 review that listed one clarity
+   question and two minor notes and never said it was ready; the owner had to ask "do you recommend approval?".
 
 9. **A negative result is not evidence until the instrument is shown able to produce a
    positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
@@ -334,7 +334,15 @@ and loads whichever repo it reviews.
     failing checks and no standing block — visibly reviewed, actually at 0-of-2. A peer
     validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
     35 were `base=main`, so their population could not have exposed the base dependency at
-    any sample size.
+    any sample size. This evidence predates the ruleset change from two approvals to one
+    plus code-owner review. A PR is approved on `main` when GitHub reports
+    `reviewDecision: APPROVED`, which the ruleset computes. Among other things that needs the
+    required count (one, or two when `require_extra_approval_for_unattributed_changes`
+    applies), a code owner's approval for every touched path (#5143 shows a collaborator's
+    sole APPROVE with `REVIEW_REQUIRED`, because the author is the path's code owner), and no
+    standing CHANGES_REQUESTED (#5651 shows a satisfied count still reading
+    CHANGES_REQUESTED). Read the field; don't derive it. The write-access
+    half still holds, and the code-owner requirement still applies only on `main`.
 
 18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
     by count and, where available, by name, before you interpret a discrimination result.** The standard proof that a new test earns its place is: revert the
@@ -390,8 +398,10 @@ and loads whichever repo it reviews.
     opposite polarity: two-becomes-one on someone else's PR, no-decision-possible on your own.
     **And `reviewDecision` over *other* logins is a THRESHOLD, not a latest-verdict flag.** An
     active block reads `CHANGES_REQUESTED`; approvals below the repo's required count still read
-    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. One approval is not an approved
-    PR. Measured on #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
+    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. An approval count below the live
+    ruleset's required count, or missing the required code-owner approval, is not an approved
+    PR. Historical example (that era's ruleset required more than one approval): measured on
+    #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
     12:14:45Z and the field read `REVIEW_REQUIRED` at 12:16:58Z; `sonichi` APPROVED at 12:51:36Z
     and it read `APPROVED`.
     *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a

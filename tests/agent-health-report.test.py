@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent diagnostics must reach the heartbeat, including recovery and expiry."""
+"""Health diagnostics stay in structured health; work status remains independent."""
 from contextlib import ExitStack
 import importlib.util
 import json
@@ -11,7 +11,7 @@ import time
 import unittest
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
@@ -49,8 +49,75 @@ class HealthReportTests(unittest.TestCase):
     def publish(self, status):
         hc.publish_health_report([{'name': 'private name', 'status': status, 'detail': 'secret detail'}], self.state)
 
+    def test_health_never_replaces_work_fields(self):
+        for alive, condition, reason in ((False, 'abnormal', 'process-down'),
+                                          (None, 'unknown', 'unavailable'),
+                                          (True, 'healthy', None)):
+            health = {'alive': alive, 'motion': 'idle', 'condition': condition,
+                      'reason': reason, 'since': None}
+            for report in ('{', json.dumps({'version': 1, 'checked_at': time.time(),
+                                            'total': 1, 'failures': 1})):
+                with self.subTest(health=health, report=report), \
+                        patch.object(bridge, '_HEALTH_COMMAND', None), \
+                        patch.object(bridge, '_core_health', return_value=health):
+                    (self.state / 'agent-health.json').write_text(report)
+                    payload = self.heartbeat()
+                    self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
+                    expected = health if report == '{' else {**health, 'condition': 'abnormal',
+                        'reason': 'health-check', 'since': json.loads(report)['checked_at']}
+                    self.assertEqual(payload['health'], expected)
+                    self.assertIn('worker_health.v1', payload['capabilities'])
+        (self.state / 'core-status.json').unlink()
+        with patch.object(bridge, '_HEALTH_COMMAND', None), \
+                patch.object(bridge, '_core_health', return_value=health):
+            payload = self.heartbeat()
+            self.assertEqual(payload['status'], 'idle')
+            self.assertNotIn('step', payload)
+            self.assertEqual(payload['health']['reason'], 'health-check')
+
+    def test_failing_diagnostic_supplies_health_without_a_snapshot(self):
+        self.publish('down')
+        with patch.object(bridge, '_HEALTH_COMMAND', None), \
+                patch.object(bridge, '_health_snapshot', return_value=None):
+            payload = self.heartbeat()
+        health = payload['health']
+        self.assertEqual((health['alive'], health['motion'], health['condition'], health['reason']),
+                         (None, 'unknown', 'abnormal', 'health-check'))
+        self.assertEqual(bridge.health_command.validate(health), (health, None))
+        self.assertNotIn('needs_attention', health)
+        self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
+
+    def test_unusable_or_passing_diagnostics_preserve_structured_health(self):
+        health = {'alive': True, 'motion': 'moving', 'condition': 'healthy', 'reason': None, 'since': None}
+        valid = {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}
+        reports = [None, [], {}, {**valid, 'checked_at': time.time() + 60},
+                   {**valid, 'checked_at': time.time() - 3600}, {**valid, 'checked_at': float('nan')},
+                   {**valid, 'failures': 0}, {**valid, 'failures': True},
+                   {**valid, 'failures': 2}, {**valid, 'total': 0}]
+        for report in reports:
+            with self.subTest(report=report):
+                (self.state / 'agent-health.json').write_text(json.dumps(report))
+                self.assertEqual(bridge._diagnostic_health(health), health)
+        (self.state / 'agent-health.json').unlink()
+        self.assertEqual(bridge._diagnostic_health(health), health)
+
+    def test_injected_health_preserves_work_and_motion_contract(self):
+        command = Mock()
+        health = {'alive': False, 'motion': 'unknown', 'condition': 'abnormal',
+                  'reason': 'process-down', 'since': None}
+        command.row.return_value = health
+        self.publish('down')
+        with patch.object(bridge, '_HEALTH_COMMAND', command):
+            payload = self.heartbeat()
+        self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
+        self.assertEqual(payload['health'], {**health, 'motion': 'idle', 'reason': 'health-check',
+                         'since': json.loads((self.state / 'agent-health.json').read_text())['checked_at']})
+        self.assertEqual(command.row.return_value, health)
+
     def test_failure_and_recovery_over_http(self):
         received = []
+        health_rows = [dict(alive=True, motion='moving', condition=c, reason=r, since=None)
+                       for c, r in [('abnormal', 'process-down'), ('healthy', None)]]
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -68,34 +135,39 @@ class HealthReportTests(unittest.TestCase):
         try:
             with patch.object(bridge, 'URL', f'http://127.0.0.1:{server.server_port}'), \
                     patch.object(bridge, 'TOKEN', 'test-token'), \
-                    patch.object(bridge, '_heartbeat_retry_at', 0.0, create=True):
+                    patch.object(bridge, '_heartbeat_retry_at', 0.0, create=True), \
+                    patch.object(bridge, '_HEALTH_COMMAND', None), \
+                    patch.object(bridge, '_core_health', side_effect=health_rows):
                 for status in ('down', 'ok'):
                     self.publish(status)
                     self.assertTrue(bridge._post_heartbeat(set(), force=True))
             self.assertEqual([path for path, _ in received], ['/v1/heartbeat'] * 2)
-            self.assertEqual([payload['status'] for _, payload in received], ['error', 'running'])
+            self.assertEqual([payload['status'] for _, payload in received], ['running', 'running'])
+            self.assertEqual(received[0][1]['health']['reason'], 'health-check')
+            self.assertEqual(received[0][1]['health']['condition'], 'abnormal')
+            self.assertEqual(received[1][1]['health'], health_rows[1])
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
-    def test_failure_overrides_running_and_recovery_restores_it(self):
+    def test_failure_and_recovery_preserve_work_status(self):
         self.publish('down')
         payload = self.heartbeat()
-        self.assertEqual(payload['status'], 'error')
-        self.assertEqual(payload['step'], 'Health check: 1 failing check(s)')
-        self.assertNotIn('private', json.dumps(payload))
+        self.assertEqual(payload['status'], 'running')
+        self.assertEqual(payload['step'], 'private task')
+        self.assertNotIn('secret detail', json.dumps(payload))
         self.assertNotIn('secret', (self.state / 'agent-health.json').read_text())
         self.publish('ok')
         self.assertEqual(self.heartbeat()['status'], 'running')
 
-    def test_failure_reports_without_core_status(self):
+    def test_diagnostics_do_not_invent_work_without_core_status(self):
         (self.state / 'core-status.json').unlink()
-        self.publish('down')
-        self.assertEqual(self.heartbeat()['status'], 'error')
-        self.publish('ok')
-        # A passing report alone does not invent a positive core status.
-        self.assertNotIn(self.heartbeat().get('status'), ('idle', 'running'))
+        for status in ('down', 'ok'):
+            self.publish(status)
+            payload = self.heartbeat()
+            self.assertEqual(payload['status'], 'unknown')
+            self.assertEqual(payload['step'], 'Core liveness unavailable')
 
     def test_warnings_are_not_failures(self):
         self.publish('warn')
@@ -104,7 +176,7 @@ class HealthReportTests(unittest.TestCase):
     def test_expired_report_passes_core_status_through(self):
         # Regression: an expired report sent the literal 'unknown' over a valid core status, and
         # nothing on a desktop install reruns health-check, so the agent read 'unknown' forever.
-        old = time.time() - bridge._HEALTH_REPORT_MAX_AGE - 1
+        old = time.time() - (35 * 60) - 1
         for failures in (0, 1):
             with self.subTest(failures=failures):
                 (self.state / 'agent-health.json').write_text(json.dumps(
@@ -112,14 +184,14 @@ class HealthReportTests(unittest.TestCase):
                 payload = self.heartbeat()
                 self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
 
-    def test_fresh_report_still_decides(self):
-        for failures, expected in ((1, 'error'), (0, 'running')):
+    def test_fresh_report_does_not_replace_work(self):
+        for failures, expected in ((1, 'running'), (0, 'running')):
             with self.subTest(failures=failures):
                 (self.state / 'agent-health.json').write_text(json.dumps(
                     {'version': 1, 'checked_at': time.time(), 'total': 2, 'failures': failures}))
                 self.assertEqual(self.heartbeat()['status'], expected)
 
-    def test_future_and_invalid_reports_are_unknown(self):
+    def test_future_and_invalid_reports_preserve_work(self):
         valid = {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}
         invalid = [[], {}, None,
                    {**valid, 'checked_at': time.time() + 60}, {**valid, 'checked_at': float('nan')},
@@ -127,9 +199,9 @@ class HealthReportTests(unittest.TestCase):
         for report in invalid:
             with self.subTest(report=report):
                 (self.state / 'agent-health.json').write_text(json.dumps(report))
-                self.assertEqual(self.heartbeat().get('status'), 'unknown')
+                self.assertEqual(self.heartbeat().get('status'), 'running')
         (self.state / 'agent-health.json').write_text('{')
-        self.assertEqual(self.heartbeat().get('status'), 'unknown')
+        self.assertEqual(self.heartbeat().get('status'), 'running')
 
     def test_invalid_diagnostics_do_not_hide_explicit_core_failure(self):
         (self.state / 'agent-health.json').write_text('{')
@@ -144,7 +216,7 @@ class HealthReportTests(unittest.TestCase):
         self.publish('down')
         with patch.object(hc.os, 'replace', side_effect=OSError('disk full')):
             self.publish('ok')
-        self.assertEqual(self.heartbeat()['status'], 'error')
+        self.assertEqual(self.heartbeat()['status'], 'running')
         self.assertEqual(list(self.state.glob('.agent-health-*')), [])
 
     def test_cleanup_error_never_breaks_health_check(self):
@@ -191,10 +263,10 @@ class HealthReportTests(unittest.TestCase):
                 except SystemExit as e:
                     self.assertEqual(e.code, 1)
                 publish.assert_called_once_with(checks)
-                self.assertEqual(self.heartbeat()['status'], 'error')
+                self.assertEqual(self.heartbeat()['status'], 'running')
 
 
-STALE_STATUS_AGE = getattr(bridge, '_CORE_STATUS_MAX_AGE', 3600) + 60
+STALE_STATUS_AGE = 3660
 
 
 class CoreLivenessTests(unittest.TestCase):
@@ -255,10 +327,12 @@ class CoreLivenessTests(unittest.TestCase):
                 self.write_status(status, STALE_STATUS_AGE)
                 self.assertEqual(self.heartbeat(True)['status'], status)
 
-    def test_a_fresh_failing_report_still_wins_over_the_beat(self):
+    def test_a_fresh_failing_report_does_not_replace_the_beat_status(self):
         (self.state / 'agent-health.json').write_text(json.dumps(
             {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}))
-        self.assertEqual(self.heartbeat(True)['status'], 'error')
+        payload = self.heartbeat(True)
+        self.assertEqual(payload['status'], 'idle')
+        self.assertEqual(payload['health']['reason'], 'health-check')
 
 
 class CoreStatusWrittenAtTests(unittest.TestCase):

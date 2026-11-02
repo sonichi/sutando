@@ -56,8 +56,29 @@ def state_path(workspace) -> Path:
 
 
 def is_paused(workspace, worker_id) -> bool:
-    """Only the owner writes or removes this file; nothing here ever does."""
+    """Only the owner writes or removes this file, through `set_paused`."""
     return (wi.worker_dir(workspace, worker_id) / PAUSED_MARKER).exists()
+
+
+def set_paused(workspace, worker_id, paused: bool) -> None:
+    """The owner's pause (`pool_manage.py stop` / `enable`)."""
+    marker = wi.worker_dir(workspace, worker_id) / PAUSED_MARKER
+    if paused:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def run_socket(workspace, worker_id) -> str | None:
+    """The tmux socket of the worker's open run, else of its last run; None when it never ran.
+    A wrong socket answers "no server running" for a host whose real socket is fine."""
+    runs = [r for r in wi.incarnations(workspace, worker_id) if isinstance(r, dict)]
+    open_runs = [r for r in runs if r.get("ended_at") is None]
+    for run in reversed(open_runs or runs):
+        if (run.get("tmux") or {}).get("socket"):
+            return str(run["tmux"]["socket"])
+    return None
 
 
 def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
@@ -132,7 +153,10 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
             return ps.PANE_LOGGED_OUT
         return ps.PANE_ABNORMAL
     if verdict.state == "busy":
-        return ps.PANE_WORKING if verdict.reason == "working" else ps.PANE_GATE
+        # A limit banner under the composer is status, not a dialog: a live turn above it runs.
+        if verdict.reason == "working" or (verdict.reason == "usage-limit" and cw.frame_working(text)):
+            return ps.PANE_WORKING
+        return ps.PANE_GATE
     if verdict.state in ("idle-ready", "pending"):
         return ps.PANE_IDLE
     return ps.PANE_UNKNOWN
@@ -140,7 +164,7 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
 
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
                  runner=subprocess.run) -> tuple[str | None, str | None]:
-    """(pane kind, raw frame id) of this worker's pane; (None, None) when unread."""
+    """(pane kind, frame id) of this worker's pane; (None, None) when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
         return None, None
@@ -153,7 +177,12 @@ def observe_pane(workspace, worker_id, runtime: str = "claude", *,
     if not text or not text.strip():
         return None, None
     return (classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name),
-            cw.raw_state_id(text))
+            frame_id(text))
+
+
+def frame_id(text: str) -> str:
+    """"raw:progress": the raw frame proves a frozen turn, the progress half a waiting one."""
+    return f"{cw.raw_state_id(text)}:{pane_gate.progress_id(text)}"
 
 
 def supervised_workers(workspace) -> dict:

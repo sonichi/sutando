@@ -18,7 +18,9 @@ from pathlib import Path
 from file_lock import locked_file
 from workspace_default import resolve_workspace
 
-KINDS = ("processing", "thinking", "working", "notice", "done")
+# `wedge` = stopped, the owner has to act. Written roomless (see the CLI): it stops every task this
+# seat holds, so the client shows it in whatever room the owner is in, through a dismissed drawer.
+KINDS = ("processing", "thinking", "working", "notice", "wedge", "done")
 TEXT_MAX = 160
 LIVE_ROWS = 400
 
@@ -71,16 +73,6 @@ def open_task_index(workspace: Path | None = None) -> dict:
     """The tasks the index still holds open: what the hook falls back to when a task's rows have
     rotated out of the live log but its result now exists."""
     return _load_index(index_path(workspace))
-
-
-def default_room(workspace: Path | None = None) -> str | None:
-    """The room of the owner's latest AG2 Space message; a row with no room shows only in the dock."""
-    p = (workspace or resolve_workspace()) / "state" / "last-owner-activity.json"
-    try:
-        d = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None
-    return d.get("channel_id") if d.get("channel") == "ag2space" else None
 
 
 def acks_dir(workspace: Path | None = None) -> Path:

@@ -87,7 +87,8 @@ class TestAuthPreflightGate(unittest.TestCase):
         held = list((self.ws / "state" / "pending-questions-outbox").glob("*.json"))
         self.assertEqual(len(held), 1, r.stdout + r.stderr)
         record = json.loads(held[0].read_text())
-        self.assertIn("BOOT ABORTED", record["question"]["question"])
+        self.assertEqual(record["question"]["question"],
+                         "Startup stopped on testhost: the CLI needs a login. Log in now? (remedy in the details)")
         self.assertIn("needs GUI /login on testhost", record["question"]["context"])
         proactive = list((self.ws / "results").glob("proactive-*.txt"))
         self.assertEqual(len(proactive), 1, "ask-owner queues the DM; the gate adds no second file")

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrapper for the launchd-managed ag2.space gateway bridge
+# Wrapper for the launchd-managed gateway bridge
 # (src/remote-gateway-bridge.py).
 #
 # Why a wrapper (not a bare ProgramArguments python3 call): the bridge needs
@@ -13,6 +13,9 @@
 # the launchd job tracks THIS pid and KeepAlive restarts the bridge on death —
 # the fix for the 2026-07-10 incident where the bridge died and stayed dead for
 # 3 days with nothing restarting it (mobile messages stranded in the cloud).
+#
+# Beside the bridge it keeps `src/sparrowd.py --agent-bridges` alive, the only supervisor of the
+# agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
 
 set -euo pipefail
 
@@ -37,9 +40,26 @@ fi
 # dropping an environment-provided one.
 _ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
 _ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
-    [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
-fi
+# `.env` first (policy, shell-form credentials), then the file the shared resolver
+# names as holding the token, unless the process environment supplied one.
+_load_channel_env() {
+    local dot="" tok=""
+    dot="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)" || dot=""
+    [ -n "$dot" ] && [ -f "$dot" ] && { set -a; . "$dot"; set +a; }
+    if [ -z "${_ENV_REMOTE_TASK_TOKEN}${_ENV_AG2_REMOTE_TOKEN}" ]; then
+        tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
+        [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
+    fi
+    # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
+    local v rc
+    for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
+        rc=0
+        printf '%s' "${!v:-}" | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from channel_token import clean_relay_token as c; sys.exit(0 if c(sys.stdin.read()) else 3)' "$REPO/src" 2>/dev/null || rc=$?
+        [ "$rc" -ne 3 ] || eval "$v="
+    done
+    return 0
+}
+_load_channel_env
 
 # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).
 # Default tier is "owner" for the personal-agent model (PR #2018, 2026-07-08): a
@@ -123,9 +143,38 @@ if [ -f "$MARKER" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"
 CHILD_PID=''
 STOPPING=0
+AGENTS_SUPERVISOR="$REPO/src/sparrowd.py"
+AGENTS_PID=''
+AGENTS_NEXT_START=0
+POLL_S=1
+# One agent-bridge supervisor at a time: started when none is running, relaunched
+# RESTART_DELAY after it exits (its own log says why), never while its pid is live.
+tend_agents_supervisor() {
+  if [ -n "$AGENTS_PID" ]; then
+    kill -0 "$AGENTS_PID" 2>/dev/null && return 0
+    set +e
+    wait "$AGENTS_PID"
+    local rc=$?
+    set -e
+    AGENTS_PID=''
+    echo "[gateway-bridge-wrapper] agent-bridge supervisor exited rc=$rc; relaunching in ${RESTART_DELAY}s" >&2
+    AGENTS_NEXT_START=$(( $(date +%s) + RESTART_DELAY ))
+  fi
+  [ "$(date +%s)" -ge "$AGENTS_NEXT_START" ] || return 0
+  python3 "$AGENTS_SUPERVISOR" --agent-bridges &
+  AGENTS_PID=$!
+  echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID)" >&2
+}
+stop_agents_supervisor() {
+  [ -n "$AGENTS_PID" ] || return 0
+  kill "$AGENTS_PID" 2>/dev/null || true
+  wait "$AGENTS_PID" 2>/dev/null || true
+  AGENTS_PID=''
+}
 stop_wrapper() {
   STOPPING=1
   [ -z "$CHILD_PID" ] || kill "$CHILD_PID" 2>/dev/null || true
+  [ -z "$AGENTS_PID" ] || kill "$AGENTS_PID" 2>/dev/null || true
 }
 trap stop_wrapper TERM INT HUP
 while [ "$STOPPING" = 0 ]; do
@@ -133,25 +182,63 @@ while [ "$STOPPING" = 0 ]; do
   # environment-provided values, re-read the .env, redo the legacy mapping.
   REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
   REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
-  [ -n "${_RELAY_ENV:-}" ] && [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  _load_channel_env
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
   REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
   if [ -z "$REMOTE_TASK_TOKEN" ]; then
     echo "[gateway-bridge-wrapper] token removed — nothing to relaunch; exiting cleanly." >&2
+    stop_agents_supervisor
     rm -f "$MARKER"
     exit 0
   fi
-  python3 "$REPO/src/remote-gateway-bridge.py" &
+  tend_agents_supervisor
+  # A primary move parked the legacy row: launch nothing, keep tending the agent bridges, and
+  # resume on its own once the row is unparked.
+  if python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1; then
+    [ "${_PARKED_SAID:-0}" = 1 ] || echo "[gateway-bridge-wrapper] the legacy connection is parked; waiting for unpark" >&2
+    _PARKED_SAID=1
+    rm -f "$MARKER"
+    sleep "$RESTART_DELAY" &
+    CHILD_PID=$!
+    set +e
+    wait "$CHILD_PID"
+    set -e
+    CHILD_PID=''
+    continue
+  fi
+  [ "${_PARKED_SAID:-0}" = 1 ] && { echo "[gateway-bridge-wrapper] the legacy connection is unparked; launching" >&2; date +%s > "$MARKER"; }
+  _PARKED_SAID=0
+  # Once a named row holds the primary this legacy bridge is a secondary: it must not
+  # inherit the proactive room, or two bridges post nudges. Otherwise the variable is
+  # passed through as is, unset included: the bridge reads the device env only when unset.
+  if _PRIMARY="$(python3 "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_PRIMARY" ]; then
+    REMOTE_PROACTIVE_ROOM="" python3 "$REPO/src/remote-gateway-bridge.py" &
+  else
+    python3 "$REPO/src/remote-gateway-bridge.py" &
+  fi
   CHILD_PID=$!
+  # Poll rather than `wait`: /bin/bash has no `wait -n`, and the agent-bridge
+  # supervisor must be tended while the bridge runs.
+  while kill -0 "$CHILD_PID" 2>/dev/null && [ "$STOPPING" = 0 ]; do
+    tend_agents_supervisor
+    sleep "$POLL_S"
+  done
   set +e
   wait "$CHILD_PID"
   CHILD_RC=$?
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
-  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
-  emit_restart_alert
+  # Stopped by a primary move (or stood down on it): no alert, and the loop above waits.
+  python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1 && continue
+  [ "$CHILD_RC" -eq 75 ] && { stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
+  # rc 69 is the bridge's poll-stall exit: an outage, already in its log and status file.
+  if [ "$CHILD_RC" -eq 69 ]; then
+    echo "[gateway-bridge-wrapper] bridge exited on a poll stall (rc 69); relaunching without an owner alert" >&2
+  else
+    emit_restart_alert
+  fi
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!
   set +e
@@ -159,3 +246,4 @@ while [ "$STOPPING" = 0 ]; do
   set -e
   CHILD_PID=''
 done
+stop_agents_supervisor

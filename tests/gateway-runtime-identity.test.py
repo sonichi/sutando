@@ -31,7 +31,7 @@ def check(cond, label):
 
 os.environ.setdefault("SUTANDO_TEST_MODE", "1")
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:1"
-os.environ["REMOTE_TASK_TOKEN"] = "t"
+os.environ["REMOTE_TASK_TOKEN"] = "runtime-identity-test-token"  # a token is withheld wherever it appears
 
 # ── loader injection survives the exec; sha matches the real checkout ──────
 spec = importlib.util.spec_from_file_location(

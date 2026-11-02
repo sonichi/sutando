@@ -82,10 +82,15 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(ln) if ln else b"{}"
         if self.path.startswith("/v1/room"):
             try:
-                with LOCK:
-                    STATE["room_posts"].append(json.loads(raw))
+                req = json.loads(raw)
             except ValueError:
-                pass
+                req = None
+            if isinstance(req, dict) and req.get("op") == "members":  # a membership read is not a post
+                self._json({"members": [{"user_id": "@mock-agent:example.org"}, {"user_id": "@o:example.org"}]})
+                return
+            if req is not None:
+                with LOCK:
+                    STATE["room_posts"].append(req)
         self._json({"ok": True, "event_id": "$mock"})
 
 

@@ -8,10 +8,10 @@ mkdir -p "$T/bin" "$T/cfg" "$T/state"
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 # Hang the Nth Enter before tmux takes its ticket (the sender revokes: 124) or after (125).
-if [ "${3:-}" = if-shell ] && case "${5:-}" in *"'Enter'"*) true;; *) false;; esac; then
+if [ "${1:-}" = -u ] && [ "${4:-}" = if-shell ] && case "${6:-}" in *"'Enter'"*) true;; *) false;; esac; then
   n=$(( $(grep -c -- " Enter$" "$TMUX_LOG" 2>/dev/null) + 1 ))
   [ "${TMUX_HANG_UNCLAIMED_ENTER_N:-0}" = "$n" ] && exec sleep 60
-  [ "${TMUX_HANG_CLAIMED_ENTER_N:-0}" = "$n" ] && { sh -c "$4"; exec sleep 60; }
+  [ "${TMUX_HANG_CLAIMED_ENTER_N:-0}" = "$n" ] && { sh -c "$5"; exec sleep 60; }
 fi
 . "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
