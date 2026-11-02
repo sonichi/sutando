@@ -54,6 +54,22 @@ def read(ws: Path, prompt_id: str):
     return turn if turn is None or isinstance(turn, dict) else UNKNOWN
 
 
+def open_dialog(ws: Path, task_id: str) -> "dict | None":
+    """The newest open permission dialog of an unended turn that names `task_id`: {tool, at}, or None
+    (none open, or a record that cannot be read: a reader fails to "not waiting", never to a guess)."""
+    try:
+        data = json.loads(path(ws).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    turns = data.get("turns") if isinstance(data, dict) else None
+    if not isinstance(turns, dict):
+        return None
+    found = [t["dialog"] for t in turns.values()
+             if isinstance(t, dict) and t.get("ended") is None and isinstance(t.get("dialog"), dict)
+             and isinstance(t.get("tasks"), list) and task_id in t["tasks"]]
+    return max(found, key=lambda d: d.get("at") or 0, default=None)
+
+
 def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
     """Fold one hook payload into its turn's record."""
     event, pid = payload.get("hook_event_name"), payload.get("prompt_id")

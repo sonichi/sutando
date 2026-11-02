@@ -89,6 +89,11 @@ def rules_phase(tool_name: str, tool_input) -> str:
         return "Asking someone"
     if tool_name == "Monitor":
         return "Waiting"
+    action = inp.get("action") if tool_name.startswith("mcp__") else None
+    if isinstance(action, str) and action.startswith("room.question."):
+        return "Asking someone"
+    if isinstance(action, str) and action.startswith(("room.message.", "room.commons.comments.")):
+        return "Writing a reply"
     if tool_name.startswith("mcp__") and "message" in tool_name:
         return "Writing a reply"
     if tool_name == "Bash":
@@ -725,6 +730,18 @@ def _picked_up_at(workspace, task_id: str, now: float) -> "float | None":
     return started if started and now - started <= PICKUP_WINDOW_S else None
 
 
+PERMISSION_LINE = "Waiting for your approval"
+
+
+def _open_dialog(workspace, task_id: str) -> "dict | None":
+    """The permission dialog this task's turn is parked on (turns.py), or None; never raises."""
+    try:
+        import turns
+        return turns.open_dialog(Path(workspace), task_id)
+    except Exception:  # noqa: BLE001 - the dialog is optional status, never a crash
+        return None
+
+
 def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = None,
                now: "float | None" = None) -> "dict | None":
     """{phase, line, since} saying why the task is where it is, or None for a finished or unknown
@@ -748,6 +765,12 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
                      if (t := _ts(h.get("at"))) is not None), default=now)
         return {"phase": "Delegated", "line": delegated["line"], "since": since, "waiting": {"reason": "delegated"}}
     st = latest(workspace, task_id)
+    dialog = _open_dialog(workspace, task_id)
+    if dialog is not None:
+        stepped = [_ts(r.get("at")) for r in records(workspace, task_id)]
+        at = _ts(dialog.get("at"), now)
+        if not any(t is not None and t > at for t in stepped):  # a later step means the turn moved on
+            return {"phase": "Waiting", "line": PERMISSION_LINE, "since": at, "waiting": {"reason": "permission"}}
     if st is not None:
         rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
         line = st.get("line") or st.get("step") or st["phase"]
@@ -817,10 +840,36 @@ def shareable_line(workspace, task_id: str, status: "dict | None" = None) -> "st
     return line if line in FIXED_LINES or _QUEUED.fullmatch(line) else st["phase"]
 
 
+_STEP_TASK = re.compile(r"^task-[A-Za-z0-9_~.-]{1,120}$")
+STEPS_MAX = 200
+
+
+def record_steps(workspace, raw: str) -> int:
+    """Rules records for a batch of steps another runtime observed ([{task, tool, input}], the Codex
+    observer's): each one as on_step records a hook's, with no step text. Malformed entries are
+    skipped; the count recorded, or -1 when the batch is not a JSON list."""
+    try:
+        steps = json.loads(raw)
+    except ValueError:
+        return -1
+    if not isinstance(steps, list):
+        return -1
+    done = 0
+    for st in steps[:STEPS_MAX]:
+        if not isinstance(st, dict) or not isinstance(st.get("task"), str) or not _STEP_TASK.match(st["task"]):
+            continue
+        if not isinstance(st.get("tool"), str) or not st["tool"]:
+            continue
+        inp = st.get("input") if isinstance(st.get("input"), dict) else {}
+        on_step(workspace, st["task"], st["tool"], inp, None)
+        done += 1
+    return done
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Phase word and status line for a task's live status.")
-    ap.add_argument("cmd", choices=("enrich", "latest", "status", "published"))
-    ap.add_argument("--task", required=True)
+    ap.add_argument("cmd", choices=("enrich", "latest", "status", "published", "steps"))
+    ap.add_argument("--task", help="the task (every command but steps, which reads a JSON list on stdin)")
     ap.add_argument("--workspace")
     a = ap.parse_args(argv)
     if a.workspace:
@@ -828,6 +877,10 @@ def main(argv=None) -> int:
     else:
         from workspace_default import resolve_workspace
         ws = resolve_workspace(migrate=False)
+    if a.cmd == "steps":
+        return 0 if record_steps(ws, sys.stdin.read()) >= 0 else 1
+    if not a.task:
+        ap.error("--task is required")
     if a.cmd == "enrich":
         enrich(ws, a.task)
         return 0

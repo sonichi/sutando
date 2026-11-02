@@ -141,10 +141,10 @@ _QUESTION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _HOLDER_ID_RE = re.compile(r"[A-Za-z0-9._~:-]{1,160}")
 QUESTION_DATA_MAX = 2000
 
-# 4 adds saved-serve references (`pending_serve.reserve`, `owed_reserve`): a format-3 reader refuses the
-# ledger rather than serve their debts from a legacy task-wide file. A format-3 ledger is read and upgraded.
-FORMAT = 4
-_READS = (3, FORMAT)
+# 5: held copies are redacted (v2-), so a format-4 bridge, which would save a raw copy, refuses the ledger
+# and holds every task. Formats 3 and 4 are read and upgraded.
+FORMAT = 5
+_READS = (3, 4, FORMAT)
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
