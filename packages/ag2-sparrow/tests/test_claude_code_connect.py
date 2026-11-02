@@ -34,7 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     _dirs, _Resp, AGENT, AGENT_LOCK_HOLDER, AgentRootBase, Backend, BASE, BEARER, card, cb, cli, cm, CODE,
     ConnectBase, CONTENDER, hold, hold_mod, inbox, L, launcher, PKG, ran, records, RELAY, REPLACER, SEAT_HOLDER,
-    seed_seat, SESSION_ID, shape_mod, sm, START_VERBS, SUCCESSOR_WRITER, task_io, tmux_pane_keys, TOKEN, unhold,
+    REAL_TMUX_VERSION, seed_seat, SESSION_ID, shape_mod, sm, START_VERBS, SUCCESSOR_WRITER, task_io, tmux_pane_keys,
+    TOKEN, unhold,
     UNPUBLISHED,
 )
 
@@ -135,7 +136,7 @@ class ConnectCode(AgentRootBase):
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-"),
                 plugin=True):
         fake = fake or self.bridged()
-        argv = ["connect", "--base", base, *code_args, *(("--plugin-dir", str(self.plugin)) if plugin else ()),
+        argv = ["connect", "--base", base, "--agent", AGENT, *code_args, *(("--plugin-dir", str(self.plugin)) if plugin else ()),
                 "--claude-config-dir",
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()
@@ -1326,16 +1327,16 @@ class ConnectCode(AgentRootBase):
 
     def test_a_202_still_redeeming_is_retried_honouring_retry_after(self):
         sleeps = []
-        backend = Backend((202, {"state": "redeeming", "retry_after": 3}), (202, {"state": "redeeming"}))
-        rc, _out, err = self.connect(backend, sleeps=sleeps)
-        self.assertEqual(rc, 0, err)
-        self.assertEqual((len(backend.calls), sleeps), (3, [3.0, 2]), "retry_after, then the backoff")
-        sleeps = []
         backend = Backend(*[(202, {"state": "redeeming", "retry_after": 999})] * 10)
         rc, _out, err = self.connect(backend, sleeps=sleeps)
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertEqual(sleeps, [cm.RETRY_AFTER_MAX_S] * len(cm.REDEEM_BACKOFF_S), "capped")
         self.assertIn("still redeeming the code; run connect again with the same code", err)
+        sleeps = []
+        backend = Backend((202, {"state": "redeeming", "retry_after": 3}), (202, {"state": "redeeming"}))
+        rc, _out, err = self.connect(backend, sleeps=sleeps)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((len(backend.calls), sleeps), (3, [3.0, 2]), "retry_after, then the backoff")
 
     def test_a_404_names_why_the_code_is_gone(self):
         for body, why in (({"error": "gone"}, "already used or has expired; make a new one"),
@@ -1369,6 +1370,106 @@ class ConnectCode(AgentRootBase):
         rc, _out, err = self.connect(backend)
         self.assert_code_unspent(backend, rc, err)
         self.assertIn("not a Claude Code plugin", err)
+
+    def off_path_tmux(self, version="3.4"):
+        """tmux only in the desktop app's engine/bin: a link (under a path with spaces) to a fake that logs
+        each argv; PATH holds no tmux and the package-manager dirs are out of reach."""
+        store = self.home / "tmux store" / ("tmux-" + version)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text('#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s.log"\necho "tmux %s"\n' % (store, version))
+        store.chmod(0o755)
+        link = self.home.joinpath(*launcher.APP_TMUX_DIR, "tmux")
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(store)
+        for p in (mock.patch.dict(os.environ, {"PATH": str(self.bin)}), mock.patch.object(launcher, "TMUX_DIRS", ()),
+                  mock.patch.object(launcher, "tmux_version", REAL_TMUX_VERSION)):
+            p.start()
+            self.addCleanup(p.stop)
+        return link, Path(str(store) + ".log")
+
+    def test_tmux_off_path_is_resolved_recorded_and_used_by_its_absolute_path_through_a_restart(self):
+        link, log = self.off_path_tmux()
+        rc, out, err = self.connect(Backend())
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(" ", str(link))
+        self.assertEqual(self.cfg()["TMUX"], str(link), "the link as named, not its target")
+        seen = []
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}), \
+                mock.patch.object(launcher.Launcher, "_serve", lambda lc: seen.append(lc.tm.tmux) or 0):
+            self.assertEqual(self.main("run")[0], 0, "the manager's restart, on launchd's PATH")
+            self.assertEqual(launcher.Launcher(cli.load_config()[0], cli.config_dir()).tm.tmux, str(link),
+                             "stop and uninstall use the same")
+            execs = []
+            with mock.patch.object(os, "execv", lambda f, argv: execs.append(f)):
+                self.main("attach")
+        self.assertEqual((seen, execs), ([str(link)], [str(link)]))
+        self.assertEqual(log.read_text().splitlines().count("-u -V"), 3, "connect, install and the restart checked it")
+
+    def test_a_missing_old_or_silent_tmux_refuses_before_the_code_is_read(self):
+        def refused(why, *extra):
+            backend, stdin = Backend(), io.StringIO(CODE + "\n")
+            rc, _out, err = self.connect(backend, None, *extra, stdin=stdin)
+            self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
+            self.assertIn(why, err)
+            self.assertIn("the code was not used", err)
+            self.assertEqual((backend.calls, stdin.read()), ([], CODE + "\n"), "no code read, none redeemed")
+            self.assertFalse(cli.config_path().exists())
+        with mock.patch.dict(os.environ, {"PATH": str(self.bin)}), mock.patch.object(launcher, "TMUX_DIRS", ()):
+            refused("tmux was not found on PATH or in ~/Library/Application Support/space.ag2.app/engine/bin")
+            refused("--tmux /nowhere/tmux is not an executable file", "--tmux", "/nowhere/tmux")
+        link, _log = self.off_path_tmux("3.1")
+        refused(f"tmux 3.1 is older than the 3.2 this adapter needs (new-session -e): {link}")
+        link.resolve().write_text("#!/bin/sh\nexec /bin/sleep 10\n")
+        with mock.patch.object(cm, "RUN_TIMEOUT_S", 1):
+            refused(f"{link} -V did not answer within 1 s")
+
+    def reconnect_stopped(self):
+        """The agent connected once, its job stopped: what a credential rotation starts from."""
+        fake = self.running_job()
+        fake.runner.stop_session()
+        return fake, (self.seat() / "token").read_bytes()
+
+    def assert_unspent(self, backend, rc, err, token, why):
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
+        self.assertIn(why, err)
+        self.assertIn("the code was not used", err)
+        self.assertEqual(backend.calls, [], "no redemption")
+        self.assertEqual((self.seat() / "token").read_bytes(), token, "the seat is unchanged")
+
+    def test_a_busy_agent_lock_refuses_a_reconnect_with_no_redemption(self):
+        fake, token = self.reconnect_stopped()
+        holder, backend = self.agent_lock_holder(), Backend()
+        rc, _out, err = self.connect(backend, fake)
+        unhold(holder)
+        self.assert_unspent(backend, rc, err, token, f"another operation on an agent is in progress (lock "
+                                                     f"{cm.agent_lock_path(self.root)})")
+
+    def test_a_held_root_refuses_a_reconnect_with_no_redemption(self):
+        fake, token = self.reconnect_stopped()
+        holder, backend = hold(self.root, "codex-local"), Backend()
+        try:
+            rc, _out, err = self.connect(backend, fake)
+        finally:
+            unhold(holder)
+        self.assert_unspent(backend, rc, err, token, f"{self.root} is held by launcher pid {holder.pid}")
+
+    def test_a_seat_that_cannot_be_written_refuses_a_reconnect_with_no_redemption(self):
+        fake, token = self.reconnect_stopped()
+        os.rename(self.seat() / "token", self.home / "token.kept")
+        os.mkfifo(self.seat() / "token")
+        backend = Backend()
+        rc, _out, err = self.connect(backend, fake)
+        self.assertEqual((rc, backend.calls), (cli.EXIT_UNUSABLE, []), err)
+        self.assertIn("cannot be written (", err)
+        self.assertIn("the code was not used", err)
+
+    def test_on_a_fresh_host_any_agent_operation_in_progress_refuses_with_no_redemption(self):
+        holder, backend = self.agent_lock_holder(), Backend()
+        rc, _out, err = self.connect(backend)
+        unhold(holder)
+        self.assertEqual((rc, backend.calls), (cli.EXIT_UNUSABLE, []), err)
+        self.assertIn(f"another operation on an agent is in progress (lock {cm.agent_lock_path(self.root)})", err)
+        self.assertFalse(cli.config_path().exists())
 
     def test_under_a_host_supervisor_connect_declares_the_seat_with_no_vault_key(self):
         backend = Backend()

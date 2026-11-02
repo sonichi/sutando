@@ -171,7 +171,7 @@ class InstalledWheel(unittest.TestCase):
         (fake / "systemctl").chmod(0o755)
         cenv = dict(env, PATH="%s:%s" % (fake, env["PATH"]), HOME=str(self.tmp / "chome"))
         r = subprocess.run([str(venv / "bin" / "ag2-sparrow-claude-local"), "connect", "--base", "http://127.0.0.1:9",
-                            "--code", "-"], input="acp.wheel-code\n", capture_output=True, text=True,
+                            "--agent", "@probe:ag2.space", "--code", "-"], input="acp.wheel-code\n", capture_output=True, text=True,
                            cwd=str(elsewhere), env=cenv, timeout=120)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertNotIn("not a Claude Code plugin", r.stderr)

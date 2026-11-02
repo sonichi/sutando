@@ -41,7 +41,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[2] / "src"))  # lint-workspace-resolution: allow-repo-root (engine src, not a data root)
-from file_lock import try_lock_fd, unlock_fd  # noqa: E402
+from file_lock import locked_file, try_lock_fd, unlock_fd  # noqa: E402
 
 SIDECAR = "agent-activity.phase.jsonl"
 MANIFEST = HERE.parent / "manifest.json"
@@ -89,6 +89,11 @@ def rules_phase(tool_name: str, tool_input) -> str:
         return "Asking someone"
     if tool_name == "Monitor":
         return "Waiting"
+    action = inp.get("action") if tool_name.startswith("mcp__") else None
+    if isinstance(action, str) and action.startswith("room.question."):
+        return "Asking someone"
+    if isinstance(action, str) and action.startswith(("room.message.", "room.commons.comments.")):
+        return "Writing a reply"
     if tool_name.startswith("mcp__") and "message" in tool_name:
         return "Writing a reply"
     if tool_name == "Bash":
@@ -234,6 +239,55 @@ def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | No
     if model_on() and _debounced(workspace, task_id):
         (spawn or _spawn)(workspace, task_id)
     return phase
+
+
+# What the task's room row shows now, besides a phase word: a step line the hook wrote.
+SHOWN_LINE = "\x00line"
+
+
+def _shown_marker(workspace, task_id: str) -> Path:
+    return _marker(workspace, task_id, "shown")
+
+
+def _record_shown(marker: Path, value: str) -> bool:
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+        tmp.write_text(value, encoding="utf-8")
+        os.replace(tmp, marker)
+        return True
+    except OSError:
+        return False
+
+
+def show_phase_if_new(workspace, task_id: str, phase: str, write_row) -> bool:
+    """Write `phase` as the task's room row through `write_row()` (True when it landed) unless the room
+    already shows it. Compare, write and record run under one non-blocking lock: a racing caller skips,
+    and a write that failed is not recorded, so the next step tries again."""
+    marker = _shown_marker(workspace, task_id)
+    with _try_locked(marker.with_name(marker.name + ".lock")) as got:
+        if not got:
+            return False
+        try:
+            if marker.read_text(encoding="utf-8") == phase:
+                return False
+        except OSError:
+            pass
+        if not write_row():
+            return False
+        _record_shown(marker, phase)
+        return True
+
+
+def note_line_shown(workspace, task_id: str) -> None:
+    """The room now shows a step line, so the task's next phase row is due whatever its phase. Waits for
+    the lock (held only across one row write): a skipped record would leave that phase suppressed."""
+    marker = _shown_marker(workspace, task_id)
+    try:
+        with locked_file(marker.with_name(marker.name + ".lock")):
+            _record_shown(marker, SHOWN_LINE)
+    except OSError:
+        pass
 
 
 def _marker_dir(workspace) -> Path:
@@ -477,7 +531,7 @@ def gemini(project: str, model: str, system: str, user: str, timeout: float = TI
                f"models/{model}:generateContent")
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 80, "responseMimeType": "application/json",
+                "generationConfig": {"maxOutputTokens": 80, "responseMimeType": "application/json",
                                      "responseSchema": SCHEMA, "thinkingConfig": {"thinkingLevel": "minimal"}}}
         def post(token: str) -> dict:
             req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
@@ -676,6 +730,18 @@ def _picked_up_at(workspace, task_id: str, now: float) -> "float | None":
     return started if started and now - started <= PICKUP_WINDOW_S else None
 
 
+PERMISSION_LINE = "Waiting for your approval"
+
+
+def _open_dialog(workspace, task_id: str) -> "dict | None":
+    """The permission dialog this task's turn is parked on (turns.py), or None; never raises."""
+    try:
+        import turns
+        return turns.open_dialog(Path(workspace), task_id)
+    except Exception:  # noqa: BLE001 - the dialog is optional status, never a crash
+        return None
+
+
 def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = None,
                now: "float | None" = None) -> "dict | None":
     """{phase, line, since} saying why the task is where it is, or None for a finished or unknown
@@ -699,6 +765,12 @@ def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = No
                      if (t := _ts(h.get("at"))) is not None), default=now)
         return {"phase": "Delegated", "line": delegated["line"], "since": since, "waiting": {"reason": "delegated"}}
     st = latest(workspace, task_id)
+    dialog = _open_dialog(workspace, task_id)
+    if dialog is not None:
+        stepped = [_ts(r.get("at")) for r in records(workspace, task_id)]
+        at = _ts(dialog.get("at"), now)
+        if not any(t is not None and t > at for t in stepped):  # a later step means the turn moved on
+            return {"phase": "Waiting", "line": PERMISSION_LINE, "since": at, "waiting": {"reason": "permission"}}
     if st is not None:
         rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
         line = st.get("line") or st.get("step") or st["phase"]
@@ -733,9 +805,10 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
     summary is the phase word or the fixed waiting line ("Queued · next"), never a step's text; with
     `share_line` it is the detail line as `shareable_line` lets it leave. The publisher adds the task's source
     message itself. None when `status_for` says nothing."""
+    import wedge_detector
     st = status_for(workspace, task_id, **kw)
     if st is None:
-        return None
+        return wedge_detector.status_for(workspace, task_id, None, now=kw.get("now"))
     waiting = st.get("waiting")
     out = {"phase": st["phase"], "summary": st["phase"], "since": st["since"]}
     if waiting:
@@ -744,7 +817,22 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
             out["summary"] = st["line"]
     if share_line:
         out["summary"] = shareable_line(workspace, task_id, st)
-    return out
+    try:
+        silence_s = float(setting("WEDGE_SILENCE_SECONDS", "180"))
+        if not math.isfinite(silence_s) or silence_s < 1:
+            silence_s = 180.0
+    except (TypeError, ValueError):
+        silence_s = 180.0
+    try:
+        tool_max_s = float(setting("WEDGE_TOOL_MAX_SECONDS", "900"))
+        if not math.isfinite(tool_max_s) or tool_max_s < 1:
+            tool_max_s = 900.0
+    except (TypeError, ValueError):
+        tool_max_s = 900.0
+    import turns
+    return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s,
+                                     active_tool=turns.has_open_tool(Path(workspace), task_id,
+                                                                     now=kw.get("now"), max_age_s=tool_max_s))
 
 
 # The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a
@@ -768,10 +856,36 @@ def shareable_line(workspace, task_id: str, status: "dict | None" = None) -> "st
     return line if line in FIXED_LINES or _QUEUED.fullmatch(line) else st["phase"]
 
 
+_STEP_TASK = re.compile(r"^task-[A-Za-z0-9_~.-]{1,120}$")
+STEPS_MAX = 200
+
+
+def record_steps(workspace, raw: str) -> int:
+    """Rules records for a batch of steps another runtime observed ([{task, tool, input}], the Codex
+    observer's): each one as on_step records a hook's, with no step text. Malformed entries are
+    skipped; the count recorded, or -1 when the batch is not a JSON list."""
+    try:
+        steps = json.loads(raw)
+    except ValueError:
+        return -1
+    if not isinstance(steps, list):
+        return -1
+    done = 0
+    for st in steps[:STEPS_MAX]:
+        if not isinstance(st, dict) or not isinstance(st.get("task"), str) or not _STEP_TASK.match(st["task"]):
+            continue
+        if not isinstance(st.get("tool"), str) or not st["tool"]:
+            continue
+        inp = st.get("input") if isinstance(st.get("input"), dict) else {}
+        on_step(workspace, st["task"], st["tool"], inp, None)
+        done += 1
+    return done
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Phase word and status line for a task's live status.")
-    ap.add_argument("cmd", choices=("enrich", "latest", "status", "published"))
-    ap.add_argument("--task", required=True)
+    ap.add_argument("cmd", choices=("enrich", "latest", "status", "published", "steps"))
+    ap.add_argument("--task", help="the task (every command but steps, which reads a JSON list on stdin)")
     ap.add_argument("--workspace")
     a = ap.parse_args(argv)
     if a.workspace:
@@ -779,6 +893,10 @@ def main(argv=None) -> int:
     else:
         from workspace_default import resolve_workspace
         ws = resolve_workspace(migrate=False)
+    if a.cmd == "steps":
+        return 0 if record_steps(ws, sys.stdin.read()) >= 0 else 1
+    if not a.task:
+        ap.error("--task is required")
     if a.cmd == "enrich":
         enrich(ws, a.task)
         return 0

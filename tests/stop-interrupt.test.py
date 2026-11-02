@@ -389,7 +389,8 @@ class Turns(Base):
     def test_the_manifest_registers_the_turn_events(self):
         m = json.loads((REPO / "skills" / "agent-activity" / "manifest.json").read_text())
         self.assertEqual({h["event"] for h in m["hooks"]},
-                         {"PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit", "PermissionRequest"})
+                         {"PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop", "UserPromptSubmit",
+                          "PermissionRequest"})
 
 
 class Rulings(Base):

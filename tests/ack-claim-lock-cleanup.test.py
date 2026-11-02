@@ -84,6 +84,44 @@ def interleave(ws: Path, lock: Path):
     return during, done, calls
 
 
+def directory_unlock_handoff():
+    ws = ws_()
+    lock = released_lock(ws)
+    directory_inode = (ack_claim.claims_dir(ws) / ack_claim.DIR_LOCK).stat().st_ino
+    released, resume = threading.Event(), threading.Event()
+    real_flock = fcntl.flock
+    errors = []
+
+    def paused_unlock(fh, operation):
+        real_flock(fh, operation)
+        if (threading.current_thread().name == "handoff-publisher"
+                and operation == fcntl.LOCK_UN
+                and os.fstat(fh.fileno()).st_ino == directory_inode):
+            released.set()
+            if not resume.wait(10):
+                raise AssertionError("publisher was not resumed")
+
+    def publish():
+        try:
+            ack_claim.update(ws, KEY, "status-ack", via="late")
+        except BaseException as exc:
+            errors.append(exc)
+
+    fcntl.flock = paused_unlock
+    publisher = threading.Thread(target=publish, name="handoff-publisher")
+    try:
+        publisher.start()
+        assert released.wait(10), "publisher never released the directory lock"
+        removed = ack_claim.prune_orphan_locks(ws, lock.stat().st_mtime + 2 * RET, RET)
+        check(removed == [f"lock:{lock.stem}"] and not lock.exists(),
+              f"f) directory unlock hands cleanup an already-unlocked key ({removed})")
+    finally:
+        resume.set()
+        publisher.join(10)
+        fcntl.flock = real_flock
+    check(not publisher.is_alive() and not errors, f"f) publisher completed ({errors})")
+
+
 def main() -> int:
     ws = ws_()
     lock = released_lock(ws)
@@ -129,6 +167,7 @@ def main() -> int:
           f"CONTROL (d): without the directory lock cleanup unlinks mid-open and the publisher reopens ({len(calls)})")
 
     check((ack_claim.claims_dir(ws) / ack_claim.DIR_LOCK).exists(), "e) the directory lock is never removed")
+    directory_unlock_handoff()
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
 

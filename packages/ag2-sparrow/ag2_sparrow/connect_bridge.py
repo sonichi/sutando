@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shlex
 import sys
@@ -166,14 +167,98 @@ def served_elsewhere(agent_id: str, root: str) -> str:
     return ""
 
 
+_WRITER = re.compile(r"Written by (\S+) install;")
+
+
+def _writer(text: str) -> str:
+    m = _WRITER.search("\n".join(text.splitlines()[:2]))
+    return m.group(1) if m else ""
+
+
+def _unit_environ(text: str) -> dict:
+    """The variables a bridge unit or plist runs with, as cm.render_supervisor wrote them."""
+    if text.startswith("<?xml"):
+        try:
+            env = plistlib.loads(text.encode("utf-8")).get("EnvironmentVariables")
+        except Exception:  # noqa: BLE001 - an unparsable plist names no agent
+            return {}
+        return env if isinstance(env, dict) else {}
+    return {m.group(1): re.sub(r"\\(.)", r"\1", m.group(2)).replace("%%", "%")
+            for m in re.finditer(r'^Environment="([A-Z_][A-Z0-9_]*)=(.*)"$', text, re.M)}
+
+
+def _named(name: str, command: str) -> cm.Shape:
+    return cm.Shape(name=name, command=command, description="", cli="", min_version=(0, 0, 0), version_anchor="",
+                    version_note="", required_keys=(), config_keys=(), env_keep=(), kept="")
+
+
+def _other_bridges(local: cm.Shape, root, agent_id: str) -> dict:
+    """{adapter: (its command, its bridge mode, the agent it serves)} for each other adapter whose config or
+    bridge unit on this host names `root` or `agent_id` (root None: any agent)."""
+    def names(r, a):
+        return root is None or r == root or bool(agent_id) and a == agent_id
+    found = {}
+    for path in sorted(cm.config_path(local).parent.glob("*.conf"))[:64]:
+        text, _ = cm.file_text(path, "config")
+        try:
+            cfg = cm.read_config(path) if text else {}
+        except (OSError, ValueError):
+            cfg = {}
+        if path.stem != local.name and bridge_mode(cfg) != EXTERNAL and names(cfg.get("ROOT"), cfg.get("AGENT_ID")):
+            found[path.stem] = (_writer(text), bridge_mode(cfg), cfg.get("AGENT_ID") or cfg.get("ROOT"))
+    head, tail = cm.supervisor_path(bridge_shape(_named("*", ""))).name.split("*")
+    for path in sorted(cm.supervisor_path(bridge_shape(local)).parent.glob(f"{head}*{tail}"))[:64]:
+        name, (text, _) = path.name[len(head):-len(tail)], cm.file_text(path, "supervisor file")
+        env = _unit_environ(text or "")
+        tasks = env.get("AGENT_CONNECT_TASK_DIR", "")
+        if name != local.name and tasks and names(os.path.dirname(tasks), env.get("AGENT_MXID")):
+            found.setdefault(name, (_writer(text), UNIT, env.get("AGENT_MXID") or tasks))
+    return found
+
+
+def bridge_owner_problem(local: cm.Shape, root, agent_id: str = "") -> str:
+    """'' unless another adapter's bridge for this agent (root None: for any agent) is on this host or cannot
+    be shown gone: one agent is one bridge, whichever adapter runs it. A unit is gone once its file and job
+    are; a host supervisor's declaration is the credential owner's to read, so only its uninstall clears it."""
+    for name, (command, mode, served) in sorted(_other_bridges(local, root, agent_id).items()):
+        other = bridge_shape(_named(name, command or f"ag2-sparrow-{name}"))
+        where = cm.job_name(other) if mode == UNIT else f"declared for {mode}"
+        gone = mode == UNIT and not os.path.lexists(cm.supervisor_path(other)) and cm.manager_state(other) == "absent"
+        if not gone:
+            return (f"{served} already has a bridge, run by {name} ({where}); one agent is one bridge: run "
+                    f"{other.writer} uninstall first, then this command again")
+    return ""
+
+
+AGENT_ID_RE = re.compile(r"@[^\s:]+:\S+")
+
+
+def connect_agent_problem(agent_id) -> str:
+    """'' when connect names its agent (--agent, the agent's Matrix ID), else why: the code names its
+    agent only once redeemed, which spends it."""
+    if not agent_id:
+        return "connect needs --agent <the agent's Matrix ID>; copy the connect command from the app again"
+    if not AGENT_ID_RE.fullmatch(agent_id):
+        return (f"--agent {agent_id} is not a Matrix ID (@name:server); copy the connect command from the "
+                "app again")
+    return ""
+
+
+def agent_owner_problem(local: cm.Shape, agent_id: str) -> str:
+    """bridge_owner_problem before a code is spent, for the agent connect names and its own root: another
+    agent's bridge on this host does not refuse."""
+    root, _ = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")
+    return bridge_owner_problem(local, root, agent_id)
+
+
 def agent_root(agent_id: str) -> "tuple[str, str]":
     """(the agent's own root under the agents dir, '') or (root, why it cannot be served here)."""
     root, problem = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")
     return root, problem or served_elsewhere(agent_id, root)
 
 
-_NOT_SESSION = ("help", "base", "code", "trust_relay_host", "work", "inbox", "token_env_file", "bridge_state_dir",
-                "experimental_connect")
+_NOT_SESSION = ("help", "base", "code", "agent", "trust_relay_host", "work", "inbox", "token_env_file",
+                "bridge_state_dir", "experimental_connect")
 
 
 def session_flags(args) -> list:
@@ -235,12 +320,17 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
     return ""
 
 
-def under_agent_lock(root: str, fn) -> int:
+def under_agent_lock(root: str, fn, local: "cm.Shape | None" = None, agent_id: str = "") -> int:
     """fn() under the agent lock for `root`, so an install's local setup and its bridge wiring are one
-    operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy. The job it
-    started is settled once the lock is released (cm.settle)."""
+    operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy. With
+    `local`, the install that wires the agent's bridge, refused first while another adapter's bridge serves
+    the agent. The job it started is settled once the lock is released (cm.settle)."""
     try:
         with cm.agent_lock(root):
+            problem = bridge_owner_problem(local, root, agent_id) if local is not None else ""
+            if problem:
+                print(f"error: {problem}; nothing was changed", file=sys.stderr)
+                return cm.EXIT_UNUSABLE
             try:
                 rc = fn()
             except BaseException:
@@ -282,7 +372,7 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
         return _replaced(root, local, cm.stop_started(local, root), "")
     artifact = _bridge_artifact(cfg, bridge)
     before = _bytes(artifact)
-    problem = wire_bridge(cfg, command, bridge)
+    problem = bridge_owner_problem(local, root, cfg.get("AGENT_ID", "")) or wire_bridge(cfg, command, bridge)
     replaced = root_id is not None and cm.dir_identity(root) != root_id
     if root_id is None or not (problem or replaced):
         pending = cm.pending_start(local) if root_id is not None else None
@@ -420,21 +510,44 @@ def host_problem(command: str) -> str:
     return ""
 
 
+def known_root_problem(local: cm.Shape) -> str:
+    """What would refuse after the redemption, asked before it: the config and unit connect may not
+    change, and the root, its agent lock and its seat. The root is known now only as `local`'s recorded
+    ROOT (the only one connect's install accepts); with none, any agent operation in progress refuses."""
+    cfg, problem = cm.owned_config(local)
+    problem = problem or cm.owned_text(cm.supervisor_path(local), cm.supervisor_marker(local), "supervisor file")[1]
+    if problem:
+        return problem
+    root = (cfg or {}).get("ROOT", "")
+    busy = cm.agent_lock_busy(root) if root else cm.agent_operation_in_progress()
+    if busy:
+        return f"another operation on an agent is in progress (lock {busy}); wait for it, then try again"
+    return (cm._free_root_problem(root) or cm.seat_problem(bridge_home(root))) if root else ""
+
+
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
-                     local: cm.Shape) -> "tuple[dict | None, str]":
-    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): the code read, checked with
-    `preflight()` and refused while `local`'s job runs, both before it is spent; redeemed once; the
-    credential written to the agent's seat only while this process holds the free root and its path still
-    names it (connect_common.under_root). `root_id` is that root's identity, for install to hold to; `lock`
-    is the agent lock, taken once the root is known and held until finish_connect. The bearer never leaves
-    the seat's token file."""
-    code, problem = cm.read_code(code_arg)
-    problem = problem or cm.code_problem(base, code) or preflight() or cm.active_job_problem(local)
+                     local: cm.Shape, agent_id) -> "tuple[dict | None, str]":
+    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): `agent_id` (--agent),
+    `preflight()`, `local`'s job, agent_owner_problem and known_root_problem asked before the code is even
+    read; the code checked, then redeemed once, and refused unless it is `agent_id`'s; the credential
+    written to the agent's seat only while this process holds the free root and its path still names it
+    (connect_common.under_root). `root_id` is that root's identity, for install to hold to; `lock` is the
+    agent lock, taken once the root is known and held until finish_connect.
+    The bearer never leaves the seat's token file."""
+    agent_id = (agent_id or "").strip()
+    problem = connect_agent_problem(agent_id)
+    problem = problem or (preflight() or cm.active_job_problem(local) or agent_owner_problem(local, agent_id)
+                          or known_root_problem(local))
+    code, why = cm.read_code(code_arg) if not problem else ("", "")
+    problem = problem or why or cm.code_problem(base, code)
     if problem:
         return None, f"{problem}; the code was not used"
     redeemed, problem = cm.redeem_code(base, code)
     if problem:
         return None, problem
+    if redeemed["agent_id"] != agent_id:
+        return None, (f"the code is for {redeemed['agent_id']}, not {agent_id}; the code is spent and nothing was "
+                      "written: make a new code for the agent you meant")
     problem = cm.relay_problem(base, redeemed["relay_url"], trust_relay_host or "")
     root, problem = ("", problem) if problem else cm.canonical_root(
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
@@ -460,7 +573,8 @@ def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict,
     def act(owner):
         seat_env, why = cm.write_seat_held(owner, root, bridge_home(root), redeemed)
         return seat_env, cm.held_identity(owner), why
-    written, held = cm.under_root(local, root, act, precheck=lambda: cm.seat_problem(bridge_home(root)))
+    written, held = cm.under_root(local, root, act, precheck=lambda: bridge_owner_problem(
+        local, root, redeemed["agent_id"]) or cm.seat_problem(bridge_home(root)))
     if held:
         return {}, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
                     "make a new code in s.space once the root is free")

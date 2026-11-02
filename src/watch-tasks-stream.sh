@@ -1278,6 +1278,10 @@ fi
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 if [ "$WATCHER_ROLE" = "standby" ] && sentinel_held_by_other_watcher "$PID_FILE" "$$" "$SUTANDO_PY_BIN"; then
   echo "watch-tasks-stream: standby not stamping $PID_FILE: it names live watcher pid $(cat "$PID_FILE" 2>/dev/null)" >&2
+elif ! inbox_in_workspace "$TASKS_DIR_ABS" "$WORKSPACE_DIR" \
+     && sentinel_held_by_other_inbox "$PID_FILE" "$$" "$TASKS_DIR_ABS" "$SUTANDO_PY_BIN"; then
+  # A foreign inbox resolved to this workspace (an inherited SUTANDO_WORKSPACE_DIR): never unready its own watcher.
+  echo "watch-tasks-stream: not stamping $PID_FILE: inbox $TASKS_DIR_ABS is outside $WORKSPACE_DIR and the sentinel names live watcher pid $(cat "$PID_FILE" 2>/dev/null)" >&2
 else
   echo "$$" > "$PID_FILE"
 fi
