@@ -283,6 +283,17 @@ def _mark(cells: dict, prop: str) -> Optional[str]:
     return val if val and (tag or None) == (cells.get("host") or None) else None
 
 
+# A click claim's close leaves its token in the Recovery cell ("click:<token>@<host>") beside a
+# plain Closed mark, so a reader that predates tokens still reads the row as closed.
+CLICK_MARK = "click:"
+
+
+def click_token(cells: dict) -> Optional[str]:
+    """The click claim token this row's own host left in Recovery, or None."""
+    val = _mark(cells, "recovery") or ""
+    return val[len(CLICK_MARK):] or None if val.startswith(CLICK_MARK) else None
+
+
 def effective_status(cells: dict) -> str:
     """The owner's terminal Status wins; then the row's Closed mark; else Open."""
     closed = _mark(cells, "closed")
@@ -339,6 +350,11 @@ class RoomDbStore:
     def insert(self, q: Question, sent_line: str) -> dict:
         return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
 
+    def redeliver(self, q: Question, sent_line: str) -> None:
+        """Rewrite this row's body with a new delivery record, in one body write under `lock`."""
+        rid = self._rid(q.ask_id)
+        self._locked(lambda: self.client.set_body(DB_SCHEMA, rid, question_body(q, sent_line)))
+
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""
@@ -379,11 +395,19 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str) -> None:
-        """Record a closure made by code in the Closed cell; Status stays the owner's."""
+    def close(self, ask_id: str, to: str, require_open: bool = False, token: Optional[str] = None) -> None:
+        """Record a closure made by code in the Closed cell; Status stays the owner's.
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write.
+        `token`: the click claim closing it, left in Recovery in the same write (see CLICK_MARK)."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
+        cells = {"closed": self._tag(to), **({"recovery": self._tag(CLICK_MARK + token)} if token else {})}
+        self._guarded(ask_id, cells, expect)
+
+    def click_token_of(self, ask_id: str) -> Optional[str]:
+        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        return click_token((r or {}).get("cells") or {})
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""
@@ -426,8 +450,9 @@ class Outbox(HeldRecords):
         super().__init__(workspace)
         self.workspace = Path(workspace)
 
-    def save(self, q: Question, sent_line: str, now: Optional[float] = None) -> Path:  # type: ignore[override]
-        return super().save(q.to_dict(), sent_line, now)
+    def save(self, q: Question, sent_line: str, now: Optional[float] = None,  # type: ignore[override]
+             redeliver: bool = False) -> Path:
+        return super().save(q.to_dict(), sent_line, now, redeliver)
 
     def commit_history(self, ask_id: str) -> None:
         """The durable fact a confirmed row proves, committed before any local evidence goes."""
@@ -457,6 +482,8 @@ class Outbox(HeldRecords):
                 store.insert(q, e["sent"] or f"**Sent:** record not kept; held in the outbox since {e['saved_at']}")
                 if not store.complete(q.ask_id):
                     raise StoreError("the row is still incomplete after the replay")
+                if e.get("redeliver"):
+                    store.redeliver(q, e["sent"])  # a row born with an older record takes this one
                 self.commit_history(q.ask_id)
                 self.delete(q.ask_id)
                 flushed.append(q.ask_id)

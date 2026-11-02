@@ -821,6 +821,7 @@ describe('a result that answers several requests (the core deduped them into it)
 		const { dedupTarget } = await import('../src/skip_marker_ownership.js');
 		assert.equal(dedupTarget('[deduped: task-1791611250258]'), 'task-1791611250258');
 		assert.equal(dedupTarget('**[core: 2]**\n[deduped: task-9]'), 'task-9');
+		assert.equal(dedupTarget('[deduped: task-ag2space_dlocal~task-9c65da61713b5c635f]'), 'task-ag2space_dlocal~task-9c65da61713b5c635f');
 		assert.equal(dedupTarget('[no-send]'), null);
 		assert.equal(dedupTarget('see [deduped: task-9]'), null);
 	});

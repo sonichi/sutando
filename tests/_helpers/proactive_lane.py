@@ -33,7 +33,7 @@ class Lane:
         self.owner_dm = OWNER_DM
         self.respond = respond or (lambda payload: {"ok": True, "event_id": f"$evt{len(self.posts)}"})
 
-    def _req(self, method, path, payload=None, timeout=None):
+    def _req(self, method, path, payload=None, timeout=None, **_kw):
         if method == "POST" and path == "/v1/room" and (payload or {}).get("op") == "message":
             self.posts.append(dict(payload))
             return self.respond(payload)

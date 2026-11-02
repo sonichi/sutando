@@ -173,4 +173,8 @@ if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
 fi
 
+# Every launch (startup.sh execs here; so does the desktop) starts the installed skills' launch
+# hooks, detached; src/launch_hooks.py names no skill, and a launch never waits on or fails for one.
+_hook_py="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)" && "$_hook_py" "$REPO/src/launch_hooks.py" || true
+
 exec bash "$launcher" "$@"

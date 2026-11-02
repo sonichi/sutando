@@ -246,9 +246,10 @@ case "$__holders" in
            && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
            && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"
-          # Never overwrite a LIVE pid: that file is another watcher's readiness,
-          # and taking it is the clobber this whole change exists to undo.
-          if [ -n "$__hprev" ] && kill -0 "$__hprev" 2>/dev/null; then
+          # Never overwrite a LIVE pid, that file is another watcher's readiness; the one
+          # exception is this inbox's standby, which never owned the session's readiness.
+          if [ -n "$__hprev" ] && kill -0 "$__hprev" 2>/dev/null \
+             && ! printf '%s\n' "$__holders" | grep -qx "$__hprev standby"; then
             echo "watch-tasks-stream: not re-stamping $__hsent: it names live pid $__hprev" >&2
           else
             mkdir -p "$(dirname "$__hsent")" 2>/dev/null || true
@@ -1275,7 +1276,15 @@ if [ "$WATCHER_ROLE" = "session" ]; then
 fi
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
-echo "$$" > "$PID_FILE"
+if [ "$WATCHER_ROLE" = "standby" ] && sentinel_held_by_other_watcher "$PID_FILE" "$$" "$SUTANDO_PY_BIN"; then
+  echo "watch-tasks-stream: standby not stamping $PID_FILE: it names live watcher pid $(cat "$PID_FILE" 2>/dev/null)" >&2
+elif ! inbox_in_workspace "$TASKS_DIR_ABS" "$WORKSPACE_DIR" \
+     && sentinel_held_by_other_inbox "$PID_FILE" "$$" "$TASKS_DIR_ABS" "$SUTANDO_PY_BIN"; then
+  # A foreign inbox resolved to this workspace (an inherited SUTANDO_WORKSPACE_DIR): never unready its own watcher.
+  echo "watch-tasks-stream: not stamping $PID_FILE: inbox $TASKS_DIR_ABS is outside $WORKSPACE_DIR and the sentinel names live watcher pid $(cat "$PID_FILE" 2>/dev/null)" >&2
+else
+  echo "$$" > "$PID_FILE"
+fi
 # The sentinel is what a waiting starter's scan will see: the lock's job is done.
 release_start_lock
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is

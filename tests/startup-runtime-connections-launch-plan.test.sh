@@ -32,6 +32,7 @@ case "$script" in
       launch) [ "$2" = notoken ] && { echo "connections: no token under AG2_REMOTE_TOKEN_NOTOKEN" >&2; exit 1; }
               printf 'REMOTE_TASK_TOKEN=%s\n' "${REMOTE_TASK_TOKEN-<unset>}" > "$FAKE_OUT/$2.env";;
       primary) [ -n "${FAKE_PRIMARY+x}" ] || exit 2; printf '%s\n' "$FAKE_PRIMARY";;
+      legacy-parked) [ "${FAKE_PARKED:-0}" = 1 ] || exit 1;;
     esac;;
   */remote-gateway-bridge.py) printf 'GATEWAY_INSTANCE=%s\nREMOTE_PROACTIVE_ROOM=%s\n' "${GATEWAY_INSTANCE-<unset>}" "${REMOTE_PROACTIVE_ROOM-<unset>}" > "$FAKE_OUT/primary.env";;
 esac
@@ -78,6 +79,14 @@ out="$(run_lanes FAKE_PRIMARY=s-space)"
 out="$(run_lanes FAKE_PRIMARY=)"
 [ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "!owner:prod.example" ] \
   && ok "an explicit legacy primary keeps the room" || bad "legacy room with legacy primary: $(cat "$OUT/primary.env")"
+
+echo "== a primary move parked the legacy row: it is not launched, the named lanes are =="
+rm -f "$OUT"/*.env "$OUT/calls"
+out="$(run_lanes FAKE_PARKED=1 FAKE_PRIMARY=s-space)"
+sleep 1
+[ ! -f "$OUT/primary.env" ] && ok "a parked legacy row is not launched" || bad "parked legacy launched: $(cat "$OUT/primary.env")"
+case "$out" in *"gateway bridge (legacy) parked"*) ok "the skip is reported";; *) bad "no parked line: $out";; esac
+grep -q "^connections launch s-space " "$OUT/calls" && ok "the named lanes still launch" || bad "no s-space launch: $(cat "$OUT/calls")"
 
 echo "== a room absent from the shell (the desktop's device env holds it) stays UNSET, never empty =="
 run_lanes_noroom() {

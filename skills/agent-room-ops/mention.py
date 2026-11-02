@@ -189,7 +189,7 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
                        reason=f"client gate denied for {agent_mxid}", posted=False)
 
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
                        reason="no gateway configured", posted=False)

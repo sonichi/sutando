@@ -8,6 +8,7 @@ import tempfile
 import importlib
 import sys
 import pathlib
+import time
 from unittest.mock import patch
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
@@ -47,6 +48,19 @@ def test_connected_then_reconnecting_preserves_last_ok():
         # no temp file left behind (atomic replace)
         assert not list(tmp.glob("gateway-status.json.*.tmp"))
         print("PASS test_connected_then_reconnecting_preserves_last_ok")
+
+def test_status_names_its_writer_and_its_sub_second_time():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        before = time.time()
+        m._emit_gateway_status(True)
+        rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+        assert rec["pid"] == os.getpid()
+        assert rec["start"] == m.agent_identity.own_start() and rec["start"]
+        assert rec["proc_start"] == m._ws_proc_start(os.getpid()) and rec["proc_start"]
+        assert isinstance(rec["written_at"], float) and before <= rec["written_at"] <= time.time()
+        assert rec["ts"] == int(rec["written_at"])
+        print("PASS test_status_names_its_writer_and_its_sub_second_time")
 
 def test_connected_without_a_poll_preserves_absent_evidence():
     with tempfile.TemporaryDirectory() as d:
@@ -133,6 +147,7 @@ def test_emitted_gateway_field_carries_no_secret():
 if __name__ == "__main__":
     test_connected_then_reconnecting_preserves_last_ok()
     test_connected_without_a_poll_preserves_absent_evidence()
+    test_status_names_its_writer_and_its_sub_second_time()
     test_only_explicit_poll_evidence_advances_last_ok()
     test_status_is_atomically_replaced()
     test_status_write_never_raises()

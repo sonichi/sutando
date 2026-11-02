@@ -64,9 +64,11 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
+from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
+import wedge_probes  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -89,6 +91,7 @@ from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
+    status_path as _gateway_lane_status_path,
     safe_num as _gateway_num,
     verdict_from_record as _gateway_verdict_from_record,
 )
@@ -573,6 +576,22 @@ def resolve_web_client_port(
     return {"port": port}
 
 
+DISCORD_FLAP_SESSIONS_PER_HOUR = 6
+
+
+def _discord_flap_detail(state_dir: Path, now: "float | None" = None) -> "str | None":
+    """The warn detail when the Discord bridge opened too many new gateway sessions in the last
+    hour, read from the record the bridge alone writes; None when it did not."""
+    import time
+    import gateway_sessions
+    now = time.time() if now is None else now
+    n = gateway_sessions.count_recent(state_dir / "discord-bridge.sessions.json", now)
+    if n < DISCORD_FLAP_SESSIONS_PER_HOUR:
+        return None
+    return (f"running but gateway flapping ({n} new sessions in the last hour; "
+            f"see the [discord.gateway] lines in its log)")
+
+
 def check_voice_stack(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -796,6 +815,44 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
             found.add(exe)
     return sorted(found)
 
+
+
+PROACTIVE_STUCK_S = 600
+
+
+def check_proactive_undelivered(results_dir: "Path | None" = None, now: "float | None" = None) -> dict:
+    """An undestined proactive message (results/proactive-*.txt with no `.to-<channel>` tag) no
+    bridge has claimed for 10 minutes: an owner message stranded silently. Destined files are
+    check_stranded_destined_proactive's; presenter mode holds every delivery on purpose. Names
+    only the count and the oldest age, never a file's content."""
+    check = {"name": "proactive-undelivered", "status": "ok", "detail": ""}
+    results_dir = WORKSPACE_DIR / "results" if results_dir is None else results_dir
+    now = time.time() if now is None else now
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
+        from proactive_routing import proactive_destination
+    except ImportError as e:
+        check["detail"] = f"could not load proactive_routing: {e} — no reading"
+        return check
+    if presenter_mode_active(results_dir.parent):
+        check["detail"] = "presenter mode active — deliveries intentionally held"
+        return check
+    try:
+        ages = [now - p.stat().st_mtime for p in results_dir.glob("proactive-*.txt")
+                if proactive_destination(p.name) is None]
+    except OSError as e:
+        check["detail"] = f"results/ not readable ({type(e).__name__}) — no reading"
+        return check
+    stuck = [a for a in ages if a >= PROACTIVE_STUCK_S]
+    if stuck:
+        check["status"] = "warn"
+        check["detail"] = (f"{len(stuck)} proactive message(s) unclaimed for over {PROACTIVE_STUCK_S // 60} min "
+                           f"(oldest {int(max(stuck) // 60)} min): no bridge is delivering them; see the bridge "
+                           "logs' 'proactive … held' / 'left for another lane' lines")
+    else:
+        check["detail"] = f"{len(ages)} pending, none older than {PROACTIVE_STUCK_S // 60} min"
+    return check
 
 
 def check_cli_wedge() -> dict:
@@ -1609,6 +1666,34 @@ def check_workspace_wiring() -> "dict | None":
         "status": status,
         "detail": f"{state}: {report['detail']} — {fix}",
     }
+
+
+def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """The periodic wakeup for decision-card clicks: a deferred click, or a handoff whose lease ran
+    out unacked, has no task left to trigger its retry, so this warns until a `clicks` pass runs."""
+    import pending_questions_reader as pq_reader  # noqa: PLC0415 — the core contract, adapter injected
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        due, _ = pq_reader.due_clicks(ws, skill_roots.declared(pq_reader.DECLARATION, ws))
+    except Exception:  # noqa: BLE001 — an unreadable store is not a click owed
+        return None
+    if not due:
+        return None
+    return {"name": "decision-card-clicks", "status": "warn",
+            "detail": (f"{len(due)} decision-card click(s) owe a pass or need attention ({', '.join(due)}) — run "
+                       "`python3 src/pending_questions_reader.py clicks` and handle its output as for a "
+                       "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
+
+
+def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when the connections record has rows but no primary, or a primary whose bridge has no
+    proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
+    import connections  # noqa: PLC0415
+    found = connections.notes(Path(workspace_dir) if workspace_dir else WORKSPACE_DIR)
+    if not found:
+        return None
+    status = "warn" if any(level == "warn" for level, _ in found) else "ok"
+    return {"name": "connections-primary", "status": status, "detail": "; ".join(text for _, text in found)}
 
 
 CURRENT_TRACK_READ_BUDGET = 32 * 1024
@@ -2885,12 +2970,17 @@ def check_hitl_archive() -> "dict | None":
     """
     name = "hitl-archive"
     try:
-        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, default_store
-        h = archive_health(default_store(WORKSPACE_DIR))
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, store_roots
+        default, *siblings = store_roots(WORKSPACE_DIR)
+        h = archive_health(default)
+        failed_elsewhere = [i for root in siblings
+                            for i in (archive_health(root) or {}).get("projection_failed", [])]
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
         return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
     if h is None:
-        return None
+        if not failed_elsewhere:
+            return None
+        h = {"live": 0, "failures": 0, "error": "", "reported": False, "stale": False}
     problems = []
     if h["stale"]:
         problems.append(f"archive status stale: not refreshed in over "
@@ -2901,6 +2991,10 @@ def check_hitl_archive() -> "dict | None":
     if h["live"] > HITL_LIVE_WARN:
         problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
                         f"each one every second")
+    failed = [*(h.get("projection_failed") or []), *failed_elsewhere]
+    if failed:
+        problems.append(f"{len(failed)} card(s) could not be projected ({', '.join(failed[:5])}): "
+                        f"the relay refused them; the gateway log names the error")
     if problems:
         return {"name": name, "status": "warn", "detail": "; ".join(problems)}
     state = "archive healthy" if h["reported"] else "no archive report yet"
@@ -3992,7 +4086,7 @@ def _default_local_notifier(msg: str) -> bool:
 # Per-bridge EXACT detail: gateway-bridge's other warns (not-serving, duplicate
 # pileup) describe a live process, so only this string may respawn one.
 GATEWAY_DOWN_DETAIL = (
-    "configured but NOT running — ag2.space mobile messages will not be delivered"
+    "configured but NOT running — gateway messages will not be delivered"
 )
 DOWN_BRIDGE_DETAILS = {
     "telegram-bridge": "configured but not running",
@@ -5779,10 +5873,14 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["detail"] = f"{len(ledger)} ledger entr(y/ies) but none carry a parsable ts"
         return check
 
+    from quota_availability import models_match  # src/ is on sys.path
     own = _own_core_model()
+    # `default` names no model, so no rejection could ever be attributed to it.
+    if own and own.strip().lower() == "default":
+        own = None
     if own:
-        mine = [p for p in dated if p[0].get("model") == own]
-        others = [p for p in dated if p[0].get("model") != own]
+        mine = [p for p in dated if models_match(own, p[0].get("model"))]
+        others = [p for p in dated if not models_match(own, p[0].get("model"))]
         attribution = f"counting model={own}"
     else:
         mine, others = dated, []
@@ -6663,21 +6761,21 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
         # half-written file caught between os.write() syscalls. Fall through
         # to ok so the next tick sees a (re-)written status.
         return {"name": name, "status": "ok", "detail": f"core-status.json unreadable: {str(e)[:60]}"}
-    state = data.get("status")
-    ts = data.get("ts")
+    state = data.get("status") if isinstance(data, dict) else None
+    ts = data.get("ts") if isinstance(data, dict) else None
     if state != "running":
         return {"name": name, "status": "ok", "detail": f"status={state}"}
-    if not isinstance(ts, (int, float)):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return {"name": name, "status": "ok", "detail": "running, no ts"}
-    age = int(time.time() - ts)
-    if age > threshold_sec:
-        step = data.get("step", "?")
+    now = time.time()
+    stale = wedge_probes.core_status_verdict(data, now, threshold_sec)  # the wedge detector's rule too
+    if stale:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"running for {age}s on '{step}' — last heartbeat > {threshold_sec}s ago",
+            "detail": f"running for {stale['age']}s on '{stale['step']}' — last heartbeat > {threshold_sec}s ago",
         }
-    return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
+    return {"name": name, "status": "ok", "detail": f"running ({int(now - ts)}s ago)"}
 
 
 def check_core_supervisor() -> dict:
@@ -6714,7 +6812,7 @@ def check_core_supervisor() -> dict:
     prompt = data.get("prompt")
     if prompt:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
-    needs_user = {"blocked-human", "logged-out"}
+    needs_user = wedge_probes.NEEDS_USER
     degraded = {"crashed", "hung", "gateway-down"}
     # `gateway-down` means "core up, relay gateway not running". On a host with no
     # gateway configured that is the DESIGNED state — startup.sh never launches the
@@ -6724,7 +6822,7 @@ def check_core_supervisor() -> dict:
     # which is how a status tool teaches its reader to skip the warn line.
     if state == "gateway-down" and not _gateway_configured():
         return {"name": name, "status": "ok",
-                "detail": "core up; ag2.space gateway not configured on this host"}
+                "detail": "core up; gateway not configured on this host"}
     if state in needs_user:
         return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
     if state in degraded:
@@ -6733,27 +6831,22 @@ def check_core_supervisor() -> dict:
 
 
 def _gateway_configured() -> bool:
-    """Is the ag2.space mobile gateway configured on this host?
+    """Is a gateway configured on this host: any enabled connection row, or the legacy relay token?
 
     `startup.sh` is deliberately silent when it is not — "a Sutando-only user
     never sees it" — so absence of the bridge is the EXPECTED state, not a fault.
     Shared by the two probes that must agree about that; they did not, which is
     the bug this helper exists to close.
     """
+    import connections  # noqa: PLC0415
+    if connections.enabled_rows(WORKSPACE_DIR):
+        return True
     try:
         if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
             return True
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        if gw_env.exists():
-            return any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                # errors="replace" is load-bearing, not cosmetic: without it a
-                # single non-UTF-8 byte raises, the except below swallows it, and a
-                # CONFIGURED gateway reads as unconfigured — which now also silences
-                # the gateway-down warn. Fail-open on a decode error is exactly the
-                # class this PR closes. (Caught in review by Sutando-Pro.)
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
+        # Which file defines the token is content, not filename, and the same
+        # owner answers it for startup and for runtime-health.
+        return channel_configured(claude_home_path("channels"), "ag2space")
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
@@ -6790,13 +6883,39 @@ def _gateway_lock_pids() -> "dict[str, str]":
     return out
 
 
+def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when every connection row is on the legacy DotSpace and none on its successor: a
+    terminal-run core is never moved by the desktop and goes silent if the legacy one goes read-only."""
+    import connections  # noqa: PLC0415
+    import dotspace  # noqa: PLC0415
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        # Read the record as it is: list_connections may import or adopt rows, a write.
+        rows = connections._read(connections.record_path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable record is reported by the connections surfaces
+        return None
+    legacy, target = dotspace.LEGACY_SERVER, dotspace.SUCCESSOR_SERVER
+    servers = {dotspace.dotspace_for(str(r.get("server") or ""), fetch=dotspace.NO_FETCH).server for r in rows}
+    if servers != {legacy}:
+        return None
+    inst = connections.instance_for(target)
+    return {"name": "sspace-migration", "status": "warn",
+            "detail": (f"only connected to {legacy}, no {target} connection — from the repo first try the "
+                       "agent's existing secret: python3 scripts/connections.py move --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (if it is refused, get a connect '
+                       f"code at {target}'s agent portal, then run: python3 scripts/connections.py add "
+                       f"'<code>' && python3 scripts/connections.py promote {inst} --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (docs/connections.md, '
+                       f'"Moving a terminal-run core to {target}"))')}
+
+
 def check_gateway_bridge() -> "dict | None":
-    """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
+    """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
     local core (and results back up).
 
     Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
-    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    AG2_REMOTE_TOKEN in env or under channels/ag2space/) — a Sutando-only user
     without the mobile gateway never sees this check. Otherwise: ``warn`` when
     configured-but-not-running (with the delivery impact spelled out) or on a
     duplicate-process pileup, ``ok`` when a single instance is running.
@@ -6883,10 +7002,10 @@ def check_gateway_bridge() -> "dict | None":
             "name": "gateway-bridge",
             "status": "warn",
             "detail": f"process running but NOT serving — {since}; "
-                      "ag2.space mobile messages are not being delivered",
+                      f"{_gateway_where()} messages are not being delivered",
         }
     if verdict is True:
-        return _gateway_ok_unless_lane_stalled("running + connected")
+        return _gateway_ok_unless_lane_stalled(_gateway_connected_detail())
     # The bridge rewrites this file on every poll outcome, so silence past the
     # freshness window means the writer stopped — evidence, not absence of it.
     stale_age = _gateway_status_stale_age_s()
@@ -6897,7 +7016,7 @@ def check_gateway_bridge() -> "dict | None":
             "detail": (
                 f"process running but its status sidecar has not been written for "
                 f"{stale_age:.0f}s (freshness window {GATEWAY_STATUS_MAX_AGE_S:.0f}s) — "
-                "the bridge is not reporting poll outcomes, so ag2.space mobile "
+                f"the bridge is not reporting poll outcomes, so {_gateway_where()} "
                 "messages may not be delivered"
             ),
         }
@@ -6907,25 +7026,70 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": ("process running but its status sidecar carries an unusable "
                        "timestamp — the writer is not reporting poll outcomes, so "
-                       "ag2.space mobile messages may not be delivered"),
+                       f"{_gateway_where()} messages may not be delivered"),
         }
     # Primary said nothing and is not merely stale, so it may not exist at all.
     # Ask the lanes before calling a live PID healthy — one of them owns it.
     lanes = _gateway_lane_verdicts()
     if lanes and not any(serving for _, serving, _ in lanes):
-        never = [ln for ln, _, ever in lanes if not ever]
+        never = [_gateway_lane_label(ln) for ln, _, ever in lanes if not ever]
         why = (f"lane {', '.join(never)} has never completed a poll" if never
-               else f"lane {', '.join(ln for ln, _, _ in lanes)} is not connected")
+               else f"lane {', '.join(_gateway_lane_label(ln) for ln, _, _ in lanes)} is not connected")
         return {
             "name": "gateway-bridge",
             "status": "warn",
             "detail": (f"process running but NOT serving — {why}; "
-                       "ag2.space mobile messages are not being delivered"),
+                       "messages on those connections are not being delivered"),
         }
     if lanes:
-        served = ", ".join(ln for ln, serving, _ in lanes if serving)
+        served = ", ".join(_gateway_lane_label(ln) for ln, serving, _ in lanes if serving)
         return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
     return _gateway_ok_unless_lane_stalled("running")
+
+
+def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
+    """Every row as stored (no sidecar read, no lease probe); [] with no connections record."""
+    import connections  # noqa: PLC0415
+    return connections.read_rows(WORKSPACE_DIR if workspace is None else workspace)
+
+
+def _gateway_primary_sidecar() -> Path:
+    """The desktop's active lane's sidecar when it exists, else the primary connection's: the
+    unsuffixed one, read legacy-aware, when no row is primary."""
+    return Path(status_read_path(_gateway_lane_status_path(WORKSPACE_DIR / "state").name, WORKSPACE_DIR))
+
+
+def _gateway_where() -> str:
+    """The primary connection's server, for a message the owner reads; "gateway" without one."""
+    import connections  # noqa: PLC0415
+    return connections.primary_server(WORKSPACE_DIR) or "gateway"
+
+
+def _gateway_connected_detail() -> str:
+    import connections  # noqa: PLC0415
+    server = connections.primary_server(WORKSPACE_DIR)
+    return f"running + connected ({server})" if server else "running + connected"
+
+
+def _gateway_lanes_not_served(state_dir: Path) -> "set[str]":
+    """Lane names a scan of `state_dir` skips: the primary's own (read as the primary) and every
+    parked or disabled row's, whose sidecar goes stale by design."""
+    import connections  # noqa: PLC0415
+    root = Path(state_dir)
+    out = set()
+    for r in _gateway_rows(root.parent if root.name == "state" else root):
+        if r.get("primary") or r.get("parked") or r.get("disabled"):
+            out.update([r["instance"], *connections.alias_instances(r)])
+    return out
+
+
+def _gateway_lane_label(lane: str, rows: "list[dict] | None" = None) -> str:
+    """`lane (server)` when a row names the lane's server, else the lane alone."""
+    import connections  # noqa: PLC0415
+    rows = _gateway_rows() if rows is None else rows
+    server = next((r["server"] for r in rows
+                   if lane in (r["instance"], *connections.alias_instances(r)) and r.get("server")), "")
+    return f"{lane} ({server})" if server else lane
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
@@ -6939,7 +7103,7 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     """Hours since the sidecar's `last_ok_ts`; None when it is absent or
     unusable, so an unknown start is never reported as a fresh one."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     try:
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
@@ -6962,7 +7126,7 @@ def check_runtime_identity(path: "Path | None" = None,
     an UNREADABLE or MALFORMED one warns — the probe's own input being
     damaged must never render as a clean pass."""
     name = "runtime-identity"
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     p = Path(p)
     if not p.exists():
         return {"name": name, "status": "ok",
@@ -7087,8 +7251,11 @@ def _gateway_lane_verdicts(state_dir: "Path | None" = None,
         entries = sorted(root.glob("gateway-status.*.json"))
     except OSError:
         return out
+    skip = _gateway_lanes_not_served(root)
     for f in entries:
         lane = f.name[len("gateway-status."):-len(".json")]
+        if lane in skip:
+            continue
         v = read_gateway_verdict(f, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
         if v is None:
             continue
@@ -7113,8 +7280,11 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
         entries = sorted(root.glob("gateway-status.*.json"))
     except OSError:
         return out
+    skip = _gateway_lanes_not_served(root)
     for f in entries:
         lane = f.name[len("gateway-status."):-len(".json")]
+        if lane in skip:
+            continue
         age = _gateway_status_stale_age_s(f, now=now)
         if age is not None:
             out.append((lane, age))
@@ -7143,7 +7313,10 @@ def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> 
     stalled = _gateway_stale_lanes()
     if not stalled:
         return {"name": "gateway-bridge", "status": "ok", "detail": detail}
+    rows = _gateway_rows()
+
     def _aged(ln, age):
+        ln = _gateway_lane_label(ln, rows)
         return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
                 else f"{ln} (last write {age / 3600:.1f}h ago)")
 
@@ -7206,7 +7379,7 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
     together with "sidecar stopped being written" — only the latter is a signal.
     """
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     try:
         ts = json.loads(Path(p).read_text()).get("ts")
@@ -7226,7 +7399,7 @@ def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
     Separate from the age helper because its caller reads None as healthy: a
     writer emitting garbage is an outage, and has no age to report.
     """
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     try:
         raw = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
@@ -7242,7 +7415,7 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
     The sidecar verdict itself is owned by gateway_serving; only the freshness
     window is this reader's."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
     return None if v is None else v.serving
@@ -9808,10 +9981,12 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
                 "detail": "no outbox root — nothing to park (this 0 is untestable)"}
     try:
         import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+        import outbox_cli  # noqa: PLC0415 - its body_gone is the requeue refusal's own rule
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
     parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
+    stranded: list[tuple[str, str, str]] = []  # QUEUED with nothing left to send
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9825,32 +10000,49 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
+            iid = str(d.get("item_id") or "?")
+            gone = d.get("item_id") and outbox_cli.body_gone(root, iid, results)
+            parked.append((root.name, iid, "body-gone" if gone else str(d.get("reason") or "")))
+        for d in outbox.list_items(root, status="QUEUED"):
+            iid = str(d.get("item_id") or "")
+            # Unclaimed and with no body anywhere: nothing will ever pick it up.
+            if iid and outbox.read_delivery_claim(root, iid) is None and outbox_cli.body_gone(root, iid, results):
+                stranded.append((root.name, iid, "queued-no-body"))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
-    if parked:
+    if parked or stranded:
         parked.sort()
+        stranded.sort()
 
         def listing(items):
             shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
                                for root_name, item_id, _reason in items[:4])
             return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
         # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        gone = [p for p in parked if p[2] == "body-gone"]
         unknown = [p for p in parked if p[2] == "outcome-unknown"]
-        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] not in ("outcome-unknown", "body-gone")]
         parts = []
+        if gone:
+            parts.append(f"{len(gone)} cannot be requeued, their body is gone (archived under "
+                         f"results/archive/) — re-send manually: {listing(gone)}")
+        if stranded:
+            parts.append(f"{len(stranded)} QUEUED with nothing to send (an earlier requeue of a "
+                         f"body-less reply) — re-send manually: {listing(stranded)}")
         if undelivered:
             parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
                          f"{listing(undelivered)}")
         if unknown:
             parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
                          f"checking the room: {listing(unknown)}")
+        recover = (f" Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                   f"(the root varies per item; a single hardcoded root under-reports)"
+                   if undelivered or unknown else "")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
-                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
-                          f"(the root varies per item; a single hardcoded root under-reports)"}
+                "detail": (f"{len(parked)} reply/replies PARKED; " if parked else "")
+                          + "; ".join(parts) + "." + recover}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
@@ -12988,6 +13180,7 @@ def run_all_checks() -> list[dict]:
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
     checks.append(check_pane_key_fence())
+    checks.append(check_proactive_undelivered())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -13026,6 +13219,14 @@ def run_all_checks() -> list[dict]:
     _wiring = check_workspace_wiring()
     if _wiring:
         checks.append(_wiring)
+
+    _card_clicks = check_decision_card_clicks()
+    if _card_clicks:
+        checks.append(_card_clicks)
+
+    _no_primary = check_connections_primary()
+    if _no_primary:
+        checks.append(_no_primary)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
@@ -13222,6 +13423,12 @@ def run_all_checks() -> list[dict]:
                 status = "warn"
                 detail = f"running but heartbeat stale ({int(hb_age)}s old)"
 
+        # Check 3b: gateway flapping. A heartbeat stays fresh through a loop of fresh sessions.
+        if name == "discord-bridge" and status == "ok":
+            flap = _discord_flap_detail(WORKSPACE_DIR / "state")
+            if flap:
+                status, detail = "warn", flap
+
         # Check 4: Stale code — process started before the source file's last
         # modification. This catches the case where a fix is on disk but the
         # running process is from a previous version (e.g., PR #203 silently
@@ -13355,6 +13562,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
@@ -13892,14 +14100,34 @@ def _gateway_owner_room(source: str = "ag2space") -> "str | None":
     a health alert can carry host/config/outage details that must never leak into
     a team room (qingyun #2487 P1-privacy). Requiring an explicit config entry
     makes the target owner-controlled and owner-only by construction; unset means
-    no gateway post at all (the Slack surface stays as the backup)."""
-    return (_env_file_dict(claude_home_path("channels", source, ".env")).get("REMOTE_ALERT_ROOM") or "").strip() or None
+    no gateway post at all (the Slack surface stays as the backup). The primary
+    connection's own channel dir is read first when the primary is a named row."""
+    for src in dict.fromkeys((_primary_channel_source(source), source)):
+        room = (_env_file_dict(claude_home_path("channels", src, ".env")).get("REMOTE_ALERT_ROOM") or "").strip()
+        if room:
+            return room
+    return None
 
 
-def _gateway_creds(source: str = "ag2space") -> "tuple[str, str] | None":
-    """(url, token) for the gateway op:message endpoint, or None. Supports the
-    one-token onboarding form (REMOTE_TASK_TOKEN='https://gw|secret') and the
-    legacy AG2_REMOTE_URL / AG2_REMOTE_TOKEN aliases honored by startup.sh."""
+def _primary_channel_source(source: str = "ag2space") -> str:
+    """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
+    import connections
+    row = connections.primary_row(WORKSPACE_DIR)
+    return connections.lane_channel_dir(row["instance"]) if row and row.get("instance") else source
+
+
+def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":
+    """(url, token) for the gateway op:message endpoint, or None. With several connections,
+    the one serving `room`'s server (no room: the primary), and None when it has none. Else
+    the one-token form (REMOTE_TASK_TOKEN='https://gw|secret') or the legacy AG2_REMOTE_* aliases."""
+    import connections
+    try:
+        routed = connections.room_credential(room, workspace=WORKSPACE_DIR)
+    except connections.ConnectionsError:  # never answered with another server's token
+        return None
+    if routed is not None:
+        url, token = routed
+        return url.rstrip("/"), connections.secret_of(token) or token.strip()
     env = _env_file_dict(claude_home_path("channels", source, ".env"))
 
     def get(key: str) -> str:
@@ -13918,7 +14146,7 @@ def _default_gateway_sender(text: str) -> bool:
     the same transport notify.py uses (POST {url}/v1/room, op:message), so it
     reaches the owner even when the core is wedged. Returns True on a 2xx."""
     room = _gateway_owner_room()
-    creds = _gateway_creds()
+    creds = _gateway_creds(room=room) if room else None
     if not room or not creds:
         return False
     url, token = creds

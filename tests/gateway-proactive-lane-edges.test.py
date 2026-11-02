@@ -139,6 +139,8 @@ def grammar() -> None:
     except ValueError:
         check(True, "a bad task id is refused")
     check(proactive_routing.about_task("proactive-1.txt") is None, "an ordinary name is about no task")
+    check(proactive_routing.about_task_ts(name) == 5 and proactive_routing.about_task_ts("proactive-1.txt") is None,
+          "an about-task name gives back its timestamp; an ordinary one none")
     check(undelivered_quarantine.canonical_result(ISO, "proactive-1").name == "proactive-1.txt"
           and undelivered_quarantine.canonical_result(ISO, "17").name == "task-17.txt",
           "the quarantine names a proactive stem as itself and a bare id as a task")

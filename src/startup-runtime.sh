@@ -455,11 +455,26 @@ reap_stale_task_watcher() {
 # Requires REPO, PY (resolved via scripts/python-binary.sh) and LOGS_DIR set
 # by the caller — same contract as every other block in startup.sh.
 start_gateway_lanes() {
-  local _RELAY_ENV
-  if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-     { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
-     || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
-    [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  local _DOT_ENV _TOKEN_ENV="" _RELAY_ENV=""
+  _DOT_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"
+  if [ -n "${PY:-}" ]; then
+    # Which file defines the credential is content, not filename: where `.env`
+    # carries another channel's creds the token lives in a sibling.
+    _TOKEN_ENV="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || _TOKEN_ENV=""
+  else
+    # Resolver unrunnable — degrade to the legacy single-file gate rather than
+    # read a configured host as unconfigured, as startup.sh's bridges do.
+    { [ -f "$_DOT_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_DOT_ENV" 2>/dev/null; } \
+      && _TOKEN_ENV="$_DOT_ENV"
+  fi
+  if [ -n "$_TOKEN_ENV" ] || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+    # `.env` is sourced whatever holds the token: it may carry channel POLICY
+    # (tier, marker) and shell-form credentials a KEY=VALUE reader cannot see.
+    [ -f "$_DOT_ENV" ] && { set -a; . "$_DOT_ENV"; set +a; }
+    if [ -n "$_TOKEN_ENV" ] && [ "$_TOKEN_ENV" != "$_DOT_ENV" ] && [ -f "$_TOKEN_ENV" ]; then
+      set -a; . "$_TOKEN_ENV"; set +a
+    fi
+    _RELAY_ENV="${_TOKEN_ENV:-$_DOT_ENV}"
     # Tell the bridge where the durable token lives so auth-rejection recovery
     # (revoked/expired key) can re-read it after the connect flow rewrites it —
     # hot-swap instead of a supervisor crash-loop. Only when the file exists:
@@ -537,7 +552,9 @@ start_gateway_lanes() {
     # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-    if [ -n "$PY" ]; then
+    if [ -n "$PY" ] && "$PY" "$REPO/scripts/connections.py" legacy-parked > /dev/null 2>&1; then
+      echo "  ⊘ gateway bridge (legacy) parked by a primary move — scripts/connections.py unpark '' to resume"
+    elif [ -n "$PY" ]; then
       # Once a named row holds the primary, the legacy bridge is a secondary: it must not
       # inherit the proactive room, or two bridges post nudges. Otherwise the variable passes
       # through as is, unset included: the bridge reads the device env only when unset.

@@ -61,6 +61,24 @@ CONFIRM_WAITS = (0.25, 0.5, 1.0, 2.0, 2.0)
 DEAD_MEMORY_LIMIT = 512
 
 
+# Answers on /v1/results that close the item: the lease ended, the task is terminal, or a
+# waiting release found no blocker left (the lease lapses and the broker re-serves).
+SETTLED_RESULT_CODES = {409: frozenset({"task_already_terminal", "stale_execution_generation",
+                                        "task_cancelled"}),
+                        400: frozenset({"waiting_input_without_blocker"})}
+
+
+def _settled_result_code(e: urllib.error.HTTPError) -> str:
+    if e.code not in SETTLED_RESULT_CODES:
+        return ""
+    try:
+        body = json.loads((e.read() or b"").decode("utf-8", "replace") or "{}")
+    except (OSError, ValueError):
+        return ""
+    code = body.get("error_code") if isinstance(body, dict) else None
+    return code if code in SETTLED_RESULT_CODES[e.code] else ""
+
+
 class AG2SpaceResultProvider:
     """``request``: ``(method, path, payload_dict) -> parsed-json dict``,
     raising urllib errors on failure — the bridge's ``_req`` signature."""
@@ -110,6 +128,12 @@ class AG2SpaceResultProvider:
         try:
             resp = self._request("POST", RESULTS_PATH, envelope) or {}
         except urllib.error.HTTPError as e:
+            settled = _settled_result_code(e)
+            if settled:
+                # The task closed or moved on server-side: nothing is left to deliver.
+                return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                                       provider_ref=f"settled:{settled}",
+                                       detail=f"broker answered {e.code} {settled}")
             # The bridge refreshes credentials through its polling loop.
             if not is_retryable_http_status(e.code, auth_recoverable=True):
                 raise ProviderPermanentRefused(

@@ -204,14 +204,15 @@ def _last_run(workspace, worker_id) -> dict:
     return runs[-1] if runs else {}
 
 
-def close_dead_runs(workspace, worker_id, closed: list | None = None) -> list:
-    """The ladder established death, so every run still open is over. Left open,
-    the next probe reads the newest of them as the worker's live run.
+def close_dead_runs(workspace, worker_id, closed: list | None = None,
+                    end_reason: str = "crashed") -> list:
+    """The ladder established death (or the owner killed it: "killed"), so every run still
+    open is over. Left open, the next probe reads the newest of them as the worker's live run.
     `closed` is appended in place, so a caller sees the partial list if a write fails."""
     closed = [] if closed is None else closed
     for run in wi.incarnations(workspace, worker_id):
         if run.get("ended_at") is None:
-            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
+            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], end_reason)
             closed.append(run["incarnation_id"])
     return closed
 

@@ -158,7 +158,7 @@ EOF
   cp "$REAL_REPO/src/claude_config_dir.sh" "$REPO_FAKE/src/"
   # Sourced by the launcher before anything else it does here.
   cp "$REAL_REPO/src/agent/restart-guard.sh" "$REPO_FAKE/src/agent/"
-  cp "$REAL_REPO/src/agent/core-runtime-record.sh" "$REPO_FAKE/src/agent/"
+  cp "$REAL_REPO/src/agent/core-runtime-record.sh" "$REAL_REPO/src/agent/core-window.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/core_runtime_record.py" "$REAL_REPO/src/result_publish.py" "$REPO_FAKE/src/"
   cp "$REAL_REPO/src/agent/task-event-handler-lookup.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"

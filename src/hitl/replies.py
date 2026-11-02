@@ -14,11 +14,12 @@ nothing. No owner configured => inert, fail-closed.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from ..local_task_protocol import reply_action_text   # the vendored package layout
@@ -95,11 +96,13 @@ class HitlReplyHandler:
     carrying the reply field; unrelated room traffic flows on untouched."""
 
     def __init__(self, manager: HitlManager, owner_mxid: Optional[str],
-                 workspace: Optional[Path] = None, log=print):
+                 workspace: Optional[Path] = None, log=print,
+                 authorize: Optional[Callable[[Dict[str, Any]], str]] = None):
         self._manager = manager
         self._owner = owner_mxid
         self._workspace = Path(workspace) if workspace is not None else None
         self._log = log
+        self._authorize = authorize
         self.last_path = None  # handler-contract compat (never promotes tasks)
         # What the most recent offer() did: applied | rejected | ignored (+ reason).
         self.last_outcome = None
@@ -137,6 +140,14 @@ class HitlReplyHandler:
             self._log("hitl: malformed action reply ignored")
             self.last_outcome = "rejected"
             self.last_reason = "malformed action payload"
+            return claimed
+        reply = dataclasses.replace(
+            reply, room=str(event.get("room_id") or ""), sender=actor)
+        reason = self._authorize(event) if self._authorize is not None else ""
+        if reason:
+            self.last_outcome = "refused"
+            self.last_reason = str(reason)
+            self._log(f"hitl: {reply.hitl_id} refused for {actor} — {reason}")
             return claimed
         try:
             action = self._manager.apply_action(reply)
@@ -200,6 +211,8 @@ class HitlReplyHandler:
             "room_id": task.get("channel_id"),
             "actor_id": str(task.get("user_id") or ""),
         }
+        if "access_tier" in task:
+            base["access_tier"] = task.get("access_tier")
         self.last_branch = None
         payload = task.get("hitl_action")
         if isinstance(payload, dict):

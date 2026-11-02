@@ -49,8 +49,8 @@ REFUSED_NOTE = "The turn is no longer frozen on the frame this card was raised f
 
 
 def manager_for(workspace):
-    from hitl.manager import HitlManager, HitlStore, default_store
-    return HitlManager(HitlStore(default_store(Path(workspace))))
+    from hitl.cards import manager_for as store_manager
+    return store_manager(Path(workspace))
 
 
 def seat_label(workspace, worker_id) -> str:
@@ -129,7 +129,8 @@ def _jump(session):
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
                manager=None) -> dict:
     """One card for this wedge episode, from the pane as it reads NOW. Types nothing."""
-    from hitl.schema import Action, HumanRequirement
+    from hitl.cards import choice_request
+    from hitl.schema import Action
     socket, session = sup._open_tmux(workspace, worker_id)
     if not socket:
         return {"worker_id": worker_id, "outcome": "no-recorded-session"}
@@ -155,31 +156,29 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         from hitl import tui_gate
         # The seat monitor's card for this limit shares the guard, so one card serves both.
         subject.update(episode=tui_gate.LIMIT_EPISODE, remind=False)
-        req = HumanRequirement(
-            kind="core-blocked", runtime=runtime, device=device, subject=subject,
-            title=f"{seat} · usage limit",
-            message=(f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
-                     + tui_gate.limit_unblock(session, runtime)),
-            guard=tui_gate.limit_guard(session), actions=[_jump(session)])
+        req = choice_request(
+            (f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
+             + tui_gate.limit_unblock(session, runtime)),
+            [_jump(session)], tui_gate.limit_guard(session), subject, runtime=runtime,
+            title=f"{seat} · usage limit", device=device, kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_HUMAN:
-        req = HumanRequirement(
-            kind="core-blocked", runtime=runtime, device=device, subject=subject,
-            title=f"{seat} · needs your decision",
-            message=(f"{seat} (tmux session {session}) owes work and is waiting at a gate "
-                     "or usage limit. Open its terminal to review the decision."),
-            guard=f"{SOURCE}:{session}:human", actions=[_jump(session)])
+        req = choice_request(
+            (f"{seat} (tmux session {session}) owes work and is waiting at a gate "
+             "or usage limit. Open its terminal to review the decision."),
+            [_jump(session)], f"{SOURCE}:{session}:human", subject, runtime=runtime,
+            title=f"{seat} · needs your decision", device=device, kind="core-blocked",
+            turn_on_action=False)
     elif which == ps.CARD_FROZEN:
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
-        req = HumanRequirement(
-            kind="confirmation", runtime=runtime, device=device, subject=subject,
-            title=f"{seat} · its turn looks frozen",
-            message=(f"{seat} (tmux session {session}) owes work and its screen has not changed "
-                     "across supervision ticks. Send Escape interrupts the turn; it is typed only "
-                     "if you press it, and only if the screen is still the same frozen frame."),
-            guard=f"{SOURCE}:{session}:frozen:{frame}",
-            actions=[Action(id=ESCAPE_ACTION, kind="confirmation", label="Send Escape"),
-                     _jump(session)])
+        req = choice_request(
+            (f"{seat} (tmux session {session}) owes work and its screen has not changed "
+             "across supervision ticks. Send Escape interrupts the turn; it is typed only "
+             "if you press it, and only if the screen is still the same frozen frame."),
+            [Action(id=ESCAPE_ACTION, kind="confirmation", label="Send Escape"), _jump(session)],
+            f"{SOURCE}:{session}:frozen:{frame}", subject, runtime=runtime,
+            title=f"{seat} · its turn looks frozen", device=device, kind="confirmation",
+            turn_on_action=False)
     else:
         abn = cw.frame_abnormal(text)
         if abn is None or (which == ps.CARD_LOGIN and pane != ps.PANE_LOGGED_OUT):
@@ -206,11 +205,10 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
                        remedy=PROXY_REMEDY if via_proxy else None)
         actions = ([Action(id=PROXY_ACTION, kind="confirmation", label="Restart the credential proxy")]
                    if via_proxy else []) + [_jump(session)]
-        req = HumanRequirement(
-            kind="choice" if via_proxy else "core-blocked", runtime=runtime, device=device,
-            subject=subject, title=f"{seat} · {abn.kind}: {cause}", message="\n".join(body),
-            guard=f"{SOURCE}:{session}:cause:{cause}", actions=actions,
-            turn_on_action=via_proxy)
+        req = choice_request(
+            "\n".join(body), actions, f"{SOURCE}:{session}:cause:{cause}", subject,
+            runtime=runtime, title=f"{seat} · {abn.kind}: {cause}", device=device,
+            kind="choice" if via_proxy else "core-blocked", turn_on_action=via_proxy)
     manager = manager or manager_for(workspace)
     made = manager.create(req)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}

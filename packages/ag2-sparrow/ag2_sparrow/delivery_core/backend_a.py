@@ -37,6 +37,7 @@ class DesignAClaimBackend:
     persists_receipt_metadata = True   # record_delivered() stores both
     persists_provider_ref = True       # ...and the provider's reference (an event id)
     records_source_digest = True       # publish(source_ready_sha256=) persists the source
+    records_lifecycle = True           # publish(lifecycle=) persists the claim the item was published under
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
@@ -55,7 +56,8 @@ class DesignAClaimBackend:
 
     def publish(self, item_id: str, payload: bytes, *,
                 republish_delivered: Optional[bool] = None,
-                source_ready_sha256: Optional[str] = None) -> bool:
+                source_ready_sha256: Optional[str] = None,
+                lifecycle: Optional[dict] = None) -> bool:
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         with outbox._item_lock(self.root, item_id):
@@ -75,6 +77,8 @@ class DesignAClaimBackend:
                 "published_at": time.time(),
                 **outbox.source_proof_fields(source_ready_sha256, text, outbox.new_publication_id()),
             }
+            if lifecycle is not None:
+                record["lifecycle"] = dict(lifecycle)
             outbox._write_item(self.root, item_id, record)
             return True
 
@@ -179,6 +183,14 @@ class DesignAClaimBackend:
             # After the transition: a crash before it keeps the mark, which parks rather than resends.
             outbox.clear_dispatching(self.root, item_id)
             return outbox._release_locked(self.root, item_id, token.worker)
+
+    def release(self, token: ClaimToken) -> bool:
+        with outbox._item_lock(self.root, token.item_id):
+            rec = outbox.read_delivery_claim(self.root, token.item_id)
+            if rec is None or rec.drainer_id != token.worker or \
+                    self._incarnation_of(token.item_id) != token.incarnation:
+                return False
+            return outbox._release_locked(self.root, token.item_id, token.worker)
 
     def park_unclaimed(self, item_id: str, reason: str, on_release=None) -> bool:
         """Park a live item no claimant holds; refused (False) once it settled or is claimed."""

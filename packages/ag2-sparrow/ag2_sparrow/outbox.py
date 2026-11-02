@@ -1074,6 +1074,26 @@ def park_item(root: Path, item_id: str, reason: str = "") -> None:
     _write_item(Path(root), item_id, d)
 
 
+def withdraw_unsent(root: Path, item_id: str, matches: Callable[[str], bool]) -> bool:
+    """Withdraw a published item whose payload `matches` and that never left: ready or queued, with no
+    delivery claim, dispatch mark or receipt. True when no such payload is left to send (withdrawn,
+    absent, refused, already delivered, or another payload); False while a send of it may be under way."""
+    root = Path(root)
+    with _item_lock(root, item_id):
+        if not _item_path(root, item_id).exists():
+            return True
+        d = _read_item(root, item_id)
+        if d.get("unreadable") or not matches(str(d.get("payload") or "")):
+            return not d.get("unreadable")
+        if d.get("status") in ("PARKED", "DELIVERED"):
+            return True                             # refused, or already out: nothing left to take back
+        if (d.get("status") not in ("READY", "QUEUED") or dispatch_unsettled(d)
+                or read_delivery_claim(root, item_id) is not None):
+            return False
+        _item_path(root, item_id).unlink()
+        return True
+
+
 def resend_epoch_for(root: Path, item_id: str) -> int:
     """The item's re-send generation. 0 until an operator requeues it.
 
@@ -1091,6 +1111,13 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     if not _item_path(Path(root), item_id).exists():
         return None
     return _read_item(Path(root), item_id)
+
+
+def effective_item_id(root: Path, item_id: str, no_send: bool) -> str:
+    """The item a result for `item_id` is delivered under: a suppressed close for an item already
+    delivered rides its own record."""
+    accepted = (read_item(root, item_id) or {}) if no_send else {}
+    return f"{item_id}.lease-close" if accepted.get("status") == "DELIVERED" else item_id
 
 
 PROOF_VERSION = 1
@@ -1237,6 +1264,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if d.get("status") != "PARKED":
             return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
+        if d.get("reason") == "outcome-unknown" or dispatch_unsettled(d):
+            d["prior_outcome_unknown"] = True  # an earlier send may be visible; never cleared
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
         d["reason"] = None

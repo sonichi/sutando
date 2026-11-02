@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -204,6 +205,114 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
     again = rs.RequestStore(old_db)
     check(again.get("approval-m1") is not None, "re-boot over migrated DB is clean")
     again.close()
+
+    # The connection is opened check_same_thread=False: a poller on another thread
+    # interleaving with writes used to corrupt reads (InterfaceError, None rows).
+    shared = rs.RequestStore(str(tmp / "threads.sqlite"))
+    errors: list = []
+    stop = threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            try:
+                shared.pending()
+            except Exception as exc:  # noqa: BLE001 - every failure is the finding
+                errors.append(repr(exc))
+
+    poller = threading.Thread(target=poll)
+    poller.start()
+    try:
+        for i in range(2000):
+            rec7 = shared.create("capability", "m", "@a:hs", {"i": i},
+                                 idempotency_key=f"t{i}")
+            if rec7 is None or not shared.transition(rec7["requestId"], "completed",
+                                                     result={"i": i}):
+                errors.append(f"write {i} lost")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(repr(exc))
+    finally:
+        stop.set()
+        poller.join()
+    check(errors == [], f"one store shared by two threads stays consistent: {errors[:3]}")
+    shared.close()
+
+    # create_consuming's insert and consume are one transaction: another thread's
+    # commit landing between them must wait, or it commits the insert alone.
+    txn_path = str(tmp / "txn.sqlite")
+    txn = rs.RequestStore(txn_path)
+    other = txn.create("capability", "m", "@a:hs", {})
+    unapproved = txn.create("approval", "approval.request", "@a:hs", {})
+    real_db, real_lock = txn._db, getattr(txn, "_lock", None)
+    seen = threading.Condition()
+    evidence: list = []  # first entry decides: only "blocked" passes
+    worker_errors: list = []
+
+    def note(what):
+        with seen:
+            evidence.append(what)
+            seen.notify_all()
+
+    class WatchedLock:
+        # A failed non-blocking try from the rival is proof the transaction holds it.
+        def __enter__(self):
+            if not real_lock.acquire(blocking=False):
+                note("blocked")
+                real_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            real_lock.release()
+
+    def rival():
+        try:
+            won = txn.transition(other["requestId"], "completed")
+        except BaseException as exc:  # noqa: BLE001 - any worker failure fails the case
+            worker_errors.append(repr(exc))
+            note("error")
+        else:
+            note("committed" if won else "lost")
+
+    rival_thread = threading.Thread(target=rival, daemon=True)
+
+    class Paused:
+        def __getattr__(self, name):
+            return getattr(real_db, name)
+
+        def execute(self, sql, *args):
+            if sql.startswith("UPDATE runtime_requests SET consumed_at"):
+                rival_thread.start()
+                with seen:
+                    if not seen.wait_for(lambda: evidence, timeout=30):
+                        evidence.append("timeout")
+            return real_db.execute(sql, *args)
+
+    txn._db = Paused()
+    if real_lock is not None:
+        txn._lock = WatchedLock()
+    lost = txn.create_consuming(unapproved["requestId"], "capability", "m", "@a:hs", {},
+                                idempotency_key="interleaved")
+    first = evidence[0] if evidence else "none"
+    rival_thread.join(30)
+    stuck = rival_thread.is_alive()
+    txn._db = real_db
+    if real_lock is not None:
+        txn._lock = real_lock
+    check(first == "blocked",
+          f"a commit from another thread mid-create_consuming waits on the store lock (saw {first})")
+    check(not stuck and worker_errors == [] and evidence[-1:] == ["committed"],
+          f"the waiting thread finishes and commits (stuck={stuck}, errors={worker_errors[:2]})")
+    durable = sqlite3.connect(txn_path)
+    try:
+        orphans = durable.execute("SELECT COUNT(*) FROM runtime_requests"
+                                  " WHERE idempotency_key = 'interleaved'").fetchone()[0]
+        landed = durable.execute("SELECT status FROM runtime_requests WHERE request_id = ?",
+                                 (other["requestId"],)).fetchone()
+    finally:
+        durable.close()
+    check(lost is None and orphans == 0, "the lost consume leaves no committed row")
+    check(landed == ("completed",), f"the waiting thread's write is durable ({landed})")
+    if not stuck:  # a rival still holding the lock would hang close()
+        txn.close()
 
     print(f"\n{'PASS — request store unit suite green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0

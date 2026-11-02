@@ -106,11 +106,14 @@ class Outbox:
     def close_path(self, ask_id: str) -> Path:
         return self._closed.path(safe_ask_id(ask_id))
 
-    def save(self, question: dict, sent_line: str, now: Optional[float] = None) -> Path:
-        """Hold `question` (its dict shape; `ask_id` names the file) with its delivery record."""
+    def save(self, question: dict, sent_line: str, now: Optional[float] = None, redeliver: bool = False) -> Path:
+        """Hold `question` (its dict shape; `ask_id` names the file) with its delivery record.
+        `redeliver`: its row, if one exists, still carries an older record and must take this one."""
         ask_id = safe_ask_id((question or {}).get("ask_id"))
         record = {"question": dict(question), "sent": sent_line,
                   "saved_at": _iso(datetime.now(timezone.utc).timestamp() if now is None else now)}
+        if redeliver:
+            record["redeliver"] = True
         return self._held.write(ask_id, record)
 
     def entries(self) -> list:
@@ -121,7 +124,8 @@ class Outbox:
                 print(f"pending-questions outbox: {p.name} is not named by an ask id; left in place", file=sys.stderr)
                 continue
             out.append({"ask_id": name, "question": d["question"], "sent": str(d.get("sent") or ""),
-                        "saved_at": str(d.get("saved_at") or ""), "path": p})
+                        "saved_at": str(d.get("saved_at") or ""), "redeliver": bool(d.get("redeliver")),
+                        "path": p})
         return out
 
     def delete(self, ask_id: str) -> None:

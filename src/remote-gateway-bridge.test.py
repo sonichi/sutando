@@ -822,7 +822,7 @@ def main() -> int:
           "AG2 Space has no NOTIFY step")
     # room_ops.py falls back to a channel env file only when url+token are
     # absent from the environment; WHICH file carries them differs per onboarding.
-    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
+    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space --room \'!room:ag2.space\')"; set +a'
     check(sum(_env_hint in ln for ln in sk.splitlines()) == 1,
           "the env prelude rides the sole gateway-calling step (context-first)")
     # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
@@ -835,7 +835,7 @@ def main() -> int:
     finally:
         rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
     check("channel-env.sh dev-ag2space" in skd
-          and "channel-env.sh ag2space)" not in skd,
+          and "channel-env.sh ag2space " not in skd,
           "a non-default CHANNEL_DIR reaches the env prelude, not the default")
     check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 1,
           "the sole gateway-calling step names the task's own channel dir, not the default")
@@ -876,6 +876,8 @@ def main() -> int:
           "no file defines the token -> resolver FAILS instead of naming a tokenless file")
     check(sk.rstrip().splitlines()[-1].startswith("2. Process"),
           "skill block is the file tail (appended after access_tier)")
+    check("to end it with no reply, write `[no-send]` as the result" in sk.rstrip().splitlines()[-1],
+          "the task file says how to end a task with no reply")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
     check(tiers_sk == ["access_tier: owner"], "exactly one access_tier line, owner")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
@@ -1394,6 +1396,20 @@ def main() -> int:
     _activity.parent.mkdir(parents=True, exist_ok=True)
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
+    # Once it holds the lease the unsuffixed bridge asks whether it keeps the proactive room.
+    check(rtc.PROACTIVE_ROOM_KEEP is rtc._legacy_keeps_proactive_room, "the unsuffixed bridge asks whether it keeps the room")
+    _main_src = (SRC_DIR.parent / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+    _main_src = _main_src[_main_src.index("def main() -> None:"):]
+    check(_main_src.index("_acquire_singleton()") < _main_src.index("_start_lock_heartbeat()")
+          < _main_src.index("_settle_proactive_room()"), "the room is settled right after the lease heartbeats")
+    _saved_room = (rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP)
+    for _keep, _want, _label in ((lambda: True, "!r:example.org", "kept while no named row is primary"),
+                                 (lambda: (_ for _ in ()).throw(OSError("x")), "!r:example.org", "kept when the check fails"),
+                                 (lambda: False, "", "dropped once a named row is primary")):
+        rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP = "!r:example.org", _keep
+        rtc._settle_proactive_room()
+        check(rtc.PROACTIVE_ROOM == _want, f"proactive room {_label}")
+    rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP = _saved_room
     # Unset → no scan, files untouched (existing hosts unchanged).
     (rtc.RESULTS_DIR / "proactive-t1.txt").write_text("nudge one\n")
     rtc.PROACTIVE_ROOM = ""
@@ -1752,6 +1768,77 @@ def main() -> int:
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
           "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
     (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
+    check(rtc.OWNS_UNADDRESSED is rtc._owns_unaddressed, "the host answers which bridge is the primary")
+    check(rtc.TASK_STATUS is rtc._ag2space_task_status, "the host supplies each task's published status")
+    import json as _json
+    _sidecar = rtc.WS / "state" / "agent-activity.phase.jsonl"
+    _sidecar.parent.mkdir(parents=True, exist_ok=True)
+    _sidecar.write_text(_json.dumps({"task_id": "task-status-probe", "seq": "s1", "step": "Run the suite",
+                                     "phase": "Running tests", "phase_source": "rules", "at": time.time()}) + "\n")
+    _st = rtc._ag2space_task_status("task-status-probe")
+    check(isinstance(_st, dict) and _st.get("phase") == "Running tests" and _st.get("summary") == "Running tests",
+          f"the host's status is the Basic fields only, never the step text ({_st})")
+    _sidecar.unlink()
+    import connections as _conn
+    _saved_conn = (_conn.unaddressed_owner, _conn.owns_unaddressed, rtc._log)
+    _handoff_logs: list = []
+    _conn.unaddressed_owner = lambda ws=None: ({"instance": ""}, {"instance": "s-lane"})
+    _conn.owns_unaddressed = lambda inst, ws=None: inst == ""
+    rtc._log = _handoff_logs.append
+    try:
+        check(rtc._owns_unaddressed() is (rtc.GATEWAY_INSTANCE == ""), "the host answers from the handed-off owner")
+        rtc._owns_unaddressed()
+        check(len(_handoff_logs) == 2 and "lane s-lane has no owner DM, so lane primary delivers them" in _handoff_logs[0],
+              f"a handoff of unaddressed messages is logged, backed off ({_handoff_logs[:1]})")
+        _conn.unaddressed_owner = lambda ws=None: ({"instance": "s-lane"}, None)
+        _handoff_logs.clear(); rtc._owns_unaddressed()
+        check(_handoff_logs == [], "no handoff, no log line")
+    finally:
+        _conn.unaddressed_owner, _conn.owns_unaddressed, rtc._log = _saved_conn
+    _saved_owns = rtc.OWNS_UNADDRESSED
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True  # the record made this lane the primary
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1h.txt").write_text("nudge for the new primary\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts + 1 and STATE["room_posts"][-1]["room_id"] == "!dm:example.org"
+          and not (rtc.RESULTS_DIR / "proactive-t1h.txt").exists(),
+          "a named lane the record made primary delivers an unaddressed nudge to its owner DM")
+    _coexist_nudge = rtc.RESULTS_DIR / "proactive-coexist-nudge.txt"
+    _coexist_nudge.write_text("existing nudge remains\n")
+    _sidecar.write_text(_json.dumps({"task_id": "task-wedge-coexist", "seq": "s2", "step": "Run the suite",
+                                     "phase": "Running tests", "phase_source": "rules", "at": time.time() - 3600}) + "\n")
+    _wedge_status = rtc._ag2space_task_status("task-wedge-coexist")
+    check(_wedge_status.get("waiting", {}).get("kind") == "activity-silent"
+          and _coexist_nudge.read_text() == "existing nudge remains\n",
+          "a real silence notice leaves an already queued nudge unchanged")
+    n_posts = len(STATE["room_posts"])
+    rtc._post_proactive()
+    _coexist_posts = STATE["room_posts"][n_posts:]
+    check(len(_coexist_posts) == 2 and {post["body"].strip() for post in _coexist_posts} == {
+              "existing nudge remains",
+              "Task task-wedge-coexist: No recent task activity. Check the running tool or runtime."}
+          and all(post["room_id"] == "!dm:example.org" for post in _coexist_posts)
+          and not _coexist_nudge.exists(),
+          "an existing nudge and a real wedge notice both reach the owner DM once")
+    rtc._ag2space_task_status("task-wedge-coexist")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts + 2,
+          "another detector and delivery pass duplicates neither the wedge notice nor the nudge")
+    _sidecar.unlink()
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _inst, lambda: False  # the unsuffixed bridge once a lane is primary
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1i.txt").write_text("not the legacy's\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1i.txt").exists(),
+          "the unsuffixed bridge leaves unaddressed nudges once a named lane is primary")
+    rtc.OWNS_UNADDRESSED = lambda: (_ for _ in ()).throw(OSError("x"))
+    check(rtc.owns_unaddressed() is True, "a failed primary check keeps the launch-time rule")
+    (rtc.RESULTS_DIR / "proactive-t1i.txt").unlink(); rtc.OWNS_UNADDRESSED = _saved_owns
+    _real_resolve, _asked = rtc.resolve_destination, []
+    rtc.resolve_destination = lambda audience, **kw: _asked.append(audience) or ""
+    rtc.OWNS_UNADDRESSED = lambda: False
+    check(rtc._project_hitl() == 0 and not _asked, "a bridge that is not the primary projects no cards")
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True
+    check(rtc._project_hitl() == 0 and _asked == [rtc.OWNER_PRIVATE], "a named primary looks for the owner DM to project cards")
+    rtc.resolve_destination, rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _real_resolve, _inst, _saved_owns
     rtc._reenroll_identity = lambda: "@agent-t:example.org"
     rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
@@ -2014,6 +2101,7 @@ def main() -> int:
     tok_file = tok_dir / "relay.env"
     # _read_token_file: dotenv form (export prefix + quotes stripped)
     tok_file.write_text('# comment\nexport REMOTE_TASK_TOKEN="dotenv-secret"\nOTHER=x\n')
+    tok_file.chmod(0o600)  # a token file is read only when it is private
     check(rtc._read_token_file(str(tok_file)) == "dotenv-secret",
           "_read_token_file parses dotenv form (export + quotes)")
     # raw onboarding-string form (no KEY=)

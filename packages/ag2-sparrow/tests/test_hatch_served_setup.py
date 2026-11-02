@@ -44,7 +44,7 @@ SHA_NEW, SHA_OLD, SHA_SDIST = "a" * 64, "b" * 64, "c" * 64
 NEW = {"ag2_sparrow-0.6.0-py3-none-any.whl": SHA_NEW}
 REAL_STOP, REAL_START = self_upgrade.stop_sparrow, self_upgrade.start_sparrow
 REAL_DISTRIBUTION = self_upgrade._distribution
-OWNER_NOTE = ("To reach your owner, post only in your owner's AG2 Space DM; "
+OWNER_NOTE = ("To reach your owner, post only in your owner's s.space DM; "
               "never use another channel.")
 
 
@@ -706,9 +706,10 @@ print(json.dumps({"calls": calls}))
     SCRUB = """
 import errno, io, json, os, traceback, urllib.error, urllib.request, http.client
 from ag2_sparrow import remote_gateway_bridge as m
-secret = "enrollment=Se%2fcR%2FeT"
-forms = [secret, secret.upper(), secret.lower(), "Se%2fcR%2FeT", "Se/cR/eT", "Se%252fcR%252FeT",
-         repr("Se\\ncR"), "Se\\x7fcR", "U2UvY1IvZVQ"]
+secret = "enrollment=SeQ4vXk9%2fcRz8LpW2%2FeTm3YhN7"
+forms = [secret, secret.upper(), secret.lower(), "SeQ4vXk9%2fcRz8LpW2%2FeTm3YhN7",
+         "SeQ4vXk9/cRz8LpW2/eTm3YhN7", "SeQ4vXk9%252fcRz8LpW2%252FeTm3YhN7",
+         repr("SeQ4vXk9\\ncRz8LpW2"), "SeQ4vXk9\\x7fcRz8LpW2", "U2VRNHZYazkvY1J6OExwVzIvZVRtM1loTjc"]
 text = " | ".join(forms)
 raised = [urllib.error.HTTPError(m.URL + "/v1/tasks", 503, text, {}, io.BytesIO(b"{}")),
           urllib.error.URLError(text), TimeoutError(text), ConnectionResetError(104, text),
@@ -736,7 +737,7 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
 """
 
     def test_an_exception_from_a_gateway_call_is_logged_and_persisted_only_as_its_type(self):
-        url = "https://gw.example/relay?enrollment=Se%2fcR%2FeT"
+        url = "https://gw.example/relay?enrollment=SeQ4vXk9%2fcRz8LpW2%2FeTm3YhN7"
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.SCRUB], capture_output=True, text=True,
                            cwd=str(self.home), timeout=60, env=self.bridge_env(REMOTE_TASK_URL=url))
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -756,7 +757,8 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
         for form in result["forms"]:
             self.assertNotIn(form, json.dumps(result["out"]), "nor from its attributes")
         self.assertEqual(result["out"][0]["code"], 503, "the status code survives")
-        for form in result["forms"] + ["cR", "eT", "Se%"]:
+        # Each piece is 8 mixed-case chars, so a random 6-char tmp-dir suffix cannot contain one.
+        for form in result["forms"] + ["SeQ4vXk9", "cRz8LpW2", "eTm3YhN7", "SeQ4vXk9%"]:
             self.assertNotIn(form, printed, form)
             for path, text in result["files"].items():
                 self.assertNotIn(form, text, (form, path))
@@ -1083,11 +1085,13 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
     def test_the_media_token_a_rotated_token_and_a_url_username_are_registered(self):
         media, rotated = "media-tok-77", "rotated-secret-99"
         token_file = self.home / "token"
-        token_file.write_text(f"REMOTE_TASK_TOKEN={rotated}\n")
+        token_file.write_text("REMOTE_TASK_TOKEN=start-secret-55\n")  # the startup token; then a rotation
+        token_file.chmod(0o600)
         url = "https://longusername1:pw-123456@gw.example/relay"
         out = self.bridge("""
 import json
 from ag2_sparrow import remote_gateway_bridge as m
+open(m.TOKEN_FILE, "w").write("REMOTE_TASK_TOKEN=ROTATED\\n")
 assert m._reload_rotated_token(), "the rotation is read"
 for word in ("MEDIA", "ROTATED", "longusername1"):
     m._log("a line naming " + word)
@@ -2245,7 +2249,8 @@ class Tunables(unittest.TestCase):
             "keepawake_interval_s": 1, "stuck_task_age_s": 10 ** 9,
             "hook_silent_age_s": 600, "heartbeat_cadence_s": "fast"}}, logs.append)
         self.assertEqual(got, {"keepawake_interval_s": 300, "stuck_task_age_s": 7200,
-                               "hook_silent_age_s": 600, "heartbeat_cadence_s": 60})
+                               "hook_silent_age_s": 600, "heartbeat_cadence_s": 60,
+                               "listener_disconnect_age_s": 300})
         self.assertEqual(len(logs), 3, logs)
         self.assertTrue(any("keepawake_interval_s=1 is outside [300, 3600]" in l for l in logs))
 
@@ -3177,7 +3182,7 @@ class Upgrade(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=5000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+                mock.patch.object(keepalive, "open_tasks", return_value=(None, None, {})):
             row = keepalive.health_row(self.cfg, self.home / "log", now=5000.0)
         self.assertEqual((row["condition"], row["reason"]),
                          ("abnormal", self_upgrade.UPGRADE_FAILED), label)
@@ -4695,7 +4700,7 @@ class Health(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=1000.0 - 1000):
+                mock.patch.object(keepalive, "open_tasks", return_value=(1000.0 - 1000, None, {})):
             row = keepalive.health_row(cfg, self.home, now=1000.0)
             self.assertEqual((row["reason"], row["since"]), (keepalive.TASK_NOT_PICKED_UP, 900.0))
             # A cache applies only with a revision that normalises; a tunables-only cache is no cache.
@@ -4714,7 +4719,7 @@ class Health(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+                mock.patch.object(keepalive, "open_tasks", return_value=(None, None, {})):
             self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0 + 11 * 60)
                              ["condition"], "healthy")
             self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0 + 31 * 60)

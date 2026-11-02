@@ -12,8 +12,8 @@ this gitignored per-clone override:
 
 Save it as `sutando.config.local.json`, then run:
 
-> **Never run `--restart` from inside the sutando-core session** — it kills the canonical
-> session, which is the agent running the command. Run it from a terminal outside the core,
+> **Never run `--restart` from inside the sutando-core session** — it kills the core's
+> window, which is the agent running the command. Run it from a terminal outside the core,
 > or have the owner type `restart core` in a **Discord** DM — that is the only adapter wired
 > to it (`src/discord-bridge.py:3032`; slack and telegram do not import
 > `core_restart_intent`), and it needs Sutando.app running to consume the intent.
@@ -33,6 +33,12 @@ codex login status
 bash skills/install.sh
 bash src/agent/start-cli.sh --restart
 ```
+
+That command starts the core and the local agent API (`127.0.0.1:7843`) when
+nothing serves it yet; the s.space desktop hands its connect code to that API,
+so a core moved to s.space from the desktop needs it running. It does not start
+the other local services (voice, web client, dashboard, bridges): for those, start
+everything with `bash src/startup.sh`, which then launches the same core.
 
 With `core.runtime: codex`, `skills/install.sh` links every repo skill and every
 `<workspace>/skills/` skill into `$CODEX_HOME/skills/` (resolved by
@@ -58,8 +64,13 @@ The Codex implementation:
   not copy Claude login state or run the Claude-only preflight for a Codex core;
 - exports the configured `CODEX_HOME` and requires `codex login status` to pass
   before any background service launches;
-- forwards `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into the core session, so skills
-  that read the engine's channel state (such as `ag2space/access.json`) find it;
+- resolves `CLAUDE_CONFIG_DIR` the same way the Claude launcher does (the
+  configured `core_config_dirs[type=claude]`, else `<workspace>/.claude-sutando`),
+  refusing to start when that configuration is invalid, and forwards it with
+  `CODEX_HOME` into the core session, so skills that read the engine's channel
+  state (such as `ag2space/access.json`) find it whichever CLI is the core;
+- starts the local agent API on port 7843 when nothing listens there (skipped with
+  `--external-helpers`, whose embedder owns its services);
 - owns the same `sutando-core` tmux session used by the menu bar, health checks,
   and terminal attachment;
 - validates `codex` availability and authentication before changing the live
@@ -77,7 +88,16 @@ The Codex implementation:
 - runs a separate `sutando-core-observer` tmux session (`cli/codex-observer.mjs`)
   that follows the core's rollout file and writes its HealthStatus runtime
   observation record (`docs/health-snapshot.md`, "Runtime observation");
-- restarts the core and notifier together, preventing duplicate task consumers.
+- restarts the core and notifier together, preventing duplicate task consumers;
+- replaces only the core's own window on `--restart` (the window started as
+  `codex`, or `claude` when switching runtimes), so sibling windows in the
+  session, such as the desktop's `gateway-<instance>` lanes, keep running. When
+  the session outlives its core window (the core exited), the next launch heals
+  it the same way: it recreates the core as the session's lowest-index window,
+  where the task notifier types, and leaves every sibling untouched. A session
+  with no other window still ends with its core, as before. A live window that is neither a
+  known sibling (`gateway-*`, `monitor`) nor started as `codex` could be a core the
+  launcher cannot identify, so it refuses to heal (exit 3) rather than start a second core.
 
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F
@@ -131,30 +151,52 @@ also defers after the configured confirmation retries. An unobservable successfu
 send keeps the existing advisory behavior. A race with scrolling can leave the
 attached terminal's jump prompt visible; Escape dismisses that client prompt.
 
-## AG2 Space MCP without the desktop app
+## s.space MCP without the desktop app
 
-The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
-A Codex core set up without the app has no such entry, so it has no AG2 Space
-Actions (`room.commons.*` included) until you add the hosted server yourself. Find
-the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
-then add this to its `config.toml`:
+The s.space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
+A Codex core set up without the app has no such entry, so it has no s.space
+Actions (`room.commons.*` included) until you add the hosted server yourself.
+
+The MCP endpoint belongs to the homeserver your agent is on, so take it from your
+primary connection rather than from a fixed URL. Each DotSpace in the registry
+(`DEFAULT_INSTANCES` in `src/dotspace.py`, or `core.dotspace.instances` in your
+config) names its `mcp_url`:
+
+```bash
+server="${AG2_SERVER:-$(python3 scripts/connections.py list --json \
+  | python3 -c 'import json,sys; print(next((r["server"] for r in json.load(sys.stdin) if r["primary"]), ""))')}"
+mcp_url=""
+if [ -z "$server" ]; then
+  echo "no primary connection: set AG2_SERVER=<your homeserver, e.g. ag2.space> and rerun" >&2
+else
+  mcp_url=$(python3 src/dotspace.py "$server" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mcp_url"])')
+  [ -n "$mcp_url" ] && echo "$mcp_url" || echo "no mcp_url registered for $server: add it under core.dotspace.instances" >&2
+fi
+```
+
+With no connections record (a Codex core set up without the app) the first check prints the fix
+and leaves `$mcp_url` empty: export `AG2_SERVER` with your homeserver and rerun. Do not continue
+with an empty URL.
+
+Find the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
+then add that URL to its `config.toml`:
 
 ```toml
 [mcp_servers.ag2-space]
-url = "https://mcp.ag2.space/mcp"
+url = "<the mcp_url printed above>"
 ```
 
-`codex mcp add ag2-space --url https://mcp.ag2.space/mcp` writes the same entry
+`codex mcp add ag2-space --url "$mcp_url"` writes the same entry
 and starts the sign-in. The server uses OAuth, so no token goes in the file:
 
 ```bash
-codex mcp login ag2-space   # sign in to AG2 Space in the browser
+codex mcp login ag2-space   # sign in to s.space in the browser
 codex mcp list              # ag2-space: enabled, Auth no longer "Not logged in"
 ```
 
 That connection acts as you. To act as your agent, call the server's `agent_link`
 tool once from a Codex session with the one-time link code on the agent's
-settings page in AG2 Space. Restart the core afterwards
+settings page in s.space. Restart the core afterwards
 (`bash src/agent/start-cli.sh --restart`, from outside the core session).
 
 ## Externally managed monitor and heartbeat
@@ -272,7 +314,7 @@ bash src/agent/start-cli.sh --runtime codex --restart
 ```
 
 The leading `--runtime` flag wins over `SUTANDO_CORE_RUNTIME`, which otherwise
-wins over the AG2 Space desktop's selection, which wins over `core.runtime`. The
+wins over the s.space desktop's selection, which wins over `core.runtime`. The
 desktop selection is `coreRuntime` in the desktop's `runtime.json`
 (`$SUTANDO_APP_SUPPORT/runtime.json`, or the directory above a bundled
 `engine/<checkout>`), so launchd jobs started without the desktop's environment

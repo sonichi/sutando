@@ -10,8 +10,12 @@ Notices are per seat (runtime + device), not per card: a seat that stays blocked
 can mint a card per repaint, and the owner must hear once that the seat is still
 blocked or has recovered, not once per card.
 
+A card the relay refused past the retry bound is announced once per revision as
+a plain message, since the owner never saw the card itself.
+
 Ledger keys (beside `revision` / `event_id`): `notified_at` (epoch of the last
-owner-facing message), `reminders` (count sent), `recovered` (notice sent).
+owner-facing message), `reminders` (count sent), `recovered` (notice sent),
+`failed_notice` (the failed revision announced).
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ REMIND_INTERVALS_S = (30 * 60, 2 * 60 * 60, 6 * 60 * 60)
 
 REMINDER = "reminder"
 RECOVERY = "recovery"
+FAILED = "failed"
+_FAILED_HEADLINE_MAX = 200
 # Kinds whose recovery is a sign-in, announced without the card's headline; others say what cleared.
 SIGN_IN_KINDS = frozenset({"auth"})
 
@@ -80,6 +86,8 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
 
 def after(notice: str, projection: Dict, now: float, reminders: Optional[int] = None) -> Dict:
     """Ledger fields to record once `notice` was accepted."""
+    if notice == FAILED:
+        return {"failed_notice": projection.get("failed_revision")}
     if notice == RECOVERY:
         return {"recovered": True}
     if reminders is None:
@@ -144,6 +152,16 @@ def plan(entries: Iterable[Tuple[HumanRequirement, Dict]], now: float) -> List[N
     return out
 
 
+def failures(entries: Iterable[Tuple[HumanRequirement, Dict]]) -> List[Notice]:
+    """One FAILED notice per card whose current revision was given up on and not yet announced."""
+    out: List[Notice] = []
+    for req, pj in entries:
+        failed = pj.get("failed_revision")
+        if failed == req.revision and pj.get("revision", 0) < failed and pj.get("failed_notice") != failed:
+            out.append(Notice(FAILED, req, [(req, pj)], req.created_at, _queued(req), 0))
+    return out
+
+
 def _duration(seconds: float) -> str:
     minutes = max(int(seconds // 60), 1)
     hours, minutes = divmod(minutes, 60)
@@ -165,6 +183,10 @@ def _headline(req: HumanRequirement) -> str:
 def body(notice: str, req: HumanRequirement, now: float,
          since: Optional[float] = None, queued: Optional[int] = None) -> str:
     n = _queued(req) if queued is None else queued
+    if notice == FAILED:
+        head = _headline(req)
+        head = head if len(head) <= _FAILED_HEADLINE_MAX else head[:_FAILED_HEADLINE_MAX - 1] + "…"
+        return f"⚠ Sutando could not show you a card — {head}. The relay refused it."
     if notice == RECOVERY:
         tail = (f"resuming {n} queued task{'s' if n != 1 else ''}" if n
                 else "Sutando has continued its work")
@@ -180,6 +202,8 @@ def body(notice: str, req: HumanRequirement, now: float,
 
 def dedupe_key(notice: str, req: HumanRequirement, projection: Dict,
                reminders: Optional[int] = None) -> str:
+    if notice == FAILED:
+        return f"hitl:{req.id}:failed:{req.revision}"
     if notice == RECOVERY:
         return f"hitl:{req.id}:recovered"
     if reminders is None:

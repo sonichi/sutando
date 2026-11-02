@@ -18,6 +18,7 @@ _REPO = Path(__file__).resolve().parents[3]
 if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 import local_record  # noqa: E402
+from local_task_protocol import valid_local_task_id  # noqa: E402
 
 UNREADABLE = "unreadable"
 #: A record whose task left the queue is kept this long, then pruned.
@@ -32,6 +33,8 @@ def store_dir(ws: Path) -> Path:
 
 
 def _valid(tid) -> bool:
+    if isinstance(tid, str) and "~" in tid:
+        return valid_local_task_id(tid)
     return isinstance(tid, str) and bool(_TID.match(tid)) and ".." not in tid
 
 

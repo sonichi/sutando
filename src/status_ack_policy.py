@@ -88,7 +88,8 @@ def _id_epoch(task_id: str) -> Optional[float]:
 
 def intake_at(task_id: str, headers: Mapping[str, str], first_seen: Optional[float] = None) -> Optional[float]:
     """The earliest immutable intake anchor: the `timestamp` header, the id's epoch, or a first-seen
-    stamp the caller has persisted. None when there is none; a file mtime is never an anchor."""
+    stamp the caller has persisted. None when there is none; a file mtime is never an anchor.
+    Not `local_time`: an ack deadline runs from when the sender sent, unlike the orphan age."""
     stamps = [_header_epoch(headers.get("timestamp")), _id_epoch(task_id)]
     if isinstance(first_seen, (int, float)) and not isinstance(first_seen, bool):
         stamps.append(_plausible(float(first_seen)))

@@ -200,8 +200,9 @@ def _repo_root():
     return str(Path(__file__).resolve().parents[2])
 
 
-def _load_gateway(repo=None):
+def _load_gateway(repo=None, room=None):
     """Return (base_url, secret) for the gateway, or (None, None) if unconfigured.
+    With several connections it is the one serving `room`'s server (no room: the primary).
 
     Delegates to the canonical resolver (ensure-cron-room.py:resolve_token) so
     cron-notify honors the SAME cred contract as every other client: process env
@@ -211,7 +212,7 @@ def _load_gateway(repo=None):
     invoked from any cwd still resolves — the prior cwd-relative, `.env`-only,
     `AG2_REMOTE_TOKEN`-only reader returned (None, None) for a supported
     split-token install and from a non-repo cwd (#2346 review)."""
-    return _canonical_resolver()(repo if repo is not None else _repo_root())
+    return _canonical_resolver()(repo if repo is not None else _repo_root(), room)
 
 
 def _post_to_room(room_id, body, repo=None):
@@ -219,7 +220,11 @@ def _post_to_room(room_id, body, repo=None):
     import json
     import urllib.error
     import urllib.request
-    base, secret = _load_gateway(repo)
+    try:
+        base, secret = _load_gateway(repo, room_id)
+    except RuntimeError as e:
+        print(f"cron-notify: {e}", file=sys.stderr)
+        return None
     if not base:
         return None
     req = urllib.request.Request(

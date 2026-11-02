@@ -8,9 +8,12 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import types
 import unittest
 import urllib.error
+import urllib.parse
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -72,6 +75,10 @@ class EnvCase(unittest.TestCase):
             _gateway, "_channel_env_file", lambda: None)
         self._env_file_patch.start()
         self.addCleanup(self._env_file_patch.stop)
+        # Nor the host's connections record: room routing is pinned in tests/.
+        self._route_patch = mock.patch.object(_gateway, "_room_credential", lambda room_id: None)
+        self._route_patch.start()
+        self.addCleanup(self._route_patch.stop)
 
     def tearDown(self):
         _clear()
@@ -232,6 +239,96 @@ class MediaTests(EnvCase):
             res = md.fetch_media("mxc://x/y", HS, ROOM, gate=None)
         self.assertTrue(res["ok"] and os.path.isfile(res["path"]))
         self.assertEqual(open(res["path"], "rb").read(), b"PNG")
+
+    def test_fetch_normalizes_relay_links_and_preserves_room_auth(self):
+        for host, server in (("dev-chat.s.space", "dev.s.space"), ("chat.s.space", "s.space")):
+            room = "!image:" + server
+            base = "https://" + host + "/relay"
+            ref = base + "/v1/media/" + server + "/image?room_id=" + _gateway.quote(room)
+            os.environ["GATEWAY_URL"] = base
+            os.environ["GATEWAY_TOKEN"] = "fixture-bearer"
+            with self.subTest(server=server), mock.patch.object(md, "http_request", return_value=(200, b"PNG", {})) as req:
+                result = md.fetch_media(ref, HS, gate=None)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["room_id"], room)
+                args = req.call_args.args
+                parsed = urllib.parse.urlsplit(args[1])
+                query = urllib.parse.parse_qs(parsed.query)
+                self.assertEqual(parsed.path, "/relay/v1/media/fetch")
+                self.assertEqual(query, {"ref": ["mxc://" + server + "/image"], "room_id": [room]})
+                self.assertEqual(args[2]["Authorization"], "Bearer fixture-bearer")
+                self.assertEqual(req.call_args.kwargs["max_bytes"], md.MAX_BYTES)
+
+    def test_fetch_downloads_bytes_through_the_broker_http_contract(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                parsed = urllib.parse.urlsplit(self.path)
+                expected = {"ref": ["mxc://dev.s.space/image"], "room_id": [ROOM]}
+                valid = (parsed.path == "/relay/v1/media/fetch"
+                         and urllib.parse.parse_qs(parsed.query) == expected
+                         and self.headers.get("Authorization") == "Bearer fixture-bearer")
+                self.send_response(200 if valid else 400)
+                self.end_headers()
+                self.wfile.write(b"PNG" if valid else b"bad request")
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/relay"
+            try:
+                with mock.patch.object(md, "gateway", return_value=(base, {"Authorization": "Bearer fixture-bearer"})):
+                    for ref, room in [("mxc://dev.s.space/image", ROOM),
+                                      (base + "/v1/media/dev.s.space/image?room_id=" + _gateway.quote(ROOM), None)]:
+                        result = md.fetch_media(ref, HS, room, gate=None)
+                        self.assertTrue(result["ok"], result)
+                        with open(result["path"], "rb") as stream:
+                            self.assertEqual(stream.read(), b"PNG")
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_fetch_requires_room_for_mxc_without_requesting(self):
+        with mock.patch.object(md, "http_request") as req:
+            result = md.fetch_media("mxc://dev.s.space/image", HS, gate=None)
+        self.assertFalse(result["ok"])
+        self.assertIn("--room", result["reason"])
+        req.assert_not_called()
+
+    def test_fetch_refuses_mismatched_or_untrusted_relay_links(self):
+        os.environ["GATEWAY_URL"] = "https://dev-chat.s.space/relay"
+        cases = [
+            ("https://evil.example/relay/v1/media/dev.s.space/image?room_id=" + ROOM, None),
+            ("https://dev-chat.s.space/relay-evil/v1/media/dev.s.space/image", ROOM),
+            ("https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=!other:hs", ROOM),
+            ("https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=" + ROOM + "&room_id=!other:hs", None),
+            ("https://dev-chat.s.space/relay/v1/media/dev.s.space/a%2Fb", ROOM),
+        ]
+        for ref, room in cases:
+            with self.subTest(ref=ref), mock.patch.object(md, "http_request") as req:
+                self.assertFalse(md.fetch_media(ref, HS, room, gate=None)["ok"])
+                req.assert_not_called()
+
+    def test_fetch_rejects_invalid_ref_syntax_before_network(self):
+        os.environ["GATEWAY_URL"] = "https://dev-chat.s.space/relay"
+        for ref in ("file:///image", "https://user:pass@example.com/image",
+                    "mxc://dev.s.space/image#fragment", "mxc://dev.s.space/image?query=1"):
+            with self.subTest(ref=ref), mock.patch.object(md, "http_request") as req:
+                result = md.fetch_media(ref, HS, ROOM, gate=None)
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["reason"])
+                req.assert_not_called()
+
+    def test_embedded_room_reaches_gate_and_connection_selection(self):
+        ref = "https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=" + _gateway.quote(ROOM)
+        with mock.patch.object(md, "gateway", return_value=("https://dev-chat.s.space/relay", {})) as gateway:
+            self.assertFalse(md.fetch_media(ref, HS, gate={})["ok"])
+            gateway.assert_not_called()
+            with mock.patch.object(md, "http_request", return_value=(200, b"PNG", {})):
+                self.assertTrue(md.fetch_media(ref, HS, gate={HS: {"rooms": [ROOM]}})["ok"])
+            gateway.assert_called_once_with(ROOM)
 
     def test_fetch_reads_bounded_and_rejects_oversize(self):
         # Regression for the OOM finding: fetch must (a) bound the read to

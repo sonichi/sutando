@@ -277,7 +277,22 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def _gateway_config(source: str) -> "tuple[str, str] | None":
+def _room_credential(room_id: str):
+    """`connections.room_credential` for the room: (url, token), None to keep the
+    source's own chain, or False when it refused (reason printed)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        import connections  # type: ignore
+    except Exception:
+        return None
+    try:
+        return connections.room_credential(room_id)
+    except connections.ConnectionsError as e:
+        print(f"[task-progress] {e}", file=sys.stderr)
+        return False
+
+
+def _gateway_config(source: str, room_id: str = "") -> "tuple[str, str] | None":
     """(url, token) for a gateway-bridged source, or None (reason already
     printed). Shared by the text and media senders so the two cannot drift."""
     if not _SOURCE_SLUG_RE.match(source or ""):
@@ -285,6 +300,12 @@ def _gateway_config(source: str) -> "tuple[str, str] | None":
               "provider names are lowercase slugs; dots allowed only between "
               "alphanumerics (e.g. dev.ag2.space)", file=sys.stderr)
         return None
+    routed = _room_credential(room_id)
+    if routed is False:
+        return None
+    if routed is not None:
+        url, token = routed
+        return url.rstrip("/"), (token.split("|", 1)[1] if "|" in token else token)
     # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
     _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
@@ -368,7 +389,7 @@ def send_remote_gateway(source: str, channel_id: str, message: str,
     reply_to = _event_id_or_empty(reply_to, "reply_to")
     if reply_to is None:
         return False
-    cfg = _gateway_config(source)
+    cfg = _gateway_config(source, channel_id)
     if cfg is None:
         return False
     url, token = cfg
@@ -419,7 +440,7 @@ def upload_room_media(source: str, channel_id: str, path: str,
     stay text. Returns (ok, reason); the reason is already human-readable."""
     if source in ("slack", "discord", "telegram"):
         return False, f"media steps are not supported on {source}; the text step was sent"
-    cfg = _gateway_config(source)
+    cfg = _gateway_config(source, channel_id)
     if cfg is None:
         return False, "no gateway config"
     url, token = cfg

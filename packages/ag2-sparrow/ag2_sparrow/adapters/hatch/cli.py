@@ -1,4 +1,4 @@
-"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive|wake-context`: set up, check and answer through the Hatch hook.
+"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|no-reply|keepalive|wake-context`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/ (a registered hook's script is never
 rewritten: a changed one goes beside it), stages the hook definition for the agent's hooks
@@ -6,12 +6,14 @@ tool (~/hooks/definitions/ is the tool's own), writes the config the script read
 manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
 install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
-writes a worker's answer to its result_file and waits until Sparrow has sent it;
+writes a worker's answer to its result_file and waits until Sparrow has sent it; no-reply
+ends an item with nothing posted and waits until Sparrow has settled it;
 keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log;
 wake-context prints the text a woken worker follows (served by the backend, else built in)."""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import hashlib
 import json
@@ -29,10 +31,16 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, agent_identity, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import (_dirs, agent_identity, bounded_file_read, delivery_destination, diagnostics,
+                 gateway_credential_io,
+                 gateway_credentials, gateway_instance, outbox, result_ready, task_attempts,
+                 task_hold, workspace_lock)
+from ...persisted_number import bounded_number
+from ...delivery_core import WITHDRAWN
+from ...proactive_routing import about_task_filename
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
-from .task_fields import item_id, valid_mxid
+from .task_fields import item_id, task_fields, valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
@@ -59,7 +67,9 @@ REPLY_COMMAND = "ag2-sparrow-hatch"
 REPLY_PLACEHOLDER = "<REPLY_COMMAND>"
 # `reply` exit codes: posted, not posted, usage, sent to Sparrow but not yet confirmed.
 REPLY_POSTED, REPLY_NOT_POSTED, REPLY_UNCONFIRMED = 0, 1, 3
+HOLD_NOTICE = "Waiting for my owner's go on this."
 REPLY_WAIT_S, REPLY_WAIT_MAX_S, REPLY_MAX_BYTES = 30.0, 300.0, 64 * 1024
+NO_REPLY_REASON_MAX = 200
 SPARROW_COMMAND = "ag2-sparrow"
 SERVICE_NAME = "ag2-sparrow.service"
 # First line of every unit install writes: a unit without it is the owner's and is kept.
@@ -391,7 +401,7 @@ def render_service(exec_start: str, env: dict, unset: "tuple[str, ...]" = ()) ->
                    for k, v in env.items())
     if unset:
         rows += f"UnsetEnvironment={' '.join(unset)}\n"
-    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
+    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (s.space listener)\n"
             "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
             f"[Service]\n{rows}ExecStart={exec_start}\nRestart=always\nRestartSec=10\n"
@@ -454,16 +464,65 @@ def _parse_unit_props(stdout: str) -> "dict | None":
     return props
 
 
+_LOCK_MAX_BYTES = 4096
+
+
+def _lock_role(instance: str) -> str:
+    return f"gateway-bridge{gateway_instance.suffix(instance)}"
+
+
+def _lock_file(state_dir: Path, instance: str) -> Path:
+    return state_dir.parent / "state" / "locks" / f"{_lock_role(instance)}.lock"
+
+
 def _lock_record(state_dir: Path, instance: str) -> "dict | None":
-    """This host's Sparrow single-instance lock record, or None when there is none to read."""
-    lock = state_dir.parent / "state" / "locks" / \
-        f"gateway-bridge{gateway_instance.suffix(instance)}.lock"
+    """This host's Sparrow single-instance lock record, or None when there is none to read. It
+    is read without following a symlink and never blocks: a FIFO, a non-regular or an oversized
+    file is refused."""
+    lock = _lock_file(state_dir, instance)
+    text = bounded_file_read.read_regular(str(lock), _LOCK_MAX_BYTES, follow=False)[0]
     try:
-        holder = json.loads(lock.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        holder = json.loads(text) if text is not None else None
+    except ValueError:
         return None
     ok = isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label()
     return holder if ok else None
+
+
+def _file_id(path: Path) -> "tuple[int, int] | None":
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def lock_snapshot(state_dir: Path, instance: str) -> "tuple[dict | None, tuple[int, int] | None]":
+    """(_lock_record, the lock file's (device, inode)), the id None unless the same file was in
+    place before and after the read, so the record is that file's content."""
+    path = _lock_file(state_dir, instance)
+    before = _file_id(path)
+    record = _lock_record(state_dir, instance)
+    return record, (before if before is not None and _file_id(path) == before else None)
+
+
+def canonical_lock(lock: "dict | None", state_dir: Path, instance: str) -> bool:
+    """`lock` is this workspace's own Sparrow lock as workspace_lock writes it: its role, this
+    workspace, its schema, a valid pid, and times that are finite, not ahead of now, with the
+    lock taken no later than its last heartbeat. Only such a record may authorize a signal."""
+    if not isinstance(lock, dict):
+        return False
+    try:
+        same = os.path.realpath(lock.get("workspace")) == os.path.realpath(Path(state_dir).parent)
+    except (TypeError, ValueError):
+        return False
+    now = time.time()
+    acquired = bounded_number(lock.get("acquired_at"), 1, now)
+    beat = bounded_number(lock.get("heartbeat_at"), 1, now)
+    return (same and lock.get("role") == _lock_role(instance)
+            and lock.get("schema_version") == workspace_lock.SCHEMA_VERSION
+            and outbox.valid_pid(lock.get("pid")) is not None
+            and acquired is not None and beat is not None and acquired <= beat)
 
 
 def _proc_stat(pid: int) -> bytes:
@@ -473,15 +532,29 @@ def _proc_stat(pid: int) -> bytes:
         return b""
 
 
-def process_gone(pid: int) -> bool:
-    """Whether `pid` has exited, a zombie included; False when that cannot be told."""
+def _pid_answers(pid: int) -> "bool | None":
+    """True while `pid` answers signal 0, False once no process has it, None when that cannot be told."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return True
-    except OSError:
         return False
+    except (OSError, OverflowError):
+        return None
+    return True
+
+
+def process_gone(pid: int) -> bool:
+    """Whether `pid` has exited, a zombie included; False when that cannot be told. A pid outside
+    `outbox.valid_pid` is gone: no process can own it."""
+    if outbox.valid_pid(pid) is None:
+        return True
+    answers = _pid_answers(pid)
+    if answers is not True:
+        return answers is False
     stat = _proc_stat(pid)
+    if not stat:
+        # A zombie reaped between the probe and the read leaves no stat; a host without /proc does too.
+        return _pid_answers(pid) is False
     return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
 
 
@@ -789,6 +862,11 @@ def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
     return state_dir / f"gateway-status{'.' + instance if instance else ''}.json"
 
 
+_STATUS_TS_MAX = 1e11  # a wall-clock second no status file will carry
+# A status dated further ahead than this is not Sparrow's current one, so it reads as down.
+SPARROW_STATUS_FUTURE_SKEW_S = 5
+
+
 def check_sparrow(state_dir: Path, now: float | None = None,
                   instance: str | None = None) -> tuple[int, str]:
     """SPARROW_OK, SPARROW_DOWN or SPARROW_NOT_CONNECTED, with a detail, judged by the
@@ -796,11 +874,17 @@ def check_sparrow(state_dir: Path, now: float | None = None,
     path = sparrow_status_path(state_dir, instance)
     try:
         status = json.loads(path.read_text(encoding="utf-8"))
-        ts = float(status["ts"])
+        ts = bounded_number(status["ts"], 0, _STATUS_TS_MAX)
+        if ts is None:
+            raise ValueError("ts is not a bounded number")
     except (OSError, ValueError, KeyError, TypeError) as e:
         return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
                        f"this state dir; {restart_hint()}")
-    age = int((time.time() if now is None else now) - ts)
+    delta = (time.time() if now is None else now) - ts
+    if delta < -SPARROW_STATUS_FUTURE_SKEW_S:
+        return SPARROW_DOWN, (f"{path} is dated {-delta:.1f}s in the future, so it is not Sparrow's "
+                              f"current status; {restart_hint()}")
+    age = int(delta)
     if age > SPARROW_STATUS_MAX_AGE_S:
         return SPARROW_DOWN, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
                        f"reaches the hook; {restart_hint()}")
@@ -808,7 +892,7 @@ def check_sparrow(state_dir: Path, now: float | None = None,
         return SPARROW_NOT_CONNECTED, (
             f"Sparrow is running but not connected: {status.get('error') or 'no error given'}; "
             "if the token was rejected, a restart does not help: put a valid relay token from "
-            "the AG2 Space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV "
+            "the s.space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV "
             "names), then restart Sparrow")
     return SPARROW_OK, f"running and connected ({path} written {max(age, 0)}s ago)"
 
@@ -893,6 +977,11 @@ def verify(_args) -> int:
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
+    wrong = live_identity_mismatch(cfg, (cfg.get("GATEWAY_INSTANCE") or "").strip())
+    if wrong is not None:
+        _check(results, False, "identity",
+               f"the running Sparrow (pid {wrong[0]}) serves {wrong[1]}, not {cfg.get('AGENT_MXID')} "
+               "as the config says; run ag2-sparrow-hatch install again to replace it")
 
     run = hook_last_run(state_dir)
     if run is None:
@@ -966,7 +1055,7 @@ def verify(_args) -> int:
                   "whether its heartbeats carry the health row is unknown")
 
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
-    print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "
+    print(f"\nManual test: from another account, mention {mxid} in an s.space room. Within a "
           "few polls a task file appears in the task_dir, the hook wakes the worker, and the "
           "reply lands in that message's thread tagging you. hooks.logs shows the wake.")
     return 0 if all(results) else 1
@@ -1074,14 +1163,16 @@ def _publish_once(result_file: Path, body: str) -> bool:
     except FileExistsError:
         return False
     finally:
-        Path(tmp).unlink(missing_ok=True)
+        # After a successful link a failed cleanup must not read as an uncommitted answer.
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink(missing_ok=True)
 
 
-def reply(args) -> int:
-    cfg = _installed_config()
+def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
+    """(result_dir, task_dir, tid, item, instance) for an open wake item's result_file,
+    else None after printing why."""
     result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     task_dir = Path(cfg.get("TASK_DIR") or _dirs.task_dir())
-    result_file = Path(args.result_file).expanduser()
     tid = result_file.stem
     # The instance the bridge runs as, read as install recorded it (else as the bridge reads it).
     instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
@@ -1091,25 +1182,437 @@ def reply(args) -> int:
             and result_file.parent.resolve() == result_dir.resolve()):
         print(f"error: {result_file} is not a result_file from the wake payload "
               f"(task-<id>.txt in {result_dir})", file=sys.stderr)
-        return 2
+        return None
     if not (task_dir / f"{tid}.txt").is_file():
         print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
+        return None
+    return result_dir, task_dir, tid, item, instance
+
+
+def _delivered_item(cfg: dict, tid: str, instance: str, item: str) -> "str | None":
+    """The outbox item the running drain delivers `tid` under: under lifecycle 2 a run of its own (a
+    wake or a newer generation) has the item its ledger names, else the task's own `item`. None,
+    after printing why, when that cannot be told."""
+    state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    lane = _live_lane_record(cfg, instance)
+    if lane is not None and lane.get("lifecycle") != 2:
+        return item                             # the running drain keeps no ledger: its own item
+    run = task_attempts.TaskAttempts(state_dir, suffix=gateway_instance.suffix(instance)).run_item(tid)
+    if lane is None:
+        if run is None or run is task_attempts.UNKNOWN:
+            return item
+        print(f"error: Sparrow is not running, and its ledger names {tid} a run of its own, whose item "
+              "depends on how Sparrow starts; nothing written, start Sparrow and run it again",
+              file=sys.stderr)
+        return None
+    if run is task_attempts.UNKNOWN:
+        print(f"error: Sparrow's attempt ledger in {state_dir} cannot be read, so {tid}'s outbox item is "
+              "unknown; nothing written, run it again", file=sys.stderr)
+        return None
+    return run or item
+
+
+def _hold_notice(result_dir: Path, tid: str) -> Path:
+    """The task's current hold line, spelt as a message about it named with its notice generation
+    (0 when none can be read): the outbox withdraws it at its send unless a hold armed it."""
+    try:
+        record = task_hold.notice_record(result_dir, tid)
+    except (OSError, ValueError):
+        record = None
+    return result_dir / about_task_filename(tid, (record or {}).get("gen") or 0)
+
+
+def task_settled(result_dir: Path, tid: str) -> bool:
+    """The task has a result, or its instance's outbox already has a record of one."""
+    instance = tid[len("task-"):].split("~", 1)[0] if "~" in tid else ""
+    item = item_id(tid, instance)
+    root = gateway_instance.outbox_root(result_dir, instance)
+    return ((result_dir / f"{tid}.txt").exists()
+            or (item is not None and outbox.item_status(root, item) is not None))
+
+
+# Bounded rescans for a line the drain moves mid-check (claim, hand-back, delivery).
+_LINE_SCANS = 3
+
+
+def _line_state(result_dir: Path, tid: str, body: str) -> str:
+    """'queued' while `body` itself waits ready to send or is being sent, 'delivered' on the
+    drain's receipt, 'new' when no line was ever queued, else 'unknown' (no proof)."""
+    notice = _hold_notice(result_dir, tid)
+    for _ in range(_LINE_SCANS):
+        state = _scan_line(result_dir, notice, tid, body.strip())
+        if state is not None:
+            return state
+    return "unknown"
+
+
+def _line_items(result_dir: Path, notice: Path) -> "list[dict] | None":
+    """The proactive outbox's items for the line; None when they cannot be read (no proof)."""
+    try:
+        return delivery_destination.lane_items(result_dir, notice.stem)
+    except Exception:  # noqa: BLE001 — an unreadable outbox proves nothing
+        return None
+
+
+def hold_line_outcome(result_dir: Path, tid: str) -> str:
+    """Where `tid`'s hold line stands, by the proactive outbox: 'delivered'; 'withdrawn' (the
+    outbox withdrew it at its send, its task answered); 'undelivered' (queued, claimed, due a
+    retry after a definite refusal, or parked never sent); else 'unconfirmed' (a send that left
+    with no confirmed outcome, or gone with no record)."""
+    notice = _hold_notice(result_dir, tid)
+    items = _line_items(result_dir, notice)
+    if items is None:
+        return "unconfirmed"
+    if any(i.get("status") == "DELIVERED" for i in items):
+        return "delivered"
+    if any(outbox.dispatch_unsettled(i) or i.get("reason") == "outcome-unknown"
+           or i.get("prior_outcome_unknown") for i in items):
+        return "unconfirmed"
+    if notice.exists() or _line_claimed(result_dir, notice) or any(
+            i.get("status") in ("QUEUED", "READY") for i in items):
+        return "undelivered"
+    parked = [str(i.get("reason") or "") for i in items if i.get("status") == "PARKED"]
+    if parked and all(r.startswith(f"{WITHDRAWN}:") for r in parked):
+        return "withdrawn"
+    return "undelivered" if parked else "unconfirmed"
+
+
+def _line_claimed(result_dir: Path, notice: Path) -> bool:
+    return any(delivery_destination.claim_base(p.name) == notice.stem
+               for p in result_dir.glob(f"{notice.stem}.sending.*"))
+
+
+def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":
+    """One pass in the order the drain moves a line (queued, claimed, delivered); None when
+    a file vanished under it and nothing later explains where it went."""
+    moved = seen = False
+
+    def matches(path: Path) -> bool:
+        nonlocal moved, seen
+        # The drain's own readiness predicate: an empty or partial file is not a line.
+        text = result_ready.read_ready_result(path)
+        if text is None and not path.exists():
+            moved = True
+        else:
+            seen = True
+        return text == want
+
+    if notice.exists() and matches(notice):
+        return "queued"
+    claims = sorted(p for p in result_dir.glob(f"{notice.stem}.sending.*")
+                    if delivery_destination.claim_base(p.name) == notice.stem)
+    if any(matches(p) for p in claims):
+        return "queued"
+    if seen and not moved:
+        return "unknown"  # some other or unready file holds the line's name
+    items = _line_items(result_dir, notice)
+    if items is None:
+        return "unknown"
+    if items:
+        return "delivered" if any(i.get("status") == "DELIVERED" for i in items) else "unknown"
+    if moved:
+        return None
+    return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
+
+
+def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
+    """One read of the live drain's lane: (pid, homeserver, declares the send-lock protocol hold
+    and reply rely on), or None when there is no such drain: no fresh record, its publisher gone,
+    the lock names another live process, or the record is not that process's own (another one
+    wrote it under a reused pid). A drain from an older package lacks the protocol, and
+    keepawake replaces it."""
+    rec = _live_lane_record(cfg, instance)
+    if rec is None:
+        return None
+    return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
+            rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
+
+
+def _live_lane_record(cfg: dict, instance: str) -> "dict | None":
+    """The live drain's own fresh lane record, under the conditions _lane_snapshot names; else None."""
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    rec = agent_identity.published_lane_record(state, instance)
+    if rec is None or process_gone(rec["pid"]):
+        return None
+    holder = _lock_record(state, instance)
+    if holder is not None and live_lock_holder(holder) != rec["pid"]:
+        return None  # a lock names the live drain, and it is not the publisher
+    if not agent_identity.owned_by(rec, rec["pid"], (holder or {}).get("acquired_at")):
+        return None
+    return rec
+
+
+def live_identity_mismatch(cfg: dict, instance: str) -> "tuple[int, str] | None":
+    """(pid, agent_id) of the live drain when the id it serves is not the AGENT_MXID install saved;
+    None when they match, or when there is no saved MXID or no live drain record to compare."""
+    want = saved_mxid(cfg.get("AGENT_MXID"))
+    rec = _live_lane_record(cfg, instance) if want else None
+    if rec is None or rec["agent_id"].lower() == want.lower():
+        return None
+    return rec["pid"], rec["agent_id"]
+
+
+def _lane_homeserver(cfg: dict, instance: str) -> str:
+    """The homeserver the live drain of `instance` published; "" when there is none, it is another
+    instance's, or its publisher is not that live drain, which `hold` refuses rather than guess."""
+    snap = _lane_snapshot(cfg, instance)
+    return snap[1] if snap else ""
+
+
+def _held_line(cfg: dict, instance: str) -> str:
+    """The served held line when the setup cache wake-context reads has a usable one, else
+    HOLD_NOTICE."""
+    from . import runtime_text
+    _register_device_secrets()
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    return runtime_text.held_line(runtime_text.current_cache(state, instance)) or HOLD_NOTICE
+
+
+def hold(args) -> int:
+    """Park one wake item for the owner's go: queue its held line once, then mark it held."""
+    cfg = _installed_config()
+    found = _wake_item(cfg, Path(args.result_file).expanduser())
+    if found is None:
         return 2
+    result_dir, task_dir, tid, _item, instance = found
+    try:
+        task_hold.prune(result_dir, task_dir)
+        held = task_hold.read(result_dir, tid)
+    except (OSError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if task_settled(result_dir, tid):
+        print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
+        return REPLY_NOT_POSTED
+    if held is not None:
+        print(f"held: {tid} was already held; nothing posted again")
+        return REPLY_POSTED
+    fields = task_fields(task_dir / f"{tid}.txt", result_dir, instance) or {}
+    room, sender = fields.get("room_id") or "", fields.get("sender") or ""
+    lines = [f"[channel: {room}]"]
+    if fields.get("thread_root"):
+        lines.append(f"[thread: {fields['thread_root']}]")
+    lines.append((f"{sender} " if valid_mxid(sender) else "") + _held_line(cfg, instance))
+    body = "\n".join(lines) + "\n"
+    snap = _lane_snapshot(cfg, instance)
+    lane = snap[1] if snap else ""
+    if not lane:
+        print(f"NOT confirmed: can't confirm the room is deliverable yet, as no live Sparrow drain "
+              f"has published its lane identity; no hold recorded and {tid} still reads "
+              "task-not-picked-up", file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    if not room or delivery_destination.drain_room(body, lane) != room:
+        print(f"error: task {tid} names no s.space room Sparrow would deliver to",
+              file=sys.stderr)
+        return 2
+    if not snap[2]:
+        print(f"NOT confirmed: the running Sparrow predates the hold-line send lock, so a hold line "
+              f"could not be withdrawn once answered; no hold recorded and {tid} still reads "
+              f"task-not-picked-up. {restart_hint()}", file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    try:
+        with delivery_destination.send_lock(result_dir):
+            return _hold_under_lock(result_dir, tid, body,
+                                    lambda: _lane_snapshot(cfg, instance) == snap)
+    except delivery_destination.SendLockUnavailable as e:
+        print(f"NOT confirmed: the hold-line send lock was not taken ({diagnostics.describe(e)}); "
+              f"no hold recorded and {tid} still reads task-not-picked-up. Run hold again",
+              file=sys.stderr)
+        return REPLY_UNCONFIRMED
+
+
+def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> int:
+    """hold's commit, run under the send lock that reply's commit and the drain's send also take:
+    no answer can land between its settled check and the line's publication, and no drain sends
+    the line before the commit ends. `lane_unchanged()` re-reads the drain the checks before the
+    lock were made against, and a commit needs it still true. The drain sends only the generation
+    a hold armed, so a refused commit leaves a line no drain sends; the next hold queues a new one."""
+    try:
+        if task_settled(result_dir, tid):
+            print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
+            return REPLY_NOT_POSTED
+        if task_hold.read(result_dir, tid) is not None:
+            print(f"held: {tid} was already held; nothing posted again")
+            return REPLY_POSTED
+        record = task_hold.notice_record(result_dir, tid)
+        if record is not None and record["gen"] is not None and record["armed"] \
+                and hold_line_outcome(result_dir, tid) == "withdrawn":
+            # Armed by a hold whose marker never landed, and withdrawn for it: the next line replaces it.
+            task_hold.disarm_notice(result_dir, tid, record["token"])
+            record = {**record, "armed": False}
+    except (OSError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    unarmed = record is not None and record["gen"] is not None and not record["armed"]
+    try:
+        line = "new" if unarmed else _line_state(result_dir, tid, body)
+        if line == "unknown":
+            print(f"NOT confirmed: the hold line for {tid} was queued before and nothing proves "
+                  "it was delivered; it is not queued again and the task still reads "
+                  "task-not-picked-up", file=sys.stderr)
+            return REPLY_UNCONFIRMED
+        if not lane_unchanged():
+            return _drain_changed(tid)
+        owner = None
+        if unarmed:
+            owner = task_hold.advance_notice(result_dir, tid, record["token"])[0]
+        elif line == "new":
+            owner = task_hold.mark_notice(result_dir, tid)
+        if owner is not None:
+            _publish_once(_hold_notice(result_dir, tid), body)
+        # A hold stands only on a line proven queued or delivered, whoever queued it.
+        if _line_state(result_dir, tid, body) not in ("queued", "delivered"):
+            print(f"NOT confirmed: the hold line for {tid} is not proven queued; the task "
+                  "still reads task-not-picked-up", file=sys.stderr)
+            return REPLY_UNCONFIRMED
+        if not lane_unchanged():
+            return _drain_changed(tid, "; its line is never sent, since no hold armed it")
+        if owner is not None:
+            task_hold.arm_notice(result_dir, tid, owner)
+        token = task_hold.place(result_dir, tid, task_hold.OWNER_GO)
+    except (OSError, ValueError) as e:
+        print(f"NOT confirmed: the hold was not recorded ({e}); the task still reads "
+              "task-not-picked-up. Run hold again; its line is sent only once a hold stands",
+              file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    if token is None:
+        if task_hold.read(result_dir, tid) is not None:
+            print(f"held: {tid} was already held; nothing posted again")
+            return REPLY_POSTED
+        print(f"NOT confirmed: an unreadable hold marker for {tid} is in the way; the task "
+              "still reads task-not-picked-up", file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    if task_settled(result_dir, tid):
+        _note_withdrawal(tid, _line_report(result_dir, tid))
+        _release_quietly(result_dir, tid, token)
+        print(f"NOT held: {tid} was answered meanwhile", file=sys.stderr)
+        return REPLY_NOT_POSTED
+    print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
+    return REPLY_POSTED
+
+
+def _drain_changed(tid: str, line_note: str = "") -> int:
+    print(f"NOT confirmed: the Sparrow drain changed while hold ran{line_note}; no hold recorded "
+          f"and {tid} still reads task-not-picked-up. Run hold again", file=sys.stderr)
+    return REPLY_UNCONFIRMED
+
+
+# What reply reports of the hold line once its answer is queued; "none" says nothing.
+WITHDRAW_NOTES = {
+    "withdrawn": "the hold line of {tid} will not post: the drain withdraws it now that the task "
+                 "is answered",
+    "posted": "the hold line of {tid} was already posted before this answer",
+    "unsent": "the hold line of {tid} was parked unsent; it will not post",
+    "unconfirmed": "the hold line of {tid} left the queue before this answer with an unconfirmed "
+                   "outcome (the room may already show it); it will not be sent again",
+}
+
+
+def _line_report(result_dir: Path, tid: str) -> str:
+    """Where `tid`'s hold line stands for reply's report, read under the send lock once the answer
+    is queued: no send of it can start or be under way, so the outbox's state is its outcome."""
+    if not task_hold.notice_marked(result_dir, tid):
+        return "none"
+    outcome = hold_line_outcome(result_dir, tid)
+    if outcome == "delivered":
+        return "posted"
+    if outcome == "unconfirmed":
+        return "unconfirmed"
+    notice = _hold_notice(result_dir, tid)
+    pending = notice.exists() or _line_claimed(result_dir, notice) or any(
+        i.get("status") in ("QUEUED", "READY") for i in _line_items(result_dir, notice) or [])
+    return "withdrawn" if outcome == "withdrawn" or pending else "unsent"
+
+
+def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path, item: str,
+                          result_file: Path, body: str) -> "tuple[bool, str]":
+    """reply's commit under the send lock: claim the task and queue the answer, which withdraws
+    its hold line at the outbox's dispatch-time recheck. A failed publication releases the claim
+    and raises OSError, so a retry finds the task, and its line, as they were."""
+    _prune_claims(result_dir, task_dir)
+    if not _claim(result_dir, tid):
+        return False, "none"
+    if outbox.item_status(root, item) is not None:
+        return False, "none"
+    try:
+        committed = _publish_once(result_file, body)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            (_claims_dir(result_dir) / tid).unlink(missing_ok=True)
+        raise
+    # False: another result holds the name, so the task is answered either way.
+    return committed, _line_report(result_dir, tid)
+
+
+def _note_withdrawal(tid: str, where: str) -> None:
+    if where in WITHDRAW_NOTES:
+        print("note: " + WITHDRAW_NOTES[where].format(tid=tid), file=sys.stderr)
+
+
+def _release_quietly(result_dir: Path, tid: str, token: "str | None" = None) -> None:
+    """Release a hold once the task is answered, never failing the command over it."""
+    try:
+        task_hold.release(result_dir, tid, token)
+    except (OSError, ValueError) as e:
+        # A hold left behind is harmless: health ignores holds on answered tasks.
+        print(f"note: could not release the hold on {tid} ({e}); it reads as answered",
+              file=sys.stderr)
+
+
+def reply(args) -> int:
+    return _answer(args, _read_body, silent=False)
+
+
+def _no_reply_body(args) -> "tuple[str | None, str]":
+    reason = " ".join((args.reason or "").split())
+    if len(reason) > NO_REPLY_REASON_MAX:
+        return None, f"reason over {NO_REPLY_REASON_MAX} characters"
+    return "[no-send]" + (f" {reason}" if reason else "") + "\n", ""
+
+
+def no_reply(args) -> int:
+    return _answer(args, _no_reply_body, silent=True)
+
+
+def _answer(args, read_body, silent: bool) -> int:
+    cfg = _installed_config()
+    result_file = Path(args.result_file).expanduser()
+    found = _wake_item(cfg, result_file)
+    if found is None:
+        return 2
+    result_dir, task_dir, tid, item, instance = found
     if not (math.isfinite(args.wait) and 0 <= args.wait <= REPLY_WAIT_MAX_S):
         print(f"error: --wait must be 0 to {REPLY_WAIT_MAX_S:g} seconds", file=sys.stderr)
         return 2
-    body, why = _read_body(args)
+    body, why = read_body(args)
     if body is None:
         print(f"error: {why}", file=sys.stderr)
         return 2
+    item = _delivered_item(cfg, tid, instance, item)
+    if item is None:
+        return 2
+    done = "settled" if silent else "posted"
     root = gateway_instance.outbox_root(result_dir, instance)
-    _prune_claims(result_dir, task_dir)
-    if (not _claim(result_dir, tid) or outbox.item_status(root, item) is not None
-            or not _publish_once(result_file, body)):
-        print(f"NOT posted: {result_file.name} already has a reply or result; nothing written",
+    item = outbox.effective_item_id(root, item, silent or bool(getattr(args, "no_send", False)))
+    # One transaction with hold's commit and the drain's send: the answer is queued under the send
+    # lock, so the hold line is sent before it or withdrawn at its send, never after it.
+    try:
+        with delivery_destination.send_lock(result_dir):
+            committed, where = _commit_answer_locked(result_dir, task_dir, tid, root, item,
+                                                     result_file, body)
+    except OSError as e:  # SendLockUnavailable included: every step taken was undone
+        print(f"error: the answer was not committed ({diagnostics.describe(e)}); nothing "
+              f"written and its hold line left as it was, run {'no-reply' if silent else 'reply'} "
+              "again", file=sys.stderr)
+        return 2
+    _note_withdrawal(tid, where)
+    if not committed:
+        print(f"NOT {done}: {result_file.name} already has a reply or result; nothing written",
               file=sys.stderr)
         return REPLY_NOT_POSTED
-    if args.no_send:
+    _release_quietly(result_dir, tid)  # the answer ends any hold
+    if getattr(args, "no_send", False):
         print(f"closed: {result_file.name}, nothing posted")
         return REPLY_POSTED
     deadline = time.monotonic() + args.wait
@@ -1117,21 +1620,23 @@ def reply(args) -> int:
         record = outbox.read_item(root, item) or {}
         status = record.get("status")
         if status == "DELIVERED":
-            print(f"posted: {result_file.name} (accepted by the AG2 Space gateway)")
+            print(f"settled: {result_file.name}, nothing posted (closed with the s.space gateway)"
+                  if silent else f"posted: {result_file.name} (accepted by the s.space gateway)")
             return REPLY_POSTED
         if status == "PARKED":
-            print(f"NOT posted: Sparrow gave up on {result_file.name}: "
+            print(f"NOT {done}: Sparrow gave up on {result_file.name}: "
                   f"{record.get('reason') or 'no reason given'}", file=sys.stderr)
             return REPLY_NOT_POSTED
         if not result_file.exists() and outbox.item_status(root, item) != "DELIVERED":
-            print(f"NOT posted: Sparrow withheld {result_file.name} (held for review or "
+            print(f"NOT {done}: Sparrow withheld {result_file.name} (held for review or "
                   f"quarantined in {result_dir / 'undelivered'})", file=sys.stderr)
             return REPLY_NOT_POSTED
         if time.monotonic() >= deadline:
             _, detail = check_sparrow(Path(cfg.get("STATE_DIR") or _dirs.state_dir()),
                                       instance=cfg.get("GATEWAY_INSTANCE"))
             print(f"NOT confirmed after {args.wait:g}s: {result_file.name} is queued and Sparrow "
-                  f"will keep trying; do not report it as posted. Sparrow: {detail}",
+                  f"will keep trying; do not report it as {done}. "
+                  f"Sparrow: {detail}",
                   file=sys.stderr)
             return REPLY_UNCONFIRMED
         time.sleep(0.25)
@@ -1174,7 +1679,7 @@ def main(argv=None) -> int:
                                  description="Meta Hatch adapter for ag2-sparrow.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="install the Hatch hook script, definition and config")
-    p.add_argument("--mxid", required=True, help="the agent's AG2 Space MXID")
+    p.add_argument("--mxid", required=True, help="the agent's s.space MXID")
     p.add_argument("--task-dir", help="Sparrow's task dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--result-dir", help="Sparrow's result dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--state-dir", help="Sparrow's state dir (default: as ag2-sparrow resolves it)")
@@ -1231,6 +1736,18 @@ def main(argv=None) -> int:
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
+    n = sub.add_parser("no-reply", help=f"end one wake item with nothing posted and wait until "
+                       f"Sparrow settled it (exit {REPLY_POSTED} settled, {REPLY_NOT_POSTED} not "
+                       f"settled, {REPLY_UNCONFIRMED} queued but not confirmed)")
+    n.add_argument("result_file", help="the item's result_file from the wake payload")
+    n.add_argument("--reason", help="why nothing is posted, kept with the result (one line)")
+    n.add_argument("--wait", type=float, default=REPLY_WAIT_S,
+                   help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
+    n.set_defaults(func=no_reply)
+    h = sub.add_parser("hold", help="park one wake item for your owner's go: mark it held and "
+                       "post one line saying so in its room, once")
+    h.add_argument("result_file", help="the item's result_file from the wake payload")
+    h.set_defaults(func=hold)
     w = sub.add_parser("wake-context", help="print the prompt and worker note a woken worker "
                        "follows (the backend's served copy when valid, else the built-in one)")
     w.set_defaults(func=wake_context)

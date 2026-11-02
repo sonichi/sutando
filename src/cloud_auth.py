@@ -59,9 +59,9 @@ DEFAULT_CLOUD_ORIGIN = dotspace.default_cloud_origin()
 # The shared production Cloud. A retired-origin, bare-key or base-less stored credential belongs
 # HERE, whatever instance this install is on; it is never re-paired with another origin.
 PRODUCTION_CLOUD_ORIGIN = dotspace.PRODUCTION_CLOUD_ORIGIN
-# sutando.ag2.ai 307s to .space and clients drop Authorization across the
-# cross-origin redirect, so a bearer sent there reads back as a bogus 401.
-RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
+# Earlier hosts of the production Cloud. A bearer sent to one can cross a redirect that drops
+# Authorization and read back as a bogus 401, so it always goes to PRODUCTION_CLOUD_ORIGIN.
+RETIRED_CLOUD_ORIGINS = tuple(f"https://{host}" for host in dotspace.RETIRED_CLOUD_HOSTS)
 # What the desktop host overwrites the Keychain token with on sign-out (its
 # vault CLI has no delete verb); must read as "not signed in".
 SIGNED_OUT_SENTINEL = "__signed_out__"
@@ -288,7 +288,8 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
             return CloudAuth(base, tok, stamp_user_id=stamped, credential_user_ids=(uid,))
         if uid and uid not in others:
             others.append(uid)
-    if others:
+    # A credential we could not check may be the stamped user's: that is unverified, not changed.
+    if others and not unknown:
         return CloudAuth(None, None, "account_changed", stamped, others)
     # Only dead or unsendable credentials left is plainly signed out, not a cloud outage.
     return CloudAuth(None, None, "account_unverified" if unknown else None, stamped if unknown else None)
