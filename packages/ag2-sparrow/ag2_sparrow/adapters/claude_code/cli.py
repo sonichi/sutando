@@ -234,7 +234,7 @@ def install(args) -> int:
                   file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
-    return cb.under_agent_lock(root, installed)
+    return cb.under_agent_lock(root, installed, LOCAL if mode != EXTERNAL else None, agent_id)
 
 
 def hmac_settings(args) -> "tuple[str, bool, str, str]":

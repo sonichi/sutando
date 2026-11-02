@@ -47,7 +47,7 @@ makes the root the agent's own (`<agents dir>/<segment of its id>`) and has inst
 bridge, exactly as claude-local's install does: one launch environment (the root's `tasks/` and
 `results/`, the bridge's state at `<root>.bridge/state`, a seat's exports with every inherited token
 cleared) in a marked unit or launchd agent of its own, `ag2-sparrow-codex-local-bridge`. `verify` adds
-the bridge's connected status and its unit; `uninstall` stops and removes that unit too.
+the bridge's connected status and its unit; `uninstall` stops and removes that unit too. One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. With no root recorded yet, `connect` cannot know the code's agent until it is spent, so any other adapter's live bridge refuses it.
 
 `install` checks `codex --version` against the pin (0.160.1, the version the stdio shape was measured
 on; parsed from the line starting with `codex`; older is one line and exit 2, nothing written), then

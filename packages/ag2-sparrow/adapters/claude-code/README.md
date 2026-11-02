@@ -410,7 +410,7 @@ or the `ai.ag2.sparrow.claude-local-bridge` agent): `ag2-sparrow` with
 Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
-one bridge).
+one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. With no root recorded yet, `connect` cannot know the code's agent until it is spent, so any other adapter's live bridge refuses it.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the
