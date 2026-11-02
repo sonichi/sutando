@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
+from . import readable
 from .schema import STATUS_RESOLVED, TERMINAL_STATUSES, HumanRequirement
 
 # Kinds that stop the runtime outright; a decision card waits without re-alerting.
@@ -175,16 +176,11 @@ def _queued(req: HumanRequirement) -> int:
     return len(req.blocked_task_ids or [])
 
 
-def _headline(req: HumanRequirement) -> str:
-    first = next((ln.strip() for ln in (req.message or "").splitlines() if ln.strip()), "")
-    return (req.title or first or req.kind).rstrip(".")
-
-
 def body(notice: str, req: HumanRequirement, now: float,
          since: Optional[float] = None, queued: Optional[int] = None) -> str:
     n = _queued(req) if queued is None else queued
     if notice == FAILED:
-        head = _headline(req)
+        head = readable.headline(req)
         head = head if len(head) <= _FAILED_HEADLINE_MAX else head[:_FAILED_HEADLINE_MAX - 1] + "…"
         return f"⚠ Sutando could not show you a card — {head}. The relay refused it."
     if notice == RECOVERY:
@@ -193,11 +189,11 @@ def body(notice: str, req: HumanRequirement, now: float,
         if req.kind in SIGN_IN_KINDS:
             seat = str((req.device or {}).get("name") or "")
             return f"✓ Signed in{f' ({seat})' if seat else ''} — {tail}."
-        return f"✓ Cleared — {_headline(req)}; {tail}."
+        return f"✓ Cleared — {readable.headline(req)}; {tail}."
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
     return (f"⚠ Still blocked after {_duration(now - started)} — "
-            f"{_headline(req)}.{waiting} The card above has the way to clear it.")
+            f"{readable.headline(req)}.{waiting} The card above has the way to clear it.")
 
 
 def dedupe_key(notice: str, req: HumanRequirement, projection: Dict,

@@ -15,9 +15,9 @@ returning the gateway's dict answer) — this module never imports a bridge.
 from __future__ import annotations
 
 import time
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
-from . import renotify
+from . import readable, renotify
 from .manager import HitlManager
 from .schema import (
     CATEGORY_BLOCKED,
@@ -73,18 +73,26 @@ _STATUS_LINES = {
 _KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has continued its work."}
 
 
-def fallback_body(req: HumanRequirement) -> str:
-    """Plain-text rendering for clients that ignore the hitl content field."""
-    device = req.wire_device() or {}
-    name, host = device.get("name", ""), device.get("host", "")
-    where = f" (on {host} · {name})" if host and name else f" (on {host or name})" if (host or name) else ""
-    lead = _CATEGORY_HEADS.get(category_of(req.kind),
-                               _CATEGORY_HEADS[CATEGORY_BLOCKED])
-    head = f"{lead} — {req.message}{where}"
-    closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
+def plain_text(content: Dict[str, Any]) -> str:
+    """The body for a client that ignores the hitl content field. It is composed of
+    `content`'s own strings, so it can never say something the card itself does not.
+
+    The machine is named in `device` on the wire, never here: a person deciding does
+    not read a host name, and a client that routes by one reads the structured field.
+    """
+    kind, status = content.get("kind"), content.get("status")
+    lead = _CATEGORY_HEADS.get(category_of(kind), _CATEGORY_HEADS[CATEGORY_BLOCKED])
+    message = str(content.get("message") or "")
+    head = f"{lead} — {message}" if message else lead
+    closer = _KIND_STATUS_LINES.get((kind, status)) or _STATUS_LINES.get(status)
     if closer:
         return f"{head}\n\n{closer}"
     return head
+
+
+def fallback_body(req: HumanRequirement) -> str:
+    """Plain-text rendering for clients that ignore the hitl content field."""
+    return plain_text(readable.card(req))
 
 
 def _notices(manager: HitlManager, now: float) -> List[renotify.Notice]:
@@ -200,12 +208,13 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         if not manager.needs_projection(req.id) or _backing_off(manager, req, now, mono):
             continue
         target = manager.projection_target(req.id)
+        content = readable.card(req)
         payload: Dict = {
             # A card names its room when it belongs to one conversation; the reply gate checks it.
             "room_id": req.room or room_id,
-            "body": fallback_body(req),
+            "body": plain_text(content),
             "dedupe_key": f"hitl:{req.id}:{req.revision}",
-            "extra_content": {WIRE_FIELD: req.to_wire()},
+            "extra_content": {WIRE_FIELD: content},
         }
         if target:
             payload.update({"op": "edit", "event_id": target})
