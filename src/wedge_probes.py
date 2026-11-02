@@ -30,6 +30,7 @@ from typing import Callable, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import watcher_identity  # noqa: E402
+from workspace_default import status_read_path  # noqa: E402
 
 WATCHER_NOT_READY = "watcher-not-ready"
 CORE_STATUS_STALE = "core-status-stale"
@@ -117,7 +118,7 @@ def _read_json(path: Path):
 
 def core_status_stale(workspace: Path, now: Optional[float] = None,
                       threshold_s: float = CORE_STATUS_STALE_S) -> Optional[Signature]:
-    path = workspace / "state" / "core-status.json"
+    path = status_read_path("core-status.json", workspace)
     stale = core_status_verdict(_read_json(path), time.time() if now is None else now, threshold_s)
     if stale is None:
         return None
@@ -130,7 +131,7 @@ def core_status_stale(workspace: Path, now: Optional[float] = None,
 def pane_prompt_blocked(workspace: Path, now: Optional[float] = None,
                         fresh_s: float = SUPERVISOR_FRESH_S) -> Optional[Signature]:
     """The core supervisor's current verdict, when it says a person must act on the core's pane."""
-    path = workspace / "state" / "core-supervisor.json"
+    path = status_read_path("core-supervisor.json", workspace)
     now = time.time() if now is None else now
     try:
         age = now - path.stat().st_mtime
