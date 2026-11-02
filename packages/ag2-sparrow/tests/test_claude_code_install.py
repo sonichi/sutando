@@ -282,8 +282,9 @@ class ConnectInstall(ConnectBase):
             rc, _, err = self.install()
         self.assertEqual((rc, "use a shorter config dir" in err), (2, True))
         self.assertFalse(cli.config_path().exists())
-        self.assertEqual(REAL_TMUX_VERSION(run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "tmux 3.6b\n", "")), (3, 6))
-        self.assertIsNone(REAL_TMUX_VERSION(run=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "")))
+        self.assertEqual(REAL_TMUX_VERSION("/x/tmux", run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "tmux 3.6b\n", "")),
+                         (3, 6))
+        self.assertIsNone(REAL_TMUX_VERSION("/x/tmux", run=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "")))
 
     def test_ownership_refusals_are_final_and_name_the_file_to_remove_by_hand(self):
         cli.service_path().parent.mkdir(parents=True)

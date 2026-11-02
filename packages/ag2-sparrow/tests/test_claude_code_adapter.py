@@ -1850,6 +1850,25 @@ class LauncherTmux(ConnectBase):
         self.assertEqual(self.tmux("display-message", "-p", "-t", gen["pane_id"], "#{pane_title}").stdout.strip(),
                          rec["title_token"])
 
+    def test_a_recorded_tmux_behind_a_link_under_spaces_creates_stops_and_recreates_off_path(self):
+        """The managed launch on a PATH without tmux's dir: the recorded TMUX, a link under a path with spaces,
+        for the create, the fenced stop and the next launcher's create."""
+        link = self.home / "app engine" / "bin" / "tmux"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(shutil.which("tmux"))
+        self.configure(TMUX=str(link))
+        self.cfg, path = cli.load_config()[0], os.environ["PATH"]
+        os.environ["PATH"] = "%s:/usr/bin:/bin" % self.bin
+        try:
+            for _ in range(2):
+                lc, rec = self.created()
+                self.assertEqual(lc.tm.tmux, str(link))
+                self.assertEqual(lc.stop_session(rec, "test"), "stopped")
+                self.assertIs(lc.tm.has_session(), False)
+                self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15))
+        finally:
+            os.environ["PATH"] = path
+
     def test_create_reads_the_pane_back_when_the_launchers_environment_has_no_locale(self):
         """The managed job sets no locale; a client without one escapes the TAB pane_fields splits on."""
         with mock.patch.dict(os.environ):
@@ -2539,10 +2558,12 @@ class LocalCommands(ConnectBase):
     """§6: attach is tmux attach on the adapter's socket; stop needs --confirm; verify names what waits."""
 
     def test_attach_execs_tmux_on_the_adapters_own_socket(self):
-        self.configure()
+        self.configure(TMUX=str(self.tmux_bin))
         seen = []
-        with mock.patch.object(os, "execvp", lambda f, argv: seen.append(argv)):
+        with mock.patch.object(os, "execv", lambda f, argv: seen.append([f] + argv)):
             self.main("attach")
+        self.assertEqual(seen[0][:2], [str(self.tmux_bin)] * 2, "the recorded tmux, by its absolute path")
+        seen[0] = seen[0][1:]
         self.assertEqual(seen[0][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
         self.assertNotIn("sutando-tmux", seen[0][3])
         help_text = subprocess.run([sys.executable, "-c", covered_code("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
