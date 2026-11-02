@@ -7,9 +7,11 @@ host's copy. Codex reads AGENTS.md only from its project root down, so a Codex c
 sees the host file. Codex does read `$CODEX_HOME/AGENTS.md` for every session, so this
 links the host file there.
 
-The desktop gives the core its own Codex home. The owner's `~/.codex` is never written,
-recognised by filesystem identity, and nothing already at `$CODEX_HOME/AGENTS.md` (a file,
-another link, a dangling link) or an AGENTS.override.md is removed or replaced.
+It only ever writes into the app-private Codex home the launcher made: every existing
+component of CODEX_HOME must be a real directory (no symlink anywhere, no `..`), each is
+opened without following links, and the walk stops before entering or creating anything
+that is, or would become, the owner's `~/.codex`. Nothing already at
+`$CODEX_HOME/AGENTS.md` is removed or replaced.
 """
 import argparse
 import errno
@@ -28,162 +30,109 @@ def host_instructions(repo):
     return path if path.is_file() else None
 
 
-def _nearest_existing(path):
-    """The nearest existing ancestor of an absolute, `..`-free `path` and the parts below it."""
-    path, rest = Path(path), []
-    while not os.path.lexists(path) and path != path.parent:
-        rest.insert(0, path.name)
-        path = path.parent
-    return path, rest
-
-
-_MAX_LINKS = 40
-
-
-def _resolve_strict(path):
-    """Resolve an existing absolute path one component at a time, as the OS traverses it.
-
-    Raises OSError where the OS would: a missing or non-directory component before `..` or
-    another component, or too many links. Unlike realpath, nothing is collapsed lexically.
-    """
-    todo, resolved, links = path.split(os.sep)[1:], os.sep, 0
-    while todo:
-        part = todo.pop(0)
-        if part in ("", "."):
-            continue
-        if part == "..":
-            resolved = os.path.dirname(resolved)
-            continue
-        step = os.path.join(resolved, part)
-        mode = os.lstat(step).st_mode
-        if stat.S_ISLNK(mode):
-            links += 1
-            if links > _MAX_LINKS:
-                raise OSError(errno.ELOOP, "too many levels of symbolic links", step)
-            target = os.readlink(step)
-            if os.path.isabs(target):
-                resolved = os.sep
-            todo[:0] = target.split(os.sep)
-            continue
-        if any(p not in ("", ".") for p in todo) and not stat.S_ISDIR(mode):
-            raise NotADirectoryError(errno.ENOTDIR, "not a directory", step)
-        resolved = step
-    return resolved
-
-
-def canonical(path):
-    """`path` as the OS resolves it: symlinks before `..`, then the missing rest appended.
-
-    Raises ValueError for a relative path or a `..` in the missing rest, and OSError when the
-    existing part cannot be traversed (a missing or non-directory component, a link loop).
-    """
-    raw = os.fspath(path)
-    if not os.path.isabs(raw):
-        raise ValueError(f"{raw}: not an absolute path")
-    parts = raw.split(os.sep)
-    for cut in range(len(parts), 0, -1):
-        prefix = os.sep.join(parts[:cut]) or os.sep
-        if os.path.lexists(prefix):
-            break
-    rest = [p for p in parts[cut:] if p not in ("", ".")]
-    if ".." in rest:
-        raise ValueError(f"{raw}: '..' below a directory that does not exist")
-    resolved = _resolve_strict(prefix)
-    if rest and not stat.S_ISDIR(os.stat(resolved).st_mode):
-        raise NotADirectoryError(errno.ENOTDIR, "not a directory", resolved)
-    return Path(resolved).joinpath(*rest)
-
-
-def _maybe_same(candidate, owner):
-    """True when `candidate` is `owner`, or when that cannot be told; False only when known not."""
-    try:
-        cst = os.stat(candidate)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    try:
-        ost = os.stat(owner)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return os.path.samestat(cst, ost)
-
-
-def is_owner_codex_home(codex_home, home):
-    """True when `codex_home` is, or would be created as, the owner's `~/.codex` or a path in it.
-
-    Compared on the physical path by filesystem identity, so an alias or case variant counts;
-    a path that cannot be resolved, or an identity that cannot be read, counts too.
-    """
-    owner = Path(home) / ".codex"
-    try:
-        path = canonical(codex_home)
-        for candidate in (path, *path.parents):
-            if _maybe_same(candidate, owner):
-                return True
-        have, rest = _nearest_existing(path)
-        base, missing = _nearest_existing(canonical(owner))
-    except (ValueError, OSError):
-        return True
-    folded = [p.casefold() for p in rest[:len(missing)]]
-    return folded == [p.casefold() for p in missing] and _maybe_same(have, base)
-
-
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
-def _fd_path(fd):
-    """Where an open directory is now, or None when the platform cannot say."""
-    try:
-        import fcntl
-        if hasattr(fcntl, "F_GETPATH"):
-            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
-    except OSError:
-        return None
-    try:
-        return Path(os.readlink(f"/proc/self/fd/{fd}"))
-    except OSError:
-        return None
+def _parts(codex_home):
+    """The components of an absolute, `..`-free CODEX_HOME; ValueError otherwise."""
+    raw = os.path.expanduser(os.fspath(codex_home))
+    if not os.path.isabs(raw):
+        raise ValueError(f"{raw}: not an absolute path")
+    parts = [p for p in raw.split(os.sep) if p not in ("", ".")]
+    if ".." in parts:
+        raise ValueError(f"{raw}: contains '..'")
+    return parts
 
 
-def _open_home(path):
-    """Open `path` without following a symlink at any step below its existing canonical base."""
-    have, rest = _nearest_existing(path)
-    fd = os.open(have, _DIR_FLAGS)
+def _owner_anchor(home):
+    """The identity of `~/.codex`, or of its nearest existing ancestor plus the missing parts.
+
+    Raises OSError when an identity cannot be read; callers treat that as the owner's home.
+    """
+    path, missing = Path(home) / ".codex", []
+    while True:
+        try:
+            st = os.stat(path)
+            return (st.st_dev, st.st_ino), missing
+        except FileNotFoundError:
+            if path == path.parent:
+                raise
+            missing.insert(0, path.name)
+            path = path.parent
+
+
+def _at_owner(fd, anchor, missing, rest):
+    """True when the directory open at `fd`, with `rest` still below it, is or would be ~/.codex."""
     try:
-        for part in rest:
+        st = os.fstat(fd)
+    except OSError:
+        return True
+    if (st.st_dev, st.st_ino) != anchor:
+        return False
+    return [p.casefold() for p in rest[:len(missing)]] == [p.casefold() for p in missing]
+
+
+def _walk(parts, anchor, missing, create):
+    """Descend from `/` one real directory at a time; returns (status, fd or None).
+
+    status is "open", "owner-home", "invalid-home" (a symlink or non-directory component)
+    or, without `create`, "absent" at the first missing component.
+    """
+    fd = os.open(os.sep, _DIR_FLAGS)
+    try:
+        for i in range(len(parts) + 1):
+            if _at_owner(fd, anchor, missing, parts[i:]):
+                return "owner-home", None
+            if i == len(parts):
+                opened, fd = fd, None
+                return "open", opened
             try:
-                os.mkdir(part, dir_fd=fd)
-            except FileExistsError:
-                pass
-            child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+                child = os.open(parts[i], _DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    return "absent", None
+                try:
+                    os.mkdir(parts[i], dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(parts[i], _DIR_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = child
-    except BaseException:
-        os.close(fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return "invalid-home", None
         raise
-    return fd
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
-def _lexists(name, fd):
+def is_owner_codex_home(codex_home, home):
+    """True when `codex_home` is, or would be created as, `~/.codex` or a path in it, or
+    cannot be told apart from one (not absolute, `..`, a symlink, an unreadable identity)."""
     try:
-        os.stat(name, dir_fd=fd, follow_symlinks=False)
+        parts = _parts(codex_home)
+        anchor, missing = _owner_anchor(home)
+        status, fd = _walk(parts, anchor, missing, create=False)
+    except (ValueError, OSError):
         return True
-    except FileNotFoundError:
-        return False
+    if fd is not None:
+        os.close(fd)
+    return status in ("owner-home", "invalid-home")
 
 
 def _active_override(fd):
-    """Codex honours AGENTS.override.md only as a regular file, or a link to one."""
+    """Codex honours AGENTS.override.md only as a regular file it can open; else AGENTS.md."""
     try:
-        return stat.S_ISREG(os.stat("AGENTS.override.md", dir_fd=fd).st_mode)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
+        probe = os.open("AGENTS.override.md", os.O_RDONLY | os.O_NONBLOCK, dir_fd=fd)
     except OSError:
-        return True  # unreadable: assume the owner's override is there
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(probe).st_mode)
+    except OSError:
+        return False
+    finally:
+        os.close(probe)
 
 
 def ensure_linked(codex_home, repo, home):
@@ -196,35 +145,31 @@ def ensure_linked(codex_home, repo, home):
     if source is None:
         return "no-host"
     try:
-        path = canonical(os.path.expanduser(os.fspath(codex_home)))
-    except (ValueError, OSError):
+        parts = _parts(codex_home)
+    except ValueError:
         return "invalid-home"
-    if is_owner_codex_home(path, home):
+    try:
+        anchor, missing = _owner_anchor(home)
+    except OSError:
         return "owner-home"
+    status, fd = _walk(parts, anchor, missing, create=True)
+    if fd is None:
+        return status
     try:
-        fd = _open_home(path)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            return "foreign"  # a component turned into a symlink after the check
-        raise
-    try:
-        # Re-check the directory actually opened; its path may differ from the one checked.
-        where = _fd_path(fd)
-        if is_owner_codex_home(where or path, home):
-            return "owner-home"
-        if where is None and not os.path.samestat(os.fstat(fd), os.stat(path)):
-            return "foreign"
-        # Codex reads an AGENTS.override.md in place of AGENTS.md; the override is the owner's.
         if _active_override(fd):
             return "overridden"
-        if _lexists("AGENTS.md", fd):
-            if not stat.S_ISLNK(os.stat("AGENTS.md", dir_fd=fd, follow_symlinks=False).st_mode):
+        try:
+            mode = os.stat("AGENTS.md", dir_fd=fd, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None:
+            if not stat.S_ISLNK(mode):
                 return "foreign"
             if Path(os.readlink("AGENTS.md", dir_fd=fd)) == source:
                 return "already-set"
             try:
                 os.stat("AGENTS.md", dir_fd=fd)
-            except FileNotFoundError:
+            except OSError:
                 return "dangling"
             return "foreign"
         try:

@@ -85,17 +85,20 @@ The Codex implementation:
   (`src/codex_host_instructions.py`). Codex reads AGENTS.md only from its project
   root down, so without the link a Codex core never sees the host's first-contact
   and Getting started instructions that a Claude core reads from the parent
-  directory. The owner's `~/.codex` is never written: `CODEX_HOME` is resolved to its
-  physical path the way the OS resolves it (symlinks before `..`, one component at a time; a
-  relative path, a `..` below a missing directory, and a path the OS could not traverse,
-  such as a link through a missing or non-directory component, are refused, and an
-  identity that cannot be read counts as the owner's) and refused when that is, or is inside, `~/.codex` by filesystem identity
-  (symlink aliases, `..` detours and case variants count), and every check and write then
-  goes through the opened, re-verified directory, never the alias. Anything already at
+  directory. The link is only ever made in the app-private Codex home the launcher
+  created: `CODEX_HOME` must be absolute, contain no `..`, and have no symlink or
+  non-directory component anywhere. Otherwise it is refused as `invalid-home`, with a
+  warning; a symlinked `CODEX_HOME` is never followed. The helper walks down from `/`
+  one real directory at a time (`O_DIRECTORY|O_NOFOLLOW`, relative to the parent's
+  descriptor). Before each step and before each directory it creates, it compares the
+  open directory's identity with the owner's `~/.codex`, or, while that does not exist
+  yet, with its nearest existing ancestor plus the case-folded missing names. A match,
+  or an identity it cannot read, refuses the link. Anything already at
   `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
-  Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` when it is a regular
-  file or a link to one (a dangling link or a directory there does not count), so when one exists
-  the launcher links nothing, leaves the override as it is and warns that the core reads
+  Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` only when it can
+  open it as a regular file, so a directory, FIFO, dangling or looping link, or an
+  unreadable file there does not count and the link is made. When a readable override
+  exists, the launcher links nothing, leaves it as it is and warns that the core reads
   it instead of the host's file;
 - honors `SUTANDO_CORE_MODEL`, `SUTANDO_CORE_WORKING_DIR`, and the more specific
   `SUTANDO_CODEX_WORKING_DIR`;

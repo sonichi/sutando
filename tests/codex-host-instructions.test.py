@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """A desktop-hosted Codex core gets the host's AGENTS.md through its own Codex home.
 
+The helper only writes into an app-private Codex home whose every existing component is a
+real directory, and never into the owner's ~/.codex.
+
 Run: python3 tests/codex-host-instructions.test.py
 """
 import contextlib
 import errno
 import io
-import types
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,45 +24,62 @@ sys.path.insert(0, str(REPO / "src"))
 import codex_host_instructions as chi  # noqa: E402
 
 SCRIPT = REPO / "src/codex_host_instructions.py"
+DARWIN_MAXSYMLINKS = 32
 
 
-class EnsureLinked(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name).resolve()
-        self.home = root / "home"
-        self.engine = root / "Application Support" / "engine"
+        self.root = Path(self.tmp.name).resolve()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.owner = self.home / ".codex"
+        self.engine = self.root / "Application Support" / "engine"
         self.repo = self.engine / "sutando"
         self.repo.mkdir(parents=True)
         (self.repo / "AGENTS.md").write_text("checkout\n")
         self.host = self.engine / "AGENTS.md"
         self.host.write_text("host\n")
-        self.codex_home = root / "workspace" / ".codex-sutando"
+        self.codex_home = self.root / "workspace" / ".codex-sutando"
         self.target = self.codex_home / "AGENTS.md"
 
     def tearDown(self):
+        for top, dirs, _ in os.walk(self.root):
+            for d in dirs:
+                p = os.path.join(top, d)
+                if not os.path.islink(p):
+                    os.chmod(p, 0o700)
         self.tmp.cleanup()
 
     def tree(self):
         """Every path under the temp root, links included, as a sorted list."""
-        root = Path(self.tmp.name).resolve()
         found = []
-        for top, dirs, files in os.walk(root):
+        for top, dirs, files in os.walk(self.root):
             for name in dirs + files:
-                found.append(os.path.relpath(os.path.join(top, name), root))
+                found.append(os.path.relpath(os.path.join(top, name), self.root))
         return sorted(found)
 
     def link(self, codex_home=None, repo=None):
         return chi.ensure_linked(codex_home or self.codex_home, repo or self.repo, self.home)
 
+    def assert_refused_unchanged(self, codex_home, expected):
+        before = self.tree()
+        self.assertEqual(self.link(codex_home=codex_home), expected)
+        self.assertTrue(chi.is_owner_codex_home(codex_home, self.home))
+        self.assertEqual(self.tree(), before)
+
+
+class Linking(Base):
     def test_a_fresh_codex_home_gets_the_host_file_and_a_rerun_changes_nothing(self):
+        self.assertFalse(chi.is_owner_codex_home(self.codex_home, self.home))
         self.assertEqual(self.link(), "linked")
         self.assertEqual(Path(os.readlink(self.target)), self.host)
         self.assertEqual(self.target.read_text(), "host\n")
         self.assertEqual(self.link(), "already-set")
+        self.assertFalse(chi.is_owner_codex_home(self.codex_home, self.home))
 
     def test_a_checkout_outside_a_desktop_engine_dir_is_left_alone(self):
-        repo = Path(self.tmp.name).resolve() / "code" / "sutando"
+        repo = self.root / "code" / "sutando"
         repo.mkdir(parents=True)
         (repo.parent / "AGENTS.md").write_text("the owner's own\n")
         self.assertEqual(self.link(repo=repo), "no-host")
@@ -68,11 +89,6 @@ class EnsureLinked(unittest.TestCase):
         self.host.unlink()
         self.assertEqual(self.link(), "no-host")
         self.assertFalse(self.target.exists())
-
-    def test_the_owners_own_codex_home_is_never_written(self):
-        owner = self.home / ".codex"
-        self.assertEqual(self.link(codex_home=owner), "owner-home")
-        self.assertFalse((owner / "AGENTS.md").exists())
 
     def test_an_existing_file_or_other_link_is_kept(self):
         self.codex_home.mkdir(parents=True)
@@ -91,11 +107,9 @@ class EnsureLinked(unittest.TestCase):
         gone = self.codex_home / "gone.md"
         self.target.symlink_to(gone)
         self.assertEqual(self.link(), "dangling")
-        self.assertTrue(self.target.is_symlink())
         self.assertEqual(Path(os.readlink(self.target)), gone)
 
     def test_a_dangling_link_swapped_for_an_owners_file_after_the_check_survives(self):
-        """The check sees a dangling link; the owner's file lands before any mutation."""
         self.codex_home.mkdir(parents=True)
         self.target.symlink_to(self.codex_home / "gone.md")
         real_readlink = os.readlink
@@ -108,7 +122,6 @@ class EnsureLinked(unittest.TestCase):
             return answer
         with patch.object(os, "readlink", swap_after_answering):
             self.assertIn(self.link(), ("dangling", "foreign"))
-        self.assertFalse(self.target.is_symlink())
         self.assertEqual(self.target.read_text(), "owner's file\n")
 
     def test_a_missing_target_that_an_owner_creates_before_the_link_survives(self):
@@ -120,37 +133,6 @@ class EnsureLinked(unittest.TestCase):
         with patch.object(os, "symlink", owner_first):
             self.assertEqual(self.link(), "foreign")
         self.assertEqual(self.target.read_text(), "owner's file\n")
-
-    def test_a_symlinked_alias_of_the_owners_codex_home_is_never_written(self):
-        owner = self.home / ".codex"
-        owner.mkdir(parents=True)
-        alias = Path(self.tmp.name).resolve() / "alias-codex"
-        alias.symlink_to(owner)
-        self.assertEqual(self.link(codex_home=alias), "owner-home")
-        self.assertEqual(self.link(codex_home=alias / "sub"), "owner-home")
-        self.assertEqual(os.listdir(owner), [])
-
-    def test_a_case_variant_of_the_owners_codex_home_is_never_written(self):
-        owner = self.home / ".codex"
-        owner.mkdir(parents=True)
-        variant = self.home / ".CODEX"
-        if not variant.exists():
-            self.skipTest("case-sensitive filesystem: .CODEX is a different directory")
-        self.assertEqual(self.link(codex_home=variant), "owner-home")
-        self.assertFalse((owner / "AGENTS.md").exists())
-
-    def test_a_case_variant_is_refused_before_the_owners_home_exists(self):
-        self.home.mkdir(parents=True)
-        self.assertEqual(self.link(codex_home=self.home / ".CODEX"), "owner-home")
-        self.assertFalse((self.home / ".CODEX").exists())
-
-    def test_an_owners_override_is_left_alone_and_reported(self):
-        self.codex_home.mkdir(parents=True)
-        override = self.codex_home / "AGENTS.override.md"
-        override.write_text("owner override\n")
-        self.assertEqual(self.link(), "overridden")
-        self.assertFalse(self.target.exists() or self.target.is_symlink())
-        self.assertEqual(override.read_text(), "owner override\n")
 
     def test_a_concurrent_launch_that_links_first_wins(self):
         real_symlink = os.symlink
@@ -171,130 +153,11 @@ class EnsureLinked(unittest.TestCase):
             self.assertEqual(self.link(), "foreign")
         self.assertEqual(Path(os.readlink(self.target)), other)
 
-    def test_an_alias_to_a_directory_inside_the_owners_codex_home_is_refused(self):
-        sub = self.home / ".codex" / "sub"
-        sub.mkdir(parents=True)
-        alias = Path(self.tmp.name).resolve() / "alias-sub"
-        alias.symlink_to(sub)
-        self.assertEqual(self.link(codex_home=alias), "owner-home")
-        self.assertEqual(self.link(codex_home=alias / "deeper"), "owner-home")
-        self.assertEqual(sorted(p.name for p in (self.home / ".codex").rglob("*")), ["sub"])
-
-    def test_an_alias_retargeted_to_the_owners_codex_home_after_the_check_writes_nothing_there(self):
-        owner = self.home / ".codex"
-        owner.mkdir(parents=True)
-        safe = Path(self.tmp.name).resolve() / "safe-home"
-        safe.mkdir()
-        alias = Path(self.tmp.name).resolve() / "alias-home"
-        alias.symlink_to(safe)
-        real_check = chi.is_owner_codex_home
-
-        def retarget_after_check(*a, **k):
-            answer = real_check(*a, **k)
-            if os.readlink(alias) != str(owner):
-                alias.unlink()
-                alias.symlink_to(owner)
-            return answer
-        with patch.object(chi, "is_owner_codex_home", retarget_after_check):
-            result = self.link(codex_home=alias)
-        self.assertEqual(os.listdir(owner), [], result)
-        self.assertEqual(result, "linked")
-        self.assertEqual(Path(os.readlink(safe / "AGENTS.md")), self.host)
-
-    def test_an_alias_through_dotdot_into_the_owners_codex_home_is_refused(self):
-        sub = self.home / ".codex" / "sub"
-        sub.mkdir(parents=True)
-        detour = Path(self.tmp.name).resolve() / "x"
-        detour.mkdir()
-        alias = Path(self.tmp.name).resolve() / "alias-dotdot"
-        alias.symlink_to(f"{detour}/../{self.home.name}/.codex/sub")
-        self.assertEqual(self.link(codex_home=alias), "owner-home")
-        self.assertEqual(sorted(p.name for p in (self.home / ".codex").rglob("*")), ["sub"])
-
-    def test_aliases_into_an_absent_owner_codex_home_are_refused_and_create_nothing(self):
-        self.home.mkdir(parents=True)
-        owner = self.home / ".codex"
-        root = Path(self.tmp.name).resolve()
-        for name, dest in (("to-owner", owner), ("to-owner-sub", owner / "sub"),
-                           ("to-dotdot", f"{root}/x/../{self.home.name}/.codex/sub")):
-            with self.subTest(alias=name):
-                alias = root / name
-                alias.symlink_to(dest)
-                # A link to a missing directory cannot be traversed, so it is refused unresolved.
-                before = self.tree()
-                self.assertEqual(self.link(codex_home=alias), "invalid-home")
-                self.assertEqual(self.link(codex_home=alias / "deeper"), "invalid-home")
-                self.assertTrue(chi.is_owner_codex_home(alias, self.home))
-                self.assertEqual(self.tree(), before)
-                self.assertFalse(os.path.lexists(owner), f"{name} created the owner's home")
-
-    def test_an_alias_then_dotdot_to_the_owners_codex_home_is_refused(self):
-        """alias/../.codex resolves the alias first, as the OS does: it is ~/.codex."""
-        (self.home / ".codex").mkdir(parents=True)
-        (self.home / "child").mkdir()
-        elsewhere = Path(self.tmp.name).resolve() / "elsewhere"
-        elsewhere.mkdir()
-        alias = elsewhere / "alias"
-        alias.symlink_to(self.home / "child")
-        spelled = f"{alias}/../.codex"
-        resolved = Path(os.path.realpath(spelled))
-        self.assertTrue(os.path.samefile(resolved, self.home / ".codex"))
-        before = self.tree()
-        self.assertEqual(self.link(codex_home=spelled), "owner-home")
-        self.assertEqual(self.tree(), before)
-        self.assertEqual(os.listdir(resolved), [])
-        self.assertFalse(os.path.lexists(elsewhere / ".codex"), "lexical location created")
-
-    def test_an_alias_then_dotdot_links_into_the_directory_the_os_resolves(self):
-        root = Path(self.tmp.name).resolve()
-        real_parent = root / "real-parent"
-        (real_parent / "child").mkdir(parents=True)
-        (real_parent / "codex-home").mkdir()
-        elsewhere = root / "elsewhere"
-        elsewhere.mkdir()
-        alias = elsewhere / "alias"
-        alias.symlink_to(real_parent / "child")
-        spelled = f"{alias}/../codex-home"
-        resolved = Path(os.path.realpath(spelled))
-        self.assertEqual(resolved, real_parent / "codex-home")
-        self.assertEqual(self.link(codex_home=spelled), "linked")
-        self.assertTrue((resolved / "AGENTS.md").is_symlink())
-        self.assertEqual(Path(os.readlink(resolved / "AGENTS.md")), self.host)
-        self.assertEqual((resolved / "AGENTS.md").read_text(), "host\n")
-        self.assertFalse(os.path.lexists(elsewhere / "codex-home"), "lexical location created")
-        self.assertEqual(sorted(os.listdir(elsewhere)), ["alias"])
-
-    def test_a_relative_codex_home_is_refused_and_creates_nothing(self):
-        before = self.tree()
-        self.assertEqual(self.link(codex_home="rel-home"), "invalid-home")
-        self.assertTrue(chi.is_owner_codex_home("rel-home", self.home))
-        self.assertEqual(self.tree(), before)
-        self.assertFalse(os.path.lexists("rel-home"))
-
-    def test_dotdot_below_a_missing_directory_is_refused_before_anything_is_created(self):
-        spelled = f"{self.codex_home}/missing/../x"
-        before = self.tree()
-        self.assertEqual(self.link(codex_home=spelled), "invalid-home")
-        self.assertTrue(chi.is_owner_codex_home(spelled, self.home))
-        self.assertEqual(self.tree(), before)
-        self.assertFalse(os.path.lexists(self.codex_home.parent))
-
-    def test_fd_path_reads_f_getpath(self):
-        fake = types.SimpleNamespace(F_GETPATH=50, fcntl=lambda fd, op, buf: b"/some/dir\0junk")
-        with patch.dict(sys.modules, {"fcntl": fake}):
-            self.assertEqual(chi._fd_path(3), Path("/some/dir"))
-
-        def broken(fd, op, buf):
-            raise OSError(errno.EBADF, "bad fd")
-        with patch.dict(sys.modules, {"fcntl": types.SimpleNamespace(F_GETPATH=50, fcntl=broken)}):
-            self.assertIsNone(chi._fd_path(3))
-
-    def test_fd_path_falls_back_to_proc_then_to_none(self):
-        with patch.dict(sys.modules, {"fcntl": types.SimpleNamespace()}):
-            with patch.object(os, "readlink", return_value="/proc/dir"):
-                self.assertEqual(chi._fd_path(3), Path("/proc/dir"))
-            with patch.object(os, "readlink", side_effect=OSError(errno.ENOENT, "no proc")):
-                self.assertIsNone(chi._fd_path(3))
+        def vanished(src, dst, *a, **k):
+            raise FileExistsError(dst)
+        self.target.unlink()
+        with patch.object(os, "symlink", vanished):
+            self.assertEqual(self.link(), "foreign")
 
     def test_a_directory_created_concurrently_is_opened(self):
         real_mkdir = os.mkdir
@@ -306,134 +169,196 @@ class EnsureLinked(unittest.TestCase):
             self.assertEqual(self.link(), "linked")
         self.assertTrue(self.target.is_symlink())
 
-    def test_a_failed_open_closes_the_parent_and_raises(self):
-        real_open, real_close, closed = os.open, os.close, []
+    def test_an_unexpected_open_error_is_raised(self):
+        real_open = os.open
 
-        def fail_child(path, flags, *a, **k):
-            if k.get("dir_fd") is not None:
-                raise PermissionError(errno.EACCES, "denied")
+        def denied(path, flags, *a, **k):
+            if path == "workspace":
+                raise PermissionError(errno.EACCES, "denied", path)
             return real_open(path, flags, *a, **k)
-
-        def track(fd):
-            closed.append(fd)
-            real_close(fd)
-        with patch.object(os, "open", fail_child), patch.object(os, "close", track):
+        with patch.object(os, "open", denied):
             with self.assertRaises(PermissionError):
                 self.link()
-        self.assertEqual(len(closed), 1)
+            self.assertTrue(chi.is_owner_codex_home(self.codex_home, self.home))
 
-    def test_a_component_that_became_a_symlink_is_foreign_and_other_errors_raise(self):
-        with patch.object(chi, "_open_home", side_effect=OSError(errno.ELOOP, "loop")):
-            self.assertEqual(self.link(), "foreign")
-        with patch.object(chi, "_open_home", side_effect=OSError(errno.EACCES, "denied")):
-            with self.assertRaises(OSError):
-                self.link()
 
-    def test_the_opened_directory_is_rechecked_against_the_owners_home(self):
-        owner = self.home / ".codex"
-        owner.mkdir(parents=True)
-        with patch.object(chi, "_fd_path", return_value=owner):
-            self.assertEqual(self.link(), "owner-home")
-        self.assertEqual(os.listdir(owner), [])
-        self.assertFalse(self.target.exists())
+class OwnerGuard(Base):
+    def test_the_owners_codex_home_and_paths_in_it_are_never_written(self):
+        (self.owner / "sub").mkdir(parents=True)
+        for spelled in (self.owner, self.owner / "sub", self.owner / "sub" / "new"):
+            with self.subTest(path=str(spelled)):
+                self.assert_refused_unchanged(spelled, "owner-home")
 
-    def test_without_an_fd_path_the_opened_directory_must_match_by_identity(self):
-        with patch.object(chi, "_fd_path", return_value=None):
-            with patch.object(os.path, "samestat", return_value=False):
-                self.assertEqual(self.link(), "foreign")
-            self.assertFalse(self.target.exists())
-            self.assertEqual(self.link(), "linked")
+    def test_an_absent_owners_codex_home_is_refused_before_it_is_created(self):
+        for spelled in (self.owner, self.owner / "sub", self.home / ".CODEX" / "sub"):
+            with self.subTest(path=str(spelled)):
+                self.assert_refused_unchanged(spelled, "owner-home")
+                self.assertFalse(os.path.lexists(self.owner))
 
-    def _untraversable(self, name, target, error):
-        root = Path(self.tmp.name).resolve()
-        (root / "target").mkdir()
-        (root / "a-file").write_text("x\n")
-        alias = root / name
-        alias.symlink_to(target)
-        with self.assertRaises(error):
-            os.stat(alias)  # the OS cannot traverse it
-        before = self.tree()
-        self.assertEqual(self.link(codex_home=alias), "invalid-home")
-        self.assertEqual(self.link(codex_home=alias / "deeper"), "invalid-home")
-        self.assertTrue(chi.is_owner_codex_home(alias, self.home))
-        self.assertEqual(self.tree(), before)
-        self.assertFalse(os.path.lexists(root / "target" / "AGENTS.md"))
+    def test_a_case_variant_of_an_existing_owners_codex_home_is_never_written(self):
+        self.owner.mkdir()
+        variant = self.home / ".CODEX"
+        if not variant.exists():
+            self.skipTest("case-sensitive filesystem: .CODEX is a different directory")
+        self.assert_refused_unchanged(variant, "owner-home")
 
-    def test_a_link_through_a_missing_component_is_invalid_and_creates_nothing(self):
-        self._untraversable("alias-missing", "missing/../target", FileNotFoundError)
-
-    def test_a_link_through_a_file_is_invalid_and_creates_nothing(self):
-        self._untraversable("alias-file", "a-file/../target", NotADirectoryError)
-
-    def test_a_home_below_a_regular_file_is_invalid(self):
-        (Path(self.tmp.name).resolve() / "a-file").write_text("x\n")
-        self.assertEqual(self.link(codex_home=Path(self.tmp.name).resolve() / "a-file" / "home"),
-                         "invalid-home")
-
-    def test_a_link_loop_is_invalid(self):
-        root = Path(self.tmp.name).resolve()
-        (root / "loop-a").symlink_to(root / "loop-b")
-        (root / "loop-b").symlink_to(root / "loop-a")
-        self.assertEqual(self.link(codex_home=root / "loop-a" / "home"), "invalid-home")
-
-    def test_strict_resolution_follows_links_like_the_os(self):
-        root = Path(self.tmp.name).resolve()
-        (root / "d" / "e").mkdir(parents=True)
-        (root / "rel").symlink_to("d/e")
-        (root / "abs").symlink_to(root / "d")
-        for spelled in (f"{root}/rel/..", f"{root}/abs/e/./..", f"{root}/rel/../e", "/.."):
-            with self.subTest(spelled=spelled):
-                self.assertEqual(chi._resolve_strict(spelled), os.path.realpath(spelled))
+    def test_an_owners_codex_home_reached_through_its_own_symlink_is_refused(self):
+        real = self.root / "real-codex"
+        real.mkdir()
+        self.owner.symlink_to(real)
+        self.assert_refused_unchanged(real / "sub", "owner-home")
 
     def test_an_unreadable_owner_identity_fails_closed_without_any_mutation(self):
-        """EIO where samefile() would stat: the candidate is the existing ~/.codex itself."""
-        owner = self.home / ".codex"
-        owner.mkdir(parents=True)
+        self.owner.mkdir()
         real_stat = os.stat
 
         def eio_for_owner(path, *a, **k):
-            if os.fspath(path) == os.fspath(owner):
+            if os.fspath(path) == os.fspath(self.owner):
                 raise OSError(errno.EIO, "I/O error", os.fspath(path))
             return real_stat(path, *a, **k)
-        with self.assertRaises(OSError):
-            with patch.object(os, "stat", eio_for_owner):
-                os.path.samefile(owner, owner)
-        before = self.tree()
         mutation = AssertionError("mutated the filesystem")
+        before = self.tree()
         with patch.object(os, "stat", eio_for_owner), \
                 patch.object(os, "mkdir", side_effect=mutation) as mkdir, \
                 patch.object(os, "open", side_effect=mutation) as opened, \
                 patch.object(os, "symlink", side_effect=mutation) as symlink:
-            self.assertEqual(self.link(codex_home=owner), "owner-home")
+            self.assertEqual(self.link(codex_home=self.owner), "owner-home")
             self.assertEqual(self.link(), "owner-home")
             self.assertTrue(chi.is_owner_codex_home(self.codex_home, self.home))
         for call in (mkdir, opened, symlink):
             call.assert_not_called()
         self.assertEqual(self.tree(), before)
 
-    def test_an_unreadable_candidate_identity_fails_closed(self):
-        real_stat = os.stat
+    def test_an_unreadable_directory_identity_during_the_walk_fails_closed(self):
+        with patch.object(os, "fstat", side_effect=OSError(errno.EIO, "I/O error")):
+            self.assert_refused_unchanged(self.codex_home, "owner-home")
 
-        def eio_for_candidate(path, *a, **k):
-            if os.fspath(path) == os.fspath(self.engine):
-                raise OSError(errno.EIO, "I/O error", os.fspath(path))
-            return real_stat(path, *a, **k)
-        with patch.object(os, "stat", eio_for_candidate):
-            self.assertTrue(chi.is_owner_codex_home(self.engine / "home", self.home))
+    def test_the_owner_anchor_walks_up_to_an_existing_ancestor(self):
+        anchor, missing = chi._owner_anchor(self.root / "no" / "such-home")
+        st = os.stat(self.root)
+        self.assertEqual((anchor, missing), ((st.st_dev, st.st_ino), ["no", "such-home", ".codex"]))
+        with patch.object(os, "stat", side_effect=FileNotFoundError(errno.ENOENT, "gone")):
+            with self.assertRaises(FileNotFoundError):
+                chi._owner_anchor(self.home)
 
-    def test_identity_of_a_missing_candidate_or_owner_is_known_different(self):
-        self.assertFalse(chi._maybe_same(self.engine / "nope", self.host))
-        self.assertFalse(chi._maybe_same(self.host, self.home / ".codex"))
-        self.assertTrue(chi._maybe_same(self.host, self.host))
 
-    def test_only_a_regular_override_file_overrides(self):
-        def regular(p):
-            p.write_text("owner\n")
+class NoSymlinkScope(Base):
+    def test_any_symlink_component_is_invalid_and_creates_nothing(self):
+        (self.owner / "sub").mkdir(parents=True)
+        (self.root / "real-parent" / "child").mkdir(parents=True)
+        (self.root / "real-parent" / "codex-home").mkdir()
+        (self.root / "a-file").write_text("x\n")
+        cases = {
+            "to-owner": self.owner,
+            "to-owner-sub": self.owner / "sub",
+            "to-absent": self.root / "nowhere",
+            "to-plain-dir": self.root / "real-parent" / "codex-home",
+            "through-missing": "missing/../real-parent",
+            "through-file": "a-file/../real-parent",
+            "file-dot": "a-file/.",
+        }
+        for name, dest in cases.items():
+            alias = self.root / name
+            alias.symlink_to(dest)
+            for spelled in (alias, alias / "deeper"):
+                with self.subTest(alias=name, path=str(spelled)):
+                    self.assert_refused_unchanged(spelled, "invalid-home")
+        self.assertEqual(os.listdir(self.owner), ["sub"])
+        self.assertFalse(os.path.lexists(self.root / "real-parent" / "codex-home" / "AGENTS.md"))
 
-        def link_to_regular(p):
+    def test_a_symlinked_intermediate_component_is_invalid(self):
+        (self.root / "real" / "mid").mkdir(parents=True)
+        (self.root / "via").symlink_to(self.root / "real")
+        self.assert_refused_unchanged(self.root / "via" / "mid" / "home", "invalid-home")
+        self.assertEqual(os.listdir(self.root / "real" / "mid"), [])
+
+    def test_a_chain_longer_than_darwins_limit_is_invalid(self):
+        (self.root / "end").mkdir()
+        prev = self.root / "end"
+        for i in range(DARWIN_MAXSYMLINKS + 1):
+            link = self.root / f"chain-{i}"
+            link.symlink_to(prev)
+            prev = link
+        if sys.platform == "darwin":
+            with self.assertRaises(OSError) as raised:
+                os.stat(prev)
+            self.assertEqual(raised.exception.errno, errno.ELOOP)
+        self.assert_refused_unchanged(prev, "invalid-home")
+        self.assertEqual(os.listdir(self.root / "end"), [])
+
+    def test_a_dotdot_or_a_relative_path_is_invalid(self):
+        (self.root / "real").mkdir()
+        for spelled in (f"{self.root}/real/../real", f"{self.codex_home}/missing/../x", "rel-home"):
+            with self.subTest(path=spelled):
+                self.assert_refused_unchanged(spelled, "invalid-home")
+        self.assertFalse(os.path.lexists("rel-home"))
+
+    def test_a_home_below_a_regular_file_is_invalid(self):
+        (self.root / "a-file").write_text("x\n")
+        self.assert_refused_unchanged(self.root / "a-file" / "home", "invalid-home")
+
+    def test_eloop_and_enotdir_from_a_component_open_are_both_invalid(self):
+        real_open = os.open
+        for code in (errno.ELOOP, errno.ENOTDIR):
+            def fail(path, flags, *a, _code=code, **k):
+                if path == "workspace":
+                    raise OSError(_code, os.strerror(_code), path)
+                return real_open(path, flags, *a, **k)
+            with self.subTest(errno=errno.errorcode[code]):
+                with patch.object(os, "open", fail):
+                    self.assert_refused_unchanged(self.codex_home, "invalid-home")
+
+    def test_an_intermediate_swapped_to_the_owners_home_mid_walk_creates_nothing_there(self):
+        """`mid` becomes a link to ~/.codex after the checks, before the first directory open."""
+        (self.owner / "deep").mkdir(parents=True)
+        mid = self.root / "safe" / "mid"
+        (mid / "deep").mkdir(parents=True)
+        real_open, swapped = os.open, []
+
+        def swap_first(path, flags, *a, **k):
+            if not swapped:
+                swapped.append(True)
+                (mid / "deep").rmdir()
+                mid.rmdir()
+                mid.symlink_to(self.owner)
+            return real_open(path, flags, *a, **k)
+        with patch.object(os, "open", swap_first):
+            self.assertEqual(self.link(codex_home=mid / "deep" / "new"), "invalid-home")
+        self.assertEqual(sorted(p.name for p in self.owner.rglob("*")), ["deep"])
+        self.assertTrue(mid.is_symlink())
+
+
+class Overrides(Base):
+    def make_home(self, name):
+        home = self.root / f"home-{name}"
+        home.mkdir()
+        return home, home / "AGENTS.override.md"
+
+    def shape(self, path):
+        st = os.lstat(path)
+        return (st.st_mode, st.st_ino, os.readlink(path) if os.path.islink(path) else None)
+
+    def check(self, name, make, expected):
+        home, override = self.make_home(name)
+        make(override)
+        before = self.shape(override)
+        self.assertEqual(self.link(codex_home=home), expected)
+        self.assertEqual(self.shape(override), before, "the override was touched")
+        if expected == "linked":
+            self.assertEqual(Path(os.readlink(home / "AGENTS.md")), self.host)
+        else:
+            self.assertFalse(os.path.lexists(home / "AGENTS.md"))
+
+    def test_a_readable_regular_file_overrides(self):
+        self.check("regular", lambda p: p.write_text("owner\n"), "overridden")
+
+    def test_a_link_to_a_readable_regular_file_overrides(self):
+        def make(p):
             (p.parent / "real.md").write_text("owner\n")
             p.symlink_to(p.parent / "real.md")
+        self.check("link-to-regular", make, "overridden")
 
+    def test_overrides_codex_ignores_do_not_block_the_link(self):
         def directory(p):
             p.mkdir()
 
@@ -443,41 +368,104 @@ class EnsureLinked(unittest.TestCase):
         def link_to_directory(p):
             (p.parent / "real-dir").mkdir()
             p.symlink_to(p.parent / "real-dir")
-        for name, make, expected in (("regular", regular, "overridden"),
-                                     ("link-to-regular", link_to_regular, "overridden"),
-                                     ("directory", directory, "linked"),
-                                     ("dangling", dangling, "linked"),
-                                     ("link-to-directory", link_to_directory, "linked")):
+
+        def self_loop(p):
+            p.symlink_to(p.name)
+
+        def long_chain(p):
+            (p.parent / "real.md").write_text("owner\n")
+            prev = p.parent / "real.md"
+            for i in range(DARWIN_MAXSYMLINKS + 8):
+                link = p.parent / f"hop-{i}"
+                link.symlink_to(prev)
+                prev = link
+            p.symlink_to(prev)
+
+        def fifo(p):
+            os.mkfifo(p)
+        cases = [("directory", directory), ("dangling", dangling),
+                 ("link-to-directory", link_to_directory), ("self-loop", self_loop),
+                 ("long-chain", long_chain), ("fifo", fifo)]
+        for name, make in cases:
             with self.subTest(override=name):
-                home = Path(self.tmp.name).resolve() / f"home-{name}"
-                home.mkdir()
-                override = home / "AGENTS.override.md"
-                make(override)
-                shape = (os.path.islink(override), os.readlink(override) if os.path.islink(override)
-                         else None, os.path.isdir(override), override.read_text()
-                         if override.is_file() else None)
-                self.assertEqual(self.link(codex_home=home), expected)
-                self.assertEqual((os.path.islink(override), os.readlink(override)
-                                  if os.path.islink(override) else None, os.path.isdir(override),
-                                  override.read_text() if override.is_file() else None),
-                                 shape, "the override was touched")
-                if expected == "linked":
-                    self.assertEqual(Path(os.readlink(home / "AGENTS.md")), self.host)
-                else:
-                    self.assertFalse(os.path.lexists(home / "AGENTS.md"))
+                self.check(name, make, "linked")
 
-    def test_an_unreadable_override_is_treated_as_present(self):
-        self.codex_home.mkdir(parents=True)
-        real_stat = os.stat
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read mode 000")
+    def test_an_unreadable_regular_override_does_not_block_the_link(self):
+        def make(p):
+            p.write_text("owner\n")
+            os.chmod(p, 0)
+        self.check("mode-000", make, "linked")
 
-        def eacces(path, *a, **k):
-            if os.fspath(path) == "AGENTS.override.md":
+    def test_an_override_open_or_stat_error_does_not_block_the_link(self):
+        home, override = self.make_home("eacces")
+        override.write_text("owner\n")
+        real_open = os.open
+
+        def eacces(path, flags, *a, **k):
+            if path == "AGENTS.override.md":
                 raise PermissionError(errno.EACCES, "denied", path)
-            return real_stat(path, *a, **k)
-        with patch.object(os, "stat", eacces):
-            self.assertEqual(self.link(), "overridden")
-        self.assertFalse(os.path.lexists(self.target))
+            return real_open(path, flags, *a, **k)
+        with patch.object(os, "open", eacces):
+            self.assertEqual(self.link(codex_home=home), "linked")
+        (home / "AGENTS.md").unlink()
+        real_fstat, probes = os.fstat, []
 
+        def record(path, flags, *a, **k):
+            fd = real_open(path, flags, *a, **k)
+            if path == "AGENTS.override.md":
+                probes.append(fd)
+            return fd
+
+        def fstat_fails_on_probe(fd):
+            if fd in probes:
+                raise OSError(errno.EIO, "I/O error")
+            return real_fstat(fd)
+        with patch.object(os, "open", record), patch.object(os, "fstat", fstat_fails_on_probe):
+            self.assertEqual(self.link(codex_home=home), "linked")
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(override.read_text(), "owner\n")
+
+
+class DesktopLayout(Base):
+    COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh",
+              "src/sutando_config.py", "sutando.config.json")
+
+    def test_the_codex_home_the_desktop_configures_is_all_real_directories_and_links(self):
+        app = self.root / "app-support"
+        engine = app / "engine"
+        checkout = engine / "sutando"
+        for rel in self.COPIED:
+            (checkout / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO / rel, checkout / rel)
+        (checkout / "src" / "__init__.py").touch()
+        (engine / "AGENTS.md").write_text("host\n")
+        workspace = app / "workspace"
+        workspace.mkdir()
+        (checkout / "workspace").symlink_to("../../workspace")
+        # The layer the desktop writes for its app-private Codex home.
+        (workspace / "sutando.config.local.json").write_text(json.dumps({"core_config_dirs": [
+            {"env_name": "CLAUDE_CONFIG_DIR", "id": "claude-default", "synced": True,
+             "type": "claude", "value": "${WORKSPACE_DIR}/.claude-sutando"},
+            {"env_name": "CODEX_HOME", "id": "codex-app", "synced": False,
+             "type": "codex", "value": "${WORKSPACE_DIR}/.codex-sutando"}]}))
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("SUTANDO_", "CODEX_", "CLAUDE_"))}
+        env.update({"HOME": str(self.home), "SUTANDO_APP_SUPPORT": str(app)})
+        out = subprocess.run(["bash", str(checkout / "scripts/sutando-config.sh"),
+                              "core-config-dir-value", "codex"],
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        value = Path(out.stdout.strip())
+        self.assertEqual(value, workspace / ".codex-sutando")
+        value.mkdir()  # as start-cli.sh does before the helper runs
+        for prefix in (value, *value.parents):
+            self.assertFalse(os.path.islink(prefix), f"{prefix} is a symlink")
+        self.assertEqual(chi.ensure_linked(value, checkout, self.home), "linked")
+        self.assertEqual((value / "AGENTS.md").read_text(), "host\n")
+
+
+class Cli(Base):
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with patch.object(Path, "home", return_value=self.home), \
@@ -492,9 +480,8 @@ class EnsureLinked(unittest.TestCase):
         self.assertEqual((rc, out.strip()), (0, "already-set"))
 
     def test_main_returns_1_and_reports_an_os_error(self):
-        self.codex_home.parent.mkdir(parents=True)
-        self.codex_home.write_text("a file where the Codex home should be\n")
-        rc, out, err = self.main(self.codex_home, self.repo)
+        with patch.object(chi, "ensure_linked", side_effect=OSError(errno.EIO, "I/O error")):
+            rc, out, err = self.main(self.codex_home, self.repo)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("codex host instructions:", err)
 

@@ -741,31 +741,37 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("could not record Codex project trust", result.stderr)
         self.assertFalse((self.root / "codex-home" / "config.toml").exists())
 
-    def test_a_desktop_hosted_core_gets_the_hosts_agents_md_in_its_codex_home(self):
-        """Codex never reads AGENTS.md above its project root, so the desktop's own
-        first-contact and Getting started instructions reach the core only this way."""
-        engine = Path(self.tmp.name) / "app-support" / "engine"
+    def _desktop_hosted(self):
+        """The fixture as a desktop install, its Codex home on a symlink-free physical path."""
+        base = Path(self.tmp.name).resolve()
+        engine = base / "app-support" / "engine"
         hosted = engine / "sutando"
         shutil.copytree(self.root, hosted, symlinks=True)
         self.root = hosted
         (engine / "AGENTS.md").write_text("# Sutando in AG2 Space\n")
+        home = base / "app-support" / "workspace" / ".codex-sutando"
+        config = json.loads((hosted / "sutando.config.json").read_text())
+        config["core_config_dirs"][0]["value"] = str(home)
+        (hosted / "sutando.config.json").write_text(json.dumps(config))
+        return home
+
+    def test_a_desktop_hosted_core_gets_the_hosts_agents_md_in_its_codex_home(self):
+        """Codex never reads AGENTS.md above its project root, so the desktop's own
+        first-contact and Getting started instructions reach the core only this way."""
+        home = self._desktop_hosted()
         self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
         self.fake_core_pane("codex")
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("could not link the host's AGENTS.md", result.stderr)
-        linked = Path(self.tmp.name) / "repo" / "codex-home" / "AGENTS.md"
+        self.assertNotIn("the host's AGENTS.md was not linked", result.stderr)
+        linked = home / "AGENTS.md"
         self.assertTrue(linked.is_symlink(), result.stdout)
         self.assertEqual(linked.read_text(), "# Sutando in AG2 Space\n")
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
 
     def test_an_override_in_the_codex_home_is_kept_and_reported(self):
-        engine = Path(self.tmp.name) / "app-support" / "engine"
-        hosted = engine / "sutando"
-        shutil.copytree(self.root, hosted, symlinks=True)
-        self.root = hosted
-        (engine / "AGENTS.md").write_text("# Sutando in AG2 Space\n")
-        home = Path(self.tmp.name) / "repo" / "codex-home"
+        home = self._desktop_hosted()
         home.mkdir(parents=True, exist_ok=True)
         (home / "AGENTS.override.md").write_text("owner\n")
         self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
