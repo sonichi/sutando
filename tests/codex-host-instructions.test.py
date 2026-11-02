@@ -75,11 +75,63 @@ class EnsureLinked(unittest.TestCase):
         self.assertEqual(self.link(), "foreign")
         self.assertEqual(Path(os.readlink(self.target)), other)
 
-    def test_a_dangling_link_is_replaced(self):
+    def test_a_dangling_link_is_reported_and_never_touched(self):
+        self.codex_home.mkdir(parents=True)
+        gone = self.codex_home / "gone.md"
+        self.target.symlink_to(gone)
+        self.assertEqual(self.link(), "dangling")
+        self.assertTrue(self.target.is_symlink())
+        self.assertEqual(Path(os.readlink(self.target)), gone)
+
+    def test_a_dangling_link_swapped_for_an_owners_file_after_the_check_survives(self):
+        """The check sees a dangling link; the owner's file lands before any mutation."""
         self.codex_home.mkdir(parents=True)
         self.target.symlink_to(self.codex_home / "gone.md")
-        self.assertEqual(self.link(), "linked")
-        self.assertEqual(Path(os.readlink(self.target)), self.host)
+        real_exists = Path.exists
+
+        def swap_after_answering(path, *a, **k):
+            answer = real_exists(path, *a, **k)
+            if path == self.target and path.is_symlink():
+                os.unlink(self.target)
+                self.target.write_text("owner's file\n")
+            return answer
+        with patch.object(Path, "exists", swap_after_answering):
+            self.assertEqual(self.link(), "dangling")
+        self.assertFalse(self.target.is_symlink())
+        self.assertEqual(self.target.read_text(), "owner's file\n")
+
+    def test_a_missing_target_that_an_owner_creates_before_the_link_survives(self):
+        real_symlink = Path.symlink_to
+
+        def owner_first(path, src, *a, **k):
+            path.write_text("owner's file\n")
+            return real_symlink(path, src, *a, **k)
+        with patch.object(Path, "symlink_to", owner_first):
+            self.assertEqual(self.link(), "foreign")
+        self.assertEqual(self.target.read_text(), "owner's file\n")
+
+    def test_a_symlinked_alias_of_the_owners_codex_home_is_never_written(self):
+        owner = self.home / ".codex"
+        owner.mkdir(parents=True)
+        alias = Path(self.tmp.name).resolve() / "alias-codex"
+        alias.symlink_to(owner)
+        self.assertEqual(self.link(codex_home=alias), "owner-home")
+        self.assertEqual(self.link(codex_home=alias / "sub"), "owner-home")
+        self.assertEqual(os.listdir(owner), [])
+
+    def test_a_case_variant_of_the_owners_codex_home_is_never_written(self):
+        owner = self.home / ".codex"
+        owner.mkdir(parents=True)
+        variant = self.home / ".CODEX"
+        if not variant.exists():
+            self.skipTest("case-sensitive filesystem: .CODEX is a different directory")
+        self.assertEqual(self.link(codex_home=variant), "owner-home")
+        self.assertFalse((owner / "AGENTS.md").exists())
+
+    def test_a_case_variant_is_refused_before_the_owners_home_exists(self):
+        self.home.mkdir(parents=True)
+        self.assertEqual(self.link(codex_home=self.home / ".CODEX"), "owner-home")
+        self.assertFalse((self.home / ".CODEX").exists())
 
     def test_an_owners_override_is_left_alone_and_reported(self):
         self.codex_home.mkdir(parents=True)
@@ -88,18 +140,6 @@ class EnsureLinked(unittest.TestCase):
         self.assertEqual(self.link(), "overridden")
         self.assertFalse(self.target.exists() or self.target.is_symlink())
         self.assertEqual(override.read_text(), "owner override\n")
-
-    def test_a_dangling_link_removed_by_a_concurrent_launch_is_tolerated(self):
-        self.codex_home.mkdir(parents=True)
-        self.target.symlink_to(self.codex_home / "gone.md")
-        real_unlink = Path.unlink
-
-        def raced(path, *a, **k):
-            real_unlink(path)
-            raise FileNotFoundError(str(path))
-        with patch.object(Path, "unlink", raced):
-            self.assertEqual(self.link(), "linked")
-        self.assertEqual(Path(os.readlink(self.target)), self.host)
 
     def test_a_concurrent_launch_that_links_first_wins(self):
         real_symlink = Path.symlink_to

@@ -305,6 +305,7 @@ ensure_codex_host_instructions() {
     case "$out" in
       linked) echo "  ✓ Codex core given the host's AGENTS.md" ;;
       overridden) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
+      dangling) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.md is a broken link; remove it so the core gets the host's AGENTS.md" >&2 ;;
       foreign) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.md is not the host's; the core reads that file instead" >&2 ;;
     esac
   else
