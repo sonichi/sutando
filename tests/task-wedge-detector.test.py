@@ -10,10 +10,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / 'tests'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ()
+REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / 'src'))
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 import wedge_detector as detector
