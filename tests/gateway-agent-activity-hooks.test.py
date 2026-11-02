@@ -530,6 +530,11 @@ class Hooks(unittest.TestCase):
         self.assertEqual(gw._commit_ack(tid, claim, _ack(tid, 1)), "recorded")
         self.assertEqual(gw._commit_ack(tid, twin, _ack(tid, 1)), "stale")
         self.assertFalse([m for m in self.logs if "no longer holds" in m], "its twin recorded it: nothing to say")
+        for label, other, answer in (("another op", gw.task_attempts.Claim({**claim, "op": "ack-other"}), _ack(tid, 1)),
+                                     ("another generation", twin, _ack(tid, 3))):
+            self.logs.clear()
+            self.assertEqual(gw._commit_ack(tid, other, answer), "stale")
+            self.assertTrue([m for m in self.logs if "no longer holds" in m], f"{label} is no twin: it is logged")
         stale = gw._claim_ack(gone, "L1", local=gone, durable=True)
         self.forget(gone)
         self.assertEqual(gw._commit_ack(gone, stale, _ack(gone, 1)), "stale")
@@ -543,6 +548,15 @@ class Hooks(unittest.TestCase):
         self.assertEqual(gw._commit_ack(legacy, twin, no_gen), "stale")
         self.assertFalse([m for m in self.logs if f"{legacy}: ack for a serve" in m],
                          "an answer naming no generation keeps the bound one: still its twin")
+        switched = "task-twin-switch"
+        self.addCleanup(self.forget, switched)
+        self.held(switched, gen_answer=2)                               # generation 1 under L1, L2 held
+        claim, twin = (gw._claim_ack(switched, "L2", local=switched, durable=True) for _ in range(2))
+        self.assertEqual(claim["op"], twin["op"])
+        self.assertEqual(gw._commit_ack(switched, claim, _ack(switched, 2)), "recorded", "the switch to generation 2")
+        self.assertEqual(gw._commit_ack(switched, twin, _ack(switched, 2)), "stale")
+        self.assertFalse([m for m in self.logs if f"{switched}: ack for a serve" in m],
+                         "the switch recorded this op: its twin is quiet")
         settled = "task-twin-settled"
         self.addCleanup(self.forget, settled)
         self.assertTrue(gw._take_served_task(_task(settled, lease_id="L1", source_event_id="$e"), set(), []))
