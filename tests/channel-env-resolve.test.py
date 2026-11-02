@@ -563,11 +563,6 @@ class TestActiveLane(_Base):
         channels = self._install(dir_line=False)
         self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
 
-    def test_lane_dir_decoding(self):
-        self.assertEqual(m.lane_channel_dir("s_dspace"), "s.space")
-        self.assertEqual(m.lane_channel_dir("a_hb_uc_dd"), "a-b_c.d")
-        self.assertEqual(m.lane_channel_dir("plain"), "plain")
-
     def test_a_primary_token_in_the_device_file_still_wins(self):
         channels = self._install()
         device = channels / "ag2space" / ".env"
@@ -597,18 +592,48 @@ class TestActiveLane(_Base):
         device.write_text(self.LANE_TOKEN + "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=../outside\n")
         self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
 
-    def test_a_dir_line_naming_the_device_channel_is_skipped(self):
+    def test_a_dir_line_naming_the_device_channel_is_refused(self):
         channels = self._install(dir_line=False)
-        os.environ["REMOTE_TASK_CHANNEL_DIR_S_DSPACE"] = "ag2space"
-        self.addCleanup(os.environ.pop, "REMOTE_TASK_CHANNEL_DIR_S_DSPACE", None)
-        self.assertEqual(m.lane_channel_dirs("s_dspace"), ["ag2space", "s.space"])
-        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
+        (channels / "ag2space" / "relay-client.env").write_text(TOKEN_LINE)
+        os.environ["AG2_DEVICE_ENV"] = str(channels / "ag2space" / ".env")
+        with unittest.mock.patch.dict(os.environ, {"REMOTE_TASK_CHANNEL_DIR_S_DSPACE": "ag2space"}):
+            # The ag2space dir is the primary's; a lane never resolves back into it.
+            self.assertIsNone(m.resolve_active_lane_env(channels))
+
+    def test_a_signed_out_lane_is_not_followed(self):
+        channels = self._install()
+        (channels / "ag2space" / ".env").write_text("REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n")
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+
+    def test_a_lane_key_in_the_environment_counts_as_signed_in(self):
+        channels = self._install()
+        (channels / "ag2space" / ".env").unlink()
+        with unittest.mock.patch.dict(os.environ, {"AG2_REMOTE_TOKEN_S_DSPACE": "https://x.test|y"}):
+            self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
 
     def test_no_lane_reader_resolves_nothing(self):
         channels = self._install()
         with unittest.mock.patch.dict(sys.modules, {"gateway_serving": None}):
             self.assertIsNone(m._active_lane())
             self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+        with unittest.mock.patch.dict(sys.modules, {"connections": None}), \
+                unittest.mock.patch.object(m, "_active_lane", return_value="s_dspace"):
+            self.assertIsNone(m.resolve_active_lane_env(channels))
+
+    def test_a_legacy_row_room_lookup_never_gets_the_lane_file(self):
+        import connections
+        channels = self._install()
+        legacy = {"instance": "", "server": "ag2.example.test"}
+        with unittest.mock.patch.object(connections, "connection_for_room", return_value=legacy):
+            self.assertIsNone(m.resolve_room_channel_env(channels, "ag2space", "!r:ag2.example.test"))
+
+    def test_a_lane_row_room_lookup_gets_the_lane_dir(self):
+        import connections
+        channels = self._install(dir_line=False)
+        row = {"instance": "s_dspace", "server": "s.example.test"}
+        with unittest.mock.patch.object(connections, "connection_for_room", return_value=row):
+            self.assertEqual(m.resolve_room_channel_env(channels, "ag2space", "!r:s.example.test"),
+                             channels / "s.space" / ".env")
 
     def test_launch_keys_are_still_read_from_the_device_file(self):
         channels = self._install()

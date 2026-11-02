@@ -182,6 +182,23 @@ class TokenDerivation(unittest.TestCase):
         self.assertEqual(C.token_ref_for(""), "REMOTE_TASK_TOKEN")
         self.assertEqual(C.channel_dir_for("dev", {}), "dev-ag2space")
         self.assertEqual(C.channel_dir_for("s-space", {"REMOTE_TASK_CHANNEL_DIR_S_SPACE": "custom"}), "custom")
+        # A desktop sign-in lane names its server escaped; its dir is the decoded name.
+        self.assertEqual(C.channel_dir_for("s_dspace", {}), "s.space")
+        self.assertEqual(C.channel_dir_for("a_hb_uc_dd", {}), "a-b_c.d")
+        self.assertEqual(C.channel_dir_for("s_dspace", {"REMOTE_TASK_CHANNEL_DIR_S_DSPACE": "x"}), "x")
+
+    def test_lane_channel_dir_reads_env_then_launch_file_then_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / ".env"
+            f.write_text("REMOTE_TASK_CHANNEL_DIR_S_DSPACE='from-file'\n")
+            self.assertEqual(C.lane_channel_dir("s_dspace", {"REMOTE_TASK_CHANNEL_DIR_S_DSPACE": "env"},
+                                                launch_file=f), "env")
+            self.assertEqual(C.lane_channel_dir("s_dspace", {}, launch_file=f), "from-file")
+            f.write_text("")
+            self.assertEqual(C.lane_channel_dir("s_dspace", {}, launch_file=f), "s.space")
+        with unittest.mock.patch.object(C, "_launch_file_value", return_value="launched") as read:
+            self.assertEqual(C.lane_channel_dir("dev", {}), "launched")
+        read.assert_called_once_with("REMOTE_TASK_CHANNEL_DIR_DEV")
 
 
 class Preview(unittest.TestCase):
