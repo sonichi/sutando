@@ -550,21 +550,43 @@ class Hooks(unittest.TestCase):
         self.assertIn("SECURITY NOTICE", text, "the secret notice still comes with it")
         intercept.assert_not_called()
 
-    def test_a_saved_copy_redacts_the_wake_and_the_question_with_the_questions_own_cleaner(self):
+    def test_a_held_question_is_redacted_once_and_comes_back_unchanged_after_a_restart(self):
+        tid = "task-reserve-question"
+        self.addCleanup(self.forget, tid)
+        q = {"question_id": "rq_once", "expected_revision": 1, "prompt": f"use {self.TOKEN}?", "can_answer": True,
+             "options": [{"id": "o1", "label": "vault set K hunter2secret"}]}
+        once, types = gw._redacted_question(q)
+        self.assertEqual(len(types), 2, "the token's type and the vault command")
+        fake, inflight = self.served_acked(tid), {tid}
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", room_question=q)), (tid, True))
+        env = json.loads(self.saved(tid).read_text())
+        self.assertEqual(env["task"]["room_question"], once, "saved as the one redaction left it")
+        self.assertEqual(env["cleaned"], sorted(types), "with everything that redaction found")
+        self.assertNotIn(gw.QUESTION_REDACTED, env["task"])
+        fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        gw._ATTEMPTS.take_ownership()                                   # a restart before it runs
+        gw._post_task_beats(inflight, force=True)
+        text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
+        self.assertIn(gw.task_attempts.render_room_question(once), text, "published unchanged")
+        self.assertIn(gw.secret_handling_instruction("AG2Space", types).strip("\n"), text, "every type named")
+        self.assertNotIn(gw.QUESTION_REDACTED, text)
+
+    def test_a_saved_copy_redacts_the_wake_and_keeps_the_question_as_its_one_redaction_left_it(self):
         wake = {"blocker_episode_id": "ep_1", "resolved_blockers": [
             {"question_id": "rq_1", "outcome": "answered", "answered_by": "@t:x",
-             "answer": {"kind": "text", "form_id": self.TOKEN, "text": f"vault set K hunter2secret {self.TOKEN}"}}]}
-        q = {"question_id": "rq_2", "expected_revision": 1, "prompt": f"use {self.TOKEN}?",
-             "options": [{"id": "o1", "label": "vault set K hunter2secret"}], self.TOKEN: "a key"}
-        out, found = gw._cleaned_for_reserve(_task("task-c", wake=wake, room_question=q))
+             "answer": {"kind": "text", "form_id": self.TOKEN, "text": f"vault set K hunter2secret {self.TOKEN}"}},
+            {self.TOKEN: "a key"}]}
+        once, types = gw._redacted_question({"question_id": "rq_2", "prompt": f"use {self.TOKEN}?"})
+        out, found = gw._cleaned_for_reserve(_task("task-c", wake=wake, room_question=once,
+                                                   **{gw.QUESTION_REDACTED: list(types)}))
         flat = json.dumps(out)
         for s in (self.TOKEN, "hunter2secret"):
             self.assertNotIn(s, flat, "every string, ids and dict keys included")
-        self.assertEqual(out["room_question"], gw._redacted_question(q)[0], "one cleaner for the question")
+        self.assertEqual(out["room_question"], once, "not redacted a second time")
         self.assertEqual(out["wake"]["blocker_episode_id"], "ep_1")
-        self.assertIn("vault-set command", found)
-        named, _ = gw._cleaned_for_reserve(_task("task-c", room_question={**q, "question_id": self.TOKEN}))
-        self.assertIsNone(named["room_question"], "a question named by a secret is not kept")
+        self.assertTrue(set(types) <= set(found) and "vault-set command" in found)
+        self.assertNotIn(gw.QUESTION_REDACTED, out)
 
     def test_a_broker_field_never_marks_a_task_as_already_redacted(self):
         tid = "task-reserve-forged"

@@ -5943,13 +5943,15 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     task = {**task, "id": tid}
     if run is None:
         task.pop(RESERVE_CLEANED, None)         # only a saved serve's own copy carries it
+    task.pop(QUESTION_REDACTED, None)
     if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
         task["task_id"] = broker_tid
     question_found: tuple = ()
-    if "room_question" in task:
-        # Sanitized before any durable writer, a held serve's saved copy included; unused when off.
+    if "room_question" in task and not isinstance(task.get(RESERVE_CLEANED), list):
+        # Sanitized once, before any durable writer; a redacted saved copy's question already was.
         task["room_question"], question_found = (_redacted_question(task["room_question"])
                                                  if TURN_CONTEXT else (None, ()))
+        task[QUESTION_REDACTED] = list(question_found)
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication
         task = {**task, "id": tid}
@@ -6046,7 +6048,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if isinstance(_cleaned, list):
                 # Its vault commands were redacted when it was saved; intercepting the placeholder
                 # would report a key as not stored.
-                _secret_types = tuple(sorted({str(t) for t in _cleaned}))
+                _secret_types = tuple(sorted(set(_secret_types) | {str(t) for t in _cleaned}))
             elif sender_tier == "owner" and _intercept_fn is not None:
                 try:
                     _vault_result = _intercept_fn(_fetched)
@@ -6264,19 +6266,18 @@ _RESERVE_ID_RE = re.compile(r"v1-[0-9a-f]{32}")
 RESERVE_CLEANED = "reserve_cleaned"
 # 2: the copy is redacted, and the envelope's `cleaned` lists what was found.
 _RESERVE_FORMAT = 2
+# What the question's one redaction found, carried to the saved copy's `cleaned`; never rendered.
+QUESTION_REDACTED = "room_question_redacted"
 
 
 def _cleaned_for_reserve(task: dict) -> "tuple[dict, list]":
     """(the copy of a held serve that may be saved, what its redaction found): its body, media
-    markers included, its wake and its room question redacted."""
-    found: set = set()
-    out = {k: v for k, v in task.items() if k != RESERVE_CLEANED}
+    markers included, and its wake redacted; its room question was redacted as the task came in."""
+    found = {str(t) for t in task.get(QUESTION_REDACTED) or ()}
+    out = {k: v for k, v in task.items() if k not in (RESERVE_CLEANED, QUESTION_REDACTED)}
     for f in ("task", "wake"):
         if f in out:
             out[f] = _redact_quoted(out[f], found)
-    if "room_question" in out:
-        out["room_question"], qfound = _redacted_question(out["room_question"])
-        found.update(qfound)
     return out, sorted(found)
 
 
