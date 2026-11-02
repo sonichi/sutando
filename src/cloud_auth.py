@@ -288,7 +288,8 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
             return CloudAuth(base, tok, stamp_user_id=stamped, credential_user_ids=(uid,))
         if uid and uid not in others:
             others.append(uid)
-    if others:
+    # A credential we could not check may be the stamped user's: that is unverified, not changed.
+    if others and not unknown:
         return CloudAuth(None, None, "account_changed", stamped, others)
     # Only dead or unsendable credentials left is plainly signed out, not a cloud outage.
     return CloudAuth(None, None, "account_unverified" if unknown else None, stamped if unknown else None)

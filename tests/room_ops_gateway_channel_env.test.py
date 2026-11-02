@@ -125,6 +125,27 @@ class ChannelEnvLocator(_Base):
                                           "REMOTE_TASK_CHANNEL_DIR": "dev-ag2space"}):
             self.assertIsNone(_gateway._channel_env_file())
 
+    def test_secondary_lane_only_install_resolves_the_lane_token(self):
+        # The device file holds only the lane's suffixed launch key; the lane's own dir has the token.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        channels = os.path.join(d, "channels")
+        os.makedirs(os.path.join(channels, "ag2space"))
+        os.makedirs(os.path.join(channels, "s.space"))
+        device = os.path.join(channels, "ag2space", ".env")
+        with open(device, "w") as fh:
+            fh.write("AG2_REMOTE_TOKEN_S_DSPACE=https://gw.example/relay|lane-secret\n"
+                     "REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n")
+        with open(os.path.join(channels, "s.space", ".env"), "w") as fh:
+            fh.write("AG2_REMOTE_TOKEN=https://gw.example/relay|lane-secret\n")
+        with open(os.path.join(channels, "active-gateway-lane"), "w") as fh:
+            fh.write("s_dspace\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d, "SUTANDO_APP_SUPPORT": d,
+                                          "AG2_DEVICE_ENV": device}):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
     def test_none_when_absent(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)

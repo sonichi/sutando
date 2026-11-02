@@ -948,6 +948,34 @@ class Hook(unittest.TestCase):
             got = [wins.get(timeout=5) for _ in procs]
             self.assertEqual(sum(got), 1, f"round {n}: {got}")
 
+    def test_show_step_with_neither_a_line_nor_a_phase_writes_nothing(self):
+        hook, calls = self._hook(), []
+        self.assertEqual(hook.show_step(Path(tempfile.mkdtemp()), {"id": "task-a"}, "!r:x", None, None,
+                                        lambda cmd, **k: calls.append(cmd)), [])
+        self.assertEqual(calls, [])
+
+    def test_show_step_survives_a_failing_marker(self):
+        hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
+        run = lambda cmd, **k: calls.append(cmd)  # noqa: E731
+        with patch.object(pl, "note_line_shown", side_effect=OSError("disk")):
+            self.assertEqual(hook.show_step(ws, {"id": "task-a"}, "!r:x", "Running tests", "Run x", run),
+                             [("working", "Run x")], "the step line is still written")
+        with patch.object(pl, "show_phase_if_new", side_effect=OSError("disk")):
+            self.assertEqual(hook.show_step(ws, {"id": "task-a"}, "!r:x", "Running tests", None, run), [])
+        self.assertEqual(len(calls), 1)
+
+    def test_the_hook_finds_the_phase_module_off_its_own_path(self):
+        hook = self._hook()
+        scripts = str(REPO / "skills" / "agent-activity" / "scripts")
+        with patch.object(sys, "path", [p for p in sys.path if p != scripts]):
+            self.assertIs(hook._phase_line(), pl)
+            self.assertIn(scripts, sys.path)
+
+    def test_an_unwritable_marker_records_nothing(self):
+        blocker = Path(tempfile.mkdtemp()) / "a-file"
+        blocker.write_text("")
+        self.assertFalse(pl._record_shown(blocker / "sub" / "task-a.shown", "Reading files"))
+
     def test_the_hook_survives_a_broken_phase_module(self):
         hook = self._hook()
         with patch.object(pl, "on_step", side_effect=RuntimeError("boom")):

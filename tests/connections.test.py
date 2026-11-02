@@ -182,6 +182,38 @@ class TokenDerivation(unittest.TestCase):
         self.assertEqual(C.token_ref_for(""), "REMOTE_TASK_TOKEN")
         self.assertEqual(C.channel_dir_for("dev", {}), "dev-ag2space")
         self.assertEqual(C.channel_dir_for("s-space", {"REMOTE_TASK_CHANNEL_DIR_S_SPACE": "custom"}), "custom")
+        # Underscored engine instances keep their own dir; only the active desktop lane is decoded.
+        self.assertEqual(C.channel_dir_for("my_dev", {}), "my_dev-ag2space")
+        self.assertEqual(C.channel_dir_for("team_hub", {}), "team_hub-ag2space")
+
+    def test_lane_channel_dir_reads_env_then_launch_file_then_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / ".env"
+            f.write_text("REMOTE_TASK_CHANNEL_DIR_S_DSPACE='from-file'\n")
+            self.assertEqual(C.lane_channel_dir("s_dspace", {"REMOTE_TASK_CHANNEL_DIR_S_DSPACE": "env"},
+                                                launch_file=f), "env")
+            self.assertEqual(C.lane_channel_dir("s_dspace", {}, launch_file=f), "from-file")
+            f.write_text("")
+            with unittest.mock.patch.object(C, "_is_active_desktop_lane", return_value=True):
+                self.assertEqual(C.lane_channel_dir("s_dspace", {}, launch_file=f), "s.space")
+                self.assertEqual(C.lane_channel_dir("a_hb_uc_dd", {}, launch_file=f), "a-b_c.d")
+                self.assertEqual(C.lane_channel_dir("plain", {}, launch_file=f), "plain-ag2space")
+            for inst in ("my_dev", "team_hub", "s_dspace"):
+                self.assertEqual(C.lane_channel_dir(inst, {}, launch_file=f), inst + "-ag2space")
+
+    def test_only_the_active_desktop_lane_is_decoded(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "channels").mkdir()
+            (Path(d) / "channels" / "active-gateway-lane").write_text("s_dspace\n")
+            with unittest.mock.patch.dict(os.environ, {"SUTANDO_APP_SUPPORT": d}):
+                self.assertTrue(C._is_active_desktop_lane("s_dspace"))
+                self.assertFalse(C._is_active_desktop_lane("my_dev"))
+                self.assertFalse(C._is_active_desktop_lane(""))
+        with unittest.mock.patch.dict(sys.modules, {"gateway_serving": None}):
+            self.assertFalse(C._is_active_desktop_lane("s_dspace"))
+        with unittest.mock.patch.object(C, "_launch_file_value", return_value="launched") as read:
+            self.assertEqual(C.lane_channel_dir("dev", {}), "launched")
+        read.assert_called_once_with("REMOTE_TASK_CHANNEL_DIR_DEV")
 
 
 class Preview(unittest.TestCase):
