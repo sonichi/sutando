@@ -94,6 +94,37 @@ check("same messages either way — selection is unchanged, only rendering",
 check("CONTROL: `| tail -1` on oldest_first yields the NEWEST message",
       r_old["messages"][-1]["body"] == "newest", f"got {r_old['messages'][-1]['body']}")
 
+# 5b. #6176: the gateway pulls a replied-to message up behind its reply, so its order is not
+#     chronological. The result declares newest_first, and `limit` keeps the newest.
+CHAINED = [{"sender": "@a:x", "ts": 400, "body": "reply", "event_id": "$4", "in_reply_to": "$1"},
+           {"sender": "@a:x", "ts": 100, "body": "replied-to", "event_id": "$1"},
+           {"sender": "@a:x", "ts": 300, "body": "between-2", "event_id": "$3"},
+           {"sender": "@a:x", "ts": 200, "body": "between-1", "event_id": "$2"}]
+
+
+def read_bodies(payload, **kw):
+    rr.http_request = lambda *a, **k: (200, __import__("json").dumps({"messages": payload}).encode(), {})
+    return [m["body"] for m in rr.read_room("!r:x", "@me:x", gate=_open_gate, **kw)["messages"]]
+
+
+got = read_bodies(CHAINED, limit=4)
+check("a reply chain is read newest first by timestamp",
+      got == ["reply", "between-2", "between-1", "replied-to"], f"got {got}")
+got = read_bodies(CHAINED, limit=2)
+check("...and the limit keeps the newest messages, not the replied-to one", got == ["reply", "between-2"],
+      f"got {got}")
+got = read_bodies(CHAINED, limit=4, oldest_first=True)
+check("...and oldest_first is the same, reversed", got == ["replied-to", "between-1", "between-2", "reply"],
+      f"got {got}")
+TIED = [{"sender": "@a:x", "ts": 5, "body": "first", "event_id": "$a"},
+        {"sender": "@a:x", "ts": 5, "body": "second", "event_id": "$b"}]
+got = read_bodies(TIED, limit=2)
+check("equal timestamps keep the gateway's order", got == ["first", "second"], f"got {got}")
+UNDATED = [dict(CHAINED[0]), {k: v for k, v in CHAINED[1].items() if k != "ts"}, dict(CHAINED[2])]
+got = read_bodies(UNDATED, limit=3)
+check("CONTROL: with a message lacking a numeric ts, the gateway's order is kept, not guessed",
+      got == ["reply", "replied-to", "between-2"], f"got {got}")
+
 # 6. Drive the CLI dispatch itself. String-matching room_ops.py source left the
 #    `oldest_first=a.oldest_first` line uncovered, which is how it reached CI.
 
