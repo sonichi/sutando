@@ -1186,14 +1186,30 @@ def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
     if not (task_dir / f"{tid}.txt").is_file():
         print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
         return None
-    # A run of its own (a newer generation or a wake) is delivered under the item its ledger names.
+    return result_dir, task_dir, tid, item, instance
+
+
+def _delivered_item(cfg: dict, tid: str, instance: str, item: str) -> "str | None":
+    """The outbox item the running drain delivers `tid` under: under lifecycle 2 a run of its own (a
+    wake or a newer generation) has the item its ledger names, else the task's own `item`. None,
+    after printing why, when that cannot be told."""
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    run_item = task_attempts.TaskAttempts(state_dir, suffix=gateway_instance.suffix(instance)).run_item(tid)
-    if run_item is task_attempts.UNKNOWN:
+    lane = _live_lane_record(cfg, instance)
+    if lane is not None and lane.get("lifecycle") != 2:
+        return item                             # the running drain keeps no ledger: its own item
+    run = task_attempts.TaskAttempts(state_dir, suffix=gateway_instance.suffix(instance)).run_item(tid)
+    if lane is None:
+        if run is None or run is task_attempts.UNKNOWN:
+            return item
+        print(f"error: Sparrow is not running, and its ledger names {tid} a run of its own, whose item "
+              "depends on how Sparrow starts; nothing written, start Sparrow and run it again",
+              file=sys.stderr)
+        return None
+    if run is task_attempts.UNKNOWN:
         print(f"error: Sparrow's attempt ledger in {state_dir} cannot be read, so {tid}'s outbox item is "
               "unknown; nothing written, run it again", file=sys.stderr)
         return None
-    return result_dir, task_dir, tid, run_item or item, instance
+    return run or item
 
 
 def _hold_notice(result_dir: Path, tid: str) -> Path:
@@ -1572,6 +1588,9 @@ def _answer(args, read_body, silent: bool) -> int:
     body, why = read_body(args)
     if body is None:
         print(f"error: {why}", file=sys.stderr)
+        return 2
+    item = _delivered_item(cfg, tid, instance, item)
+    if item is None:
         return 2
     done = "settled" if silent else "posted"
     root = gateway_instance.outbox_root(result_dir, instance)

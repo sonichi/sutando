@@ -29,7 +29,7 @@ REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / 'packages' / 'ag2-sparrow'
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw
+from ag2_sparrow import agent_identity, delivery_destination, gateway_instance, outbox, remote_gateway_bridge as gw
 from ag2_sparrow.adapters.hatch import task_fields
 
 TID = 'task-1784700000001'
@@ -148,14 +148,20 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertIn('NOT settled', err)
         self.assertEqual(self.inflight, {self.tid})
 
-    def wake_run(self, base_delivered=False):
-        """A lifecycle-v2 wake: its run's own task file, delivered under the episode's item."""
+    def lane(self, lifecycle=None):
+        """The running drain's lane record, as the bridge publishes it, naming its lifecycle."""
+        agent_identity.publish_lane(self.home / 'state', self.instance, '@agent:ag2.space',
+                                    send_lock=delivery_destination.SEND_LOCK_PROTOCOL, lifecycle=lifecycle)
+
+    def wake_run(self, base_delivered=False, bridge_keeps_ledger=True):
+        """A wake opened in a lifecycle-2 ledger: its run's own task file, and the episode's item."""
         from ag2_sparrow import task_attempts
         att = task_attempts.TaskAttempts(self.home / 'state', log=lambda *_: None)  # where the CLI reads it
         att.take_ownership()
-        stack = contextlib.ExitStack()
-        stack.enter_context(patch.object(gw, '_ATTEMPTS', att))
-        self.addCleanup(stack.close)
+        if bridge_keeps_ledger:
+            stack = contextlib.ExitStack()
+            stack.enter_context(patch.object(gw, '_ATTEMPTS', att))
+            self.addCleanup(stack.close)
         if base_delivered:
             outbox.record_delivered(self.results / '.outbox', TID)
         with att.transition(TID) as t:
@@ -170,6 +176,7 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         for base_delivered in (False, True):
             with self.subTest(base_delivered=base_delivered):
                 self.start()
+                self.lane(lifecycle=2)
                 item = self.wake_run(base_delivered)
                 rc, out, err = self.reply('', 'no-reply')
                 self.assertEqual(rc, 0, out + err)
@@ -177,6 +184,30 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
                 self.assertEqual(outbox.item_status(self.results / '.outbox', item), 'DELIVERED')
                 self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls], [('[no-send]', True)])
                 self.assertEqual(self.inflight, set())
+
+    def test_with_lifecycle_2_off_a_ledger_left_behind_is_never_read(self):
+        for ledger in ('valid', 'damaged'):
+            with self.subTest(ledger=ledger):
+                self.start()
+                self.lane()                                   # the running drain keeps no ledger
+                self.wake_run(bridge_keeps_ledger=False)
+                if ledger == 'damaged':
+                    (self.home / 'state' / 'relay-task-ledger.json').write_text('{not json')
+                rc, out, err = self.reply('', 'no-reply')
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
+                self.assertEqual(outbox.item_status(self.results / '.outbox', TID), 'DELIVERED',
+                                 'the drain delivers it under the task\'s own item')
+                self.assertEqual(self.inflight, set())
+
+    def test_with_no_running_drain_a_run_the_ledger_names_is_not_guessed(self):
+        self.start()
+        self.wake_run()
+        rc, out, err = self.reply('', 'no-reply')
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn('Sparrow is not running', err)
+        self.assertFalse((self.results / f'{self.tid}.txt').exists(), 'nothing written')
+        self.assertEqual(self.server.calls, [])
 
     def test_a_skip_behind_a_redirect_is_refused_before_anything_is_sent(self):
         self.start()

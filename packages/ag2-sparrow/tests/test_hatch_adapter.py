@@ -3435,6 +3435,16 @@ class StartSparrow(Base):
             self.assertTrue(line.endswith(" listener=up restarted=0"), line)
         self.assertIsNone(old.poll(), "a drain whose lock declares the protocol is never replaced")
 
+    def test_the_drains_lane_record_states_lifecycle_2_only_when_it_runs_it(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        for lifecycle in (2, None):
+            with self.subTest(lifecycle=lifecycle), mock.patch.object(gb, "_STATE", self.state), \
+                    mock.patch.object(gb, "_log"), mock.patch.object(gb, "_reenroll_identity", return_value=AGENT), \
+                    mock.patch.object(gb, "_LANE_LIFECYCLE", lifecycle), mock.patch.dict(gb._LANE_OWNED, clear=True):
+                gb._lane_identity()
+                self.assertEqual(agent_identity.published_lane_record(self.state, "").get("lifecycle"), lifecycle,
+                                 "republished as soon as it differs")
+
     def test_keepawake_judges_a_declaring_lock_by_its_protocol_and_its_process(self):
         want = keepalive.health_command(str(self.reply_stub))
         for proto, start, restarted in ((delivery_destination.SEND_LOCK_PROTOCOL - 1, "own", 1),
@@ -5085,15 +5095,20 @@ class Reply(Base):
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.result_file.read_text(), "hi")
 
-    def test_an_unreadable_attempt_ledger_writes_nothing(self):
-        ledger = self.home / "state" / "relay-task-ledger.json"
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-        ledger.write_text("{not json")
-        for cmd in (self.no_reply, lambda *a: self.reply(*a, "--body", "hi")):
-            r = cmd(str(self.result_file), "--wait", "0")
-            self.assertEqual(r.returncode, 2, r.stderr)
-            self.assertIn("attempt ledger", r.stderr)
-            self.assertFalse(self.result_file.exists(), "its outbox item is unknown: nothing written")
+    def test_an_unreadable_attempt_ledger_writes_nothing_only_when_the_drain_keeps_one(self):
+        from ag2_sparrow import agent_identity, delivery_destination
+        state = self.home / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "relay-task-ledger.json").write_text("{not json")
+        for lifecycle, rc in ((2, 2), (None, 3)):
+            with self.subTest(lifecycle=lifecycle):
+                self.result_file.unlink(missing_ok=True)
+                shutil.rmtree(self.results / ".hatch-reply-claims", ignore_errors=True)
+                agent_identity.publish_lane(state, "", "@agent:ag2.space",
+                                            send_lock=delivery_destination.SEND_LOCK_PROTOCOL, lifecycle=lifecycle)
+                r = self.no_reply(str(self.result_file), "--wait", "0")
+                self.assertEqual(r.returncode, rc, r.stderr)
+                self.assertEqual(self.result_file.exists(), rc == 3, "written only when its item is known")
 
     def test_no_reply_refuses_an_overlong_reason(self):
         r = self.no_reply(str(self.result_file), "--reason", "x" * 201)
@@ -5293,6 +5308,14 @@ class Hold(Base):
                 {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time(),
                  **({"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if self.send_lock else {})}))
         return env
+
+    def test_hold_never_reads_the_attempt_ledger(self):
+        self.add_task(self.TID, "$ev1")
+        ledger = self.home / "state" / "relay-task-ledger.json"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("{not json")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
 
     def armed_mark(self):
         """A notice record whose generation a hold armed, as a hold that stood leaves it."""

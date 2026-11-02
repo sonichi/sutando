@@ -7727,6 +7727,10 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     return None
 
 
+# Stated in the lane record so Hatch's reply waits on the item this drain delivers a run under.
+_LANE_LIFECYCLE = 2 if LIFECYCLE_V2 else None
+
+
 def _lane_identity() -> str:
     """The identity the deliverability predicate uses, republished whenever this instance's lane
     record does not say it or is due a heartbeat, so Hatch judges rooms by it without reading the
@@ -7737,10 +7741,12 @@ def _lane_identity() -> str:
     rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
     if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip() \
             or rec.get("send_lock") != _delivery_destination.SEND_LOCK_PROTOCOL \
+            or rec.get("lifecycle") != _LANE_LIFECYCLE \
             or time.time() - rec.get("ts", 0) >= agent_identity.LANE_REFRESH_S:
         try:
             _LANE_OWNED.update(agent_identity.publish_lane(
-                _STATE, GATEWAY_INSTANCE, identity, send_lock=_delivery_destination.SEND_LOCK_PROTOCOL))
+                _STATE, GATEWAY_INSTANCE, identity, send_lock=_delivery_destination.SEND_LOCK_PROTOCOL,
+                lifecycle=_LANE_LIFECYCLE))
             _LANE_OWNED["failing"] = False
         except OSError as e:  # publish_lane has already tried to invalidate the old record
             if not _LANE_OWNED.get("failing"):
