@@ -7,7 +7,7 @@ parametrised by this adapter's Shape. `install` records the paths, mints the ses
 bridge's claude-local HITL store root and the canonical work root in a 0600 config, writes the unit
 or the plist, has the manager start it, and confirms a fresh holder of the root. With no explicit root,
 the root is the agent's own, `<agents dir>/<segment of its id>`, and install wires the agent's bridge to
-it: a unit of its own, or a declaration a host supervisor runs (`_dirs.bridge_host`). `connect --base --code`
+it: a unit of its own, or a declaration a host supervisor runs (`_dirs.bridge_host`). `connect --base --agent --code`
 checks the machine, redeems AG2 Space's one-time code for the agent's relay credential, has the credential
 owner write it to the agent's seat beside its root, then runs install with that seat. `run` is the managed
 launcher (`run --launchd` is launchd's entry shim); `hold` is the pane's own command; `inbox` is the
@@ -274,7 +274,7 @@ def connect(args) -> int:
     """Preflight, redeem the code into the agent's seat beside its root (connect_bridge's), then install
     exactly as `install` does with the seat's .env as the token env file."""
     seat, problem = cb.redeem_into_seat(args.base, args.code, args.trust_relay_host, lambda: connect_preflight(args),
-                                         LOCAL)
+                                         LOCAL, args.agent)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -574,6 +574,8 @@ def main(argv=None) -> int:
     c.add_argument("--base", required=True, help="the s.space backend URL the code was issued by")
     c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
+    c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for, as "
+                   "s.space's connect command names it; without it connect refuses and the code is not used")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when s.space told you to)")
     session_options(c)

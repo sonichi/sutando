@@ -147,8 +147,8 @@ def _claude_local_tmux_off_path(d, bindir, py, env):
         store.chmod(0o755)
         if not link.is_symlink():
             link.symlink_to(store)
-        r = subprocess.run([cmd, "connect", "--base", "https://127.0.0.1:9", "--code", "-", "--claude", str(claude),
-                            "--tmux", tmux], input="acp.never-redeemed\n", capture_output=True, text=True, cwd=d,
+        r = subprocess.run([cmd, "connect", "--base", "https://127.0.0.1:9", "--agent", "@probe:ag2.space", "--code", "-",
+                            "--claude", str(claude), "--tmux", tmux], input="acp.never-redeemed\n", capture_output=True, text=True, cwd=d,
                            env=cenv, timeout=60)
         assert r.returncode == 2 and why in r.stderr and "the code was not used" in r.stderr, r.stderr
         assert "could not reach" not in r.stderr, r.stderr

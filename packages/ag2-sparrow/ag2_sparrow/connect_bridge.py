@@ -230,11 +230,25 @@ def bridge_owner_problem(local: cm.Shape, root, agent_id: str = "") -> str:
     return ""
 
 
-def recorded_owner_problem(local: cm.Shape) -> str:
-    """bridge_owner_problem before a code is spent: for the root `local` recorded, the only one connect's
-    install accepts; with none, the code names its agent only once spent, so any agent's."""
-    cfg = cm.owned_config(local)[0] or {}
-    return bridge_owner_problem(local, cfg.get("ROOT") or None, cfg.get("AGENT_ID", ""))
+AGENT_ID_RE = re.compile(r"@[^\s:]+:\S+")
+
+
+def connect_agent_problem(agent_id) -> str:
+    """'' when connect names its agent (--agent, the agent's Matrix ID), else why: the code names its
+    agent only once redeemed, which spends it."""
+    if not agent_id:
+        return "connect needs --agent <the agent's Matrix ID>; copy the connect command from the s.space app again"
+    if not AGENT_ID_RE.fullmatch(agent_id):
+        return (f"--agent {agent_id} is not a Matrix ID (@name:server); copy the connect command from the s.space "
+                "app again")
+    return ""
+
+
+def agent_owner_problem(local: cm.Shape, agent_id: str) -> str:
+    """bridge_owner_problem before a code is spent, for the agent connect names and its own root: another
+    agent's bridge on this host does not refuse."""
+    root, _ = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")
+    return bridge_owner_problem(local, root, agent_id)
 
 
 def agent_root(agent_id: str) -> "tuple[str, str]":
@@ -243,8 +257,8 @@ def agent_root(agent_id: str) -> "tuple[str, str]":
     return root, problem or served_elsewhere(agent_id, root)
 
 
-_NOT_SESSION = ("help", "base", "code", "trust_relay_host", "work", "inbox", "token_env_file", "bridge_state_dir",
-                "experimental_connect")
+_NOT_SESSION = ("help", "base", "code", "agent", "trust_relay_host", "work", "inbox", "token_env_file",
+                "bridge_state_dir", "experimental_connect")
 
 
 def session_flags(args) -> list:
@@ -512,15 +526,18 @@ def known_root_problem(local: cm.Shape) -> str:
 
 
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
-                     local: cm.Shape) -> "tuple[dict | None, str]":
-    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): `preflight()`, `local`'s
-    job, recorded_owner_problem and known_root_problem asked before the code is even read; the code checked,
-    then redeemed once; the credential written to the agent's seat only while this process holds the free
-    root and its path still names it (connect_common.under_root). `root_id` is that root's identity, for
-    install to hold to; `lock` is the agent lock, taken once the root is known and held until finish_connect.
+                     local: cm.Shape, agent_id) -> "tuple[dict | None, str]":
+    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): `agent_id` (--agent),
+    `preflight()`, `local`'s job, agent_owner_problem and known_root_problem asked before the code is even
+    read; the code checked, then redeemed once, and refused unless it is `agent_id`'s; the credential
+    written to the agent's seat only while this process holds the free root and its path still names it
+    (connect_common.under_root). `root_id` is that root's identity, for install to hold to; `lock` is the
+    agent lock, taken once the root is known and held until finish_connect.
     The bearer never leaves the seat's token file."""
-    problem = (preflight() or cm.active_job_problem(local) or recorded_owner_problem(local)
-               or known_root_problem(local))
+    agent_id = (agent_id or "").strip()
+    problem = connect_agent_problem(agent_id)
+    problem = problem or (preflight() or cm.active_job_problem(local) or agent_owner_problem(local, agent_id)
+                          or known_root_problem(local))
     code, why = cm.read_code(code_arg) if not problem else ("", "")
     problem = problem or why or cm.code_problem(base, code)
     if problem:
@@ -528,6 +545,9 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     redeemed, problem = cm.redeem_code(base, code)
     if problem:
         return None, problem
+    if redeemed["agent_id"] != agent_id:
+        return None, (f"the code is for {redeemed['agent_id']}, not {agent_id}; the code is spent and nothing was "
+                      "written: make a new code for the agent you meant")
     problem = cm.relay_problem(base, redeemed["relay_url"], trust_relay_host or "")
     root, problem = ("", problem) if problem else cm.canonical_root(
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")

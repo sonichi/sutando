@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """One agent, one bridge, whichever adapter runs it: with claude-local's bridge for an agent on the host,
 codex-local's install or connect for that agent is refused before anything moves, and the reverse, under
-systemd and launchd. A same-adapter reinstall, a stale owner whose unit and job are gone, a bridge unit
+systemd and launchd. connect names its agent (--agent) so that check runs before the code is spent for
+that agent alone: another agent's bridge does not refuse it, no --agent refuses with the code unread, and
+a code redeemed for another agent writes no seat. A same-adapter reinstall, a stale owner whose unit and job are gone, a bridge unit
 from before the check, and a bridge that lands mid-connect are covered too. Driven in-process against a
 fake manager for both adapters' launchers and bridges; no real manager, codex, claude or relay."""
 from __future__ import annotations
@@ -160,15 +162,16 @@ class Exclusive(fx.AgentRootBase):
                     "--token-env-file", str(self.relay)]
         return self.run_cli(name, argv, jobs, mac)
 
-    def connect(self, name, jobs, backend, mac=False):
+    def connect(self, name, jobs, backend, mac=False, agent=fx.AGENT, stdin=None):
+        named = ["--agent", agent] if agent else []
         if name == CL.name:
-            argv = ["connect", "--base", fx.BASE, "--code", "-", "--plugin-dir", str(self.plugin),
+            argv = ["connect", "--base", fx.BASE, *named, "--code", "-", "--plugin-dir", str(self.plugin),
                     "--claude-config-dir", str(self.home / ".claude-sutando"),
                     "--hmac-key-file", str(self.home / "task-hmac.key")]
         else:
-            argv = ["connect", "--experimental-connect", "--base", fx.BASE, "--code", "-", "--codex", str(self.codex),
-                    "--codex-home", str(self.codex_home)]
-        return self.run_cli(name, argv, jobs, mac, backend=backend)
+            argv = ["connect", "--experimental-connect", "--base", fx.BASE, *named, "--code", "-", "--codex",
+                    str(self.codex), "--codex-home", str(self.codex_home)]
+        return self.run_cli(name, argv, jobs, mac, stdin=stdin, backend=backend)
 
     def bridged(self, name, mac):
         """`name` installed for the agent, its bridge running, then its session stopped: the bridge runs on."""
@@ -219,10 +222,11 @@ class Exclusive(fx.AgentRootBase):
 
     def connect_switch(self, first, second, mac):
         jobs = self.bridged(first, mac)
-        before, backend = self.snapshot(), fx.Backend()
-        rc, out, err = self.connect(second, jobs, backend, mac)
+        before, backend, stdin = self.snapshot(), fx.Backend(), io.StringIO(fx.CODE + "\n")
+        rc, out, err = self.connect(second, jobs, backend, mac, stdin=stdin)
         self.assert_refused_untouched(rc, out + err, first, second, jobs, before)
         self.assertEqual(backend.calls, [], "the code is never redeemed")
+        self.assertEqual(stdin.tell(), 0, "nor read")
         self.assertIn("the code was not used", err)
 
     def test_codex_experimental_connect_is_refused_before_the_code_is_spent_systemd(self):
@@ -251,14 +255,49 @@ class Exclusive(fx.AgentRootBase):
         self.assert_refused_untouched(rc, out + err, CL.name, CX.name, jobs, before)
         self.assertEqual(backend.calls, [])
 
-    def test_a_connect_whose_recorded_root_is_another_agents_still_redeems_its_code(self):
-        jobs = self.bridged(CL.name, False)
-        other = self.root.parent / "other.agent_ag2.space"
-        self.record(other, "@other.agent:ag2.space")
-        backend = fx.Backend(answer={"relay_url": fx.RELAY, "bearer": fx.BEARER, "agent_id": "@other.agent:ag2.space"})
-        rc, out, err = self.connect(CX.name, jobs, backend)
-        self.assertEqual(len(backend.calls), 1, out + err)
-        self.assertNotIn("already has a bridge", err)
+    def test_a_connect_for_another_agent_redeems_its_code_beside_the_served_agents_bridge(self):
+        other = "@other.agent:ag2.space"
+        for recorded in (False, True):
+            with self.subTest(recorded=recorded):
+                jobs = self.bridged(CL.name, False)
+                if recorded:
+                    self.record(self.root.parent / "other.agent_ag2.space", other)
+                backend = fx.Backend(answer={"relay_url": fx.RELAY, "bearer": fx.BEARER, "agent_id": other})
+                rc, out, err = self.connect(CX.name, jobs, backend, agent=other)
+                self.assertEqual(len(backend.calls), 1, out + err)
+                self.assertNotIn("already has a bridge", err)
+                self.assertIn(f"connected: {other}", out)
+                self.assertTrue(jobs.bridges[CL.name].active, "the served agent's bridge is left running")
+                for path in (cm.config_path(CX), cm.supervisor_path(BRIDGES[CX.name]), cm.supervisor_path(CX)):
+                    path.unlink(missing_ok=True)
+
+    def test_a_connect_without_agent_is_refused_before_the_code_is_read(self):
+        for name in (CL.name, CX.name):
+            for agent in ("", "not-a-matrix-id"):
+                with self.subTest(name=name, agent=agent):
+                    jobs, backend, stdin = self.jobs(), fx.Backend(), io.StringIO(fx.CODE + "\n")
+                    before = self.snapshot()
+                    rc, out, err = self.connect(name, jobs, backend, agent=agent, stdin=stdin)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn("copy the connect command from the s.space app again", err)
+                    self.assertIn("the code was not used", err)
+                    self.assertEqual(stdin.tell(), 0, "the code is never read")
+                    self.assertEqual(backend.calls, [])
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_a_code_redeemed_for_another_agent_writes_no_seat(self):
+        for name in (CL.name, CX.name):
+            with self.subTest(name=name):
+                jobs, other = self.jobs(), "@other.agent:ag2.space"
+                other_home = cb.bridge_home(self.root.parent / "other.agent_ag2.space")
+                before = self.snapshot()
+                rc, out, err = self.connect(name, jobs, fx.Backend(), agent=other)
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertIn(f"the code is for {fx.AGENT}, not {other}; the code is spent and nothing was written",
+                              err)
+                self.assertEqual(self.snapshot(), before, "no seat, unit or config for the code's agent")
+                self.assertFalse(other_home.exists(), "nor for the agent named")
+                self.assertFalse(any(b.started() for b in jobs.bridges.values()))
 
     def test_a_bridge_that_lands_during_the_redemption_is_refused_before_the_seat_is_written(self):
         jobs = self.bridged(CL.name, False)
