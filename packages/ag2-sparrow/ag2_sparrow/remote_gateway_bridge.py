@@ -5042,29 +5042,55 @@ _last_task_beat_at = 0.0
 _QUESTION_IDENTITY = ("question_id", "expected_revision")
 
 
+def _vault_handled(text: str, sender_tier: str) -> str:
+    """`text` with each `vault set KEY VALUE` handled once: intercepted and stored for the owner,
+    redacted for anyone else or when interception fails; never neither."""
+    intercept_fn, redact_fn = _vault_intercept_fns()
+    fallback = redact_fn or _local_redact_vault_set
+    if sender_tier != "owner" or intercept_fn is None:
+        return fallback(text)
+    try:
+        result = intercept_fn(text)
+    except Exception as e:  # noqa: BLE001 — a broken interceptor still redacts
+        _log(f"[vault] intercept errored ({diagnostics.describe(e)}) — redacted, NOT stored")
+        return fallback(text)
+    if result.stored:
+        _log(f"[vault] stored keys: {result.stored}")
+    if result.failed:
+        _log(f"[vault] store failed (still redacted): {result.failed}")
+    return result.text
+
+
+def _sender_tier(task: dict) -> str:
+    attested, _ = local_task_protocol.broker_attested_tier(
+        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
+    return _tier_for(task.get("user_id"), attested)
+
+
+def _redact_quoted(value, found: set):
+    """`value` with every string in it, dict keys included, redacted: the vault grammar, which only
+    redacts here and never intercepts or stores, then the signature scanner. Adds what it found."""
+    if isinstance(value, str):
+        unvaulted = (_vault_intercept_fns()[1] or _local_redact_vault_set)(value)
+        if unvaulted != value:
+            found.add("vault-set command")
+        r = filter_chat_secrets(unvaulted)
+        found.update(r.secret_types)
+        return r.text
+    if isinstance(value, dict):
+        return {_redact_quoted(k, found): _redact_quoted(v, found) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_quoted(v, found) for v in value]
+    return value
+
+
 def _redacted_question(question) -> "tuple[dict | None, tuple]":
     """(the question with every string redacted, the secret types found); (None, found) when a
     redaction would change a field that identifies it, so it is withheld whole."""
     if not isinstance(question, dict):
         return None, ()
     found: set = set()
-    # Quoted room data: the vault grammar only redacts here, never intercepts or stores.
-    redact_vault = _vault_intercept_fns()[1] or _local_redact_vault_set
-
-    def clean(v):
-        if isinstance(v, str):
-            unvaulted = redact_vault(v)
-            if unvaulted != v:
-                found.add("vault-set command")
-            r = filter_chat_secrets(unvaulted)
-            found.update(r.secret_types)
-            return r.text
-        if isinstance(v, dict):
-            return {clean(k): clean(x) for k, x in v.items()}
-        if isinstance(v, (list, tuple)):
-            return [clean(x) for x in v]
-        return v
-    out = clean(question)
+    out = _redact_quoted(question, found)
     if any(out.get(k) != question.get(k) for k in _QUESTION_IDENTITY):
         return None, tuple(sorted(found))
     return out, tuple(sorted(found))
@@ -5950,13 +5976,17 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if run is None:
+        task.pop(RESERVE_CLEANED, None)         # only a saved serve's own copy carries it
+    task.pop(QUESTION_REDACTED, None)
     if type(task.get("execution_generation")) is int and task["execution_generation"] > 0:
         task["task_id"] = broker_tid
     question_found: tuple = ()
-    if "room_question" in task:
-        # Sanitized before any durable writer, a held serve's saved copy included; unused when off.
+    if "room_question" in task and not isinstance(task.get(RESERVE_CLEANED), list):
+        # Sanitized once, before any durable writer; a redacted saved copy's question already was.
         task["room_question"], question_found = (_redacted_question(task["room_question"])
                                                  if TURN_CONTEXT else (None, ()))
+        task[QUESTION_REDACTED] = list(question_found)
     if run is not None:
         tid = run                               # a run its generation's ack owed a publication
         task = {**task, "id": tid}
@@ -6047,23 +6077,13 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
             # Intercept `vault set KEY VALUE` before ordinary redaction, owner-tier only.
             # Every path below intercepts-and-stores or falls through to a redactor — never neither.
-            _intercept_fn, _redact_fn = _vault_intercept_fns()
-            _redact_fallback = _redact_fn or _local_redact_vault_set
-            if sender_tier == "owner" and _intercept_fn is not None:
-                try:
-                    _vault_result = _intercept_fn(_fetched)
-                    _fetched = _vault_result.text
-                    if _vault_result.stored:
-                        _log(f"[vault] stored keys: {_vault_result.stored}")
-                    if _vault_result.failed:
-                        _log(f"[vault] store failed (still redacted): {_vault_result.failed}")
-                except Exception as _vault_exc:
-                    _fetched = _redact_fallback(_fetched)
-                    _log(f"[vault] intercept errored "
-                         f"({diagnostics.describe(_vault_exc)}) — "
-                         f"redacted, NOT stored")
+            _cleaned = task.get(RESERVE_CLEANED)
+            if isinstance(_cleaned, list):
+                # Its vault commands were handled when it was saved; intercepting the placeholder
+                # would report a key as not stored.
+                _secret_types = tuple(sorted(set(_secret_types) | {str(t) for t in _cleaned}))
             else:
-                _fetched = _redact_fallback(_fetched)
+                _fetched = _vault_handled(_fetched, sender_tier)
             # Redact pasted secrets BEFORE the body is persisted (#2267 parity
             # with the discord/slack/telegram bridges): a token pasted into a
             _filtered = filter_chat_secrets(_fetched)
@@ -6259,30 +6279,65 @@ class _ReserveLost(Exception):
     """The saved serve is missing, damaged, or not the one its reference names."""
 
 
-_RESERVE_ID_RE = re.compile(r"v1-[0-9a-f]{32}")
+# v1: a raw copy (an earlier bridge's); v2: a redacted one, a name an earlier bridge refuses.
+_RESERVE_ID_RE = re.compile(r"v[12]-[0-9a-f]{32}")
+
+
+# A saved serve's copy whose envelope says it was redacted: its render must not redact it again.
+RESERVE_CLEANED = "reserve_cleaned"
+# 2: the copy is redacted, and the envelope's `cleaned` lists what was found.
+_RESERVE_FORMAT = 2
+# What the question's one redaction found, carried to the saved copy's `cleaned`; never rendered.
+QUESTION_REDACTED = "room_question_redacted"
+
+
+# A re-sent copy never stores: a late store could put an old value over a newer one.
+_RESENT_VAULT = "[vault: not stored from this re-sent copy; send the command again if the key is not stored]"
+
+
+def _cleaned_for_reserve(task: dict) -> "tuple[dict, list]":
+    """(the copy of a held serve that may be saved, what its redaction found): its body, media
+    markers included, and its wake redacted, never storing a vault command (the owner's is told to
+    resend); its room question was redacted as the task came in."""
+    found = {str(t) for t in task.get(QUESTION_REDACTED) or ()}
+    out = {k: v for k, v in task.items() if k not in (RESERVE_CLEANED, QUESTION_REDACTED)}
+    if isinstance(out.get("task"), str):
+        from .vault_set_grammar import redact_vault_commands
+        handled = (redact_vault_commands(out["task"], placeholder=_RESENT_VAULT)
+                   if _sender_tier(out) == "owner" else _vault_handled(out["task"], "other"))
+        if handled != out["task"]:
+            found.add("vault-set command")
+        r = filter_chat_secrets(handled)
+        found.update(r.secret_types)
+        out["task"] = r.text
+    if "wake" in out:
+        out["wake"] = _redact_quoted(out["wake"], found)
+    return out, sorted(found)
 
 
 def _save_reserve(wire_tid: str, run: str, lease: "str | None", task: dict) -> "dict | None":
     """Save one held serve as an immutable envelope owned by (task, candidate run, lease); the
     reference the ledger keeps for it, or None when it could not be saved or a different one holds
-    its name. An identical envelope already there is the same serve."""
-    body = {**task, "id": wire_tid}
-    digest = _digest(body)
+    its name. The same lease is the same serve: a copy already there is kept."""
     rid = _reserve_id(wire_tid, run, lease)
-    text = json.dumps({"format": 1, "owner": {"task": wire_tid, "candidate_run": run, "lease": lease},
-                       "sha256": digest, "task": body}, sort_keys=True)
     path = _reserve_dir() / f"{rid}.json"
+
+    def kept() -> dict:
+        # Durable before it is named: it may be from a write whose fsync failed.
+        task_attempts.make_durable(path)
+        ref = {"id": rid, "run": run, "lease": lease, "sha256": json.loads(path.read_text()).get("sha256")}
+        _read_reserve(wire_tid, ref, run, lease)
+        return ref
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(path):
+            return kept()
+        body, cleaned = _cleaned_for_reserve({**task, "id": wire_tid})
+        digest = _digest(body)
+        text = json.dumps({"format": _RESERVE_FORMAT, "owner": {"task": wire_tid, "candidate_run": run, "lease": lease},
+                           "sha256": digest, "cleaned": cleaned, "task": body}, sort_keys=True)
         if task_attempts.write_if_absent(path, text, mode=0o600) is None:
-            # Already there, perhaps from a write whose fsync failed: durable before it is named.
-            task_attempts.make_durable(path)
-            if path.read_text() != text:
-                # The same lease is the same serve: its first copy is kept, whatever bytes came again.
-                ref = {"id": rid, "run": run, "lease": lease, "sha256": json.loads(path.read_text()).get("sha256")}
-                _read_reserve(wire_tid, ref, run, lease)
-                _log(f"task {wire_tid}: served again under the same lease with other bytes — the first copy is kept")
-                return ref
+            return kept()
     except (OSError, ValueError, _ReserveLost) as e:
         _log_backoff((wire_tid, "reserve-unsaved"), f"task {wire_tid}: its held serve could not be saved "
                      f"({diagnostics.describe(e)})")
@@ -6294,9 +6349,9 @@ def _digest(body: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _reserve_id(wire_tid: str, run, lease) -> str:
-    """The one name a serve's copy has: its owner (task, candidate run, lease)."""
-    return "v1-" + hashlib.sha256(f"{wire_tid}\0{run}\0{lease}".encode()).hexdigest()[:32]
+def _reserve_id(wire_tid: str, run, lease, version: int = 2) -> str:
+    """The one name a serve's copy has: its owner (task, candidate run, lease), under `version`."""
+    return f"v{version}-" + hashlib.sha256(f"{wire_tid}\0{run}\0{lease}".encode()).hexdigest()[:32]
 
 
 def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
@@ -6308,7 +6363,7 @@ def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
             task = json.loads(_reserve_path(wire_tid).read_text())
             if not isinstance(task, dict) or task.get("id") != wire_tid or _lease_id_of(task) != lease:
                 raise _ReserveLost("the task-wide saved serve is not this serve's")
-            return task
+            return {k: v for k, v in task.items() if k != RESERVE_CLEANED}
         if (not isinstance(ref, dict) or type(ref.get("id")) is not str or not _RESERVE_ID_RE.fullmatch(ref["id"])
                 or ref.get("run") != run or ref.get("lease") != lease):
             raise _ReserveLost("its reference is not this serve's")
@@ -6318,6 +6373,11 @@ def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
         if (not isinstance(body, dict) or env.get("owner") != owner or env.get("sha256") != ref.get("sha256")
                 or _digest(body) != ref.get("sha256")):
             raise _ReserveLost("the saved serve is not the one its reference names")
+        body = {k: v for k, v in body.items() if k != RESERVE_CLEANED}
+        if ref["id"].startswith("v2-"):
+            if env.get("format") != _RESERVE_FORMAT or not isinstance(env.get("cleaned"), list):
+                raise _ReserveLost("a redacted serve's copy without its redaction record")
+            body[RESERVE_CLEANED] = env["cleaned"]
         return body
     except FileNotFoundError as e:
         raise _ReserveLost("the saved serve is gone") from e
@@ -6331,11 +6391,28 @@ def _drop_reserve(wire_tid: str, ref) -> None:
     if ref is None:
         _unlink_reserve(_reserve_path(wire_tid))
         return
-    if not (isinstance(ref, dict) and ref.get("id") == _reserve_id(wire_tid, ref.get("run"), ref.get("lease"))):
+    if not (isinstance(ref, dict) and ref.get("id") in {_reserve_id(wire_tid, ref.get("run"), ref.get("lease"), v)
+                                                         for v in (1, 2)}):
         _log(f"task {wire_tid}: a saved-serve reference not its own — nothing removed")
         return
     _ATTEMPTS.with_reserves(lambda named: ref["id"] in named or _unlink_reserve(_reserve_dir() / f"{ref['id']}.json"),
                             f"task {wire_tid}: the removal of its saved serve")
+
+
+def _same_held_copy(t, pending: dict, lease: "str | None", task: dict) -> bool:
+    """Whether the held serve's saved copy is this serve's, made again when it is gone. A v1- copy an
+    earlier bridge saved is kept while it reads as this serve's; a lost one is replaced redacted."""
+    ref, run = pending["reserve"], pending["run"]
+    if not (isinstance(ref, dict) and str(ref.get("id", "")).startswith("v1-")):
+        return _save_reserve(t.wire, run, lease, task) == ref
+    try:
+        _read_reserve(t.wire, ref, run, lease)
+        return True
+    except _ReserveLost:
+        new = _save_reserve(t.wire, run, lease, task)
+        return new is not None and bool(t.put(pending_serve={**pending, "reserve": new}))
+    except OSError:
+        return False
 
 
 def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str, None, bool] | None":
@@ -6346,7 +6423,7 @@ def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str,
     pending = rec.get("pending_serve") if isinstance(rec.get("pending_serve"), dict) else {}
     if pending.get("lease") == lease and pending.get("run"):
         # The same held serve, delivered again: its saved copy is checked, or made again, first.
-        if "reserve" not in pending or _save_reserve(t.wire, pending["run"], lease, task) == pending["reserve"]:
+        if "reserve" not in pending or _same_held_copy(t, pending, lease, task):
             return rec["run"], None, True
         _log_backoff((first, "unrecorded"), f"task {first}: its held serve's saved copy is not this serve "
                      "— left unacked for a re-serve")
