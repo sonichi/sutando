@@ -477,7 +477,7 @@ def gemini(project: str, model: str, system: str, user: str, timeout: float = TI
                f"models/{model}:generateContent")
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 80, "responseMimeType": "application/json",
+                "generationConfig": {"maxOutputTokens": 80, "responseMimeType": "application/json",
                                      "responseSchema": SCHEMA, "thinkingConfig": {"thinkingLevel": "minimal"}}}
         def post(token: str) -> dict:
             req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
