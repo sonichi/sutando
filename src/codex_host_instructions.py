@@ -40,11 +40,12 @@ def _nearest_existing(path):
 def canonical(path):
     """`path` as the OS resolves it: symlinks before `..`, then the missing rest appended.
 
-    Raises ValueError when the missing rest holds `..`, which has no physical meaning yet.
+    Raises ValueError for a relative path, and when the missing rest holds `..`, which has
+    no physical meaning yet.
     """
     raw = os.fspath(path)
     if not os.path.isabs(raw):
-        raw = os.path.join(os.getcwd(), raw)  # joined, never normalized
+        raise ValueError(f"{raw}: not an absolute path")
     parts = raw.split(os.sep)
     for cut in range(len(parts), 0, -1):
         prefix = os.sep.join(parts[:cut]) or os.sep

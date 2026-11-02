@@ -260,11 +260,12 @@ class EnsureLinked(unittest.TestCase):
         self.assertFalse(os.path.lexists(elsewhere / "codex-home"), "lexical location created")
         self.assertEqual(sorted(os.listdir(elsewhere)), ["alias"])
 
-    def test_a_relative_codex_home_is_resolved_against_the_cwd(self):
-        root = Path(self.tmp.name).resolve()
-        with patch.object(os, "getcwd", return_value=str(root)):
-            self.assertEqual(self.link(codex_home="rel-home"), "linked")
-        self.assertTrue((root / "rel-home" / "AGENTS.md").is_symlink())
+    def test_a_relative_codex_home_is_refused_and_creates_nothing(self):
+        before = self.tree()
+        self.assertEqual(self.link(codex_home="rel-home"), "invalid-home")
+        self.assertTrue(chi.is_owner_codex_home("rel-home", self.home))
+        self.assertEqual(self.tree(), before)
+        self.assertFalse(os.path.lexists("rel-home"))
 
     def test_dotdot_below_a_missing_directory_is_refused_before_anything_is_created(self):
         spelled = f"{self.codex_home}/missing/../x"
