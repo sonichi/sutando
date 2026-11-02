@@ -48,3 +48,24 @@ NOTIFIER_STOP=""
 notifier_signal() {
   if [ "$NOTIFIER_IN_READ" = 1 ]; then NOTIFIER_STOP="$1"; else exit "$1"; fi
 }
+
+# A process's exact start time (C locale, UTC), so a recorded pid is acted on only while it is that process.
+notifier_proc_start() {
+  LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//; s/  */ /g'
+}
+
+# The notifier's watcher leads a session of its own; recording it lets the supervisor stop it after a KILL.
+notifier_record_watcher() {
+  [ -n "${2:-}" ] || return 0
+  printf '%s %s\n' "$1" "$(notifier_proc_start "$1")" > "$2" 2>/dev/null || true
+}
+
+# Stop the watcher recorded in $1, only while that pid is still the process recorded (pid and start time).
+stop_recorded_watcher() {
+  local pid start
+  [ -n "${1:-}" ] && [ -s "$1" ] || return 0
+  read -r pid start < "$1" || true
+  rm -f "$1"
+  [ -n "$pid" ] && notifier_proc_live "$pid" && [ "$(notifier_proc_start "$pid")" = "$start" ] || return 0
+  stop_group_bounded "$pid"
+}

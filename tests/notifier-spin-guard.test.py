@@ -41,6 +41,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 import helper_cpu_guard as hcg  # noqa: E402
 import holder_lock  # noqa: E402
+import notifier_slot  # noqa: E402
 
 GUARD = REPO / "src" / "notifier-guard.sh"
 SUPERVISOR = REPO / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
@@ -50,6 +51,11 @@ STUCK_WATCHER = """#!/bin/bash
 trap '' TERM
 echo $$ > "$WATCHER_PID_FILE"
 exec 1>&- 9>&-
+while :; do sleep 1; done
+"""
+RESPONSIVE_WATCHER = """#!/bin/bash
+# A healthy watcher that exits on TERM.
+echo $$ > "$WATCHER_PID_FILE"
 while :; do sleep 1; done
 """
 DEAF_WATCHER = """#!/bin/bash
@@ -240,6 +246,47 @@ sleep 0.2; kill -0 "$member" 2>/dev/null && echo member-alive || echo member-gon
         self.assertEqual(r.stdout.strip(), "fine")
 
 
+class SupervisorStopsTheWatcherToo(unittest.TestCase):
+    """The supervisor's own stop path, at the notifiers' default 30 s read: a TERM deferred until the read
+    returns runs past the stop's grace, so the notifier is killed before its cleanup; its watcher must go too."""
+
+    def run_case(self, notifier: str):
+        f = FakeRepo(notifier, RESPONSIVE_WATCHER)
+        script = f"""export SUTANDO_SUPERVISOR_SOURCE_ONLY=1
+. "{SUPERVISOR}"
+NOTIFIER="{f.notifier}"
+start_child
+for i in $(seq 1 100); do [ -s "{f.watcher_pid_file}" ] && break; sleep 0.1; done
+w=$(cat "{f.watcher_pid_file}"); n=$child_pid
+sleep 1.5
+s=$SECONDS; stop_child; echo "took $((SECONDS - s))"
+sleep 0.5
+kill -0 "$n" 2>/dev/null && echo notifier-alive || echo notifier-gone
+kill -0 "$w" 2>/dev/null && echo watcher-alive || echo watcher-gone"""
+        env = isolated_child_env(SUTANDO_TASKS_DIR=str(f.ws / "tasks"), SUTANDO_WORKSPACE_DIR=str(f.ws),
+                                 SUTANDO_TMUX_SOCKET=str(f.tmp / "no-tmux.sock"),
+                                 WATCHER_PID_FILE=str(f.watcher_pid_file), SUTANDO_NOTIFIER_PY=sys.executable)
+        env.pop("SUTANDO_INSTANCE_ID", None)
+        out = f.tmp / "stop.out"
+        # Output to files: a surviving watcher would hold a pipe open and hang the run instead of failing it.
+        with open(out, "w") as o, open(f.tmp / "stop.err", "w") as e:
+            subprocess.run(["bash", "-c", script], stdout=o, stderr=e, stdin=subprocess.DEVNULL, timeout=120, env=env)
+        try:
+            self.addCleanup(kill_quietly, int(f.watcher_pid_file.read_text().strip()))
+        except (OSError, ValueError):
+            pass
+        text = out.read_text()
+        self.assertIn("notifier-gone", text, text)
+        self.assertIn("watcher-gone", text, text)
+        self.assertLessEqual(int(text.split()[1]), 12)
+
+    def test_the_claude_notifier(self):
+        self.run_case("claude/cli/task-notifier.sh")
+
+    def test_the_codex_notifier(self):
+        self.run_case("codex/cli/task-notifier.sh")
+
+
 class SupervisorHelpers(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="sup-guard."))
@@ -341,6 +388,35 @@ class SupervisorSlot(unittest.TestCase):
         time.sleep(0.5)
         self.assertIsNone(first.poll(), "the holder is never signalled")
 
+    def helper_pid(self) -> int:
+        prior = holder_lock.read_holder(self.ws / "tasks")
+        return int(prior.record["pid"])
+
+    def test_a_dead_slot_helper_is_replaced_by_its_own_supervisor(self):
+        first, err = self.start(self.ws / "tasks")
+        self.assertEqual(self.occupancy("held"), "held")
+        os.kill(self.helper_pid(), signal.SIGKILL)
+        time.sleep(4)
+        self.assertIsNone(first.poll(), err.read_text())
+        self.assertIn("reclaiming the slot", err.read_text())
+        self.assertEqual(self.occupancy("held"), "held")
+        second, err2 = self.start(self.ws / "tasks", wait_s=1)
+        self.assertEqual(second.wait(timeout=30), 0)
+        self.assertIn("standing down", err2.read_text())
+
+    def test_a_successor_that_took_a_lost_slot_leaves_the_original_to_exit(self):
+        first, _ = self.start(self.ws / "tasks")
+        self.assertEqual(self.occupancy("held"), "held")
+        os.kill(self.helper_pid(), signal.SIGKILL)
+        second, err2 = self.start(self.ws / "tasks", wait_s=0)
+        deadline = time.time() + 20
+        while time.time() < deadline and first.poll() is None and second.poll() is None:
+            time.sleep(0.2)
+        time.sleep(3)
+        alive = [p for p in (first, second) if p.poll() is None]
+        self.assertEqual(len(alive), 1, "exactly one supervisor serves the inbox")
+        self.assertEqual(self.occupancy("held"), "held")
+
     def test_a_waiter_takes_the_slot_when_the_holder_exits(self):
         first, _ = self.start(self.ws / "tasks")
         self.assertEqual(self.occupancy("held"), "held")
@@ -354,6 +430,111 @@ class SupervisorSlot(unittest.TestCase):
         third, err3 = self.start(self.ws / "tasks", wait_s=1)
         self.assertEqual(third.wait(timeout=30), 0)
         self.assertIn("standing down", err3.read_text())
+
+
+def _hold_busy(home, inbox, ready, done):
+    """Another process holding the slot (its own holder_lock home, as the test's)."""
+    holder_lock._home = lambda: home
+    got = holder_lock.acquire(inbox, install_id=holder_lock.install_id())
+    holder_lock.publish(got.owner, notifier_slot.ADAPTER)
+    ready.set()
+    done.wait(30)
+    holder_lock.release(got.owner)
+
+
+class NotifierSlotInProcess(unittest.TestCase):
+    """notifier_slot.hold in this process (so coverage sees it), with holder_lock's home in a temp dir."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="slot-ip."))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = str(self.tmp / "home")
+        os.makedirs(self.home)
+        self.inbox = self.tmp / "tasks"
+        self.inbox.mkdir()
+        p = unittest.mock.patch.object(holder_lock, "_home", lambda: self.home)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def hold(self, parent, wait=0.5, poll=0.05):
+        import contextlib
+        import io
+        out = io.StringIO()
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = notifier_slot.hold(str(self.inbox) + "/", parent, wait, poll=poll)
+        finally:
+            for sig, h in saved.items():
+                signal.signal(sig, h)
+        return rc, out.getvalue()
+
+    def test_held_for_the_parents_life_then_released(self):
+        # A grandchild, so init reaps it: an unreaped child of this test would linger as a zombie.
+        pid = int(subprocess.run(["bash", "-c", "sleep 1.5 >/dev/null 2>&1 & echo $!"], capture_output=True,
+                                 text=True).stdout)
+        rc, out = self.hold(pid)
+        self.assertEqual((rc, out), (0, "held\n"))
+        self.assertEqual(holder_lock.occupancy(self.inbox), "free", "released once the parent is gone")
+
+    def test_a_term_releases_it(self):
+        parent = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(parent.kill)
+        signal.setitimer(signal.ITIMER_REAL, 0.5)
+        old = signal.signal(signal.SIGALRM, lambda *a: os.kill(os.getpid(), signal.SIGTERM))
+        try:
+            rc, out = self.hold(parent.pid)
+        finally:
+            signal.signal(signal.SIGALRM, old)
+        self.assertEqual((rc, out), (0, "held\n"))
+        self.assertEqual(holder_lock.occupancy(self.inbox), "free")
+
+    def test_busy_names_the_holder(self):
+        ctx = multiprocessing.get_context("spawn")
+        ready, done = ctx.Event(), ctx.Event()
+        other = ctx.Process(target=_hold_busy, args=(self.home, str(self.inbox), ready, done))
+        other.start()
+        try:
+            self.assertTrue(ready.wait(30))
+            rc, out = self.hold(os.getpid(), wait=0.3)
+            self.assertEqual(rc, 3)
+            self.assertTrue(out.startswith(f"busy {other.pid} "), out)
+        finally:
+            done.set()
+            other.join(30)
+
+    def test_an_undecidable_slot_says_unknown(self):
+        with unittest.mock.patch.object(holder_lock, "acquire", side_effect=holder_lock.LockError("unsupported")):
+            self.assertEqual(self.hold(os.getpid()), (4, "unknown LockError: unsupported\n"))
+        with unittest.mock.patch.object(holder_lock, "acquire", return_value=holder_lock.Unreadable("x")):
+            self.assertEqual(self.hold(os.getpid()), (4, "unknown Unreadable\n"))
+
+    def test_the_parent_check(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.assertFalse(notifier_slot._parent_alive(gone.pid, None, False))
+        me = holder_lock.start_time(os.getpid())
+        self.assertTrue(notifier_slot._parent_alive(os.getpid(), me, True))
+        self.assertFalse(notifier_slot._parent_alive(os.getpid(), "Thu Jan  1 00:00:00 1970", True), "a reused pid")
+        with unittest.mock.patch.object(notifier_slot.os, "kill", side_effect=PermissionError):
+            self.assertTrue(notifier_slot._parent_alive(1, None, False), "another user's live process")
+        self.assertEqual(notifier_slot._holder_of(holder_lock.Missing()), "? ?")
+
+    def test_a_release_that_fails_still_returns(self):
+        pid = int(subprocess.run(["bash", "-c", "sleep 0.5 >/dev/null 2>&1 & echo $!"], capture_output=True,
+                                 text=True).stdout)
+        real = holder_lock.release
+
+        def release_then_fail(owner):
+            real(owner)  # really released, so this process holds nothing afterwards
+            raise holder_lock.LockError("lock lost")
+        with unittest.mock.patch.object(holder_lock, "release", release_then_fail):
+            self.assertEqual(self.hold(pid), (0, "held\n"))
+
+    def test_main_parses_and_holds(self):
+        with unittest.mock.patch.object(notifier_slot, "hold", return_value=0) as h:
+            self.assertEqual(notifier_slot.main(["hold", "--inbox", "/x", "--parent", "7", "--wait", "2"]), 0)
+        h.assert_called_once_with("/x", 7, 2.0)
 
 
 class HelperScript(unittest.TestCase):
@@ -472,10 +653,40 @@ class HelperCpu(unittest.TestCase):
             r = hcg.check(self.repo, self.state)
         self.assertEqual((r["status"], r["detail"]), ("ok", "not checked: no POSIX process table on this platform"))
 
+    def test_other_processes_and_malformed_lines_are_skipped(self):
+        rows = [{"pid": 7, "start": START, "cpu": 5.0, "command": "claude --plugin-dir /x"}] + self.rows(1)
+        hcg.evaluate(rows, self.repo, self.state, now=1000)
+        self.assertEqual(list(json.loads(self.state.read_text())), [f"42:{' '.join(START.split())}"])
+
+        class Out:
+            returncode = 0
+            stdout = f"   42 {START}  not-a-time bash {self.repo}/src/x.sh\n   43 short\n"
+        self.assertEqual(hcg.processes(lambda *a, **k: Out()), [])
+
+    def test_a_clean_table_is_ok_and_unwritable_samples_say_so(self):
+        class Out:
+            returncode = 0
+            stdout = f"   42 {START}  0:01.00 bash {self.repo}/src/x.sh\n"
+        r = hcg.check(self.repo, self.state, runner=lambda *a, **k: Out())
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("no Sutando helper above 50% CPU", r["detail"])
+        blocked = self.repo / "a-file"
+        blocked.write_text("")
+        r = hcg.check(self.repo, blocked / "state" / "samples.json", runner=lambda *a, **k: Out())
+        self.assertEqual((r["status"], r["detail"].split(":")[0]), ("warn", "not checked"))
+        with unittest.mock.patch.object(hcg.os, "replace", side_effect=OSError("ro")):
+            self.assertEqual(hcg.evaluate(self.rows(1), self.repo, self.state, now=1), [], "a write failure is quiet")
+
     def test_health_check_runs_the_probe(self):
+        import importlib.util
         src = (REPO / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_helper_cpu())", src)
-        self.assertIn('helper_cpu_guard.check(REPO_DIR, WORKSPACE_DIR / "state" / "helper-cpu-samples.json")', src)
+        spec = importlib.util.spec_from_file_location("health_check_hcg", REPO / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        with unittest.mock.patch.object(hc.helper_cpu_guard, "check", return_value={"status": "ok"}) as c:
+            self.assertEqual(hc.check_helper_cpu(), {"status": "ok"})
+        c.assert_called_once_with(hc.REPO_DIR, hc.WORKSPACE_DIR / "state" / "helper-cpu-samples.json")
 
 
 if __name__ == "__main__":

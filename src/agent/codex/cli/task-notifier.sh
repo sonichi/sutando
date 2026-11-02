@@ -446,6 +446,7 @@ mkdir -p "$queue_dir" "$PAYLOAD_DIR"
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
+notifier_record_watcher "$watcher_pid" "${SUTANDO_NOTIFIER_WATCHER_PIDFILE:-}"
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
