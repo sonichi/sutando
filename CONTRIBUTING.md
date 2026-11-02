@@ -316,6 +316,11 @@ For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC
 - **Read the diff before pushing.** "I trust the agent" is not enough — bots miss conventions, hallucinate referenced files, and sometimes regenerate unrelated areas. Skim every change.
 - **No "drive-by" repo-wide refactors.** If the agent suggests one, open ONE small PR with the proposal first, get sign-off, then expand.
 - **Take responsibility for what your bot ships.** Its PRs are *your* PRs — your CLA, your review feedback to address, your closes-link to file. If a maintainer closes the PR as duplicate / not-planned / scope-drift, that's data — diagnose the root cause before re-filing.
+- **Say who wrote it and who answers for it.** An agent's work carries an attribution line wherever it lands, so a reader never mistakes it for the human's own:
+  - **Commits:** the accountable human is the author, under a CLA-mapped email, and the agent is named in a `Co-Authored-By:` trailer.
+  - **PR body:** one line naming the agent that wrote it and the human accountable for it.
+  - **Reviews and comments posted from a human's account:** end with `(agent-assisted, <agent> for <human>'s seat)`. A code-owner approval counts toward the merge gate, so the record must show when an agent, not the owner, made the call.
+  - **Outside contributors:** the same applies. A PR from an account that doesn't say whether an agent wrote it may be asked, and its CI is run only after a maintainer has read the diff.
 
 ## Community
 
