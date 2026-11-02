@@ -10,7 +10,8 @@ links the host file there.
 It only ever writes into the app-private Codex home the launcher made: every existing
 component of CODEX_HOME must be a real directory (no symlink anywhere, no `..`), each is
 opened without following links, and the walk stops before entering or creating anything
-that is, or would become, the owner's `~/.codex`. Nothing already at
+that is, or would become, the owner's `~/.codex`, judged both by its lexical path and by
+directory identity. Nothing already at
 `$CODEX_HOME/AGENTS.md` is removed or replaced.
 """
 import argparse
@@ -44,6 +45,20 @@ def _parts(codex_home):
     return parts
 
 
+def _lexically_owner(parts, home):
+    """True when `parts`, case-folded, are `$HOME/.codex` or `realpath($HOME)/.codex` or below.
+
+    The walk follows no link, so the path it opens is this lexical one; this check cannot race.
+    """
+    folded = [p.casefold() for p in parts]
+    for base in (os.fspath(home), os.path.realpath(home)):
+        owner = [p.casefold() for p in os.path.normpath(os.path.join(base, ".codex")).split(os.sep)
+                 if p not in ("", ".")]
+        if folded[:len(owner)] == owner:
+            return True
+    return False
+
+
 def _owner_anchor(home):
     """The identity of `~/.codex`, or of its nearest existing ancestor plus the missing parts.
 
@@ -72,7 +87,15 @@ def _at_owner(fd, anchor, missing, rest):
     return [p.casefold() for p in rest[:len(missing)]] == [p.casefold() for p in missing]
 
 
-def _walk(parts, anchor, missing, create):
+def _owner_moved(home, anchor, missing):
+    """True when ~/.codex's identity is no longer the one checked against, or cannot be read."""
+    try:
+        return _owner_anchor(home) != (anchor, missing)
+    except OSError:
+        return True
+
+
+def _walk(parts, home, anchor, missing, create):
     """Descend from `/` one real directory at a time; returns (status, fd or None).
 
     status is "open", "owner-home", "invalid-home" (a symlink or non-directory component)
@@ -91,6 +114,8 @@ def _walk(parts, anchor, missing, create):
             except FileNotFoundError:
                 if not create:
                     return "absent", None
+                if _owner_moved(home, anchor, missing):
+                    return "owner-home", None
                 try:
                     os.mkdir(parts[i], dir_fd=fd)
                 except FileExistsError:
@@ -112,8 +137,10 @@ def is_owner_codex_home(codex_home, home):
     cannot be told apart from one (not absolute, `..`, a symlink, an unreadable identity)."""
     try:
         parts = _parts(codex_home)
+        if _lexically_owner(parts, home):
+            return True
         anchor, missing = _owner_anchor(home)
-        status, fd = _walk(parts, anchor, missing, create=False)
+        status, fd = _walk(parts, home, anchor, missing, create=False)
     except (ValueError, OSError):
         return True
     if fd is not None:
@@ -121,18 +148,36 @@ def is_owner_codex_home(codex_home, home):
     return status in ("owner-home", "invalid-home")
 
 
+_OVERRIDE_READ_CAP = 1 << 20
+
+
 def _active_override(fd):
-    """Codex honours AGENTS.override.md only as a regular file it can open; else AGENTS.md."""
+    """Codex honours AGENTS.override.md only as a regular file it can open whose text is not
+    blank: undecodable bytes count as content, whitespace (str.strip) does not. A file past
+    the read cap counts as an override."""
     try:
         probe = os.open("AGENTS.override.md", os.O_RDONLY | os.O_NONBLOCK, dir_fd=fd)
     except OSError:
         return False
     try:
-        return stat.S_ISREG(os.fstat(probe).st_mode)
+        if not stat.S_ISREG(os.fstat(probe).st_mode):
+            return False
+        data = b""
+        while len(data) <= _OVERRIDE_READ_CAP:
+            chunk = os.read(probe, 65536)
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > _OVERRIDE_READ_CAP:
+            return True
     except OSError:
         return False
     finally:
         os.close(probe)
+    try:
+        return bool(data.decode("utf-8").strip())
+    except UnicodeDecodeError:
+        return True
 
 
 def ensure_linked(codex_home, repo, home):
@@ -148,11 +193,13 @@ def ensure_linked(codex_home, repo, home):
         parts = _parts(codex_home)
     except ValueError:
         return "invalid-home"
+    if _lexically_owner(parts, home):
+        return "owner-home"
     try:
         anchor, missing = _owner_anchor(home)
     except OSError:
         return "owner-home"
-    status, fd = _walk(parts, anchor, missing, create=True)
+    status, fd = _walk(parts, home, anchor, missing, create=True)
     if fd is None:
         return status
     try:
@@ -172,6 +219,8 @@ def ensure_linked(codex_home, repo, home):
             except OSError:
                 return "dangling"
             return "foreign"
+        if _owner_moved(home, anchor, missing):
+            return "owner-home"
         try:
             os.symlink(source, "AGENTS.md", dir_fd=fd)
         except FileExistsError:

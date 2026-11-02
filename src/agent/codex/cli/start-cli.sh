@@ -307,7 +307,8 @@ ensure_codex_host_instructions() {
       overridden) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
       invalid-home) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex} is relative, contains '..', or has a symlink or non-directory component; the host's AGENTS.md was not linked" >&2 ;;
       dangling) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.md is a broken link; remove it so the core gets the host's AGENTS.md" >&2 ;;
-      foreign) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.md is not the host's; the core reads that file instead" >&2 ;;
+      foreign) echo "  ⚠ an existing AGENTS.md entry in ${CODEX_HOME:-$HOME/.codex} is not the host's and was kept; the host's AGENTS.md was not linked" >&2 ;;
+      owner-home) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex} is the owner's own Codex home; the host's AGENTS.md was not linked" >&2 ;;
     esac
   else
     echo "  ⚠ could not link the host's AGENTS.md; the core may miss its first-contact instructions" >&2

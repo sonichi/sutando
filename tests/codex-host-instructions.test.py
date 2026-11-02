@@ -233,6 +233,156 @@ class OwnerGuard(Base):
         with patch.object(os, "fstat", side_effect=OSError(errno.EIO, "I/O error")):
             self.assert_refused_unchanged(self.codex_home, "owner-home")
 
+    def race(self, codex_home, home):
+        """Replace ~/.codex with a fresh directory right after its identity is read."""
+        real_anchor, replaced = chi._owner_anchor, []
+
+        def replace_after_snapshot(h):
+            answer = real_anchor(h)
+            real = Path(os.path.realpath(self.owner))
+            shutil.rmtree(real)
+            real.mkdir()
+            replaced.append(True)
+            return answer
+        before = self.tree()
+        with patch.object(chi, "_owner_anchor", replace_after_snapshot):
+            result = chi.ensure_linked(codex_home, self.repo, home)
+        return result, before
+
+    def test_an_owners_codex_home_replaced_after_its_identity_is_read_is_still_refused(self):
+        self.owner.mkdir()
+        result, before = self.race(self.owner, self.home)
+        self.assertEqual(result, "owner-home")
+        self.assertEqual(os.listdir(self.owner), [])
+        self.assertEqual(self.tree(), before)
+
+    def test_a_case_variant_of_a_replaced_owners_codex_home_is_still_refused(self):
+        self.owner.mkdir()
+        result, _ = self.race(self.home / ".CODEX" / "sub", self.home)
+        self.assertEqual(result, "owner-home")
+        self.assertEqual(os.listdir(self.owner), [])
+
+    def test_the_owners_codex_home_under_a_symlinked_home_is_still_refused(self):
+        self.owner.mkdir()
+        home_link = self.root / "home-link"
+        home_link.symlink_to(self.home)
+        result, _ = self.race(self.owner, home_link)
+        self.assertEqual(result, "owner-home")
+        self.assertEqual(os.listdir(self.owner), [])
+        self.assertTrue(chi.is_owner_codex_home(self.owner / "x", home_link))
+
+    def test_the_lexical_guard_matches_only_the_owners_codex_home(self):
+        parts = chi._parts(self.home / ".codexes" / "x")
+        self.assertFalse(chi._lexically_owner(parts, self.home))
+        self.assertTrue(chi._lexically_owner(chi._parts(self.home / ".Codex"), self.home))
+
+    def retarget(self, candidate):
+        """~/.codex is a link elsewhere when its identity is read, then retargeted to `candidate`."""
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        self.owner.symlink_to(elsewhere)
+        real_anchor, calls = chi._owner_anchor, []
+
+        def retarget_after_snapshot(h):
+            answer = real_anchor(h)
+            if not calls:
+                self.owner.unlink()
+                self.owner.symlink_to(candidate)
+            calls.append(answer)
+            return answer
+        with patch.object(chi, "_owner_anchor", retarget_after_snapshot):
+            return chi.ensure_linked(candidate, self.repo, self.home)
+
+    def test_an_owner_link_retargeted_to_an_existing_candidate_before_the_link_is_refused(self):
+        candidate = self.root / "candidate"
+        candidate.mkdir()
+        self.assertEqual(self.retarget(candidate), "owner-home")
+        self.assertEqual(os.listdir(candidate), [])
+
+    def test_an_owner_link_retargeted_to_a_missing_candidate_before_its_mkdir_is_refused(self):
+        candidate = self.root / "new-candidate"
+        self.assertEqual(self.retarget(candidate), "owner-home")
+        self.assertFalse(os.path.lexists(candidate))
+
+    def test_an_unreadable_owner_identity_on_the_recheck_fails_closed(self):
+        real_anchor, calls = chi._owner_anchor, []
+
+        def fails_second_time(h):
+            calls.append(h)
+            if len(calls) > 1:
+                raise OSError(errno.EIO, "I/O error")
+            return real_anchor(h)
+        with patch.object(chi, "_owner_anchor", fails_second_time):
+            self.assertEqual(self.link(), "owner-home")
+        self.assertFalse(os.path.lexists(self.codex_home))
+
+    def at_pre_symlink(self, transition, codex_home=None):
+        """Run `transition` after the walk and override probe, just before the final recheck."""
+        real_probe = chi._active_override
+
+        def probe_then_transition(fd):
+            answer = real_probe(fd)
+            transition()
+            return answer
+        with patch.object(chi, "_active_override", probe_then_transition):
+            return self.link(codex_home=codex_home)
+
+    def test_any_owner_transition_just_before_the_symlink_refuses_it(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        other = self.root / "other"
+        other.mkdir()
+
+        def created():
+            self.owner.mkdir()
+
+        def removed():
+            self.owner.rmdir()
+
+        def replaced():
+            self.owner.rmdir()
+            self.owner.mkdir()
+
+        def retargeted():
+            self.owner.unlink()
+            self.owner.symlink_to(other)
+        cases = [("created", None, created), ("removed", "dir", removed),
+                 ("replaced", "dir", replaced), ("retargeted", "link", retargeted)]
+        for name, start, transition in cases:
+            with self.subTest(transition=name):
+                if os.path.islink(self.owner):
+                    self.owner.unlink()
+                elif self.owner.exists():
+                    self.owner.rmdir()
+                if start == "dir":
+                    self.owner.mkdir()
+                elif start == "link":
+                    self.owner.symlink_to(elsewhere)
+                home = self.root / f"app-home-{name}"
+                self.assertEqual(self.at_pre_symlink(transition, home), "owner-home")
+                self.assertFalse(os.path.lexists(home / "AGENTS.md"), "linked despite the transition")
+
+    def test_an_unchanged_owner_lets_the_same_path_link(self):
+        """Positive control for the transition tests: no transition, same hook, a link."""
+        self.owner.mkdir()
+        self.assertEqual(self.at_pre_symlink(lambda: None), "linked")
+        self.assertEqual(Path(os.readlink(self.target)), self.host)
+
+    def test_a_stable_owner_link_to_the_candidate_is_refused(self):
+        candidate = self.root / "candidate"
+        candidate.mkdir()
+        self.owner.symlink_to(candidate)
+        self.assert_refused_unchanged(candidate, "owner-home")
+
+    def test_a_sibling_of_the_owners_codex_home_is_allowed(self):
+        self.owner.mkdir()
+        for name in (".codex-other", ".codexx", "codex"):
+            with self.subTest(sibling=name):
+                sibling = self.home / name
+                self.assertFalse(chi.is_owner_codex_home(sibling, self.home))
+                self.assertEqual(self.link(codex_home=sibling), "linked")
+        self.assertEqual(os.listdir(self.owner), [])
+
     def test_the_owner_anchor_walks_up_to_an_existing_ancestor(self):
         anchor, missing = chi._owner_anchor(self.root / "no" / "such-home")
         st = os.stat(self.root)
@@ -396,6 +546,40 @@ class Overrides(Base):
             p.write_text("owner\n")
             os.chmod(p, 0)
         self.check("mode-000", make, "linked")
+
+    def test_an_empty_or_whitespace_only_override_does_not_block_the_link(self):
+        for name, body in (("empty", b""), ("newline", b"\n"), ("spaces", b"   "),
+                           ("tabs", b"\t\t"), ("cr", b"\r"), ("vt", b"\x0b"), ("ff", b"\x0c"),
+                           ("nbsp", "\u00a0".encode()), ("em-space", "\u2003".encode()),
+                           ("mixed", " \t\r\n\x0b\x0c\u00a0\u2003\n".encode())):
+            with self.subTest(override=name):
+                self.check(f"ws-{name}", lambda p, b=body: p.write_bytes(b), "linked")
+
+    def test_text_and_invalid_utf8_overrides_block_the_link(self):
+        for name, body in (("text", b"  \n# owner rules\n"), ("invalid-utf8", b"\xff\xfe\x80"),
+                           ("nul", b"\x00"), ("nul-in-whitespace", b" \x00 \n"),
+                           ("unicode-ws-and-nul", "\u00a0\u2003\x00".encode()),
+                           ("ws-prefix-then-text", " \t\u00a0\n rules".encode())):
+            with self.subTest(override=name):
+                self.check(f"content-{name}", lambda p, b=body: p.write_bytes(b), "overridden")
+
+    def test_a_hardlinked_override_blocks_the_link(self):
+        def make(p):
+            (p.parent / "real.md").write_text("owner\n")
+            os.link(p.parent / "real.md", p)
+        self.check("hardlink", make, "overridden")
+
+    def test_content_found_late_or_past_the_read_cap_still_overrides(self):
+        with patch.object(chi, "_OVERRIDE_READ_CAP", 70000):
+            self.check("late", lambda p: p.write_bytes(b" " * 65536 + b"x"), "overridden")
+            self.check("past-cap", lambda p: p.write_bytes(b" " * 80000 + b"x"), "overridden")
+            self.check("ws-long", lambda p: p.write_bytes(b" " * 66000), "linked")
+
+    def test_a_read_error_on_the_override_does_not_block_the_link(self):
+        home, override = self.make_home("eio-read")
+        override.write_text("owner\n")
+        with patch.object(os, "read", side_effect=OSError(errno.EIO, "I/O error")):
+            self.assertEqual(self.link(codex_home=home), "linked")
 
     def test_an_override_open_or_stat_error_does_not_block_the_link(self):
         home, override = self.make_home("eacces")
