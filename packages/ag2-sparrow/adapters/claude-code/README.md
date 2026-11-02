@@ -374,7 +374,10 @@ tests), and a relay that is not on `--base`'s host or a host under it is
 refused unless you name its host with `--trust-relay-host`; a refused relay URL is never written.
 
 `connect` first checks the CLI version, tmux, the plugin and the Claude login,
-so a machine that cannot run the agent never spends the single-use code. It
+then what would refuse later: a config or unit it may not change, and for the
+root an earlier install recorded, a held root, a busy agent lock or a seat that
+cannot be written (with no recorded root, any agent operation in progress). A
+machine that cannot run the agent never reads or spends the single-use code. It
 then redeems the code (`POST <base>/connect/poll`; a 503, or a 202 "still
 redeeming" with its `retry_after`, retried with backoff; a used, expired or
 revoked code refused with one line) for the agent's id and relay
@@ -477,7 +480,14 @@ launcher starts the session on the adapter's **own** tmux server and socket
 refuses a socket path over 100 bytes): `env -i` with `PATH`, `HOME`, `TERM`,
 `USER` and the allowlist, `-f /dev/null`, `update-environment` cleared, and
 the session's environment set in the one `new-session -e K=V …` step (tmux 3.2
-or newer; `install` and `verify` check `tmux -V`). The pane's command is
+or newer). `install` and `connect` resolve tmux once: `--tmux <path>`, else the
+one the config records, else `PATH`, the desktop app's
+`~/Library/Application Support/space.ag2.app/engine/bin`, `/opt/homebrew/bin`
+and `/usr/local/bin`, taking the first that answers `tmux -V` with 3.2 or newer;
+a missing, silent (timed out) or old tmux is its own error. The absolute path
+(a link kept as named) is recorded as `TMUX`, and the managed launch, the
+probes, `verify`, `attach`, the stop path and `uninstall` run exactly that file,
+never a `tmux` looked up on the manager's `PATH`. The pane's command is
 the console script's
 `hold --generation=<32 hex> --` and nothing else: the work root, config dir, session id and HITL store reach `hold`
 through that environment, and the launcher reads `#{pane_start_command}` back
