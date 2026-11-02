@@ -249,18 +249,20 @@ def _well_formed(rec: dict, instance: str) -> "tuple[dict, float] | None":
     return {**rec, "agent_id": agent.strip()}, ts
 
 
-def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None) -> dict:
+def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None,
+                 lifecycle: "int | None" = None) -> dict:
     """Record, under the lane lock, the identity the live drain of `instance` resolved, so a reader
     that must not open the credential env sees that drain's lane; returns the record written.
     It holds the id, instance, pid, the process's start time (which binds it to that process, not
     to a reused pid), a timestamp and, when given, the proactive `send_lock` protocol the drain
-    honours. On a failed write the record is emptied in the same locked step, so it reads invalid,
-    and OSError is raised either way."""
+    honours, and the task `lifecycle` it runs when not the default. On a failed write the record is
+    emptied in the same locked step, so it reads invalid, and OSError is raised either way."""
     if valid_pid(os.getpid()) is None:
         raise OSError(f"pid {os.getpid()} is outside the pid domain readers accept")
     record = {"agent_id": (agent_id or "").strip(), "instance": instance or "",
               "pid": os.getpid(), "start": own_start(), "ts": time.time(),
-              **({"send_lock": send_lock} if send_lock is not None else {})}
+              **({"send_lock": send_lock} if send_lock is not None else {}),
+              **({"lifecycle": lifecycle} if lifecycle is not None else {})}
     dfd = _auth_dir(state_dir, create=True)
     try:
         with _lane_locked(dfd, instance):
