@@ -738,6 +738,22 @@ class Hooks(unittest.TestCase):
         self.assertTrue([m for m in self.logs if f"{settled}: ack for a serve this attempt no longer holds" in m],
                         "a settled claim is no twin: it is logged")
 
+    def test_with_lifecycle_2_off_a_run_of_its_own_is_never_settled_by_its_tasks_item(self):
+        base, run = "task-flagoff-run", "task-flagoff-run~~2"
+        self.addCleanup(self.forget, base)
+        for tid in (base, run):
+            gw.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+            (gw.TASKS_DIR / f"{tid}.txt").write_text(f"id: {tid}\nsource: ag2space\ntask: reply\n")
+        sys.modules[gw.read_item.__module__].record_delivered(gw._delivery_core().backend.root, base)
+        inflight = {base, run}
+        with mock.patch.object(gw, "_ATTEMPTS", None):
+            gw._post_ready_results(inflight)
+        self.assertTrue((gw.TASKS_DIR / f"{run}.txt").exists(), "the wake stays queued for the core")
+        self.assertIn(run, inflight)
+        self.assertFalse([m for m in self.logs if f"result {run}: its result is disposed of" in m])
+        self.assertFalse((gw.TASKS_DIR / f"{base}.txt").exists(), "the task's own run is settled as before")
+        self.assertNotIn(base, inflight)
+
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
         self.addCleanup(self.forget, tid)
