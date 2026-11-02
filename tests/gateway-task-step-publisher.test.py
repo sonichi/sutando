@@ -206,14 +206,20 @@ class Publisher(unittest.TestCase):
         live.clear()
 
     def test_a_set_that_changes_mid_copy_is_retried_on_the_next_interval(self):
-        class Shifting(set):
-            """A live set whose first copy fails as a set does when another thread mutates it."""
-            raised = False
+        class Shifting:
+            """A live set whose first copy fails as a set does when another thread mutates it
+            (a set subclass would not do: set(s) copies a set without calling __iter__)."""
+            def __init__(self, items):
+                self.items, self.raised = set(items), False
+            def __bool__(self):
+                return bool(self.items)
             def __iter__(self):
                 if not self.raised:
                     self.raised = True
                     raise RuntimeError("Set changed size during iteration")
-                return super().__iter__()
+                return iter(self.items)
+            def clear(self):
+                self.items.clear()
         live, snapshots = Shifting({"task-dev~task-a"}), []
         def snapshot(inflight, live_set=None):
             snapshots.append(set(inflight))
