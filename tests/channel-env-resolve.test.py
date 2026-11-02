@@ -597,6 +597,19 @@ class TestActiveLane(_Base):
         device.write_text(self.LANE_TOKEN + "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=../outside\n")
         self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
 
+    def test_a_dir_line_naming_the_device_channel_is_skipped(self):
+        channels = self._install(dir_line=False)
+        os.environ["REMOTE_TASK_CHANNEL_DIR_S_DSPACE"] = "ag2space"
+        self.addCleanup(os.environ.pop, "REMOTE_TASK_CHANNEL_DIR_S_DSPACE", None)
+        self.assertEqual(m.lane_channel_dirs("s_dspace"), ["ag2space", "s.space"])
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), channels / "s.space" / ".env")
+
+    def test_no_lane_reader_resolves_nothing(self):
+        channels = self._install()
+        with unittest.mock.patch.dict(sys.modules, {"gateway_serving": None}):
+            self.assertIsNone(m._active_lane())
+            self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+
     def test_launch_keys_are_still_read_from_the_device_file(self):
         channels = self._install()
         self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), channels / "ag2space" / ".env")
