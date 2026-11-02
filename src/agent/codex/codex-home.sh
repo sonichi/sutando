@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shell adapter for src/codex_home.py, the one owner of the Codex core's home: resolve it,
 # check it, create it only when permitted. Every launcher sources this; none creates the home.
 #
