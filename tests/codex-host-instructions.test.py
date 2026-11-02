@@ -220,8 +220,12 @@ class EnsureLinked(unittest.TestCase):
             with self.subTest(alias=name):
                 alias = root / name
                 alias.symlink_to(dest)
-                self.assertEqual(self.link(codex_home=alias), "owner-home")
-                self.assertEqual(self.link(codex_home=alias / "deeper"), "owner-home")
+                # A link to a missing directory cannot be traversed, so it is refused unresolved.
+                before = self.tree()
+                self.assertEqual(self.link(codex_home=alias), "invalid-home")
+                self.assertEqual(self.link(codex_home=alias / "deeper"), "invalid-home")
+                self.assertTrue(chi.is_owner_codex_home(alias, self.home))
+                self.assertEqual(self.tree(), before)
                 self.assertFalse(os.path.lexists(owner), f"{name} created the owner's home")
 
     def test_an_alias_then_dotdot_to_the_owners_codex_home_is_refused(self):
@@ -339,6 +343,110 @@ class EnsureLinked(unittest.TestCase):
                 self.assertEqual(self.link(), "foreign")
             self.assertFalse(self.target.exists())
             self.assertEqual(self.link(), "linked")
+
+    def test_a_link_through_a_missing_component_is_invalid_and_creates_nothing(self):
+        root = Path(self.tmp.name).resolve()
+        (root / "surprise").mkdir()
+        alias = root / "alias-missing"
+        alias.symlink_to("missing/../surprise")
+        before = self.tree()
+        self.assertEqual(self.link(codex_home=alias), "invalid-home")
+        self.assertEqual(self.link(codex_home=alias / "deeper"), "invalid-home")
+        self.assertTrue(chi.is_owner_codex_home(alias, self.home))
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(os.listdir(root / "surprise"), [])
+
+    def test_a_link_through_a_file_is_invalid_and_creates_nothing(self):
+        root = Path(self.tmp.name).resolve()
+        (root / "surprise").mkdir()
+        (root / "a-file").write_text("x\n")
+        alias = root / "alias-file"
+        alias.symlink_to("a-file/../surprise")
+        before = self.tree()
+        self.assertEqual(self.link(codex_home=alias), "invalid-home")
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(os.listdir(root / "surprise"), [])
+
+    def test_a_home_below_a_regular_file_is_invalid(self):
+        (Path(self.tmp.name).resolve() / "a-file").write_text("x\n")
+        self.assertEqual(self.link(codex_home=Path(self.tmp.name).resolve() / "a-file" / "home"),
+                         "invalid-home")
+
+    def test_a_link_loop_is_invalid(self):
+        root = Path(self.tmp.name).resolve()
+        (root / "loop-a").symlink_to(root / "loop-b")
+        (root / "loop-b").symlink_to(root / "loop-a")
+        self.assertEqual(self.link(codex_home=root / "loop-a" / "home"), "invalid-home")
+
+    def test_strict_resolution_follows_links_like_the_os(self):
+        root = Path(self.tmp.name).resolve()
+        (root / "d" / "e").mkdir(parents=True)
+        (root / "rel").symlink_to("d/e")
+        (root / "abs").symlink_to(root / "d")
+        for spelled in (f"{root}/rel/..", f"{root}/abs/e/./..", f"{root}/rel/../e", "/.."):
+            with self.subTest(spelled=spelled):
+                self.assertEqual(chi._resolve_strict(spelled), os.path.realpath(spelled))
+
+    def test_an_unreadable_owner_identity_fails_closed(self):
+        owner = self.home / ".codex"
+        owner.mkdir(parents=True)
+        real_stat = os.stat
+
+        def eio_for_owner(path, *a, **k):
+            if os.fspath(path) == os.fspath(owner):
+                raise OSError(errno.EIO, "I/O error", os.fspath(path))
+            return real_stat(path, *a, **k)
+        with patch.object(os, "stat", eio_for_owner):
+            self.assertEqual(self.link(codex_home=owner), "owner-home")
+            self.assertTrue(chi.is_owner_codex_home(self.codex_home, self.home))
+            self.assertEqual(self.link(), "owner-home")
+        self.assertEqual(os.listdir(owner), [])
+        self.assertFalse(self.target.exists())
+
+    def test_an_unreadable_candidate_identity_fails_closed(self):
+        real_stat = os.stat
+
+        def eio_for_candidate(path, *a, **k):
+            if os.fspath(path) == os.fspath(self.engine):
+                raise OSError(errno.EIO, "I/O error", os.fspath(path))
+            return real_stat(path, *a, **k)
+        with patch.object(os, "stat", eio_for_candidate):
+            self.assertTrue(chi.is_owner_codex_home(self.engine / "home", self.home))
+
+    def test_identity_of_a_missing_candidate_or_owner_is_known_different(self):
+        self.assertFalse(chi._maybe_same(self.engine / "nope", self.host))
+        self.assertFalse(chi._maybe_same(self.host, self.home / ".codex"))
+        self.assertTrue(chi._maybe_same(self.host, self.host))
+
+    def test_a_dangling_or_directory_override_does_not_override(self):
+        for name, make in (("dangling", lambda p: p.symlink_to(p.parent / "gone.md")),
+                           ("directory", lambda p: p.mkdir())):
+            with self.subTest(override=name):
+                home = Path(self.tmp.name).resolve() / f"home-{name}"
+                home.mkdir()
+                make(home / "AGENTS.override.md")
+                self.assertEqual(self.link(codex_home=home), "linked")
+                self.assertEqual(Path(os.readlink(home / "AGENTS.md")), self.host)
+
+    def test_a_link_to_a_regular_override_file_overrides(self):
+        self.codex_home.mkdir(parents=True)
+        real = self.codex_home / "real-override.md"
+        real.write_text("owner\n")
+        (self.codex_home / "AGENTS.override.md").symlink_to(real)
+        self.assertEqual(self.link(), "overridden")
+        self.assertFalse(os.path.lexists(self.target))
+
+    def test_an_unreadable_override_is_treated_as_present(self):
+        self.codex_home.mkdir(parents=True)
+        real_stat = os.stat
+
+        def eacces(path, *a, **k):
+            if os.fspath(path) == "AGENTS.override.md":
+                raise PermissionError(errno.EACCES, "denied", path)
+            return real_stat(path, *a, **k)
+        with patch.object(os, "stat", eacces):
+            self.assertEqual(self.link(), "overridden")
+        self.assertFalse(os.path.lexists(self.target))
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()

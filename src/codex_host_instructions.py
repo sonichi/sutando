@@ -37,11 +37,45 @@ def _nearest_existing(path):
     return path, rest
 
 
+_MAX_LINKS = 40
+
+
+def _resolve_strict(path):
+    """Resolve an existing absolute path one component at a time, as the OS traverses it.
+
+    Raises OSError where the OS would: a missing or non-directory component before `..` or
+    another component, or too many links. Unlike realpath, nothing is collapsed lexically.
+    """
+    todo, resolved, links = path.split(os.sep)[1:], os.sep, 0
+    while todo:
+        part = todo.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        step = os.path.join(resolved, part)
+        mode = os.lstat(step).st_mode
+        if stat.S_ISLNK(mode):
+            links += 1
+            if links > _MAX_LINKS:
+                raise OSError(errno.ELOOP, "too many levels of symbolic links", step)
+            target = os.readlink(step)
+            if os.path.isabs(target):
+                resolved = os.sep
+            todo[:0] = target.split(os.sep)
+            continue
+        if any(p not in ("", ".") for p in todo) and not stat.S_ISDIR(mode):
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", step)
+        resolved = step
+    return resolved
+
+
 def canonical(path):
     """`path` as the OS resolves it: symlinks before `..`, then the missing rest appended.
 
-    Raises ValueError for a relative path, and when the missing rest holds `..`, which has
-    no physical meaning yet.
+    Raises ValueError for a relative path or a `..` in the missing rest, and OSError when the
+    existing part cannot be traversed (a missing or non-directory component, a link loop).
     """
     raw = os.fspath(path)
     if not os.path.isabs(raw):
@@ -54,33 +88,47 @@ def canonical(path):
     rest = [p for p in parts[cut:] if p not in ("", ".")]
     if ".." in rest:
         raise ValueError(f"{raw}: '..' below a directory that does not exist")
-    return Path(os.path.realpath(prefix)).joinpath(*rest)
+    resolved = _resolve_strict(prefix)
+    if rest and not stat.S_ISDIR(os.stat(resolved).st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "not a directory", resolved)
+    return Path(resolved).joinpath(*rest)
 
 
-def _same(a, b):
+def _maybe_same(candidate, owner):
+    """True when `candidate` is `owner`, or when that cannot be told; False only when known not."""
     try:
-        return os.path.samefile(a, b)
-    except OSError:
+        cst = os.stat(candidate)
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
+    try:
+        ost = os.stat(owner)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return os.path.samestat(cst, ost)
 
 
 def is_owner_codex_home(codex_home, home):
     """True when `codex_home` is, or would be created as, the owner's `~/.codex` or a path in it.
 
-    Compared on the physical path by filesystem identity, so an alias or case variant counts.
+    Compared on the physical path by filesystem identity, so an alias or case variant counts;
+    a path that cannot be resolved, or an identity that cannot be read, counts too.
     """
     owner = Path(home) / ".codex"
     try:
         path = canonical(codex_home)
-    except ValueError:
+        for candidate in (path, *path.parents):
+            if _maybe_same(candidate, owner):
+                return True
+        have, rest = _nearest_existing(path)
+        base, missing = _nearest_existing(canonical(owner))
+    except (ValueError, OSError):
         return True
-    for candidate in (path, *path.parents):
-        if os.path.exists(candidate) and _same(candidate, owner):
-            return True
-    have, rest = _nearest_existing(path)
-    base, missing = _nearest_existing(canonical(owner))
     folded = [p.casefold() for p in rest[:len(missing)]]
-    return _same(have, base) and folded == [p.casefold() for p in missing]
+    return folded == [p.casefold() for p in missing] and _maybe_same(have, base)
 
 
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -128,6 +176,16 @@ def _lexists(name, fd):
         return False
 
 
+def _active_override(fd):
+    """Codex honours AGENTS.override.md only as a regular file, or a link to one."""
+    try:
+        return stat.S_ISREG(os.stat("AGENTS.override.md", dir_fd=fd).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True  # unreadable: assume the owner's override is there
+
+
 def ensure_linked(codex_home, repo, home):
     """Returns "no-host", "invalid-home", "owner-home", "overridden", "foreign", "dangling",
     "already-set" or "linked".
@@ -139,7 +197,7 @@ def ensure_linked(codex_home, repo, home):
         return "no-host"
     try:
         path = canonical(os.path.expanduser(os.fspath(codex_home)))
-    except ValueError:
+    except (ValueError, OSError):
         return "invalid-home"
     if is_owner_codex_home(path, home):
         return "owner-home"
@@ -157,7 +215,7 @@ def ensure_linked(codex_home, repo, home):
         if where is None and not os.path.samestat(os.fstat(fd), os.stat(path)):
             return "foreign"
         # Codex reads an AGENTS.override.md in place of AGENTS.md; the override is the owner's.
-        if _lexists("AGENTS.override.md", fd):
+        if _active_override(fd):
             return "overridden"
         if _lexists("AGENTS.md", fd):
             if not stat.S_ISLNK(os.stat("AGENTS.md", dir_fd=fd, follow_symlinks=False).st_mode):
