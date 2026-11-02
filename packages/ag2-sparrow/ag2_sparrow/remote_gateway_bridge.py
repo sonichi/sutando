@@ -4432,10 +4432,11 @@ def _held_serve(rec, claim) -> bool:
             and rec.get("lease_id") != claim.get("serve"))
 
 
-def _ack_recorded_by_its_twin(rec, claim) -> bool:
-    """Whether another post of this same claim (same operation id) already recorded its serve's ack."""
-    return (isinstance(rec, dict) and claim["op"] not in (rec.get("claims") or {})
-            and rec.get("lease_id") == claim.get("serve") and rec.get("awaiting_ack") is False)
+def _ack_recorded_by_its_twin(rec, claim, gen) -> bool:
+    """Whether another post of this same claim (same operation id) already recorded its serve's ack,
+    for the generation this answer names."""
+    return (isinstance(rec, dict) and rec.get("ack_op") == claim["op"] and rec.get("lease_id") == claim.get("serve")
+            and rec.get("awaiting_ack") is False and rec.get("execution_generation") == gen)
 
 
 def _commit_ack(wire_tid: str, claim, doc, open_turn: bool = True) -> str:
@@ -4452,7 +4453,7 @@ def _commit_ack(wire_tid: str, claim, doc, open_turn: bool = True) -> str:
             return "unrecorded"
         if not t.holds_claim(claim):
             t.release_claim(claim)
-            if not _ack_recorded_by_its_twin(t.rec, claim):
+            if not _ack_recorded_by_its_twin(t.rec, claim, gen):
                 _log(f"task {wire_tid}: ack for a serve this attempt no longer holds — not recorded")
             return "stale"
         rec = t.record_ack(claim, doc, _reenroll_identity() or None, open_turn=open_turn)

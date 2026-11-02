@@ -155,6 +155,16 @@ class Edges(unittest.TestCase):
         self.assertFalse(path.exists(), "and it still drops the turn file")
         self.assertTrue(at.is_closed(self.state, ctx["turn_id"]))
 
+    def test_a_dangling_closed_entry_is_no_fence_and_keeps_the_turn_file(self):
+        ctx = _ctx(self.state)
+        path = at.write_turn_context(self.state, ctx)
+        closed = self.state / "turns" / f"{ctx['turn_id']}.closed"
+        closed.symlink_to(self.state / "missing-fence")
+        with self.assertRaises(OSError):
+            at.close_turn(self.state, ctx["turn_id"])
+        self.assertTrue(path.exists(), "its turn file stays, so the close is retried")
+        self.assertFalse(at.is_closed(self.state, ctx["turn_id"]), "and nothing reads it as fenced")
+
     def test_odd_journal_lines_and_outcome_shapes(self):
         turn = _ctx(self.state)["turn_id"]
         at.room_actions_path(self.state).write_text(

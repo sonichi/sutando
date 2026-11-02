@@ -23,6 +23,7 @@ Stdlib only, so the ag2-sparrow package can vendor it byte-identical.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -260,7 +261,8 @@ def close_turn(state_dir: Path, turn_id: str) -> bool:
         try:
             os.close(os.open(closed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400))
         except FileExistsError:
-            pass                                # fenced before: only its turn file may be left
+            if not closed.exists():             # a dangling entry is no fence: keep the turn file
+                raise OSError(errno.EEXIST, f"{closed.name} is not a fence") from None
         try:
             _turn_path(state_dir, turn_id, ".json").unlink()
         except FileNotFoundError:

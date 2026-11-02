@@ -951,7 +951,8 @@ class Transition:
         if not self.holds_claim(c):
             self.release_claim(c)
             return "stale"
-        extra = extra or {}
+        # Which operation recorded the ack: another post of the same claim can tell it was its twin.
+        extra = {**(extra or {}), "ack_op": c["op"]}
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if type(gen) is not int or gen < 1:
             return self.rec if self.commit_claim(c, awaiting_ack=False, **extra) else None

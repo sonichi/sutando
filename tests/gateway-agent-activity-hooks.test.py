@@ -534,6 +534,14 @@ class Hooks(unittest.TestCase):
         self.forget(gone)
         self.assertEqual(gw._commit_ack(gone, stale, _ack(gone, 1)), "stale")
         self.assertTrue([m for m in self.logs if f"{gone}: ack for a serve this attempt no longer holds" in m])
+        settled = "task-twin-settled"
+        self.addCleanup(self.forget, settled)
+        self.assertTrue(gw._take_served_task(_task(settled, lease_id="L1", source_event_id="$e"), set(), []))
+        claim = gw._claim_ack(settled, "L1", local=settled, durable=True)
+        self.assertTrue(gw._ack_settled(settled, claim), "the ack wait ended without an accepted ack")
+        self.assertEqual(gw._commit_ack(settled, claim, _ack(settled, 1)), "stale")
+        self.assertTrue([m for m in self.logs if f"{settled}: ack for a serve this attempt no longer holds" in m],
+                        "a settled claim is no twin: it is logged")
 
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
