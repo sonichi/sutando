@@ -765,9 +765,28 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("could not link the host's AGENTS.md", result.stderr)
         self.assertNotIn("the host's AGENTS.md was not linked", result.stderr)
+        self.assertTrue(home.is_dir(), "the launcher did not create the app home")
+        self.assertNotIn("not creating it", result.stderr)
         linked = home / "AGENTS.md"
         self.assertTrue(linked.is_symlink(), result.stdout)
         self.assertEqual(linked.read_text(), "# Sutando in AG2 Space\n")
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_desktop_owner_link_to_the_missing_app_home_is_never_created(self):
+        """~/.codex -> the app home: the launcher must not mkdir it before the helper refuses."""
+        home = self._desktop_hosted()
+        user_home = Path(self.tmp.name) / "home"
+        user_home.mkdir(parents=True, exist_ok=True)
+        (user_home / ".codex").symlink_to(home)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertFalse(os.path.lexists(home), "the launcher created the owner's link target")
+        self.assertFalse(os.path.lexists(home.parent), "the launcher created its parent")
+        self.assertIn("not creating it", result.stderr)
+        self.assertIn("is the owner's own Codex home", result.stderr)
+        # The fake codex reports signed in, so the core still starts with the unchanged env.
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
 
     def test_an_override_in_the_codex_home_is_kept_and_reported(self):

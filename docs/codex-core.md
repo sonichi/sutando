@@ -89,8 +89,9 @@ The Codex implementation:
   created: `CODEX_HOME` must be absolute, contain no `..`, and have no symlink or
   non-directory component anywhere. Otherwise the helper refuses it as `invalid-home`,
   creates nothing and the launcher warns; a symlinked `CODEX_HOME` is never followed.
-  (The launcher's own earlier `mkdir -p` of the configured `CODEX_HOME` is separate and
-  unchanged.) A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
+  On a desktop host the launcher asks the helper first (`--check`, which creates
+  nothing) and skips its own `mkdir -p` of `CODEX_HOME` when the home would be refused;
+  a non-desktop checkout gets `no-host` and keeps the plain `mkdir -p`. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
   is refused as `owner-home` from its path alone, before anything is created. The
   spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
   chain names, read textually whether or not the target exists; a chain past 32 hops
@@ -100,10 +101,13 @@ The Codex implementation:
   open directory's identity with the owner's `~/.codex`, or, while that does not exist
   yet, with its nearest existing ancestor plus the case-folded missing names. A match,
   or an identity it cannot read, refuses the link. That owner record is read again before
-  every directory it creates and right before the link: any change (created, removed,
-  replaced, retargeted) refuses with no further write. The threat model assumes no
-  untrusted process is rewriting the owner's `$HOME` concurrently: a retarget during the
-  `mkdir`/`symlink` call itself cannot be closed with path APIs. Anything already at
+  every directory it creates and right before the link, and any change observed by the
+  recheck refuses. The helper protects against pre-existing/stable aliases and owner-home
+  changes observed before each mutation. Concurrent replacement or retargeting of
+  `$HOME/.codex` (or an ancestor) by the user or another same-UID process while the helper
+  runs is unsupported. In that worst case the host AGENTS.md link can be created in the
+  app home at the instant another process makes that home reachable as `~/.codex`; the
+  helper still never removes or replaces an existing entry. Anything already at
   `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
   Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` only when it can
   open it as a regular file whose whole content (read to EOF, no cap) is not blank:

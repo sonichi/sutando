@@ -687,6 +687,38 @@ class Overrides(Base):
         self.assertEqual(override.read_text(), "owner\n")
 
 
+class CheckMode(Base):
+    def test_check_reports_what_would_be_refused_and_creates_nothing(self):
+        app_home = self.root / "app" / ".codex-sutando"
+        (self.root / "a-link").symlink_to(self.root)
+        before = self.tree()
+        self.assertEqual(chi.check(self.codex_home, self.repo, self.home), "ok")
+        self.assertEqual(chi.check("rel", self.repo, self.home), "invalid-home")
+        self.assertEqual(chi.check(self.root / "a-link" / "x", self.repo, self.home), "invalid-home")
+        self.assertEqual(chi.check(self.owner, self.repo, self.home), "owner-home")
+        self.assertEqual(chi.check(self.codex_home, self.root / "code" / "x", self.home), "no-host")
+        self.owner.symlink_to(app_home)
+        self.assertEqual(chi.check(app_home, self.repo, self.home), "owner-home")
+        self.assertEqual(self.tree(), before + [os.path.relpath(self.owner, self.root)])
+
+    def test_check_fails_closed_on_an_unreadable_owner_identity(self):
+        with patch.object(chi, "_owner_anchor", side_effect=OSError(errno.EIO, "I/O error")):
+            self.assertEqual(chi.check(self.codex_home, self.repo, self.home), "owner-home")
+
+    def test_check_refuses_a_walk_that_reaches_the_owner(self):
+        with patch.object(chi, "_walk", return_value=("owner-home", None)):
+            self.assertEqual(chi.check(self.codex_home, self.repo, self.home), "owner-home")
+        self.codex_home.mkdir(parents=True)
+        self.assertEqual(chi.check(self.codex_home, self.repo, self.home), "ok")
+
+    def test_the_check_flag_on_the_cli(self):
+        out = subprocess.run([sys.executable, str(SCRIPT), "--check", str(self.codex_home),
+                              str(self.repo)], capture_output=True, text=True,
+                             env={**os.environ, "HOME": str(self.home)})
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "ok"), out.stderr)
+        self.assertFalse(os.path.lexists(self.codex_home))
+
+
 class DesktopLayout(Base):
     COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh",
               "src/sutando_config.py", "sutando.config.json")

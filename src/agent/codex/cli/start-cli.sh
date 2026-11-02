@@ -200,8 +200,25 @@ fi
 # The default points at ~/.codex to reuse the existing authenticated install.
 config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
 config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"
+# On a desktop host, a home that resolves into the owner's ~/.codex is never created here;
+# a non-desktop checkout gets "no-host" and keeps the plain mkdir.
+codex_home_refused() {
+  local py
+  [ -r "$REPO/scripts/python-binary.sh" ] || return 1
+  . "$REPO/scripts/python-binary.sh"
+  py="$(resolve_python "$REPO" 2>/dev/null || true)"
+  [ -n "$py" ] || return 1
+  case "$("$py" "$REPO/src/codex_host_instructions.py" --check "$1" "$REPO" 2>/dev/null)" in
+    owner-home|invalid-home) return 0 ;;
+  esac
+  return 1
+}
 if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  mkdir -p "$config_value"
+  if codex_home_refused "$config_value"; then
+    echo "  ⚠ $config_env=$config_value is, or leads into, the owner's own Codex home, or is not a plain directory path; not creating it" >&2
+  else
+    mkdir -p "$config_value"
+  fi
   export "$config_env=$config_value"
   echo "  ✓ $config_env=$config_value"
 fi

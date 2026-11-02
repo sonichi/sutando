@@ -201,6 +201,29 @@ def _active_override(fd):
         os.close(probe)
 
 
+def check(codex_home, repo, home):
+    """What ensure_linked would refuse, without creating or writing anything.
+
+    Returns "no-host", "invalid-home", "owner-home" or "ok".
+    """
+    if host_instructions(repo) is None:
+        return "no-host"
+    try:
+        parts = _parts(codex_home)
+    except ValueError:
+        return "invalid-home"
+    if _lexically_owner(parts, home):
+        return "owner-home"
+    try:
+        anchor, missing = _owner_anchor(home)
+    except OSError:
+        return "owner-home"
+    status, fd = _walk(parts, home, anchor, missing, create=False)
+    if fd is not None:
+        os.close(fd)
+    return status if status in ("owner-home", "invalid-home") else "ok"
+
+
 def ensure_linked(codex_home, repo, home):
     """Returns "no-host", "invalid-home", "owner-home", "overridden", "foreign", "dangling",
     "already-set" or "linked".
@@ -257,11 +280,14 @@ def ensure_linked(codex_home, repo, home):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--check", action="store_true",
+                        help="only say whether the home would be refused; create nothing")
     parser.add_argument("codex_home", type=Path)
     parser.add_argument("repo", type=Path)
     args = parser.parse_args(argv)
+    action = check if args.check else ensure_linked
     try:
-        print(ensure_linked(args.codex_home, args.repo, Path.home()))
+        print(action(args.codex_home, args.repo, Path.home()))
     except OSError as exc:
         print(f"codex host instructions: {exc}", file=sys.stderr)
         return 1
