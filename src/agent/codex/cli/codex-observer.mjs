@@ -164,7 +164,7 @@ export class Observer {
     this.misses = 0;
     this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
     this.dirty = false;
-    this.task = null;
+    this.bound = [];
     this.steps = [];
     this.timer = null;
     this.inFlight = false;
@@ -212,7 +212,7 @@ export class Observer {
     this.offset = size;
     // A tail read can start mid-line; that fragment fails to parse and is skipped. History binds
     // the task the core is on but records no step: its steps happened before this observer.
-    this.task = null;
+    this.bound = [];
     this.steps = [];
     this.feed(text, true);
     this.markDirty();
@@ -235,11 +235,23 @@ export class Observer {
       try { line = JSON.parse(raw); } catch { continue; }
       changed = apply(this.state, lineChange(this.state, line), epoch(line.timestamp, this.deps.now())) || changed;
       if (line?.type !== 'response_item') continue;
-      this.task = taskTouched(line.payload) || this.task;
+      // As the Claude hook binds: the first touch of an OPEN task file, never a later mention.
+      const touched = taskTouched(line.payload);
+      if (touched && !this.bound.includes(touched) && this.deps.taskOpen(touched)) this.bound.push(touched);
       const step = toolStep(line.payload);
-      if (step && this.task && !history) { this.steps.push({task: this.task, ...step}); changed = true; }
+      const task = step && this.currentTask();
+      if (step && task && !history) { this.steps.push({task, ...step}); changed = true; }
     }
     if (changed) this.markDirty();
+  }
+
+  // The newest bound task still open: a finished task's steps fall back to the one before it.
+  currentTask() {
+    for (let i = this.bound.length - 1; i >= 0; i--) {
+      if (this.deps.taskOpen(this.bound[i])) return this.bound[i];
+      this.bound.splice(i, 1);
+    }
+    return null;
   }
 
   async tick() {
@@ -368,6 +380,9 @@ export function fileDeps(opts, io = fs) {
       if (opts.workspace) args.push('--workspace', opts.workspace);
       return run(python, args, JSON.stringify(record));
     },
+    // Open = its task file exists and no result does; without a workspace every task reads as open.
+    taskOpen: (id) => !opts.workspace || (io.existsSync(path.join(opts.workspace, 'tasks', `${id}.txt`))
+      && !io.existsSync(path.join(opts.workspace, 'results', `${id}.txt`))),
     steps: (python, steps) => {
       const args = [path.join(opts.engine, 'skills', 'agent-activity', 'scripts', 'phase_line.py'), 'steps'];
       if (opts.workspace) args.push('--workspace', opts.workspace);

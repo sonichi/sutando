@@ -111,6 +111,7 @@ function fake(files, opts = {}) {
     resolvePython: async () => (opts.python === undefined ? '/py' : opts.python),
     write: async (py, rec) => { writes.push({py, rec}); },
     steps: async (py, batch) => { stepped.push(...batch); },
+    taskOpen: (id) => !(opts.closed || new Set()).has(id),
   };
   return {deps, writes, stepped, flush: async () => { for (const fn of timers.splice(0)) fn(); await new Promise((r) => setTimeout(r, 5)); }};
 }
@@ -428,13 +429,54 @@ test('steps after the start are recorded for the bound task; history only binds'
   await o.tick();
   await f.flush();
   assert.deepEqual(f.stepped, [], 'history records no step');
-  assert.equal(o.task, 'task-old', 'history binds the task the core is on');
+  assert.deepEqual(o.bound, ['task-old'], 'history binds the task the core is on');
   files['/r/main'].text += jl(call('exec', 'pytest -q'), call('exec', 'cat /w/tasks/task-new.txt'), fcall('sleep', {duration_ms: 1}));
   await o.tick();
   await f.flush();
   assert.deepEqual(f.stepped.map((s) => [s.task, s.tool]),
     [['task-old', 'Bash'], ['task-new', 'Bash'], ['task-new', 'Monitor']]);
   assert.equal(f.stepped[0].input.command, 'pytest -q');
+});
+
+test('a mention of a task that is not open never binds; a re-mention never rebinds', async () => {
+  const files = {'/r/main': {meta: {}, text: jl(ev('task_started'), call('exec', 'cat /w/tasks/task-a.txt'))}};
+  const f = fake(files, {closed: new Set(['task-gone'])});
+  const o = new Observer({session: 's'}, f.deps);
+  await o.tick();
+  files['/r/main'].text += jl(call('exec', 'grep x /w/tasks/task-gone.txt'), call('exec', 'make'),
+    call('exec', 'cat /w/tasks/task-b.txt'), call('exec', 'grep y /w/tasks/task-a.txt'), call('exec', 'pytest'));
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped.map((s) => s.task), ['task-a', 'task-a', 'task-b', 'task-b', 'task-b'],
+    'a closed task is never bound; naming task-a again does not take the work back from task-b');
+});
+
+test('a finished task hands its later steps back to the task bound before it', async () => {
+  const closed = new Set();
+  const files = {'/r/main': {meta: {}, text: jl(ev('task_started'))}};
+  const f = fake(files, {closed});
+  const o = new Observer({session: 's'}, f.deps);
+  await o.tick();
+  files['/r/main'].text += jl(call('exec', 'cat /w/tasks/task-a.txt'), call('exec', 'cat /w/tasks/task-b.txt'), call('exec', 'make'));
+  await o.tick();
+  closed.add('task-b');
+  files['/r/main'].text += jl(call('exec', 'pytest'));
+  await o.tick();
+  await f.flush();
+  assert.deepEqual(f.stepped.map((s) => [s.task, s.input.command]),
+    [['task-a', 'cat /w/tasks/task-a.txt'], ['task-b', 'cat /w/tasks/task-b.txt'], ['task-b', 'make'], ['task-a', 'pytest']]);
+  assert.deepEqual(o.bound, ['task-a']);
+});
+
+test('the file deps read a task as open only with its task file and no result', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-open-'));
+  fs.mkdirSync(path.join(ws, 'tasks')); fs.mkdirSync(path.join(ws, 'results'));
+  fs.writeFileSync(path.join(ws, 'tasks', 'task-a.txt'), 'x'); fs.writeFileSync(path.join(ws, 'tasks', 'task-b.txt'), 'x');
+  fs.writeFileSync(path.join(ws, 'results', 'task-b.txt'), 'done');
+  const d = fileDeps({engine: '/e', workspace: ws});
+  assert.deepEqual([d.taskOpen('task-a'), d.taskOpen('task-b'), d.taskOpen('task-c')], [true, false, false]);
+  assert.equal(fileDeps({engine: '/e'}).taskOpen('task-z'), true, 'no workspace: nothing to check against');
+  fs.rmSync(ws, {recursive: true, force: true});
 });
 
 test('a tool call before any task is bound records nothing', async () => {
