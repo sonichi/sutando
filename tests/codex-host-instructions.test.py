@@ -422,6 +422,32 @@ class OwnerGuard(Base):
         self.owner.symlink_to(self.owner.name)
         self.assert_refused_unchanged(self.codex_home, "owner-home")
 
+    def test_an_owner_link_chain_of_32_hops_resolves_and_33_refuses(self):
+        target = self.root / "app" / ".codex-sutando"
+        (self.root / "app").mkdir()
+        for hops, expected in ((32, "owner-home"), (33, "owner-home")):
+            with self.subTest(hops=hops):
+                if os.path.lexists(self.owner):
+                    self.owner.unlink()
+                for old in self.root.glob("chain-hop-*"):
+                    old.unlink()
+                prev = target
+                for i in range(hops - 1):
+                    link = self.root / f"chain-hop-{i}"
+                    link.symlink_to(prev)
+                    prev = link
+                self.owner.symlink_to(prev)
+                spellings = None
+                try:
+                    spellings = chi._owner_spellings(self.home)
+                except ValueError:
+                    pass
+                if hops == 32:
+                    self.assertIn(str(target), spellings, "32 hops must resolve")
+                else:
+                    self.assertIsNone(spellings, "33 hops must refuse")
+                self.assert_refused_unchanged(target, expected)
+
     def test_a_stable_owner_link_to_the_candidate_is_refused(self):
         candidate = self.root / "candidate"
         candidate.mkdir()
@@ -634,7 +660,7 @@ class Overrides(Base):
         self.check("hardlink", make, "overridden")
 
     def test_the_whole_override_is_read_with_no_cap(self):
-        # Codex then loads neither file; linking AGENTS.md is the closest safe match.
+        # Codex falls back to AGENTS.md for a blank override of any size, as the link does.
         self.check("ws-1mib-plus-1", lambda p: p.write_bytes(b" " * (1024 * 1024 + 1)), "linked")
         self.check("late", lambda p: p.write_bytes(b" " * (1024 * 1024 + 1) + b"x"), "overridden")
         split = "\u00a0".encode()  # a multi-byte character straddling a read boundary
@@ -650,6 +676,28 @@ class Overrides(Base):
             with self.subTest(char=f"U+{ord(char):04X}"):
                 self.check(f"ws-{ord(char):x}", lambda p, c=char: p.write_bytes(c.encode()), "linked")
         self.check("zwsp", lambda p: p.write_bytes("\u200b".encode()), "overridden")
+
+    def test_content_then_a_read_error_does_not_block_the_link(self):
+        """Codex reads the whole file; a later error falls back to AGENTS.md."""
+        real_read = os.read
+        for name, first in (("text", b"x"), ("invalid-utf8", b"\xff")):
+            with self.subTest(first=name):
+                home, override = self.make_home(f"late-eio-{name}")
+                override.write_bytes(first + b" " * 70000)
+                reads = []
+
+                def then_eio(fd, n):
+                    reads.append(fd)
+                    if len(reads) > 1:
+                        raise OSError(errno.EIO, "I/O error")
+                    return real_read(fd, n)
+                with patch.object(os, "read", then_eio):
+                    self.assertEqual(self.link(codex_home=home), "linked")
+                self.assertEqual(len(reads), 2, "stopped reading at the first content")
+
+    def test_content_is_read_through_to_eof(self):
+        self.check("content-then-ws", lambda p: p.write_bytes(b"x" + b" " * 200000), "overridden")
+        self.check("invalid-then-ws", lambda p: p.write_bytes(b"\xff" + b" " * 200000), "overridden")
 
     def test_a_read_error_on_the_override_does_not_block_the_link(self):
         home, override = self.make_home("eio-read")

@@ -51,11 +51,12 @@ _OWNER_LINK_HOPS = 32
 
 def _owner_spellings(home):
     """Every path `~/.codex` names, created or not: `$HOME/.codex`, `realpath($HOME)/.codex`,
-    and each target its symlink chain names, read textually; ValueError past the hop cap."""
+    and each target its symlink chain names, read textually; ValueError past 32 links, as
+    Darwin's MAXSYMLINKS."""
     found = []
     for base in (os.fspath(home), os.path.realpath(home)):
         path = os.path.normpath(os.path.join(base, ".codex"))
-        for _ in range(_OWNER_LINK_HOPS):
+        for _ in range(_OWNER_LINK_HOPS + 1):
             found += [path, os.path.realpath(path)]
             if not os.path.islink(path):
                 break
@@ -176,25 +177,28 @@ _WHITE_SPACE = frozenset(map(chr, [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680,
 
 
 def _active_override(fd):
-    """Codex honours AGENTS.override.md only as a regular file it can open whose whole text is
-    not blank; bytes that are not UTF-8 count as content. Read to EOF in chunks."""
+    """Codex honours AGENTS.override.md only as a regular file it reads whole whose text is not
+    blank; bytes that are not UTF-8 count as content. A read error anywhere means no override."""
     try:
         probe = os.open("AGENTS.override.md", os.O_RDONLY | os.O_NONBLOCK, dir_fd=fd)
     except OSError:
         return False
     decoder = codecs.getincrementaldecoder("utf-8")()
+    content = False
     try:
         if not stat.S_ISREG(os.fstat(probe).st_mode):
             return False
         while True:
             chunk = os.read(probe, 65536)
-            text = decoder.decode(chunk, final=not chunk)
-            if any(c not in _WHITE_SPACE for c in text):
-                return True
+            if not content:
+                try:
+                    text = decoder.decode(chunk, final=not chunk)
+                except UnicodeDecodeError:
+                    content = True
+                else:
+                    content = any(c not in _WHITE_SPACE for c in text)
             if not chunk:
-                return False
-    except UnicodeDecodeError:
-        return True
+                return content
     except OSError:
         return False
     finally:

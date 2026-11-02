@@ -213,8 +213,10 @@ codex_home_refused() {
   esac
   return 1
 }
+CODEX_HOME_REFUSED=""
 if [ -n "$config_env" ] && [ -n "$config_value" ]; then
   if codex_home_refused "$config_value"; then
+    CODEX_HOME_REFUSED=1
     echo "  ⚠ $config_env=$config_value is, or leads into, the owner's own Codex home, or is not a plain directory path; not creating it" >&2
   else
     mkdir -p "$config_value"
@@ -333,8 +335,13 @@ ensure_codex_host_instructions() {
   return 0
 }
 
+# A refused home gets no write from the launcher: not the trust entry, not the link.
 prepare_codex_home() {
-  ensure_codex_project_trust
+  if [ -n "$CODEX_HOME_REFUSED" ]; then
+    echo "  ⚠ not recording Codex project trust in a refused CODEX_HOME" >&2
+  else
+    ensure_codex_project_trust
+  fi
   ensure_codex_host_instructions
 }
 

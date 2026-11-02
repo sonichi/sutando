@@ -94,8 +94,8 @@ The Codex implementation:
   a non-desktop checkout gets `no-host` and keeps the plain `mkdir -p`. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
   is refused as `owner-home` from its path alone, before anything is created. The
   spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
-  chain names, read textually whether or not the target exists; a chain past 32 hops
-  refuses. The helper walks down from `/`
+  chain names, read textually whether or not the target exists; a chain of more than 32
+  links (Darwin's limit) refuses. The helper walks down from `/`
   one real directory at a time (`O_DIRECTORY|O_NOFOLLOW`, relative to the parent's
   descriptor). Before each step and before each directory it creates, it compares the
   open directory's identity with the owner's `~/.codex`, or, while that does not exist
@@ -111,7 +111,8 @@ The Codex implementation:
   `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
   Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` only when it can
   open it as a regular file whose whole content (read to EOF, no cap) is not blank:
-  content that is not valid UTF-8 (a NUL included) counts, and blank means only Unicode
+  content that is not valid UTF-8 counts, any non-whitespace character (a NUL included)
+  counts, and blank means only Unicode
   White_Space characters, as Rust's `char::is_whitespace` (U+0009 to U+000D, U+0020,
   U+0085, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000).
   So an empty or whitespace-only file, a directory, FIFO, dangling or looping link, or an unreadable
