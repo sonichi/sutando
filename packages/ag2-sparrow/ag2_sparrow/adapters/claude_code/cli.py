@@ -153,9 +153,20 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 # ── commands ─────────────────────────────────────────────────────────────────
 
+def resolve_tmux(args) -> "tuple[str, str]":
+    """The tmux install records and connect checks before the code is spent: --tmux, else the one the
+    config records, else the shared lookup (launcher.resolve_tmux)."""
+    try:
+        recorded = cm.read_config(config_path()).get("TMUX", "") if config_path().is_file() else ""
+    except (OSError, ValueError):
+        recorded = ""
+    return launcher.resolve_tmux(getattr(args, "tmux", None) or "", recorded)
+
+
 def install(args) -> int:
     claude = shutil.which(args.claude) or args.claude
-    problem = version_problem(claude) or launcher.tmux_problem() or launcher.socket_problem(config_dir())
+    tmux, problem = resolve_tmux(args)
+    problem = version_problem(claude) or problem or launcher.socket_problem(config_dir())
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -193,7 +204,7 @@ def install(args) -> int:
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
-              "BRIDGE_STATE_DIR": str(state)}
+              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux}
 
     def revise(old: dict, values: dict) -> dict:
         """The session id: kept from the old config; minted when there is none; rotated by
@@ -255,7 +266,7 @@ def connect_preflight(args) -> str:
         return f"{plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)"
     login = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser()
                                                                          .resolve()) if args.claude_config_dir else ""}
-    return (version_problem(claude) or launcher.tmux_problem() or launcher.socket_problem(config_dir())
+    return (version_problem(claude) or resolve_tmux(args)[1] or launcher.socket_problem(config_dir())
             or auth_problem(login) or hmac_settings(args)[2])
 
 
@@ -348,7 +359,10 @@ def pane_dialog(rec: dict) -> "str | None":
     gen = rec.get("generation")
     if not gen:
         return None
-    tm = launcher.Tmux(launcher.socket_path(config_dir()))
+    tmux, problem = launcher.configured_tmux(load_config()[0])
+    if problem:
+        return None
+    tm = launcher.Tmux(launcher.socket_path(config_dir()), tmux)
     return trust.dialog(tm.capture(gen["pane_id"])) if tm.has_session() is True else None
 
 
@@ -378,8 +392,9 @@ def verify(_args) -> int:
     if not problem:
         problem = auth_problem(cfg)
         cm.check(results, not problem, "login", problem or "claude auth status: logged in")
-    problem = launcher.tmux_problem()
-    cm.check(results, not problem, "tmux", problem or "tmux %s" % ".".join(map(str, launcher.tmux_version() or ())))
+    tmux, problem = launcher.configured_tmux(cfg)
+    found, problem = (None, problem) if problem else launcher.tmux_check(tmux)
+    cm.check(results, not problem, "tmux", problem or "tmux %s at %s" % (".".join(map(str, found or ())), tmux))
     problem = launcher.socket_problem(config_dir())
     sock = launcher.socket_path(config_dir())
     cm.check(results, not problem, "socket", problem or f"{sock} ({len(str(sock).encode())} bytes)")
@@ -484,9 +499,12 @@ def attach(_args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
+    tmux, problem = launcher.configured_tmux(cfg)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     sock = str(launcher.socket_path(config_dir()))
-    tmux = shutil.which("tmux") or "tmux"
-    os.execvp(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
+    os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
 
 
 def stop(args) -> int:
@@ -531,6 +549,8 @@ def session_options(p) -> None:
     p.add_argument("--new-session", action="store_true", help="rotate the session id, only once the old session "
                    "is proven gone (quiescent); else the old id is kept and said so")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
+    p.add_argument("--tmux", help="the tmux executable, 3.2 or newer, recorded for every later command (default: the "
+                   "recorded one, else PATH, the desktop app's engine/bin, %s)" % ", ".join(launcher.TMUX_DIRS))
 
 
 def main(argv=None) -> int:
