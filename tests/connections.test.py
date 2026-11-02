@@ -116,6 +116,12 @@ class Base(unittest.TestCase):
         self.ws = Path(self.tmp.name)
         self.vault = FakeVault()
         self.children = []
+        # reconnect's preflight asks the target checkout what it resolves; these fixtures have no real
+        # checkout, so it answers "this workspace, this host" (ReconnectPreflight tests the real probe).
+        probe = unittest.mock.patch.object(C, "_launch_probe", lambda repo, env, python: {
+            "workspace": str(self.ws.resolve()), "host": C._this_host()})
+        probe.start()
+        self.addCleanup(probe.stop)
 
     def tearDown(self):
         for proc in self.children:
@@ -233,8 +239,14 @@ class Preview(unittest.TestCase):
 
     def test_probe_requires_https(self):
         with self.assertRaises(C.InvalidToken) as cm:
-            C.preview_connection("http://chat.alpha-fixture.net/relay|s", fetch=lambda *a: self.fail("probed"))
+            C.preview_connection("http://chat.alpha-fixture.net/relay|s", fetch=lambda *a: self.fail("probed"),
+                                 getaddrinfo=lambda *a, **k: self.fail("resolved"))
         self.assertEqual(str(cm.exception), "invalid_gateway")
+        # An undeclared http gateway is refused before resolution, even where port 80 would apply.
+        for url in ("http://chat.alpha-fixture.net:80/relay", "http://localhost/relay", "http://127.0.0.1/relay"):
+            with self.assertRaises(C.InvalidToken, msg=url):
+                C.preview_connection(url + "|s", fetch=lambda *a: self.fail("probed"),
+                                     getaddrinfo=lambda *a, **k: self.fail("resolved"))
         self.assertEqual(C.gateway_url_of("http://chat.alpha-fixture.net/relay|s"), "http://chat.alpha-fixture.net/relay",
                          "env rows may still carry an http gateway; only the probe refuses it")
 
@@ -330,6 +342,173 @@ class Preview(unittest.TestCase):
             t.join(5)
             srv.server_close()
         self.assertEqual(cm.exception.code, 302)
+
+class DeclaredLocalServer(unittest.TestCase):
+    """A self-hosted homeserver on this machine or the owner's own network (#3165): only a
+    `core.dotspace.instances` entry with `allow_local: true` for that exact gateway host lets a
+    token be plain http, name localhost or a private address. Nothing else changes."""
+
+    ENTRY = {"server": "localhost", "gateway_host": "localhost", "allow_local": True}
+
+    def section(self, *entries):
+        return unittest.mock.patch.object(dotspace, "_loaded_section", lambda: {"instances": list(entries)})
+
+    def listing(self, mxid):
+        seen = []
+        def fetch(url, token, address):
+            seen.append((url, address)); return {"agents": [{"id": mxid}]}
+        return fetch, seen
+
+    def resolving_to(self, ip):
+        return lambda host, port, **kw: [(2, 1, 6, "", (ip, port))]
+
+    def test_a_declared_local_server_is_probed_over_http_and_verified(self):
+        fetch, seen = self.listing("@alice-laptop.agent:localhost")
+        with self.section(self.ENTRY):
+            p = C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        self.assertEqual((p["server"], p["server_source"], p["verified"], p["agent_mxid"]),
+                         ("localhost", "identity", True, "@alice-laptop.agent:localhost"))
+        self.assertEqual(seen, [("http://localhost/relay", "127.0.0.1")])
+
+    def test_a_declared_lan_server_may_resolve_to_a_private_address(self):
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        entry = {"server": "chat.home.example", "allow_local": True}
+        with self.section(entry):
+            p = C.preview_connection("https://chat.home.example/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("192.168.1.20"))
+        self.assertEqual((p["server"], p["verified"]), ("chat.home.example", True))
+
+    def test_without_the_entry_nothing_changes(self):
+        for entries in ((), ({**self.ENTRY, "allow_local": False},), ({**self.ENTRY, "allow_local": "true"},),
+                        ({"server": "localhost", "gateway_host": "other-host", "allow_local": True},)):
+            with self.section(*entries), self.assertRaises(C.InvalidToken, msg=entries) as cm:
+                C.preview_connection("http://localhost/relay|s", fetch=lambda *a: self.fail("probed"),
+                                     getaddrinfo=lambda *a, **k: self.fail("resolved"))
+            self.assertEqual(str(cm.exception), "invalid_gateway")
+        with self.section(), self.assertRaises(C.InvalidToken):
+            C.preview_connection("https://chat.home.example/relay|s", fetch=lambda *a: self.fail("probed"),
+                                 getaddrinfo=self.resolving_to("192.168.1.20"))
+
+    def test_the_entry_names_one_host_and_the_listing_still_only_confirms(self):
+        with self.section(self.ENTRY):
+            self.assertEqual(C.local_server_for("localhost"), "localhost")
+            self.assertEqual(C.local_server_for("LOCALHOST."), "localhost")
+            self.assertEqual(C.local_server_for("127.0.0.1"), "")
+            self.assertEqual(C.local_server_for("evil.example"), "")
+            # A gateway on the declared host still has to name an agent of the declared server.
+            fetch, _ = self.listing("@mallory:evil.example")
+            p = C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertEqual((p["verified"], p["agent_mxid"]), (False, None))
+            # A URL that is neither http nor https, or a bad port, is still refused.
+            with self.assertRaises(C.InvalidToken):
+                C.preview_connection("http://localhost:99999/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertEqual(C.local_server_for("localhost"), "")
+
+    def test_a_declared_local_server_resolves_only_to_loopback_private_or_shared_addresses(self):
+        """allow_local admits this machine and the owner's own network, never any address."""
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        entry = {"server": "chat.home.example", "allow_local": True}
+        with self.section(entry):
+            for ip in ("127.0.0.1", "::1", "10.1.2.3", "172.16.0.9", "192.168.1.20", "100.64.0.1",
+                       "fd00::1", "::ffff:192.168.1.20"):
+                p = C.preview_connection("https://chat.home.example/relay|s", fetch=fetch,
+                                         getaddrinfo=self.resolving_to(ip))
+                self.assertTrue(p["verified"], ip)
+            for ip in ("169.254.169.254", "fe80::1", "0.0.0.0", "::", "8.8.8.8", "2001:4860::8888",
+                       "224.0.0.1", "240.0.0.1", "::ffff:169.254.169.254", "203.0.113.5"):
+                with self.assertRaises(C.InvalidToken, msg=ip) as cm:
+                    C.preview_connection("https://chat.home.example/relay|s",
+                                         fetch=lambda *a: self.fail(f"probed {ip}"),
+                                         getaddrinfo=self.resolving_to(ip))
+                self.assertEqual(str(cm.exception), "invalid_gateway")
+
+    def test_plain_http_only_to_loopback(self):
+        """The bearer rides every poll in cleartext over http: only to this machine itself."""
+        fetch, _ = self.listing("@bob.agent:chat.home.example")
+        with self.section({"server": "chat.home.example", "allow_local": True}):
+            for ip in ("192.168.1.20", "10.0.0.5", "100.64.0.1", "fd00::1"):
+                with self.assertRaises(C.InvalidToken, msg=ip):
+                    C.preview_connection("http://chat.home.example/relay|s",
+                                         fetch=lambda *a: self.fail(f"cleartext to {ip}"),
+                                         getaddrinfo=self.resolving_to(ip))
+            # A name that resolves to loopback today is not loopback: the bridge re-resolves it.
+            with self.assertRaises(C.InvalidToken):
+                C.preview_connection("http://chat.home.example/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+        fetch, _ = self.listing("@a.agent:localhost")
+        for entry, url in (({"server": "localhost", "allow_local": True}, "http://localhost/relay"),
+                           ({"server": "localhost", "gateway_host": "127.0.0.1", "allow_local": True}, "http://127.0.0.1/relay"),
+                           ({"server": "localhost", "gateway_host": "[::1]", "allow_local": True}, "http://[::1]/relay")):
+            with self.section(entry):
+                ip = "::1" if "::1" in url else "127.0.0.1"
+                self.assertTrue(C.preview_connection(url + "|s", fetch=fetch, getaddrinfo=self.resolving_to(ip))["verified"], url)
+
+    def test_a_malformed_port_in_an_entry_matches_nothing(self):
+        fetch, _ = self.listing("@a.agent:localhost")
+        with self.section({"server": "bad", "gateway_host": "localhost:99999", "allow_local": True}, self.ENTRY):
+            self.assertEqual(C.local_server_for("localhost", port=80), "localhost")
+            self.assertTrue(C.preview_connection("http://localhost/relay|s", fetch=fetch,
+                                                 getaddrinfo=self.resolving_to("127.0.0.1"))["verified"])
+
+    def test_an_entry_that_names_a_port_covers_that_port_only(self):
+        fetch, seen = self.listing("@alice.agent:localhost")
+        with self.section({"server": "localhost", "gateway_host": "localhost:8008", "allow_local": True}):
+            p = C.preview_connection("http://localhost:8008/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+            for url in ("http://localhost:22/relay", "http://localhost/relay", "https://localhost/relay"):
+                with self.assertRaises(C.InvalidToken, msg=url):
+                    C.preview_connection(url + "|s", fetch=lambda *a: self.fail(f"probed {url}"),
+                                         getaddrinfo=lambda *a, **k: self.fail(f"resolved {url}"))
+        with self.section(self.ENTRY):  # no port named: every port on the host
+            p = C.preview_connection("http://localhost:8008/relay|s", fetch=fetch,
+                                     getaddrinfo=self.resolving_to("127.0.0.1"))
+            self.assertTrue(p["verified"])
+
+    def test_userinfo_and_other_schemes_are_refused_on_the_local_path(self):
+        with self.section(self.ENTRY):
+            for url in ("http://evil@localhost/relay", "http://u:p@localhost/relay", "http://localhost@evil.example/relay",
+                        "ws://localhost/relay", "ftp://localhost/relay", "http://ｌocalhost/relay"):
+                with self.assertRaises(C.InvalidToken, msg=url):
+                    C.preview_connection(url + "|s", fetch=lambda *a: self.fail(f"probed {url}"),
+                                         getaddrinfo=lambda *a, **k: self.fail(f"resolved {url}"))
+
+    def test_an_ipv6_host_header_is_bracketed(self):
+        sent = []
+        class Sock:
+            def makefile(self, *a, **k):
+                import io
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            def sendall(self, data): sent.append(data)
+            def close(self): pass
+        C._fetch_json("http://[::1]:8008/relay", "t|s", "::1", "/v1/whoami", connect=lambda *a: Sock())
+        C._fetch_json("http://[::1]/relay", "t|s", "::1", "/v1/whoami", connect=lambda *a: Sock())
+        heads = b"".join(sent)
+        self.assertIn(b"Host: [::1]:8008\r\n", heads)
+        self.assertIn(b"Host: [::1]\r\n", heads)
+
+    def test_an_http_gateway_defaults_to_port_80_and_is_fetched_without_tls(self):
+        self.assertEqual(C._gateway_port("http://localhost/relay"), 80)
+        self.assertEqual(C._gateway_port("https://localhost/relay"), 443)
+        calls = []
+        class Sock:
+            def makefile(self, *a, **k):
+                import io
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            def sendall(self, data): calls.append(("sent", data[:4]))
+            def close(self): pass
+        def connect(address, port, host, timeout):
+            calls.append((address, port, host)); return Sock()
+        self.assertEqual(C._fetch_json("http://localhost/relay", "http://localhost/relay|s", "127.0.0.1",
+                                       "/v1/whoami", connect=connect), {})
+        self.assertEqual(calls[0], ("127.0.0.1", 80, "localhost"))
+        with unittest.mock.patch.object(C.socket, "create_connection", lambda addr, timeout: ("plain", addr)):
+            self.assertEqual(C._connect_plain("127.0.0.1", 80, "localhost", 1.0), ("plain", ("127.0.0.1", 80)))
+
 
 class AddConnection(Base):
     def test_add_writes_row_and_stores_secret_only_in_vault(self):
@@ -533,6 +712,60 @@ class Primary(Base):
         C.record_path(self.ws).write_text("{broken")
         self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("", "beta")], [True, False], "unreadable: legacy")
 
+    def test_unaddressed_go_to_a_lane_with_an_owner_dm(self):
+        """A designated lane with no owner DM can only hold unaddressed owner messages: they go to a
+        lane that has one, and back once the designated lane has one again."""
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        rows = {r["instance"]: r for r in json.loads(C.record_path(self.ws).read_text())["connections"]}
+        state = self.ws / "state"
+
+        def routing(inst, owner_dm="!dm:x", private=True, identity=None):
+            name = f"owner-routing{'.' + inst if inst else ''}.json"
+            ident = identity if identity is not None else rows[inst].get("agent_mxid", "")
+            (state / name).write_text(json.dumps({"identity": ident, "owner_dm": owner_dm, "private": private}))
+
+        def owners():
+            return [C.owns_unaddressed(i, self.ws) for i in ("", "beta-fixture-net")]
+
+        self.assertEqual(owners(), [False, True], "no owner DM anywhere: the designated lane keeps them")
+        self.assertEqual(C.unaddressed_owner(self.ws)[1], None)
+        routing("")
+        self.assertEqual(owners(), [False, True], "a lane whose bridge is not running never takes them")
+        ai = C._agent_identity()
+        ai.publish_lane(state, "", rows[""].get("agent_mxid") or "@a:alpha-fixture.net")
+        with unittest.mock.patch.object(ai, "LANE_FRESH_S", -1.0):
+            self.assertEqual(owners(), [False, True], "nor one whose lane record is stale")
+        self.assertEqual(owners(), [True, False], "handed to the running lane with an owner DM")
+        owner, handed_from = C.unaddressed_owner(self.ws)
+        self.assertEqual((owner["instance"], handed_from["instance"]), ("", "beta-fixture-net"))
+        routing("beta-fixture-net", private=None)
+        self.assertEqual(owners(), [True, False], "an unchecked room is not an owner DM")
+        routing("beta-fixture-net", identity="@other:elsewhere.net")
+        self.assertEqual(owners(), [True, False], "another agent's reading is not this lane's owner DM")
+        (state / "owner-routing.beta-fixture-net.json").write_text("{broken")
+        self.assertEqual(owners(), [True, False], "an unreadable reading is no owner DM")
+        routing("beta-fixture-net")
+        self.assertEqual(owners(), [False, True], "the designated lane has one again: back to it")
+        self.assertEqual(C.unaddressed_owner(self.ws)[1], None)
+        routing("beta-fixture-net", owner_dm="")
+        rec = json.loads(C.record_path(self.ws).read_text())
+        for r in rec["connections"]:
+            r["owner_mxid"] = "@owner-a:x" if r["instance"] == "beta-fixture-net" else "@owner-b:x"
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        self.assertEqual(owners(), [False, True], "a lane serving another owner never takes them")
+        for r in rec["connections"]:
+            r.pop("owner_mxid", None)
+        next(r for r in rec["connections"] if r["instance"] == "")["disabled"] = True
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        self.assertEqual(owners(), [False, True], "a disabled lane never takes them")
+        with unittest.mock.patch.object(C, "_agent_identity", side_effect=ImportError("no package")):
+            self.assertFalse(C._lane_running({"instance": ""}, self.ws), "an unknown lane state is not running")
+        self.assertEqual(C.lane_server("beta-fixture-net", self.ws), "beta-fixture.net")
+        C.record_path(self.ws).write_text("{broken")
+        self.assertEqual(C.lane_server("beta-fixture-net", self.ws), "", "an unreadable record names no server")
+
     def test_primary_in_the_plan_keeps_the_proactive_room(self):
         self.add()
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
@@ -568,6 +801,178 @@ class Primary(Base):
         self.assertEqual(C.launch_env(alpha, environ, vault=self.vault)["REMOTE_PROACTIVE_ROOM"], "",
                          "the old primary's next launch has no room")
         self.assertTrue(C.disconnect("alpha-fixture-net", workspace=self.ws, kill=lambda *a: None)["disabled"])
+
+
+class ReconnectPreflight(Base):
+    """reconnect refuses, touching nothing, when the new bridge cannot start here; a launch that still
+    fails after the stop brings the previous bridge back from the checkout its last good launch ran from."""
+
+    def setUp(self):
+        super().setUp()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.killed = []
+        self.logs = self.ws / "logs"
+
+    def kill(self, pid, sig):
+        self.killed.append(pid)
+        os.kill(pid, sig)
+
+    def reconnect(self, repo, spawn=None):
+        return C.reconnect("beta-fixture-net", repo=repo, logs_dir=self.logs, environ={}, workspace=self.ws,
+                           vault=self.vault, spawn=spawn or self.bridge_spawn(), kill=self.kill, fetch=unreachable)
+
+    def running(self):
+        bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        self.children.append(bridge)
+        return bridge
+
+    def test_a_checkout_that_resolves_elsewhere_is_refused_before_the_stop(self):
+        bridge = self.running()
+        for answer, why in (({"workspace": "/elsewhere", "host": C._this_host()}, "workspace"),
+                            ({"workspace": str(self.ws.resolve()), "host": "another-host"}, "host label")):
+            with unittest.mock.patch.object(C, "_launch_probe", lambda repo, env, python, a=answer: a):
+                with self.assertRaises(C.RelaunchPreflightFailed) as cm:
+                    self.reconnect(self.ws / "wt")
+            self.assertIn(why, str(cm.exception))
+            self.assertIn("the running bridge was left up", str(cm.exception))
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid), "nothing stopped")
+
+    def test_no_bridge_or_no_token_is_refused_before_the_stop(self):
+        bridge = self.running()
+        with unittest.mock.patch.object(C, "_launch_probe", side_effect=ValueError("no src/remote-gateway-bridge.py")):
+            with self.assertRaises(C.RelaunchPreflightFailed):
+                self.reconnect(self.ws / "empty")
+        self.vault.store.clear()
+        with self.assertRaises(C.RelaunchPreflightFailed) as cm:
+            self.reconnect(self.ws / "repo")
+        self.assertIn("no token", str(cm.exception))
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid))
+
+    def test_a_row_without_an_identity_yet_still_passes_the_preflight(self):
+        rec = json.loads(C.record_path(self.ws).read_text())
+        for r in rec["connections"]:
+            r["agent_mxid"] = ""
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        seen = []
+        with unittest.mock.patch.object(C, "_launch_probe", lambda repo, env, python: seen.append(env) or {
+                "workspace": str(self.ws.resolve()), "host": C._this_host()}):
+            C._launch_preflight("beta-fixture-net", self.ws / "repo", {}, self.ws, self.vault, None)
+        self.assertEqual(seen[0]["GATEWAY_INSTANCE"], "beta-fixture-net")
+
+    def test_a_disconnected_row_without_its_token_is_refused_too(self):
+        self.add()
+        C.set_primary("alpha-fixture-net", workspace=self.ws)
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        self.vault.store.clear()
+        with self.assertRaisesRegex(C.RelaunchPreflightFailed, "no token"):
+            self.reconnect(self.ws / "repo")
+        beta = next(r for r in self.rows() if r["instance"] == "beta-fixture-net")
+        self.assertTrue(beta["disabled"], "still disconnected: nothing changed")
+
+    def test_every_good_launch_records_its_checkout(self):
+        rec = C.launch("beta-fixture-net", repo=self.ws / "main", logs_dir=self.logs,
+                       environ={"SUTANDO_BRIDGE_LOCK": "0"}, workspace=self.ws, vault=self.vault,
+                       spawn=self.bridge_spawn(), fetch=unreachable)
+        self.assertEqual((rec["lease"], rec["repo"]), ("disabled", str((self.ws / "main").resolve())))
+
+    def test_a_failed_launch_brings_the_previous_bridge_back_from_its_checkout(self):
+        good, bad = self.ws / "main", self.ws / "wt"
+        (good / "src").mkdir(parents=True)
+        (good / "src" / "remote-gateway-bridge.py").write_text("")
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        self.assertEqual(C._launch_record("beta-fixture-net", self.ws)["repo"], str(good.resolve()))
+        argvs = []
+
+        def spawn(argv, env, log_path):
+            argvs.append(argv[1])
+            if str(bad) in argv[1]:
+                raise OSError("will not start")
+            return self.bridge_spawn()(argv, env, log_path)
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.reconnect(bad, spawn=spawn)
+        self.assertIn(f"the previous bridge was brought back from {good.resolve()}", str(cm.exception))
+        self.assertEqual([Path(a).parents[1] for a in argvs], [bad, good.resolve()])
+        self.assertTrue(C.bridge_pid("beta-fixture-net", self.ws), "the lane is up again")
+        self.assertEqual(C._launch_record("beta-fixture-net", self.ws)["repo"], str(good.resolve()))
+
+    def test_when_the_previous_bridge_will_not_start_either_both_failures_are_named(self):
+        good = self.ws / "main"
+        (good / "src").mkdir(parents=True)
+        (good / "src" / "remote-gateway-bridge.py").write_text("")
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+
+        def spawn(argv, env, log_path):
+            raise OSError("nothing starts")
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertIn("failed too", str(cm.exception))
+        self.assertEqual(C._launch_record("beta-fixture-net", self.ws).get("last_repo"), str(good.resolve()),
+                         "the last good checkout survives failed records")
+
+    def test_a_failure_from_the_same_checkout_is_not_retried(self):
+        repo = self.ws / "main"
+        C.launch("beta-fixture-net", repo=repo, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            spawned.append(argv)
+            raise OSError("will not start")
+        with self.assertRaisesRegex(C.LaunchFailed, "same checkout, so it was not retried"):
+            self.reconnect(repo, spawn=spawn)
+        self.assertEqual(len(spawned), 1, "one attempt, no second run of the same code")
+
+    def test_a_previous_checkout_without_its_bridge_is_not_spawned(self):
+        good = self.ws / "gone"
+        C.launch("beta-fixture-net", repo=good, logs_dir=self.logs, environ={}, workspace=self.ws, vault=self.vault,
+                 spawn=self.bridge_spawn(), fetch=unreachable)
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            spawned.append(argv)
+            raise OSError("will not start")
+        with self.assertRaisesRegex(C.LaunchFailed, "has no bridge any more"):
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertEqual(len(spawned), 1)
+
+    def test_a_vault_error_passes_through_unwrapped(self):
+        bridge = self.running()
+        with unittest.mock.patch.object(C, "launch_env", side_effect=C.VaultUnavailable("vault down")):
+            with self.assertRaises(C.VaultUnavailable) as cm:
+                self.reconnect(self.ws / "repo")
+        self.assertNotIsInstance(cm.exception, C.RelaunchPreflightFailed)
+        self.assertEqual((self.killed, C.bridge_pid("beta-fixture-net", self.ws)), ([], bridge.pid))
+
+    def test_with_no_previous_bridge_the_failure_says_so(self):
+        def spawn(argv, env, log_path):
+            raise OSError("nothing starts")
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.reconnect(self.ws / "wt", spawn=spawn)
+        self.assertIn("no previous bridge to bring back", str(cm.exception))
+
+    def test_the_real_probe_asks_the_checkout_itself(self):
+        unittest.mock.patch.stopall()
+        repo = self.ws / "stub"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "remote-gateway-bridge.py").write_text("")
+        (repo / "src" / "workspace_default.py").write_text(
+            "from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path('/ws/x')\n")
+        (repo / "src" / "util_paths.py").write_text("def host_label():\n    return 'host-x'\n")
+        self.assertEqual(C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None), {"workspace": "/ws/x", "host": "host-x"})
+        (repo / "src" / "util_paths.py").write_text("raise ImportError('broken checkout')\n")
+        with self.assertRaisesRegex(ValueError, "could not resolve its workspace"):
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None)
+        (repo / "src" / "util_paths.py").write_text("def host_label():\n    return 'h'\nprint('[]')\n")
+        (repo / "src" / "workspace_default.py").write_text("import sys\nprint('[1]')\nsys.exit(0)\n")
+        with self.assertRaisesRegex(ValueError, "gave no workspace|could not resolve"):
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, None)
+        with self.assertRaisesRegex(ValueError, "did not run"):
+            C._launch_probe(repo, {"PATH": os.environ.get("PATH", "")}, "/nonexistent/python")
+        with self.assertRaisesRegex(ValueError, "no src/remote-gateway-bridge.py"):
+            C._launch_probe(self.ws / "empty", {}, None)
+        self.assertTrue(C._this_host())
 
 
 class RemoveConnection(Base):
@@ -1219,7 +1624,14 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({}, {"ok": True, "pid": 4}), ("pending", None))
         self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}), ("failed", "no_token"))
         self.assertEqual(C.derive_state({"connected": True}, {"ok": True}), ("connected", None))
-        self.assertEqual(C.derive_state({"connected": False, "error": "timed out"}, {}), ("disconnected", None))
+        self.assertEqual(C.derive_state({"connected": False, "error": "timed out", "last_ok_ts": 9}, {}),
+                         ("disconnected", None))
+        starting = {"connected": False, "error": "starting — not yet connected", "last_ok_ts": None}
+        self.assertEqual(C.derive_state(starting, {"ok": True}), ("pending", None),
+                         "a live bridge that has never polled is starting, not disconnected")
+        self.assertEqual(C.derive_state(starting, {"ok": True}, writer_alive=False), ("disconnected", None),
+                         "one whose writer is gone is not starting")
+        self.assertEqual(C.derive_state({**starting, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "reenroll": {"pending": True}}, {}),
                          ("failed", "auth_rejected"))
@@ -2023,10 +2435,11 @@ class Disconnect(Base):
         self.assertEqual([e["instance"] for e in C.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net", "beta-fixture-net"])
         # A failed row still reconnects as before, enabled rows untouched by the flag path.
         self.vault.store.pop("AG2_REMOTE_TOKEN_BETA_FIXTURE_NET")
-        with self.assertRaises(C.LaunchFailed):
+        before = C.status_for(self.rows()[1], self.ws)["state"]
+        with self.assertRaises(C.RelaunchPreflightFailed):  # refused before the stop: the running bridge stays up
             C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
                         workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=unreachable)
-        self.assertEqual(C.status_for(self.rows()[1], self.ws)["state"], "failed")
+        self.assertEqual(C.status_for(self.rows()[1], self.ws)["state"], before, "nothing was changed")
         self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
         record = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
                              workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=unreachable)

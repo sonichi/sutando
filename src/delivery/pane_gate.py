@@ -186,6 +186,16 @@ _SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.
 _TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
 
 
+def turn_status(lines: List[str]) -> Optional[List[str]]:
+    """The last turn row and the lines below it (its status line and footer) while that row is a
+    live spinner; None when the last turn row is a completion line or there is none."""
+    for i in range(len(lines) - 1, -1, -1):
+        row = _SGR.sub("", lines[i])
+        if _TURN_ROW.search(row):
+            return lines[i:] if _SPINNER_ROW.search(row) else None
+    return None
+
+
 def live_tail(lines: List[str]) -> List[str]:
     """`lines` below the last turn spinner / completion row, else all of them. Tool output
     above that row may quote a dialog's caret or key hints; only a dialog below it is live."""
@@ -570,7 +580,7 @@ def progress_id(capture: str) -> str:
 def _limit_row(ln: str) -> bool:
     plain = _SGR.sub("", ln)
     abn = frame_abnormal(plain)
-    return bool(LIMIT_WAIT.search(plain)) or (
+    return limit_line(plain) or (
         abn is not None and all(n in PROVIDER_LIMIT_PATTERNS for n in abn.names))
 
 
@@ -597,6 +607,45 @@ def limit_baseline(capture: str) -> LimitBaseline:
                          frozenset(key for key, _ in _turns(capture)))
 
 
+# A spinner's clock: its first `·` field that is only a duration ("2m 37s"), never a
+# suffix such as "thought for 4s".
+_CLOCK = re.compile(r"\d+[hms](?:\s+\d+[hms])*")
+_UNIT_S = {"h": 3600, "m": 60, "s": 1}
+
+
+def spinner_elapsed(row: str) -> Optional[int]:
+    """Seconds on a spinner row's own clock, else None."""
+    inner = row.partition("(")[2].rpartition(")")[0]
+    for field in inner.split("\u00b7"):
+        if _CLOCK.fullmatch(field.strip()):
+            return sum(int(t[:-1]) * _UNIT_S[t[-1]] for t in field.split())
+    return None
+#: A delivery the limit refuses ends within seconds; a turn running longer was served.
+FLIGHT_MIN_S = 10
+# A turn waiting rather than working: a limit, a retry or a cancellable wait on its rows.
+_WAIT_TEXT = re.compile(r"\bretry(?:ing)?\b|\brate[ -]?limit|\boverloaded\b|\battempt \d+"
+                        r"|esc to cancel|\b429\b", re.I)
+
+
+def _waiting_row(plain: str) -> bool:
+    return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
+
+
+def turn_in_flight(capture: Optional[str]) -> bool:
+    """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
+    and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
+    so a limit banner under the composer is from before it."""
+    lines = (capture or "").splitlines()
+    above = [_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]]
+    for i in range(len(above) - 1, -1, -1):
+        if _TURN_ROW.search(above[i]):
+            if not _SPINNER_ROW.search(above[i]) or any(_waiting_row(r) for r in above[i:]):
+                return False
+            ran = spinner_elapsed(above[i])
+            return ran is not None and ran >= FLIGHT_MIN_S
+    return False
+
+
 def strip_limit_banners(capture: str) -> str:
     """`capture` without the limit banner under its composer, for a caller that has judged
     it stale. Rows inside turns (a refusal) are evidence and stay."""
@@ -607,16 +656,19 @@ def strip_limit_banners(capture: str) -> str:
 
 def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, baseline=None) -> bool:
     """A quota-only banner is a line from before the reset, scrollback, not a hold, when
-    the seat shows it is not held: the newest turn finished since `baseline` (limit_baseline
-    of the first capture showing the banner) ran, or a FRESH proxy record says accepted for a
-    seat ROUTED through that proxy. A newest turn that was refused holds whatever the record
-    says. Anything else keeps the hold -- another abnormal family, no newer turn, an
-    unrouted or unobserved seat, or a record absent, stale or rejected. A retry never
-    reaches here: classify_pane returns on it before any gate."""
+    the seat shows it is not held: a turn is in flight above the composer, the newest turn
+    finished since `baseline` (limit_baseline of the first capture showing the banner) ran,
+    or a FRESH proxy record says accepted for a seat ROUTED through that proxy. A newest
+    turn that was refused holds whatever the record says. Anything else keeps the hold --
+    another abnormal family, no newer turn, an unrouted or unobserved seat, or a record
+    absent, stale or rejected. A retry never reaches here: classify_pane returns on it
+    before any gate."""
     if abn is None or abn.kind != "provider-limit":
         return False
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
         return False
+    if turn_in_flight(capture):
+        return True
     if capture is not None and baseline is not None:
         new = [ran for key, ran in _turns(capture) if key not in baseline.seen]
         if new:
@@ -667,9 +719,11 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
     gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
+    if gate in LIMIT_GATES and turn_in_flight(capture):
+        return Verdict("busy", "working")
     if gate:
         return Verdict("busy", gate)
-    if abn and not limit_is_stale(abn, workspace, socket, session, probe):
+    if abn and not limit_is_stale(abn, workspace, socket, session, probe, capture=capture):
         return Verdict("abnormal", ",".join(abn.names))
     if frame_working(tail):
         return Verdict("busy", "working")

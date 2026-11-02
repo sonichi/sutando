@@ -235,6 +235,11 @@ retires that ack the same way; a task served without one is acked without the ke
 An `ack_first` task is not in the pending-ack ledger: its manifest entry is its
 retry record, because an accepted ack must also publish it, and its `404` is
 decided with the task's status rather than retired (see `GET /v1/tasks`).
+With `REMOTE_TASK_LIFECYCLE_V2=1` the ack's claim in the attempt ledger is the authority: it carries
+who retries it, the local id and the durability, so an open claim alone resends the ack under its
+own lease and operation id, whatever became of the pending-ack files. A pending-ack file that cannot
+be read is neither written over nor retired, and an entry whose lease cannot be proved is kept,
+never posted without one.
 
 ### `POST /v1/results`
 
@@ -378,7 +383,7 @@ Sutando checkout around it sends neither field.
   either ack path carrying a fencing `error_code` (`stale_execution_generation`, `task_cancelled`,
   `task_not_found`, `task_already_terminal`, on a 404 or a 409) fences the attempt, retires its
   pending ack and, for a published task, stops the core (below) — except a stale older lease
-  when a newer serve of the same task is pending here, which that serve's ack decides.
+  when a newer serve of the same task is held here, which that serve's ack decides.
 - **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
   is sent every 15 s for every attempt with a generation, for as long as the bridge holds it, even
   while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
@@ -387,14 +392,14 @@ Sutando checkout around it sends neither field.
   going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
   one still queued whose task file the core took up (a turn row newer than the file) and then left
   with no turn activity and no result for 30 min while the core's health row reads it idle (2 h when
-  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call); a task file the core has not reached yet keeps
+  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call). With
+  `SUTANDO_STOP_INTERRUPT=1` that one also gets a `CANCEL_INSTRUCTION`, a cooperative stop: its
+  failure result is already written, so no Escape is sent for it. A task file the core has not reached yet keeps
   beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
   dropping it as completed elsewhere. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
-  also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
-  generation of the task is acked here. If the core took it already, the newer attempt it then
-  leaves with no result and no queued task file is posted as `status: failed` with `no_send`. The other
+  also stops the core. A stop names the local run it is for, so it never stops a later run. The other
   two, from a beat or an ack, withdraw the task file if the core has not
   taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
   broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
@@ -407,7 +412,7 @@ Sutando checkout around it sends neither field.
   only if it has taken it up), and it is cancel-acked at once. A 404 disables the per-task beat.
 - **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
   without a post. A result written before its task's ack named the lease waits for it. On a broker that has
-  ever named a lease (`state/relay-broker-contract.json`) it keeps waiting, until the ack lands,
+  ever named a lease (recorded in the ledger) it keeps waiting, until the ack lands,
   the attempt is fenced, or the server closes the task; on one never seen to, it waits 120 s and
   is then posted without lease fields, still gated on the journal records that name the task. A
   task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
@@ -417,8 +422,81 @@ Sutando checkout around it sends neither field.
   ago) is only logged: absence is not a terminal status, so it is fenced only when its beat or ack
   answers with one. Server tasks this node does not hold are written to
   `state/relay-outstanding-tasks.json`.
-- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is left unacked, whether or not this node saw its first
-  attempt: running it without its answer, or closing it as a redelivery, would lose the answer.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is never closed as a redelivery, and never
+  run without its answer. Without turn context, for an `ack_first` wake, or for an episode already run
+  here, it is left unacked, whether or not this node saw its first attempt. With the flag off it is an
+  ordinary task, as before.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, each served task runs as a **local run**: the core's task file and
+  result are named by the run's id. The first run of a task keeps the task's local id; each later
+  one is `<local id>~~<n>` (`src/local_task_protocol.py`, `run_task_id` / `split_run_id`; no local id
+  contains `~~`, so the split is exact). A run id is allocated and saved before its task file is
+  published and is never used again. A result at an id with no live run of its task is moved to
+  `results/undelivered/`, never posted for the task's current run.
+- A run is bound to one execution generation once it can execute. A serve under a new lease for a
+  task whose run is already published is **held**: nothing is published, and its ack decides. If
+  the ack names the run's own generation (a lost ack re-served), the lease moves onto the run and
+  nothing re-runs. If it names a newer generation, the earlier run is stopped (its untaken task file
+  withdrawn, else a cancel naming that run), every effect it claimed is settled first under its
+  own operation id (one claimed and not yet in the outbox, or still sending, makes the switch
+  wait; a claim whose exact reply is gone from its name and pin and never reached the outbox sent nothing and is ended,
+  whichever drain exit disposed of the file; every outbox item a result claim publishes is recorded on
+  the claim before the publish, so the settle checks exactly those items; a name or outbox item that cannot be read is never taken
+  as absent: the claim is kept and the wait is logged with what clears it), and the generation gets a new run of its own, published from the held serve. Each
+  held serve saves its task as an immutable envelope, `relay-reserves*/v1-<hash>.json`, owned by
+  (task, candidate run, lease) with the task's digest; the ledger names it by reference, the
+  newer generation's debt carries that reference, and only its owner reads or removes it. A copy
+  that is missing, damaged or another owner's fails that generation (`dispatch_lost`) and is never
+  used for another; the same held serve delivered again repairs a missing copy, and one whose bytes
+  changed keeps its first copy (the lease is the serve). An adopted run never published is owed in
+  the adoption's own write and publishes the copy saved for its serve. A copy is removed only by the
+  ledger's owner, under the ledger's lock, while no record names it: at start, copies no record
+  names are removed, and none while any record or reference cannot be read; a copy whose removal
+  fails is left for the next start. Copies are private (0600). Its result
+  goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
+  An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
+  The same holds after the earlier run has finished: a serve under a lease other than the one it
+  finished under (or for a run whose details were pruned) is held for its ack, so an answer the
+  broker refused as stale never makes a newer generation look already handled. Every run after the
+  first has its own item, `<task>.run-<n>`. A serve under a lease other than the record's is always
+  held, whether or not the earlier run's publication was recorded. An ack the broker accepted counts
+  as done only once its generation can reach the core: its run is on disk or owed a publish, or a
+  newer serve has replaced it; otherwise the ack is kept and retried. A newer generation's task file
+  carries one writer-owned line saying what became of the earlier attempt, from what the bridge
+  recorded: its answer delivered (a real receipt, not one the broker settled by refusing it), its
+  result undelivered but its own `room.message.send` messages sent, unknown (the journal cannot be
+  read, or the earlier run's entry has aged out of the ledger), or not delivered. So the core never takes it for a redelivery it already answered. The run
+  is published only once that can be read; until then it stays owed and its held serve is kept.
+  A wake is a new run too, even under the same generation; a replay of the same episode reuses
+  its run and publishes nothing. The same episode served again under a new lease is held like any
+  serve: its ack keeps the run (same generation) or gives the newer generation its own run, which
+  carries the wake's answer, episode and rule.
+- Every change to a task's attempt is one transition under that task's lock, committed to
+  `state/relay-task-ledger.json` under a file lock (re-read, compared, written to a temp file,
+  fsynced, renamed, directory fsynced). A remote effect (an ack, a cancel-ack, a result) is
+  claimed in one transition, made with no lock held, and committed in another only while the exact
+  claim still owns the exact run and generation. Its operation id rides the request as
+  `Idempotency-Key` and every retry reuses it; a result's outbox item records it. An effect whose
+  outcome is unknown (a timeout, a crash) keeps its claim and is reconciled under the same id. Each
+  start takes the ledger over with a new epoch, and a bridge whose epoch is gone makes no further
+  claim or call and stops polling. A ledger that cannot be locked, read or written is never written
+  over, and nothing that depends on it moves. The ledger is format 4 (saved-serve references); a
+  format-3 ledger is read and upgraded on its next write, and a format-3 bridge refuses a format-4
+  ledger rather than serve its debts from a legacy file. A damaged value inside it (its `contract`,
+  a record, a run entry) is never read as absent: the work that needs it is held and logged. The way
+  out is to stop the bridge, set the ledger aside (or repair the named key), and restart: a missing
+  ledger starts empty, and the attempts the old one held are not resumed.
+- The pending-ack index (`remote-task-acks*.json`) is a backup of the ledger's ack claims. With the
+  ledger on, a damaged index is set aside (`*.damaged-<ts>`) and the claims retry its acks; one that
+  cannot be read now is left as it is. With the ledger off, a damaged index reads as empty, as before.
+- The result drain pins the file it will deliver as a hard link under `results/.delivering/` and
+  claims it for the run and generation in the same transition, before any effect (attachments,
+  Stop, settle, publish). A reply written at the result's name after that is a new result; one that
+  arrives after the task's lease closed is kept in `results/undelivered/` for review. A task id is
+  not retired while its pin is held, so the results directory must support hard links. Each
+  result is delivered on a worker of its own, so a send that hangs holds no other task's result.
+- Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
+  upgraded; start logs that they are ignored, and attempts in flight across that upgrade are not
+  resumed.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
@@ -436,6 +514,21 @@ unknown: neither terminal nor suspended, so only the same-text check applies to 
 proxy could not bind but that name the task, written since it was published, count as the turn's.
 A journal line that does not parse makes the journal unreadable (`failed` + `no_send`), except an
 unterminated last line younger than 30 s, an append in progress, which defers the result.
+
+Each task file then carries one writer-owned line telling the agent to ask a question that blocks
+it with `room.question.ask` on its exact `task_id`, to send anything the room should read with
+`room.message.send` before asking, and that its result file is never posted while the question is
+open (`waiting_input` + `no_send`). A wake (the same task re-served with
+`wake.resolved_blockers` after the answer) runs once per `blocker_episode_id`
+(`state/relay-wake-episodes.json`): it is queued again under the same id, with each answer appended
+to the task's line as quoted room data, and it is acked at the same generation into a new turn.
+Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt's delivered record
+neither blocks nor stands in for it. A wake served while an earlier attempt of the same id is still settling here
+(its result unarchived, its task still queued, or its id still to retire) is left unacked until
+the broker serves it again, so the earlier attempt's settle can never retire the wake. Every
+branch that archives a result and retires its id does both as one step under the same lock. The
+recovery judgement that a result was already disposed of is made inside that step too, and a
+settle never archives a task whose open wake has not delivered its own result.
 
 ### `GET /v1/setup` *(optional)*
 
@@ -556,6 +649,17 @@ Credential routing is by parsed exact origin, never string matching:
 
 Authenticated fetches refuse redirects (a 3xx is a failure), so a
 gateway-controlled URL can never bounce a bearer to another host.
+
+The local `room_ops.py fetch` fallback accepts `mxc://server/id` with an
+explicit `--room`, or a media link under the selected gateway's
+`/v1/media/server/id` path. For a link, its single `room_id` query parameter
+supplies the room when `--room` is absent; conflicting rooms are refused.
+The room is resolved before the client gate and connection selection. Links
+are normalized to MXC refs for `/v1/media/fetch`, with `room_id` sent separately.
+Only links matching that connection's origin and base path are accepted;
+credentials are sent to the configured gateway, never to the supplied link.
+Selecting a channel environment does not supply room context for a bare MXC
+ref: without `--room`, the client reports the missing argument before HTTP.
 
 Outbound `[file: …]` markers upload through `POST /v1/rooms/<room>/media`. A
 task the server marked with a `signal` object instead uploads against its own
@@ -880,23 +984,95 @@ It uses the same failure predicate as the local check's exit code. Warnings
 remain warnings; check names, diagnostic output, task text, and paths are not
 included in the record.
 
-The gateway overlays a recent failing report onto its next heartbeat as
-`status: error` with a failure count. This works even without a core status
-file, allowing the independent health checker to report a failed core.
-A later passing check removes the override and resumes the core's status.
-Repair attempts do not imply recovery: another completed check must verify it.
+The heartbeat's `status` and `step` describe work from `core-status.json`, subject
+to the existing liveness safeguards above: a newer graceful-stop tombstone reports
+`offline`, and a missing/stale self-report without a live beat uses the beat's
+`offline`/`idle`/`unknown` verdict. Diagnostic check failures never replace work
+fields. An idle or offline verdict omits the stale step.
 
-Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
-as the five-minute fallback. An expired report gives no opinion: the core status
-passes through exactly as with no report, so a cached failure is never refreshed
-and a host that stops running the checker is not pinned to `unknown`. Malformed,
-empty, or future-dated reports emit `status: unknown`.
-An absent report preserves legacy core-status reporting for installations
-without the health checker. A passing report alone does not invent a core
-status. If the gateway or host is down, no heartbeat can be sent; the broker's
-existing contact timeout still yields disconnected/unknown.
+Health travels separately in the existing `health` object (`alive`, `motion`,
+`condition`, `reason`, `since`) with the `worker_health.v1` capability. The
+snapshot/injected-command selection, validation and reason grammar are unchanged.
+A valid independent report with failures and age at most 35 minutes sets
+`condition: abnormal`, `reason: health-check`, and `since: checked_at`, preserving
+`alive` and `motion` from that source. Without a source, they remain null/unknown.
+Passing, stale or invalid reports leave the source row unchanged. The broker
+derives `needs_attention: false` for `health-check`; the bridge does not send a
+new attention field. A diagnostic condition change participates in the existing
+heartbeat change detection. Consumers use this structured field for diagnostic
+health; presence still receives the existing liveness override in `status`.
 
-The s.space dashboard already classifies `error` as unhealthy, so this
-requires updating Sutando's health checker and restarting its gateway bridge;
-no dashboard schema change is needed. Reporting starts after the first health
-check completes and follows the installed check cadence.
+This bridge change requires loading the updated bridge code. It does not require
+a core restart or change the broker's health schema. The broker's existing
+contact timeout still detects a disconnected bridge or host.
+
+### Local hook activity attribution
+
+The agent-activity hook attributes working and turn-end thinking rows to the
+most recently picked-up (`processing`) task bound to that session in the live
+activity log. Later working or queued rows cannot change that selection. A done
+row closes a task until a later processing row explicitly picks up the same ID
+again; late working rows cannot reopen it. Results older than that renewed pickup
+do not close the resumed task. Otherwise, an existing result (including archived
+results) excludes the task even when its session binding remains. Without an eligible
+pickup in the live log, the hook emits no working or thinking row.
+
+Result lookups are cached per task, session and pickup in
+`state/agent-activity.answers.json`, under a lock with atomic replacement. Each
+hook invocation checks only result-directory, archive-root and live-result
+modification times before reusing a cached answer. A changed stamp, session or
+pickup triggers a new archive lookup; cache writes prune unbound task IDs. Normal
+result publication and archival invalidate the stamps. Direct edits inside an
+existing nested archive directory without a live-result transition are not a
+cache invalidation signal.
+
+### Local activity row room scope
+
+The agent-activity CLI assigns a room only from explicit `--room` or the
+task file's `channel_id` (explicit wins). Without either, the JSON row omits
+`room`; it never reads the owner's last activity to infer a destination.
+This keeps background health-check and cron activity from acquiring the
+owner's latest DM or room. Task rows retain their own room.
+
+A roomless ordinary activity row belongs in the dock, not every room's drawer.
+Only `kind: wedge` represents a global blocker: it always omits `room`, even
+when a task file supplies one, and the CLI rejects an explicit `--room`.
+Clients must distinguish a roomless wedge from other roomless kinds; missing
+`room` alone does not mean global. This is a writer contract, not a change to
+client rendering. No historical rows are rewritten.
+
+### Owner task step summaries (default off)
+
+`skills/agent-activity/manifest.json` declares `LEDGER_STEP_PUBLISH_ENABLED: false`.
+The Sutando adapter reads this through `skill_config.enabled` (environment override
+then manifest). Standalone Sparrow has no enablement callback and defaults off.
+When off, the bridge does not read the activity tail or start a publisher worker.
+When enabled, an optional daemon thread coalesces steps without blocking intake;
+a still-running worker is not duplicated. Empty task sets never read the log.
+
+The publisher sends `room.task.progress` through
+`POST /api/capabilities/v1/actions/execute` on the gateway's origin, authenticated
+with that connection's bearer. Arguments contain only `summary`; top-level fields
+carry `task_id`, `execution_generation`, `operation_id`, and the room. The same
+operation ID is sent as `Idempotency-Key`. Per the backend contract, this changes
+only summary and `last_reported_at`, never phase or blockers. It never uses
+`room.task.update` or a `working` transition for progress.
+
+An HTTP 404 means the Action is not deployed: log it and skip, leaving the row
+eligible for a later rate-limited retry. Other failures are logged and contained.
+Keep the switch off until the Action is live and a live owner-ledger witness has
+been captured. Enabling it does not authorize a bridge restart.
+
+The publisher selects working/thinking rows for the connection's own
+in-flight task envelopes. Missing generation/room, a different connection or
+room, ready results, terminal rows and finished/fenced/stale attempts are skipped.
+The bridge preserves served task ID and execution generation above the body;
+legacy envelopes lacking generation are unchanged and skipped. Health, notice,
+processing and projected rows are excluded. `filter_chat_secrets` redacts each
+summary before normalization and the 140-character cap.
+
+Eligible changes coalesce to the latest summary, with at most one attempt per
+ten seconds per task including failures. Failure logs contain exception types,
+not summaries or credential values. The idempotency key is stable for
+retries of a row. Timing and deduplication remain process-local. Intended owner
+ledger visibility is private step text; other room members receive only counts.

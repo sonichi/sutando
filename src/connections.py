@@ -275,6 +275,16 @@ class BridgeStillRunning(Refusal):
         self.pid = pid
 
 
+class RelaunchPreflightFailed(Refusal):
+    """The bridge `reconnect` would launch cannot be shown to start here; the running one is left up."""
+
+    CODE = "relaunch_preflight_failed"
+
+    def __init__(self, instance: str, detail: str):
+        super().__init__(f"{self.CODE}: the bridge for {instance or '<primary>'} would not start from that "
+                         f"checkout ({detail}); the running bridge was left up; nothing changed")
+
+
 class BridgeLeaseIndeterminate(Refusal):
     """The bridge's lease does not show which process holds it; nothing is signalled or written."""
 
@@ -486,9 +496,50 @@ def _public_address(ip: str) -> bool:
     return True
 
 
+def _local_address(ip: str) -> bool:
+    """Whether `ip` may be a declared local homeserver's (`allow_local`): loopback, private
+    (RFC 1918, IPv6 ULA fc00::/7) or shared (100.64/10, a tailnet range), in its own form or as
+    the IPv4 an IPv6 address maps. Never link-local (169.254/16, where cloud metadata answers),
+    unspecified, multicast, reserved or public: a declared local server is on this machine or
+    the owner's own network."""
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    if addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        return False
+    if addr.is_loopback:
+        return True
+    if addr.version == 4:
+        shared = addr in ipaddress.ip_network("100.64.0.0/10")
+        rfc1918 = any(addr in ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+        return shared or rfc1918
+    return addr in ipaddress.ip_network("fc00::/7")
+
+
+def _loopback_host(host: str) -> bool:
+    """Whether a gateway host names this machine itself: localhost (or a name under .localhost),
+    or a loopback address literal. A name that merely resolves to loopback today is not."""
+    h = (host or "").strip().lower().rstrip(".").strip("[]")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    return _loopback_address(h)
+
+
+def _loopback_address(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(addr.is_loopback or (getattr(addr, "ipv4_mapped", None) or addr).is_loopback)
+
+
 def _gateway_port(url: str) -> Optional[int]:
-    """The gateway URL's port (443 when absent); None when the URL carries userinfo, a port
-    outside 1..65535, or a port that is not a number, all of which refuse the token."""
+    """The gateway URL's port (443 when absent, 80 for http); None when the URL carries userinfo,
+    a port outside 1..65535, or a port that is not a number, all of which refuse the token."""
     try:
         parts = urllib.parse.urlsplit(url)
         if parts.username is not None or parts.password is not None or "@" in parts.netloc:
@@ -497,13 +548,15 @@ def _gateway_port(url: str) -> Optional[int]:
     except ValueError:
         return None
     if port is None:
-        return 443
+        return 80 if parts.scheme.lower() == "http" else 443
     return port if 1 <= port <= 65535 else None
 
 
-def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
+def vetted_address(host: str, port: int, getaddrinfo=None, *, allow_private: bool = False) -> Optional[str]:
     """Resolve `host` once; the first address when every answer is public, '' when any is not,
-    None when the name does not resolve. The caller pins the connection to the address it got."""
+    None when the name does not resolve. The caller pins the connection to the address it got.
+    `allow_private` (a declared local server only) requires every answer to be loopback, private
+    or shared instead (`_local_address`): never link-local, unspecified or public."""
     getaddrinfo = getaddrinfo or DEFAULT_GETADDRINFO or socket.getaddrinfo
     try:
         infos = getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -512,7 +565,8 @@ def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
     addresses = [str(info[4][0]) for info in infos if info and info[4]]
     if not addresses:
         return None
-    if not all(_public_address(ip) for ip in addresses):
+    allowed = _local_address if allow_private else _public_address
+    if not all(allowed(ip) for ip in addresses):
         return ""
     return addresses[0]
 
@@ -540,16 +594,23 @@ def _fetch_whoami(gateway_url: str, token: str, address: str, *, connect=None) -
     return _fetch_json(gateway_url, token, address, "/v1/whoami", connect=connect)
 
 
+def _connect_plain(address: str, port: int, host: str, timeout: float):
+    """Plain TCP to the address: only for a gateway the owner declared local (`allow_local`)."""
+    return socket.create_connection((address, port), timeout=timeout)
+
+
 def _fetch_json(gateway_url: str, token: str, address: str, path: str, *, connect=None) -> dict:
     parts = urllib.parse.urlsplit(gateway_url)
     host = parts.hostname or ""
-    port = parts.port or 443
-    sock = (connect or _connect)(address, port, host, PROBE_TIMEOUT_S)
+    plain = parts.scheme.lower() == "http"
+    port = parts.port or (80 if plain else 443)
+    sock = (connect or (_connect_plain if plain else _connect))(address, port, host, PROBE_TIMEOUT_S)
     conn = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_S)
     conn.sock = sock  # the transport is the pinned one; connect() is never reached
     try:
         conn.request("GET", parts.path.rstrip("/") + path, headers={
-            "Host": f"{parts.hostname}:{port}" if parts.port else parts.hostname,
+            "Host": (lambda h: f"{h}:{port}" if parts.port else h)(
+                f"[{parts.hostname}]" if ":" in (parts.hostname or "") else parts.hostname),
             "Authorization": f"Bearer {secret_of(token)}",
             "Accept": "application/json", "User-Agent": "sutando-gateway-client/1.0"})
         resp = conn.getresponse()
@@ -590,6 +651,37 @@ def resolve_server(host: str, resolver=None) -> str:
     if not server or getattr(found, "source", "none") == "none":
         return ""
     return server
+
+
+def local_server_for(host: str, config=None, port: Optional[int] = None) -> str:
+    """The server of a `core.dotspace.instances` entry with `allow_local: true` whose
+    gateway_host (its server when it names no gateway_host) is `host`; '' for every other host.
+    An entry that names a port covers that port only; one without covers every port on the host.
+    Only such an entry, written by the owner for a self-hosted homeserver on this machine or
+    their own network (#3165), lets a gateway name a single-label host such as localhost or
+    resolve to a loopback, private or shared address, and lets it be plain http when that
+    address is loopback; nothing a token or a server says can turn it on."""
+    try:
+        import dotspace  # type: ignore
+        entries = dotspace._config_entries(config)
+        host_only = dotspace._host_only
+    except Exception:  # noqa: BLE001 - without the resolver there is no declared local server
+        return ""
+    want = (host or "").strip().lower().rstrip(".").strip("[]")
+    for e in entries:
+        if e.get("allow_local") is not True:
+            continue
+        gateway = str(e.get("gateway_host") or e.get("server") or "").strip().lower().rstrip(".")
+        if not want or host_only(gateway) != want:
+            continue
+        try:
+            named = urllib.parse.urlsplit(f"//{gateway}").port if gateway.count(":") == 1 or "]:" in gateway else None
+        except ValueError:  # a malformed port in the owner's entry matches nothing
+            continue
+        if named is not None and named != port:
+            continue
+        return host_only(str(e.get("server") or ""))
+    return ""
 
 
 def gateway_host_ok(host: str) -> bool:
@@ -633,15 +725,23 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
     host = server_of_token(token)
     port = _gateway_port(url)
-    if not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
+    local = local_server_for(host, port=port)
+    if local:
+        if not url.lower().startswith(("https://", "http://")) or port is None:
+            raise InvalidToken("invalid_gateway")
+    elif not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
         raise InvalidToken("invalid_gateway")
-    registered = resolve_server(host, resolver)
+    registered = local or resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
            "verified": False, "authenticated": None, "error": None}
     out.update({k: None for k in IDENTITY_FIELDS})
-    address = vetted_address(host, port, getaddrinfo)
+    address = vetted_address(host, port, getaddrinfo, allow_private=bool(local))
     if address == "":
+        raise InvalidToken("invalid_gateway")
+    if url.lower().startswith("http://") and not (_loopback_host(host) and (not address or _loopback_address(address))):
+        # Cleartext bearer only to this machine: the host must name loopback, since the bridge
+        # re-resolves it every poll.
         raise InvalidToken("invalid_gateway")
     if address is None:
         out["error"] = "unreachable (resolution)"
@@ -1287,15 +1387,72 @@ def legacy_parked(workspace: Optional[Path] = None) -> bool:
 
 def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     """Whether the bridge running as `instance` owns unaddressed proactive messages and the owner's
-    cards: the primary row's bridge, under its slug or a launch-key alias. With no named primary, or
-    an unreadable record, the legacy unsuffixed bridge owns them, as before any row existed."""
-    try:
-        primary = next((r for r in _read(record_path(workspace)) if r["primary"]), None)
-    except (SchemaError, OSError):
-        primary = None
-    if primary is None or not primary["instance"]:
+    cards: the lane `unaddressed_owner` names, under its slug or a launch-key alias."""
+    owner, _from = unaddressed_owner(workspace)
+    if owner is None:
         return not instance
-    return bool(instance) and instance in [primary["instance"]] + alias_instances(primary)
+    if not owner["instance"]:
+        return not instance
+    return bool(instance) and instance in [owner["instance"]] + alias_instances(owner)
+
+
+def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge has a checked owner DM on disk (state/owner-routing<suffix>.json: a
+    private room, bound to the row's agent when the row names one). Every lane reads it alike."""
+    inst = str(row.get("instance") or "")
+    path = _workspace(workspace) / "state" / f"owner-routing{'.' + inst if inst else ''}.json"
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict) or not rec.get("owner_dm") or rec.get("private") is not True:
+        return False
+    agent = str(row.get("agent_mxid") or "")
+    return not agent or rec.get("identity") == agent
+
+
+def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
+    """(the row whose bridge owns unaddressed messages, the designated row it was handed from or None).
+    Designated: the primary row. A designated lane with no owner DM can only hold them, so they go
+    to the first enabled lane whose bridge is running (a fresh lane record) and has one (the
+    unsuffixed lane first, then by name). Only a lane serving the same owner (`owner_mxid`, where
+    both rows name one) may take them. With none, the designated lane keeps them.
+    (None, None) when the record is unreadable or names no primary: the legacy bridge, as before."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None, None
+    designated = next((r for r in rows if r["primary"]), None)
+    if designated is None:
+        return None, None
+    if _has_owner_dm(designated, workspace):
+        return designated, None
+    owner = designated.get("owner_mxid")
+    live = [r for r in rows if r is not designated and not r.get("disabled") and not r.get("parked")
+            and (not owner or not r.get("owner_mxid") or r.get("owner_mxid") == owner)]
+    live.sort(key=lambda r: (bool(r["instance"]), str(r["instance"])))
+    taker = next((r for r in live if _has_owner_dm(r, workspace) and _lane_running(r, workspace)), None)
+    return (taker, designated) if taker is not None else (designated, None)
+
+
+def _lane_running(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge is running now: its lane record (agent_identity.lane_state) is fresh.
+    An owner-routing file outlives a crashed or revoked bridge; a handoff to it would strand."""
+    try:
+        state, _rec = _agent_identity().lane_state(_workspace(workspace) / "state", str(row.get("instance") or ""))
+        return state == _agent_identity().LANE_FRESH
+    except Exception:  # noqa: BLE001 - unknown is not running
+        return False
+
+
+def lane_server(instance: str, workspace: Optional[Path] = None) -> str:
+    """The homeserver the row running as `instance` (by slug or launch-key alias) names; "" if none."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return ""
+    row = next((r for r in rows if instance and instance in [r["instance"]] + alias_instances(r)), None)
+    return str((row or {}).get("server") or "")
 
 
 def _names_mxid(text: str, mxid: str) -> bool:
@@ -2054,7 +2211,8 @@ def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
 
 
 def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
-                 disabled: bool = False, parked: bool = False) -> "tuple[str, Optional[str]]":
+                 disabled: bool = False, parked: bool = False,
+                 writer_alive: bool = True) -> "tuple[str, Optional[str]]":
     """(state, reason) from the bridge's sidecar and the last launch record; a disabled row is
     `parked` with reason `disabled`, a parked row with reason `parked`, whatever a
     stale sidecar still says."""
@@ -2073,6 +2231,9 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
     error = str(sidecar.get("error") or "")
     if re.search(r"\b(401|403)\b|auth", error, re.IGNORECASE):
         return "failed", "auth_rejected"
+    # A live bridge that has never completed a poll is still starting, not disconnected.
+    if writer_alive and sidecar.get("last_ok_ts") is None:
+        return "pending", None
     return "disconnected", None
 
 
@@ -2092,7 +2253,7 @@ def _writer_gone(sidecar: Mapping[str, object]) -> bool:
     if not isinstance(started, str) or not started:
         return False
     now = workspace_lock.proc_start(pid)
-    return now is not None and now != started
+    return now is not None and not workspace_lock.same_start(started, now)
 
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
@@ -2102,7 +2263,8 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     (`disabled` and `parked` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
-    if sidecar.get("connected") and _writer_gone(sidecar):
+    gone = bool(sidecar) and _writer_gone(sidecar)
+    if sidecar.get("connected") and gone:
         sidecar = {**sidecar, "connected": False}  # a bridge that died says nothing about now
     launch = _read_json(launch_record_path(inst, workspace))
     out = dict(row)
@@ -2111,7 +2273,8 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     out["legacy"] = not inst
     for key in IDENTITY_FIELDS:
         out.setdefault(key, None)
-    state, reason = derive_state(sidecar, launch, out["disabled"], out["parked"])
+    state, reason = derive_state(sidecar, launch, out["disabled"], out["parked"],
+                                 writer_alive=not gone)
     out["status"] = {"connected": bool(sidecar["connected"]) if "connected" in sidecar else None,
                      "last_ok_ts": sidecar.get("last_ok_ts")}
     out["state"] = state
@@ -2378,9 +2541,91 @@ def _agent_identity():
 
 
 def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
+    """Write the launch record. A failed launch keeps the checkout the last good one ran from
+    (`last_repo`), so `reconnect` can still bring that bridge back."""
     record = {"instance": instance, "ts": int(time.time()), **fields}
+    if not fields.get("repo"):
+        prev = _launch_record(instance, workspace)
+        if prev.get("repo") or prev.get("last_repo"):
+            record["last_repo"] = prev.get("repo") or prev.get("last_repo")
     _atomic_json(launch_record_path(instance, workspace), record)
     return record
+
+
+def _launch_record(instance: str, workspace: Optional[Path]) -> dict:
+    try:
+        rec = json.loads(launch_record_path(instance, workspace).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+_LAUNCH_PROBE = (
+    "import json, sys\n"
+    "sys.path.insert(0, 'src')\n"
+    "from workspace_default import resolve_workspace\n"
+    "from util_paths import host_label\n"
+    "print(json.dumps({'workspace': str(resolve_workspace(migrate=False).resolve()), 'host': host_label()}))\n")
+
+
+def _launch_probe(repo: Path, env: Mapping[str, str], python: Optional[str]) -> dict:
+    """What a bridge started from `repo` with `env` would resolve, asked of that checkout's own code:
+    {workspace, host}. ValueError (with why) when it has no bridge or the probe does not answer."""
+    if not (Path(repo) / "src" / "remote-gateway-bridge.py").is_file():
+        raise ValueError(f"no src/remote-gateway-bridge.py under {repo}")
+    try:
+        out = subprocess.run([python or sys.executable, "-c", _LAUNCH_PROBE], cwd=str(repo), env=dict(env),
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ValueError(f"the checkout's Python did not run ({type(e).__name__})") from None
+    try:
+        answer = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise ValueError(f"the checkout could not resolve its workspace (exit {out.returncode})") from None
+    if not isinstance(answer, dict):
+        raise ValueError("the checkout gave no workspace")
+    return answer
+
+
+def _this_host() -> str:
+    from util_paths import host_label
+    return host_label()
+
+
+def _launch_preflight(instance: str, repo: Path, environ: Mapping[str, str], workspace: Optional[Path],
+                      vault, python: Optional[str]) -> None:
+    """Refuse (`RelaunchPreflightFailed`) a relaunch that cannot start here, before anything is
+    stopped: the checkout must have the bridge, its token must be reachable, and that checkout's own
+    code must resolve this workspace and this host label (else its lease lands where no one looks).
+    A row with no identity yet, or disconnected, passes those steps: `reconnect` learns the identity
+    and re-enables the row after the stop; its token must still be there."""
+    try:
+        row = _row_named(instance, workspace)
+        if row is not None and row.get("disabled") and not row.get("parked"):
+            ref = str(row["token_ref"])
+            if not ((environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)):
+                raise NoToken(f"no token under {ref}")
+            env = {**environ, "GATEWAY_INSTANCE": instance}
+        else:
+            entry = plan_entry(instance, environ, workspace=workspace)
+            try:
+                env = launch_env(entry, environ, vault=vault)
+            except NoIdentity:
+                env = {**environ, "GATEWAY_INSTANCE": str(entry["instance"])}
+        answer = _launch_probe(Path(repo), env, python)
+    except NoToken as e:
+        raise RelaunchPreflightFailed(instance, str(e)) from None
+    except VaultUnavailable:
+        raise  # the vault's own error (HTTP 503), not this checkout's
+    except (ValueError, ConnectionsError) as e:
+        raise RelaunchPreflightFailed(instance, str(e)) from None
+    here = str(_workspace(workspace).resolve())
+    if str(answer.get("workspace") or "") != here:
+        raise RelaunchPreflightFailed(instance, f"it resolves the workspace {answer.get('workspace')!r}, not {here!r}"
+                                      " — give it this install's sutando.config.local.json")
+    host = _this_host()
+    if str(answer.get("host") or "") != host:
+        raise RelaunchPreflightFailed(instance, f"it resolves the host label {answer.get('host')!r}, not {host!r}")
 
 
 # Children this process spawned, kept so their exit is observed and reaped, never guessed from a pid.
@@ -2530,7 +2775,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
         for alias in alias_instances(_row_named(instance, workspace) or {}):
             holder = _proven_holder(alias, workspace)
             if holder:  # the same connection, already up under the name its host launched it as
-                return _record_launch(instance, workspace, ok=True, pid=holder, lease="alias_running", alias=alias)
+                return _record_launch(instance, workspace, ok=True, pid=holder, lease="alias_running", alias=alias, repo=str(Path(repo).resolve()))
         try:
             env = launch_env(entry, environ, vault=vault)
         except NoToken as e:
@@ -2553,10 +2798,10 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
                 _CHILDREN[pid] = child
                 _reap_when_done(child)
             if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
-                return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled", repo=str(Path(repo).resolve()))
             lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))
             if lease == "held":
-                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease)
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, repo=str(Path(repo).resolve()))
             if lease == "timeout":
                 mine = _CHILDREN.pop(pid, None)
                 if mine is not None:
@@ -2566,7 +2811,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
                 raise LaunchFailed(f"the bridge for {instance} (pid {pid}) took no lease within {LEASE_TIMEOUT_S}s"
                                    + ("; it was stopped" if mine is not None else ""))
             if holder:
-                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, holder_pid=holder)
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, holder_pid=holder, repo=str(Path(repo).resolve()))
             rc = _exit_code(child)
             wait = _retained_wait(instance, workspace) if rc in (None, 75) else None
             if wait is not None and attempt == 1 and time.monotonic() + wait + 0.1 < deadline:
@@ -2657,11 +2902,16 @@ def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
 def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
               workspace: Optional[Path] = None, vault=None, spawn=None, kill=None,
               python: Optional[str] = None, fetch=None, getaddrinfo=None) -> dict:
-    """Relaunch exactly this one bridge: stop the running one, learn the identity its token
-    answers to now (a provisional row is re-keyed), then `launch`."""
+    """Relaunch exactly this one bridge: refuse first, touching nothing, when the new one cannot
+    start here (`_launch_preflight`); then stop the running one, learn the identity its token
+    answers to now (a provisional row is re-keyed), and `launch`. A launch that still fails brings
+    the previous bridge back from the checkout its last good launch recorded, and says so."""
+    environ = os.environ if environ is None else environ
+    _launch_preflight(instance, repo, environ, workspace, vault, python)
+    previous = _launch_record(instance, workspace)
+    previous_repo = previous.get("repo") or previous.get("last_repo") or ""
     known = _row_named(instance, workspace)
     stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
-    environ = os.environ if environ is None else environ
     rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
     if instance in rows:
         if rows[instance].get("disabled"):
@@ -2674,8 +2924,25 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
                                workspace=workspace)
             except ConnectionsError:
                 pass
-    record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                    vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+    try:
+        record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                        vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+    except LaunchFailed as e:
+        if not stopped or not previous_repo:
+            raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
+        if Path(previous_repo).resolve() == Path(repo).resolve():
+            raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
+                               "retried: the lane is down until it is relaunched") from None
+        if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
+            raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
+                               "the lane is down until it is relaunched") from None
+        try:
+            back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
+                          vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+        except LaunchFailed as e2:
+            raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
+        raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
+                           f"(pid {back.get('pid')})") from None
     record["stopped_pid"] = stopped
     return record
 

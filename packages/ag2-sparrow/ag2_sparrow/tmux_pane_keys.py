@@ -39,6 +39,13 @@ def fence_argv(socket, target_pane, predicate_format, action_cmd, tmux="tmux"):
             "-t", target_pane, "--fence", predicate_format, action_cmd]
 
 
+def fence_keys_argv(socket, target_pane, predicate_format, *keys, tmux="tmux"):
+    """The guarded fenced send: the script sends `keys` to target_pane only while predicate_format
+    holds for it, in one server command; a false predicate sends nothing."""
+    return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
+            "-t", target_pane, "--fence-keys", predicate_format, "--", *keys]
+
+
 def tmux_quote(value):
     """A tmux single-quoted word, the script's rule: literal; an embedded ' closes, is double-quoted, reopens."""
     return "'" + str(value).replace("'", "'\"'\"'") + "'"
