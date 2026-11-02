@@ -483,9 +483,10 @@ class SupervisorSlot(unittest.TestCase):
         """A supervisor that arms its (counted) notifier after a 1 s grace, behind the fault-injecting python."""
         self.flag, self.starts = self.tmp / "slot-unknown", self.tmp / "starts"
         py = self.tmp / "py"
-        py.write_text(UNDECIDED_PY)
-        py.chmod(0o755)
-        self.notifier.write_text(COUNTED_NOTIFIER)
+        if not py.exists():  # once: rewriting a script a running supervisor execs is ETXTBSY on Linux
+            py.write_text(UNDECIDED_PY)
+            py.chmod(0o755)
+            self.notifier.write_text(COUNTED_NOTIFIER)
         return self.start(self.ws / "tasks", wait_s=wait_s, SUTANDO_NOTIFIER_PY=str(py), REAL_PY=sys.executable,
                           SLOT_UNKNOWN_FLAG=str(self.flag), NOTIFIER_STARTS=str(self.starts),
                           **{**dict(SUTANDO_NOTIFIER_GRACE_PERIOD="1", SUTANDO_NOTIFIER_TARGET_POLL="0.5",
