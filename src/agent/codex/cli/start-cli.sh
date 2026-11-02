@@ -196,10 +196,6 @@ if ! command -v codex >/dev/null 2>&1; then
   fi
 fi
 
-# Use the configured CODEX_HOME (or another env name chosen by the operator).
-# The default points at ~/.codex to reuse the existing authenticated install.
-config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
-config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"
 # One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
 # `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
 # Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
@@ -216,28 +212,14 @@ heartbeat_python() {
 }
 resolve_heartbeat_python
 
-# On a desktop host, a home that resolves into the owner's ~/.codex is never created here;
-# a non-desktop checkout gets "no-host" and keeps the plain mkdir.
-codex_home_refused() {
-  local py
-  py="$(heartbeat_python)"
-  [ -n "$py" ] || return 1
-  case "$("$py" "$REPO/src/codex_host_instructions.py" --check "$1" "$REPO" 2>/dev/null)" in
-    owner-home|invalid-home) return 0 ;;
-  esac
-  return 1
-}
-CODEX_HOME_REFUSED=""
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  if codex_home_refused "$config_value"; then
-    CODEX_HOME_REFUSED=1
-    echo "  ⚠ $config_env=$config_value is, or leads into, the owner's own Codex home, or is not a plain directory path; not creating it" >&2
-  else
-    mkdir -p "$config_value"
-  fi
-  export "$config_env=$config_value"
-  echo "  ✓ $config_env=$config_value"
-fi
+# The configured CODEX_HOME is resolved, checked and created only by src/codex_home.py;
+# CODEX_HOME_DIR is the one home every later step uses, empty when nothing may be written.
+# shellcheck source=../codex-home.sh
+. "$REPO/src/agent/codex/codex-home.sh"
+sutando_codex_home_prepare "$REPO" "$(heartbeat_python)" || true
+CODEX_HOME_DIR="$SUTANDO_CODEX_HOME"
+CODEX_HOME_REFUSED="$SUTANDO_CODEX_HOME_REFUSED"
+[ -n "${CODEX_HOME:-}" ] && echo "  ✓ CODEX_HOME=$CODEX_HOME"
 
 # `|| _codex_auth_rc=$?` keeps set -e from killing the script on a non-zero
 # probe — the exit code IS the signal here, not a failure.
@@ -320,7 +302,7 @@ ensure_codex_project_trust() {
   local py out
   py="$(heartbeat_python)"
   [ -n "$py" ] || return 0
-  if out="$("$py" "$REPO/src/codex_project_trust.py" "${CODEX_HOME:-$HOME/.codex}" "$WORKING_DIR" "$REPO")"; then
+  if out="$("$py" "$REPO/src/codex_project_trust.py" "$CODEX_HOME_DIR" "$WORKING_DIR" "$REPO")"; then
     [ "$out" = trusted ] && echo "  ✓ Codex project trust recorded for $WORKING_DIR"
   else
     echo "  ⚠ could not record Codex project trust; the core may wait on a trust prompt" >&2
@@ -334,14 +316,14 @@ ensure_codex_host_instructions() {
   local py out
   py="$(heartbeat_python)"
   [ -n "$py" ] || return 0
-  if out="$("$py" "$REPO/src/codex_host_instructions.py" "${CODEX_HOME:-$HOME/.codex}" "$REPO")"; then
+  if out="$("$py" "$REPO/src/codex_host_instructions.py" "$CODEX_HOME_DIR" "$REPO")"; then
     case "$out" in
       linked) echo "  ✓ Codex core given the host's AGENTS.md" ;;
-      overridden) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
-      invalid-home) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex} is relative, contains '..', or has a symlink or non-directory component; the host's AGENTS.md was not linked" >&2 ;;
-      dangling) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.md is a broken link; remove it so the core gets the host's AGENTS.md" >&2 ;;
-      foreign) echo "  ⚠ an existing AGENTS.md entry in ${CODEX_HOME:-$HOME/.codex} is not the host's and was kept; the host's AGENTS.md was not linked" >&2 ;;
-      owner-home) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex} is the owner's own Codex home; the host's AGENTS.md was not linked" >&2 ;;
+      overridden) echo "  ⚠ $CODEX_HOME_DIR/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
+      invalid-home) echo "  ⚠ $CODEX_HOME_DIR is relative, contains '..', or has a symlink or non-directory component; the host's AGENTS.md was not linked" >&2 ;;
+      dangling) echo "  ⚠ $CODEX_HOME_DIR/AGENTS.md is a broken link; remove it so the core gets the host's AGENTS.md" >&2 ;;
+      foreign) echo "  ⚠ an existing AGENTS.md entry in $CODEX_HOME_DIR is not the host's and was kept; the host's AGENTS.md was not linked" >&2 ;;
+      owner-home) echo "  ⚠ $CODEX_HOME_DIR is the owner's own Codex home; the host's AGENTS.md was not linked" >&2 ;;
     esac
   else
     echo "  ⚠ could not link the host's AGENTS.md; the core may miss its first-contact instructions" >&2
@@ -351,11 +333,11 @@ ensure_codex_host_instructions() {
 
 # A refused home gets no write from the launcher: not the trust entry, not the link.
 prepare_codex_home() {
-  if [ -n "$CODEX_HOME_REFUSED" ]; then
-    echo "  ⚠ not recording Codex project trust in a refused CODEX_HOME" >&2
-  else
-    ensure_codex_project_trust
+  if [ -n "$CODEX_HOME_REFUSED" ] || [ -z "$CODEX_HOME_DIR" ]; then
+    echo "  ⚠ not recording Codex project trust or linking the host's AGENTS.md: the Codex home was refused" >&2
+    return 0
   fi
+  ensure_codex_project_trust
   ensure_codex_host_instructions
 }
 
@@ -542,7 +524,8 @@ ensure_codex_auto_reset_timer() {
     return 0
   fi
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+  [ -n "$CODEX_HOME_DIR" ] || return 0
+  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "$CODEX_HOME_DIR" >/dev/null; then
     echo "  ⚠ Could not reconcile the Codex earned-reset timer" >&2
   fi
 }

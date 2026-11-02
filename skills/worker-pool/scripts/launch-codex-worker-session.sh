@@ -29,16 +29,15 @@ for fallback in "$REPO/../bin" "$REPO/../runtime/node/bin" \
 done
 export PATH
 
-config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
-config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  mkdir -p "$config_value"
-  export "$config_env=$config_value"
-fi
 # shellcheck source=../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 WORKER_PY="$(require_python "$REPO" "launch Codex worker")" || exit 1
 export SUTANDO_PY="$WORKER_PY"
+# src/codex_home.py alone resolves, checks and creates the Codex home.
+# shellcheck source=../../../src/agent/codex/codex-home.sh
+. "$REPO/src/agent/codex/codex-home.sh"
+sutando_codex_home_prepare "$REPO" "$WORKER_PY" || true
+CODEX_HOME_DIR="$SUTANDO_CODEX_HOME"
 
 WORKING_DIR="${SUTANDO_CODEX_WORKING_DIR:-$REPO}"
 WORKING_DIR="${WORKING_DIR/#\~/$HOME}"
@@ -58,8 +57,8 @@ for forwarded in SUTANDO_INSTANCE_ID SUTANDO_WORKER_ID SUTANDO_TASKS_DIR SUTANDO
   [ -n "${!forwarded:-}" ] && ENV_ARGS+=(-e "$forwarded=${!forwarded}")
 done
 [ -n "${CODEX_HOME:-}" ] && ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  ENV_ARGS+=(-e "$config_env=$config_value")
+if [ -n "$SUTANDO_CODEX_HOME_ENV" ]; then
+  ENV_ARGS+=(-e "$SUTANDO_CODEX_HOME_ENV=$SUTANDO_CODEX_HOME_VALUE")
 fi
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
@@ -109,8 +108,8 @@ fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
   reset_timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
-  if [ -f "$reset_timer" ] && ! "$WORKER_PY" "$reset_timer" ensure \
-      --workspace "$SUTANDO_WORKSPACE_DIR" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+  if [ -f "$reset_timer" ] && [ -n "$CODEX_HOME_DIR" ] && ! "$WORKER_PY" "$reset_timer" ensure \
+      --workspace "$SUTANDO_WORKSPACE_DIR" --codex-home "$CODEX_HOME_DIR" >/dev/null; then
     echo "launch-codex-worker-session: could not reconcile the Codex earned-reset timer" >&2
   fi
 fi

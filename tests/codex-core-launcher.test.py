@@ -127,6 +127,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
             "src/codex_host_instructions.py",
+            "src/codex_home.py",
+            "src/agent/codex/codex-home.sh",
             "src/toml_fallback.py",
             "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
@@ -790,8 +792,8 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertFalse(os.path.lexists(home.parent), "the launcher created the app home's parent")
         self.assertFalse(os.path.lexists(home / "config.toml"))
         self.assertIn("not creating it", result.stderr)
-        self.assertIn("not recording Codex project trust in a refused CODEX_HOME", result.stderr)
-        self.assertIn("is the owner's own Codex home", result.stderr)
+        self.assertIn("not recording Codex project trust or linking the host's AGENTS.md", result.stderr)
+        self.assertIn("is, or leads into, the owner's own Codex home", result.stderr)
         # This fake Codex reports signed in, so the core still starts with the unchanged env.
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
@@ -805,6 +807,32 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("not authenticated", result.stderr)
         self.assertFalse(os.path.lexists(home.parent))
         self.assertNotIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_failing_home_checker_refuses_the_desktop_home_and_writes_nothing(self):
+        """The checker cannot run: the launcher must refuse, not fall back to creating it."""
+        home = self._desktop_hosted()
+        (self.root / "src/codex_host_instructions.py").write_text("import sys\nsys.exit(7)\n")
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertFalse(os.path.lexists(home.parent), "the launcher created the app home")
+        self.assertIn("not creating it", result.stderr)
+        self.assertFalse(os.path.lexists(Path(self.tmp.name) / "home" / ".codex"))
+
+    def test_an_alternate_env_name_on_a_desktop_writes_nothing_under_the_owners_codex(self):
+        home = self._desktop_hosted()
+        config = json.loads((self.root / "sutando.config.json").read_text())
+        config["core_config_dirs"][0]["env_name"] = "CODEX_CONFIG_DIR"
+        (self.root / "sutando.config.json").write_text(json.dumps(config))
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        owner = Path(self.tmp.name) / "home" / ".codex"
+        self.assertFalse(os.path.lexists(owner / "config.toml"), result.stderr)
+        self.assertFalse(os.path.lexists(home.parent))
+        self.assertIn("not a CODEX_HOME", result.stderr)
 
     def test_an_override_in_the_codex_home_is_kept_and_reported(self):
         home = self._desktop_hosted()

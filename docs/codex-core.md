@@ -89,9 +89,15 @@ The Codex implementation:
   created: `CODEX_HOME` must be absolute, contain no `..`, and have no symlink or
   non-directory component anywhere. Otherwise the helper refuses it as `invalid-home`,
   creates nothing and the launcher warns; a symlinked `CODEX_HOME` is never followed.
-  On a desktop host the launcher asks the helper first (`--check`, which creates
-  nothing) and skips its own `mkdir -p` of `CODEX_HOME` when the home would be refused;
-  a non-desktop checkout gets `no-host` and keeps the plain `mkdir -p`. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
+  One owner, `src/codex_home.py` (shell adapter `src/agent/codex/codex-home.sh`),
+  resolves the configured Codex home once, checks it with the helper's mutation-free
+  `--check`, and creates it only after an explicit `ok` or `no-host`. The startup auth
+  preflight, the core launcher, the worker launcher and `skills/install.sh` all call it
+  and create nothing themselves; project trust, the host link and the reset timer are
+  handed its one resolved home and skip when it is empty. A missing interpreter, a
+  failing or silent checker, or a desktop env name other than `CODEX_HOME` (the only one
+  Codex reads) refuses. A non-desktop checkout is unchanged: its home is created as
+  before and the effective home is the one Codex reads. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
   is refused as `owner-home` from its path alone, before anything is created. The
   spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
   chain names, read textually whether or not the target exists; a chain of more than 32
