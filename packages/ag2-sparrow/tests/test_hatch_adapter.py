@@ -5085,6 +5085,16 @@ class Reply(Base):
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.result_file.read_text(), "hi")
 
+    def test_an_unreadable_attempt_ledger_writes_nothing(self):
+        ledger = self.home / "state" / "relay-task-ledger.json"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("{not json")
+        for cmd in (self.no_reply, lambda *a: self.reply(*a, "--body", "hi")):
+            r = cmd(str(self.result_file), "--wait", "0")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("attempt ledger", r.stderr)
+            self.assertFalse(self.result_file.exists(), "its outbox item is unknown: nothing written")
+
     def test_no_reply_refuses_an_overlong_reason(self):
         r = self.no_reply(str(self.result_file), "--reason", "x" * 201)
         self.assertEqual(r.returncode, 2)

@@ -148,6 +148,36 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertIn('NOT settled', err)
         self.assertEqual(self.inflight, {self.tid})
 
+    def wake_run(self, base_delivered=False):
+        """A lifecycle-v2 wake: its run's own task file, delivered under the episode's item."""
+        from ag2_sparrow import task_attempts
+        att = task_attempts.TaskAttempts(self.home / 'state', log=lambda *_: None)  # where the CLI reads it
+        att.take_ownership()
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(gw, '_ATTEMPTS', att))
+        self.addCleanup(stack.close)
+        if base_delivered:
+            outbox.record_delivered(self.results / '.outbox', TID)
+        with att.transition(TID) as t:
+            episode, run = t.open_wake({'blocker_episode_id': 'e1'}, self.tid,
+                                       used=lambda local: (self.tasks / f'{local}.txt').exists())
+        (self.tasks / f'{run}.txt').write_text((self.tasks / f'{self.tid}.txt').read_text())
+        self.tid, item = run, att.run_item(run)
+        self.assertEqual(item, f'{TID}.wake-{episode}')
+        return item
+
+    def test_no_reply_settles_a_wake_run_under_its_own_item(self):
+        for base_delivered in (False, True):
+            with self.subTest(base_delivered=base_delivered):
+                self.start()
+                item = self.wake_run(base_delivered)
+                rc, out, err = self.reply('', 'no-reply')
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
+                self.assertEqual(outbox.item_status(self.results / '.outbox', item), 'DELIVERED')
+                self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls], [('[no-send]', True)])
+                self.assertEqual(self.inflight, set())
+
     def test_a_skip_behind_a_redirect_is_refused_before_anything_is_sent(self):
         self.start()
         rc, out, err = self.reply('[channel: !r:ag2.space]\n[REPLIED]\n')

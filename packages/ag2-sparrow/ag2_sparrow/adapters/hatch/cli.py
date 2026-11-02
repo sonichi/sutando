@@ -33,8 +33,8 @@ from pathlib import Path
 
 from ... import (_dirs, agent_identity, bounded_file_read, delivery_destination, diagnostics,
                  gateway_credential_io,
-                 gateway_credentials, gateway_instance, outbox, result_ready, task_hold,
-                 workspace_lock)
+                 gateway_credentials, gateway_instance, outbox, result_ready, task_attempts,
+                 task_hold, workspace_lock)
 from ...persisted_number import bounded_number
 from ...delivery_core import WITHDRAWN
 from ...proactive_routing import about_task_filename
@@ -1186,7 +1186,14 @@ def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
     if not (task_dir / f"{tid}.txt").is_file():
         print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
         return None
-    return result_dir, task_dir, tid, item, instance
+    # A run of its own (a newer generation or a wake) is delivered under the item its ledger names.
+    state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    run_item = task_attempts.TaskAttempts(state_dir, suffix=gateway_instance.suffix(instance)).run_item(tid)
+    if run_item is task_attempts.UNKNOWN:
+        print(f"error: Sparrow's attempt ledger in {state_dir} cannot be read, so {tid}'s outbox item is "
+              "unknown; nothing written, run it again", file=sys.stderr)
+        return None
+    return result_dir, task_dir, tid, run_item or item, instance
 
 
 def _hold_notice(result_dir: Path, tid: str) -> Path:
