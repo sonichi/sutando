@@ -679,14 +679,26 @@ class HelperCpu(unittest.TestCase):
 
     def test_health_check_runs_the_probe(self):
         import importlib.util
-        src = (REPO / "src" / "health-check.py").read_text()
-        self.assertIn("checks.append(check_helper_cpu())", src)
         spec = importlib.util.spec_from_file_location("health_check_hcg", REPO / "src" / "health-check.py")
         hc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hc)
         with unittest.mock.patch.object(hc.helper_cpu_guard, "check", return_value={"status": "ok"}) as c:
             self.assertEqual(hc.check_helper_cpu(), {"status": "ok"})
         c.assert_called_once_with(hc.REPO_DIR, hc.WORKSPACE_DIR / "state" / "helper-cpu-samples.json")
+        # The whole check list, as health-check runs it, against a process table with a hot helper in it.
+        ws = Path(tempfile.mkdtemp(prefix="hc-ws."))
+        self.addCleanup(shutil.rmtree, ws, True)
+        (ws / "state").mkdir()
+        key = f"42:{' '.join(START.split())}"
+        (ws / "state" / "helper-cpu-samples.json").write_text(
+            json.dumps({key: {"cpu": 0.0, "at": time.time() - hcg.WINDOW_S - 5}}))
+        hot = [{"pid": 42, "start": START, "cpu": 900.0, "command": f"bash {hc.REPO_DIR}/src/watch-tasks-stream.sh"}]
+        with unittest.mock.patch.object(hc, "WORKSPACE_DIR", ws), \
+                unittest.mock.patch.object(hc.helper_cpu_guard, "processes", return_value=hot):
+            rows = [r for r in hc.run_all_checks() if r.get("name") == "helper-cpu"]
+        self.assertEqual(len(rows), 1, "run_all_checks reports the helper-cpu probe once")
+        self.assertEqual(rows[0]["status"], "warn", rows[0])
+        self.assertIn("src/watch-tasks-stream.sh", rows[0]["detail"])
 
 
 if __name__ == "__main__":
