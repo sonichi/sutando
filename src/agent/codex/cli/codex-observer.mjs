@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Read-only observer of the Codex core: publishes its runtime observation record from the rollout
-// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace].
+// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace] [--seat].
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -120,7 +120,7 @@ export function apply(state, change, at) {
 export function buildRecord(state, ident, now) {
   return {
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
-    observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
+    observer_started_at: ident.startedAt, seat: ident.seat || 'core', session: ident.session, claude_session_id: null,
     seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: state.conditionSince,
     last_success_at: state.lastSuccessAt, heartbeat_at: now, phase: state.phase, motion: state.motion,
     condition: state.condition, reason: state.condition === 'abnormal' ? (state.reason || 'api-error') : null,
@@ -162,7 +162,8 @@ export class Observer {
     this.ticks = 0;
     this.gone = 0;
     this.misses = 0;
-    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
+    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session,
+      seat: opts.seat || 'core'};
     this.dirty = false;
     this.bound = [];
     this.steps = [];
@@ -297,7 +298,10 @@ export function parseArgs(argv) {
     out[key] = argv[i + 1];
   }
   for (const key of ['engine', 'tmux-socket', 'session']) if (!out[key]) throw new Error(`missing --${key}`);
-  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || ''};
+  // The seat the record is written for: the core, or a pool worker by its 32-hex id.
+  const seat = out.seat || 'core';
+  if (!/^(core|[0-9a-f]{32})$/.test(seat)) throw new Error('bad --seat');
+  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || '', seat};
 }
 
 // partialOk: exit 1 with output is a result (lsof exits 1 when one listed pid has gone).
