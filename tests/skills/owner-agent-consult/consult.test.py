@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -997,18 +998,45 @@ class TestExpiryAndPending(WorldCase):
         self.assertEqual([(r["task_id"], r.get("claim_only")) for r in policy.pending(ws, 600)],
                          [(tid, True)])
 
-    def test_dead_tasks_cost_no_task_file_lookup(self):
+    def _dead_consults(self, n=20):
+        """`n` expired, nudged consults whose tasks are gone: none may be listed."""
         ws, old = self.w.ws[SELF], time.time() - 9 * 86400
-        for i in range(20):
+        for i in range(n):
             cid, tid = f"{i:016x}", f"task-{1700000000000 + i}"
             policy._write_record(policy._record_path(ws, "pending", cid),
                                  {"cid": cid, "task_id": tid, "asked_at": old, "ask_event": f"$a{i}"})
             policy._write_record(policy._record_path(ws, "nudged", cid), {"cid": cid, "asked_at": old})
             policy._claim_file(policy._root_claim(ws, tid), {"cid": cid})
+        return ws
+
+    def _pending_counting_lookups(self, ws):
         import task_archive
         with mock.patch.object(task_archive, "find_task_file", wraps=task_archive.find_task_file) as lookup:
-            self.assertEqual(policy.pending(ws, 600), [])
-        self.assertEqual(lookup.call_count, 0, "a dead task is answered from one listing of tasks/")
+            rows = policy.pending(ws, 600)
+        return rows, lookup.call_count
+
+    def test_dead_tasks_cost_no_task_file_lookup(self):
+        rows, lookups = self._pending_counting_lookups(self._dead_consults())
+        self.assertEqual(rows, [])
+        self.assertEqual(lookups, 0, "a dead task is answered from one listing of tasks/")
+
+    def test_a_missing_tasks_dir_is_an_empty_listing(self):
+        ws = self._dead_consults()
+        shutil.rmtree(ws / "tasks")
+        self.assertEqual(self._pending_counting_lookups(ws), ([], 0))
+
+    def test_an_unreadable_tasks_dir_takes_the_full_lookup_with_the_same_answer(self):
+        ws = self._dead_consults(3)
+        real = os.listdir
+
+        def listdir(path="."):
+            if Path(path) == ws / "tasks":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+        with mock.patch.object(policy.os, "listdir", side_effect=listdir):
+            rows, lookups = self._pending_counting_lookups(ws)
+        self.assertEqual(rows, [])
+        self.assertGreater(lookups, 0, "an unreadable inbox is never read as an empty one")
 
     def test_overdue_consults_are_due_a_nudge_once(self):
         self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() - 700)
