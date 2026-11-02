@@ -66,7 +66,7 @@ from __future__ import annotations
 import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
-from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
 from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
@@ -523,11 +523,6 @@ GATEWAY_STATUS_MAX_AGE_S = 90.0
 GATEWAY_OUTAGE_MAX_AGE_S = 90.0
 
 
-def _primary_sidecar_name(state_dir):
-    from connections import primary_sidecar_name
-    return primary_sidecar_name(state_dir)
-
-
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
@@ -551,7 +546,7 @@ def _gateway_status(state_dir):
         # Serving verdict is gateway_serving's; the freshness window and the
         # reconnect grace below are this reader's. Stale -> None, as before.
         v = read_gateway_verdict(
-            os.path.join(state_dir, _primary_sidecar_name(state_dir)),
+            gateway_status_path(state_dir),
             now=now,
             max_age=GATEWAY_STATUS_MAX_AGE_S,
         )
@@ -571,7 +566,7 @@ def _gateway_status(state_dir):
 def gateway_alive(app_data, state_dir=None):
     """Whether the relay gateway is up.
 
-    Prefer the bridge's OWN status sidecar (the primary connection's state/gateway-status sidecar), which
+    Prefer the bridge's OWN status sidecar (the active lane's, else the primary connection's), which
     remote_gateway_bridge rewrites on every poll outcome. It reports whether the
     connection is *serving*; the pgrep paths below only ever answered "is there a
     process whose argv looks right", which is a proxy for the wrong thing.
