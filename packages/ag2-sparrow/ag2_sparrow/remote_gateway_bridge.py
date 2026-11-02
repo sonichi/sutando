@@ -4211,17 +4211,129 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
+# Room Actions go as the agent's MCP proxy sends them: a delegation minted from the relay credential,
+# then one stateless tools/call on the lane's MCP endpoint (the relay bearer is refused there).
+AGENT_ACCESS_MINT_PATH = "/api/v1/mcp/agent-access-tokens"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_AUTH_CODE = "AUTHENTICATION_FAILED"  # the proxy's in-band auth failure, read from content[0]
+MINT_RATE_LIMIT_S = 60.0  # the mint allows 30 per 60 s per agent, shared with its MCP tools
+TOKEN_TTL_MAX_S = 3600.0
+MCP_REPLY_MAX = 1 << 20
+_AGENT_ACCESS = {"token": "", "until": 0.0, "penalty_until": 0.0}
+_AGENT_ACCESS_LOCK = threading.Lock()
+
+
+class MintRateLimited(RuntimeError):
+    """The mint answered 429: no mint for MINT_RATE_LIMIT_S."""
+
+
+def _agent_access_token(refresh: bool = False) -> str:
+    """This lane's MCP delegation: minted with the relay bearer (POST, no body -> {access_token,
+    expires_in}), reused until a minute before it expires; `refresh` mints again."""
+    with _AGENT_ACCESS_LOCK:
+        now = time.monotonic()
+        if not refresh and _AGENT_ACCESS["token"] and now < _AGENT_ACCESS["until"]:
+            return _AGENT_ACCESS["token"]
+        if now < _AGENT_ACCESS["penalty_until"]:
+            raise MintRateLimited("the mint is rate limited; not minting yet")
+        _AGENT_ACCESS.update(token="", until=0.0)
+        try:
+            out = _req("POST", AGENT_ACCESS_MINT_PATH, None, timeout=10, origin=True)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                exc.close()
+                _AGENT_ACCESS["penalty_until"] = now + MINT_RATE_LIMIT_S
+                raise MintRateLimited("the mint answered 429; backing off") from None
+            raise
+        token = out.get("access_token") if isinstance(out, dict) else None
+        if not isinstance(token, str) or not token:
+            raise ValueError("the mint endpoint returned no access token")
+        _SECRETS.register(token)
+        try:
+            ttl = float(out.get("expires_in") or 900)
+        except (TypeError, ValueError):
+            ttl = 900.0
+        ttl = min(ttl, TOKEN_TTL_MAX_S) if math.isfinite(ttl) else 900.0
+        _AGENT_ACCESS.update(token=token, until=now + max(30.0, ttl - 60.0))
+        return token
+
+
+def _lane_mcp_url() -> str:
+    """This lane's MCP endpoint, from its gateway's DotSpace (no fetch: a hot path)."""
+    return _dotspace_for(urllib.parse.urlsplit(URL).hostname or "", fetch=_NO_FETCH).mcp_url
+
+
+def _mcp_envelope(result: dict) -> dict:
+    """A tool result's JSON: its structuredContent, else the last content text that is a JSON object
+    (a success carries a sentence first, an error its envelope alone)."""
+    if isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    for item in reversed(result.get("content") or []):
+        try:
+            value = json.loads(item.get("text") or "")
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _mcp_tool(name: str, arguments: dict, timeout: int = 10) -> dict:
+    """One MCP tools/call on this lane's endpoint with its delegation; the tool's envelope, with
+    `is_error` set on a tool error. A rejected delegation (HTTP 401 or an auth envelope) is minted once
+    more. Raises HTTPError on any other HTTP failure, ValueError on a reply that is not JSON-RPC."""
+    url = _lane_mcp_url()
+    if not url:
+        raise LookupError("this lane's homeserver names no MCP endpoint")
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": name, "arguments": arguments}}).encode()
+    for attempt in (0, 1):
+        token = _agent_access_token(refresh=attempt > 0)
+        try:
+            with gateway_instance.gateway_call(url):
+                req = urllib.request.Request(url, data=body, method="POST")
+                for key, value in (("Authorization", f"Bearer {token}"), ("Content-Type", "application/json"),
+                                   ("Accept", "application/json"), ("MCP-Protocol-Version", MCP_PROTOCOL_VERSION),
+                                   ("User-Agent", "sutando-gateway-client/1.0")):
+                    req.add_header(key, value)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    rpc = json.loads(resp.read(MCP_REPLY_MAX))
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == 401 and attempt == 0:
+                continue
+            raise
+        result = rpc.get("result") if isinstance(rpc, dict) else None
+        if not isinstance(result, dict):
+            raise ValueError("the MCP endpoint did not answer the call")
+        envelope = _mcp_envelope(result)
+        if result.get("isError"):
+            if envelope.get("code") == MCP_AUTH_CODE and attempt == 0:
+                continue
+            return {**envelope, "is_error": True}
+        return envelope
+
+
 def _send_task_step(payload: dict):
+    """room.task.progress as room.action.execute through this lane's MCP endpoint. Not deployed (a 404
+    from the mint or the endpoint, no MCP endpoint, or the Action not available here) is a skip."""
     try:
-        return _req("POST", "/api/capabilities/v1/actions/execute", payload,
-                    timeout=10, operation_id=payload["operation_id"], origin=True)
+        out = _mcp_tool("room.action.execute", payload)
+    except LookupError:
+        return {"status": "not_deployed"}
     except urllib.error.HTTPError as exc:
         exc.close()
-        if exc.code != 404:
-            raise
+        if exc.code == 404:
+            return {"status": "not_deployed"}
+        raise
+    if out.get("is_error") and out.get("code") in ("NOT_FOUND", "ACTION_NOT_FOUND"):
         return {"status": "not_deployed"}
+    return out
 
 
+# Host-injected (local task id) -> its published status (phase_line.published_status), whose typed
+# fields are all a published step carries. None (standalone default): the latest activity row's text.
+TASK_STATUS: Callable[[str], "dict | None"] | None = None
 _STEP_PUBLISHER = task_step_publisher.StepPublisher(_STATE, _send_task_step, _log)
 
 
@@ -4241,19 +4353,21 @@ def _publish_task_steps(inflight: set[str]) -> None:
     with _STEP_PUSH_LOCK:
         if _STEP_PUSH_THREAD is not None and _STEP_PUSH_THREAD.is_alive():
             return
-        _STEP_PUSH_THREAD = threading.Thread(target=_publish_task_steps_now, args=(set(inflight),),
+        _STEP_PUSH_THREAD = threading.Thread(target=_publish_task_steps_now, args=(set(inflight), inflight),
                                              name="task-step-publisher", daemon=True)
         _STEP_PUSH_THREAD.start()
 
 
-def _publish_task_steps_now(inflight: set[str]) -> None:
+def _publish_task_steps_now(inflight: set[str], live: "set[str] | None" = None) -> None:
     try:
-        _publish_task_steps_snapshot(inflight)
+        _publish_task_steps_snapshot(inflight, live)
     except Exception as exc:
         _log(f"task step publisher failed ({type(exc).__name__}); continuing")
 
 
-def _publish_task_steps_snapshot(inflight: set[str]) -> None:
+def _publish_task_steps_snapshot(inflight: set[str], live: "set[str] | None" = None) -> None:
+    """`inflight` is the snapshot to publish for; `live` the outbound worker's own set, re-read right
+    before each send so a task retired meanwhile (its result delivered) is never stepped again."""
     tasks = {}
     for tid in inflight:
         if not gateway_instance.owns(tid, GATEWAY_INSTANCE):
@@ -4280,7 +4394,9 @@ def _publish_task_steps_snapshot(inflight: set[str]) -> None:
             continue
         tasks[tid] = {"task_id": wire, "execution_generation": gen,
                       "room_id": headers.get("source_room_id") or headers.get("channel_id")}
-    _STEP_PUBLISHER.publish(tasks)
+    _STEP_PUBLISHER.status_of = TASK_STATUS
+    _STEP_PUBLISHER.publish(tasks, open_now=lambda tid: (live is None or tid in live)
+                            and not (RESULTS_DIR / f"{tid}.txt").exists())
 
 
 def _claim_ack(wire_tid: str, lease_id: "str | None", local: "str | None" = None, durable: bool = False,
