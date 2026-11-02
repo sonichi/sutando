@@ -451,7 +451,7 @@ Sutando checkout around it sends neither field.
   the adoption's own write and publishes the copy saved for its serve. A copy is removed only by the
   ledger's owner, under the ledger's lock, while no record names it: at start, copies no record
   names are removed, and none while any record or reference cannot be read; a copy whose removal
-  fails is left for the next start. Copies are private (0600) and redacted before they are written: the body, the wake and the room question (as it was redacted on intake) hold no pasted token or `vault set` value. A held copy never stores a `vault set`: the owner's is replaced with a note that it was not stored from this re-sent copy and should be sent again if the key is not stored (a late store could put an old value over a newer one); anyone else's is redacted as usual. Only the first render of a serve stores. A redacted copy is `v2-<hash>.json`, envelope format 2, with what was found under `cleaned`; it is published without a second vault interception, and an earlier bridge, which reads only `v1-` copies, refuses it and fails that generation. A `v1-` copy is published as before. Its result
+  fails is left for the next start. Copies are private (0600) and redacted before they are written: the body, the wake and the room question (as it was redacted on intake) hold no pasted token or `vault set` value. A held copy never stores a `vault set`: the owner's is replaced with a note that it was not stored from this re-sent copy and should be sent again if the key is not stored (a late store could put an old value over a newer one); anyone else's is redacted as usual. Only the first render of a serve stores. A redacted copy is `v2-<hash>.json`, envelope format 2, with what was found under `cleaned`; it is published without a second vault interception, and an earlier bridge never reaches it, as it refuses the format-5 ledger. A `v1-` copy is published as before. Its result
   goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
   An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
   The same holds after the earlier run has finished: a serve under a lease other than the one it
@@ -479,9 +479,10 @@ Sutando checkout around it sends neither field.
   outcome is unknown (a timeout, a crash) keeps its claim and is reconciled under the same id. Each
   start takes the ledger over with a new epoch, and a bridge whose epoch is gone makes no further
   claim or call and stops polling. A ledger that cannot be locked, read or written is never written
-  over, and nothing that depends on it moves. The ledger is format 4 (saved-serve references); a
-  format-3 ledger is read and upgraded on its next write, and a format-3 bridge refuses a format-4
-  ledger rather than serve its debts from a legacy file. A damaged value inside it (its `contract`,
+  over, and nothing that depends on it moves. The ledger is format 5 (saved-serve references, redacted held copies); a
+  format-3 or format-4 ledger is read and upgraded on its next write. An earlier bridge refuses a
+  format-5 ledger and holds every task, rather than serve debts from a legacy file (format 3) or
+  save a raw held copy (format 4); setting the ledger aside starts it clean. A damaged value inside it (its `contract`,
   a record, a run entry) is never read as absent: the work that needs it is held and logged. The way
   out is to stop the bridge, set the ledger aside (or repair the named key), and restart: a missing
   ledger starts empty, and the attempts the old one held are not resumed.
