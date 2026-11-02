@@ -64,7 +64,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from channel_env_resolve import resolve_channel_env  # noqa: E402
+from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
@@ -6841,7 +6841,7 @@ def _gateway_configured() -> bool:
             return True
         # Which file defines the token is content, not filename, and the same
         # owner answers it for startup and for runtime-health.
-        return resolve_channel_env(claude_home_path("channels"), "ag2space") is not None
+        return channel_configured(claude_home_path("channels"), "ag2space")
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.

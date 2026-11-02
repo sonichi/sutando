@@ -112,10 +112,11 @@ def _from_channel_env(names, env_file=None):
     and a stored one still loses. Alias set matches the VAULT tier (which
     includes the legacy AG2_REMOTE_TOKEN), not the narrower env chain.
     """
+    default = env_file is None
     try:
         env_file = _channel_env_file() if env_file is None else env_file
         if env_file is None:
-            return ""
+            return _active_lane_value(names) if default else ""
         if not _core_src_on_path():
             return ""
         from channel_token import token_from_env_file
@@ -131,7 +132,21 @@ def _from_channel_env(names, env_file=None):
             return ""
         if got:
             return got
-    return ""
+    return _active_lane_value(names) if default else ""
+
+
+def _active_lane_value(names):
+    """First of `names` the desktop's active lane sets (`channel_env_resolve.active_lane_values`):
+    a host signed in only on a secondary homeserver has no primary token. '' for a lane bridge."""
+    try:
+        if os.environ.get("REMOTE_TASK_CHANNEL_DIR") or not _core_src_on_path():
+            return ""
+        from channel_env_resolve import active_lane_values
+        from util_paths import claude_home_path
+        found = active_lane_values(claude_home_path("channels"), "ag2space", names)
+    except Exception:
+        return ""
+    return next((found[n] for n in names if n in found), "")
 
 
 def _token_from_vault(vault_get=None):

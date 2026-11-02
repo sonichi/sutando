@@ -229,5 +229,34 @@ class GatewayPrecedence(_Base):
         self.assertEqual(headers.get("Authorization"), "Bearer legacy")
 
 
+class SecondaryLaneOnlyInstall(_Base):
+    """A device file holding only the active lane's own token key: gateway() uses that token."""
+
+    def _install(self, key):
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "channels" / "ag2space").mkdir(parents=True)
+        (root / "channels" / "active-gateway-lane").write_text("s_dspace\n")
+        device = root / "channels" / "ag2space" / ".env"
+        device.write_text(f'{key}="https://gw.example/relay|lane-secret"\n')
+        patch = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(root), "SUTANDO_APP_SUPPORT": str(root),
+                                             "AG2_DEVICE_ENV": str(device)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("REMOTE_TASK_CHANNEL_DIR", None)
+
+    def test_the_active_lanes_token_is_used(self):
+        self._install("AG2_REMOTE_TOKEN_S_DSPACE")
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
+    def test_another_lanes_token_is_not_used(self):
+        self._install("AG2_REMOTE_TOKEN_OTHER")
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "")
+        self.assertNotIn("Authorization", headers)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

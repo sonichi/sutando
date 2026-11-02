@@ -663,6 +663,21 @@ class CredentialTest(unittest.TestCase):
         self.assertNotIn("not-a-real-secret", done.stdout + done.stderr)
         self.assertNotIn("relay.test.invalid/relay|", done.stdout + done.stderr)
 
+    def test_a_secondary_lane_only_install_reads_the_active_lanes_token(self):
+        support = self.tmp / "app-support"
+        device = support / "channels" / "ag2space" / ".env"
+        device.parent.mkdir(parents=True)
+        (support / "channels" / "active-gateway-lane").write_text("s_dspace\n")
+        device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n"
+                          "AG2_REMOTE_TOKEN_OTHER=https://relay.test.invalid/relay|other-secret\n")
+        (self.config / "channels" / "ag2space" / ".env").unlink()
+        lane = {**self.base, "CLAUDE_CONFIG_DIR": str(support), "SUTANDO_APP_SUPPORT": str(support),
+                "AG2_DEVICE_ENV": str(device)}
+        with mock.patch.dict(os.environ, lane, clear=True):
+            env = gs.commons_env(self.script)
+        self.assertEqual(env.get("AG2_REMOTE_TOKEN"), "https://relay.test.invalid/relay|lane-secret")
+        self.assertNotIn("ROOM_COMMONS_TOKEN", env)
+
     def test_redact_hides_credential_values_and_token_halves(self):
         env = {"AG2_REMOTE_TOKEN": "https://relay.test.invalid/r|s3cr3t-value", "ROOM_KEY": "short",
                "PATH": "/usr/bin:/bin"}

@@ -268,6 +268,68 @@ class TestLaunchKeyEnv(_Base):
         self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), named)
 
 
+class TestActiveLane(_Base):
+    """A device file holding only the desktop's active lane's own keys resolves that lane's token,
+    by key name in that same file; no other lane's key is read and a primary token still wins."""
+
+    LANE_TOKEN = "https://gw.example/relay|lane-secret"
+    NAMES = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
+    def _install(self, device_body: str, lane: str = "s_dspace") -> Path:
+        root = self._tmpdir()
+        channels = root / "channels"
+        (channels / "ag2space").mkdir(parents=True)
+        (channels / "active-gateway-lane").write_text(lane + "\n")
+        device = channels / "ag2space" / ".env"
+        device.write_text(device_body)
+        os.environ["SUTANDO_APP_SUPPORT"] = str(root)
+        os.environ["AG2_DEVICE_ENV"] = str(device)
+        return channels
+
+    def _lane_only(self, lane: str = "s_dspace") -> Path:
+        return self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
+                             "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=s.space\n", lane)
+
+    def test_a_lane_only_device_file_resolves_the_active_lanes_token(self):
+        channels = self._lane_only()
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"), "the sourced-path contract is unchanged")
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+        self.assertEqual(m.channel_values(channels, "ag2space", ("REMOTE_TASK_CHANNEL_DIR",)),
+                         {"REMOTE_TASK_CHANNEL_DIR": "s.space"})
+        self.assertTrue(m.channel_configured(channels, "ag2space"))
+
+    def test_a_key_of_a_lane_that_is_not_active_is_never_used(self):
+        channels = self._install(f'AG2_REMOTE_TOKEN_OTHER_LANE="{self.LANE_TOKEN}"\n')
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+        self.assertFalse(m.channel_configured(channels, "ag2space"))
+
+    def test_no_active_lane_reads_no_suffixed_key(self):
+        channels = self._lane_only()
+        os.environ.pop("SUTANDO_APP_SUPPORT")
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+        for lane in ("all", "primary", "../x"):
+            with self.subTest(lane=lane):
+                channels = self._lane_only(lane)
+                self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {})
+
+    def test_a_primary_token_in_the_device_file_still_wins(self):
+        channels = self._install(f'AG2_REMOTE_TOKEN="https://gw.example/relay|primary"\n'
+                                 f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n')
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES),
+                         {"AG2_REMOTE_TOKEN": "https://gw.example/relay|primary"})
+
+    def test_a_primary_token_in_the_channels_tree_still_wins(self):
+        channels = self._lane_only()
+        (channels / "ag2space" / "relay-client.env").write_text(TOKEN_LINE)
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {"REMOTE_TASK_TOKEN": "real-token"})
+
+    def test_other_sources_never_follow_the_lane(self):
+        channels = self._lane_only()
+        (channels / "discord").mkdir()
+        self.assertEqual(m.channel_values(channels, "discord", self.NAMES), {})
+        self.assertIsNone(m.active_lane_env(channels, "discord"))
+
+
 class TestCli(_Base):
     """`main()` in-process. The wrapper cases below cover the same paths through
     bash, but only as a subprocess — which no coverage run can see."""
