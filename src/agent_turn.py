@@ -257,8 +257,10 @@ def close_turn(state_dir: Path, turn_id: str) -> bool:
     if held is None:
         return False
     try:
-        fd = os.open(closed, os.O_WRONLY | os.O_CREAT, 0o400)
-        os.close(fd)
+        try:
+            os.close(os.open(closed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400))
+        except FileExistsError:
+            pass                                # fenced before: only its turn file may be left
         try:
             _turn_path(state_dir, turn_id, ".json").unlink()
         except FileNotFoundError:

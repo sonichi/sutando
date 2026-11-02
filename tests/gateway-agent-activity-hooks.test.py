@@ -520,6 +520,21 @@ class Hooks(unittest.TestCase):
         self.assertEqual([p.get("lease_id") for p, _op in self.acks(fake, leased)], ["L7"],
                          "the sidecar lost its lease: the attempt's own record proves it")
 
+    def test_a_twin_post_of_one_ack_is_quiet_and_a_superseded_ack_is_logged(self):
+        tid, gone = "task-twin-ack", "task-twin-gone"
+        self.addCleanup(self.forget, tid, gone)
+        for t in (tid, gone):
+            self.assertTrue(gw._take_served_task(_task(t, lease_id="L1", source_event_id="$e"), set(), []))
+        claim, twin = (gw._claim_ack(tid, "L1", local=tid, durable=True) for _ in range(2))
+        self.assertEqual(claim["op"], twin["op"], "both posts carry the one open claim")
+        self.assertEqual(gw._commit_ack(tid, claim, _ack(tid, 1)), "recorded")
+        self.assertEqual(gw._commit_ack(tid, twin, _ack(tid, 1)), "stale")
+        self.assertFalse([m for m in self.logs if "no longer holds" in m], "its twin recorded it: nothing to say")
+        stale = gw._claim_ack(gone, "L1", local=gone, durable=True)
+        self.forget(gone)
+        self.assertEqual(gw._commit_ack(gone, stale, _ack(gone, 1)), "stale")
+        self.assertTrue([m for m in self.logs if f"{gone}: ack for a serve this attempt no longer holds" in m])
+
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
         self.addCleanup(self.forget, tid)

@@ -144,6 +144,17 @@ class Edges(unittest.TestCase):
         at.close_turn(self.state, ctx["turn_id"])
         self.assertFalse(path.exists())
 
+    def test_a_turn_closed_once_closes_again_without_error(self):
+        ctx = _ctx(self.state)
+        path = at.write_turn_context(self.state, ctx)
+        self.assertTrue(at.close_turn(self.state, ctx["turn_id"]))
+        closed = self.state / "turns" / f"{ctx['turn_id']}.closed"
+        self.assertEqual(stat.S_IMODE(closed.stat().st_mode), 0o400)
+        path.write_text(json.dumps(ctx))                    # its turn file left by an interrupted close
+        self.assertTrue(at.close_turn(self.state, ctx["turn_id"]), "a second close is no error")
+        self.assertFalse(path.exists(), "and it still drops the turn file")
+        self.assertTrue(at.is_closed(self.state, ctx["turn_id"]))
+
     def test_odd_journal_lines_and_outcome_shapes(self):
         turn = _ctx(self.state)["turn_id"]
         at.room_actions_path(self.state).write_text(
