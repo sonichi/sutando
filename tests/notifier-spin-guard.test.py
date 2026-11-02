@@ -40,6 +40,7 @@ isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 import helper_cpu_guard as hcg  # noqa: E402
+
 import holder_lock  # noqa: E402
 import notifier_slot  # noqa: E402
 
