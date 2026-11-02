@@ -360,7 +360,7 @@
    ],
    "status": "canonical",
    "canonical_for": "test coverage policy",
-   "last_verified": null
+   "last_verified": "2026-11-02"
   },
   "docs/tutorial-delivery.md": {
    "title": "Tutorial delivery",
