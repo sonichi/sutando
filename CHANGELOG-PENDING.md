@@ -21,6 +21,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- worker-pool: the remedy timer keeps the launcher's `SUTANDO_STOP_INTERRUPT` (including the `0` opt-out) in its LaunchAgent, so a worker it relaunches keeps the Stop setting. A spawner with a different value reinstalls the timer once; one without the setting, or an explicit install without it, keeps the saved value. ([#6186])
 - ag2-sparrow: the Hatch hook's timed steps now fit its 30 s script timeout (12 + 4 + 4 s, each with a 1 s kill grace), a step whose child ignores SIGTERM is killed, and no child the hook starts keeps holding its poll lock. ([#6184])
 - Task watcher: a session watcher whose inbox is outside its workspace (an inherited `SUTANDO_WORKSPACE_DIR`, as a test run on a live host has) no longer overwrites the workspace's sentinel while that workspace's own watcher is live, nor removes it on exit. Such a run made the core's live watcher read as not ready for minutes, and the Stop hook then blocked until a re-arm. The standby-gate test now isolates its workspace.
 - ag2-sparrow: a bridge running with `REMOTE_TASK_LIFECYCLE_V2` off no longer retires a queued wake run (`task-…~~N`) left by a V2 run as already answered because its task's first result was delivered. The run stays for the core: a `[no-send]` answer closes its task, and a text answer is quarantined to `undelivered/` for review rather than lost. ([#6166])
