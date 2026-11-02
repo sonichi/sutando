@@ -196,7 +196,7 @@ def resolve_room_channel_env(channels_dir, source: str, room_id: str) -> Path | 
     if not row["instance"]:
         # The legacy row's own server only: the active lane may be another server's.
         return _resolve_primary(channels_dir, DEVICE_ENV_SOURCE)
-    channel_dir = connections.channel_dir_for(row["instance"])
+    channel_dir = connections.lane_channel_dir(row["instance"])
     picked = resolve_channel_env(channels_dir, channel_dir)
     if picked is None:
         raise connections.NoConnectionForRoom(
