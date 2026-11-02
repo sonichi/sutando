@@ -5,7 +5,6 @@ claude_code_fixtures.py."""
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import errno
 import functools
 import io
@@ -32,6 +31,7 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
+import dataclasses  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     _dirs, _Resp, AGENT, AGENT_LOCK_HOLDER, AgentRootBase, Backend, BASE, BEARER, card, cb, cli, cm, CODE,
