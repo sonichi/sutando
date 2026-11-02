@@ -12,7 +12,9 @@ recognised by filesystem identity, and nothing already at `$CODEX_HOME/AGENTS.md
 another link, a dangling link) or an AGENTS.override.md is removed or replaced.
 """
 import argparse
+import errno
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -35,6 +37,12 @@ def _nearest_existing(path):
     return path, rest
 
 
+def canonical(path):
+    """`path` with every symlink in its existing part resolved; the missing rest kept as given."""
+    have, rest = _nearest_existing(path)
+    return Path(os.path.realpath(have)).joinpath(*rest)
+
+
 def _same(a, b):
     try:
         return os.path.samefile(a, b)
@@ -45,17 +53,62 @@ def _same(a, b):
 def is_owner_codex_home(codex_home, home):
     """True when `codex_home` is, or would be created as, the owner's `~/.codex` or a path in it.
 
-    Compared by filesystem identity, so a case-variant or symlinked spelling is caught too.
+    Compared on the physical path by filesystem identity, so an alias or case variant counts.
     """
     owner = Path(home) / ".codex"
-    path = Path(os.path.abspath(codex_home))
+    path = canonical(codex_home)
     for candidate in (path, *path.parents):
         if os.path.exists(candidate) and _same(candidate, owner):
             return True
     have, rest = _nearest_existing(path)
-    base, missing = _nearest_existing(owner)
+    base, missing = _nearest_existing(canonical(owner))
     folded = [p.casefold() for p in rest[:len(missing)]]
     return _same(have, base) and folded == [p.casefold() for p in missing]
+
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _fd_path(fd):
+    """Where an open directory is now, or None when the platform cannot say."""
+    try:
+        import fcntl
+        if hasattr(fcntl, "F_GETPATH"):
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+            return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
+    except OSError:
+        return None
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError:
+        return None
+
+
+def _open_home(path):
+    """Open `path` without following a symlink at any step below its existing canonical base."""
+    have, rest = _nearest_existing(path)
+    fd = os.open(have, _DIR_FLAGS)
+    try:
+        for part in rest:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _lexists(name, fd):
+    try:
+        os.stat(name, dir_fd=fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def ensure_linked(codex_home, repo, home):
@@ -66,25 +119,46 @@ def ensure_linked(codex_home, repo, home):
     source = host_instructions(repo)
     if source is None:
         return "no-host"
-    codex_home = Path(codex_home).expanduser()
-    if is_owner_codex_home(codex_home, home):
+    path = canonical(Path(codex_home).expanduser())
+    if is_owner_codex_home(path, home):
         return "owner-home"
-    # Codex reads an AGENTS.override.md in place of AGENTS.md; the override is the owner's.
-    if (codex_home / "AGENTS.override.md").exists():
-        return "overridden"
-    target = codex_home / "AGENTS.md"
-    if target.is_symlink():
-        if Path(os.readlink(target)) == source:
-            return "already-set"
-        return "foreign" if target.exists() else "dangling"
-    if target.exists():
-        return "foreign"
-    codex_home.mkdir(parents=True, exist_ok=True)
     try:
-        target.symlink_to(source)
-    except FileExistsError:
-        return "already-set" if target.is_symlink() and Path(os.readlink(target)) == source else "foreign"
-    return "linked"
+        fd = _open_home(path)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return "foreign"  # a component turned into a symlink after the check
+        raise
+    try:
+        # Re-check the directory actually opened; its path may differ from the one checked.
+        where = _fd_path(fd)
+        if is_owner_codex_home(where or path, home):
+            return "owner-home"
+        if where is None and not os.path.samestat(os.fstat(fd), os.stat(path)):
+            return "foreign"
+        # Codex reads an AGENTS.override.md in place of AGENTS.md; the override is the owner's.
+        if _lexists("AGENTS.override.md", fd):
+            return "overridden"
+        if _lexists("AGENTS.md", fd):
+            if not stat.S_ISLNK(os.stat("AGENTS.md", dir_fd=fd, follow_symlinks=False).st_mode):
+                return "foreign"
+            if Path(os.readlink("AGENTS.md", dir_fd=fd)) == source:
+                return "already-set"
+            try:
+                os.stat("AGENTS.md", dir_fd=fd)
+            except FileNotFoundError:
+                return "dangling"
+            return "foreign"
+        try:
+            os.symlink(source, "AGENTS.md", dir_fd=fd)
+        except FileExistsError:
+            try:
+                same = Path(os.readlink("AGENTS.md", dir_fd=fd)) == source
+            except OSError:
+                same = False
+            return "already-set" if same else "foreign"
+        return "linked"
+    finally:
+        os.close(fd)
 
 
 def main(argv=None):

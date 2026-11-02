@@ -85,8 +85,10 @@ The Codex implementation:
   (`src/codex_host_instructions.py`). Codex reads AGENTS.md only from its project
   root down, so without the link a Codex core never sees the host's first-contact
   and Getting started instructions that a Claude core reads from the parent
-  directory. The owner's `~/.codex` is recognised by filesystem identity (a case-variant
-  or symlinked spelling counts) and never written. Anything already at
+  directory. The owner's `~/.codex` is never written: `CODEX_HOME` is resolved to its
+  physical path and refused when that is, or is inside, `~/.codex` by filesystem identity
+  (symlink aliases, `..` detours and case variants count), and every check and write then
+  goes through the opened, re-verified directory, never the alias. Anything already at
   `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
   Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md`, so when one exists
   the launcher links nothing, leaves the override as it is and warns that the core reads

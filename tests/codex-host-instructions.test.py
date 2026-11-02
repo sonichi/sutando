@@ -87,26 +87,26 @@ class EnsureLinked(unittest.TestCase):
         """The check sees a dangling link; the owner's file lands before any mutation."""
         self.codex_home.mkdir(parents=True)
         self.target.symlink_to(self.codex_home / "gone.md")
-        real_exists = Path.exists
+        real_readlink = os.readlink
 
         def swap_after_answering(path, *a, **k):
-            answer = real_exists(path, *a, **k)
-            if path == self.target and path.is_symlink():
+            answer = real_readlink(path, *a, **k)
+            if os.path.islink(self.target):
                 os.unlink(self.target)
                 self.target.write_text("owner's file\n")
             return answer
-        with patch.object(Path, "exists", swap_after_answering):
-            self.assertEqual(self.link(), "dangling")
+        with patch.object(os, "readlink", swap_after_answering):
+            self.assertIn(self.link(), ("dangling", "foreign"))
         self.assertFalse(self.target.is_symlink())
         self.assertEqual(self.target.read_text(), "owner's file\n")
 
     def test_a_missing_target_that_an_owner_creates_before_the_link_survives(self):
-        real_symlink = Path.symlink_to
+        real_symlink = os.symlink
 
-        def owner_first(path, src, *a, **k):
-            path.write_text("owner's file\n")
-            return real_symlink(path, src, *a, **k)
-        with patch.object(Path, "symlink_to", owner_first):
+        def owner_first(src, dst, *a, **k):
+            self.target.write_text("owner's file\n")
+            return real_symlink(src, dst, *a, **k)
+        with patch.object(os, "symlink", owner_first):
             self.assertEqual(self.link(), "foreign")
         self.assertEqual(self.target.read_text(), "owner's file\n")
 
@@ -142,23 +142,76 @@ class EnsureLinked(unittest.TestCase):
         self.assertEqual(override.read_text(), "owner override\n")
 
     def test_a_concurrent_launch_that_links_first_wins(self):
-        real_symlink = Path.symlink_to
+        real_symlink = os.symlink
 
-        def raced(path, src, *a, **k):
-            real_symlink(path, src)
-            raise FileExistsError(str(path))
-        with patch.object(Path, "symlink_to", raced):
+        def raced(src, dst, *a, **k):
+            real_symlink(src, dst, *a, **k)
+            raise FileExistsError(dst)
+        with patch.object(os, "symlink", raced):
             self.assertEqual(self.link(), "already-set")
         other = self.codex_home / "other.md"
         other.write_text("other\n")
         self.target.unlink()
 
-        def other_won(path, src, *a, **k):
-            real_symlink(path, other)
-            raise FileExistsError(str(path))
-        with patch.object(Path, "symlink_to", other_won):
+        def other_won(src, dst, *a, **k):
+            real_symlink(other, dst, *a, **k)
+            raise FileExistsError(dst)
+        with patch.object(os, "symlink", other_won):
             self.assertEqual(self.link(), "foreign")
         self.assertEqual(Path(os.readlink(self.target)), other)
+
+    def test_an_alias_to_a_directory_inside_the_owners_codex_home_is_refused(self):
+        sub = self.home / ".codex" / "sub"
+        sub.mkdir(parents=True)
+        alias = Path(self.tmp.name).resolve() / "alias-sub"
+        alias.symlink_to(sub)
+        self.assertEqual(self.link(codex_home=alias), "owner-home")
+        self.assertEqual(self.link(codex_home=alias / "deeper"), "owner-home")
+        self.assertEqual(sorted(p.name for p in (self.home / ".codex").rglob("*")), ["sub"])
+
+    def test_an_alias_retargeted_to_the_owners_codex_home_after_the_check_writes_nothing_there(self):
+        owner = self.home / ".codex"
+        owner.mkdir(parents=True)
+        safe = Path(self.tmp.name).resolve() / "safe-home"
+        safe.mkdir()
+        alias = Path(self.tmp.name).resolve() / "alias-home"
+        alias.symlink_to(safe)
+        real_check = chi.is_owner_codex_home
+
+        def retarget_after_check(*a, **k):
+            answer = real_check(*a, **k)
+            if os.readlink(alias) != str(owner):
+                alias.unlink()
+                alias.symlink_to(owner)
+            return answer
+        with patch.object(chi, "is_owner_codex_home", retarget_after_check):
+            result = self.link(codex_home=alias)
+        self.assertEqual(os.listdir(owner), [], result)
+        self.assertEqual(result, "linked")
+        self.assertEqual(Path(os.readlink(safe / "AGENTS.md")), self.host)
+
+    def test_an_alias_through_dotdot_into_the_owners_codex_home_is_refused(self):
+        sub = self.home / ".codex" / "sub"
+        sub.mkdir(parents=True)
+        detour = Path(self.tmp.name).resolve() / "x"
+        detour.mkdir()
+        alias = Path(self.tmp.name).resolve() / "alias-dotdot"
+        alias.symlink_to(f"{detour}/../{self.home.name}/.codex/sub")
+        self.assertEqual(self.link(codex_home=alias), "owner-home")
+        self.assertEqual(sorted(p.name for p in (self.home / ".codex").rglob("*")), ["sub"])
+
+    def test_aliases_into_an_absent_owner_codex_home_are_refused_and_create_nothing(self):
+        self.home.mkdir(parents=True)
+        owner = self.home / ".codex"
+        root = Path(self.tmp.name).resolve()
+        for name, dest in (("to-owner", owner), ("to-owner-sub", owner / "sub"),
+                           ("to-dotdot", f"{root}/x/../{self.home.name}/.codex/sub")):
+            with self.subTest(alias=name):
+                alias = root / name
+                alias.symlink_to(dest)
+                self.assertEqual(self.link(codex_home=alias), "owner-home")
+                self.assertEqual(self.link(codex_home=alias / "deeper"), "owner-home")
+                self.assertFalse(os.path.lexists(owner), f"{name} created the owner's home")
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
