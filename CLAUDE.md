@@ -164,8 +164,8 @@ Asked to report or file a bug or feature about Sutando, s.space or the desktop a
 
 ## Pending decisions
 
-When you need the owner's word or are blocked:
-1. `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records it as a row of the owner's Pending questions database, via the store an installed skill declares (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; the next reconcile files it), queues it as `results/proactive-*.txt` (the task's conversation when that is the owner's DM; else his DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is history only.
+When you need the owner's word or are blocked (every ask carries your proposal; see the pending-questions skill):
+1. `python3 scripts/ask-owner.py "<question>" --default "<your proposal>" --reason "<why>" [--option "Label=alternative"] [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records it as a row of the owner's Pending questions database, via the store an installed skill declares (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; the next reconcile files it), queues it as `results/proactive-*.txt` (the task's conversation when that is the owner's DM; else his DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is history only.
 2. Continue with other work; don't block.
 
 `python3 src/pending_questions_reader.py list` is read-only, only when the owner asks or you are blocked; `… resolve <id>` when he answers. `python3 src/check-pending-questions.py` reconciles and lists, and sends the one text pointer owed for a decision card the gateway never posted; `--notify` reminds, on demand only; no reminder is scheduled or surfaced per pass.
