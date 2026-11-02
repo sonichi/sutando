@@ -9161,7 +9161,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     payload = json.dumps(doc).encode("utf-8")
     woken_item = ruling.woken_item
     # A fold posts nothing either, so it closes an already-accepted id the same way.
-    item_id = effective_item_id(core.backend.root, woken_item or broker_tid, no_send or bool(consolidated_into))
+    item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
     # The task's own result item only: a close of an id already accepted keeps today's policy.
     relay = relay and item_id == broker_tid
     if relay:
@@ -9392,6 +9392,11 @@ def _log_relay_end(tid: str, mark_retired: bool, *ids: str) -> None:
     else:
         _log(f"result {tid}: its task is settled, but its relay mark could not be retired; "
              "the next start finishes the end")
+
+
+def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:
+    """The item a result goes under; the outbox is read only for a suppressed close."""
+    return effective_item_id(core.backend.root, broker_tid, True) if no_send else broker_tid
 
 
 def _dispose_terminal(core, item_id: str, tid: str, record: dict, result_file,
@@ -10065,7 +10070,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                     _save_inflight(inflight)
                     _forget_ack_first(_btid)
                 continue
-        _item = effective_item_id(_delivery_core().backend.root, _btid, bool(skip))
+        _item = _effective_item_id(_delivery_core(), _btid, bool(skip))
         if _delivery_core().backend.is_terminal(_item):
             if _settle_delivered(tid, _btid, rfile, inflight):
                 _save_inflight(inflight)        # disposed and logged by the delivery call
