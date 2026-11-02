@@ -71,7 +71,7 @@ def open_dialog(ws: Path, task_id: str) -> "dict | None":
     return max(found, key=lambda d: d.get("at") or 0, default=None)
 
 
-def has_open_tool(ws: Path, task_id: str, *, now=None, max_age_s=900.0) -> bool:
+def has_open_tool(ws: Path, task_id: str, *, now=None, max_age_s=1800.0) -> bool:
     """Whether all unmatched task-bound tool starts remain within the exemption bound."""
     try:
         data = json.loads(path(ws).read_text(encoding="utf-8"))

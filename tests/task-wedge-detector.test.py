@@ -387,11 +387,11 @@ class Wedges(unittest.TestCase):
                 patch.object(phase_line, 'setting', side_effect=lambda key, default: default), \
                 patch.object(phase_line.time, 'time', return_value=100):
             phase_line.on_step(self.ws, 'task-a', 'Bash', {}, '', spawn=lambda *args: None)
-            for now in (400, 999):
+            for now in (400, 1000, 1899):
                 self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=now)['phase'], 'Waiting')
             self.assertEqual(self.notices(), [])
-            turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=999)
-            self.blocked(phase_line.published_status(self.ws, 'task-a', now=1000))
+            turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=1899)
+            self.blocked(phase_line.published_status(self.ws, 'task-a', now=1900))
             self.blocked(phase_line.published_status(self.ws, 'task-a', now=7300))
             self.assertEqual(len(self.notices()), 1)
         self.assertEqual(turns.read(self.ws, 'bounded')['tool_started']['id:call-1'], 100)
@@ -400,11 +400,11 @@ class Wedges(unittest.TestCase):
         import turns
         import phase_line
         manifest = json.loads((REPO / 'skills' / 'agent-activity' / 'manifest.json').read_text())
-        self.assertEqual(manifest['config']['WEDGE_TOOL_MAX_SECONDS'], 900)
+        self.assertEqual(manifest['config']['WEDGE_TOOL_MAX_SECONDS'], 1800)
         base = {'prompt_id': 'configured', 'tool_name': 'Bash', 'tool_use_id': 'call-1'}
         turns.record(dict(base, hook_event_name='UserPromptSubmit', prompt='TASK_FILE: task-a.txt'), self.ws, now=100)
         turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=100)
-        for value, bound in (('600', 600), ('nan', 900), ('-1', 900), ('invalid', 900)):
+        for value, bound in (('600', 600), ('nan', 1800), ('-1', 1800), ('invalid', 1800)):
             with self.subTest(value=value), patch.object(detector, '_signals', return_value=[]), \
                     patch.object(phase_line, 'setting', side_effect=lambda key, default: value if key == 'WEDGE_TOOL_MAX_SECONDS' else default), \
                     patch.object(phase_line.time, 'time', return_value=100):
