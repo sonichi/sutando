@@ -70,7 +70,7 @@ cleanup_notifier() {
 }
 
 trap cleanup_notifier EXIT
-trap 'exit 0' HUP INT TERM
+trap 'notifier_signal 0' HUP INT TERM
 
 clear_workstream_context() {
   if [ -n "$workstream_context_file" ]; then
@@ -574,7 +574,10 @@ process_announced_queue() {
 # the assignment runs, leaving the timeout branch below unreachable.
 while :; do
   event="" rrc=0 read_at=$SECONDS
+  NOTIFIER_IN_READ=1
   IFS= read -r -t "$RETRY_INTERVAL" event || rrc=$?
+  NOTIFIER_IN_READ=0
+  [ -z "$NOTIFIER_STOP" ] || exit "$NOTIFIER_STOP"
   if [ "$rrc" -eq 0 ]; then
     case "$event" in
       "TASK_FILE: "*)

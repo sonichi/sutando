@@ -1,12 +1,5 @@
-# Sourced by the task notifiers (claude, codex) and their supervisor. Bash 3.2 safe.
-#
-# 2026-11-01: a claude notifier spun at 60-90% CPU for about 9 h and ignored TERM. Its standby
-# watcher had closed the events FIFO but not finished exiting. Every timed `read` then
-# returned EOF at once. bash 3.2 reports EOF as 1, the same as a timeout, and `kill -0`
-# on the dying watcher still succeeded, so the loop went round with no sleep. TERM then
-# ran a cleanup that `wait`ed on that same watcher forever, so the notifier never exited,
-# and neither did the supervisor waiting on the notifier. These helpers end both: a
-# stream that has ended is recognised as ended, and every stop is bounded.
+# shellcheck shell=bash
+# Shared by the task notifiers and their supervisor: when an events stream has ended, and a bounded stop.
 
 # A process that exited but was not reaped still answers kill -0.
 notifier_proc_is_zombie() {
@@ -18,35 +11,40 @@ notifier_proc_live() {
   [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null && ! notifier_proc_is_zombie "$1"
 }
 
-# After a timed `read` from the events FIFO returned non-zero: has the stream ended?
-# $1 writer pid, $2 seconds the read took, $3 its timeout. The stream has ended when its
-# writer is gone or a zombie, or when the read came back well before its timeout. That is
-# EOF, not a timeout: no writer ever reopens this FIFO, so every later read is EOF too.
-# A timeout under 2 s cannot be told from EOF by time; the caller's 1 s backoff keeps
-# that case from spinning, and the writer check still ends it.
+# After a timed read of the events FIFO returned non-zero ($1 writer pid, $2 seconds taken, $3 timeout):
+# ended when the writer is gone, or the read returned early, which is EOF since no writer reopens it.
 events_stream_ended() {
   notifier_proc_live "$1" || return 0
   [ "$3" -ge 2 ] && [ "$2" -lt $(( $3 - 1 )) ] && return 0
   return 1
 }
 
-# Stop a child that leads its own process group: TERM the group (else the pid), wait up
-# to $2 seconds (default 3) of wall time, then KILL. A child that ignores TERM can no
-# longer hold its parent in `wait` forever. The wait polls with kill -0, a builtin, and
-# asks `ps` about a zombie only about once a second: a fork per poll under load would
-# stretch the grace far past its seconds.
+# Whether any member of process group $1 is still running (kill -0 to the group).
+notifier_group_live() {
+  kill -0 "-$1" 2>/dev/null
+}
+
+# TERM $1's process group (else $1 alone), wait up to $2 s (default 3) for all of it, then KILL what is left.
+# A group outlives its leader: members are waited on and killed whether or not the leader is gone.
 stop_group_bounded() {
-  local pid="${1:-}" grace="${2:-3}" deadline n=0
+  local pid="${1:-}" grace="${2:-3}" deadline group=0
   [ -n "$pid" ] || return 0
-  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  notifier_group_live "$pid" && group=1
+  if [ "$group" = 1 ]; then kill -TERM "-$pid" 2>/dev/null || true; else kill -TERM "$pid" 2>/dev/null || true; fi
   deadline=$((SECONDS + grace))
-  while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
-    n=$((n + 1))
-    if [ $((n % 10)) -eq 0 ] && notifier_proc_is_zombie "$pid"; then break; fi
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$group" = 1 ]; then notifier_group_live "$pid" || break; else notifier_proc_live "$pid" || break; fi
     sleep 0.1
   done
-  if notifier_proc_live "$pid"; then
-    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-  fi
+  if [ "$group" = 1 ] && notifier_group_live "$pid"; then kill -KILL "-$pid" 2>/dev/null || true; fi
+  if notifier_proc_live "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
   wait "$pid" 2>/dev/null || true
+}
+
+# A signal trap's exit while `read -t` waits leaves bash 3.2's read timeout armed; it then spins in cleanup.
+# So during the events read a signal is only recorded; the caller exits once the read returns.
+NOTIFIER_IN_READ=0
+NOTIFIER_STOP=""
+notifier_signal() {
+  if [ "$NOTIFIER_IN_READ" = 1 ]; then NOTIFIER_STOP="$1"; else exit "$1"; fi
 }

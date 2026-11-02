@@ -93,7 +93,7 @@ standby_end_log() {
     log_notifier "standby ended for $TASKS_DIR ($1) with no session-role watcher ready"
   fi
 }
-trap 'exit 0' HUP INT TERM
+trap 'notifier_signal 0' HUP INT TERM
 
 cleanup_notifier() {
   # The watcher goes FIRST: the ending is logged from here, and a probe that ran
@@ -111,8 +111,8 @@ cleanup_notifier() {
   fi
 }
 trap cleanup_notifier EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
+trap 'notifier_signal 143' TERM
+trap 'notifier_signal 130' INT
 log_notifier() {
   local msg="task-notifier: $*" dir
   dir="$WORKSPACE_DIR/logs"
@@ -988,7 +988,10 @@ process_announced_queue() {
 # exit status is 0 whenever the then-branch never ran, erasing read's real one.
 while :; do
   event="" rc=0 read_at=$SECONDS
+  NOTIFIER_IN_READ=1
   IFS= read -r -t "$RETRY_POLL_SEC" event || rc=$?
+  NOTIFIER_IN_READ=0
+  [ -z "$NOTIFIER_STOP" ] || exit "$NOTIFIER_STOP"
   if [ "$rc" -eq 0 ]; then
     case "$event" in
       "TASK_FILE: "*)
