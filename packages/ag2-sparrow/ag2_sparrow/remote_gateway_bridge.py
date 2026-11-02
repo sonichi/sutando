@@ -4303,7 +4303,17 @@ def _mcp_tool(name: str, arguments: dict, timeout: int = 10) -> dict:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     rpc = json.loads(resp.read(MCP_REPLY_MAX))
         except urllib.error.HTTPError as exc:
-            exc.close()
+            # The safe diagnostic (an error code, never the body) is read here, the one place the
+            # response is still open; _send_task_step and the publisher log it (#6116).
+            try:
+                code, err_body = task_attempts.error_code_of(exc.read(65536).decode("utf-8", "replace"))
+                error = err_body.get("error")
+                code = code or err_body.get("code") or (error.get("code") if isinstance(error, dict) else None)
+                exc.task_step_error_code = diagnostics.code_field(code, URL)
+            except (OSError, ValueError):
+                exc.task_step_error_code = None
+            finally:
+                exc.close()
             if exc.code == 401 and attempt == 0:
                 continue
             raise
@@ -4327,9 +4337,10 @@ def _send_task_step(payload: dict):
         return {"status": "not_deployed"}
     except urllib.error.HTTPError as exc:
         exc.close()
-        if exc.code == 404:
-            return {"status": "not_deployed"}
-        raise
+        if exc.code != 404:
+            raise
+        return {"status": "not_deployed", "http_status": exc.code,
+                "error_code": getattr(exc, "task_step_error_code", None)}
     if out.get("is_error") and out.get("code") in ("NOT_FOUND", "ACTION_NOT_FOUND"):
         return {"status": "not_deployed"}
     return out

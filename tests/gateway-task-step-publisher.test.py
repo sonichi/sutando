@@ -45,6 +45,15 @@ class Publisher(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # A fresh secret registry per test: the AgentAccess fixtures mint one-letter tokens, which the
+        # bridge registers as secrets, and a one-letter secret makes every error code a piece of one.
+        fresh = gw.gateway_credentials.SecretRegistry()
+        self._registry_patches = [patch.object(gw.diagnostics, "REGISTRY", fresh)]
+        if getattr(gw, "_SECRETS", None) is not None:
+            self._registry_patches.append(patch.object(gw, "_SECRETS", fresh))
+        for p in self._registry_patches:
+            p.start()
+            self.addCleanup(p.stop)
         self.root = Path(self.tmp.name)
         self.calls, self.logs = [], []
         self.clock = 100.0
@@ -266,13 +275,33 @@ class Publisher(unittest.TestCase):
 
     def test_non_404_transport_error_is_logged_as_failure(self):
         relay = Relay(); self.addCleanup(relay.close)
-        relay.on_post = minting(lambda body: (503, {"error": "unavailable"}))
+        relay.on_post = minting(lambda body: (503, {"error_code": "UPSTREAM_UNAVAILABLE", "message": "private response content"}))
         self.row()
         self.pub.send = gw._send_task_step
         with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-token", _lane_mcp_url=lambda: relay.url + MCP):
             self.pub.publish(self.tasks)
-        self.assertIn("Action failed (HTTPError)", self.logs[0])
+        self.assertIn("HTTP 503", self.logs[0])
+        self.assertIn("error_code=UPSTREAM_UNAVAILABLE", self.logs[0])
+        self.assertNotIn("private response content", self.logs[0])
         self.assertEqual(self.pub.sent, {})
+
+
+    def test_error_codes_never_log_registered_secrets_or_free_text(self):
+        gw.diagnostics.register_secret("fixture-private-credential")
+        for code in ("fixture-private-credential", "private response body with spaces", None):
+            with self.subTest(code=code):
+                relay = Relay(); self.addCleanup(relay.close)
+                relay.on_post = minting(lambda body: (401, {"error_code": code}))
+                self.row()
+                self.pub.send = gw._send_task_step
+                with patch.multiple(gw, URL=relay.url + "/relay", TOKEN="fixture-private-credential",
+                                    _lane_mcp_url=lambda: relay.url + MCP):
+                    self.pub.publish(self.tasks)
+                self.assertIn("HTTP 401", self.logs[-1])
+                self.assertIn("error_code=unavailable", self.logs[-1])
+                self.assertNotIn("fixture-private-credential", self.logs[-1])
+                self.assertNotIn("private response body", self.logs[-1])
+                self.clock += 10
 
 
 class AgentAccess(unittest.TestCase):
@@ -405,11 +434,19 @@ class AgentAccess(unittest.TestCase):
         self.assertLessEqual(gw._AGENT_ACCESS["until"] - gw.time.monotonic(), gw.TOKEN_TTL_MAX_S)
 
     def test_not_deployed_cases_are_a_skip(self):
-        self.assertEqual(self.run_step(self.mint(self.http(404)), self.endpoint()), {"status": "not_deployed"})
+        # A 404 carries its safe diagnostics beside the skip (#6116): the status and HTTP code, and an
+        # error code when the body named one (none here).
+        self.assertEqual(self.run_step(self.mint(self.http(404)), self.endpoint()),
+                         {"status": "not_deployed", "http_status": 404, "error_code": None})
         self.assertEqual(self.run_step(self.mint(), self.endpoint(), url=""), {"status": "not_deployed"})
         gw._AGENT_ACCESS.update(token="", until=0.0)
         self.assertEqual(self.run_step(self.mint({"access_token": "a"}), self.endpoint(self.http(404))),
-                         {"status": "not_deployed"})
+                         {"status": "not_deployed", "http_status": 404, "error_code": None})
+        # A body that cannot be read (the response already closed) is still a skip, with no code.
+        closed = self.http(404)
+        closed.fp.close()
+        self.assertEqual(self.run_step(self.mint(), self.endpoint(closed)),
+                         {"status": "not_deployed", "http_status": 404, "error_code": None})
         self.assertEqual(self.run_step(self.mint(), self.endpoint(self.tool_error("NOT_FOUND"))),
                          {"status": "not_deployed"})
         gw._AGENT_ACCESS.update(token="", until=0.0)

@@ -1116,6 +1116,8 @@ only summary and `last_reported_at`, never phase or blockers. It never uses
 
 An HTTP 404 means the Action is not deployed: log it and skip, leaving the row
 eligible for a later rate-limited retry. Other failures are logged and contained.
+HTTP failures include their status and a sanitized structured error code (or
+`unavailable`); response bodies, exception messages and credentials are never logged.
 Keep the switch off until the Action is live and a live owner-ledger witness has
 been captured. Enabling it does not authorize a bridge restart.
 
