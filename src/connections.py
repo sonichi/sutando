@@ -469,31 +469,16 @@ def _inst_var(instance: str) -> str:
     return instance.upper().replace("-", "_")
 
 
-# A desktop sign-in lane is its server name escaped: `_d` '.', `_h` '-', `_u` '_' (`s_dspace`).
-_LANE_ESCAPE_RE = re.compile(r"_([dhu])")
-_LANE_ESCAPES = {"d": ".", "h": "-", "u": "_"}
-
-
 def channel_dir_for(instance: str, environ: Optional[Mapping[str, str]] = None) -> str:
     """`<instance>-ag2space`, unless `REMOTE_TASK_CHANNEL_DIR_<INST>` names another directory."""
     environ = os.environ if environ is None else environ
     return environ.get("REMOTE_TASK_CHANNEL_DIR_" + _inst_var(instance), "") or f"{instance}-ag2space"
 
 
-def _is_active_desktop_lane(instance: str) -> bool:
-    try:
-        from gateway_serving import active_lane
-        return bool(instance) and active_lane() == instance
-    except Exception:  # noqa: BLE001 - no lane record is no desktop lane
-        return False
-
-
 def lane_channel_dir(instance: str, environ: Optional[Mapping[str, str]] = None,
                      launch_file: Optional[Path] = None) -> str:
     """Where `instance`'s channel env lives: `REMOTE_TASK_CHANNEL_DIR_<INST>` from the environment,
-    then from the launch-key file (`launch_file`, default the resolver's); else, for the desktop's
-    active sign-in lane, its decoded server name (`s_dspace` -> `s.space`, the dir the desktop
-    writes); else `channel_dir_for`."""
+    then from the launch-key file (`launch_file`, default the resolver's); else `channel_dir_for`."""
     environ = os.environ if environ is None else environ
     var = "REMOTE_TASK_CHANNEL_DIR_" + _inst_var(instance)
     if launch_file is not None:
@@ -501,12 +486,7 @@ def lane_channel_dir(instance: str, environ: Optional[Mapping[str, str]] = None,
         from_file = (token_from_env_file(var, launch_file) or "").strip()
     else:
         from_file = _launch_file_value(var)
-    named = environ.get(var) or from_file
-    if named:
-        return named
-    if _LANE_ESCAPE_RE.search(instance) and _is_active_desktop_lane(instance):
-        return _LANE_ESCAPE_RE.sub(lambda m: _LANE_ESCAPES[m.group(1)], instance)
-    return channel_dir_for(instance, environ)
+    return environ.get(var) or from_file or channel_dir_for(instance, environ)
 
 
 # ── preview: who is this token, according to its gateway ─────────────────────
