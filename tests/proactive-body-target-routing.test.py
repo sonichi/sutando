@@ -57,9 +57,12 @@ def source_checks() -> None:
     for name, channel in (("slack-bridge.py", "slack"),
                           ("telegram-bridge.py", "telegram")):
         src = (REPO / "src" / name).read_text(encoding="utf-8")
-        check(f'body_claimable_by(peek, "{channel}")' in src,
+        gate = ("should_claim_proactive_peeked" if channel == "telegram"
+                else "body_claimable_by")
+        check(f'{gate}(peek, "{channel}")' in src or f"{gate}(\n" in src
+              or f"{gate}(f.name, peek" in src,
               f"5) {name} delegates its peek to proactive_routing")
-        check("from proactive_routing import" in src and "body_claimable_by" in src,
+        check("from proactive_routing import" in src and gate in src,
               f"5) {name} imports it")
         check(not private.search(src),
               f"5) no private Discord-only body grammar survives in {name}")

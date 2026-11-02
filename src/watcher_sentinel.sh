@@ -24,6 +24,41 @@
 # file (health-check.py, services_status.py, and the tests), so a richer token
 # would convert this bug into a different false "watcher is broken" signal.
 
+# --- naming ------------------------------------------------------------------
+# The stem only. The per-instance SUFFIX is not computed here: src/util_paths.py
+# owns it and delegates to src/runtime-api/instance_key.py, so a shell mirror
+# would be a second implementation of one contract.
+WATCHER_SENTINEL_STEM="watch-tasks-stream"
+
+# The sentinel THIS process writes. $1 = state dir. Asks the Python owner, which
+# reads SUTANDO_INSTANCE_ID and the enrolled actor exactly as the run dir does.
+# A failure is fatal: guessing a path here is how two instances share one file.
+sentinel_path_for() {
+  local state_dir="$1" here out
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local py
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "resolve the watcher sentinel")" || return 1
+  if ! out="$("$py" "$here/util_paths.py" watcher-sentinel "$state_dir")"; then
+    echo "watcher_sentinel: could not resolve the sentinel path" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# Every sentinel present, historic name first, one per line. A caller that asks
+# about one file has asked about one watcher; on a pool host the others are
+# equally real.
+sentinel_paths_in() {
+  local state_dir="$1" p
+  [ -f "$state_dir/$WATCHER_SENTINEL_STEM.pid" ] && printf '%s/%s.pid\n' "$state_dir" "$WATCHER_SENTINEL_STEM"
+  for p in "$state_dir/$WATCHER_SENTINEL_STEM"-*.pid; do
+    [ -f "$p" ] && printf '%s\n' "$p"
+  done
+  return 0
+}
+
 # Seconds of elapsed time for a pid, or empty when it cannot be determined.
 # `etime` is [[DD-]HH:]MM:SS on both BSD and GNU ps.
 sentinel_pid_elapsed() {
@@ -79,6 +114,41 @@ sentinel_pid_wrote_file() {
   if [ "$(( elapsed + slack ))" -lt "$age" ]; then
     return 1
   fi
+  return 0
+}
+
+# True when <pid_file> names a live task watcher other than <self>; an undecidable
+# pid counts as one, so a standby never takes the readiness a session watcher needs.
+# True when <inbox> is its workspace's own: <workspace>/tasks or a delivery folder under it (both resolved).
+inbox_in_workspace() {
+  local inbox ws
+  inbox="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  ws="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
+  case "$inbox/" in "$ws/tasks/"|"$ws/deliveries/"?*) return 0 ;; esac
+  return 1
+}
+
+# True when <pid_file> names a live watcher that is provably NOT serving <inbox> (a predecessor on the
+# same inbox is a replacement, not an intruder); an unreadable process table proves nothing.
+sentinel_held_by_other_inbox() {
+  local pid_file="$1" self="$2" inbox="$3" py="$4" holder here holders
+  sentinel_held_by_other_watcher "$pid_file" "$self" "$py" || return 1
+  holder="$(tr -d '[:space:]' 2>/dev/null < "$pid_file")"
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  holders="$("$py" "$here/watcher_identity.py" inbox-holders --inbox "$inbox" 2>/dev/null)" || return 1
+  [ "$holders" != "unobserved" ] || return 1
+  ! printf '%s\n' "$holders" | awk '{print $1}' | grep -qx "$holder"
+}
+
+sentinel_held_by_other_watcher() {
+  local pid_file="$1" self="$2" py="$3" holder here verdict
+  holder="$(tr -d '[:space:]' 2>/dev/null < "$pid_file")"
+  case "$holder" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$holder" != "$self" ] || return 1
+  kill -0 "$holder" 2>/dev/null || return 1
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  verdict="$("$py" "$here/watcher_identity.py" "$holder" 2>/dev/null | head -1)"
+  case "$verdict" in not-watcher|dead) return 1 ;; esac
   return 0
 }
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · read — pull recent room/channel history for an agent.
 
 A synchronous pull-on-demand read, orthogonal to the task file bridge. Gateway-only
@@ -43,12 +45,14 @@ def _windows(start, cap):
     return out
 
 
-def _result(ok, messages=None, reason=None, room_id=None, complete=None):
+def _result(ok, messages=None, reason=None, room_id=None, complete=None, order="newest_first"):
     # `complete` is False when the raw-event window was still growing when we stopped, so a
     # caller can tell "this room is quiet" from "I did not look far enough". None on error
     # paths, where the question does not arise.
+    # `order` is in-band because the default is newest-first, so `tail` returns the OLDEST
+    # rows and a caller reads a prefix of history as the present.
     return {"ok": bool(ok), "room_id": room_id, "reason": reason, "messages": messages or [],
-            "complete": complete}
+            "complete": complete, "order": order}
 
 
 _REDACTOR = None
@@ -102,6 +106,21 @@ def _redactor():
     return _REDACTOR
 
 
+def _relation(m):
+    """(in_reply_to, thread_root) event ids the gateway item carries, flat or Matrix-nested."""
+    rel = m.get("relates_to") or m.get("m.relates_to")
+    if not isinstance(rel, dict):
+        content = m.get("content")
+        rel = content.get("m.relates_to") if isinstance(content, dict) else None
+    rel = rel if isinstance(rel, dict) else {}
+    nested = rel.get("m.in_reply_to")
+    reply = (m.get("in_reply_to") or m.get("reply_to")
+             or (nested.get("event_id") if isinstance(nested, dict) else None))
+    thread = m.get("thread_root") or (rel.get("event_id") if rel.get("rel_type") == "m.thread" else None)
+    return (reply if isinstance(reply, str) and reply else None,
+            thread if isinstance(thread, str) and thread else None)
+
+
 def _normalize(items):
     out = []
     redact = _redactor()
@@ -119,19 +138,28 @@ def _normalize(items):
             "reactions": m.get("reactions") or [],
         }
         # `fetch` needs media_ref as its handle, so dropping it leaves an attachment
-        # visible but unfetchable. Set only when present, keeping the shape additive.
-        ref = m.get("media_ref")
+        # visible but unfetchable. The broker names it `mxc`; both are accepted.
+        ref = m.get("media_ref") or m.get("mxc")
         if ref:
             norm["media_ref"] = ref
             # Also conditional: the gateway is an external producer, so a media event
-            # arriving without msgtype must not grow an explicit null either.
+            # arriving without msgtype or mimetype must not grow an explicit null either.
             if (mt := m.get("msgtype")):
                 norm["msgtype"] = mt
+            if (mime := m.get("mimetype")):
+                norm["mimetype"] = mime
+        # Conditional like media_ref: a reader binding a reply to its question needs these.
+        reply, thread = _relation(m)
+        if reply:
+            norm["in_reply_to"] = reply
+        if thread:
+            norm["thread_root"] = thread
         out.append(norm)
     return out
 
 
-def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, before=None):
+def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, before=None,
+              oldest_first=False):
     """Pull up to `limit` recent messages from `room_id` via the gateway verb."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
@@ -143,7 +171,7 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, reason=f"client gate denied for {agent_mxid}", room_id=room_id)
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, reason="no gateway configured", room_id=room_id)
     # `limit` here means MESSAGES, but the gateway applies its limit to RAW TIMELINE
@@ -207,5 +235,10 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     # nothing more, because from here those two cases are indistinguishable. A caller that
     # sees complete=False knows only "do not treat this as the whole story", which is the
     # safe direction for a function whose failure mode is a confident empty.
-    return _result(True, messages[:limit], room_id=room_id,
-                   complete=len(messages) >= limit)
+    # Still the NEWEST `limit` messages either way — `oldest_first` reverses only the
+    # rendering, so `| tail` shows the latest instead of the oldest.
+    kept = messages[:limit]
+    if oldest_first:
+        kept = list(reversed(kept))
+    return _result(True, kept, room_id=room_id, complete=len(messages) >= limit,
+                   order="oldest_first" if oldest_first else "newest_first")

@@ -5,7 +5,9 @@ Every case here is a store that existed on a real host on 2026-08-28 and
 broke a prior revision: wrapped {quick_lookup:}, flat {people:}, MALFORMED
 yaml, roster-only, and a multi-host merge leaving one person under two keys.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -67,6 +69,35 @@ class StoreShapes(unittest.TestCase):
                       roster=ROSTER)
             q, _ = lk.load(d)          # must not raise
             self.assertEqual(q, {})
+            rows = lk.load_roster(d)
+            hits = lk.match(rows, "john-the-dev")
+            self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
+
+    def test_missing_pyyaml_degrades_to_roster(self):
+        # Each store has its OWN import, so a fixture writing one leaves the other
+        # unpinned; both warnings are asserted so neither degradation goes silent.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n    - id: present\n", roster=ROSTER)
+            (d / "entities.yaml").write_text("entities:\n  - entity_id: present\n")
+            saved = sys.modules.get("yaml", "absent")
+            sys.modules["yaml"] = None      # makes `import yaml` raise ImportError
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    q, ents = lk.load(d)    # must not raise
+            finally:
+                if saved == "absent":
+                    del sys.modules["yaml"]
+                else:
+                    sys.modules["yaml"] = saved
+            self.assertEqual(q, {})
+            self.assertEqual(ents, [])
+            warned = err.getvalue()
+            # Count, not substring: the quick-lookup warning does not name its file,
+            # so the entities one alone satisfies any shared-phrase assertion.
+            self.assertEqual(warned.count("PyYAML missing"), 2, warned)
+            self.assertIn("using roster only", warned, warned)
+            self.assertIn("entities.yaml", warned, warned)
             rows = lk.load_roster(d)
             hits = lk.match(rows, "john-the-dev")
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
@@ -203,6 +234,53 @@ class StoreShapes(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             d = store(t, roster=ROSTER)
             self.assertEqual(lk.match(lk.load_roster(d), "no-such-login"), [])
+
+    def test_listing_names_an_id_who_row_instead_of_a_blank_column(self):
+        """--all must not render a row that match() can find as nameless.
+
+        The renderer read only `entity_id`; a real host's quick-lookup.yaml
+        keys people as `id`, so four rows listed as blank names against a
+        populated Stand column.
+        """
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n  - id: 'gh:qingyun-wu'\n"
+                         "    who: 'reviewer on the server-PR stack'\n")
+            orig_store, orig_argv = lk.store, sys.argv
+            lk.store, sys.argv = (lambda: d), ["lookup.py", "--all"]
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+        body = [l for l in buf.getvalue().splitlines()
+                if l.startswith("  ") and "updated_at" not in l]
+        self.assertEqual(len(body), 1, buf.getvalue())
+        self.assertIn("gh:qingyun-wu", body[0])
+
+    def test_a_query_renders_the_name_and_role_of_an_id_who_row(self):
+        """The per-query detail path had the same blind spot as --all: it read
+        entity_id/one_line, so a matched quick-lookup row printed a blank name
+        above a blank role — on the one surface used to decide who to address.
+        """
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n  - id: 'gh:qingyun-wu'\n"
+                         "    who: 'reviewer on the server-PR stack'\n")
+            orig_store, orig_argv = lk.store, sys.argv
+            lk.store, sys.argv = (lambda: d), ["lookup.py", "gh:qingyun-wu"]
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+        out = buf.getvalue()
+        self.assertIn("gh:qingyun-wu", out, out)
+        self.assertIn("reviewer on the server-PR stack", out, out)
 
 
 if __name__ == "__main__":

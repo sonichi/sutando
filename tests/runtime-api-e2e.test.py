@@ -25,6 +25,11 @@ Run: python3 tests/runtime-api-e2e.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -87,16 +92,40 @@ def start_daemon():
     return proc
 
 
+class _HitlStoreView:
+    """The owner-side view of the daemon's HITL store, in the record shape the
+    older ActionStore returned, so the scenario reads as the owner sees it."""
+
+    def __init__(self, ha_dir):
+        sys.path.insert(0, str(REPO / "src"))
+        sys.path.insert(0, str(REPO / "src" / "runtime-api"))
+        from hitl.manager import HitlManager, HitlStore  # noqa: E402
+        from ha_adapter import HumanActionAdapter  # noqa: E402
+        self.adapter = HumanActionAdapter(str(ha_dir))
+        self.manager = self.adapter.manager
+
+    def get(self, aid):
+        req = self.manager.get(aid)
+        if req is None:
+            return None
+        subj = req.subject or {}
+        return {"action_id": req.id, "status": req.status,
+                "card_event_id": self.manager.projection_target(req.id),
+                "questions": [{"question": req.message,
+                               "options": [{"label": a.label} for a in req.actions],
+                               "multiSelect": bool(subj.get("multi_select"))}]}
+
+    def resolve(self, aid, answers, by):
+        self.adapter.resolve(aid, answers, by)
+        return True
+
+
 def ha_store():
-    spec = importlib.util.spec_from_file_location(
-        "ha", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "human_action.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.ActionStore(ENV["SUTANDO_HA_DIR"])
+    return _HitlStoreView(ENV["SUTANDO_HA_DIR"])
 
 
 def pending_action_for(request_id, store, timeout=5):
-    aid = "ha_" + request_id.split("-", 1)[-1][:24]
+    aid = "hitl_" + request_id.split("-", 1)[-1][:24]
     deadline = time.time() + timeout
     while time.time() < deadline:
         rec = store.get(aid)
@@ -136,7 +165,7 @@ threading.Thread(target=_gw_srv.serve_forever, daemon=True).start()
 GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
 
 TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
-ENV = {**os.environ,
+ENV = {**isolated_child_env(),
        # instance lock + run dir must not collide with a live daemon's default
        "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
@@ -170,9 +199,9 @@ def main() -> int:
         # `answer <action_id> N` and _ANSWER_RE only matches ha_ + HEX. A
         # non-hex id silently strands the card (live finding 2026-07-26).
         import re as _re
-        _answer_re = _re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9])")
-        check(act is not None and _answer_re.search(f"answer {act['action_id']} 1") is not None,
-              "ha action id matches DecisionHandler's answer grammar (hex-only)")
+        _id_re = _re.compile(r"^hitl_[A-Za-z0-9_-]+$")
+        check(act is not None and _id_re.match(act["action_id"]) is not None,
+              "requirement id matches the HITL store id contract")
         check(act is not None and act["status"] == "pending"
               and not act.get("card_event_id")
               and "Approve" in json.dumps(act["questions"]),
@@ -316,7 +345,7 @@ def main() -> int:
                   "--resource", '{"roomId":"!room:example.org"}',
                   "--input", '{"body":"benign approved body"}')
         actbi = pending_action_for(rbi["requestId"], store)
-        card_bi = json.loads((Path(ENV["SUTANDO_HA_DIR"]) / (actbi["action_id"] + ".json")).read_text())
+        card_bi = store.get(actbi["action_id"])
         check('"body": "benign approved body"' in card_bi["questions"][0]["question"]
               or 'benign approved body' in card_bi["questions"][0]["question"],
               "approval card SHOWS the governed input (the body the owner approves)")

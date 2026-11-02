@@ -22,7 +22,7 @@ from typing import Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).parent))
 from local_task_protocol import find_archived_task, parse_task_headers  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
+from task_archive import find_task_file, task_id_for  # noqa: E402
 
 # Transports that own their own delivery loop. Their ids can coincidentally
 # satisfy another transport's shape, so exclude by declared source first.
@@ -80,7 +80,7 @@ def orphan_result_routes(
             task_file = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
         except OSError:
             continue
-        if task_file is None:
+        if task_file is None or task_id_for(task_file) != task_id:
             continue
         try:
             headers = parse_task_headers(task_file.read_text(encoding="utf-8"))

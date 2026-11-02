@@ -12,8 +12,8 @@ from datetime import datetime
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from task_archive import (archive_file, declared_task_id, find_task_file,
-                          task_id_for, task_id_from_filename)
+from task_archive import (archive_file, archive_id_from_filename, declared_task_id,
+                          find_task_file, task_id_for, task_id_from_filename)
 import task_archive as _task_archive  # noqa: E402
 
 
@@ -107,17 +107,45 @@ class TestArchiveNeverOverwrites(unittest.TestCase):
                         "the bytes must survive somewhere in the live queue")
 
     def test_quarantine_does_not_clobber_an_earlier_quarantine(self) -> None:
-        self.tasks_dir.mkdir()
-        os.chmod(self.tasks_dir, 0o500)
-        self.addCleanup(os.chmod, self.tasks_dir, 0o700)
         (self.live / "task-z.txt.archive-failed").write_text("FIRST")
         src = self.live / "task-z.txt"
         src.write_text("SECOND")
 
-        self.assertTrue(self._archive(src, "task-z"))
+        real_move = _task_archive._move_without_clobbering
+
+        def fail_primary_move(source, destination):
+            if Path(destination).parent == self.tasks_dir / self.month:
+                raise PermissionError("archive unavailable")
+            return real_move(source, destination)
+
+        with mock.patch.object(
+                _task_archive, "_move_without_clobbering",
+                side_effect=fail_primary_move):
+            self.assertTrue(self._archive(src, "task-z"))
         self.assertEqual((self.live / "task-z.txt.archive-failed").read_text(), "FIRST")
         self.assertEqual((self.live / "task-z.txt.archive-failed.1").read_text(), "SECOND")
         self.assertFalse(src.exists())
+
+
+class TestArchiveIdFromFilename(unittest.TestCase):
+    def test_task_names_use_the_anchored_grammar(self) -> None:
+        self.assertEqual(archive_id_from_filename("task-a.txt"), "task-a")
+        self.assertEqual(
+            archive_id_from_filename("task-a.claimed-core-3.txt"), "task-a")
+
+    def test_historic_prefixes_strip_the_plain_suffix(self) -> None:
+        self.assertEqual(archive_id_from_filename("ask-9.txt"), "ask-9")
+        self.assertEqual(archive_id_from_filename("sc-ask-9.txt.2"), "sc-ask-9")
+        self.assertEqual(
+            archive_id_from_filename("reco-skill-x.txt.archive-failed"),
+            "reco-skill-x")
+
+    def test_a_name_carrying_no_structural_txt_is_not_a_filename(self) -> None:
+        # One derivation, one null contract: a bare id is not a filename, so it
+        # is None here rather than passing through a second, laxer parser.
+        self.assertIsNone(archive_id_from_filename("ask-1.2"))
+        self.assertIsNone(archive_id_from_filename("task-1788443871192.txt.sending"))
+        self.assertIsNone(archive_id_from_filename(""))
 
 
 class TestFindTaskFile(unittest.TestCase):
@@ -537,6 +565,31 @@ class BareNameIsNotAnIdentity(unittest.TestCase):
         owned.write_text("id: task-c.claimed-core-1\ntask: go\n")
         self.assertEqual(find_task_file(self.tasks, "task-c.claimed-core-1"), owned)
 
+
+class TrailingTxtIsTerminal(unittest.TestCase):
+    """A name ending in .txt is an ordinary record whose id may contain dots,
+    even `.txt.archive-failed`; only a name ending in .archive-failed* is a
+    quarantine file (that suffix is appended to the whole filename)."""
+
+    def test_dotted_id_containing_archive_failed_survives(self):
+        self.assertEqual(task_id_from_filename("task-current.txt.archive-failed-review.txt"),
+                         "task-current.txt.archive-failed-review")
+        self.assertEqual(archive_id_from_filename("reco-skill-x.txt.archive-failed-r.txt"),
+                         "reco-skill-x.txt.archive-failed-r")
+
+    def test_real_quarantine_names_still_reduce(self):
+        for name in ("task-current.txt.archive-failed", "task-current.txt.archive-failed.1",
+                     "task-current.txt.archive-failed-review"):
+            self.assertEqual(task_id_from_filename(name), "task-current", name)
+        self.assertEqual(archive_id_from_filename("reco-skill-x.txt.archive-failed"), "reco-skill-x")
+
+    def test_dotted_terminal_record_round_trips_through_find_task_file(self):
+        d = Path(tempfile.mkdtemp())
+        tid = "task-current.txt.archive-failed-review"
+        (d / f"{tid}.txt").write_text(f"id: {tid}\n")
+        found = find_task_file(d, tid)
+        self.assertEqual(found, d / f"{tid}.txt")
+        self.assertEqual(task_id_from_filename(found.name), tid)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

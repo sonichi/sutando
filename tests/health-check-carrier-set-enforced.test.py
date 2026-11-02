@@ -22,6 +22,12 @@ probe reports them separately:
 Run: python3 tests/health-check-carrier-set-enforced.test.py
 """
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -44,6 +50,22 @@ def _load():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def _stdin_payload(kw: dict) -> str:
+    """The paths a stubbed `subprocess.run` was handed on stdin.
+
+    The probe feeds `check-ignore --stdin` from a file, not `input=` (see
+    health-check-git-stdin-no-pipe.test.py); peek without consuming it.
+    """
+    f = kw.get("stdin")
+    if f is None:
+        return kw.get("input") or ""
+    pos = f.tell()
+    try:
+        return f.read().decode("utf-8", "ignore")
+    finally:
+        f.seek(pos)
 
 
 def _mkworkspace(tmp: Path, carrier_lines: list[str], files: list[str],
@@ -552,7 +574,7 @@ class CarrierSetProbe(unittest.TestCase):
             # representative), not argv — so key on the input. Keying on argv
             # silently stopped matching when the instrument changed, and the test
             # passed by never firing its own stub.
-            if "hosts/b" in (kw.get("input") or ""):
+            if "hosts/b" in _stdin_payload(kw):
                 raise self.hc.subprocess.SubprocessError("probe failed on host b")
             return real(argv, *a, **kw)
 
@@ -726,7 +748,7 @@ class CarrierSetProbe(unittest.TestCase):
             # changed and this test kept passing, because `data/` is dropped for
             # an ordinary reason anyway — vacuous, and silently so. `fired` is
             # asserted below so it can never go vacuous quietly again.
-            if "data" in (kw.get("input") or ""):
+            if "data" in _stdin_payload(kw):
                 fired.append(1)
                 raise self.hc.subprocess.SubprocessError("timed out")
             return real(argv, *a, **kw)
@@ -768,7 +790,7 @@ class CarrierSetProbe(unittest.TestCase):
         fired = []
 
         def odd_exit(argv, *a, **kw):
-            if "data" in (kw.get("input") or ""):
+            if "data" in _stdin_payload(kw):
                 fired.append(1)
                 return _Odd()
             return real(argv, *a, **kw)

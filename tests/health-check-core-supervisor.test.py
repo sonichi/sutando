@@ -11,10 +11,16 @@ Run: python3 tests/health-check-core-supervisor.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
 import pathlib
+from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
@@ -48,9 +54,20 @@ class TestCheckCoreSupervisor(unittest.TestCase):
             self.assertEqual(r["status"], "ok")
             self.assertEqual(r["name"], "core-supervisor")
 
-    def test_malformed_is_ok(self):
+    def test_malformed_warns_it_can_hide_a_blocker(self):
+        # A present-but-corrupt signal is a fault, not "not yet written": a short
+        # write over a longer one stays corrupt until the state changes (2026-09-11).
         with tempfile.TemporaryDirectory() as td:
-            self.assertEqual(self._run(td, "{not json")["status"], "ok")
+            r = self._run(td, "{not json")
+            self.assertEqual(r["status"], "warn")
+            self.assertIn("unreadable", r["detail"])
+            self.assertIn("can't be ruled out", r["detail"])
+
+    def test_wrong_shape_warns(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self._run(td, "[1, 2, 3]")
+            self.assertEqual(r["status"], "warn")
+            self.assertIn("expected an object, got list", r["detail"])
 
     def test_blocked_human_warns_needs_you_with_prompt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -121,6 +138,38 @@ class TestCheckCoreSupervisor(unittest.TestCase):
                     self.assertTrue(hc._default_core_restart())
                 self.assertNotIn("SUTANDO_CORE_MODEL", captured,
                                  f"{runtime}: recovery restart must not pin a model")
+
+
+class PaneSendFenceTests(unittest.TestCase):
+    def test_missing_guard_and_active_sender_are_healthy_but_uncertainty_is_an_issue(self):
+        import tmux_pane_keys
+        with tempfile.TemporaryDirectory() as td:
+            sock = str(Path(td) / "core.sock")
+            with mock.patch.object(hc, "_local_core_socket", return_value=sock):
+                self.assertEqual(hc.check_pane_key_fence()["status"], "ok")
+                with tmux_pane_keys.prepare_guard(sock).open("ab") as stream:
+                    self.assertEqual(tmux_pane_keys.acquire_guard(sock, stream.fileno()), 0)
+                    self.assertEqual(hc.check_pane_key_fence()["detail"], "busy")
+                    with tempfile.TemporaryDirectory(prefix="tmux-pane-keys.") as work:
+                        ticket = Path(work) / "ticket"
+                        tmux_pane_keys.begin_guard(sock, ticket)
+                        ticket.rename(ticket.with_suffix(".claimed"))
+                        self.assertEqual(tmux_pane_keys.finish_guard(sock), 125)
+                report = hc.check_pane_key_fence()
+                self.assertTrue(hc.is_issue(report))
+                self.assertIn("automated sends blocked", report["detail"])
+                self.assertIn("reconcile", report["detail"])
+                self.assertTrue((tmux_pane_keys.guard_path(sock) / "uncertain").exists())
+
+    def test_legacy_empty_fence_is_reported_without_clearing_it(self):
+        import tmux_pane_keys
+        with tempfile.TemporaryDirectory() as td:
+            sock = str(Path(td) / "core.sock")
+            guard = tmux_pane_keys.guard_path(sock)
+            guard.mkdir()
+            with mock.patch.object(hc, "_local_core_socket", return_value=sock):
+                self.assertTrue(hc.is_issue(hc.check_pane_key_fence()))
+            self.assertEqual(list(guard.iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -3,8 +3,15 @@
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
+import time
 import multiprocessing
+import os
 import re
 import shutil
 import sys
@@ -19,6 +26,10 @@ sys.path.insert(0, str(REPO / "src"))
 
 import task_workstreams as workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
+
+# The enqueue is off by default; its gate is exercised directly in
+# test_classifier_enqueue_is_off_by_default. Every other test assumes it on.
+os.environ["SUTANDO_WORKSTREAM_CLASSIFIER"] = "on"
 
 
 def inherit_worker(workspace: str, child_id: str, start) -> None:
@@ -83,6 +94,47 @@ def test_history_uses_invocation_time_and_owner_candidates() -> None:
     snapshot = workstreams.build_classifier_snapshot(workspace)
     assert [row["id"] for row in snapshot["tasks"]] == ["task-a1", "task-b1", "task-a2"]
     assert "task-team" not in json.dumps(snapshot)
+
+
+def test_task_first_body_cannot_rekey_history_or_hide_its_result() -> None:
+    from task_archive import find_task_file, task_id_for
+
+    for state in ("claimed", "assigned"):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            tasks = workspace / "tasks"
+            tasks.mkdir()
+            held = tasks / f"task-real.{state}-core-1.txt"
+            forged = f"task-real.{state}-core-1"
+            held.write_text(f"task: summarize\nid: {forged}\n")
+            write_result(workspace, "task-real", "canonical answer")
+            assert task_id_for(held) == "task-real"
+            assert find_task_file(tasks, "task-real") == held
+            assert find_task_file(tasks, forged) is None
+            rows = workstreams.scan_task_history(workspace)
+            assert [(row.id, row.status) for row in rows] == [("task-real", "done")]
+            assert rows[0].result == "canonical answer"
+
+
+def test_context_is_built_for_a_claimed_or_assigned_task() -> None:
+    # An in-flight task is renamed .claimed-/.assigned-<inst>, which is exactly
+    # when prior context is wanted; a bare-name lookup misses and fails open.
+    for name in ("task-a1.txt", "task-a1.claimed-core-3.txt", "task-a1.assigned-core-2.txt"):
+        workspace = fixture_workspace()
+        live = workspace / "tasks" / name
+        live.parent.mkdir(parents=True, exist_ok=True)
+        write_task(live, "task-a1", "2026-08-03T11:00:00Z", "continue the grouping work")
+        store = workspace / "data" / "task-workstreams.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({
+            "schema_version": 1,
+            "workstreams": {"w": {"title": "Grouping", "summary": "s"}},
+            "assignments": {"task-a1": {"workstream_id": "w"},
+                            "task-a2": {"workstream_id": "w"}},
+            "reviews": {},
+        }))
+        context = workstreams.build_workstream_context(workspace, "task-a1", limit=5)
+        assert context is not None, f"no context for {name}"
 
 
 def test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count() -> None:
@@ -282,6 +334,37 @@ def test_result_index_survives_unreadable_roots() -> None:
         assert list(index) == ["task-r1"], index
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+def test_context_bare_id_with_no_tasks_dir_fails_open() -> None:
+    # No tasks/ at all: the bare-id resolver must answer None, not raise.
+    workspace = fixture_workspace()
+    tasks = workspace / "tasks"
+    shutil.rmtree(tasks, ignore_errors=True)
+    assert workstreams._unique_task_file(tasks, "task-a1") is None
+    assert workstreams.build_workstream_context(workspace, "task-a1") is None
+
+
+def test_context_refuses_a_task_path_that_is_missing_or_carries_another_id() -> None:
+    # task_path is the authorization read: a path that does not exist, or one
+    # whose filename resolves to a different id, yields no context at all.
+    workspace = fixture_workspace()
+    live = workspace / "tasks" / "task-a1.claimed-core-1.txt"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    write_task(live, "task-a1", "2026-08-03T11:00:00Z", "continue the grouping work")
+    store = workspace / "data" / "task-workstreams.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({
+        "schema_version": 1,
+        "workstreams": {"w": {"title": "Grouping", "summary": "s"}},
+        "assignments": {"task-a1": {"workstream_id": "w"},
+                        "task-a2": {"workstream_id": "w"}},
+        "reviews": {},
+    }))
+    assert workstreams.build_workstream_context(
+        workspace, "task-a1", task_path=live) is not None
+    assert workstreams.build_workstream_context(
+        workspace, "task-a1", task_path=workspace / "tasks" / "task-a1.txt") is None
+    assert workstreams.build_workstream_context(
+        workspace, "task-zz", task_path=live) is None
 
 
 def test_loader_parser_and_history_fail_open_edges() -> None:
@@ -539,12 +622,44 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         settled = workstreams.maybe_enqueue_classifier_task(workspace)
     assert not settled.pending and not settled.enqueued and settled.reason == "complete"
 
+
+def test_classifier_enqueue_is_off_by_default() -> None:
+    workspace = fixture_workspace()
+    # Unset: the gate refuses before any work; nothing is queued.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": ""}):
+        off = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert not off.pending and not off.enqueued and off.reason == "disabled"
+    assert not list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+    # A truthy value re-enables it; the same ready workspace now queues one.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": "on"}):
+        on = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert on.pending and on.enqueued and on.reason == "enqueued"
+    assert list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+
+    # The cooldown is measured from a COMPLETION; an inflight run does not cool.
+    workstreams.mark_classifier_complete(workspace, on.snapshot_hash)
     write_task(
         workspace / "tasks" / "archive" / "2026-08" / "task-new.txt",
         "task-new",
         "2026-08-03T13:00:00Z",
         "a newly archived task",
     )
+    # A fresh completion absorbs source churn without rescanning; only once the
+    # cooldown has lapsed does the new task re-open the gate.
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=AssertionError("cooling-down must not scan history"),
+    ):
+        cooled = workstreams.classifier_status(workspace)
+    assert not cooled.pending and not cooled.enqueued
+    assert cooled.reason == "cooling-down"
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    # completed_at governs the cooldown; enqueued_at is its legacy fallback.
+    state["enqueued_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state["completed_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state_path.write_text(json.dumps(state))
     with mock.patch.object(
         workstreams,
         "scan_task_history",
@@ -590,6 +705,15 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         "workstreams": [],
     })
     reviewed = workstreams.classifier_status(manual)
+    # A just-applied inference is a fresh completion: the gate cools instead
+    # of rescanning — the churn-absorption that breaks the #3621 spin.
+    assert not reviewed.pending and reviewed.reason == "cooling-down"
+    manual_state_path = manual / "state" / "task-workstream-classifier.json"
+    manual_state = json.loads(manual_state_path.read_text())
+    manual_state["completed_at"] = (
+        time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1)
+    manual_state_path.write_text(json.dumps(manual_state))
+    reviewed = workstreams.classifier_status(manual)
     assert not reviewed.pending and reviewed.reason == "complete"
 
     other = fixture_workspace()
@@ -627,7 +751,7 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
     assert workstreams.classifier_status(active).reason == "active-user-task"
 
 
-def test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open() -> None:
+def test_classifier_source_directory_cache_is_portable_and_rejects_unsafe_entries() -> None:
     missing = Path(tempfile.mkdtemp()) / "missing-workspace"
     directories = workstreams._source_directories(
         missing,
@@ -635,12 +759,19 @@ def test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open() ->
             "source_directories": [
                 None,
                 "../outside",
+                r"C:\outside",
+                r"tasks\archive\2026-08",
+                r"results\archive\2026-08",
                 "results/archive-2026-08-03",
             ],
         },
         discover=True,
     )
     assert "../outside" not in directories
+    assert r"C:\outside" not in directories
+    assert "tasks/archive/2026-08" in directories
+    assert "results/archive/2026-08" in directories
+    assert all("\\" not in value for value in directories)
     assert "results/archive-2026-08-03" in directories
 
 
@@ -1040,6 +1171,69 @@ def test_workstream_context_index_fail_open_edges() -> None:
     assert stored["context_history"]["workstream-chain"][0]["id"] == "task-parent"
 
 
+def test_context_cli_accepts_a_live_pool_filename() -> None:
+    """task-notifier.sh passes the on-disk name; the pool renames it while held."""
+    import contextlib
+    import importlib.util
+    import io
+
+    workspace = fixture_workspace()
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{
+            "name": "Sutando task management",
+            "summary": "group related task history",
+            "confidence": 0.95,
+            "task_ids": ["task-a1", "task-a2"],
+        }],
+    })
+    script = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+    spec = importlib.util.spec_from_file_location("workstreams_cli", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    tasks = workspace / "tasks"
+    write_task(tasks / "task-current.txt", "task-current",
+               "2026-08-03T10:05:00Z", "continue workstream context")
+    assert workstreams.inherit_assignment(workspace, "task-current", "task-a1")
+
+    # Bare id is the control; the pathname arm is the regression control — an
+    # unreduced path is rejected for its separator and yields no context.
+    for argument in ("task-current", "task-current.txt",
+                     "task-current.claimed-core-3.txt",
+                     "task-current.assigned-core-2.txt",
+                     str(tasks / "task-current.claimed-core-3.txt")):
+        for stale in tasks.glob("task-current*"):
+            stale.unlink()
+        base = Path(argument).name
+        on_disk = base if base.endswith(".txt") else f"{base}.txt"
+        write_task(tasks / on_disk, "task-current",
+                   "2026-08-03T10:05:00Z", "continue workstream context")
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+            with contextlib.redirect_stdout(buffer):
+                code = cli.main(["context", argument])
+        assert code == 0, argument
+        payload = buffer.getvalue()
+        assert payload, f"no context for {argument}"
+        assert json.loads(payload)["current_task_id"] == "task-current", argument
+
+    # Historic non-task-* producer ids (the valid_archive_lookup_id contract):
+    # the filename must normalize even though the task-* grammar rejects it.
+    write_task(tasks / "ask-current.txt", "ask-current",
+               "2026-08-03T10:06:00Z", "continue historic-id context")
+    assert workstreams.inherit_assignment(workspace, "ask-current", "task-a1")
+    buffer = io.StringIO()
+    with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["context", "ask-current.txt"])
+    assert code == 0
+    payload = buffer.getvalue()
+    assert payload, "no context for ask-current.txt"
+    assert json.loads(payload)["current_task_id"] == "ask-current"
+
+
 def test_concurrent_inheritance_keeps_every_assignment() -> None:
     workspace = fixture_workspace()
     snapshot = workstreams.build_classifier_snapshot(workspace)
@@ -1051,7 +1245,9 @@ def test_concurrent_inheritance_keeps_every_assignment() -> None:
             "task_ids": ["task-a1"],
         }],
     })
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context(
+        "spawn" if sys.platform == "win32" else "fork"
+    )
     start = context.Event()
     children = [f"task-child-{index}" for index in range(8)]
     processes = [
@@ -1146,9 +1342,145 @@ def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
     assert store["workstreams"][reused_id]["title"] == "Sutando task management"
 
 
+
+def test_context_cli_authorizes_the_exact_file_not_a_same_id_sibling() -> None:
+    """A stale bare OWNER copy beside a claimed TEAM file must never lend the
+    team task the owner's history: the named file is the authorization read,
+    and a bare id with two live candidates yields no context at all."""
+    import contextlib
+    import importlib.util
+    import io
+
+    workspace = fixture_workspace()
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{
+            "name": "Sutando task management",
+            "summary": "group related task history",
+            "confidence": 0.95,
+            "task_ids": ["task-a1", "task-a2"],
+        }],
+    })
+    script = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+    spec = importlib.util.spec_from_file_location("workstreams_cli_exact", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    tasks = workspace / "tasks"
+    assert workstreams.inherit_assignment(workspace, "task-sensitive", "task-a1")
+
+    def run(argument: str) -> str:
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+            with contextlib.redirect_stdout(buffer):
+                assert cli.main(["context", argument]) == 0
+        return buffer.getvalue()
+
+    def write(name: str, tier: str) -> None:
+        write_task(tasks / name, "task-sensitive", "2026-08-03T10:05:00Z",
+                   "continue the sensitive work", tier=tier)
+
+    for stale in tasks.glob("task-sensitive*"):
+        stale.unlink()
+    write("task-sensitive.claimed-core-3.txt", "team")
+    assert run("task-sensitive.claimed-core-3.txt") == "", "team task alone must get no context"
+    assert run("task-sensitive") == ""
+
+    write("task-sensitive.txt", "owner")  # the stale sibling keweichen's probe added
+    assert run("task-sensitive.claimed-core-3.txt") == "", (
+        "the claimed team file was named; the owner sibling must not be read instead")
+    assert run("task-sensitive") == "", "two live candidates: ambiguous, no context"
+    assert run("task-sensitive.txt") != "", "control: naming the owner file builds context"
+
+    # Owner variant that SORTS FIRST: a first-candidate-wins resolver would
+    # read the owner file for the bare id; uniqueness is what refuses it.
+    (tasks / "task-sensitive.txt").rename(tasks / "task-sensitive.assigned-core-2.txt")
+    assert run("task-sensitive") == "", "two live candidates, owner first: still no context"
+    assert run("task-sensitive.claimed-core-3.txt") == ""
+    (tasks / "task-sensitive.assigned-core-2.txt").rename(tasks / "task-sensitive.txt")
+
+    (tasks / "task-sensitive.claimed-core-3.txt").unlink()
+    assert run("task-sensitive") != "", "control: a single owner candidate still resolves"
+    (tasks / "task-sensitive.txt").rename(tasks / "task-sensitive.claimed-core-3.txt")
+    assert run("task-sensitive") != "", "control: a single claimed owner file resolves"
+
+
+def test_context_cli_reads_the_named_file_and_fails_closed_when_it_is_absent() -> None:
+    """The id comes from the FILE, not from parsing its name: `task-a.claimed-review`
+    is a gateway id, and a quarantine keeps its dotted or claimed name. A named
+    file that is absent is still an exact request and must never fall back."""
+    import contextlib
+    import importlib.util
+    import io
+
+    workspace = fixture_workspace()
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{
+            "name": "Sutando task management",
+            "summary": "group related task history",
+            "confidence": 0.95,
+            "task_ids": ["task-a1", "task-a2"],
+        }],
+    })
+    script = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+    spec = importlib.util.spec_from_file_location("workstreams_cli_named", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    tasks = workspace / "tasks"
+
+    def run(argument: str) -> str:
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+            with contextlib.redirect_stdout(buffer):
+                assert cli.main(["context", argument]) == 0
+        return buffer.getvalue()
+
+    def built(argument: str, filename: str, task_id: str) -> None:
+        for stale in tasks.glob("task-*"):
+            if stale.is_file():
+                stale.unlink()
+        write_task(tasks / filename, task_id, "2026-08-03T10:05:00Z", "continue")
+        assert workstreams.inherit_assignment(workspace, task_id, "task-a1")
+        payload = run(argument)
+        assert payload, f"no context for {argument}"
+        assert json.loads(payload)["current_task_id"] == task_id, argument
+
+    # An ordinary pool claim canonicalizes; a gateway id that LOOKS claimed is
+    # its own task, and only the persisted `id:` tells the two apart.
+    built("task-c1.claimed-core-3.txt", "task-c1.claimed-core-3.txt", "task-c1")
+    built("task-a.claimed-review.txt", "task-a.claimed-review.txt", "task-a.claimed-review")
+    # Quarantines: the structural .txt is the rightmost one, so a dotted id and
+    # a claimed name both survive `archive_file`'s .archive-failed rename.
+    built("task-q.txt.archive-failed", "task-q.txt.archive-failed", "task-q")
+    built("task-a.txt.archive-failed-review.txt.archive-failed",
+          "task-a.txt.archive-failed-review.txt.archive-failed",
+          "task-a.txt.archive-failed-review")
+    built("task-c1.claimed-core-3.txt.archive-failed",
+          "task-c1.claimed-core-3.txt.archive-failed", "task-c1")
+
+    # A named claim that does not exist, beside the owner's bare file: the
+    # request is for that file, so it fails closed instead of reading the sibling.
+    for stale in tasks.glob("task-*"):
+        if stale.is_file():
+            stale.unlink()
+    write_task(tasks / "task-sensitive.txt", "task-sensitive",
+               "2026-08-03T10:05:00Z", "private owner work")
+    assert workstreams.inherit_assignment(workspace, "task-sensitive", "task-a1")
+    assert run("task-sensitive.claimed-core-3.txt") == "", (
+        "a named-but-absent claim must not resolve to the owner's bare file")
+    assert run("task-sensitive.txt") != "", "control: naming the file that exists builds context"
+    assert run("task-sensitive") != "", "control: a bare id still uses the unique-file resolver"
+    assert workstreams.resolve_context_request(
+        workspace, "task-sensitive.claimed-core-3.txt") == (None, None)
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
+        test_task_first_body_cannot_rekey_history_or_hide_its_result,
+        test_context_is_built_for_a_claimed_or_assigned_task,
         test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
         test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,
         test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one,
@@ -1156,6 +1488,8 @@ def main() -> None:
         test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine,
         test_history_derives_every_id_through_the_shared_path_to_id_owner,
         test_result_index_survives_unreadable_roots,
+        test_context_bare_id_with_no_tasks_dir_fails_open,
+        test_context_refuses_a_task_path_that_is_missing_or_carries_another_id,
         test_loader_parser_and_history_fail_open_edges,
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,
@@ -1163,9 +1497,10 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_enqueue_is_off_by_default,
         test_classifier_task_is_envelope_stamped,
         test_classifier_task_survives_a_raising_stamper,
-        test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
+        test_classifier_source_directory_cache_is_portable_and_rejects_unsafe_entries,
         test_stale_classifier_is_archived_before_replacement,
         test_stale_classifier_is_archived_under_its_pool_assigned_name,
         test_a_worker_held_classifier_claim_is_left_alone,
@@ -1177,6 +1512,9 @@ def main() -> None:
         test_workstream_context_has_a_total_serialized_byte_cap,
         test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
+        test_context_cli_accepts_a_live_pool_filename,
+        test_context_cli_authorizes_the_exact_file_not_a_same_id_sibling,
+        test_context_cli_reads_the_named_file_and_fails_closed_when_it_is_absent,
         test_concurrent_inheritance_keeps_every_assignment,
         test_reused_workstream_id_does_not_require_a_redundant_name,
     ]

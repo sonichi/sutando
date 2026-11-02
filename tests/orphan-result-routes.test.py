@@ -5,6 +5,11 @@ Run: python3 tests/orphan-result-routes.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import re
@@ -40,8 +45,8 @@ def snowflake_ok(value: str) -> bool:
 
 
 def task_text(channel_id: str | None = SNOWFLAKE, source: str = "news-radar",
-              body: str = "do the thing", task_id: str = "task-1") -> str:
-    lines = [f"id: {task_id}", f"source: {source}"]
+              body: str = "do the thing", task_id: str | None = None) -> str:
+    lines = ([f"id: {task_id}"] if task_id else []) + [f"source: {source}"]
     if channel_id is not None:
         lines.append(f"channel_id: {channel_id}")
     lines += ["access_tier: owner", f"task: {body}"]
@@ -78,6 +83,24 @@ class OrphanResultRoutesTest(unittest.TestCase):
     def test_declared_route_is_recovered(self):
         tid = self._result()
         (self.tasks / f"{tid}.txt").write_text(task_text())
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_foreign_result_never_borrows_a_claimed_tasks_route(self):
+        long_id = self._result("task-a.claimed-core-1")
+        short = self.tasks / f"{long_id}.txt"
+        short.write_text(task_text(task_id="task-a"))
+        archived = self.archive / f"{long_id}.txt"
+        archived.write_text(task_text(task_id=long_id, source="ag2space"))
+        self.assertEqual(self.routes(), {})
+        short.unlink()
+        self.assertEqual(self.routes(), {})
+
+    def test_archive_fallback_does_not_lend_another_ids_route(self):
+        tid = self._result()
+        archived = self.archive / f"{tid}.txt"
+        archived.write_text(task_text(task_id="task-other"))
+        self.assertEqual(self.routes(), {})
+        archived.write_text(task_text(task_id=tid))
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
     def test_a_quarantined_task_still_yields_its_route(self):

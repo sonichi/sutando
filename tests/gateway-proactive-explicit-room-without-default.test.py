@@ -30,6 +30,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 # Import-time config resolution must not read the developer's real channel dir.
@@ -68,19 +73,22 @@ def drain(body: str, default_room: str):
     src.write_text(body, encoding="utf-8")
     posts: list[dict] = []
 
-    def _fake_req(method, path, payload=None, timeout=None):
-        posts.append({"path": path, "payload": payload})
+    def _fake_req(method, path, payload=None, timeout=None, **_kw):
+        if method == "POST":  # the routing lookup is a GET, not a send
+            posts.append({"path": path, "payload": payload})
         return {"ok": True, "event_id": "$evt"}
 
     saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
              gb._req, gb.PROACTIVE_CLAIM_GATE)
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp, tmp / "archive"
     gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = default_room, _fake_req, None
+    gb._ROUTING.update(owner_dm=default_room, loaded=True, next=gb.time.time() + 3600)  # the owner DM reading
     try:
         gb._post_proactive()
     finally:
         (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
          gb._req, gb.PROACTIVE_CLAIM_GATE) = saved
+        gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
     return posts, sorted(p.name for p in tmp.iterdir() if p.is_file())
 
 
@@ -131,7 +139,7 @@ def main() -> int:
              gb._req, gb.PROACTIVE_CLAIM_GATE)
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp, tmp / "archive"
     gb.PROACTIVE_ROOM = ""
-    gb._req = lambda m, path, payload=None, timeout=None: (
+    gb._req = lambda m, path, payload=None, timeout=None, **_kw: (
         posts.append(payload) or {"ok": True, "event_id": "$evt"})
     gb.PROACTIVE_CLAIM_GATE = None
     try:
@@ -181,8 +189,8 @@ def main() -> int:
              gb._req, gb.PROACTIVE_CLAIM_GATE, gb._proactive_route)
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp3, tmp3 / "archive"
     gb.PROACTIVE_ROOM = ""
-    gb._req = lambda m, path, payload=None, timeout=None: (
-        posts3.append(payload) or {"ok": True, "event_id": "$evt"})
+    gb._req = lambda m, path, payload=None, timeout=None, **_kw: (
+        (posts3.append(payload) if m == "POST" else None) or {"ok": True, "event_id": "$evt"})
     gb.PROACTIVE_CLAIM_GATE = None
     gb._proactive_route = _vanishing_route
     try:

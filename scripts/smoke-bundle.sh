@@ -13,6 +13,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 echo "── build:bundle ──"
 npm run build:bundle
+cmp src/windows-app-launcher.ps1 dist/windows-app-launcher.ps1
 
 echo "── parse check (node --check) ──"
 for f in dist/*.js; do node --check "$f" && echo "  ✓ parse $(basename "$f")"; done

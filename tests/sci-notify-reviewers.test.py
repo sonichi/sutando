@@ -14,6 +14,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = (REPO / "skills" / "collaboration-intelligence" / "scripts"
           / "notify_reviewers.py")
@@ -25,7 +30,7 @@ _TMP = tempfile.TemporaryDirectory()
 
 
 def run(roster: "dict | None", *args):
-    env = {**os.environ}
+    env = hermetic_env()
     path = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name)) / "roster.json"
     if roster is not None:
         path.write_text(json.dumps(roster))
@@ -88,6 +93,9 @@ def run_send(stub_payload, roster=None, stub_stderr=""):
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
     copy.write_text(SCRIPT.read_text())
+    # the script imports its sibling: the skill ships as a directory, not a file
+    (copy.parent / "roster_union.py").write_text(
+        (SCRIPT.parent / "roster_union.py").read_text())
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         f"sys.stdout.write({stub_payload!r})\n"
@@ -95,8 +103,8 @@ def run_send(stub_payload, roster=None, stub_stderr=""):
         "sys.exit(0)\n")          # rc 0 + empty stderr: the real refusal shape
     rp = root / "roster.json"
     rp.write_text(json.dumps(roster or GOOD))
-    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
-    return subprocess.run([sys.executable, str(copy), "--send",
+    env = hermetic_env(**{"SUTANDO_SCI_ROSTER": str(rp)})
+    return subprocess.run([sys.executable, str(copy), "--send", "--no-repo", "presence test",
                            "--allow-single", "presence test",
                            "--reviewers", "rui", "--message", "m"],
                           capture_output=True, text=True, timeout=30, env=env)
@@ -176,6 +184,9 @@ def run_room(members_payload, *extra, roster=None, env_overrides=None):
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
     copy.write_text(SCRIPT.read_text())
+    # the script imports its sibling: the skill ships as a directory, not a file
+    (copy.parent / "roster_union.py").write_text(
+        (SCRIPT.parent / "roster_union.py").read_text())
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
@@ -184,8 +195,8 @@ def run_room(members_payload, *extra, roster=None, env_overrides=None):
         "sys.exit(0)\n")
     rp = root / "roster.json"
     rp.write_text(json.dumps(roster or GOOD))
-    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp), **(env_overrides or {})}
-    return subprocess.run([sys.executable, str(copy), "--send",
+    env = hermetic_env(**{"SUTANDO_SCI_ROSTER": str(rp), **(env_overrides or {})})
+    return subprocess.run([sys.executable, str(copy), "--send", "--no-repo", "presence test",
                            # These exercise ROOM PRESENCE, not the >=2 rule: without
                            # it the count gate answers before any presence assertion.
                            "--allow-single", "presence test",
@@ -208,6 +219,9 @@ def run_room_per_room(per_room: dict, default, *extra, roster=None):
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
     copy.write_text(SCRIPT.read_text())
+    # the script imports its sibling: the skill ships as a directory, not a file
+    (copy.parent / "roster_union.py").write_text(
+        (SCRIPT.parent / "roster_union.py").read_text())
     seen = root / "queried.txt"
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
@@ -223,8 +237,8 @@ def run_room_per_room(per_room: dict, default, *extra, roster=None):
         "sys.exit(0)\n")
     rp = root / "roster.json"
     rp.write_text(json.dumps(roster or GOOD))
-    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
-    proc = subprocess.run([sys.executable, str(copy), "--send",
+    env = hermetic_env(**{"SUTANDO_SCI_ROSTER": str(rp)})
+    proc = subprocess.run([sys.executable, str(copy), "--send", "--no-repo", "presence test",
                            "--allow-single", "presence test",
                            "--reviewers", "rui", "--message", "m", *extra],
                           capture_output=True, text=True, timeout=30, env=env)
