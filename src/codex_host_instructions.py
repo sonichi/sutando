@@ -8,7 +8,7 @@ sees the host file. Codex does read `$CODEX_HOME/AGENTS.md` for every session, s
 links the host file there.
 
 The desktop gives the core its own Codex home. The owner's `~/.codex` is never written,
-and an AGENTS.md already in the home that is not this link is left as it is.
+and an AGENTS.md or AGENTS.override.md already in the home is left as it is.
 """
 import argparse
 import os
@@ -26,24 +26,33 @@ def host_instructions(repo):
 
 
 def ensure_linked(codex_home, repo, home):
-    """Returns "no-host", "owner-home", "foreign", "already-set" or "linked"."""
+    """Returns "no-host", "owner-home", "overridden", "foreign", "already-set" or "linked"."""
     source = host_instructions(repo)
     if source is None:
         return "no-host"
     codex_home = Path(codex_home).expanduser()
     if codex_home.resolve() == (Path(home) / ".codex").resolve():
         return "owner-home"
+    # Codex reads an AGENTS.override.md in place of AGENTS.md; the override is the owner's.
+    if (codex_home / "AGENTS.override.md").exists():
+        return "overridden"
     target = codex_home / "AGENTS.md"
     if target.is_symlink():
         if Path(os.readlink(target)) == source:
             return "already-set"
         if target.exists():
             return "foreign"
-        target.unlink()  # a dangling link left by a moved install
+        try:
+            target.unlink()  # a dangling link left by a moved install
+        except FileNotFoundError:
+            pass
     elif target.exists():
         return "foreign"
     codex_home.mkdir(parents=True, exist_ok=True)
-    target.symlink_to(source)
+    try:
+        target.symlink_to(source)
+    except FileExistsError:
+        return "already-set" if target.is_symlink() and Path(os.readlink(target)) == source else "foreign"
     return "linked"
 
 

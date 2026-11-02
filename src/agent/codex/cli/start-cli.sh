@@ -302,7 +302,11 @@ ensure_codex_host_instructions() {
   py="$(heartbeat_python)"
   [ -n "$py" ] || return 0
   if out="$("$py" "$REPO/src/codex_host_instructions.py" "${CODEX_HOME:-$HOME/.codex}" "$REPO")"; then
-    [ "$out" = linked ] && echo "  ✓ Codex core given the host's AGENTS.md"
+    case "$out" in
+      linked) echo "  ✓ Codex core given the host's AGENTS.md" ;;
+      overridden) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
+      foreign) echo "  ⚠ ${CODEX_HOME:-$HOME/.codex}/AGENTS.md is not the host's; the core reads that file instead" >&2 ;;
+    esac
   else
     echo "  ⚠ could not link the host's AGENTS.md; the core may miss its first-contact instructions" >&2
   fi

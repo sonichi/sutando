@@ -85,7 +85,10 @@ The Codex implementation:
   (`src/codex_host_instructions.py`). Codex reads AGENTS.md only from its project
   root down, so without the link a Codex core never sees the host's first-contact
   and Getting started instructions that a Claude core reads from the parent
-  directory. The owner's `~/.codex` and an AGENTS.md already in the home are left alone;
+  directory. The owner's `~/.codex` and an AGENTS.md already in the home are left alone.
+  Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md`, so when one exists
+  the launcher links nothing, leaves the override as it is and warns that the core reads
+  it instead of the host's file;
 - honors `SUTANDO_CORE_MODEL`, `SUTANDO_CORE_WORKING_DIR`, and the more specific
   `SUTANDO_CODEX_WORKING_DIR`;
 - runs a separate managed `sutando-core-watcher` tmux session that converts

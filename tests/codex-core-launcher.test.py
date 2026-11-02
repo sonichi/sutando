@@ -759,6 +759,23 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(linked.read_text(), "# Sutando in AG2 Space\n")
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
 
+    def test_an_override_in_the_codex_home_is_kept_and_reported(self):
+        engine = Path(self.tmp.name) / "app-support" / "engine"
+        hosted = engine / "sutando"
+        shutil.copytree(self.root, hosted, symlinks=True)
+        self.root = hosted
+        (engine / "AGENTS.md").write_text("# Sutando in AG2 Space\n")
+        home = Path(self.tmp.name) / "repo" / "codex-home"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "AGENTS.override.md").write_text("owner\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AGENTS.override.md replaces the host's AGENTS.md", result.stderr)
+        self.assertFalse((home / "AGENTS.md").exists())
+        self.assertEqual((home / "AGENTS.override.md").read_text(), "owner\n")
+
     def test_a_checkout_outside_a_desktop_host_writes_no_agents_md(self):
         (Path(self.tmp.name) / "AGENTS.md").write_text("not a host's\n")
         self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)

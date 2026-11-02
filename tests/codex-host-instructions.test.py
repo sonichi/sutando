@@ -3,12 +3,15 @@
 
 Run: python3 tests/codex-host-instructions.test.py
 """
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -77,6 +80,65 @@ class EnsureLinked(unittest.TestCase):
         self.target.symlink_to(self.codex_home / "gone.md")
         self.assertEqual(self.link(), "linked")
         self.assertEqual(Path(os.readlink(self.target)), self.host)
+
+    def test_an_owners_override_is_left_alone_and_reported(self):
+        self.codex_home.mkdir(parents=True)
+        override = self.codex_home / "AGENTS.override.md"
+        override.write_text("owner override\n")
+        self.assertEqual(self.link(), "overridden")
+        self.assertFalse(self.target.exists() or self.target.is_symlink())
+        self.assertEqual(override.read_text(), "owner override\n")
+
+    def test_a_dangling_link_removed_by_a_concurrent_launch_is_tolerated(self):
+        self.codex_home.mkdir(parents=True)
+        self.target.symlink_to(self.codex_home / "gone.md")
+        real_unlink = Path.unlink
+
+        def raced(path, *a, **k):
+            real_unlink(path)
+            raise FileNotFoundError(str(path))
+        with patch.object(Path, "unlink", raced):
+            self.assertEqual(self.link(), "linked")
+        self.assertEqual(Path(os.readlink(self.target)), self.host)
+
+    def test_a_concurrent_launch_that_links_first_wins(self):
+        real_symlink = Path.symlink_to
+
+        def raced(path, src, *a, **k):
+            real_symlink(path, src)
+            raise FileExistsError(str(path))
+        with patch.object(Path, "symlink_to", raced):
+            self.assertEqual(self.link(), "already-set")
+        other = self.codex_home / "other.md"
+        other.write_text("other\n")
+        self.target.unlink()
+
+        def other_won(path, src, *a, **k):
+            real_symlink(path, other)
+            raise FileExistsError(str(path))
+        with patch.object(Path, "symlink_to", other_won):
+            self.assertEqual(self.link(), "foreign")
+        self.assertEqual(Path(os.readlink(self.target)), other)
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(Path, "home", return_value=self.home), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = chi.main([str(a) for a in argv])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_main_prints_the_outcome_and_returns_0(self):
+        rc, out, _ = self.main(self.codex_home, self.repo)
+        self.assertEqual((rc, out.strip()), (0, "linked"))
+        rc, out, _ = self.main(self.codex_home, self.repo)
+        self.assertEqual((rc, out.strip()), (0, "already-set"))
+
+    def test_main_returns_1_and_reports_an_os_error(self):
+        self.codex_home.parent.mkdir(parents=True)
+        self.codex_home.write_text("a file where the Codex home should be\n")
+        rc, out, err = self.main(self.codex_home, self.repo)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("codex host instructions:", err)
 
     def test_cli_prints_the_outcome(self):
         out = subprocess.run([sys.executable, str(SCRIPT), str(self.codex_home), str(self.repo)],
