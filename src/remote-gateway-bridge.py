@@ -458,6 +458,19 @@ PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 from skill_config import enabled as _skill_enabled
 TASK_STEP_PUBLICATION_ENABLED = lambda: _skill_enabled(
     "LEDGER_STEP_PUBLISH_ENABLED", _REPO / "skills" / "agent-activity" / "manifest.json")
+
+
+def _ag2space_task_status(local_tid: str):
+    """A task's published status (agent-activity's phase_line): the Basic fields only, since the
+    owner's share_live_status defaults off and is not read here yet."""
+    scripts = str(_REPO / "skills" / "agent-activity" / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import phase_line
+    return phase_line.published_status(WS, local_tid)  # noqa: F821
+
+
+TASK_STATUS = _ag2space_task_status
 TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed

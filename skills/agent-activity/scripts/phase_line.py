@@ -22,12 +22,14 @@ the grounding check; a bad phase drops the record, a bad line drops only the lin
 
     python3 skills/agent-activity/scripts/phase_line.py enrich --task <task id> [--workspace W]
     python3 skills/agent-activity/scripts/phase_line.py latest --task <task id> [--workspace W]
+    python3 skills/agent-activity/scripts/phase_line.py status --task <task id> [--workspace W]
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import secrets
@@ -196,6 +198,21 @@ def model_on() -> bool:
     return setting("PHASE_MODEL", "off").lower() == "vertex" and bool(setting("PHASE_MODEL_PROJECT"))
 
 
+# What a connected-account step may be called anywhere it is shown beyond this machine: the kind
+# of account only, never what was in it.
+_ACCOUNT_KINDS = (("mail", re.compile(r"gmail|outlook|mail", re.I)), ("calendar", re.compile(r"cal", re.I)),
+                  ("contacts", re.compile(r"contact|people", re.I)),
+                  ("files", re.compile(r"drive|docs|sheets|dropbox|notion|onedrive", re.I)),
+                  ("messages", re.compile(r"slack|teams|discord|telegram|whatsapp", re.I)))
+ACCOUNT_LINES = {"mail": "Checking your email", "calendar": "Looking at your calendar",
+                 "contacts": "Looking at your contacts", "files": "Looking at your files",
+                 "messages": "Checking your messages", "app": "Using a connected app"}
+
+
+def account_kind(tool_name: str) -> str:
+    return next((k for k, rx in _ACCOUNT_KINDS if rx.search(tool_name or "")), "app")
+
+
 def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | None", spawn=None) -> str:
     """The hook's one call per bound tool call: the rules record now, the model detached and debounced.
     A task's first record says so (`first`), and a connected-account step leaves a `.private` marker
@@ -209,6 +226,7 @@ def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | No
         _prune(seen.parent)
     if _PRIVATE_TOOL.match(tool_name or ""):
         rec["private"] = True
+        rec["account"] = account_kind(tool_name)
         _touch(_marker(workspace, task_id, "private"))  # unwritten: prompt_for's other checks fail closed
     if not write(workspace, rec) and first:
         with contextlib.suppress(OSError):
@@ -581,9 +599,178 @@ def enrich(workspace, task_id: str, call=None) -> "dict | None":
     return rec
 
 
+# ---- why a task isn't moving: one status for every open or waiting task -------------------------
+
+BUSY_WINDOW_S = 300.0
+PICKUP_WINDOW_S = 3600.0
+SUMMARY_TAIL_BYTES = 256 * 1024
+
+
+def _ts(value, default: "float | None" = None) -> "float | None":
+    """A finite epoch from a record field (a number, or an ISO-8601 string); `default` otherwise."""
+    if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+        try:
+            from datetime import datetime
+            value = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _finished(workspace, task_id: str) -> bool:
+    """The task has its result (results/<id>.txt) or a done summary in the summaries log's tail."""
+    if (Path(workspace) / "results" / f"{task_id}.txt").exists():
+        return True
+    try:
+        with open(Path(workspace) / "state" / "agent-activity.summaries.jsonl", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - SUMMARY_TAIL_BYTES))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    needle = json.dumps(task_id)
+    for raw in tail.splitlines():
+        if needle not in raw:
+            continue
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and isinstance(r.get("task"), dict) and r["task"].get("id") == task_id:
+            return True
+    return False
+
+
+def _recent_other_task(workspace, task_id: str, now: float) -> bool:
+    """Another task on this host recorded a step in the last BUSY_WINDOW_S: the agent is busy."""
+    try:
+        with open(sidecar_path(workspace), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for raw in lines[1:] if size > TAIL_BYTES else lines:  # a cut first line is not a record
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("task_id") not in (None, task_id) \
+                and r.get("phase_source") == "rules" and now - (_ts(r.get("at")) or 0.0) <= BUSY_WINDOW_S:
+            return True
+    return False
+
+
+def _picked_up_at(workspace, task_id: str, now: float) -> "float | None":
+    """When the activity index saw this task picked up, if recently (the index is never pruned)."""
+    try:
+        from activity_rows import open_task_index
+        started = _ts((open_task_index(Path(workspace)).get(task_id) or {}).get("started")) or 0.0
+    except Exception:  # noqa: BLE001
+        return None
+    return started if started and now - started <= PICKUP_WINDOW_S else None
+
+
+def status_for(workspace, task_id: str, *, inbox=None, active: "str | None" = None,
+               now: "float | None" = None) -> "dict | None":
+    """{phase, line, since} saying why the task is where it is, or None for a finished or unknown
+    task (its label shows). The line never carries an age: the client renders it from `since`.
+
+    In order: delegated (handoffs), running (the newest phase record), picked up with no step yet,
+    queued behind another request, queued. Pickup outranks the queue: a task's file stays in the
+    queue while the core works it, and "Queued" must never outlive the wait. `active` is the task this seat is working on now,
+    when the caller knows it; otherwise any other task's step in the last few minutes means busy.
+    Nothing about another task is ever named."""
+    now = time.time() if now is None else now
+    if _finished(workspace, task_id):
+        return None
+    try:
+        import handoffs
+        delegated = handoffs.delegated_status(workspace, task_id, now=now)
+    except Exception:  # noqa: BLE001 - delegated status is optional (src/handoffs.py)
+        delegated = None
+    if delegated:
+        since = min((t for h in handoffs.open_handoffs(workspace, task_id, now=now)
+                     if (t := _ts(h.get("at"))) is not None), default=now)
+        return {"phase": "Delegated", "line": delegated["line"], "since": since, "waiting": {"reason": "delegated"}}
+    st = latest(workspace, task_id)
+    if st is not None:
+        rules = [r for r in records(workspace, task_id) if r.get("seq") == st["seq"]]
+        line = st.get("line") or st.get("step") or st["phase"]
+        return {"phase": st["phase"], "line": line, "since": _ts(rules[-1].get("at"), now) if rules else now}
+    picked = _picked_up_at(workspace, task_id, now)
+    if picked is not None:
+        return {"phase": "Understanding the request", "line": "Reading the request", "since": picked}
+    try:
+        from task_queue import position
+        pos = position(Path(workspace), task_id, inbox)
+    except Exception:  # noqa: BLE001 - an unreadable queue is no queue line
+        pos = {"position": 0}
+    if pos.get("position"):
+        try:
+            from task_queue import pending
+            since = next((_ts(t.get("since"), now) for t in pending(Path(workspace), inbox) if t["id"] == task_id), now)
+        except Exception:  # noqa: BLE001
+            since = now
+        busy = (active is not None and active != task_id) or (active is None and _recent_other_task(workspace, task_id, now))
+        if busy:
+            return {"phase": "Waiting", "line": "Waiting: working on another request", "since": since,
+                    "waiting": {"reason": "busy"}}
+        ahead = int(pos["position"]) - 1
+        return {"phase": "Waiting", "line": f"Queued · {ahead} ahead" if ahead else "Queued · next", "since": since,
+                "waiting": {"reason": "queued", "position": int(pos["position"])}}
+    return None
+
+
+def published_status(workspace, task_id: str, *, share_line: bool = False, **kw) -> "dict | None":
+    """What the agent publishes to the server ledger: phase, summary, since and, for a waiting task,
+    `waiting` {reason, position?}. Off (the default, and the owner's share_live_status default) the
+    summary is the phase word or the fixed waiting line ("Queued · next"), never a step's text; with
+    `share_line` it is the detail line as `shareable_line` lets it leave. The publisher adds the task's source
+    message itself. None when `status_for` says nothing."""
+    st = status_for(workspace, task_id, **kw)
+    if st is None:
+        return None
+    waiting = st.get("waiting")
+    out = {"phase": st["phase"], "summary": st["phase"], "since": st["since"]}
+    if waiting:
+        out["waiting"] = dict(waiting)
+        if waiting["reason"] in ("queued", "busy"):
+            out["summary"] = st["line"]
+    if share_line:
+        out["summary"] = shareable_line(workspace, task_id, st)
+    return out
+
+
+# The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a
+# private read is recognisable only by MCP tool and mail read by shell or browser passes a scrubber.
+FIXED_LINES = frozenset({"Reading the request", "Waiting: working on another request", "Queued · next"})
+_QUEUED = re.compile(r"Queued · \d{1,4} ahead")
+
+
+def shareable_line(workspace, task_id: str, status: "dict | None" = None) -> "str | None":
+    """The status line as it may leave this machine, for an opt-in share: a connected-account task
+    gets only its account kind ("Checking your email"); otherwise our own fixed line, or the phase
+    word. Never a step's text or the model's line, which stay local."""
+    st = status if status is not None else status_for(workspace, task_id)
+    if st is None:
+        return None
+    private = [r for r in records(workspace, task_id) if r.get("private")]
+    if private or _marker(workspace, task_id, "private").exists():
+        kind = private[-1].get("account") if private else None
+        return ACCOUNT_LINES.get(kind or "app", ACCOUNT_LINES["app"])
+    line = str(st.get("line") or "")
+    return line if line in FIXED_LINES or _QUEUED.fullmatch(line) else st["phase"]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Phase word and status line for a task's live status.")
-    ap.add_argument("cmd", choices=("enrich", "latest"))
+    ap.add_argument("cmd", choices=("enrich", "latest", "status", "published"))
     ap.add_argument("--task", required=True)
     ap.add_argument("--workspace")
     a = ap.parse_args(argv)
@@ -595,7 +782,8 @@ def main(argv=None) -> int:
     if a.cmd == "enrich":
         enrich(ws, a.task)
         return 0
-    print(json.dumps(latest(ws, a.task)))
+    show = {"status": status_for, "published": published_status, "latest": latest}[a.cmd]
+    print(json.dumps(show(ws, a.task)))
     return 0
 
 
