@@ -790,20 +790,33 @@ class agent_lock:
         return False
 
 
-def _agent_operation_in_progress() -> str:
+def _lock_busy(path) -> bool:
+    """Whether some process holds the flock on `path` now; a lock file not there is not held."""
+    try:
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def agent_lock_busy(root) -> str:
+    """`root`'s agent lock when another process holds it now, else '' (nothing is created)."""
+    path = agent_lock_path(root)
+    return str(path) if _lock_busy(path) else ""
+
+
+def agent_operation_in_progress() -> str:
     """The agent lock under the agents dir some operation holds now, else ''. Uninstall asks it when no
     config names a root: an operation that later writes a config does so under the operation lock it holds."""
     for path in sorted((Path(_dirs.agents_dir()) / ".locks").glob("*.op")):
-        try:
-            fd = os.open(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
-        except OSError:
-            continue
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if _lock_busy(path):
             return str(path)
-        finally:
-            os.close(fd)
     return ""
 
 
@@ -1537,7 +1550,7 @@ def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
             with (agent_lock(root) if root else contextlib.nullcontext()), operation_lock(shape):
                 if (owned_config(shape)[0] or {}).get("ROOT", "") != root:
                     continue
-                busy = "" if root else _agent_operation_in_progress()
+                busy = "" if root else agent_operation_in_progress()
                 if busy:
                     return _refuse(f"no config names the root {job_name(shape)} serves, and an operation on an agent "
                                    f"holds {busy}; nothing was removed; run {shape.command} uninstall once it ends")

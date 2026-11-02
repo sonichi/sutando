@@ -30,6 +30,9 @@ from local_task_protocol import find_result, valid_local_task_id  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import turns  # noqa: E402
+
 WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # lint-workspace-resolution: allow-repo-root (sibling script, not a data root)
 SKIP_TOOLS = {"Read", "Glob", "Grep", "TodoWrite"}
 MAXLEN = 100
@@ -329,7 +332,7 @@ def consolidated_into(ws: Path, task_id: str) -> str | None:
 
 
 def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subprocess.run,
-         into: str | None = None) -> None:
+         into: str | None = None) -> bool:
     if kind == "done":
         cmd = [sys.executable, str(WRITER), "done", line, "--task-id", task["id"], "--workspace", str(ws)]
         if into:
@@ -344,11 +347,114 @@ def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subpr
         cmd += ["--event", task["event"]]
     if room:
         cmd += ["--room", room]
-    run(cmd, capture_output=True)
+    done = run(cmd, capture_output=True)
+    return getattr(done, "returncode", 0) == 0
+
+
+_IX = re.compile(r"Interaction-Id: (ix_[0-9a-f]{12})")
+DELEGATING = ("Agent", "Workflow", "SendMessage")
+
+
+def handoff_pre(ws: Path, task_id: str, tool: str, inp, tool_use_id) -> None:
+    """Record work given away from a bound task: a subagent call, or a SendMessage ask with an id.
+    Silent: a record that cannot be written must never surface as a hook error."""
+    try:
+        import contextlib
+        import io
+        import handoffs
+        inp = inp if isinstance(inp, dict) else {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str):
+                handoffs.open_handoff(ws, task_id, "agent", tool_use_id,
+                                      handoffs.label_for("agent", inp.get("subagent_type")),
+                                      holds=not inp.get("run_in_background"))
+            elif tool == "SendMessage":
+                m = _IX.search(str(inp.get("message") or ""))
+                if m:
+                    handoffs.open_handoff(ws, task_id, "message", m.group(1), handoffs.label_for("message", None),
+                                          holds=False)
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a tool call
+        pass
+
+
+def handoff_post(ws: Path, tool, inp, tool_use_id, outcome: str = "done") -> None:
+    """A foreground subagent's call returning (done) or failing (failed) is its work coming back.
+    One index-file lookup; the log is not read unless a handoff is open for this call."""
+    try:
+        if tool in ("Agent", "Workflow") and isinstance(tool_use_id, str) \
+                and not (isinstance(inp, dict) and inp.get("run_in_background")):
+            import contextlib
+            import io
+            import handoffs
+            with contextlib.redirect_stderr(io.StringIO()):
+                handoffs.close_by_child(ws, "agent", tool_use_id, outcome)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _phase_line():
+    scripts = str(Path(__file__).resolve().parents[1] / "scripts")  # lint-workspace-resolution: allow-repo-root (sibling skill scripts, not a data root)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import phase_line
+    return phase_line
+
+
+def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> str | None:
+    """The phase sidecar's rules record (and, when switched on, the detached model call); its phase word,
+    or None. Never raises."""
+    try:
+        return _phase_line().on_step(ws, task_id, tool, inp, line)
+    except Exception:  # noqa: BLE001 - the live status must never break a tool call
+        return None
+
+
+def show_step(ws: Path, task: dict, room: str, phase: str | None, line: str | None, run) -> list:
+    """One room row per tool call at most: its step line when it has one, else its phase word when the
+    room does not show that already (the client renders a room's newest working row). Never raises."""
+    if line:
+        emit("working", line, task, room, ws, run)
+        try:
+            _phase_line().note_line_shown(ws, task["id"])
+        except Exception:  # noqa: BLE001
+            pass
+        return [("working", line)]
+    if not phase:
+        return []
+    try:
+        shown = _phase_line().show_phase_if_new(ws, task["id"], phase,
+                                                lambda: emit("working", phase, task, room, ws, run))
+    except Exception:  # noqa: BLE001
+        shown = False
+    return [("working", phase)] if shown else []
+
+
+def stop_rulings(ws: Path) -> None:
+    """Rule any stop still waiting on its answer: a turn ending is when the core may have given it."""
+    if any(ws.joinpath("state", "stop-interrupts").glob("*.ruling.json")):
+        import stop_interrupt
+        log = ws / "logs" / "stop-interrupt.log"
+
+        def note(line: str) -> None:            # never stderr: a hook's stderr reads as a hook error
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+        stop_interrupt.sweep(ws, log=note)
 
 
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
+    # The pane stamp moves first: the fenced key reads only the stamp, so a turn that ended or began
+    # is never stamped as one the record no longer shows open.
+    for step in (lambda: turns.stamp_pane(payload), lambda: turns.record(payload, p["ws"]),
+                 lambda: payload.get("hook_event_name") == "Stop" and stop_rulings(p["ws"])):
+        try:
+            step()
+        except Exception:  # noqa: BLE001 — turn records and stop rulings never hold up the rows below
+            pass
     sid = payload.get("session_id")
     if not isinstance(sid, str) or not sid:
         return []
@@ -384,14 +490,23 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             return out
         if result_file_refs(blob):
             return out  # the result write itself is not "working"; PostToolUse decides whether it closed the task
+        if tool in DELEGATING:
+            owner, _room = bound_task(p, sid)
+            if owner:
+                handoff_pre(p["ws"], owner["id"], tool, inp, payload.get("tool_use_id"))
         line = working_line(tool, inp) if isinstance(tool, str) else None
-        if line:
-            task, room = bound_task(p, sid)
-            if task:
-                emit("working", line, task, room, p["ws"], run)
-                out.append(("working", line))
+        task, room = bound_task(p, sid)
+        phase = step_phase(p["ws"], task["id"], tool, inp, line) if task and isinstance(tool, str) else None
+        if task and room:
+            out += show_step(p["ws"], task, room, phase, line, run)
+        elif line and task:
+            emit("working", line, task, room, p["ws"], run)
+            out.append(("working", line))
+    elif event == "PostToolUseFailure":
+        handoff_post(p["ws"], payload.get("tool_name"), payload.get("tool_input"), payload.get("tool_use_id"), "failed")
     elif event == "PostToolUse":
         inp = payload.get("tool_input")
+        handoff_post(p["ws"], payload.get("tool_name"), inp, payload.get("tool_use_id"))
         blob = json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else ""
         binds = load_json(p["bind"], {})
         opened = open_tasks(p["log"])

@@ -185,7 +185,7 @@ class RenderTest(unittest.TestCase):
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok), Muse (by Meta), or Other", by["agents"].how)
+        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
         self.assertNotIn("import", by)
@@ -195,7 +195,7 @@ class RenderTest(unittest.TestCase):
 
     def test_second_review_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Docs, HTML pages, PDFs, whiteboards, sheets and databases", by["commons"].what)
+        self.assertIn("Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases", by["commons"].what)
         self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
         self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
                       by["activity"].how)
@@ -642,6 +642,27 @@ class CredentialTest(unittest.TestCase):
         self.assertTrue(env["AG2_REMOTE_TOKEN"].endswith("|not-a-real-secret"))
         self.assertNotIn("OTHER", env)
 
+    def test_a_secondary_lane_only_install_finds_the_lane_token(self):
+        # The device file holds only the lane's suffixed keys: its token key, and the dir naming the identity file.
+        app = self.tmp / "app"
+        channels = app / "channels"
+        (channels / "ag2space").mkdir(parents=True)
+        (channels / "s.space").mkdir()
+        device = channels / "ag2space" / ".env"
+        device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n"
+                          "REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n")
+        (channels / "s.space" / ".env").write_text(
+            "AG2_REMOTE_TOKEN=https://relay.test.invalid/relay|dir-secret\n"
+            "AGENT_MXID=@lane.agent:example.test\n")
+        (channels / "active-gateway-lane").write_text("s_dspace\n")
+        env = {"CLAUDE_CONFIG_DIR": str(app), "SUTANDO_APP_SUPPORT": str(app),
+               "AG2_DEVICE_ENV": str(device), "PATH": os.environ.get("PATH", "")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            got = gs.commons_env(self.script)
+            mxid = gs.agent_mxid()
+        self.assertTrue(got.get("AG2_REMOTE_TOKEN", "").endswith("|lane-secret"))
+        self.assertEqual(mxid, "@lane.agent:example.test")
+
     def test_an_env_credential_wins_and_nothing_is_mixed_in(self):
         with mock.patch.dict(os.environ, {**self.base, "AG2_API_ROOT": "https://other.test.invalid"},
                              clear=True):
@@ -662,6 +683,23 @@ class CredentialTest(unittest.TestCase):
         self.assertIn("boom [redacted]", done.stdout)
         self.assertNotIn("not-a-real-secret", done.stdout + done.stderr)
         self.assertNotIn("relay.test.invalid/relay|", done.stdout + done.stderr)
+
+    def test_a_secondary_lane_only_install_reads_the_active_lanes_token(self):
+        support = self.tmp / "app-support"
+        device = support / "channels" / "ag2space" / ".env"
+        device.parent.mkdir(parents=True)
+        (support / "channels" / "active-gateway-lane").write_text("s_dspace\n")
+        device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n"
+                          "AG2_REMOTE_TOKEN_OTHER=https://relay.test.invalid/relay|other-secret\n"
+                          "REMOTE_TASK_URL=https://leftover.test.invalid/relay\n")
+        (self.config / "channels" / "ag2space" / ".env").unlink()
+        lane = {**self.base, "CLAUDE_CONFIG_DIR": str(support), "SUTANDO_APP_SUPPORT": str(support),
+                "AG2_DEVICE_ENV": str(device)}
+        with mock.patch.dict(os.environ, lane, clear=True):
+            env = gs.commons_env(self.script)
+        self.assertEqual(env.get("AG2_REMOTE_TOKEN"), "https://relay.test.invalid/relay|lane-secret")
+        self.assertNotIn("ROOM_COMMONS_TOKEN", env)
+        self.assertNotIn("REMOTE_TASK_URL", env, "a leftover URL never pairs with the lane token")
 
     def test_redact_hides_credential_values_and_token_halves(self):
         env = {"AG2_REMOTE_TOKEN": "https://relay.test.invalid/r|s3cr3t-value", "ROOM_KEY": "short",

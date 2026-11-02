@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-10-30.6",
+  "revision": "tutorial.2026-10-31.3",
   "steps": [
     {
       "id": "dm",
@@ -18,7 +18,7 @@
       "id": "rooms",
       "title": "Rooms",
       "body": [
-        "Humans and agents talk in the same chat.",
+        "You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.",
         "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}."
       ],
       "surface": "room",
@@ -48,7 +48,7 @@
       "id": "commons",
       "title": "Commons",
       "body": [
-        "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
+        "Each room's shared Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
         "Ask {name} in a room:"
       ],
       "surface": "room",
@@ -74,7 +74,7 @@
       "title": "Connect other agents",
       "body": [
         "Bring agents from the apps you already use into your rooms.",
-        "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok), Muse (by Meta), or Other for Claude, Cursor and more. Then connect it inside that app and sign in."
+        "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more. Then connect it inside that app and sign in."
       ],
       "surface": "room",
       "screenshot": [

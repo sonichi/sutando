@@ -397,6 +397,7 @@ def _intake_gate(task: dict):
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
+_AGENT_ACTIVITY_MANIFEST = _REPO / "skills" / "agent-activity" / "manifest.json"
 
 
 def _legacy_keeps_proactive_room() -> bool:
@@ -410,8 +411,22 @@ def _legacy_stand_down():
 
 
 def _owns_unaddressed() -> bool:
-    from connections import owns_unaddressed
+    from connections import owns_unaddressed, unaddressed_owner
+    owner, handed_from = unaddressed_owner(WS)  # noqa: F821
+    if handed_from is not None and owner is not None:
+        _log_backoff(("unaddressed-handoff", handed_from["instance"], owner["instance"]),  # noqa: F821
+                     f"unaddressed owner messages: lane {handed_from['instance'] or 'primary'} has no owner DM, "
+                     f"so lane {owner['instance'] or 'primary'} delivers them")
     return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+def _stop_interrupt_enabled(environ=None) -> bool:
+    """The agent-activity skill's Stop interrupt switch; off when it cannot be read."""
+    try:
+        from skill_config import enabled
+        return enabled("SUTANDO_STOP_INTERRUPT", _AGENT_ACTIVITY_MANIFEST, environ)
+    except Exception:  # noqa: BLE001 - a switch that cannot be read is off
+        return False
 
 
 def _status_ack_gate(environ=None):
@@ -438,13 +453,37 @@ PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
+STOP_INTERRUPT = _stop_interrupt_enabled()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 from skill_config import enabled as _skill_enabled
 TASK_STEP_PUBLICATION_ENABLED = lambda: _skill_enabled(
     "LEDGER_STEP_PUBLISH_ENABLED", _REPO / "skills" / "agent-activity" / "manifest.json")
+
+
+def _ag2space_task_status(local_tid: str):
+    """A task's published status (agent-activity's phase_line): the Basic fields only, since the
+    owner's share_live_status defaults off and is not read here yet."""
+    scripts = str(_REPO / "skills" / "agent-activity" / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import phase_line
+    return phase_line.published_status(WS, local_tid)  # noqa: F821
+
+
+TASK_STATUS = _ag2space_task_status
 TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed
+
+
+def _ag2space_lane_server() -> str:
+    """The homeserver this lane's connection row names: a secondary lane's relay answer on another
+    server is refused."""
+    from connections import lane_server
+    return lane_server(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+LANE_SERVER = _ag2space_lane_server
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 

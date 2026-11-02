@@ -872,6 +872,27 @@ edits = card_edits_since(mark)
 check(len(edits) == 1 and "Kept private" in edits[0] and not path.exists(),
       f"archived mid-retry: one card edit from the archive, copy retired: {edits}")
 
+# 14g2. A non-string withheld body is never published, even when its id's reservation
+# holds the "unreadable" sentinel too: that digest names no body, so it never matches itself.
+for label, bad in (("missing", None), ("list", ["SECRET-LIST-VALUE"]), ("int", 12345)):
+    bridge._STATE = root / f"bad-body-{label}"
+    path, rid = new_review(f"task-bad-body-{label}")
+    guard.claim_withheld_decision(path, dict(NO))
+    current = json.loads(path.read_text())
+    path.write_text(json.dumps(dict(current, withheld_body=bad)))
+    (path.parent / "issued" / f"{path.stem}.issued").write_text("unreadable")
+    check(guard._owns_its_id(path, "withheld_body") is False,
+          f"a {label} body under an 'unreadable' reservation does not own its id")
+    before = len(shared_posts())
+    bridge._retry_pending_publications()
+    archived = path.parent / "archive" / path.name
+    status = json.loads((path if path.is_file() else archived).read_text())["status"] \
+        if path.is_file() or archived.is_file() else "frozen"
+    check(len(shared_posts()) == before and status != "published",
+          f"a {label} withheld body is never published "
+          f"({status}, posts {[p.get('body') for p in shared_posts()[before:]]})")
+bridge._STATE = root / "state"
+
 # 14h. Unreadable records: the writer refuses an unreadable live record it would own, and
 # an unreadable archive reads as {}.
 bridge._STATE = root / "unreadable"
