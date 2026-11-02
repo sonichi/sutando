@@ -92,13 +92,20 @@ def _channel_env_file():
     boundary the way they already shadow the vault.
 
     The dir is REMOTE_TASK_CHANNEL_DIR, the same expression the gateway bridge
-    uses; hardcoding "ag2space" made every lane read PROD's credential.
+    uses; hardcoding "ag2space" made every lane read PROD's credential. Which
+    file in it is the shared resolver's pick (`channel_env_resolve`), so an
+    install signed in only on a secondary homeserver reads that lane's token.
     """
     try:
         if not _core_src_on_path():
             return None
         from util_paths import claude_home_path
+        from channel_env_resolve import resolve_channel_env
         channel_dir = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+        picked = resolve_channel_env(claude_home_path("channels"), channel_dir)
+        if picked is not None:
+            return str(picked)
+        # No file holds a token: a `.env` with only the URL still answers the URL tier.
         p = claude_home_path("channels", channel_dir, ".env")
         return p if os.path.isfile(p) else None
     except Exception:

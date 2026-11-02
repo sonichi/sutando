@@ -52,7 +52,7 @@ OLD_SECTIONS = [
             (("room-header-commons.jpg", "The Commons button at the right of the room header"), ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"))),
     Section("agents", "Connect other agents",
             "Bring agents from the apps you already use into your rooms.",
-            "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini Spark and more. Then connect it inside that app and sign in.",
+            "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more. Then connect it inside that app and sign in.",
             images=(("room-list-add.jpg", "The + menu at the top of the room list, with Agent"),
                     ("add-agent-dialog.jpg", "Add an agent, with Use an agent from another app"), ("which-agent.jpg", "Which agent? Dot, Grok Bot, Muse or Other"))),
     Section("teamwork", "Teamwork",
@@ -110,6 +110,7 @@ RENDERED_AT = {
     "tutorial.2026-10-30.6": "a699783d9c31d1cd9fbd73efa3738a4f4fbdfabbf9757d7cf5ba4b1067aab5d6",
     "tutorial.2026-10-31.1": "f853324233e497e1203eb784b804167445f3418eab2ff9500ac364be0667ff0f",
     "tutorial.2026-10-31.2": "d0be214f205df52c62f9dd2dec0267b49676dc80ba8ca9fea084ffae4614c728",
+    "tutorial.2026-10-31.3": "b241929d5d588687c1005c7a39b758bf1772fd74511f7dcdf44cccf08230a561",
 }
 STEP_IDS = ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "phone", "mobile"]
 ASSET_CAP = 60_000

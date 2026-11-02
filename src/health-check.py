@@ -14075,7 +14075,7 @@ def _primary_channel_source(source: str = "ag2space") -> str:
     """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
     import connections
     row = connections.primary_row(WORKSPACE_DIR)
-    return connections.channel_dir_for(row["instance"]) if row and row.get("instance") else source
+    return connections.lane_channel_dir(row["instance"]) if row and row.get("instance") else source
 
 
 def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":

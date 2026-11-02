@@ -17,9 +17,10 @@ This module owns the SELECTION, including the candidate ORDER:
   2. The `channels/<source>` candidates, which must satisfy both rules below.
 
 When none of those holds a primary token, `channel_values` reads the desktop's ACTIVE
-lane's own keys (`<NAME>_<LANE>`) from the launcher-named file: a host signed in only on
-a secondary homeserver writes nothing else there. Only `gateway_serving.active_lane` names
-the lane; no other suffixed key is ever read, and no lane is mapped to a directory.
+lane's own keys (`<NAME>_<LANE>`) from the launcher-named file, where a host signed in only
+on a secondary homeserver keeps its token; an identity it lacks comes from the lane's channel
+dir as `connections.lane_channel_dir` names it. Only `gateway_serving.active_lane` names the
+lane; no other suffixed key is read, and no lane name is decoded into a directory.
 
 The channels dir is the caller's input; this module never guesses a home dir.
 The two rules a channels-tree candidate must satisfy are each answered by
@@ -35,9 +36,10 @@ their existing owner, not re-stated here:
     startup.sh's prefix-only `grep -q "<VAR>="` gate). Key-presence alone
     selects a blank `.env` over a sibling holding the real token.
 
-Dependency-light (stdlib only, plus those two siblings; the lane lookup imports
-gateway_serving and connections lazily) so a shell wrapper can
-call it on any host without importing a stack.
+Dependency-light (stdlib only, plus those two siblings) so a shell wrapper can
+call it on any host without importing a stack; only the active-lane lookup and
+`--room` lazily import `gateway_serving` / `connections`, which own the active
+lane, its key names and a row's channel dir.
 """
 from __future__ import annotations
 
@@ -89,15 +91,7 @@ def candidates(channel_dir: Path) -> list[Path]:
     return seen
 
 
-def resolve_channel_env(channels_dir, source: str) -> Path | None:
-    """The usable launcher-named file, else the first channels-tree candidate
-    that is BOTH contained and holds a non-empty token.
-
-    None when neither the launcher-named file nor any candidate qualifies.
-    """
-    named = device_env(source)
-    if named is not None:
-        return named
+def _resolve_in(channels_dir, source: str) -> Path | None:
     channel_dir = Path(channels_dir) / source
     if not channel_dir.is_dir():
         return None
@@ -109,21 +103,36 @@ def resolve_channel_env(channels_dir, source: str) -> Path | None:
     return None
 
 
+# One path segment under channels/, the charset scripts/channel-env.sh accepts.
+_CHANNEL_DIR_RE = re.compile(r"^[a-z0-9._-]+$")
+
+
+def resolve_channel_env(channels_dir, source: str) -> Path | None:
+    """The usable launcher-named file, else the first channels-tree candidate
+    that is BOTH contained and holds a non-empty token.
+
+    None when neither the launcher-named file nor any candidate qualifies.
+    """
+    return _resolve_primary(channels_dir, source)
+
+
 def _active_lane() -> str | None:
     try:
         from gateway_serving import active_lane
-        return active_lane()
-    except Exception:  # noqa: BLE001 - no lane selector here is simply no lane
+    except ImportError:
         return None
+    return active_lane()
 
 
-def _lane_var(name: str, lane: str) -> str:
+def lane_var(name: str, lane: str) -> str:
+    """`name`'s key for `lane` in the device file, by the rule its launch key is named with
+    (`connections.token_ref_for`): `AG2_REMOTE_TOKEN` + `s_hspace_dfoo` -> `AG2_REMOTE_TOKEN_S_HSPACE_DFOO`."""
     from connections import INSTANCE_TOKEN_PREFIX, token_ref_for
     return f"{name}_{token_ref_for(lane).removeprefix(INSTANCE_TOKEN_PREFIX)}"
 
 
 def _lane_value(name: str, lane: str, path: Path) -> str:
-    got = token_from_env_file(_lane_var(name, lane), path)
+    got = token_from_env_file(lane_var(name, lane), path)
     return clean_relay_token(got) if name in RELAY_TOKEN_VARS else got
 
 
@@ -142,7 +151,8 @@ def active_lane_env(channels_dir, source: str) -> "tuple[Path, str] | None":
 
 def channel_values(channels_dir, source: str, names) -> dict:
     """{name: value} for each of `names` set non-empty in `resolve_channel_env`'s pick; without
-    one, each name's active-lane key in the launcher-named file (`active_lane_env`)."""
+    one, the active lane's values (`active_lane_values`)."""
+    names = tuple(names)
     path = resolve_channel_env(channels_dir, source)
     if path is None:
         return active_lane_values(channels_dir, source, names)
@@ -150,13 +160,29 @@ def channel_values(channels_dir, source: str, names) -> dict:
     return {n: v for n, v in found.items() if v}
 
 
+def _lane_dir_file(channels_dir, lane: str, device: Path) -> Path | None:
+    import connections
+    d = connections.lane_channel_dir(lane, launch_file=device)
+    if d in (".", "..", DEVICE_ENV_SOURCE) or not _CHANNEL_DIR_RE.fullmatch(d):
+        return None
+    home = Path(channels_dir) / d
+    files = candidates(home) if home.is_dir() else []
+    return next((f for f in files if channel_env_is_contained(f, channels_dir, d)), None)
+
+
 def active_lane_values(channels_dir, source: str, names) -> dict:
-    """{name: value} for each of `names` whose active-lane key `active_lane_env`'s file sets."""
+    """{name: value} for `active_lane_env`'s lane: each name's `<NAME>_<LANE>` key in the device
+    file; a non-token name it lacks (an identity) from the lane's channel dir file, if any."""
     lane_env = active_lane_env(channels_dir, source)
     if lane_env is None:
         return {}
-    path, lane = lane_env
-    found = {n: _lane_value(n, lane, path) for n in names}
+    device, lane = lane_env
+    names = tuple(names)
+    found = {n: _lane_value(n, lane, device) for n in names}
+    rest = [n for n in names if not found[n] and n not in TOKEN_VARS]
+    lane_file = _lane_dir_file(channels_dir, lane, device) if rest else None
+    for n in rest if lane_file else ():
+        found[n] = token_from_env_file(n, lane_file)
     return {n: v for n, v in found.items() if v}
 
 
@@ -164,6 +190,11 @@ def channel_configured(channels_dir, source: str) -> bool:
     """Whether `channel_values` can find a token for `source` here."""
     return (resolve_channel_env(channels_dir, source) is not None
             or active_lane_env(channels_dir, source) is not None)
+
+
+def _resolve_primary(channels_dir, source: str) -> Path | None:
+    named = device_env(source)
+    return named if named is not None else _resolve_in(channels_dir, source)
 
 
 LAUNCH_KEY_RE = re.compile(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", re.M)
@@ -181,9 +212,11 @@ def resolve_launch_key_env(channels_dir, source: str) -> Path | None:
     """`resolve_channel_env`'s pick, else the first file in the same order and under the same
     containment that holds a launch key: a host signed in only on a secondary homeserver writes
     `AG2_REMOTE_TOKEN_<INST>` and no primary token."""
-    picked = resolve_channel_env(channels_dir, source)
-    if picked is not None:
-        return picked
+    picked = _resolve_primary(channels_dir, source)
+    return picked if picked is not None else _resolve_launch_key_file(channels_dir, source)
+
+
+def _resolve_launch_key_file(channels_dir, source: str) -> Path | None:
     named = (os.environ.get(DEVICE_ENV_VAR) or "").strip() if source == DEVICE_ENV_SOURCE else ""
     if named and Path(named).is_file() and _has_launch_key(Path(named)):
         return Path(named)
@@ -205,8 +238,9 @@ def resolve_room_channel_env(channels_dir, source: str, room_id: str) -> Path | 
     if row is None:
         return resolve_channel_env(channels_dir, source)
     if not row["instance"]:
-        return resolve_channel_env(channels_dir, DEVICE_ENV_SOURCE)
-    channel_dir = connections.channel_dir_for(row["instance"])
+        # The legacy row's own server only: the active lane may be another server's.
+        return _resolve_primary(channels_dir, DEVICE_ENV_SOURCE)
+    channel_dir = connections.lane_channel_dir(row["instance"])
     picked = resolve_channel_env(channels_dir, channel_dir)
     if picked is None:
         raise connections.NoConnectionForRoom(

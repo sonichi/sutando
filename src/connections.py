@@ -475,6 +475,20 @@ def channel_dir_for(instance: str, environ: Optional[Mapping[str, str]] = None) 
     return environ.get("REMOTE_TASK_CHANNEL_DIR_" + _inst_var(instance), "") or f"{instance}-ag2space"
 
 
+def lane_channel_dir(instance: str, environ: Optional[Mapping[str, str]] = None,
+                     launch_file: Optional[Path] = None) -> str:
+    """Where `instance`'s channel env lives: `REMOTE_TASK_CHANNEL_DIR_<INST>` from the environment,
+    then from the launch-key file (`launch_file`, default the resolver's); else `channel_dir_for`."""
+    environ = os.environ if environ is None else environ
+    var = "REMOTE_TASK_CHANNEL_DIR_" + _inst_var(instance)
+    if launch_file is not None:
+        from channel_token import token_from_env_file
+        from_file = (token_from_env_file(var, launch_file) or "").strip()
+    else:
+        from_file = _launch_file_value(var)
+    return environ.get(var) or from_file or channel_dir_for(instance, environ)
+
+
 # ── preview: who is this token, according to its gateway ─────────────────────
 
 def _public_address(ip: str) -> bool:
@@ -1565,8 +1579,7 @@ def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
         return None
     environ = os.environ if environ is None else environ
     instance = str(row["instance"])
-    var = "REMOTE_TASK_CHANNEL_DIR_" + _inst_var(instance) if instance else ""
-    channel_dir = (environ.get(var) or _launch_file_value(var) or channel_dir_for(instance, environ)) if instance else None
+    channel_dir = lane_channel_dir(instance, environ) if instance else None
     servers = _row_servers(row)
     for mxid in (row.get("agent_mxid"), _channel_dir_value(channel_dir, "AGENT_MXID")):
         if isinstance(mxid, str) and _STRICT_MXID_RE.fullmatch(mxid.strip()) and server_of_mxid(mxid.strip()) in servers:
