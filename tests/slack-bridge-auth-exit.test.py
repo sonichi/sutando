@@ -114,6 +114,9 @@ class Handler:
 out, err = outcome_of(lambda: mod._start_socket_mode(Handler(SlackApiError("invalid_auth"))))
 check(out == ("exit", 78), f"apps.connections.open invalid_auth -> exit 78 (got {out})")
 check("vault set SLACK_APP_TOKEN" in err, "log names SLACK_APP_TOKEN")
+for code in ("not_allowed_token_type", "missing_scope"):
+    out, _ = outcome_of(lambda: mod._start_socket_mode(Handler(SlackApiError(code))))
+    check(out == ("exit", 78), f"apps.connections.open {code} (a config error) -> exit 78 (got {out})")
 out, _ = outcome_of(lambda: mod._start_socket_mode(Handler(SlackApiError("token_revoked"))))
 check(out == ("exit", 78), f"token_revoked -> exit 78 (got {out})")
 out, _ = outcome_of(lambda: mod._start_socket_mode(Handler(SlackApiError("internal_error"))))

@@ -655,7 +655,8 @@ _event_count = 0
 _event_count_lock = threading.Lock()
 
 _SLACK_AUTH_ERRORS = frozenset({
-    "invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"})
+    "invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired",
+    "not_allowed_token_type", "missing_scope"})
 
 
 def _slack_auth_error(exc: BaseException) -> bool:

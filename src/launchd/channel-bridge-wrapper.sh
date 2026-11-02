@@ -149,6 +149,8 @@ hold_for_credentials() {
     CHILD_PID=''
   done
   [ "$STOPPING" = 0 ] && echo "[$CHANNEL-bridge-wrapper] deliberate restart seen; retrying once" >&2
+  # Out of the hold: keep the stamp (one notice per restart) but drop the pid, so a retry that runs is not "held".
+  printf '%s\n' "$LAUNCH_STAMP" > "$AUTH_HELD"
   return 0
 }
 # A relaunch out of an auth hold is not a crash; the held notice already went out.

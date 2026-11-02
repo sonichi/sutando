@@ -93,6 +93,23 @@ check "relaunch while held: no new notice" "$(notices "$d" auth-failed)" 2
 check "relaunch while held: no restart notice" "$(notices "$d" restarted)" 0
 stop_wrapper "$p"; rm -rf "$d"
 
+echo "a retry that runs (rejected once, then a valid token):"
+d=$(setup 78)
+# First launch is rejected; every later launch runs, as after a vault fix and a deliberate restart.
+printf 'import sys, time\nopen("%s/launches", "a").write("x\\n")\nif sum(1 for _ in open("%s/launches")) == 1:\n    sys.exit(78)\ntime.sleep(600)\n' "$d" "$d" > "$d/src/discord-bridge.py"
+p=$(start_wrapper "$d")
+wait_for "first hold" ge held "$d" 1 && settle "$d"
+HELD_FILE="$d/ws/state/channel-bridge-supervisor/discord.auth-held"
+check "while held, the held file names the wrapper" "$(sed -n 2p "$HELD_FILE")" "$p"
+echo $(( $(/bin/date +%s) + 30 )) > "$d/ws/state/channel-bridge-supervisor/deliberate-restart"
+wait_for "the retry" ge launches "$d" 2
+wait_for "the retry runs" ge retries "$d" 1
+sleep 1
+check "the retry is running, not held again" "$(held "$d")" 1
+check "retry succeeds -> not held: the held file names no live pid" "$(wc -l < "$HELD_FILE" | tr -d ' ')" 1
+check "...and keeps the stamp, so no second notice for this restart" "$(notices "$d" auth-failed)" 1
+stop_wrapper "$p"; rm -rf "$d"
+
 echo "genuine crash loop (exit 1):"
 d=$(setup 1)
 p=$(start_wrapper "$d")
