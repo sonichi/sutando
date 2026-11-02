@@ -65,6 +65,38 @@ export function lineChange(state, line) {
   return null;
 }
 
+// A Codex tool call as the tool vocabulary phase_line.rules_phase reads, or null for no tool call.
+// The input never leaves this machine: phase_line takes the phase from it and stores no text.
+const ASKS = {request_user_input_async: 'AskUserQuestion', send_message: 'SendMessage', followup_task: 'SendMessage',
+  spawn_agent: 'Agent'};
+function argsOf(p) {
+  if (typeof p.arguments !== 'string') return {};
+  try { const a = JSON.parse(p.arguments); return a && typeof a === 'object' && !Array.isArray(a) ? a : {}; } catch { return {}; }
+}
+export function toolStep(p) {
+  if (!p || !TOOL_CALLS.has(p.type)) return null;
+  if (p.type === 'web_search_call') return {tool: 'WebSearch', input: {}};
+  if (p.type === 'mcp_tool_call') return {tool: `mcp__codex__${p.name || 'tool'}`, input: argsOf(p)};
+  const name = p.name || '';
+  if (name === 'apply_patch') return {tool: 'Edit', input: {}};
+  if (name === 'sleep' || name === 'wait') return {tool: 'Monitor', input: {}};
+  if (ASKS[name]) return {tool: ASKS[name], input: {}};
+  const a = argsOf(p);
+  const cmd = typeof p.input === 'string' ? p.input
+    : Array.isArray(a.command) ? a.command.join(' ') : typeof a.command === 'string' ? a.command
+    : typeof a.cmd === 'string' ? a.cmd : '';
+  return {tool: 'Bash', input: {command: cmd}};
+}
+
+// The task a tool call opens: the last `tasks/task-….txt` its text names (never a result's path).
+const TASK_PATH = /(?:^|[\/"'\s])tasks\/(task-[A-Za-z0-9_~.-]{1,120})\.txt/g;
+export function taskTouched(p) {
+  const text = typeof p?.input === 'string' ? p.input : typeof p?.arguments === 'string' ? p.arguments : '';
+  let id = null;
+  for (const m of text.matchAll(TASK_PATH)) id = m[1];
+  return id;
+}
+
 // Applies a change at `at` (epoch s); true when the record changed.
 export function apply(state, change, at) {
   if (!change) return false;
@@ -132,6 +164,8 @@ export class Observer {
     this.misses = 0;
     this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
     this.dirty = false;
+    this.task = null;
+    this.steps = [];
     this.timer = null;
     this.inFlight = false;
     this.python = '';
@@ -176,8 +210,11 @@ export class Observer {
     if (!file) return;
     const {text, size} = this.deps.readTail(file, TAIL_BYTES);
     this.offset = size;
-    // A tail read can start mid-line; that fragment fails to parse and is skipped.
-    this.feed(text);
+    // A tail read can start mid-line; that fragment fails to parse and is skipped. History binds
+    // the task the core is on but records no step: its steps happened before this observer.
+    this.task = null;
+    this.steps = [];
+    this.feed(text, true);
     this.markDirty();
   }
 
@@ -189,7 +226,7 @@ export class Observer {
     this.feed(chunk.text);
   }
 
-  feed(text) {
+  feed(text, history = false) {
     const lines = (this.rest + text).split('\n');
     this.rest = lines.pop();
     let changed = false;
@@ -197,6 +234,10 @@ export class Observer {
       let line;
       try { line = JSON.parse(raw); } catch { continue; }
       changed = apply(this.state, lineChange(this.state, line), epoch(line.timestamp, this.deps.now())) || changed;
+      if (line?.type !== 'response_item') continue;
+      this.task = taskTouched(line.payload) || this.task;
+      const step = toolStep(line.payload);
+      if (step && this.task && !history) { this.steps.push({task: this.task, ...step}); changed = true; }
     }
     if (changed) this.markDirty();
   }
@@ -225,6 +266,8 @@ export class Observer {
       this.python ||= await this.deps.resolvePython();
       if (!this.python) return;
       await this.deps.write(this.python, buildRecord(this.state, this.ident, this.deps.now()));
+      const steps = this.steps.splice(0);
+      if (steps.length && this.deps.steps) await this.deps.steps(this.python, steps);
     } catch {
       // The record is best effort; its lease lapses into "no opinion".
     } finally {
@@ -324,6 +367,11 @@ export function fileDeps(opts, io = fs) {
       const args = [path.join(opts.engine, 'src', 'runtime_observation.py'), 'write'];
       if (opts.workspace) args.push('--workspace', opts.workspace);
       return run(python, args, JSON.stringify(record));
+    },
+    steps: (python, steps) => {
+      const args = [path.join(opts.engine, 'skills', 'agent-activity', 'scripts', 'phase_line.py'), 'steps'];
+      if (opts.workspace) args.push('--workspace', opts.workspace);
+      return run(python, args, JSON.stringify(steps));
     },
   };
 }
