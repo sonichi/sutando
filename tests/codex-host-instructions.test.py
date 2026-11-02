@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""A desktop-hosted Codex core gets the host's AGENTS.md through its own Codex home.
+
+Run: python3 tests/codex-host-instructions.test.py
+"""
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
+import codex_host_instructions as chi  # noqa: E402
+
+SCRIPT = REPO / "src/codex_host_instructions.py"
+
+
+class EnsureLinked(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name).resolve()
+        self.home = root / "home"
+        self.engine = root / "Application Support" / "engine"
+        self.repo = self.engine / "sutando"
+        self.repo.mkdir(parents=True)
+        (self.repo / "AGENTS.md").write_text("checkout\n")
+        self.host = self.engine / "AGENTS.md"
+        self.host.write_text("host\n")
+        self.codex_home = root / "workspace" / ".codex-sutando"
+        self.target = self.codex_home / "AGENTS.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def link(self, codex_home=None, repo=None):
+        return chi.ensure_linked(codex_home or self.codex_home, repo or self.repo, self.home)
+
+    def test_a_fresh_codex_home_gets_the_host_file_and_a_rerun_changes_nothing(self):
+        self.assertEqual(self.link(), "linked")
+        self.assertEqual(Path(os.readlink(self.target)), self.host)
+        self.assertEqual(self.target.read_text(), "host\n")
+        self.assertEqual(self.link(), "already-set")
+
+    def test_a_checkout_outside_a_desktop_engine_dir_is_left_alone(self):
+        repo = Path(self.tmp.name).resolve() / "code" / "sutando"
+        repo.mkdir(parents=True)
+        (repo.parent / "AGENTS.md").write_text("the owner's own\n")
+        self.assertEqual(self.link(repo=repo), "no-host")
+        self.assertFalse(self.codex_home.exists())
+
+    def test_no_host_file_links_nothing(self):
+        self.host.unlink()
+        self.assertEqual(self.link(), "no-host")
+        self.assertFalse(self.target.exists())
+
+    def test_the_owners_own_codex_home_is_never_written(self):
+        owner = self.home / ".codex"
+        self.assertEqual(self.link(codex_home=owner), "owner-home")
+        self.assertFalse((owner / "AGENTS.md").exists())
+
+    def test_an_existing_file_or_other_link_is_kept(self):
+        self.codex_home.mkdir(parents=True)
+        self.target.write_text("mine\n")
+        self.assertEqual(self.link(), "foreign")
+        self.assertEqual(self.target.read_text(), "mine\n")
+        self.target.unlink()
+        other = self.codex_home / "other.md"
+        other.write_text("other\n")
+        self.target.symlink_to(other)
+        self.assertEqual(self.link(), "foreign")
+        self.assertEqual(Path(os.readlink(self.target)), other)
+
+    def test_a_dangling_link_is_replaced(self):
+        self.codex_home.mkdir(parents=True)
+        self.target.symlink_to(self.codex_home / "gone.md")
+        self.assertEqual(self.link(), "linked")
+        self.assertEqual(Path(os.readlink(self.target)), self.host)
+
+    def test_cli_prints_the_outcome(self):
+        out = subprocess.run([sys.executable, str(SCRIPT), str(self.codex_home), str(self.repo)],
+                             capture_output=True, text=True, env={**os.environ, "HOME": str(self.home)})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "linked")
+        self.assertTrue(self.target.is_symlink())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

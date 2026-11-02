@@ -78,6 +78,14 @@ The Codex implementation:
 - uses approval policy `never` and sandbox `danger-full-access`, matching the
   full local access required by the owner core;
 - enables web search and makes the user's home directory available;
+- raises Codex's 32 KiB `project_doc_max_bytes` default, which otherwise drops the
+  tail of the checkout's `AGENTS.md`;
+- on a desktop-hosted checkout (`<app-support>/engine/<checkout>`), links the
+  host's `engine/AGENTS.md` into `$CODEX_HOME/AGENTS.md`
+  (`src/codex_host_instructions.py`). Codex reads AGENTS.md only from its project
+  root down, so without the link a Codex core never sees the host's first-contact
+  and Getting started instructions that a Claude core reads from the parent
+  directory. The owner's `~/.codex` and an AGENTS.md already in the home are left alone;
 - honors `SUTANDO_CORE_MODEL`, `SUTANDO_CORE_WORKING_DIR`, and the more specific
   `SUTANDO_CODEX_WORKING_DIR`;
 - runs a separate managed `sutando-core-watcher` tmux session that converts

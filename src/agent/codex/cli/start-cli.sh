@@ -274,6 +274,8 @@ CODEX_ARGS=(
   # The core runs headless: an interactive "Update available" menu at startup
   # blocks it until someone answers, so the startup update check stays off.
   -c check_for_update_on_startup=false
+  # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
+  -c project_doc_max_bytes=131072
 )
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
@@ -291,6 +293,25 @@ ensure_codex_project_trust() {
     echo "  ⚠ could not record Codex project trust; the core may wait on a trust prompt" >&2
   fi
   return 0
+}
+
+# A desktop host's own AGENTS.md sits above the checkout, where Codex never looks; see
+# src/codex_host_instructions.py. Best effort: a failure leaves the core without it.
+ensure_codex_host_instructions() {
+  local py out
+  py="$(heartbeat_python)"
+  [ -n "$py" ] || return 0
+  if out="$("$py" "$REPO/src/codex_host_instructions.py" "${CODEX_HOME:-$HOME/.codex}" "$REPO")"; then
+    [ "$out" = linked ] && echo "  ✓ Codex core given the host's AGENTS.md"
+  else
+    echo "  ⚠ could not link the host's AGENTS.md; the core may miss its first-contact instructions" >&2
+  fi
+  return 0
+}
+
+prepare_codex_home() {
+  ensure_codex_project_trust
+  ensure_codex_host_instructions
 }
 
 apply_tmux_defaults() {
@@ -637,7 +658,7 @@ if ! tmux_available; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
-  ensure_codex_project_trust
+  prepare_codex_home
   stash_shutdown_sentinel
   clear_shutdown_sentinel
   # errexit would exit on the failed exec before the restore below is reached;
@@ -693,7 +714,7 @@ heal_core_window() {
   for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
-  ensure_codex_project_trust
+  prepare_codex_home
   if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" -c "$REPO" codex "${CODEX_ARGS[@]}")" \
      || [ -z "$idx" ]; then
     echo "  ⚠ could not create a core window in $SESSION — sentinel NOT cleared, no core is serving." >&2
@@ -727,7 +748,7 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
-  ensure_codex_project_trust
+  prepare_codex_home
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
   log_session_start

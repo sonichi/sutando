@@ -126,6 +126,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_services.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
+            "src/codex_host_instructions.py",
             "src/toml_fallback.py",
             "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
@@ -652,6 +653,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--ask-for-approval never", calls)
         self.assertIn("--search", calls)
         self.assertIn("-c check_for_update_on_startup=false", calls)
+        self.assertIn("-c project_doc_max_bytes=131072", calls)
         self.assertIn("-m gpt-test", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier-supervisor.sh", calls)
@@ -738,6 +740,32 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not record Codex project trust", result.stderr)
         self.assertFalse((self.root / "codex-home" / "config.toml").exists())
+
+    def test_a_desktop_hosted_core_gets_the_hosts_agents_md_in_its_codex_home(self):
+        """Codex never reads AGENTS.md above its project root, so the desktop's own
+        first-contact and Getting started instructions reach the core only this way."""
+        engine = Path(self.tmp.name) / "app-support" / "engine"
+        hosted = engine / "sutando"
+        shutil.copytree(self.root, hosted, symlinks=True)
+        self.root = hosted
+        (engine / "AGENTS.md").write_text("# Sutando in AG2 Space\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("could not link the host's AGENTS.md", result.stderr)
+        linked = Path(self.tmp.name) / "repo" / "codex-home" / "AGENTS.md"
+        self.assertTrue(linked.is_symlink(), result.stdout)
+        self.assertEqual(linked.read_text(), "# Sutando in AG2 Space\n")
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_checkout_outside_a_desktop_host_writes_no_agents_md(self):
+        (Path(self.tmp.name) / "AGENTS.md").write_text("not a host's\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "codex-home" / "AGENTS.md").exists())
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
