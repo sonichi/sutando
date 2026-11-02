@@ -5,6 +5,8 @@ its shim), mixed into each adapter's ConnectCode suite. A suite provides `local`
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import signal
 import sys
@@ -17,7 +19,7 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
 isolate_os_environ()
 
-from ag2_sparrow import connect_bridge as cb, connect_common as cm, task_io  # noqa: E402
+from ag2_sparrow import connect_bridge as cb, connect_common as cm, service_manager as sm, task_io  # noqa: E402
 
 MANAGERS = (("systemd", False), ("launchd", True))
 STOPS = {"stop", "bootout", "disable"}
@@ -220,6 +222,39 @@ class UndoSeams:
                         self.assertFalse(Path(fake.runner.acted).exists(), "it never acted on the root")
                     finally:
                         self._done(fake)
+
+    def test_after_settling_stop_started_stops_its_own_run_and_leaves_a_changed_one(self):
+        for changed in (False, True):
+            for name, mac in MANAGERS:
+                with self.subTest(manager=name, changed=changed), mock.patch.dict(cm._STARTED, clear=True):
+                    fake, successor = self._real(mac, f"settled-{int(changed)}"), []
+                    try:
+                        with mock.patch.object(cm, "is_macos", return_value=mac):
+                            rc, out, err = self.connect(self.backend(), fake)
+                            self.assertEqual(rc, 0, out + err)
+                            self.assertIn(self.local.name, cm._STARTED, "the settled start is recorded")
+                            ours, before = fake.runner.session, len(fake.runner.calls)
+                            if changed:
+                                fake.runner.start_session(by_manager=True)   # the manager's run is no longer ours
+                                successor.append(fake.runner.session)
+                            with cm.agent_lock(str(self.root)), contextlib.redirect_stdout(io.StringIO()), \
+                                    mock.patch.object(sm, "_run", side_effect=fake):
+                                line = cm.stop_started(self.local, str(self.root))
+                        verbs = {fake.runner.verb(c) for c in fake.runner.calls[before:]}
+                        if changed:
+                            self.assertIn("is no longer the job this connect started", line)
+                            self.assertIsNone(successor[0].poll(), "the changed run is left")
+                            self.assertFalse(STOPS & verbs)
+                        else:
+                            self.assertEqual(line, "")
+                            self.assertIsNotNone(ours.wait(timeout=30), "its own run exited")
+                            self.assertIn("bootout" if mac else "stop", verbs)
+                            self.assertNotIn(self.local.name, cm._STARTED)
+                    finally:
+                        self._done(fake)
+                        with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \
+                                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            cm.uninstall(self.local)
 
     def test_a_launchd_pid_shown_late_after_our_bootstrap_is_still_ours(self):
         fake = self._real(True, "late")

@@ -5,6 +5,7 @@ claude_code_fixtures.py."""
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import functools
 import io
@@ -191,6 +192,38 @@ class UndoUnits(ConnectBase):
                                        "why": "was already running when this operation asked for it"}
                 self.assertIn("so it is not this operation's", cm.stop_started(L, str(self.work)))
                 self.assertIn(L.name, cm._STARTED, "a run that is not ours stays recorded as it is")
+
+    def _ignoring_term(self):
+        child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, "
+                                  "signal.SIG_IGN); print('ready', flush=True); time.sleep(60)"],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()) if child.poll() is None else None)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        return child, {"pid": child.pid, "start": wait_for(lambda: task_io.start_time(child.pid)), "invocation": ""}
+
+    def test_a_run_that_ignores_sigterm_past_the_stop_bound_gets_the_exact_sigkill(self):
+        child, ident = self._ignoring_term()
+        quick = dataclasses.replace(L, stop_timeout_s=0.5)
+        idle = {"pid": None, "start": None, "invocation": "", "since": None}
+        with mock.patch.object(cm, "job_identity", return_value=idle), \
+                mock.patch.object(cm, "stop_supervisor", return_value="") as stop, \
+                mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as sig:
+            self.assertEqual(cm._stop_run(quick, ident), "")
+        self.assertEqual([c.args[2] for c in sig.call_args_list], [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
+        stop.assert_called_once_with(quick)
+
+    def test_a_run_seen_again_after_the_exit_is_left_without_the_manager_stop(self):
+        child, ident = self._ignoring_term()
+        quick = dataclasses.replace(L, stop_timeout_s=0.5)
+        again = {"pid": 999999, "start": "x", "invocation": "", "since": None}
+        with mock.patch.object(cm, "job_identity", return_value=again), \
+                mock.patch.object(cm, "stop_supervisor") as stop:
+            line = cm._stop_run(quick, ident)
+        self.assertEqual(line, f"pid {child.pid} exited, but it runs again as pid 999999, which is not provably this "
+                               "operation's, so that run was left")
+        stop.assert_not_called()
+        self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
 
     def test_each_failed_stop_step_leaves_the_job_and_says_why(self):
         ident = self.ident()
