@@ -18,9 +18,10 @@ This module owns the SELECTION, including the candidate ORDER:
 
 When none of those holds a primary token, `channel_values` reads the desktop's ACTIVE
 lane's own keys (`<NAME>_<LANE>`) from the launcher-named file, where a host signed in only
-on a secondary homeserver keeps its token; an identity it lacks comes from the lane's channel
-dir as `connections.lane_channel_dir` names it. Only `gateway_serving.active_lane` names the
-lane; no other suffixed key is read, and no lane name is decoded into a directory.
+on a secondary homeserver keeps its token (and any URL); only an identity it lacks comes
+from the lane's channel dir as `connections.lane_channel_dir` names it. Only
+`gateway_serving.active_lane` names the lane; no other suffixed key is read, and no lane
+name is decoded into a directory.
 
 The channels dir is the caller's input; this module never guesses a home dir.
 The two rules a channels-tree candidate must satisfy are each answered by
@@ -160,6 +161,10 @@ def channel_values(channels_dir, source: str, names) -> dict:
     return {n: v for n, v in found.items() if v}
 
 
+# Never a token or URL: those come from the device file's lane keys, so they always pair.
+LANE_DIR_NAMES = ("AGENT_MXID",)
+
+
 def _lane_dir_file(channels_dir, lane: str, device: Path) -> Path | None:
     import connections
     d = connections.lane_channel_dir(lane, launch_file=device)
@@ -172,14 +177,14 @@ def _lane_dir_file(channels_dir, lane: str, device: Path) -> Path | None:
 
 def active_lane_values(channels_dir, source: str, names) -> dict:
     """{name: value} for `active_lane_env`'s lane: each name's `<NAME>_<LANE>` key in the device
-    file; a non-token name it lacks (an identity) from the lane's channel dir file, if any."""
+    file; an identity name (`LANE_DIR_NAMES`) it lacks from the lane's channel dir file, if any."""
     lane_env = active_lane_env(channels_dir, source)
     if lane_env is None:
         return {}
     device, lane = lane_env
     names = tuple(names)
     found = {n: _lane_value(n, lane, device) for n in names}
-    rest = [n for n in names if not found[n] and n not in TOKEN_VARS]
+    rest = [n for n in names if not found[n] and n in LANE_DIR_NAMES]
     lane_file = _lane_dir_file(channels_dir, lane, device) if rest else None
     for n in rest if lane_file else ():
         found[n] = token_from_env_file(n, lane_file)

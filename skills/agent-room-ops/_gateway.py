@@ -119,11 +119,10 @@ def _from_channel_env(names, env_file=None):
     and a stored one still loses. Alias set matches the VAULT tier (which
     includes the legacy AG2_REMOTE_TOKEN), not the narrower env chain.
     """
-    default = env_file is None
     try:
         env_file = _channel_env_file() if env_file is None else env_file
         if env_file is None:
-            return _active_lane_value(names) if default else ""
+            return ""
         if not _core_src_on_path():
             return ""
         from channel_token import token_from_env_file
@@ -139,7 +138,7 @@ def _from_channel_env(names, env_file=None):
             return ""
         if got:
             return got
-    return _active_lane_value(names) if default else ""
+    return ""
 
 
 def _active_lane_value(names):
@@ -252,15 +251,20 @@ def gateway(room_id=None):
     else:
         raw, _name = gc.resolve_alias_precedence(
             os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+        token_names = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+        url_names = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL")
+        lane_raw = ""
         if not raw:
-            raw = _from_channel_env(
-                ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"))
+            raw = _from_channel_env(token_names) or (lane_raw := _active_lane_value(token_names))
         if not raw:
             raw = _token_from_vault()
-        explicit_url, _ = gc.resolve_alias_precedence(
-            os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-        if not explicit_url:
-            explicit_url = _from_channel_env(("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+        if lane_raw:
+            # The lane's bearer only ever goes to the lane's own relay: its URL key, else the token's.
+            explicit_url = _active_lane_value(url_names)
+        else:
+            explicit_url, _ = gc.resolve_alias_precedence(os.environ, url_names)
+            if not explicit_url:
+                explicit_url = _from_channel_env(url_names)
     creds = gc.normalize_credentials(raw, explicit_url=explicit_url,
                                      source="resolved" if raw else "none")
     headers = {"User-Agent": "sutando-room-ops/1"}

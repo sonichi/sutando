@@ -690,7 +690,8 @@ class CredentialTest(unittest.TestCase):
         device.parent.mkdir(parents=True)
         (support / "channels" / "active-gateway-lane").write_text("s_dspace\n")
         device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n"
-                          "AG2_REMOTE_TOKEN_OTHER=https://relay.test.invalid/relay|other-secret\n")
+                          "AG2_REMOTE_TOKEN_OTHER=https://relay.test.invalid/relay|other-secret\n"
+                          "REMOTE_TASK_URL=https://leftover.test.invalid/relay\n")
         (self.config / "channels" / "ag2space" / ".env").unlink()
         lane = {**self.base, "CLAUDE_CONFIG_DIR": str(support), "SUTANDO_APP_SUPPORT": str(support),
                 "AG2_DEVICE_ENV": str(device)}
@@ -698,6 +699,7 @@ class CredentialTest(unittest.TestCase):
             env = gs.commons_env(self.script)
         self.assertEqual(env.get("AG2_REMOTE_TOKEN"), "https://relay.test.invalid/relay|lane-secret")
         self.assertNotIn("ROOM_COMMONS_TOKEN", env)
+        self.assertNotIn("REMOTE_TASK_URL", env, "a leftover URL never pairs with the lane token")
 
     def test_redact_hides_credential_values_and_token_halves(self):
         env = {"AG2_REMOTE_TOKEN": "https://relay.test.invalid/r|s3cr3t-value", "ROOM_KEY": "short",

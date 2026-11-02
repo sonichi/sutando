@@ -343,6 +343,19 @@ class TestActiveLane(_Base):
         self.assertEqual(got, {"AGENT_MXID": "@lane.agent:example.test", "AG2_REMOTE_TOKEN": self.LANE_TOKEN},
                          "the token is the device file's lane key alone")
 
+    def test_a_lane_token_pairs_only_with_the_lanes_own_url_key(self):
+        names = ("REMOTE_TASK_URL", "AG2_REMOTE_TOKEN")
+        channels = self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
+                                 "REMOTE_TASK_URL=https://leftover.example/relay\n"
+                                 "REMOTE_TASK_CHANNEL_DIR_S_DSPACE=s.space\n")
+        (channels / "s.space").mkdir()
+        (channels / "s.space" / ".env").write_text("REMOTE_TASK_URL=https://lane-dir.example/relay\n")
+        self.assertEqual(m.channel_values(channels, "ag2space", names), {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+        device = channels / "ag2space" / ".env"
+        device.write_text(device.read_text() + "REMOTE_TASK_URL_S_DSPACE=https://gw.example/relay\n")
+        self.assertEqual(m.channel_values(channels, "ag2space", names),
+                         {"AG2_REMOTE_TOKEN": self.LANE_TOKEN, "REMOTE_TASK_URL": "https://gw.example/relay"})
+
     def test_a_lane_identity_key_in_the_device_file_wins(self):
         channels = self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
                                  "AGENT_MXID_S_DSPACE=@key.agent:example.test\n")
