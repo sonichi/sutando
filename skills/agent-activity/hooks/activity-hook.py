@@ -332,7 +332,7 @@ def consolidated_into(ws: Path, task_id: str) -> str | None:
 
 
 def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subprocess.run,
-         into: str | None = None) -> None:
+         into: str | None = None) -> bool:
     if kind == "done":
         cmd = [sys.executable, str(WRITER), "done", line, "--task-id", task["id"], "--workspace", str(ws)]
         if into:
@@ -347,7 +347,8 @@ def emit(kind: str, line: str, task: dict, room: str | None, ws: Path, run=subpr
         cmd += ["--event", task["event"]]
     if room:
         cmd += ["--room", room]
-    run(cmd, capture_output=True)
+    done = run(cmd, capture_output=True)
+    return getattr(done, "returncode", 0) == 0
 
 
 _IX = re.compile(r"Interaction-Id: (ix_[0-9a-f]{12})")
@@ -391,16 +392,41 @@ def handoff_post(ws: Path, tool, inp, tool_use_id, outcome: str = "done") -> Non
         pass
 
 
-def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> None:
-    """The phase sidecar's rules record (and, when switched on, the detached model call); never raises."""
+def _phase_line():
+    scripts = str(Path(__file__).resolve().parents[1] / "scripts")  # lint-workspace-resolution: allow-repo-root (sibling skill scripts, not a data root)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import phase_line
+    return phase_line
+
+
+def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> str | None:
+    """The phase sidecar's rules record (and, when switched on, the detached model call); its phase word,
+    or None. Never raises."""
     try:
-        scripts = str(Path(__file__).resolve().parents[1] / "scripts")  # lint-workspace-resolution: allow-repo-root (sibling skill scripts, not a data root)
-        if scripts not in sys.path:
-            sys.path.insert(0, scripts)
-        import phase_line
-        phase_line.on_step(ws, task_id, tool, inp, line)
+        return _phase_line().on_step(ws, task_id, tool, inp, line)
     except Exception:  # noqa: BLE001 - the live status must never break a tool call
-        pass
+        return None
+
+
+def show_step(ws: Path, task: dict, room: str, phase: str | None, line: str | None, run) -> list:
+    """One room row per tool call at most: its step line when it has one, else its phase word when the
+    room does not show that already (the client renders a room's newest working row). Never raises."""
+    if line:
+        emit("working", line, task, room, ws, run)
+        try:
+            _phase_line().note_line_shown(ws, task["id"])
+        except Exception:  # noqa: BLE001
+            pass
+        return [("working", line)]
+    if not phase:
+        return []
+    try:
+        shown = _phase_line().show_phase_if_new(ws, task["id"], phase,
+                                                lambda: emit("working", phase, task, room, ws, run))
+    except Exception:  # noqa: BLE001
+        shown = False
+    return [("working", phase)] if shown else []
 
 
 def stop_rulings(ws: Path) -> None:
@@ -470,9 +496,10 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
                 handoff_pre(p["ws"], owner["id"], tool, inp, payload.get("tool_use_id"))
         line = working_line(tool, inp) if isinstance(tool, str) else None
         task, room = bound_task(p, sid)
-        if task and isinstance(tool, str):
-            step_phase(p["ws"], task["id"], tool, inp, line)
-        if line and task:
+        phase = step_phase(p["ws"], task["id"], tool, inp, line) if task and isinstance(tool, str) else None
+        if task and room:
+            out += show_step(p["ws"], task, room, phase, line, run)
+        elif line and task:
             emit("working", line, task, room, p["ws"], run)
             out.append(("working", line))
     elif event == "PostToolUseFailure":

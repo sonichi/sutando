@@ -66,8 +66,14 @@ skill hook. The hook never depends on the agent remembering anything:
 - **Done, automatically.** A `PostToolUse` whose input wrote `results/task-….txt` (Write, or a shell
   redirect) writes the task's `done` row, only from the session the task is bound to and only if the
   result file exists once the tool has run: a denied or failed write closes nothing.
-- **Working.** Every later `PreToolUse` in that session (Read/Glob/Grep/TodoWrite skipped) becomes a
-  `working` row for the open task bound to it: the description's first sentence, 100 characters.
+- **Working.** Every later `PreToolUse` in that session writes at most one `working` row for the open
+  task bound to it, in the task's room (the client shows a room's newest working row):
+  - a call with a `description` writes its first sentence (100 characters), and never a phase; the step
+    line wins;
+  - a call without one writes its rules phase word (`scripts/phase_line.py`, e.g. "Running tests"), when
+    the room does not show that phase already.
+
+  The phase model's refinement feeds the published task status only, never a room row.
 - **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`
   (complete lines only, so a row mid-write is never split) and writes it as `thinking`.
 - **Turns.** Every event also folds into `state/agent-activity.turns.json`, keyed by the turn's

@@ -64,7 +64,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from channel_env_resolve import resolve_channel_env  # noqa: E402
+from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
@@ -5873,10 +5873,14 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["detail"] = f"{len(ledger)} ledger entr(y/ies) but none carry a parsable ts"
         return check
 
+    from quota_availability import models_match  # src/ is on sys.path
     own = _own_core_model()
+    # `default` names no model, so no rejection could ever be attributed to it.
+    if own and own.strip().lower() == "default":
+        own = None
     if own:
-        mine = [p for p in dated if p[0].get("model") == own]
-        others = [p for p in dated if p[0].get("model") != own]
+        mine = [p for p in dated if models_match(own, p[0].get("model"))]
+        others = [p for p in dated if not models_match(own, p[0].get("model"))]
         attribution = f"counting model={own}"
     else:
         mine, others = dated, []
@@ -6842,7 +6846,7 @@ def _gateway_configured() -> bool:
             return True
         # Which file defines the token is content, not filename, and the same
         # owner answers it for startup and for runtime-health.
-        return resolve_channel_env(claude_home_path("channels"), "ag2space") is not None
+        return channel_configured(claude_home_path("channels"), "ag2space")
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
@@ -9967,10 +9971,12 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
                 "detail": "no outbox root — nothing to park (this 0 is untestable)"}
     try:
         import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+        import outbox_cli  # noqa: PLC0415 - its body_gone is the requeue refusal's own rule
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
     parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
+    stranded: list[tuple[str, str, str]] = []  # QUEUED with nothing left to send
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9984,32 +9990,49 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
+            iid = str(d.get("item_id") or "?")
+            gone = d.get("item_id") and outbox_cli.body_gone(root, iid, results)
+            parked.append((root.name, iid, "body-gone" if gone else str(d.get("reason") or "")))
+        for d in outbox.list_items(root, status="QUEUED"):
+            iid = str(d.get("item_id") or "")
+            # Unclaimed and with no body anywhere: nothing will ever pick it up.
+            if iid and outbox.read_delivery_claim(root, iid) is None and outbox_cli.body_gone(root, iid, results):
+                stranded.append((root.name, iid, "queued-no-body"))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
-    if parked:
+    if parked or stranded:
         parked.sort()
+        stranded.sort()
 
         def listing(items):
             shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
                                for root_name, item_id, _reason in items[:4])
             return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
         # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        gone = [p for p in parked if p[2] == "body-gone"]
         unknown = [p for p in parked if p[2] == "outcome-unknown"]
-        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] not in ("outcome-unknown", "body-gone")]
         parts = []
+        if gone:
+            parts.append(f"{len(gone)} cannot be requeued, their body is gone (archived under "
+                         f"results/archive/) — re-send manually: {listing(gone)}")
+        if stranded:
+            parts.append(f"{len(stranded)} QUEUED with nothing to send (an earlier requeue of a "
+                         f"body-less reply) — re-send manually: {listing(stranded)}")
         if undelivered:
             parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
                          f"{listing(undelivered)}")
         if unknown:
             parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
                          f"checking the room: {listing(unknown)}")
+        recover = (f" Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                   f"(the root varies per item; a single hardcoded root under-reports)"
+                   if undelivered or unknown else "")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
-                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
-                          f"(the root varies per item; a single hardcoded root under-reports)"}
+                "detail": (f"{len(parked)} reply/replies PARKED; " if parked else "")
+                          + "; ".join(parts) + "." + recover}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 

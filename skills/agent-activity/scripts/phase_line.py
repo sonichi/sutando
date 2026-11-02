@@ -41,7 +41,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[2] / "src"))  # lint-workspace-resolution: allow-repo-root (engine src, not a data root)
-from file_lock import try_lock_fd, unlock_fd  # noqa: E402
+from file_lock import locked_file, try_lock_fd, unlock_fd  # noqa: E402
 
 SIDECAR = "agent-activity.phase.jsonl"
 MANIFEST = HERE.parent / "manifest.json"
@@ -234,6 +234,55 @@ def on_step(workspace, task_id: str, tool_name: str, tool_input, step: "str | No
     if model_on() and _debounced(workspace, task_id):
         (spawn or _spawn)(workspace, task_id)
     return phase
+
+
+# What the task's room row shows now, besides a phase word: a step line the hook wrote.
+SHOWN_LINE = "\x00line"
+
+
+def _shown_marker(workspace, task_id: str) -> Path:
+    return _marker(workspace, task_id, "shown")
+
+
+def _record_shown(marker: Path, value: str) -> bool:
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+        tmp.write_text(value, encoding="utf-8")
+        os.replace(tmp, marker)
+        return True
+    except OSError:
+        return False
+
+
+def show_phase_if_new(workspace, task_id: str, phase: str, write_row) -> bool:
+    """Write `phase` as the task's room row through `write_row()` (True when it landed) unless the room
+    already shows it. Compare, write and record run under one non-blocking lock: a racing caller skips,
+    and a write that failed is not recorded, so the next step tries again."""
+    marker = _shown_marker(workspace, task_id)
+    with _try_locked(marker.with_name(marker.name + ".lock")) as got:
+        if not got:
+            return False
+        try:
+            if marker.read_text(encoding="utf-8") == phase:
+                return False
+        except OSError:
+            pass
+        if not write_row():
+            return False
+        _record_shown(marker, phase)
+        return True
+
+
+def note_line_shown(workspace, task_id: str) -> None:
+    """The room now shows a step line, so the task's next phase row is due whatever its phase. Waits for
+    the lock (held only across one row write): a skipped record would leave that phase suppressed."""
+    marker = _shown_marker(workspace, task_id)
+    try:
+        with locked_file(marker.with_name(marker.name + ".lock")):
+            _record_shown(marker, SHOWN_LINE)
+    except OSError:
+        pass
 
 
 def _marker_dir(workspace) -> Path:

@@ -338,7 +338,7 @@ from . import health_command
 from . import __version__ as _PACKAGE_VERSION
 from . import delivery_destination as _delivery_destination
 from .outbox import dispatch_unsettled, record_provider_ref, released_by_operator
-from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
+from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
@@ -1082,7 +1082,9 @@ def _publish_review(path: Path, record: dict) -> bool:
         return False
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
-    body = _released_review_body(str(record.get("withheld_body") or ""))
+    raw = record.get("withheld_body")
+    # Only a string is a body: str() of a list or an int would publish its repr.
+    body = _released_review_body(raw) if isinstance(raw, str) else ""
     if not room.startswith("!") or not body:
         return _record_publish_failure(path, record, version, "invalid origin/body")
     core, item_id = _withheld_outbox(), f"{record['review_id']}.{claim}"
@@ -7735,6 +7737,10 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     return None
 
 
+# Stated in the lane record so Hatch's reply waits on the item this drain delivers a run under.
+_LANE_LIFECYCLE = 2 if LIFECYCLE_V2 else None
+
+
 def _lane_identity() -> str:
     """The identity the deliverability predicate uses, republished whenever this instance's lane
     record does not say it or is due a heartbeat, so Hatch judges rooms by it without reading the
@@ -7745,10 +7751,12 @@ def _lane_identity() -> str:
     rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
     if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip() \
             or rec.get("send_lock") != _delivery_destination.SEND_LOCK_PROTOCOL \
+            or rec.get("lifecycle") != _LANE_LIFECYCLE \
             or time.time() - rec.get("ts", 0) >= agent_identity.LANE_REFRESH_S:
         try:
             _LANE_OWNED.update(agent_identity.publish_lane(
-                _STATE, GATEWAY_INSTANCE, identity, send_lock=_delivery_destination.SEND_LOCK_PROTOCOL))
+                _STATE, GATEWAY_INSTANCE, identity, send_lock=_delivery_destination.SEND_LOCK_PROTOCOL,
+                lifecycle=_LANE_LIFECYCLE))
             _LANE_OWNED["failing"] = False
         except OSError as e:  # publish_lane has already tried to invalidate the old record
             if not _LANE_OWNED.get("failing"):
@@ -9397,10 +9405,8 @@ def _log_relay_end(tid: str, mark_retired: bool, *ids: str) -> None:
 
 
 def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:
-    """A suppressed close for an already-delivered item rides its own record."""
-    accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
-    return (f"{broker_tid}.lease-close"
-            if accepted.get("status") == "DELIVERED" else broker_tid)
+    """The item a result goes under; the outbox is read only for a suppressed close."""
+    return effective_item_id(core.backend.root, broker_tid, True) if no_send else broker_tid
 
 
 def _dispose_terminal(core, item_id: str, tid: str, record: dict, result_file,

@@ -136,7 +136,7 @@ class ConnectCode(AgentRootBase):
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-"),
                 plugin=True):
         fake = fake or self.bridged()
-        argv = ["connect", "--base", base, *code_args, *(("--plugin-dir", str(self.plugin)) if plugin else ()),
+        argv = ["connect", "--base", base, "--agent", AGENT, *code_args, *(("--plugin-dir", str(self.plugin)) if plugin else ()),
                 "--claude-config-dir",
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()

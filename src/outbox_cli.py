@@ -24,8 +24,9 @@ from typing import Optional
 # This module is src-canonical AND vendored into ag2_sparrow, so it must import
 # both ways. Relative first: it fails unambiguously when there is no package.
 try:
-    from . import outbox, undelivered_quarantine
+    from . import local_task_protocol, outbox, undelivered_quarantine
 except ImportError:
+    import local_task_protocol
     import outbox
     import undelivered_quarantine
 
@@ -87,11 +88,37 @@ def cmd_inspect(args) -> int:
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
+def body_gone(root, item_id: str, results_dir=None, body_id=None) -> Optional[str]:
+    """Why nothing can re-send `item_id`, or None when something can.
+
+    A task reply whose body lives outside the outbox (the Slack and Discord reply legs
+    publish an empty payload, keyed by the task id) re-sends only from a live
+    results/<id>.txt or a quarantined copy. A record with no payload and neither left
+    is a dead end: a requeue would leave it QUEUED with nothing to send. Other ids
+    (a proactive file's `name#mtime`) name their body differently and are not judged.
+    The one rule for that, shared by the requeue refusal and health-check.
+    """
+    if not local_task_protocol.valid_task_id(body_id or item_id):
+        return None
+    rec = outbox.read_item(Path(root), item_id)
+    if rec is None or rec.get("unreadable") or rec.get("payload"):
+        return None
+    results_dir = Path(results_dir or Path(root).parent)
+    body_id = body_id or item_id
+    if (results_dir / f"{body_id}.txt").exists() or undelivered_quarantine.find_quarantined(results_dir, body_id):
+        return None
+    # The one archive locator: every layout, exact ids only (never another task's prefix match).
+    archived = local_task_protocol.find_archived_result(results_dir, body_id)
+    where = f"; its archived copy is {archived}" if archived else "; no archived copy was found"
+    return f"the outbox holds no body for it and none is live or quarantined, so nothing can send it{where}"
+
+
 def cmd_requeue(args) -> int:
     """Exit 0 only when this call performed the transition; 3 = nothing to do;
     4 = the body could not be restored on this host (the record is left as
     the requeue made it; the body stays listed in undelivered/); 5 = refused before
-    anything changed: a malformed --body-sha256, or none while several bodies are parked;
+    anything changed: a malformed --body-sha256, none while several bodies are parked,
+    or a parked item with no body anywhere to send (see body_gone);
     6 = the item record cannot be parsed: nothing changed and no body was restored.
 
     A distinct code matters for the idempotent re-run: "already queued" is not
@@ -112,6 +139,13 @@ def cmd_requeue(args) -> int:
                    "error": "several quarantined bodies share this name; pass --body-sha256 for one",
                    "candidates": {str(p): undelivered_quarantine.sha256_of(p) for p in copies}}, args.json)
             return 5
+    gone = (body_gone(args.root, args.item_id, args.results_dir, getattr(args, "body_id", None))
+            if sha is None and outbox.item_status(args.root, args.item_id) == "PARKED" else None)
+    if gone:
+        # Refused before any state change: a REQUEUED item with nothing to send waits forever.
+        _emit({"item_id": args.item_id, "result": "refused",
+               "error": f"{gone}; re-send it manually"}, args.json)
+        return 5
     result, epoch_written = outbox.requeue_item_with_epoch(
         args.root, args.item_id,
         reset_attempts=args.reset_attempts,
