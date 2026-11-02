@@ -182,6 +182,29 @@ class Publisher(unittest.TestCase):
                     release.set()
                     gw._STEP_PUSH_THREAD.join(2)
 
+    def test_the_publisher_keeps_stepping_while_tasks_stay_in_flight(self):
+        live, snapshots = {"task-dev~task-a"}, []
+        def snapshot(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            if len(snapshots) == 3:
+                live.clear()  # the outbound worker retired the last task
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot):
+            gw._publish_task_steps_now(set(live), live)
+        self.assertEqual(len(snapshots), 3, "one snapshot now, then one per INTERVAL until the set empties")
+        snapshots.clear()
+        live.add("task-dev~task-a")
+        def snapshot_until_off(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            gw.TASK_STEP_PUBLICATION_ENABLED = lambda: False  # the switch turned off mid-flight
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot_until_off):
+            gw._publish_task_steps_now(set(live), live)
+        self.assertEqual(len(snapshots), 1, "the switch ends the loop before the next snapshot")
+        live.clear()
+
     def test_switch_declared_off_in_manifest(self):
         repo = Path(__file__).resolve().parents[1]
         manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())

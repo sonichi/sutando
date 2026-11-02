@@ -4346,13 +4346,16 @@ _STEP_PUSH_THREAD = None
 _STEP_PUSH_LOCK = threading.Lock()
 
 
+def _step_publication_enabled() -> bool:
+    try:
+        return callable(TASK_STEP_PUBLICATION_ENABLED) and TASK_STEP_PUBLICATION_ENABLED() is True
+    except Exception:
+        return False
+
+
 def _publish_task_steps(inflight: set[str]) -> None:
     global _STEP_PUSH_THREAD
-    try:
-        enabled = callable(TASK_STEP_PUBLICATION_ENABLED) and TASK_STEP_PUBLICATION_ENABLED() is True
-    except Exception:
-        enabled = False
-    if not enabled or not inflight or not _publication_permitted():
+    if not _step_publication_enabled() or not inflight or not _publication_permitted():
         return
     with _STEP_PUSH_LOCK:
         if _STEP_PUSH_THREAD is not None and _STEP_PUSH_THREAD.is_alive():
@@ -4363,8 +4366,20 @@ def _publish_task_steps(inflight: set[str]) -> None:
 
 
 def _publish_task_steps_now(inflight: set[str], live: "set[str] | None" = None) -> None:
+    """One snapshot now and, while `live` (the outbound worker's own set) still holds tasks, another
+    every INTERVAL: a step then reaches the ledger within the publisher's own throttle, not after
+    the next relay poll (up to POLL_WAIT later). Ends with the set, the switch or the ownership."""
     try:
         _publish_task_steps_snapshot(inflight, live)
+        while live:
+            time.sleep(task_step_publisher.INTERVAL)
+            if not live or not _step_publication_enabled() or not _publication_permitted():
+                return
+            try:
+                now = set(live)
+            except RuntimeError:  # the outbound worker changed the set mid-copy: next INTERVAL
+                continue
+            _publish_task_steps_snapshot(now, live)
     except Exception as exc:
         _log(f"task step publisher failed ({type(exc).__name__}); continuing")
 
