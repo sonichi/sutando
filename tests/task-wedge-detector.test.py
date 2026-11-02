@@ -11,6 +11,9 @@ import unittest
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+from _helpers.hermetic_env import isolate_os_environ
+isolate_os_environ()
 sys.path.insert(0, str(REPO / 'src'))
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 import wedge_detector as detector
@@ -293,6 +296,18 @@ class Wedges(unittest.TestCase):
                                              signals=[], silence_s=300), self.normal)
         self.blocked(detector.status_for(self.ws, 'task-a', self.normal, now=400,
                                         signals=[], silence_s=300))
+
+    def test_accepted_task_without_any_step_uses_production_activity_writer(self):
+        from activity_bus import ActivityStore, LifecycleTransition
+        sys.path.insert(0, str(REPO / 'skills' / 'agent-activity' / 'scripts'))
+        import phase_line
+        store = ActivityStore(self.ws)
+        store.apply(LifecycleTransition('task-accepted', 'RUNNING', ts=100, room='!test:example'))
+        with patch.object(detector, '_signals', return_value=[]), \
+                patch.object(phase_line, 'setting', side_effect=lambda key, default: default):
+            self.assertEqual(phase_line.published_status(self.ws, 'task-accepted', now=279)['phase'],
+                             'Understanding the request')
+            self.blocked(phase_line.published_status(self.ws, 'task-accepted', now=280))
 
     def test_phase_line_to_real_publisher_silence_and_recovery(self):
         sys.path.insert(0, str(REPO / 'skills' / 'agent-activity' / 'scripts'))

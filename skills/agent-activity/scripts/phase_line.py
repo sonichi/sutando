@@ -818,7 +818,9 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
     if share_line:
         out["summary"] = shareable_line(workspace, task_id, st)
     try:
-        silence_s = max(1.0, float(setting("WEDGE_SILENCE_SECONDS", "180")))
+        silence_s = float(setting("WEDGE_SILENCE_SECONDS", "180"))
+        if not math.isfinite(silence_s) or silence_s < 1:
+            silence_s = 180.0
     except (TypeError, ValueError):
         silence_s = 180.0
     return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s)
