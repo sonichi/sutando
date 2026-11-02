@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Worker launch names and room routing, using only synthetic credentials."""
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
@@ -39,7 +39,7 @@ class WorkerChannelLaunchTests(unittest.TestCase):
     def test_launchers_carry_names_and_redact_probe(self):
         for runtime in ("claude", "codex"):
             with self.subTest(runtime=runtime):
-                env = dict(os.environ, SUTANDO_PY=sys.executable,
+                env = isolated_child_env(SUTANDO_PY=sys.executable,
                            AG2_DEVICE_ENV=str(self.three.root / "launcher.env"),
                            SUTANDO_INSTANCE_ID="test-worker", SUTANDO_TMUX_SESSION="test-worker",
                            SUTANDO_TASKS_DIR=str(self.three.workspace / "deliveries"),
@@ -63,13 +63,13 @@ class WorkerChannelLaunchTests(unittest.TestCase):
         fixture = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fixture)
         with tempfile.TemporaryDirectory() as tmp:
-            result, _, log, _, _ = fixture.CodexWorkerResetLauncherTests()._launch(tmp)
+            result, _, log, _, _ = fixture.CodexWorkerResetLauncherTests()._launch(tmp, extra=isolated_child_env())
             self.assertEqual(result.returncode, 0, result.stderr)
             for server, (instance, _, _) in SERVERS.items():
                 self.assertIn("-e " + connections.token_ref_for(instance) + "=" + token(server), log.read_text())
 
     def test_forwarded_environment_routes_each_room_as_core(self):
-        core = dict(os.environ)
+        core = isolated_child_env()
         seat = {name: core[name] for name in channel_env_resolve.launch_env_names(core)}
         for server, room in ROOMS.items():
             with self.subTest(server=server), mock.patch.dict(os.environ, seat, clear=True):
