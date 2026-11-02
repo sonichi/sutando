@@ -17,6 +17,8 @@ from local_task_protocol import valid_local_task_id
 
 SILENCE_S = 180.0
 CONFIRM_S = 20.0
+WATCHER_CONFIRM_S = 60.0
+WATCHER_POLL_GAP_S = 30.0
 DM_AFTER_S = 60.0
 SIGNAL_FRESH_S = 60.0
 TAIL_BYTES = 256 * 1024
@@ -24,7 +26,7 @@ MESSAGES = {
     "provider-limit": "Provider limit reached. Wait for reset or change provider.",
     "pane-prompt-blocked": "Approval or sign-in needed. Open the runtime to continue.",
     "watcher-not-ready": "Task watcher unavailable. Re-arm the runtime watcher.",
-    "core-status-stale": "Runtime progress stopped. Check the runtime before restarting.",
+    "core-status-stale": "Runtime status has not refreshed. Check current task activity.",
     "activity-silent": "No recent task activity. Check the running tool or runtime.",
 }
 _PROBE_CACHE = {}
@@ -178,13 +180,20 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
         same = previous.get("kind") == kind and previous.get("generation") == snap.get("generation")
         if kind == "activity-silent" and last != previous.get("activity_at"):
             same = False
+        observed_at = _number(previous.get("observed_at"))
+        if kind == "watcher-not-ready" and (observed_at is None or not 0 <= now - observed_at <= WATCHER_POLL_GAP_S):
+            same = False
         state = previous if same else {"kind": kind, "generation": snap.get("generation"), "first": now}
         if kind == "activity-silent" and not same:
             state["first"] = last + silence_s
         state["activity_at"] = last
+        state["observed_at"] = now
         _save(path, state)
-        if kind != "activity-silent" and now - state["first"] < CONFIRM_S:
+        confirm_s = WATCHER_CONFIRM_S if kind == "watcher-not-ready" else CONFIRM_S
+        if kind != "activity-silent" and now - state["first"] < confirm_s:
             return status
+        if kind == "core-status-stale":
+            return {**status, "summary": MESSAGES[kind]}
         if now - state["first"] >= DM_AFTER_S:
             _owner_notice(workspace, task_id, state, path)
         return {"phase": "Waiting", "summary": MESSAGES[kind], "since": state["first"],

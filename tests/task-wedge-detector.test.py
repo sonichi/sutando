@@ -70,6 +70,39 @@ class Wedges(unittest.TestCase):
         self.assertEqual(self.check(100, [signal]), self.normal)
         self.assertEqual(self.check(120, [signal]), self.normal)
 
+    def test_watcher_rearm_gaps_do_not_notify_and_sustained_loss_does(self):
+        signal = self.signal('watcher-not-ready')
+        for now in (100, 110):
+            self.assertEqual(self.check(now, [signal]), self.normal)
+        self.assertEqual(self.check(120), self.normal)
+        for now in range(130, 190, 10):
+            self.assertEqual(self.check(now, [signal]), self.normal)
+        self.assertEqual(self.notices(), [])
+        self.blocked(self.check(190, [signal]))
+        self.assertEqual(len(self.notices()), 1)
+        self.activity('task-a', 200)
+        self.assertEqual(self.check(200), self.normal)
+
+    def test_missing_polls_do_not_prove_persistent_watcher_loss(self):
+        signal = self.signal('watcher-not-ready')
+        self.assertEqual(self.check(100, [signal]), self.normal)
+        self.assertEqual(self.check(160, [signal]), self.normal)
+        for now in range(170, 220, 10):
+            self.assertEqual(self.check(now, [signal]), self.normal)
+        self.assertEqual(self.notices(), [])
+        self.blocked(self.check(220, [signal]))
+
+    def test_stale_core_without_corroboration_is_only_a_working_hint(self):
+        signal = dict(self.signal('core-status-stale'), since=100)
+        for now in range(800, 1400, 10):
+            shown = self.check(now, [signal])
+            self.assertEqual(shown['phase'], self.normal['phase'])
+            self.assertNotIn('waiting', shown)
+        self.assertIn('status has not refreshed', shown['summary'])
+        self.assertEqual(self.notices(), [])
+        self.activity('task-a', 1400)
+        self.assertEqual(self.check(1400, [signal]), self.normal)
+
     def test_accepted_snapshot_does_not_revert_to_queue_after_pickup_expires(self):
         path = self.ws / 'state' / 'activity' / 'task-a.json'
         path.write_text(json.dumps({'task_id': 'task-a', 'phase': 'RUNNING', 'last_activity_at': 100}))
@@ -77,7 +110,7 @@ class Wedges(unittest.TestCase):
         self.blocked(self.check(3800, status=status))
 
     def test_each_signature_debounces_and_keeps_stable_overlay(self):
-        for kind in ('provider-limit', 'pane-prompt-blocked', 'watcher-not-ready', 'core-status-stale'):
+        for kind in ('provider-limit', 'pane-prompt-blocked'):
             with self.subTest(kind=kind):
                 signal = self.signal(kind)
                 self.assertEqual(self.check(100, [signal]), self.normal)
@@ -142,7 +175,9 @@ class Wedges(unittest.TestCase):
         self.activity('task-worker', 100, worker='worker-b')
         signal = self.signal('watcher-not-ready', task=None)
         self.check(100, [signal])
-        self.blocked(self.check(120, [signal]))
+        for now in range(110, 160, 10):
+            self.assertEqual(self.check(now, [signal]), self.normal)
+        self.blocked(self.check(160, [signal]))
         self.assertEqual(self.check(100, [signal], task='task-worker'), self.normal)
         self.assertEqual(self.check(120, [signal], task='task-worker'), self.normal)
 
