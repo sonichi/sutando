@@ -592,6 +592,34 @@ class Hooks(unittest.TestCase):
         self.assertTrue(set(types) <= set(found) and "vault-set command" in found)
         self.assertNotIn(gw.QUESTION_REDACTED, out)
 
+    def test_a_same_lease_redelivery_of_an_earlier_bridges_v1_held_serve_is_accepted(self):
+        for lost in (False, True):
+            with self.subTest(lost=lost):
+                tid = f"task-probe-v1-upgrade-{lost}"
+                self.addCleanup(self.forget, tid)
+                self.served_acked(tid)
+                task = _task(tid, lease_id="L2", source_event_id="$e", task="hello")
+                self.assertEqual(gw._write_task(task), (tid, True))
+                pend = dict(gw._ATTEMPTS.get(tid)["pending_serve"])
+                run, new_ref = pend["run"], pend["reserve"]
+                body = {**task, "id": tid}               # what an earlier bridge saved: a raw format-1 v1- copy
+                env = {"format": 1, "owner": {"task": tid, "candidate_run": run, "lease": "L2"},
+                       "sha256": gw._digest(body), "task": body}
+                v1 = gw._reserve_id(tid, run, "L2", 1)
+                (gw._reserve_dir() / f"{new_ref['id']}.json").unlink()
+                if not lost:
+                    (gw._reserve_dir() / f"{v1}.json").write_text(json.dumps(env, sort_keys=True))
+                v1_ref = {"id": v1, "run": run, "lease": "L2", "sha256": env["sha256"]}
+                with gw._ATTEMPTS.transition(tid) as t:
+                    self.assertTrue(t.put(pending_serve={**pend, "reserve": v1_ref}))
+                self.assertEqual(gw._write_task(task), (tid, True), "accepted under the same lease")
+                kept = gw._ATTEMPTS.get(tid)["pending_serve"]["reserve"]
+                if lost:
+                    self.assertTrue(kept["id"].startswith("v2-"), "a lost v1- copy is made again, redacted")
+                    self.assertTrue((gw._reserve_dir() / f"{kept['id']}.json").exists())
+                else:
+                    self.assertEqual(kept, v1_ref, "the earlier bridge's copy is kept as it is")
+
     def test_a_v2_copy_without_its_redaction_record_is_lost_not_read_raw(self):
         tid = "task-reserve-v2-format1"
         env = {"format": 1, "owner": {"task": tid, "candidate_run": f"{tid}~~2", "lease": "L2"},

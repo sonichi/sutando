@@ -6364,6 +6364,22 @@ def _drop_reserve(wire_tid: str, ref) -> None:
                             f"task {wire_tid}: the removal of its saved serve")
 
 
+def _same_held_copy(t, pending: dict, lease: "str | None", task: dict) -> bool:
+    """Whether the held serve's saved copy is this serve's, made again when it is gone. A v1- copy an
+    earlier bridge saved is kept while it reads as this serve's; a lost one is replaced redacted."""
+    ref, run = pending["reserve"], pending["run"]
+    if not (isinstance(ref, dict) and str(ref.get("id", "")).startswith("v1-")):
+        return _save_reserve(t.wire, run, lease, task) == ref
+    try:
+        _read_reserve(t.wire, ref, run, lease)
+        return True
+    except _ReserveLost:
+        new = _save_reserve(t.wire, run, lease, task)
+        return new is not None and bool(t.put(pending_serve={**pending, "reserve": new}))
+    except OSError:
+        return False
+
+
 def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str, None, bool] | None":
     """A new lease for a run that may already be executing: the run keeps its generation and nothing
     is published. The serve, with a run allocated for it, waits for its ack to name the generation:
@@ -6372,7 +6388,7 @@ def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str,
     pending = rec.get("pending_serve") if isinstance(rec.get("pending_serve"), dict) else {}
     if pending.get("lease") == lease and pending.get("run"):
         # The same held serve, delivered again: its saved copy is checked, or made again, first.
-        if "reserve" not in pending or _save_reserve(t.wire, pending["run"], lease, task) == pending["reserve"]:
+        if "reserve" not in pending or _same_held_copy(t, pending, lease, task):
             return rec["run"], None, True
         _log_backoff((first, "unrecorded"), f"task {first}: its held serve's saved copy is not this serve "
                      "— left unacked for a re-serve")
