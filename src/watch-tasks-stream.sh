@@ -389,6 +389,7 @@ fi
 # config exists but could not be copied or parsed; nothing routes on it.
 HANDLER_STATE="absent"
 HELD_NAMES=""
+ANSWERED_NAMES=""
 HELD_RETRY_AT=0
 DISPATCHED_IDS=""
 DECISION_IDENTITY=""
@@ -642,6 +643,7 @@ reconcile_dead_claims() {
     [ "${1:-}" = "hold" ] || continue
     fn="$(basename "$task_path")"
     [ -f "$TASKS_DIR/$fn" ] || continue
+    dispatch_note "$fn" "held for an immediate retry: a dead watcher's claim on it was retired"
     hold_task "$fn" now
   done
   shopt -u nullglob
@@ -649,6 +651,21 @@ reconcile_dead_claims() {
 
 # A task decided later: held names are replayed by redispatch_held_tasks once the
 # deadline passes ("now" makes the next event the deadline).
+# One stderr line per dispatch decision, so a task neither announced nor run always names why.
+dispatch_note() {
+  echo "watch-tasks-stream: dispatch $1: $2" >&2
+}
+# Why a claim was not acquired: a live owner (named), or none (our own start unreadable, or a lost race).
+claim_hold_reason() {
+  local claim="$CLAIMS_DIR/$1" owner
+  owner="$(sed -n '1p' "$claim" 2>/dev/null)"
+  if [ -n "$owner" ] && claim_is_live "$claim"; then
+    printf 'claimed by live watcher pid %s' "$owner"
+  else
+    printf 'claim not acquired (no live owner: own start time unreadable or a lost race)'
+  fi
+}
+
 hold_task() {
   local fn="$1"
   printf '%s' "$HELD_NAMES" | grep -qxF -- "$fn" && return 0
@@ -729,7 +746,9 @@ run_handler_now() {
     0) ;;
     # Not ours now: another watcher's live claim, or our own identity unreadable.
     # Either may clear with nobody to tell us, so the timer re-asks.
-    *) hold_task "$filename"; return 0 ;;
+    *)
+      dispatch_note "$filename" "held: $(claim_hold_reason "$filename"); retried in ${HELD_RETRY_INTERVAL}s"
+      hold_task "$filename"; return 0 ;;
   esac
   record_admission
   activity_transition RUNNING "$task_path"
@@ -764,6 +783,10 @@ run_handler_now() {
       record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
       transition after-done "$filename"
     fi
+  fi
+  [ "$handler_rc" -ne 0 ] || dispatch_note "$filename" "handled by the task handler (exit 0)"
+  if [ "$handler_rc" -ne 0 ] && ! claim_is_ours "$filename"; then
+    dispatch_note "$filename" "handler exit $handler_rc, and the claim is no longer this watcher's; its owner settles it"
   fi
 
   if [ "$handler_rc" -ne 0 ] && claim_is_ours "$filename"; then
@@ -906,6 +929,8 @@ dispatch_task() {
   # A sentinel nothing retires is re-swept after every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
   if handler_result_is_answer "$filename"; then
+    ANSWERED_NAMES="$ANSWERED_NAMES$(basename "$1")
+"
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
     return 0
   fi
@@ -965,18 +990,24 @@ dispatch_task() {
     --repo "$__REPO_ROOT" \
     --probe >/dev/null
   rc=$?
+  # Every decision after the probe says which way it went: a task that is neither announced nor run is
+  # otherwise invisible (one was, in a live core's inbox, with nothing on stderr).
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
+      dispatch_note "$filename" "probe rc=0: announced to the live core (an earlier run left a fallback receipt)"
       emit_dispatch_task_file "$announce" && record_admission
       return
     fi
+    dispatch_note "$filename" "probe rc=0: running the task handler"
     run_handler_now "$task_path" "fallback"
   elif [ "$rc" -eq 4 ]; then
     # A required handler is a security boundary. Remove any legacy fallback
     # receipt and never make this task visible to the unrestricted live core.
     rm -f "$FALLBACKS_DIR/$filename"
+    dispatch_note "$filename" "probe rc=4: running the required task handler"
     run_handler_now "$task_path" "must-handle"
   elif [ "$rc" -eq 3 ]; then
+    dispatch_note "$filename" "probe rc=3: the handler declined it; announced to the live core"
     emit_dispatch_task_file "$announce" && record_admission
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
@@ -1153,7 +1184,30 @@ catchup_sweep() {
   while IFS= read -r f; do
     [ -n "$f" ] && handle_event "$f"
   done < <(find "$TASKS_DIR_ABS" -maxdepth 1 -name '*.txt' -cnewer "$CATCHUP_MARK" ! -cnewer "$cut" 2>/dev/null | sort)
+  redispatch_stranded
   mv -f "$cut" "$CATCHUP_MARK"
+}
+# Still in the inbox a pass later, never admitted by this watcher, neither held nor answered: dropped on the
+# way for a reason nobody logged. Dispatched again each pass, so an unexplained drop heals within two passes.
+redispatch_stranded() {
+  local f fn identity
+  [ ! -f "$STATE_DIR/shutdown.sentinel" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    fn="$(basename "$f")"
+    printf '%s' "$HELD_NAMES" | grep -qxF -- "$fn" && continue
+    # Answered once is answered for good: each costs a resolver run, and a long-lived inbox holds many.
+    printf '%s' "$ANSWERED_NAMES" | grep -qxF -- "$fn" && continue
+    identity="$fn|$(task_file_identity "$f")"
+    [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity" && continue
+    if handler_result_is_answer "$fn"; then
+      ANSWERED_NAMES="$ANSWERED_NAMES$fn
+"
+      continue
+    fi
+    dispatch_note "$fn" "re-dispatching: still in the inbox a catch-up pass later and never admitted by this watcher"
+    handle_event "$f"
+  done < <(find "$TASKS_DIR_ABS" -maxdepth 1 -name '*.txt' ! -cnewer "$CATCHUP_MARK" 2>/dev/null | sort)
 }
 # A session watcher sweeps only once the standby has stopped (below); any other
 # role has no peer on its inbox and sweeps before it subscribes, as always.
