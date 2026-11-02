@@ -442,6 +442,11 @@ class AgentAccess(unittest.TestCase):
         gw._AGENT_ACCESS.update(token="", until=0.0)
         self.assertEqual(self.run_step(self.mint({"access_token": "a"}), self.endpoint(self.http(404))),
                          {"status": "not_deployed", "http_status": 404, "error_code": None})
+        # A body that cannot be read (the response already closed) is still a skip, with no code.
+        closed = self.http(404)
+        closed.fp.close()
+        self.assertEqual(self.run_step(self.mint(), self.endpoint(closed)),
+                         {"status": "not_deployed", "http_status": 404, "error_code": None})
         self.assertEqual(self.run_step(self.mint(), self.endpoint(self.tool_error("NOT_FOUND"))),
                          {"status": "not_deployed"})
         gw._AGENT_ACCESS.update(token="", until=0.0)
