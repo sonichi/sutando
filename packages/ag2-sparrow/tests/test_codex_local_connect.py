@@ -42,6 +42,7 @@ sys.path.insert(0, str(PKG))
 from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
 from ag2_sparrow import gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # the shared seam suite, also under runpy
 from connect_undo_seams import UndoSeams  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
