@@ -420,16 +420,32 @@ def host_problem(command: str) -> str:
     return ""
 
 
+def known_root_problem(local: cm.Shape) -> str:
+    """What would refuse after the redemption, asked before it: the config and unit connect may not
+    change, and the root, its agent lock and its seat. The root is known now only as `local`'s recorded
+    ROOT (the only one connect's install accepts); with none, any agent operation in progress refuses."""
+    cfg, problem = cm.owned_config(local)
+    problem = problem or cm.owned_text(cm.supervisor_path(local), cm.supervisor_marker(local), "supervisor file")[1]
+    if problem:
+        return problem
+    root = (cfg or {}).get("ROOT", "")
+    busy = cm.agent_lock_busy(root) if root else cm.agent_operation_in_progress()
+    if busy:
+        return f"another operation on an agent is in progress (lock {busy}); wait for it, then try again"
+    return (cm._free_root_problem(root) or cm.seat_problem(bridge_home(root))) if root else ""
+
+
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
                      local: cm.Shape) -> "tuple[dict | None, str]":
-    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): the code read, checked with
-    `preflight()` and refused while `local`'s job runs, both before it is spent; redeemed once; the
+    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): `preflight()`, `local`'s
+    job and known_root_problem asked before the code is even read; the code checked, then redeemed once; the
     credential written to the agent's seat only while this process holds the free root and its path still
     names it (connect_common.under_root). `root_id` is that root's identity, for install to hold to; `lock`
     is the agent lock, taken once the root is known and held until finish_connect. The bearer never leaves
     the seat's token file."""
-    code, problem = cm.read_code(code_arg)
-    problem = problem or cm.code_problem(base, code) or preflight() or cm.active_job_problem(local)
+    problem = preflight() or cm.active_job_problem(local) or known_root_problem(local)
+    code, why = cm.read_code(code_arg) if not problem else ("", "")
+    problem = problem or why or cm.code_problem(base, code)
     if problem:
         return None, f"{problem}; the code was not used"
     redeemed, problem = cm.redeem_code(base, code)
