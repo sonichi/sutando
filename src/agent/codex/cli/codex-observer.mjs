@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Read-only observer of the Codex core: publishes its runtime observation record from the rollout
-// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace].
+// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace] [--seat].
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -65,6 +65,38 @@ export function lineChange(state, line) {
   return null;
 }
 
+// A Codex tool call as the tool vocabulary phase_line.rules_phase reads, or null for no tool call.
+// The input never leaves this machine: phase_line takes the phase from it and stores no text.
+const ASKS = {request_user_input_async: 'AskUserQuestion', send_message: 'SendMessage', followup_task: 'SendMessage',
+  spawn_agent: 'Agent'};
+function argsOf(p) {
+  if (typeof p.arguments !== 'string') return {};
+  try { const a = JSON.parse(p.arguments); return a && typeof a === 'object' && !Array.isArray(a) ? a : {}; } catch { return {}; }
+}
+export function toolStep(p) {
+  if (!p || !TOOL_CALLS.has(p.type)) return null;
+  if (p.type === 'web_search_call') return {tool: 'WebSearch', input: {}};
+  if (p.type === 'mcp_tool_call') return {tool: `mcp__codex__${p.name || 'tool'}`, input: argsOf(p)};
+  const name = p.name || '';
+  if (name === 'apply_patch') return {tool: 'Edit', input: {}};
+  if (name === 'sleep' || name === 'wait') return {tool: 'Monitor', input: {}};
+  if (ASKS[name]) return {tool: ASKS[name], input: {}};
+  const a = argsOf(p);
+  const cmd = typeof p.input === 'string' ? p.input
+    : Array.isArray(a.command) ? a.command.join(' ') : typeof a.command === 'string' ? a.command
+    : typeof a.cmd === 'string' ? a.cmd : '';
+  return {tool: 'Bash', input: {command: cmd}};
+}
+
+// The task a tool call opens: the last `tasks/task-….txt` its text names (never a result's path).
+const TASK_PATH = /(?:^|[\/"'\s])tasks\/(task-[A-Za-z0-9_~.-]{1,120})\.txt/g;
+export function taskTouched(p) {
+  const text = typeof p?.input === 'string' ? p.input : typeof p?.arguments === 'string' ? p.arguments : '';
+  let id = null;
+  for (const m of text.matchAll(TASK_PATH)) id = m[1];
+  return id;
+}
+
 // Applies a change at `at` (epoch s); true when the record changed.
 export function apply(state, change, at) {
   if (!change) return false;
@@ -88,7 +120,7 @@ export function apply(state, change, at) {
 export function buildRecord(state, ident, now) {
   return {
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
-    observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
+    observer_started_at: ident.startedAt, seat: ident.seat || 'core', session: ident.session, claude_session_id: null,
     seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: state.conditionSince,
     last_success_at: state.lastSuccessAt, heartbeat_at: now, phase: state.phase, motion: state.motion,
     condition: state.condition, reason: state.condition === 'abnormal' ? (state.reason || 'api-error') : null,
@@ -130,8 +162,11 @@ export class Observer {
     this.ticks = 0;
     this.gone = 0;
     this.misses = 0;
-    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
+    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session,
+      seat: opts.seat || 'core'};
     this.dirty = false;
+    this.bound = [];
+    this.steps = [];
     this.timer = null;
     this.inFlight = false;
     this.python = '';
@@ -176,8 +211,11 @@ export class Observer {
     if (!file) return;
     const {text, size} = this.deps.readTail(file, TAIL_BYTES);
     this.offset = size;
-    // A tail read can start mid-line; that fragment fails to parse and is skipped.
-    this.feed(text);
+    // A tail read can start mid-line; that fragment fails to parse and is skipped. History binds
+    // the task the core is on but records no step: its steps happened before this observer.
+    this.bound = [];
+    this.steps = [];
+    this.feed(text, true);
     this.markDirty();
   }
 
@@ -189,7 +227,7 @@ export class Observer {
     this.feed(chunk.text);
   }
 
-  feed(text) {
+  feed(text, history = false) {
     const lines = (this.rest + text).split('\n');
     this.rest = lines.pop();
     let changed = false;
@@ -197,8 +235,24 @@ export class Observer {
       let line;
       try { line = JSON.parse(raw); } catch { continue; }
       changed = apply(this.state, lineChange(this.state, line), epoch(line.timestamp, this.deps.now())) || changed;
+      if (line?.type !== 'response_item') continue;
+      // As the Claude hook binds: the first touch of an OPEN task file, never a later mention.
+      const touched = taskTouched(line.payload);
+      if (touched && !this.bound.includes(touched) && this.deps.taskOpen(touched)) this.bound.push(touched);
+      const step = toolStep(line.payload);
+      const task = step && this.currentTask();
+      if (step && task && !history) { this.steps.push({task, ...step}); changed = true; }
     }
     if (changed) this.markDirty();
+  }
+
+  // The newest bound task still open: a finished task's steps fall back to the one before it.
+  currentTask() {
+    for (let i = this.bound.length - 1; i >= 0; i--) {
+      if (this.deps.taskOpen(this.bound[i])) return this.bound[i];
+      this.bound.splice(i, 1);
+    }
+    return null;
   }
 
   async tick() {
@@ -225,6 +279,8 @@ export class Observer {
       this.python ||= await this.deps.resolvePython();
       if (!this.python) return;
       await this.deps.write(this.python, buildRecord(this.state, this.ident, this.deps.now()));
+      const steps = this.steps.splice(0);
+      if (steps.length && this.deps.steps) await this.deps.steps(this.python, steps);
     } catch {
       // The record is best effort; its lease lapses into "no opinion".
     } finally {
@@ -242,7 +298,10 @@ export function parseArgs(argv) {
     out[key] = argv[i + 1];
   }
   for (const key of ['engine', 'tmux-socket', 'session']) if (!out[key]) throw new Error(`missing --${key}`);
-  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || ''};
+  // The seat the record is written for: the core, or a pool worker by its 32-hex id.
+  const seat = out.seat || 'core';
+  if (!/^(core|[0-9a-f]{32})$/.test(seat)) throw new Error('bad --seat');
+  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || '', seat};
 }
 
 // partialOk: exit 1 with output is a result (lsof exits 1 when one listed pid has gone).
@@ -324,6 +383,14 @@ export function fileDeps(opts, io = fs) {
       const args = [path.join(opts.engine, 'src', 'runtime_observation.py'), 'write'];
       if (opts.workspace) args.push('--workspace', opts.workspace);
       return run(python, args, JSON.stringify(record));
+    },
+    // Open = its task file exists and no result does; without a workspace every task reads as open.
+    taskOpen: (id) => !opts.workspace || (io.existsSync(path.join(opts.workspace, 'tasks', `${id}.txt`))
+      && !io.existsSync(path.join(opts.workspace, 'results', `${id}.txt`))),
+    steps: (python, steps) => {
+      const args = [path.join(opts.engine, 'skills', 'agent-activity', 'scripts', 'phase_line.py'), 'steps'];
+      if (opts.workspace) args.push('--workspace', opts.workspace);
+      return run(python, args, JSON.stringify(steps));
     },
   };
 }

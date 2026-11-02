@@ -191,6 +191,57 @@ class Publisher(unittest.TestCase):
                     release.set()
                     gw._STEP_PUSH_THREAD.join(2)
 
+    def test_the_publisher_keeps_stepping_while_tasks_stay_in_flight(self):
+        live, snapshots = {"task-dev~task-a"}, []
+        def snapshot(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            if len(snapshots) == 3:
+                live.clear()  # the outbound worker retired the last task
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot):
+            gw._publish_task_steps_now(set(live), live)
+        self.assertEqual(len(snapshots), 3, "one snapshot now, then one per INTERVAL until the set empties")
+        snapshots.clear()
+        live.add("task-dev~task-a")
+        def snapshot_until_off(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            gw.TASK_STEP_PUBLICATION_ENABLED = lambda: False  # the switch turned off mid-flight
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot_until_off):
+            gw._publish_task_steps_now(set(live), live)
+        self.assertEqual(len(snapshots), 1, "the switch ends the loop before the next snapshot")
+        live.clear()
+
+    def test_a_set_that_changes_mid_copy_is_retried_on_the_next_interval(self):
+        class Shifting:
+            """A live set whose first copy fails as a set does when another thread mutates it
+            (a set subclass would not do: set(s) copies a set without calling __iter__)."""
+            def __init__(self, items):
+                self.items, self.raised = set(items), False
+            def __bool__(self):
+                return bool(self.items)
+            def __iter__(self):
+                if not self.raised:
+                    self.raised = True
+                    raise RuntimeError("Set changed size during iteration")
+                return iter(self.items)
+            def clear(self):
+                self.items.clear()
+        live, snapshots = Shifting({"task-dev~task-a"}), []
+        def snapshot(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            if len(snapshots) == 2:
+                live.clear()
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot):
+            gw._publish_task_steps_now({"task-dev~task-a"}, live)
+        self.assertEqual(snapshots, [{"task-dev~task-a"}, {"task-dev~task-a"}],
+                         "the failed copy skips one interval; the next copy publishes")
+        self.assertTrue(live.raised)
+
     def test_switch_declared_off_in_manifest(self):
         repo = Path(__file__).resolve().parents[1]
         manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())
@@ -561,6 +612,98 @@ class Typed(unittest.TestCase):
         for tool, inp in tools:
             self.assertIn(phase_line.rules_phase(tool, inp), tsp.PHASES, tool)
         self.assertTrue(set(phase_line.MODEL_PHASES) <= set(tsp.PHASES))
+
+    def test_steps_from_another_runtime_record_rules_phases_without_text(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        # Three good steps (a missing or non-dict input is an empty one); the rest are skipped.
+        batch = [{"task": "task-a", "tool": "Bash", "input": {"command": "pytest -q"}},
+                 {"task": "task-a", "tool": "Monitor"},
+                 {"task": "task-a", "tool": "Bash", "input": "not a dict"},
+                 {"task": "../evil", "tool": "Bash", "input": {}},
+                 {"task": "task-a", "tool": "", "input": {}},
+                 {"task": 7, "tool": "Bash"}, "junk", None]
+        self.assertEqual(phase_line.record_steps(ws, json.dumps(batch)), 3)
+        recs = [json.loads(l) for l in (ws / "state" / "agent-activity.phase.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["task_id"], r["phase"], r["step"]) for r in recs],
+                         [("task-a", "Running tests", None), ("task-a", "Waiting", None), ("task-a", "Running a command", None)])
+        self.assertNotIn("pytest", (ws / "state" / "agent-activity.phase.jsonl").read_text(), "no command text is stored")
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command")
+        self.assertEqual(phase_line.record_steps(ws, "{not json"), -1)
+        self.assertEqual(phase_line.record_steps(ws, '{"not": "a list"}'), -1)
+        self.assertEqual(phase_line.record_steps(ws, "[]"), 0)
+        many = [{"task": "task-b", "tool": "Read", "input": {}}] * (phase_line.STEPS_MAX + 5)
+        self.assertEqual(phase_line.record_steps(ws, json.dumps(many)), phase_line.STEPS_MAX, "a batch is capped")
+
+    def test_the_steps_command_reads_stdin_and_needs_no_task(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        import io
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        with patch.object(sys, "stdin", io.StringIO('[{"task": "task-c", "tool": "Edit", "input": {}}]')):
+            self.assertEqual(phase_line.main(["steps", "--workspace", str(ws)]), 0)
+        self.assertEqual(phase_line.status_for(ws, "task-c")["phase"], "Editing code")
+        with patch.object(sys, "stdin", io.StringIO("{}")):
+            self.assertEqual(phase_line.main(["steps", "--workspace", str(ws)]), 1)
+        with self.assertRaises(SystemExit):
+            phase_line.main(["status", "--workspace", str(ws)])  # every other command still needs --task
+
+    def test_room_actions_called_through_mcp_get_their_own_phase(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        run = "mcp__s-space__room_action_execute"
+        self.assertEqual(phase_line.rules_phase(run, {"action": "room.question.ask"}), "Asking someone")
+        self.assertEqual(phase_line.rules_phase(run + "_safe", {"action": "room.message.send"}), "Writing a reply")
+        self.assertEqual(phase_line.rules_phase(run + "_safe", {"action": "room.commons.comments.reply"}),
+                         "Writing a reply")
+        self.assertEqual(phase_line.rules_phase(run, {"action": "room.task.update"}), "Running a command")
+        self.assertEqual(phase_line.rules_phase("Bash", {"action": "room.question.ask"}), "Running a command")
+
+    def test_a_turn_parked_on_a_permission_dialog_reads_as_waiting_for_approval(self):
+        repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo / "skills" / "agent-activity" / "scripts"))
+        import phase_line
+        import turns
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        prompt = "TASK_FILE: /x/tasks/task-a.txt"
+        turns.record({"hook_event_name": "UserPromptSubmit", "prompt_id": "p1", "prompt": prompt}, ws, now=100.0)
+        phase_line.on_step(ws, "task-a", "Bash", {"command": "make"}, "Build", spawn=lambda *a: None)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command")
+        turns.record({"hook_event_name": "PermissionRequest", "prompt_id": "p1", "tool_name": "Bash"},
+                     ws, now=time.time() + 1)
+        st = phase_line.status_for(ws, "task-a")
+        self.assertEqual((st["phase"], st["line"], st["waiting"]),
+                         ("Waiting", "Waiting for your approval", {"reason": "permission"}))
+        self.assertIsNone(phase_line.status_for(ws, "task-b"), "only the turn's own task waits")
+        self.assertEqual(phase_line.published_status(ws, "task-a"),
+                         {"phase": "Waiting", "summary": "Waiting", "since": st["since"],
+                          "waiting": {"reason": "permission"}})
+        self.assertEqual(progress_arguments(phase_line.published_status(ws, "task-a")),
+                         {"summary": "Waiting", "phase": "Waiting",
+                          "since": progress_arguments(phase_line.published_status(ws, "task-a"))["since"]},
+                         "the wire carries the phase; a reason the server does not know yet is not sent")
+        turns.record({"hook_event_name": "PreToolUse", "prompt_id": "p1", "tool_name": "Bash"}, ws)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "approval clears it")
+        turns.record({"hook_event_name": "PermissionRequest", "prompt_id": "p1", "tool_name": "Bash"}, ws, now=50.0)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command",
+                         "a dialog older than the task's newest step is stale")
+        turns.record({"hook_event_name": "PermissionRequest", "prompt_id": "p1"}, ws, now=time.time() + 5)
+        turns.record({"hook_event_name": "Stop", "prompt_id": "p1"}, ws)
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "an ended turn waits on nothing")
+        (ws / "state" / "agent-activity.turns.json").write_text("{not json")
+        self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "unreadable reads as not waiting")
+        (ws / "state" / "agent-activity.turns.json").write_text('{"turns": []}')
+        self.assertIsNone(turns.open_dialog(ws, "task-a"), "a damaged record (turns not a map) is no dialog")
+        with patch.object(turns, "open_dialog", side_effect=OSError("boom")):
+            self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command",
+                             "a dialog read that raises is no dialog, never a crash")
 
     def test_a_refusal_logs_its_code_and_never_payload_text(self):
         self.status["task-dev~task-a"] = {"phase": "Thinking", "summary": "Thinking"}
