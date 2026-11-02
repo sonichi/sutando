@@ -616,6 +616,27 @@ class Hooks(unittest.TestCase):
         self.assertIn("vault set K [STORED-IN-KEYCHAIN]", text, "the run says it was stored")
         self.assertNotIn("hunter2secret", text)
         self.assertEqual(len(stored), 1, "and never intercepted again")
+        self.assertTrue(gw._ATTEMPTS.get(tid).get("vault_handled"), "recorded, so a later held copy does not store it")
+
+    def test_an_owners_vault_command_is_not_stored_again_when_its_first_render_stored_it(self):
+        tid = "task-reserve-render-vault"
+        self.addCleanup(self.forget, tid)
+        stored = []
+
+        def intercept(text):
+            stored.append(text)
+            return mock.Mock(text=text.replace("hunter2secret", "[STORED-IN-KEYCHAIN]"), stored=["K"], failed=[])
+        body = "please vault set K hunter2secret"
+        with mock.patch.object(gw, "_vault_intercept_fns", return_value=(intercept, None)):
+            self.assertTrue(gw._take_served_task(_task(tid, lease_id="L1", source_event_id="$e", task=body),
+                                                 set(), []))
+            self.assertEqual(len(stored), 1, "the first render stores it")
+            self.assertTrue(gw._ATTEMPTS.get(tid).get("vault_handled"))
+            self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task=body)), (tid, True))
+        self.assertEqual(len(stored), 1, "the held copy does not store it again")
+        saved = self.saved(tid).read_text()
+        self.assertNotIn("hunter2secret", saved, "and still holds no plaintext")
+        self.assertIn("vault-set command", json.loads(saved)["cleaned"])
 
     def test_a_same_lease_redelivery_of_an_earlier_bridges_v1_held_serve_is_accepted(self):
         for lost in (False, True):
