@@ -1594,6 +1594,7 @@ def _answer(args, read_body, silent: bool) -> int:
         return 2
     done = "settled" if silent else "posted"
     root = gateway_instance.outbox_root(result_dir, instance)
+    item = outbox.effective_item_id(root, item, silent or bool(getattr(args, "no_send", False)))
     # One transaction with hold's commit and the drain's send: the answer is queued under the send
     # lock, so the hold line is sent before it or withdrawn at its send, never after it.
     try:

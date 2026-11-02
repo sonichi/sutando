@@ -186,18 +186,20 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
                 self.assertEqual(self.inflight, set())
 
     def test_with_lifecycle_2_off_a_ledger_left_behind_is_never_read(self):
-        for ledger in ('valid', 'damaged'):
-            with self.subTest(ledger=ledger):
+        for ledger, base_delivered in (('valid', False), ('damaged', False), ('valid', True)):
+            with self.subTest(ledger=ledger, base_delivered=base_delivered):
                 self.start()
                 self.lane()                                   # the running drain keeps no ledger
-                self.wake_run(bridge_keeps_ledger=False)
+                self.wake_run(base_delivered, bridge_keeps_ledger=False)
                 if ledger == 'damaged':
                     (self.home / 'state' / 'relay-task-ledger.json').write_text('{not json')
                 rc, out, err = self.reply('', 'no-reply')
                 self.assertEqual(rc, 0, out + err)
                 self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
-                self.assertEqual(outbox.item_status(self.results / '.outbox', TID), 'DELIVERED',
-                                 'the drain delivers it under the task\'s own item')
+                # Under the task's own item; one already delivered closes on its own record.
+                item = f'{TID}.lease-close' if base_delivered else TID
+                self.assertEqual(outbox.item_status(self.results / '.outbox', item), 'DELIVERED')
+                self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls], [('[no-send]', True)])
                 self.assertEqual(self.inflight, set())
 
     def test_with_no_running_drain_a_run_the_ledger_names_is_not_guessed(self):
