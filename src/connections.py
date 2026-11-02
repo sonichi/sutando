@@ -469,6 +469,15 @@ def _inst_var(instance: str) -> str:
     return instance.upper().replace("-", "_")
 
 
+def connection_env_names(environ: Mapping[str, str]) -> list[str]:
+    """Existing per-lane credential and routing variable names, without reading values."""
+    prefixes = (INSTANCE_TOKEN_PREFIX, "REMOTE_TASK_TOKEN_", "REMOTE_TASK_URL_",
+                "REMOTE_TASK_CHANNEL_DIR_", "AG2_GATEWAY_URL_")
+    return sorted(name for name in environ
+                  if any(re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_]+", name)
+                         for prefix in prefixes))
+
+
 def channel_dir_for(instance: str, environ: Optional[Mapping[str, str]] = None) -> str:
     """`<instance>-ag2space`, unless `REMOTE_TASK_CHANNEL_DIR_<INST>` names another directory."""
     environ = os.environ if environ is None else environ

@@ -27,6 +27,7 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
                 dest = root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / rel, dest)
+            (root / "src").symlink_to(REPO / "src", target_is_directory=True)
             config = root / "scripts/sutando-config.sh"
             config.write_text(
                 '#!/bin/sh\n'

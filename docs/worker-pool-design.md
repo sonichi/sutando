@@ -38,6 +38,19 @@ A worker selects a supported CLI runtime at creation. Claude Code and Codex run 
 separate tmux sessions with the same delivery and result protocol. A worker is
 not a runtime session: it keeps its id and inbox across runs.
 
+Worker launchers carry the shared channel resolver's environment names across
+the tmux boundary, including `AG2_DEVICE_ENV` and per-lane credential variables.
+The shared `connections.room_credential` / `channel_credentials.room_env` path
+selects each room's homeserver credential and keeps its gateway URL paired with
+that credential. No token values are stored in pool records or printed by the
+launcher's `--print-env` probe. Running seats need a relaunch to inherit the
+correct environment; the core launch path is unchanged.
+
+Commons callers must use that shared room-aware path. A standalone capability
+that reads only generic token variables still needs its adapter to delegate to
+`channel_credentials.room_env`; forwarding lane variables alone cannot make
+such a client select a room's lane.
+
 Claude accepts a chosen session ID and can resume that conversation. Codex
 assigns its own ID, so Codex workers record `session_id: null` until that ID can
 be captured reliably. A dead Codex worker starts a fresh conversation under
