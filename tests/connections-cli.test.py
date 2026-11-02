@@ -251,6 +251,16 @@ class CliTests(unittest.TestCase):
             "import os, pathlib\n"
             "pathlib.Path(os.environ['FAKE_OUT']).write_text(os.environ['GATEWAY_INSTANCE'] + ' ' "
             "+ os.environ['REMOTE_TASK_CHANNEL_DIR'] + ' ' + repr(os.environ['REMOTE_PROACTIVE_ROOM']))\n")
+        # reconnect asks the checkout what it resolves before stopping anything: this one answers this
+        # test's workspace and, through the real util_paths, this host.
+        (repo / "src" / "workspace_default.py").write_text(
+            f"from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path({str(self.ws)!r})\n")
+        real_src = Path(__file__).resolve().parent.parent / "src"
+        (repo / "src" / "util_paths.py").write_text(
+            f"import importlib.util, sys\nsys.path.append({str(real_src)!r})\n"
+            f"_spec = importlib.util.spec_from_file_location('_real_util_paths', {str(real_src / 'util_paths.py')!r})\n"
+            "_real = importlib.util.module_from_spec(_spec)\n_spec.loader.exec_module(_real)\n"
+            "host_label = _real.host_label\n")
         out = box / "launched.txt"
         self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta-fixture.net")
         record_file = self.ws / "state" / "connections.json"
@@ -272,6 +282,17 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("reconnect", "beta-fixture-net", "--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reconnected beta-fixture-net", proc.stdout)
+        # A checkout that resolves another workspace is refused before the stop, with exit status 1.
+        elsewhere = box / "elsewhere"
+        (elsewhere / "src").mkdir(parents=True)
+        for name in ("remote-gateway-bridge.py", "util_paths.py"):
+            (elsewhere / "src" / name).write_text((repo / "src" / name).read_text())
+        (elsewhere / "src" / "workspace_default.py").write_text(
+            "from pathlib import Path\ndef resolve_workspace(migrate=True):\n    return Path('/somewhere/else')\n")
+        proc = self.run_cli("reconnect", "beta-fixture-net", "--repo", str(elsewhere), "--logs-dir", str(box / "logs"))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("relaunch_preflight_failed", proc.stderr)
+        self.assertIn("the running bridge was left up", proc.stderr)
         proc = self.run_cli("launch", "nope", "--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no connection", proc.stderr)

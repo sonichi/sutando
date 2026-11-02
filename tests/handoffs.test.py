@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import multiprocessing
+import os
 import sys
 import tempfile
 import time
@@ -280,6 +281,10 @@ class PoolAsk(unittest.TestCase):
 
 class Hook(unittest.TestCase):
     def setUp(self):
+        # The phase model is a host setting; a host with it on would spawn a real enrich per step here.
+        env = patch.dict(os.environ, {"PHASE_MODEL": "off"})
+        env.start()
+        self.addCleanup(env.stop)
         self.hook = _hook()
         self.ws = Path(tempfile.mkdtemp())
         self.p = dict(self.hook.paths(self.ws), ws=self.ws)

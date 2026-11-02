@@ -363,8 +363,11 @@ def quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIden
     rewrite after verification goes back live. A failure after the claim
     rename puts the body back or quarantines it: the claim path is never where
     a result ends up."""
-    with locked(results_dir):
-        return _quarantine_generation(Path(results_dir), Path(rfile), generation, log)
+    try:
+        with locked(results_dir):
+            return _quarantine_generation(Path(results_dir), Path(rfile), generation, log)
+    finally:
+        unpin(results_dir, Path(rfile).stem, generation, log, keep=True)
 
 
 def _verify_fd(fd: int, generation: ResultIdentity) -> "tuple[bool, os.stat_result]":
@@ -485,7 +488,15 @@ def retire_generation(results_dir: Path, rfile: Path, generation: ResultIdentity
     """Move `rfile` into `directory` under the first free of `names` only if it
     still IS `generation`, the publication the caller read and acted on. A
     reply found at the name, before the move or after it, stays live. Never
-    raises for a filesystem outcome: the `Retired` record says what happened."""
+    raises for a filesystem outcome: the `Retired` record says what happened. A delivery's pin on
+    `generation` ends with it (`unpin`)."""
+    done = _retire_generation(results_dir, rfile, generation, log, directory, names)
+    unpin(results_dir, Path(rfile).stem, generation, log)
+    return done
+
+
+def _retire_generation(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,
+                       directory: Path, names: "Iterable[str]") -> Retired:
     names = list(names)
     done: Optional[Retired] = None
     try:
@@ -669,3 +680,68 @@ def disposed_copy_exists(results_dir: Path, tid: str, generation: ResultIdentity
                 if _recover_claim(results_dir, claim, log) is not None:
                     return True
     return False
+
+
+# A delivery's pin: a hard link, in this folder of the results directory, to the reply one delivery
+# works on, so each of its steps reads the same bytes whatever is published at the name afterwards.
+PIN_DIRNAME = ".delivering"
+
+
+def pin_path(results_dir: Path, stem: str) -> Path:
+    return Path(results_dir) / PIN_DIRNAME / f"{stem}.pin"
+
+
+def pin(results_dir: Path, stem: str) -> Path:
+    """Pin the reply published at `<stem>.txt`, unless one is pinned already; the pin's path. Raises
+    FileNotFoundError when nothing is at the name, and OSError when the pin cannot be made."""
+    pinned = pin_path(results_dir, stem)
+    if not os.path.lexists(pinned):
+        pinned.parent.mkdir(exist_ok=True)
+        try:
+            os.link(Path(results_dir) / f"{stem}.txt", pinned)
+        except FileExistsError:
+            pass
+    return pinned
+
+
+def pinned(results_dir: Path, stem: str, generation: ResultIdentity) -> bool:
+    """Whether a delivery's pin on `generation` may remain (one that cannot be read counts)."""
+    try:
+        return identity_of(pin_path(results_dir, stem))[1] == generation
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def unpin(results_dir: Path, stem: str, generation: Optional[ResultIdentity], log: Log,
+          keep: bool = False) -> bool:
+    """End the pin on `generation` once that generation has left `<stem>.txt` (disposed of, or replaced
+    there). When a newer reply replaced it, `keep` moves the pinned bytes into the quarantine instead of
+    dropping them. False when a pin on it may remain."""
+    pinned = pin_path(results_dir, stem)
+    try:
+        if generation is None or identity_of(pinned)[1] != generation:
+            return True
+        if identity_of(Path(results_dir) / f"{stem}.txt")[1] == generation:
+            return True                                 # still at its name: the pin goes with its disposal
+        replaced = True
+    except FileNotFoundError:
+        if not os.path.lexists(pinned):
+            return True
+        replaced = False
+    except OSError as e:
+        log(f"result {stem}: its pin could not be checked ({e}) — kept")
+        return False
+    try:
+        if keep and replaced:
+            kept = undelivered_quarantine.place(pinned, Path(results_dir), stem)
+            log(f"result {stem}: the reply its delivery pinned, replaced at its name, was kept as {kept.name}")
+        else:
+            os.unlink(pinned)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"result {stem}: its pin could not be released ({e}) — retried")
+        return False
+    return True
