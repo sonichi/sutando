@@ -684,5 +684,30 @@ class TestRoomRouting(_Base):
             self.assertEqual(r.stdout, "")
 
 
+class TestLaneEnv(unittest.TestCase):
+    """The pointers a launcher forwards so a child session resolves lanes as the core does."""
+
+    def test_only_the_pointer_variables_are_named(self):
+        env = {"AG2_DEVICE_ENV": "/d/device.env", "SUTANDO_APP_SUPPORT": "/app",
+               "REMOTE_TASK_CHANNEL_DIR_S_SPACE": "s-space-ag2space", "REMOTE_TASK_TOKEN": "u|t",
+               "AG2_REMOTE_TOKEN": "u|t", "AG2_REMOTE_TOKEN_S_SPACE": "u|t", "REMOTE_TASK_URL": "u",
+               "REMOTE_TASK_TOKEN_FILE": "/f", "HOME": "/h"}
+        self.assertEqual(m.lane_env(env), {"AG2_DEVICE_ENV": "/d/device.env", "SUTANDO_APP_SUPPORT": "/app",
+                                           "REMOTE_TASK_CHANNEL_DIR_S_SPACE": "s-space-ag2space"})
+
+    def test_empty_and_control_character_values_are_left_out(self):
+        env = {"AG2_DEVICE_ENV": " ", "SUTANDO_APP_SUPPORT": "/app\nREMOTE_TASK_TOKEN=x",
+               "REMOTE_TASK_CHANNEL_DIR_X": "d\0"}
+        self.assertEqual(m.lane_env(env), {})
+
+    def test_cli_prints_nul_framed_pairs_and_no_token(self):
+        env = isolated_child_env(AG2_DEVICE_ENV="/d/device.env", SUTANDO_APP_SUPPORT="/app",
+                                 REMOTE_TASK_TOKEN="u|secret", AG2_REMOTE_TOKEN_S_SPACE="u|secret")
+        r = subprocess.run([sys.executable, str(REPO / "src" / "channel_env_resolve.py"), "--lane-env"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "AG2_DEVICE_ENV=/d/device.env\0SUTANDO_APP_SUPPORT=/app\0")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

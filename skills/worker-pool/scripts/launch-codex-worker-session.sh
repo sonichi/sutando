@@ -51,6 +51,9 @@ for forwarded in SUTANDO_INSTANCE_ID SUTANDO_WORKER_ID SUTANDO_TASKS_DIR SUTANDO
                  SUTANDO_DEFAULT_WORKSPACE; do
   [ -n "${!forwarded:-}" ] && ENV_ARGS+=(-e "$forwarded=${!forwarded}")
 done
+# The core's lane-credential pointers (paths, never a token), named by its resolver.
+while IFS= read -r -d '' _lane_kv; do ENV_ARGS+=(-e "$_lane_kv"); done \
+  < <("$WORKER_PY" "$REPO/src/channel_env_resolve.py" --lane-env 2>/dev/null)
 [ -n "${CODEX_HOME:-}" ] && ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 if [ -n "$config_env" ] && [ -n "$config_value" ]; then
   ENV_ARGS+=(-e "$config_env=$config_value")

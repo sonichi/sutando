@@ -21,7 +21,8 @@ lane's own keys (`<NAME>_<LANE>`) from the launcher-named file, where a host sig
 on a secondary homeserver keeps its token (and any URL); only an identity it lacks comes
 from the lane's channel dir as `connections.lane_channel_dir` names it. Only
 `gateway_serving.active_lane` names the lane; no other suffixed key is read, and no lane
-name is decoded into a directory.
+name is decoded into a directory. `lane_env` names the variables those reads depend on, so a
+launcher can hand a child session the same pointers (never a token) the core resolves with.
 
 The channels dir is the caller's input; this module never guesses a home dir.
 The two rules a channels-tree candidate must satisfy are each answered by
@@ -60,6 +61,29 @@ TOKEN_VARS = RELAY_TOKEN_VARS
 
 DEVICE_ENV_VAR = "AG2_DEVICE_ENV"
 DEVICE_ENV_SOURCE = "ag2space"
+
+
+# What a process must inherit to resolve a lane's credential as the core does: pointers to files
+# and dirs (device file, app support, a lane's channel dir), never a token.
+LANE_ENV_VARS = (DEVICE_ENV_VAR, "SUTANDO_APP_SUPPORT")
+LANE_ENV_PREFIXES = ("REMOTE_TASK_CHANNEL_DIR_",)
+_LANE_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def lane_env(environ=None) -> dict:
+    """{name: value} for each `LANE_ENV_VARS` / `LANE_ENV_PREFIXES` variable set non-empty in
+    `environ`, for a launcher to forward. A value with a control character is left out."""
+    env = os.environ if environ is None else environ
+    out = {}
+    for name, value in env.items():
+        if not (name in LANE_ENV_VARS or name.startswith(LANE_ENV_PREFIXES)):
+            continue
+        if not _LANE_ENV_NAME_RE.fullmatch(name) or not value.strip():
+            continue
+        if any(c in value for c in ("\n", "\r", "\0")):
+            continue
+        out[name] = value
+    return out
 
 
 def _has_token(path: Path) -> bool:
@@ -256,11 +280,15 @@ def resolve_room_channel_env(channels_dir, source: str, room_id: str) -> Path | 
 
 def main(argv: list[str]) -> int:
     args = argv[1:]
+    if args == ["--lane-env"]:
+        sys.stdout.write("".join(f"{k}={v}\0" for k, v in sorted(lane_env().items())))
+        return 0
     room = ""
     if len(args) == 4 and args[2] == "--room":
         room, args = args[3], args[:2]
     if len(args) != 2:
-        print("usage: channel_env_resolve.py <channels-dir> <source> [--room <room-id>]", file=sys.stderr)
+        print("usage: channel_env_resolve.py <channels-dir> <source> [--room <room-id>] | --lane-env",
+              file=sys.stderr)
         return 2
     channels_dir, source = args
     if room:

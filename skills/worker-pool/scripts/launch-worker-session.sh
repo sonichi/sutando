@@ -124,6 +124,12 @@ ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
+# The core's lane-credential pointers (paths, never a token), named by its resolver: without them
+# a worker reads the primary lane's credential for every room, an s.space room included.
+if [ -n "$WORKER_PY" ]; then
+  while IFS= read -r -d '' _lane_kv; do ENV_ARGS+=(-e "$_lane_kv"); done \
+    < <("$WORKER_PY" "$REPO/src/channel_env_resolve.py" --lane-env 2>/dev/null)
+fi
 forward_skill_manifest_config
 ENV_ARGS+=(${SKILL_MANIFEST_ENV_ARGS[@]+"${SKILL_MANIFEST_ENV_ARGS[@]}"})
 resolve_claude_credential_proxy
