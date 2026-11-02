@@ -608,6 +608,11 @@ class Typed(unittest.TestCase):
         self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "an ended turn waits on nothing")
         (ws / "state" / "agent-activity.turns.json").write_text("{not json")
         self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command", "unreadable reads as not waiting")
+        (ws / "state" / "agent-activity.turns.json").write_text('{"turns": []}')
+        self.assertIsNone(turns.open_dialog(ws, "task-a"), "a damaged record (turns not a map) is no dialog")
+        with patch.object(turns, "open_dialog", side_effect=OSError("boom")):
+            self.assertEqual(phase_line.status_for(ws, "task-a")["phase"], "Running a command",
+                             "a dialog read that raises is no dialog, never a crash")
 
     def test_a_refusal_logs_its_code_and_never_payload_text(self):
         self.status["task-dev~task-a"] = {"phase": "Thinking", "summary": "Thinking"}
