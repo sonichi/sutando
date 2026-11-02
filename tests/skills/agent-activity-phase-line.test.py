@@ -272,6 +272,13 @@ class Enrich(unittest.TestCase):
         self.assertEqual(user.count("[working] Fetch origin"), 1)
         self.assertTrue(pl.allowed(user))
 
+    def test_the_models_refinement_writes_no_room_row(self):
+        with patch.dict(os.environ, ON):
+            pl.enrich(self.ws, "task-a", call=self._call({"phase": "Editing code"}))
+        rows = [json.loads(l) for l in (Path(self.ws) / "state" / "agent-activity.jsonl").read_text().splitlines()]
+        self.assertFalse([r for r in rows if r.get("line") == "Editing code"],
+                         "the room row is the rules phase only: a refinement would flap with it")
+
     def test_a_newer_step_during_the_call_gets_its_own_answer(self):
         def call(project, model, system, user):
             self.prompts.append(user)
@@ -847,6 +854,11 @@ class Markers(unittest.TestCase):
         self.assertTrue(pl.records(ws, "task-a")[-1].get("first"))
 
 
+def _race_show(ws, barrier, wins):
+    barrier.wait()
+    wins.put(pl.show_phase_if_new(ws, "task-a", "Running tests", lambda: True))
+
+
 class Hook(unittest.TestCase):
     def _hook(self):
         spec = importlib.util.spec_from_file_location("activity_hook_pl", REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
@@ -854,15 +866,91 @@ class Hook(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_a_bound_read_gets_a_rules_record_without_a_row(self):
-        hook = self._hook()
-        ws = Path(tempfile.mkdtemp())
+    def _step(self, hook, ws, tool, inp, room="!r:x", calls=None):
+        with patch.object(hook, "bound_task", return_value=({"id": "task-a"}, room)), patch.dict(os.environ, OFF):
+            return hook.handle({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": tool,
+                                "tool_input": inp}, {"ws": ws, "bind": ws / "bind.json"},
+                               run=lambda cmd, **k: (calls if calls is not None else []).append(cmd))
+
+    def test_a_bound_read_gets_a_rules_record_and_its_phase_as_the_rooms_working_row(self):
+        hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
+        out = self._step(hook, ws, "Read", {"file_path": "/x"}, calls=calls)
+        self.assertEqual(out, [("working", "Reading files")])
+        self.assertEqual(pl.latest(ws, "task-a")["phase"], "Reading files")
+        cmd = calls[0]
+        self.assertEqual(cmd[cmd.index("append") + 1], "Reading files", "the phase word alone, never step text")
+        self.assertEqual((cmd[cmd.index("--kind") + 1], cmd[cmd.index("--room") + 1]), ("working", "!r:x"))
+
+    def test_one_row_per_call_its_step_line_else_a_phase_the_room_does_not_show(self):
+        hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
+        steps = [("Read", {"file_path": "/a"}, [("working", "Reading files")]),
+                 ("Read", {"file_path": "/b"}, []),
+                 ("Bash", {"command": "python3 tests/x.test.py"}, [("working", "Running tests")]),
+                 ("Bash", {"command": "python3 tests/x.test.py", "description": "Run the x tests"},
+                  [("working", "Run the x tests")]),
+                 ("Bash", {"command": "python3 tests/y.test.py"}, [("working", "Running tests")])]
+        for tool, inp, want in steps:
+            self.assertEqual(self._step(hook, ws, tool, inp, calls=calls), want, (tool, inp))
+        self.assertEqual(len(calls), 4, "after a step line, the same phase is the room's row again")
+
+    def test_no_row_without_a_room_but_the_phase_is_still_recorded(self):
+        hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
+        self.assertEqual(self._step(hook, ws, "Read", {"file_path": "/x"}, room=None, calls=calls), [])
+        self.assertEqual(calls, [])
+        self.assertEqual(pl.latest(ws, "task-a")["phase"], "Reading files")
+
+    def test_a_failed_write_is_retried_on_the_next_step(self):
+        hook, ws = self._hook(), Path(tempfile.mkdtemp())
+
+        class Failed:
+            returncode = 1
         with patch.object(hook, "bound_task", return_value=({"id": "task-a"}, "!r:x")), patch.dict(os.environ, OFF):
             out = hook.handle({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Read",
                                "tool_input": {"file_path": "/x"}}, {"ws": ws, "bind": ws / "bind.json"},
-                              run=lambda *a, **k: None)
+                              run=lambda cmd, **k: Failed())
         self.assertEqual(out, [])
-        self.assertEqual(pl.latest(ws, "task-a")["phase"], "Reading files")
+        self.assertEqual(self._step(hook, ws, "Read", {"file_path": "/y"}), [("working", "Reading files")])
+
+    def test_racing_steps_write_one_row(self):
+        ctx = multiprocessing.get_context("spawn")
+        for n in range(5):
+            ws = tempfile.mkdtemp()
+            barrier, wins = ctx.Barrier(4), ctx.Queue()
+            procs = [ctx.Process(target=_race_show, args=(ws, barrier, wins)) for _ in range(4)]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(30)
+            got = [wins.get(timeout=5) for _ in procs]
+            self.assertEqual(sum(got), 1, f"round {n}: {got}")
+
+    def test_show_step_with_neither_a_line_nor_a_phase_writes_nothing(self):
+        hook, calls = self._hook(), []
+        self.assertEqual(hook.show_step(Path(tempfile.mkdtemp()), {"id": "task-a"}, "!r:x", None, None,
+                                        lambda cmd, **k: calls.append(cmd)), [])
+        self.assertEqual(calls, [])
+
+    def test_show_step_survives_a_failing_marker(self):
+        hook, ws, calls = self._hook(), Path(tempfile.mkdtemp()), []
+        run = lambda cmd, **k: calls.append(cmd)  # noqa: E731
+        with patch.object(pl, "note_line_shown", side_effect=OSError("disk")):
+            self.assertEqual(hook.show_step(ws, {"id": "task-a"}, "!r:x", "Running tests", "Run x", run),
+                             [("working", "Run x")], "the step line is still written")
+        with patch.object(pl, "show_phase_if_new", side_effect=OSError("disk")):
+            self.assertEqual(hook.show_step(ws, {"id": "task-a"}, "!r:x", "Running tests", None, run), [])
+        self.assertEqual(len(calls), 1)
+
+    def test_the_hook_finds_the_phase_module_off_its_own_path(self):
+        hook = self._hook()
+        scripts = str(REPO / "skills" / "agent-activity" / "scripts")
+        with patch.object(sys, "path", [p for p in sys.path if p != scripts]):
+            self.assertIs(hook._phase_line(), pl)
+            self.assertIn(scripts, sys.path)
+
+    def test_an_unwritable_marker_records_nothing(self):
+        blocker = Path(tempfile.mkdtemp()) / "a-file"
+        blocker.write_text("")
+        self.assertFalse(pl._record_shown(blocker / "sub" / "task-a.shown", "Reading files"))
 
     def test_the_hook_survives_a_broken_phase_module(self):
         hook = self._hook()
