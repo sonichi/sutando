@@ -7711,6 +7711,8 @@ def _result_disposed(tid: str) -> bool:
         return isinstance(record, dict) and record.get("status") == "DELIVERED"
     if _delivered_copy_exists(tid) or undelivered_quarantine.find_quarantined(RESULTS_DIR, tid):
         return True
+    if gateway_instance.first_run(tid) != tid:
+        return False                            # a run of its own, with no ledger: only its own copies count
     root = getattr(_delivery_core().backend, "root", None)
     delivery = _delivery_tid(tid)
     record = _outbox_record(root, _broker_tid(delivery)) if root is not None and delivery == tid else None
