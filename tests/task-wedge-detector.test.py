@@ -26,7 +26,7 @@ def concurrent_status(workspace, gate, answers):
     try:
         status = detector.status_for(workspace, 'task-a',
                                      {'phase': 'Running tests', 'summary': 'Running tests', 'since': 100.0},
-                                     now=180, signals=[{'kind': 'provider-limit', 'task_id': 'task-a'}])
+                                     now=180, signals=[{'kind': 'provider-limit', 'task_id': 'task-a', 'visibility': 'room'}])
         answers.put(('ok', status['phase']))
     except Exception as exc:
         answers.put(('error', repr(exc)))
@@ -51,7 +51,7 @@ class Wedges(unittest.TestCase):
                                    now=now, signals=list(signals))
 
     def signal(self, kind='provider-limit', task='task-a'):
-        value = {'kind': kind, 'raw': 'private-provider-token-and-prompt'}
+        value = {'kind': kind, 'visibility': 'room', 'raw': 'private-provider-token-and-prompt'}
         if task is not None:
             value['task_id'] = task
         return value
@@ -542,6 +542,22 @@ class Wedges(unittest.TestCase):
                 body = self.notices()[0].read_text()
                 self.assertTrue(body.startswith('[dm-only]\n'))
                 self.assertNotIn('private-provider-token-and-prompt', body)
+
+    def test_missing_visibility_is_owner_only_even_for_previously_room_visible_kind(self):
+        clock, calls = [100], []
+        signal = self.signal('provider-limit')
+        signal.pop('visibility')
+        pub = StepPublisher(self.ws / 'state', lambda body: calls.append(body) or {'status': 'completed'},
+                            lambda message: None, lambda: clock[0],
+                            status_of=lambda task: self.check(clock[0], [signal], task=task))
+        tasks = {'task-a': {'task_id': 'wire-a', 'execution_generation': 1, 'room_id': '!test:example'}}
+        for now in (100, 120, 160):
+            clock[0] = now
+            self.assertEqual(self.check(now, [signal]), self.normal)
+            pub.publish(tasks)
+        self.assertEqual([row['arguments']['phase'] for row in calls], ['Running tests'])
+        self.assertEqual(len(self.notices()), 1)
+        self.assertTrue(self.notices()[0].read_text().startswith('[dm-only]\n'))
 
     def test_real_publisher_emits_no_owner_only_signature_to_room(self):
         clock, calls = [100], []

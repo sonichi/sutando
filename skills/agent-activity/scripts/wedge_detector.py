@@ -204,7 +204,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                 if since is not None and last is not None and last > since:
                     continue
                 kind = signal["kind"]
-                visibility = signal.get("visibility", "room")
+                visibility = signal.get("visibility", "owner-dm")
                 break
             if kind is None and waiting.get("reason") == "permission":
                 kind = "pane-prompt-blocked"
