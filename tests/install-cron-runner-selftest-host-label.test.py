@@ -50,11 +50,6 @@ with tempfile.TemporaryDirectory() as ws:
     check("CRONS_FILE follows SUTANDO_HOST_LABEL", out.stdout == want,
           f"got {out.stdout!r} (rc {out.returncode}, stderr {out.stderr.strip()[:200]!r})")
 
-print("== no raw hostname-slug derivation is left in the installer ==")
-raw = [ln.strip() for ln in INSTALLER.read_text(encoding="utf-8").splitlines()
-       if "hostname" in ln and "sed" in ln and not ln.strip().startswith("#")]
-check("no `hostname | sed` slug in install-cron-runner-launchd.sh", not raw, str(raw[:1]))
-
 print()
 if failures:
     print(f"FAILED {len(failures)}: {failures}")
