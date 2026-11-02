@@ -84,7 +84,8 @@ def _signals(workspace, now):
                 limited = any(rx.search(text) for kind, rx in ABNORMAL_PATTERNS
                               if kind in PROVIDER_LIMIT_PATTERNS)
                 if limited or data.get("state") in ("blocked-human", "logged-out"):
-                    found.insert(0, {"kind": "provider-limit" if limited else "pane-prompt-blocked"})
+                    found.insert(0, {"kind": "provider-limit" if limited else "pane-prompt-blocked",
+                                     "visibility": "room" if data.get("state") == "blocked-known" else "owner-dm"})
     except (OSError, ValueError):
         pass
     _PROBE_CACHE[key] = (now, found)
@@ -190,6 +191,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
         excluded = terminal or status.get("phase") == "Delegated" or (
             waiting.get("reason") in ("queued", "busy", "delegated") and not accepted)
         kind = None
+        visibility = "room"
         if not excluded:
             observations = _signals(workspace, now) if signals is None else signals
             for signal in observations:
@@ -202,6 +204,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                 if since is not None and last is not None and last > since:
                     continue
                 kind = signal["kind"]
+                visibility = signal.get("visibility", "room")
                 break
             if kind is None and waiting.get("reason") == "permission":
                 kind = "pane-prompt-blocked"
@@ -222,6 +225,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                                       "notified_kinds": _budget(previous)}
         if kind == "activity-silent" and not same:
             state["first"] = last + silence_s
+        state["visibility"] = visibility
         state["activity_at"] = last
         state["observed_at"] = now
         _save(path, state)
@@ -229,9 +233,11 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
         if kind != "activity-silent" and now - state["first"] < confirm_s:
             return status
         if kind == "core-status-stale":
-            return {**status, "summary": MESSAGES[kind]}
+            return {**status, "summary": MESSAGES[kind]} if visibility == "room" else status
         if now - state["first"] >= DM_AFTER_S:
             _owner_notice(workspace, task_id, state, path)
+        if visibility != "room":
+            return status
         return {"phase": "Waiting", "summary": MESSAGES[kind], "since": state["first"],
                 "waiting": {"reason": "blocked", "kind": kind}}
 

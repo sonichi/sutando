@@ -482,6 +482,48 @@ class Wedges(unittest.TestCase):
         self.assertEqual(self.check(170, [self.signal()]), self.normal)
         self.assertFalse((root / 'task-a.json').exists())
 
+    def test_owner_only_signature_never_changes_room_publication(self):
+        for visibility in ('owner-dm', 'unknown', None):
+            with self.subTest(visibility=visibility):
+                signal = dict(self.signal('pane-prompt-blocked'), visibility=visibility)
+                for now in (100, 120, 160, 170):
+                    self.assertEqual(self.check(now, [signal]), self.normal)
+                self.assertEqual(len(self.notices()), 1)
+                body = self.notices()[0].read_text()
+                self.assertTrue(body.startswith('[dm-only]\n'))
+                self.assertNotIn('private-provider-token-and-prompt', body)
+
+    def test_real_publisher_emits_no_owner_only_signature_to_room(self):
+        clock, calls = [100], []
+        signal = dict(self.signal('pane-prompt-blocked'), visibility='owner-dm')
+        pub = StepPublisher(self.ws / 'state', lambda body: calls.append(body) or {'status': 'completed'},
+                            lambda message: None, lambda: clock[0],
+                            status_of=lambda task: self.check(clock[0], [signal], task=task))
+        tasks = {'task-a': {'task_id': 'wire-a', 'execution_generation': 1, 'room_id': '!test:example'}}
+        for now in (100, 120, 160, 170):
+            clock[0] = now
+            pub.publish(tasks)
+        self.assertEqual([row['arguments']['phase'] for row in calls], ['Running tests'])
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_collector_preserves_probe_privacy_and_local_fallback_cannot_bypass(self):
+        module = types.ModuleType('wedge_probes')
+        sig = types.SimpleNamespace(as_dict=lambda: {
+            'kind': 'pane-prompt-blocked', 'visibility': 'owner-dm',
+            'reason': 'private-pane-path', 'unblock': 'private instruction'})
+        module.probe_all = lambda workspace, now: [sig]
+        path = self.ws / 'state' / 'core-supervisor.json'
+        path.write_text(json.dumps({'state': 'blocked-human', 'prompt': 'private-pane-path You have hit your usage limit'}))
+        with patch.dict(sys.modules, {'wedge_probes': module}):
+            for now in (100, 120, 160):
+                detector._PROBE_CACHE.clear()
+                os.utime(path, (now, now))
+                self.assertTrue(all(s['visibility'] == 'owner-dm' for s in detector._signals(self.ws, now)))
+                self.assertEqual(detector.status_for(self.ws, 'task-a', self.normal, now=now), self.normal)
+        self.assertEqual(len(self.notices()), 1)
+        self.assertNotIn('private-pane-path', self.notices()[0].read_text())
+        detector._PROBE_CACHE.clear()
+
     def test_accepted_task_without_any_step_uses_production_activity_writer(self):
         from activity_bus import ActivityStore, LifecycleTransition
         sys.path.insert(0, str(REPO / 'skills' / 'agent-activity' / 'scripts'))
