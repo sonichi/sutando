@@ -400,6 +400,9 @@ def codeowner_violations(files, author: str, logins, rules) -> "list[tuple[str, 
     return bad
 
 
+CHECK_FAILED = "code-owner check FAILED"
+
+
 def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
     """(ok, lines) — every PR named in `message` must have, among `targets`, a
     non-author code owner of each owned changed file. No CODEOWNERS = no rule."""
@@ -411,8 +414,7 @@ def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
             facts = pr_facts(repo, num)
             found = fetch_codeowners(repo, facts["base"])
         except CodeownerCheckError as exc:
-            return False, [f"code-owner check FAILED for {repo}#{num}: {exc} — "
-                           "refusing rather than sending unchecked"]
+            return False, [f"{CHECK_FAILED} for {repo}#{num}: {exc}"]
         if found is None:
             continue
         path, text = found
@@ -507,7 +509,7 @@ def ledger_path() -> Path:
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
+def record_asks(message: str, reviewer: str, no_codeowner: str = "", interaction_id: str = "") -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
@@ -523,10 +525,41 @@ def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
                    "ts": ts, "channel": "room"}
             if no_codeowner:
                 row["no_codeowner"] = no_codeowner
+            if interaction_id:
+                row["interaction_id"] = interaction_id
             fh.write(json.dumps(row) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
+
+
+def _correlation():
+    """The correlation writer, or None where the engine's src/ is not beside this script."""
+    try:
+        import correlation_log
+    except ImportError:
+        return None
+    return correlation_log
+
+
+def with_interaction_id(message: str, interaction_id: str) -> str:
+    """The ask as sent: the id on its own last line, so the reviewer's answer can cite it."""
+    return f"{message}\n\nInteraction-Id: {interaction_id}"
+
+
+def record_interactions(message: str, target: dict, interaction_id: str, task_id: str, event_id: str) -> int:
+    """One correlation record per PR the ask names; the count written."""
+    n, log = 0, _correlation()
+    if log is None:
+        return 0
+    for repo, num in sorted({(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}):
+        if log.record("interaction", {
+                "interaction_id": interaction_id, "object": f"{repo}#{num}", "counterpart": target["stand"],
+                "counterpart_kind": "agent", "counterpart_scope": "unknown", "room_id": target.get("room"),
+                "room_kind": "unknown", "task_id": task_id or None, "channel": "room", "event_id": event_id or None},
+                path=ledger_path().with_name(log.LOG_NAME)):
+            n += 1
+    return n
 
 
 def _actor_map(roster) -> dict:
@@ -668,6 +701,9 @@ def main() -> int:
                     help="deliberately re-ask the SAME reviewers after 30min")
     ap.add_argument("--no-codeowner", dest="no_codeowner", metavar="REASON", default="",
                     help="deliberately ask without a non-author CODEOWNER; requires a reason")
+    ap.add_argument("--task", default="",
+                    help="the task this ask is for (its `id:` header); recorded with the ask's interaction id. "
+                         "Pass it whenever the ask is for a task: nothing infers the link")
     ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
                     help="ask (default) requests review; notice tells reviewers "
                          "something about a PR without asking for anything")
@@ -686,6 +722,11 @@ def main() -> int:
         print(f"REFUSED: --repo {a.repo!r} is not OWNER/NAME (one slash, GitHub-legal "
               "segments) — a repo GitHub cannot find checks nobody.", file=sys.stderr)
         return 7
+    if a.task:
+        log = _correlation()
+        if log is not None and not log.is_task_id(a.task):
+            print(f"REFUSED: --task {a.task!r} is not a task id (the task file's `id:` header).", file=sys.stderr)
+            return 7
     a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
@@ -818,6 +859,13 @@ def main() -> int:
             print(f"code-owner rule overridden: {a.no_codeowner}", file=sys.stderr)
         else:
             owned, lines = codeowner_gate(a.message, targets, load_roster())
+            if not owned and lines and lines[0].startswith(CHECK_FAILED):
+                # Failing closed is right; reading it as a roster problem is not.
+                print("NOT SENT: couldn't check code owners (the lookup failed), so nothing was "
+                      "refused and the roster is not at fault. Retry the ask.", file=sys.stderr)
+                for line in lines:
+                    print(line, file=sys.stderr)
+                return 9
             if not owned:
                 print("REFUSED: code-owner rule — where the base branch has CODEOWNERS, "
                       "an ask must include a non-author code owner.", file=sys.stderr)
@@ -827,7 +875,13 @@ def main() -> int:
                       "--no-codeowner '<reason>'.", file=sys.stderr)
                 return 8
     for t in targets:
+        log = _correlation()
+        ix = log.mint_interaction_id() if a.kind == "ask" and log is not None else ""
         argv = command_for(t, a.message)
+        if ix:
+            argv[4] = with_interaction_id(argv[4], ix)
+            if not a.task:
+                print("note: no --task, so this ask's interaction record names no task.", file=sys.stderr)
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
@@ -866,7 +920,9 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"], a.no_codeowner) if a.kind == "ask" else 0
+                n_logged = record_asks(a.message, t["name"], a.no_codeowner, ix) if a.kind == "ask" else 0
+                if ix:
+                    record_interactions(a.message, t, ix, a.task, event)
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "

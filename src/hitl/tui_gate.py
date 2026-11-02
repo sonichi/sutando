@@ -94,6 +94,19 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) 
             "or /model to switch to a model with usage left.")
 
 
+def sign_in_copy(runtime: Optional[str] = None) -> Tuple[str, str, str]:
+    """(title, message, button label) for a signed-out seat, in its own runtime's words."""
+    if runtime in (None, "claude"):
+        return ("Claude needs you to sign in again",
+                "Your Claude session has expired. Sign in again to continue.", "Sign in to Claude")
+    if runtime == "codex":
+        return ("Codex needs you to sign in again",
+                "Your Codex session has expired. Run `codex login` in its terminal to continue.",
+                "Sign in to Codex")
+    return ("Agent needs you to sign in again",
+            "The agent's sign-in has expired. Sign in again to continue.", "Sign in")
+
+
 def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:
     """Each contiguous run of numbered lines: (start line, labels, caret index)."""
     blocks: List[Tuple[int, List[str], Optional[int]]] = []
@@ -174,9 +187,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
-        kind, title = "auth", "Claude needs you to sign in again"
-        message = "Your Claude session has expired. Sign in again to continue."
-        actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
+        kind = "auth"
+        title, message, label = sign_in_copy(runtime)
+        actions = [Action(id="authenticate", kind="authenticate", label=label)]
     elif gate == "press-enter":
         kind, title = "confirmation", "Agent needs your confirmation"
         message = question(prompt, detail)
