@@ -1054,10 +1054,8 @@ class BridgeFake:
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.active else "inactive",
                      "UnitFileState": "enabled" if self.enabled else "disabled"}
             out = "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(","))
-        elif verb == "print":
-            if not self.registered:
-                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % B.agent_label)
-            out = "\tstate = running\n" if self.active else "\tstate = waiting\n"
+        elif verb == "print" and not self.registered:
+            return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % B.agent_label)
         elif verb in ("enable", "disable"):
             self.enabled = verb == "enable"
         elif verb in ("restart", "bootstrap"):

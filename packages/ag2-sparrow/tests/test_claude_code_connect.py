@@ -131,6 +131,83 @@ class ConnectVerify(ConnectBase):
             self.assertEqual(_dirs.device_env_path(), Path("/elsewhere/relay.env"))
 
 
+
+class UndoUnits(ConnectBase):
+    """The undo's refusals one by one: every unreadable, ambiguous or failed step leaves the job and says so."""
+
+    def ident(self, **over):
+        return dict({"pid": 4242, "start": "2026-01-01T00:00:00Z", "invocation": "inv-a", "since": 5}, **over)
+
+    def test_an_unreadable_manager_is_no_identity(self):
+        with mock.patch.object(sm, "_run", return_value=None):
+            self.assertIsNone(cm.job_identity(L))
+            with mock.patch.object(cm, "is_macos", return_value=True):
+                self.assertIsNone(cm.job_identity(L))
+        with mock.patch.object(sm, "_run", return_value=subprocess.CompletedProcess([], 0, "MainPID=\n", "")):
+            self.assertIsNone(cm.job_identity(L), "no MainPID word")
+        shown = subprocess.CompletedProcess([], 0, "InvocationID=inv-a\nMainPID=4242\nExecMainStartTimestampMonotonic=9\n", "")
+        with mock.patch.object(sm, "_run", return_value=shown), mock.patch.object(task_io, "start_time", return_value=None):
+            self.assertIsNone(cm.job_identity(L), "a pid whose start cannot be read")
+
+    def test_an_exact_signal_without_pidfds_and_its_failures(self):
+        nofd = mock.patch.object(os, "pidfd_open", side_effect=OSError(errno.ENOSYS, "x"), create=True)
+        started = mock.patch.object(task_io, "start_time", return_value="2026-01-01T00:00:00Z")
+        with nofd, started, mock.patch.object(os, "kill") as kill:
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM), "")
+        kill.assert_called_once_with(4242, signal.SIGTERM)
+        with nofd, started, mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM), cm._GONE)
+        with nofd, started, mock.patch.object(os, "kill", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM),
+                             "could not be signalled (Operation not permitted)")
+        with nofd, mock.patch.object(task_io, "start_time", return_value=None):
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM), cm._GONE)
+
+    def test_a_process_that_cannot_be_read_counts_as_running_until_the_bound(self):
+        with mock.patch.object(subprocess, "run", side_effect=OSError("no ps")):
+            self.assertTrue(cm._runs(4242, "x"))
+            self.assertFalse(cm._await_exit(4242, "x", 0))
+
+    def test_a_new_invocation_after_the_call_is_not_ours(self):
+        now = self.ident(invocation="inv-b", since=50)
+        with mock.patch.object(cm, "job_identity", return_value=now):
+            got = cm._own_run(L, self.ident(), {"by_call": True, "t0": 10, "t1": 20})
+        self.assertEqual(got, (None, "runs an invocation (pid 4242) that did not begin inside this operation's start"))
+
+    def test_the_undo_outside_the_agent_lock_stops_nothing(self):
+        p = {"shape": L, "root": str(self.work), "owned": True, "why": "", "unit": b"", "undo": [], "ident": self.ident()}
+        with mock.patch.object(cm, "_stop_run") as stop:
+            line = cm._undo_start(p)
+        stop.assert_not_called()
+        self.assertIn("this operation does not hold the agent lock, so nothing was stopped", line)
+        self.assertIn(cm.stop_command(L), line)
+
+    def test_stop_started_with_nothing_recorded_or_not_ours(self):
+        self.work.mkdir(parents=True)
+        with cm.agent_lock(str(self.work)):
+            with mock.patch.dict(cm._STARTED, clear=True):
+                self.assertIn("no job started by this connect was recorded", cm.stop_started(L, str(self.work)))
+                cm._STARTED[L.name] = {"shape": L, "root": str(self.work), "owned": False,
+                                       "why": "was already running when this operation asked for it"}
+                self.assertIn("so it is not this operation's", cm.stop_started(L, str(self.work)))
+                self.assertIn(L.name, cm._STARTED, "a run that is not ours stays recorded as it is")
+
+    def test_each_failed_stop_step_leaves_the_job_and_says_why(self):
+        ident = self.ident()
+        with mock.patch.object(cm, "_signal_exact", return_value=cm._OTHER):
+            self.assertEqual(cm._stop_run(L, ident), f"pid 4242 {cm._OTHER}; nothing was signalled")
+        with mock.patch.object(cm, "_signal_exact", return_value="") as sig, \
+                mock.patch.object(cm, "_await_exit", side_effect=[False, False]):
+            self.assertEqual(cm._stop_run(L, ident), "pid 4242 did not exit after SIGTERM and SIGKILL")
+        self.assertEqual([c.args[2] for c in sig.call_args_list], [signal.SIGTERM, signal.SIGKILL])
+        with mock.patch.object(cm, "_signal_exact", return_value=""), \
+                mock.patch.object(cm, "_await_exit", side_effect=[False, True]), \
+                mock.patch.object(cm, "job_identity", return_value=None), \
+                mock.patch.object(cm, "stop_supervisor") as stop:
+            self.assertEqual(cm._stop_run(L, ident), "its state after pid 4242 exited cannot be read, so nothing more "
+                                                     "was stopped")
+        stop.assert_not_called()
+
 class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
@@ -163,8 +240,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         full = OSError(errno.ENOSPC, "No space left on device")
         with mock.patch.object(cm, "_say_holder", side_effect=full):
             with self.assertRaises(cm.Busy) as refused:
-                with cm.agent_lock(root):
-                    self.fail("the operation ran without a recorded holder")
+                cm.agent_lock(root).__enter__()
             self.assertIn("its holder could not be recorded (No space left on device); it was released", str(refused.exception))
             self.assertFalse(cm.agent_lock_held(root))
             self.assertEqual(cm.agent_lock_busy(root), "", "released at once, not at exit")
