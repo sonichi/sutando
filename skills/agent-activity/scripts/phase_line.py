@@ -823,9 +823,16 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
             silence_s = 180.0
     except (TypeError, ValueError):
         silence_s = 180.0
+    try:
+        tool_max_s = float(setting("WEDGE_TOOL_MAX_SECONDS", "900"))
+        if not math.isfinite(tool_max_s) or tool_max_s < 1:
+            tool_max_s = 900.0
+    except (TypeError, ValueError):
+        tool_max_s = 900.0
     import turns
     return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s,
-                                     active_tool=turns.has_open_tool(Path(workspace), task_id))
+                                     active_tool=turns.has_open_tool(Path(workspace), task_id,
+                                                                     now=kw.get("now"), max_age_s=tool_max_s))
 
 
 # The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a

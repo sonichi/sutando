@@ -348,20 +348,20 @@ class Wedges(unittest.TestCase):
                                spawn=lambda *args: None)
             for call in ('call-a', 'call-b'):
                 turns.record(dict(base, hook_event_name='PreToolUse', tool_use_id=call), self.ws, now=100)
-            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=1000)['phase'], 'Waiting')
+            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=400)['phase'], 'Waiting')
             self.assertEqual(self.notices(), [])
-            self.assertFalse(turns.has_open_tool(self.ws, 'task-other'))
-            turns.record(dict(base, hook_event_name='PostToolUse', tool_use_id='unrelated'), self.ws, now=1001)
-            self.assertTrue(turns.has_open_tool(self.ws, 'task-a'))
-            turns.record(dict(base, hook_event_name='PostToolUse', tool_use_id='call-a'), self.ws, now=1002)
-            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=1003)['phase'], 'Waiting')
-            turns.record(dict(base, hook_event_name='PostToolUseFailure', tool_use_id='call-b'), self.ws, now=1004)
-            self.blocked(phase_line.published_status(self.ws, 'task-a', now=1005))
+            self.assertFalse(turns.has_open_tool(self.ws, 'task-other', now=500))
+            turns.record(dict(base, hook_event_name='PostToolUse', tool_use_id='unrelated'), self.ws, now=401)
+            self.assertTrue(turns.has_open_tool(self.ws, 'task-a', now=500))
+            turns.record(dict(base, hook_event_name='PostToolUse', tool_use_id='call-a'), self.ws, now=402)
+            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=403)['phase'], 'Waiting')
+            turns.record(dict(base, hook_event_name='PostToolUseFailure', tool_use_id='call-b'), self.ws, now=404)
+            self.blocked(phase_line.published_status(self.ws, 'task-a', now=405))
             self.assertEqual(len(self.notices()), 1)
-            turns.record(dict(base, hook_event_name='PreToolUse', tool_use_id='call-c'), self.ws, now=1010)
-            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=2000)['phase'], 'Waiting')
-            turns.record(dict(base, hook_event_name='Stop'), self.ws, now=2001)
-            self.assertFalse(turns.has_open_tool(self.ws, 'task-a'))
+            turns.record(dict(base, hook_event_name='PreToolUse', tool_use_id='call-c'), self.ws, now=410)
+            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=700)['phase'], 'Waiting')
+            turns.record(dict(base, hook_event_name='Stop'), self.ws, now=701)
+            self.assertFalse(turns.has_open_tool(self.ws, 'task-a', now=500))
         self.assertNotIn('private invocation', turns.path(self.ws).read_text())
 
     def test_tool_name_fallback_requires_each_matching_completion(self):
@@ -373,9 +373,59 @@ class Wedges(unittest.TestCase):
         for _ in range(2):
             turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=100)
         turns.record(dict(base, hook_event_name='PostToolUse'), self.ws, now=200)
-        self.assertTrue(turns.has_open_tool(self.ws, 'task-a'))
+        self.assertTrue(turns.has_open_tool(self.ws, 'task-a', now=500))
         turns.record(dict(base, hook_event_name='PostToolUse'), self.ws, now=300)
-        self.assertFalse(turns.has_open_tool(self.ws, 'task-a'))
+        self.assertFalse(turns.has_open_tool(self.ws, 'task-a', now=500))
+
+    def test_open_tool_exemption_expires_at_bound_and_two_hour_hang_notifies(self):
+        import turns
+        import phase_line
+        base = {'prompt_id': 'bounded', 'tool_name': 'Bash', 'tool_use_id': 'call-1'}
+        turns.record(dict(base, hook_event_name='UserPromptSubmit', prompt='TASK_FILE: task-a.txt'), self.ws, now=100)
+        turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=100)
+        with patch.object(detector, '_signals', return_value=[]), \
+                patch.object(phase_line, 'setting', side_effect=lambda key, default: default), \
+                patch.object(phase_line.time, 'time', return_value=100):
+            phase_line.on_step(self.ws, 'task-a', 'Bash', {}, '', spawn=lambda *args: None)
+            for now in (400, 999):
+                self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=now)['phase'], 'Waiting')
+            self.assertEqual(self.notices(), [])
+            turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=999)
+            self.blocked(phase_line.published_status(self.ws, 'task-a', now=1000))
+            self.blocked(phase_line.published_status(self.ws, 'task-a', now=7300))
+            self.assertEqual(len(self.notices()), 1)
+        self.assertEqual(turns.read(self.ws, 'bounded')['tool_started']['id:call-1'], 100)
+
+    def test_open_tool_bound_is_configurable_and_invalid_config_uses_default(self):
+        import turns
+        import phase_line
+        manifest = json.loads((REPO / 'skills' / 'agent-activity' / 'manifest.json').read_text())
+        self.assertEqual(manifest['config']['WEDGE_TOOL_MAX_SECONDS'], 900)
+        base = {'prompt_id': 'configured', 'tool_name': 'Bash', 'tool_use_id': 'call-1'}
+        turns.record(dict(base, hook_event_name='UserPromptSubmit', prompt='TASK_FILE: task-a.txt'), self.ws, now=100)
+        turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=100)
+        for value, bound in (('600', 600), ('nan', 900), ('-1', 900), ('invalid', 900)):
+            with self.subTest(value=value), patch.object(detector, '_signals', return_value=[]), \
+                    patch.object(phase_line, 'setting', side_effect=lambda key, default: value if key == 'WEDGE_TOOL_MAX_SECONDS' else default), \
+                    patch.object(phase_line.time, 'time', return_value=100):
+                phase_line.on_step(self.ws, 'task-a', 'Bash', {}, '', spawn=lambda *args: None)
+                self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=100 + bound - 1)['phase'], 'Waiting')
+                self.blocked(phase_line.published_status(self.ws, 'task-a', now=100 + bound))
+
+    def test_missing_future_or_invalid_tool_start_cannot_hide_silence(self):
+        import turns
+        base = {'prompt_id': 'unknown-start', 'tool_name': 'Bash', 'tool_use_id': 'call-1'}
+        turns.record(dict(base, hook_event_name='UserPromptSubmit', prompt='TASK_FILE: task-a.txt'), self.ws, now=100)
+        turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=100)
+        path = turns.path(self.ws)
+        for stamp in (None, True, float('nan'), '100', 2000):
+            data = json.loads(path.read_text())
+            data['turns']['unknown-start']['tool_started']['id:call-1'] = stamp
+            path.write_text(json.dumps(data))
+            self.assertFalse(turns.has_open_tool(self.ws, 'task-a', now=500))
+        data['turns']['unknown-start'].pop('tool_started')
+        path.write_text(json.dumps(data))
+        self.assertFalse(turns.has_open_tool(self.ws, 'task-a', now=500))
 
     def test_exact_250_second_activity_schedule_sends_only_one_notice_in_30_minutes(self):
         for now in range(100, 1900, 10):
