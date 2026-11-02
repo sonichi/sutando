@@ -1001,9 +1001,8 @@ while :; do
     esac
     continue
   fi
-  # macOS's own /bin/bash (3.2) returns 1 for a read TIMEOUT too, same as EOF
-  # (unlike a modern bash's >128): a live writer and a read that waited out its
-  # timeout mean a timeout; anything else is EOF (notifier-guard.sh).
+  # bash 3.2 returns 1 for a read timeout and for EOF alike: only a live writer and a read that
+  # waited out its timeout is a timeout (notifier-guard.sh).
   if ! events_stream_ended "$watcher_pid" "$((SECONDS - read_at))" "$RETRY_POLL_SEC"; then
     # Never round again without a pause: a sub-2s timeout cannot be told from EOF by time.
     [ $((SECONDS - read_at)) -gt 0 ] || sleep 1

@@ -116,7 +116,7 @@ class FakeRepo:
         env = isolated_child_env(SUTANDO_TASKS_DIR=str(self.ws / "tasks"), SUTANDO_WORKSPACE_DIR=str(self.ws),
                                  SUTANDO_TMUX_SOCKET=str(self.tmp / "no-tmux.sock"),
                                  WATCHER_PID_FILE=str(self.watcher_pid_file),
-                                 SUTANDO_NOTIFIER_RETRY_POLL_SEC="5", SUTANDO_NOTIFIER_RETRY_INTERVAL="5")
+                                 SUTANDO_NOTIFIER_RETRY_POLL_SEC="3", SUTANDO_NOTIFIER_RETRY_INTERVAL="3")
         env.pop("SUTANDO_INSTANCE_ID", None)
         # stderr to a file: an unread pipe fills and blocks the notifier, and the watcher inherits it.
         with open(self.err, "w") as err:
