@@ -250,6 +250,7 @@ class OwnerGuard(Base):
         return result, before
 
     def test_an_owners_codex_home_replaced_after_its_identity_is_read_is_still_refused(self):
+        # Refused by the lexical guard, so inode reuse on the replacement cannot matter.
         self.owner.mkdir()
         result, before = self.race(self.owner, self.home)
         self.assertEqual(result, "owner-home")
@@ -327,7 +328,17 @@ class OwnerGuard(Base):
         with patch.object(chi, "_active_override", probe_then_transition):
             return self.link(codex_home=codex_home)
 
-    def test_any_owner_transition_just_before_the_symlink_refuses_it(self):
+    def reset_owner(self, start, elsewhere):
+        if os.path.islink(self.owner) or self.owner.is_file():
+            self.owner.unlink()
+        elif self.owner.exists():
+            shutil.rmtree(self.owner)
+        if start == "dir":
+            self.owner.mkdir()
+        elif start == "link":
+            self.owner.symlink_to(elsewhere)
+
+    def test_any_detectable_owner_transition_just_before_the_symlink_refuses_it(self):
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
         other = self.root / "other"
@@ -339,28 +350,56 @@ class OwnerGuard(Base):
         def removed():
             self.owner.rmdir()
 
-        def replaced():
-            self.owner.rmdir()
+        def replaced_old_kept():
+            aside = self.root / "owner-aside"
+            if aside.exists():
+                aside.rmdir()
+            self.owner.rename(aside)
             self.owner.mkdir()
+
+        def replaced_by_a_file():
+            self.owner.rename(self.root / f"owner-aside-file-{len(os.listdir(self.root))}")
+            self.owner.write_text("not a directory\n")
 
         def retargeted():
             self.owner.unlink()
             self.owner.symlink_to(other)
+        # Each new owner inode is guaranteed distinct: the old one is still in use.
         cases = [("created", None, created), ("removed", "dir", removed),
-                 ("replaced", "dir", replaced), ("retargeted", "link", retargeted)]
+                 ("replaced-old-kept", "dir", replaced_old_kept),
+                 ("replaced-by-a-file", "dir", replaced_by_a_file),
+                 ("retargeted", "link", retargeted)]
         for name, start, transition in cases:
             with self.subTest(transition=name):
-                if os.path.islink(self.owner):
-                    self.owner.unlink()
-                elif self.owner.exists():
-                    self.owner.rmdir()
-                if start == "dir":
-                    self.owner.mkdir()
-                elif start == "link":
-                    self.owner.symlink_to(elsewhere)
+                self.reset_owner(start, elsewhere)
                 home = self.root / f"app-home-{name}"
                 self.assertEqual(self.at_pre_symlink(transition, home), "owner-home")
                 self.assertFalse(os.path.lexists(home / "AGENTS.md"), "linked despite the transition")
+
+    def test_an_owner_recreated_in_place_is_never_written_into(self):
+        # rmdir+mkdir may reuse the inode (Linux does), so the record may not change; the
+        # property that must hold everywhere is that nothing lands in ~/.codex.
+        real_anchor = chi._owner_anchor
+        for name, reuse in (("as-the-os-allocates", False), ("inode-reused", True)):
+            with self.subTest(case=name):
+                self.reset_owner("dir", None)
+                snapshot = real_anchor(self.home)
+
+                def recreate():
+                    self.owner.rmdir()
+                    self.owner.mkdir()
+                home = self.root / f"app-home-recreated-{name}"
+                patches = [patch.object(chi, "_owner_anchor", lambda h: snapshot)] if reuse else []
+                with contextlib.ExitStack() as stack:
+                    for p in patches:
+                        stack.enter_context(p)
+                    result = self.at_pre_symlink(recreate, home)
+                self.assertIn(result, ("owner-home", "linked"))
+                self.assertEqual(os.listdir(self.owner), [])
+                if reuse:
+                    self.assertEqual(result, "linked")
+                if result == "linked":
+                    self.assertEqual(Path(os.readlink(home / "AGENTS.md")), self.host)
 
     def test_an_unchanged_owner_lets_the_same_path_link(self):
         """Positive control for the transition tests: no transition, same hook, a link."""
