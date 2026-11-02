@@ -9,11 +9,14 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
 from file_lock import locked_file
-from local_task_protocol import valid_local_task_id
+from local_task_protocol import find_archived_task, find_result, parse_task_headers, valid_local_task_id
+from ag2space_links import room_link
+from proactive_routing import proactive_filename
 
 SILENCE_S = 180.0
 CONFIRM_S = 20.0
@@ -80,7 +83,8 @@ def _signals(workspace, now):
                 text = " ".join(str(data.get(k) or "") for k in ("kind", "detail", "prompt"))
                 limited = any(rx.search(text) for kind, rx in ABNORMAL_PATTERNS
                               if kind in PROVIDER_LIMIT_PATTERNS)
-                found.insert(0, {"kind": "provider-limit" if limited else "pane-prompt-blocked"})
+                if limited or data.get("state") in ("blocked-human", "logged-out"):
+                    found.insert(0, {"kind": "provider-limit" if limited else "pane-prompt-blocked"})
     except (OSError, ValueError):
         pass
     _PROBE_CACHE[key] = (now, found)
@@ -112,20 +116,45 @@ def _activity(workspace, task_id, status, now):
     return snap, max(stamps) if stamps else None, snap.get("phase") in ("COMPLETED", "FAILED", "CANCELLED")
 
 
+def _notice_context(workspace, task_id):
+    snap = _read(workspace / "state" / "activity" / f"{task_id}.json")
+    room, event = snap.get("room"), snap.get("message_event_id")
+    task = find_archived_task(workspace / "tasks", task_id)
+    if task is not None:
+        headers = parse_task_headers(task.read_text(encoding="utf-8")).headers
+        room = room or headers.get("source_room_id") or headers.get("channel_id")
+        event = event or headers.get("source_message_id")
+    context = f"Task {task_id}"
+    if isinstance(room, str) and re.fullmatch(r"[!#][A-Za-z0-9._~-]+:[A-Za-z0-9.:-]+", room):
+        event = event if isinstance(event, str) and re.fullmatch(r"\$[A-Za-z0-9._~:+/=-]+", event) else ""
+        context += f" — Room: {room_link(room, via='')}"
+        if event:
+            context += f" — Message: {room_link(room, event, via='')}"
+    return context
+
+
+def _budget(state):
+    kinds = set(state.get("notified_kinds", []))
+    if state.get("dm_reserved") and state.get("kind"):
+        kinds.add(state["kind"])
+    return sorted(kinds)
+
+
 def _owner_notice(workspace, task_id, state, path):
-    if state.get("dm_reserved"):
+    if state["kind"] in _budget(state):
         return
-    state["dm_reserved"] = True
+    context = _notice_context(workspace, task_id)
+    state["notified_kinds"] = sorted(set(_budget(state)) | {state["kind"]})
     _save(path, state)  # reserve before enqueue: a crash may omit a DM, never duplicate one
     digest = hashlib.sha256(f"{task_id}:{state['first']}:{state['kind']}".encode()).hexdigest()[:24]
-    result = workspace / "results" / f"proactive-wedge-{digest}.txt"
+    result = workspace / "results" / proactive_filename(f"wedge-{digest}")
     result.parent.mkdir(parents=True, exist_ok=True)
     if result.exists():
         return
     tmp = result.with_name(f".{result.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as stream:
-        stream.write(f"[dm-only]\nA task needs attention: {MESSAGES[state['kind']]}\n")
+        stream.write(f"[dm-only]\n{context}: {MESSAGES[state['kind']]}\n")
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(tmp, result)
@@ -143,13 +172,19 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
     if status is None and not path.exists():
         return None
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with locked_file(root / f".{task_id}.lock", create_mode=0o600):
+    with locked_file(root / ".lock", create_mode=0o600):
         previous = _read(path)
-        if status is None or (workspace / "results" / f"{task_id}.txt").exists():
+        if find_result(workspace / "results", task_id) is not None:
+            path.unlink(missing_ok=True)
+            return status
+        if status is None:
             if previous:
-                _save(path, {})
+                _save(path, {"notified_kinds": _budget(previous)})
             return status
         snap, last, terminal = _activity(workspace, task_id, status, now)
+        if terminal:
+            path.unlink(missing_ok=True)
+            return status
         waiting = status.get("waiting") or {}
         accepted = snap.get("phase") == "RUNNING"
         excluded = terminal or status.get("phase") == "Delegated" or (
@@ -164,7 +199,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                 if target != task_id and (target or not snap or snap.get("worker") not in (None, "", "core")):
                     continue
                 since = _number(signal.get("since"))
-                if signal["kind"] == "core-status-stale" and since is not None and last is not None and last > since:
+                if since is not None and last is not None and last > since:
                     continue
                 kind = signal["kind"]
                 break
@@ -175,15 +210,16 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                 kind = "activity-silent"
         if kind is None:
             if previous:
-                _save(path, {})
+                _save(path, {"notified_kinds": _budget(previous)})
             return status
         same = previous.get("kind") == kind and previous.get("generation") == snap.get("generation")
-        if kind == "activity-silent" and last != previous.get("activity_at"):
+        if last != previous.get("activity_at"):
             same = False
         observed_at = _number(previous.get("observed_at"))
         if kind == "watcher-not-ready" and (observed_at is None or not 0 <= now - observed_at <= WATCHER_POLL_GAP_S):
             same = False
-        state = previous if same else {"kind": kind, "generation": snap.get("generation"), "first": now}
+        state = previous if same else {"kind": kind, "generation": snap.get("generation"), "first": now,
+                                      "notified_kinds": _budget(previous)}
         if kind == "activity-silent" and not same:
             state["first"] = last + silence_s
         state["activity_at"] = last

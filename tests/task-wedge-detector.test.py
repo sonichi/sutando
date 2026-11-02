@@ -15,6 +15,7 @@ from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / 'src'))
+sys.path.insert(0, str(REPO / 'skills' / 'agent-activity' / 'scripts'))
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 import wedge_detector as detector
 from ag2_sparrow.task_step_publisher import StepPublisher
@@ -218,7 +219,7 @@ class Wedges(unittest.TestCase):
         self.blocked(self.check(150, [signal]))
         self.assertEqual(self.notices(), [])
 
-    def test_notice_is_durable_private_deduplicated_and_rearms_after_recovery(self):
+    def test_notice_budget_survives_recovery_and_module_reload(self):
         signal = self.signal()
         self.check(100, [signal])
         self.check(120, [signal])
@@ -238,7 +239,7 @@ class Wedges(unittest.TestCase):
         self.check(200, [signal])
         self.check(220, [signal])
         self.check(280, [signal])
-        self.assertEqual(len(self.notices()), 2)
+        self.assertEqual(len(self.notices()), 1)
 
     def test_new_activity_between_polls_starts_a_new_silence_episode(self):
         self.blocked(self.check(280))
@@ -267,6 +268,7 @@ class Wedges(unittest.TestCase):
             ({'state': 'blocked-known', 'detail': 'You have hit your usage limit'}, 100, 'provider-limit'),
             ({'state': 'blocked-human', 'prompt': 'Please sign in to continue'}, 100, 'pane-prompt-blocked'),
             ({'state': 'running', 'detail': 'You have hit your usage limit'}, 100, None),
+            ({'state': 'blocked-known', 'detail': 'composer text or abnormal frame'}, 100, None),
             ({'state': 'blocked-known', 'detail': 'You have hit your usage limit'}, 1, None),
             ({'state': 'blocked-human'}, 200, None),
             ('{invalid', 100, None),
@@ -374,6 +376,111 @@ class Wedges(unittest.TestCase):
         self.assertTrue(turns.has_open_tool(self.ws, 'task-a'))
         turns.record(dict(base, hook_event_name='PostToolUse'), self.ws, now=300)
         self.assertFalse(turns.has_open_tool(self.ws, 'task-a'))
+
+    def test_exact_250_second_activity_schedule_sends_only_one_notice_in_30_minutes(self):
+        for now in range(100, 1900, 10):
+            if (now - 100) % 250 == 0:
+                self.activity('task-a', now)
+            self.check(now)
+        self.assertEqual(len(self.notices()), 1)
+        importlib.reload(detector)
+        self.activity('task-a', 1900)
+        self.assertEqual(self.check(1900), self.normal)
+        self.check(2140)
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_legacy_episode_reservation_becomes_persistent_kind_budget(self):
+        root = self.ws / 'state' / 'task-wedges'
+        root.mkdir()
+        (root / 'task-a.json').write_text(json.dumps(
+            {'kind': 'provider-limit', 'first': 100, 'activity_at': 100, 'dm_reserved': True}))
+        self.activity('task-a', 200)
+        self.assertEqual(self.check(200), self.normal)
+        self.check(210, [self.signal()])
+        self.check(270, [self.signal()])
+        self.assertEqual(self.notices(), [])
+
+    def test_new_activity_clears_confirmed_provider_signature_immediately(self):
+        signal = self.signal()
+        self.check(100, [signal])
+        self.blocked(self.check(120, [signal]))
+        self.activity('task-a', 121)
+        self.assertEqual(self.check(121, [signal]), self.normal)
+        self.assertEqual(self.notices(), [])
+
+    def test_200_second_activity_schedule_never_notifies(self):
+        for now in range(100, 1900, 10):
+            if (now - 100) % 200 == 0:
+                self.activity('task-a', now)
+            self.check(now)
+        self.assertEqual(self.notices(), [])
+
+    def test_budget_survives_missing_status_generation_change_and_kind_switch(self):
+        signal = self.signal()
+        self.check(100, [signal])
+        self.check(160, [signal])
+        detector.status_for(self.ws, 'task-a', None, now=170)
+        snap = self.ws / 'state' / 'activity' / 'task-a.json'
+        data = json.loads(snap.read_text())
+        data['generation'] = 2
+        snap.write_text(json.dumps(data))
+        other = self.signal('pane-prompt-blocked')
+        self.check(180, [other])
+        self.check(240, [other])
+        self.assertEqual(len(self.notices()), 2)
+        self.check(250, [signal])
+        self.check(310, [signal])
+        self.assertEqual(len(self.notices()), 2)
+        data['phase'] = 'COMPLETED'
+        snap.write_text(json.dumps(data))
+        self.check(320, [signal])
+        self.assertFalse((self.ws / 'state' / 'task-wedges' / 'task-a.json').exists())
+
+    def test_fresh_activity_resets_each_undated_signature_confirmation(self):
+        for kind in ('provider-limit', 'pane-prompt-blocked', 'watcher-not-ready'):
+            signal = self.signal(kind)
+            for now in range(100, 300, 10):
+                self.activity('task-a', now)
+                self.assertEqual(self.check(now, [signal]), self.normal)
+            self.assertEqual(self.notices(), [])
+
+    def test_dated_signatures_cannot_override_newer_task_progress(self):
+        for kind in ('provider-limit', 'pane-prompt-blocked', 'watcher-not-ready'):
+            signal = dict(self.signal(kind), since=90)
+            for now in (100, 120, 160):
+                self.assertEqual(self.check(now, [signal]), self.normal)
+        self.assertEqual(self.notices(), [])
+
+    def test_owner_notice_names_task_and_origin_without_task_body(self):
+        (self.ws / 'tasks').mkdir()
+        (self.ws / 'tasks' / 'task-a.txt').write_text(
+            'id: task-a\nsource_room_id: !test:example\nsource_message_id: $original\n'
+            'task: private content\nsource_message_id: $forged\n')
+        self.check(100, [self.signal()])
+        self.check(160, [self.signal()])
+        body = self.notices()[0].read_text()
+        self.assertIn('Task task-a', body)
+        self.assertIn('Room: https://matrix.to/#/!test:example', body)
+        self.assertIn('Message: https://matrix.to/#/!test:example/$original', body)
+        self.assertNotIn('private content', body)
+        self.assertNotIn('$forged', body)
+        self.assertTrue(body.startswith('[dm-only]\n'))
+
+    def test_lock_files_are_bounded_and_archived_result_clears_budget(self):
+        for i in range(50):
+            task = f'task-{i}'
+            self.activity(task, 100)
+            self.check(100, task=task)
+            detector.status_for(self.ws, task, None, now=101)
+        root = self.ws / 'state' / 'task-wedges'
+        self.assertEqual([p.name for p in root.glob('.*')], ['.lock'])
+        self.check(100, [self.signal()])
+        self.check(160, [self.signal()])
+        archive = self.ws / 'results' / 'archive'
+        archive.mkdir()
+        (archive / 'task-a.txt').write_text('done')
+        self.assertEqual(self.check(170, [self.signal()]), self.normal)
+        self.assertFalse((root / 'task-a.json').exists())
 
     def test_accepted_task_without_any_step_uses_production_activity_writer(self):
         from activity_bus import ActivityStore, LifecycleTransition
