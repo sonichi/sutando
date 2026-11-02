@@ -9966,10 +9966,12 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
                 "detail": "no outbox root — nothing to park (this 0 is untestable)"}
     try:
         import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+        import outbox_cli  # noqa: PLC0415 - its body_gone is the requeue refusal's own rule
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
     parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
+    stranded: list[tuple[str, str, str]] = []  # QUEUED with nothing left to send
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9983,32 +9985,49 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
+            iid = str(d.get("item_id") or "?")
+            gone = d.get("item_id") and outbox_cli.body_gone(root, iid, results)
+            parked.append((root.name, iid, "body-gone" if gone else str(d.get("reason") or "")))
+        for d in outbox.list_items(root, status="QUEUED"):
+            iid = str(d.get("item_id") or "")
+            # Unclaimed and with no body anywhere: nothing will ever pick it up.
+            if iid and outbox.read_delivery_claim(root, iid) is None and outbox_cli.body_gone(root, iid, results):
+                stranded.append((root.name, iid, "queued-no-body"))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
-    if parked:
+    if parked or stranded:
         parked.sort()
+        stranded.sort()
 
         def listing(items):
             shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
                                for root_name, item_id, _reason in items[:4])
             return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
         # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        gone = [p for p in parked if p[2] == "body-gone"]
         unknown = [p for p in parked if p[2] == "outcome-unknown"]
-        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] not in ("outcome-unknown", "body-gone")]
         parts = []
+        if gone:
+            parts.append(f"{len(gone)} cannot be requeued, their body is gone (archived under "
+                         f"results/archive/) — re-send manually: {listing(gone)}")
+        if stranded:
+            parts.append(f"{len(stranded)} QUEUED with nothing to send (an earlier requeue of a "
+                         f"body-less reply) — re-send manually: {listing(stranded)}")
         if undelivered:
             parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
                          f"{listing(undelivered)}")
         if unknown:
             parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
                          f"checking the room: {listing(unknown)}")
+        recover = (f" Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                   f"(the root varies per item; a single hardcoded root under-reports)"
+                   if undelivered or unknown else "")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
-                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
-                          f"(the root varies per item; a single hardcoded root under-reports)"}
+                "detail": (f"{len(parked)} reply/replies PARKED; " if parked else "")
+                          + "; ".join(parts) + "." + recover}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
