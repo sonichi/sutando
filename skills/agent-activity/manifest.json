@@ -37,7 +37,7 @@
   ],
   "config": {
     "AGENT_DISPLAY_NAME": "",
-    "LEDGER_STEP_PUBLISH_ENABLED": false,
+    "LEDGER_STEP_PUBLISH_ENABLED": true,
     "PHASE_MODEL": "off",
     "PHASE_MODEL_PROJECT": "",
     "PHASE_MODEL_ID": "gemini-3.5-flash-lite",
