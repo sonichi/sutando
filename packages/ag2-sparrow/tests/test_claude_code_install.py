@@ -4,6 +4,7 @@ the source rules. Shared fixtures: claude_code_fixtures.py."""
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -1525,8 +1526,10 @@ class ConnectSourceRules(unittest.TestCase):
         for path in sorted((PKG / "ag2_sparrow").rglob("*.py")):
             self.assertNotIn("killpg", path.read_text(), path)
         src = Path(cm.__file__).read_text()
-        for token in ("start_new_session", "process_group", "pass_fds", "setsid", "setpgid", "os.kill(", "TRAMPOLINE"):
+        for token in ("start_new_session", "process_group", "pass_fds", "setsid", "setpgid", "TRAMPOLINE"):
             self.assertNotIn(token, src, token)
+        self.assertEqual(src.count("os.kill("), inspect.getsource(cm._signal_exact).count("os.kill("),
+                         "a pid that is not a child is signalled only after its start time is checked")
 
     def test_no_lease_symbol_survives_in_the_module_the_adapter_the_docs_or_the_tests(self):
         words = ["child_" + "lease", "end_" + "lease", "lease" + "_used", "Owner" + "." + "leased"]

@@ -12,6 +12,7 @@ import io
 import json
 import os
 import plistlib
+import secrets
 import shlex
 import select
 import shutil
@@ -41,6 +42,7 @@ sys.path.insert(0, str(PKG))
 from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
 from ag2_sparrow import gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
+from connect_undo_seams import UndoSeams  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
 # The wrapper survives an interpreter path with a space: exec of the quoted path on the body beside it.
@@ -207,6 +209,11 @@ def unhold(p):
     p.stdout.close()
 
 
+def platform_as(mac):
+    """The manager branch a helper runs: None keeps the one the test (or the base, systemd) chose."""
+    return contextlib.nullcontext() if mac is None else mock.patch.object(cm, "is_macos", return_value=mac)
+
+
 class Runner:
     """A manager command table for service_manager._run: (program, verb) -> rc or (rc, out, err); None =
     could not run. With a root, a start verb runs a stand-in launcher holding the root's lock, a stop
@@ -215,10 +222,12 @@ class Runner:
     def __init__(self, table=None, default=0, root=None, adapter="codex-local"):
         self.table, self.default, self.calls, self.root, self.adapter = dict(table or {}), default, [], root, adapter
         self.session, self.enabled, self.real = None, False, False
+        self.invocation, self.since = "", 0
         self.pause, self.acted, self.shim, self.spawned, self.stop_timeout = "", "", False, [], 10
 
     def start_session(self, by_manager=False):
         self.stop_session()
+        self.invocation, self.since = secrets.token_hex(16), int(time.monotonic() * 1_000_000)
         self.session = launched(self.root, self.adapter, real=self.real, pause=self.pause, acted=self.acted,
                                 shim=self.shim) if by_manager else hold(self.root, self.adapter)
         self.spawned.append(self.session)
@@ -259,9 +268,11 @@ class Runner:
             loaded = cm.service_path(L).exists()
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
                      "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
-                     "MainPID": str(self.session.pid) if self.alive() else "0"}
+                     "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
+                     "ExecMainStartTimestampMonotonic": str(self.since)}
             props = cmd[cmd.index("-p") + 1].split(",")
-            return (0, "".join(words[k] + "\n" for k in props), "")
+            shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in props)
+            return (0, "".join(w + "\n" for w in shown), "")
         return self.default
 
     def __call__(self, cmd, timeout=30):
@@ -340,8 +351,8 @@ class Base(unittest.TestCase):
     def install(self, *extra):
         return self.main("install", "--work", str(self.work), "--codex-home", str(self.codex_home), *extra)
 
-    def install_with(self, runner, mac=False, *extra):
-        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
+    def install_with(self, runner, mac=None, *extra):
+        with mock.patch.object(sm, "_run", side_effect=runner), platform_as(mac):
             return self.install(*extra)
 
     def configure(self, **over):
@@ -1042,12 +1053,17 @@ class BridgeFake:
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.active else "inactive",
                      "UnitFileState": "enabled" if self.enabled else "disabled"}
             out = "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(","))
+        elif verb == "print":
+            if not self.registered:
+                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % B.agent_label)
+            out = "\tstate = running\n" if self.active else "\tstate = waiting\n"
         elif verb in ("enable", "disable"):
             self.enabled = verb == "enable"
         elif verb in ("restart", "bootstrap"):
             self.active = self.registered = True
         elif verb in ("stop", "bootout"):
             self.active = False
+            self.registered = self.registered and verb == "stop"
         return subprocess.CompletedProcess(cmd, 0, out, "")
 
 
@@ -1059,9 +1075,21 @@ def seed_seat(seat, bearer):
     return seat
 
 
-class ConnectCode(Base):
+class ConnectCode(UndoSeams, Base):
     """`connect --base --code`: connect_bridge's preflight, redemption and seat, then install with the seat,
     which wires the agent's bridge from the same launch env as claude-local's."""
+    local = L
+
+    def seam_fake(self):
+        return self.fake()
+
+    def backend(self):
+        return Backend()
+
+    def install_seat(self, fake):
+        seed_seat(cb.bridge_home(self.root), BEARER)
+        return self._main_with(fake, "install", "--token-env-file", cb.seat_file(self.root), "--codex-home",
+                               str(self.codex_home))
 
     def setUp(self):
         super().setUp()
@@ -1082,7 +1110,7 @@ class ConnectCode(Base):
                 str(self.codex_home), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
-        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
+        with mock.patch.object(sm, "_run", side_effect=fake), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 mock.patch.object(cm, "redeem_code", side_effect=functools.partial(
                     cm.redeem_code, sleep=lambda s: (sleeps if sleeps is not None else []).append(s))), \
@@ -1096,10 +1124,17 @@ class ConnectCode(Base):
     def test_connect_is_off_without_the_experimental_flag_and_touches_nothing(self):
         backend, fake, stdin = Backend(), self.fake(), io.StringIO(CODE + "\n")
         out, err = io.StringIO(), io.StringIO()
+        spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
+                 ((cm, "_post_json"), (cm, "redeem_code"), (cm, "operation_lock"), (cm, "agent_lock"),
+                  (cb, "redeem_into_seat"), (cli, "connect_preflight"))}
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
+                contextlib.ExitStack() as stack, \
                 mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            called = {name: stack.enter_context(spy) for name, spy in spies.items()}
             rc = cli.main(["connect", "--base", BASE, "--code", "-", "--codex-home", str(self.codex_home)])
+        self.assertEqual({name: spy.call_count for name, spy in called.items()}, dict.fromkeys(spies, 0),
+                         "no backend call, no lock, no preflight")
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertEqual(err.getvalue(), "error: Codex connect is not enabled in this release; use install --work / "
                                          "verify\n")
@@ -2163,30 +2198,34 @@ class ConnectCode(Base):
                 with mock.patch.object(sm, "_run", side_effect=fake), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cm.uninstall(L), 0)
 
-    def test_a_launcher_held_past_the_operations_wait_never_acts_on_the_root(self):
+    def test_a_launcher_holding_the_agent_lock_past_the_wait_is_left_and_reported(self):
         for shim in (False, True):
             with self.subTest("launchd shim child" if shim else "systemd direct"):
                 fake = self.fake()
                 r = fake.runner
-                r.real, r.shim, r.stop_timeout = True, shim, 2       # the stop times out on the paused launcher
+                r.real, r.shim = True, shim
                 r.pause, r.acted = str(self.home / f"resume-{shim}"), str(self.home / f"acted-{shim}")
-                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim):
+                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim), \
+                        mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
                     rc, out, err = self.connect(Backend(), fake)
-                Path(r.pause).touch()                       # the paused launcher resumes after the failure
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not Path(r.acted).exists() \
-                        and any(launcher.poll() is None for launcher in r.spawned):
-                    time.sleep(0.1)
-                acted, held = Path(r.acted).exists(), task_io.lock_held(str(self.root))
-                for launcher in r.spawned:                  # cleanup, so one shape cannot leak into the next
-                    if launcher.poll() is None:
-                        os.killpg(launcher.pid, signal.SIGKILL)
-                        launcher.wait(timeout=30)
-                self.assertFalse(acted, "the late launcher never held or acted on the root")
-                self.assertEqual(held, "free")
-                self.assertNotEqual(rc, 0, out + err)
-                self.assertNotIn("next:", out)
-                self.assertIn("did not acquire", err)
+                    by_hand = f"({cm.stop_command(L)})"
+                verbs, job = [r.verb(c) for c in r.calls], r.pid()
+                Path(r.pause).touch()
+                try:
+                    self.assertNotEqual(rc, 0, out + err)
+                    self.assertNotIn("next:", out)
+                    self.assertIn("did not acquire", err)
+                    self.assertIn("so nothing was stopped", err)
+                    self.assertIn(by_hand, err, "what is left comes with the command that stops it")
+                    self.assertFalse({"stop", "bootout", "disable"} & set(verbs), "no cleanup without the agent lock")
+                    signalled.assert_not_called()
+                    self.assertIsNotNone(job, "the job is left, as reported")
+                finally:
+                    for launcher in r.spawned:              # cleanup, so one shape cannot leak into the next
+                        if launcher.poll() is None:
+                            os.killpg(launcher.pid, signal.SIGKILL)
+                            launcher.wait(timeout=30)
+                    r.session = None
 
     def test_the_real_launcher_through_launchds_shim_ends_up_alive(self):
         fake = self.fake()

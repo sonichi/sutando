@@ -5,6 +5,7 @@ claude_code_fixtures.py."""
 from __future__ import annotations
 
 import contextlib
+import errno
 import functools
 import io
 import json
@@ -36,8 +37,9 @@ from claude_code_fixtures import (  # noqa: E402
     ConnectBase, CONTENDER, hold, hold_mod, inbox, L, launcher, PKG, ran, records, RELAY, REPLACER, SEAT_HOLDER,
     REAL_TMUX_VERSION, seed_seat, SESSION_ID, shape_mod, sm, START_VERBS, SUCCESSOR_WRITER, task_io, tmux_pane_keys,
     TOKEN, unhold,
-    UNPUBLISHED,
+    UNPUBLISHED, wait_for,
 )
+from connect_undo_seams import UndoSeams  # noqa: E402
 
 
 class ConnectVerify(ConnectBase):
@@ -129,9 +131,53 @@ class ConnectVerify(ConnectBase):
             self.assertEqual(_dirs.device_env_path(), Path("/elsewhere/relay.env"))
 
 
-class ConnectCode(AgentRootBase):
+class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
+
+    local = L
+
+    def seam_fake(self):
+        return self.bridged()
+
+    def backend(self):
+        return Backend()
+
+    def install_seat(self, fake):
+        seed_seat(cli.bridge_home(self.root), BEARER)
+        return self.install_default(fake, "--token-env-file", str(cli.bridge_home(self.root) / "channels" / "ag2space" / ".env"))
+
+    def test_an_exact_signal_reaches_only_the_process_with_the_recorded_start(self):
+        child = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (child.kill(), child.wait()) if child.poll() is None else None)
+        start = wait_for(lambda: task_io.start_time(child.pid))
+        self.assertEqual(cm._signal_exact(child.pid, "2000-01-01T00:00:00Z", signal.SIGTERM), cm._OTHER)
+        self.assertIsNone(child.poll(), "a pid whose start differs is never signalled")
+        self.assertEqual(cm._signal_exact(child.pid, start, signal.SIGTERM), "")
+        self.assertEqual(child.wait(timeout=10), -signal.SIGTERM)
+        self.assertEqual(cm._signal_exact(child.pid, start, signal.SIGTERM), cm._GONE)
+
+    def test_a_holder_record_that_cannot_be_written_releases_the_agent_lock_and_refuses(self):
+        self.root.mkdir(parents=True)
+        root = str(self.root)
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(cm, "_say_holder", side_effect=full):
+            with self.assertRaises(cm.Busy) as refused:
+                with cm.agent_lock(root):
+                    self.fail("the operation ran without a recorded holder")
+            self.assertIn("its holder could not be recorded (No space left on device); it was released", str(refused.exception))
+            self.assertFalse(cm.agent_lock_held(root))
+            self.assertEqual(cm.agent_lock_busy(root), "", "released at once, not at exit")
+            fd, why = cm.launch_admission(root, wait_s=0)
+            self.assertIsNone(fd)
+            self.assertIn("its holder could not be recorded", why)
+            self.assertEqual(cm.agent_lock_busy(root), "")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(cm.install(L, {}, root), 1)
+            self.assertIn("its holder could not be recorded", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+        with cm.agent_lock(root):
+            self.assertTrue(cm.agent_lock_held(root), "the next operation takes it")
 
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-"),
                 plugin=True):
@@ -141,7 +187,7 @@ class ConnectCode(AgentRootBase):
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
-        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
+        with mock.patch.object(sm, "_run", side_effect=fake), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 mock.patch.object(cm, "redeem_code", side_effect=functools.partial(
                     cm.redeem_code, sleep=lambda s: (sleeps if sleeps is not None else []).append(s))), \
@@ -1021,30 +1067,34 @@ class ConnectCode(AgentRootBase):
                 with mock.patch.object(sm, "_run", side_effect=fake), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cm.uninstall(L), 0)
 
-    def test_a_launcher_held_past_the_operations_wait_never_acts_on_the_root(self):
+    def test_a_launcher_holding_the_agent_lock_past_the_wait_is_left_and_reported(self):
         for shim in (False, True):
             with self.subTest("launchd shim child" if shim else "systemd direct"):
                 fake = self.bridged()
                 r = fake.runner
-                r.real, r.shim, r.stop_timeout = True, shim, 2       # the stop times out on the paused launcher
+                r.real, r.shim = True, shim
                 r.pause, r.acted = str(self.home / f"resume-{shim}"), str(self.home / f"acted-{shim}")
-                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim):
+                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim), \
+                        mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
                     rc, out, err = self.connect(Backend(), fake)
-                Path(r.pause).touch()                       # the paused launcher resumes after the failure
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not Path(r.acted).exists() \
-                        and any(launcher.poll() is None for launcher in r.spawned):
-                    time.sleep(0.1)
-                acted, held = Path(r.acted).exists(), task_io.lock_held(str(self.root))
-                for launcher in r.spawned:                  # cleanup, so one shape cannot leak into the next
-                    if launcher.poll() is None:
-                        os.killpg(launcher.pid, signal.SIGKILL)
-                        launcher.wait(timeout=30)
-                self.assertFalse(acted, "the late launcher never held or acted on the root")
-                self.assertEqual(held, "free")
-                self.assertNotEqual(rc, 0, out + err)
-                self.assertNotIn("next:", out)
-                self.assertIn("did not acquire", err)
+                    by_hand = f"({cm.stop_command(L)})"
+                verbs, job = [r.verb(c) for c in r.calls], r.pid()
+                Path(r.pause).touch()
+                try:
+                    self.assertNotEqual(rc, 0, out + err)
+                    self.assertNotIn("next:", out)
+                    self.assertIn("did not acquire", err)
+                    self.assertIn("so nothing was stopped", err)
+                    self.assertIn(by_hand, err, "what is left comes with the command that stops it")
+                    self.assertFalse({"stop", "bootout", "disable"} & set(verbs), "no cleanup without the agent lock")
+                    signalled.assert_not_called()
+                    self.assertIsNotNone(job, "the job is left, as reported")
+                finally:
+                    for launcher in r.spawned:              # cleanup, so one shape cannot leak into the next
+                        if launcher.poll() is None:
+                            os.killpg(launcher.pid, signal.SIGKILL)
+                            launcher.wait(timeout=30)
+                    r.session = None
 
     def test_the_real_launcher_through_launchds_shim_ends_up_alive(self):
         fake = self.bridged()

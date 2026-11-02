@@ -322,6 +322,11 @@ def oplock_free():
         os.close(fd)
 
 
+def platform_as(mac):
+    """The manager branch a helper runs: None keeps the one the test (or the base, systemd) chose."""
+    return contextlib.nullcontext() if mac is None else mock.patch.object(cm, "is_macos", return_value=mac)
+
+
 class Runner:
     """A manager command table for service_manager._run: (program, verb) -> rc or (rc, out, err); None =
     could not run. With a root, a start verb runs a stand-in launcher (adapter `adapter`, install identity
@@ -333,12 +338,14 @@ class Runner:
                  stop_delay=0.0):
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
         self.session, self.adapter, self.install = None, adapter, install
+        self.invocation, self.since = "", 0
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
         self.real, self.pause, self.acted, self.shim, self.spawned = False, "", "", False, []
         self.stop_timeout = 10
 
     def start_session(self, by_manager=False):
         self.stop_session()
+        self.invocation, self.since = secrets.token_hex(16), int(time.monotonic() * 1_000_000)
         self.session = launched(self.root, self.adapter, self.install, self.real, self.pause, self.acted,
                                 self.shim) if by_manager else \
             hold(self.root, self.adapter, install=self.install)
@@ -392,9 +399,11 @@ class Runner:
             loaded = cm.service_path(L).exists() or self.registered
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
                      "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
-                     "MainPID": str(self.session.pid) if self.alive() else "0"}
+                     "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
+                     "ExecMainStartTimestampMonotonic": str(self.since)}
             props = cmd[cmd.index("-p") + 1].split(",")
-            return (0, "".join(words[k] + "\n" for k in props), "")
+            shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in props)
+            return (0, "".join(w + "\n" for w in shown), "")
         return self.default
 
     def __call__(self, cmd, timeout=30):
@@ -494,8 +503,8 @@ class ConnectBase(unittest.TestCase):
                          "--claude-config-dir", str(self.home / ".claude-sutando"),
                          "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
-    def install_with(self, runner, mac=False, *extra):
-        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
+    def install_with(self, runner, mac=None, *extra):
+        with mock.patch.object(sm, "_run", side_effect=runner), platform_as(mac):
             return self.install(*extra)
 
     def values(self, **over):
@@ -614,8 +623,8 @@ class AgentRootBase(ConnectBase):
         self.runners.append(runner)
         return BridgeFake(runner)
 
-    def install_default(self, fake, *extra, mac=False):
-        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
+    def install_default(self, fake, *extra, mac=None):
+        with mock.patch.object(sm, "_run", side_effect=fake), platform_as(mac):
             return self.main("install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
                              "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
