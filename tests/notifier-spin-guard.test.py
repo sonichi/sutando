@@ -18,6 +18,8 @@ Run: python3 tests/notifier-spin-guard.test.py   (macOS or Linux; bash on PATH)
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -267,6 +269,9 @@ class SupervisorStopsTheWatcherToo(unittest.TestCase):
 
     def run_case(self, notifier: str):
         f = FakeRepo(notifier, RESPONSIVE_WATCHER)
+        locks = holder_lock.lock_dir(f.ws / "tasks")  # what the supervisor's held slot creates
+        os.makedirs(locks, 0o700, exist_ok=True)
+        self.addCleanup(shutil.rmtree, locks, True)
         script = f"""export SUTANDO_SUPERVISOR_SOURCE_ONLY=1
 . "{SUPERVISOR}"
 NOTIFIER="{f.notifier}"
@@ -452,7 +457,7 @@ class SupervisorSlot(unittest.TestCase):
         self.assertEqual(len(alive), 1, "exactly one supervisor serves the inbox")
         self.assertEqual(self.occupancy("held"), "held")
 
-    def armed(self, wait_s: int = 1) -> "tuple[subprocess.Popen, Path]":
+    def armed(self, wait_s: int = 1, **extra: str) -> "tuple[subprocess.Popen, Path]":
         """A supervisor that arms its (counted) notifier after a 1 s grace, behind the fault-injecting python."""
         self.flag, self.starts = self.tmp / "slot-unknown", self.tmp / "starts"
         py = self.tmp / "py"
@@ -461,8 +466,9 @@ class SupervisorSlot(unittest.TestCase):
         self.notifier.write_text(COUNTED_NOTIFIER)
         return self.start(self.ws / "tasks", wait_s=wait_s, SUTANDO_NOTIFIER_PY=str(py), REAL_PY=sys.executable,
                           SLOT_UNKNOWN_FLAG=str(self.flag), NOTIFIER_STARTS=str(self.starts),
-                          SUTANDO_NOTIFIER_GRACE_PERIOD="1", SUTANDO_NOTIFIER_TARGET_POLL="0.5",
-                          SUTANDO_NOTIFIER_SLOT_RETRY_S="1")
+                          **{**dict(SUTANDO_NOTIFIER_GRACE_PERIOD="1", SUTANDO_NOTIFIER_TARGET_POLL="0.5",
+                                    SUTANDO_NOTIFIER_SLOT_RETRY_S="1", SUTANDO_NOTIFIER_RESTART_DELAY_MAX="2"),
+                             **extra})
 
     def started(self) -> "list[int]":
         try:
@@ -512,6 +518,27 @@ class SupervisorSlot(unittest.TestCase):
         self.assertTrue(self.until(lambda: len(self.running()) == 1), err.read_text())
         self.assertEqual(self.occupancy("held"), "held")
 
+    def test_a_successor_never_serves_while_the_old_notifier_lives(self):
+        # The old supervisor polls only every 15 s, so its fence is late: the serving lock alone must exclude.
+        old, old_err = self.armed(SUTANDO_NOTIFIER_TARGET_POLL="15")
+        self.assertTrue(self.until(lambda: len(self.running()) == 1), old_err.read_text())
+        first = self.running()[0]
+        time.sleep(1)  # into the old supervisor's 15 s poll
+        os.kill(self.helper_pid(), signal.SIGKILL)
+        self.assertTrue(self.until(lambda: self.occupancy("free", 0) == "free", 10), "the dead helper freed the slot")
+        new, new_err = self.armed()
+        most, deadline = 0, time.time() + 8
+        while time.time() < deadline:
+            most = max(most, len(self.running()))
+            time.sleep(0.1)
+        self.assertTrue(hcg_alive(first), "still before the old supervisor's next poll")
+        self.assertEqual(most, 1, f"two notifiers served one inbox: {self.started()}")
+        self.assertIn("still serving", new_err.read_text())
+        # The old supervisor's late fence stops its notifier and stands down; then the successor serves.
+        self.assertTrue(self.until(lambda: old.poll() is not None and len(self.running()) == 1
+                                   and self.running()[0] != first, 45), f"{self.started()} {old_err.read_text()}")
+        self.assertIsNone(new.poll(), new_err.read_text())
+
     def test_a_waiter_takes_the_slot_when_the_holder_exits(self):
         first, _ = self.start(self.ws / "tasks")
         self.assertEqual(self.occupancy("held"), "held")
@@ -552,8 +579,6 @@ class NotifierSlotInProcess(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def hold(self, parent, wait=0.5, poll=0.05):
-        import contextlib
-        import io
         out = io.StringIO()
         saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
         try:
@@ -625,6 +650,32 @@ class NotifierSlotInProcess(unittest.TestCase):
             raise holder_lock.LockError("lock lost")
         with unittest.mock.patch.object(holder_lock, "release", release_then_fail):
             self.assertEqual(self.hold(pid), (0, "held\n"))
+
+    def test_serve_holds_the_lock_into_the_exec_and_refuses_a_second(self):
+        os.makedirs(holder_lock.lock_dir(self.inbox), 0o700, exist_ok=True)
+        calls = []
+        rc = notifier_slot.serve(str(self.inbox), ["/bin/bash", "n.sh"],
+                                 execv=lambda path, argv: calls.append((path, argv)), setsid=lambda: calls.append("setsid"))
+        self.assertEqual((rc, calls), (0, ["setsid", ("/bin/bash", ["/bin/bash", "n.sh"])]))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            again = notifier_slot.serve(str(self.inbox) + "/", ["/bin/bash", "n.sh"], execv=calls.append,
+                                        setsid=lambda: None)
+        self.assertEqual(again, 3, "a second notifier never starts while the first holds the serving lock")
+        self.assertIn("still serving", err.getvalue())
+
+    def test_serve_with_no_lock_directory_starts_nothing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(notifier_slot.serve(str(self.inbox), ["/bin/true"], execv=self.fail), 4)
+        self.assertIn("unreadable", err.getvalue())
+
+    def test_main_parses_serve(self):
+        with unittest.mock.patch.object(notifier_slot, "serve", return_value=0) as v:
+            self.assertEqual(notifier_slot.main(["serve", "--inbox", "/x", "--", "/bin/bash", "n.sh"]), 0)
+        v.assert_called_once_with("/x", ["/bin/bash", "n.sh"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            notifier_slot.main(["serve", "--inbox", "/x", "--"])
 
     def test_main_parses_and_holds(self):
         with unittest.mock.patch.object(notifier_slot, "hold", return_value=0) as h:

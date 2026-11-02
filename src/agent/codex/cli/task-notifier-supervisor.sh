@@ -177,12 +177,18 @@ stop_child() {
 
 WATCHER_PIDFILE="${TMPDIR:-/tmp}/sutando-notifier-watcher.$$"
 
-# Start the notifier as the leader of its own group, telling it where to record its watcher.
+# Start the notifier as the leader of its own group, telling it where to record its watcher. With an inbox it
+# holds the serving lock for its whole tree, so no successor's notifier can start while it or its watcher lives.
 start_child() {
   rm -f "$WATCHER_PIDFILE"
-  SUTANDO_NOTIFIER_WATCHER_PIDFILE="$WATCHER_PIDFILE" "$PY" -c \
-    'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
-    "$NOTIFIER" &
+  if [ -n "$TASKS_DIR" ]; then
+    SUTANDO_NOTIFIER_WATCHER_PIDFILE="$WATCHER_PIDFILE" "$PY" "$REPO/src/notifier_slot.py" serve \
+      --inbox "$TASKS_DIR" -- /bin/bash "$NOTIFIER" &
+  else
+    SUTANDO_NOTIFIER_WATCHER_PIDFILE="$WATCHER_PIDFILE" "$PY" -c \
+      'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
+      "$NOTIFIER" &
+  fi
   child_pid=$!
 }
 

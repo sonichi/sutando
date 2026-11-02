@@ -2,6 +2,7 @@
 """The one-supervisor-per-inbox slot: a holder_lock on the inbox directory, held for a supervisor's life.
 
     notifier_slot.py hold --inbox DIR --parent PID [--wait SECONDS]
+    notifier_slot.py serve --inbox DIR -- COMMAND [ARGS...]
 
 Run by task-notifier-supervisor.sh in the background, this process takes the lock on the inbox's
 canonical directory, so two spellings of one inbox (a trailing slash, a symlink) share one slot. It
@@ -14,10 +15,16 @@ verdict, then it stays silent:
 
 While held it watches the parent (pid and start time): once the parent is gone, or on TERM/INT, it
 releases the lock and exits (TERM, INT and HUP alike). The flock decides; nothing here signals another process.
+
+`serve` binds exclusion to the notifier's own lifetime, not the helper's: it takes the inbox's serving
+flock without waiting and execs COMMAND as a new session leader that inherits the locked fd, so the lock
+lasts exactly as long as that process tree (its watcher too). Exit 3: another notifier still serves the
+inbox; exit 4: the serving lock could not be read. Either way nothing is started.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import signal
 import sys
@@ -28,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import holder_lock  # noqa: E402
 
 ADAPTER = "task-notifier-supervisor"
+SERVING = "serving"
 PARENT_POLL_S = 1.0
 
 
@@ -88,6 +96,31 @@ def hold(inbox: str, parent: int, wait_s: float, poll=PARENT_POLL_S) -> int:
     return 0
 
 
+def serve(inbox: str, argv: "list[str]", execv=os.execv, setsid=os.setsid) -> int:
+    """Exec `argv` holding the inbox's serving lock; refuse (3 held, 4 unreadable) and start nothing otherwise."""
+    flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(holder_lock.lock_dir(os.path.realpath(inbox)), os.O_RDONLY | flags)
+        try:
+            fd = os.open(SERVING, os.O_RDWR | os.O_CREAT | flags, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, holder_lock.LockError) as e:
+        print(f"notifier_slot: the serving lock for {inbox} is unreadable ({type(e).__name__}: {e}); "
+              "not starting a notifier", file=sys.stderr)
+        return 4
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        print(f"notifier_slot: a notifier for {inbox} is still serving; not starting another", file=sys.stderr)
+        return 3
+    os.set_inheritable(fd, True)
+    setsid()
+    execv(argv[0], argv)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -95,7 +128,15 @@ def main(argv=None) -> int:
     h.add_argument("--inbox", required=True)
     h.add_argument("--parent", type=int, required=True)
     h.add_argument("--wait", type=float, default=15.0)
+    v = sub.add_parser("serve")
+    v.add_argument("--inbox", required=True)
+    v.add_argument("command", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
+    if a.cmd == "serve":
+        command = a.command[1:] if a.command[:1] == ["--"] else a.command
+        if not command:
+            ap.error("serve needs a command after --")
+        return serve(a.inbox, command)
     return hold(a.inbox, a.parent, a.wait)
 
 
