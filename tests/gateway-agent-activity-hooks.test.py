@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import re
 import contextlib
 import os
 import sys
@@ -150,7 +151,7 @@ class Hooks(unittest.TestCase):
 
     def envelopes(self, tid):
         """Every saved serve owned by the task."""
-        return [p for p in gw._reserve_dir().glob("v1-*.json") if f'"task": "{tid}"' in p.read_text()]
+        return [p for p in gw._reserve_dir().glob("v[12]-*.json") if f'"task": "{tid}"' in p.read_text()]
 
     def controls(self, tid):
         return [p for p in gw.TASKS_DIR.glob("task-ctl-*.txt") if f"stop processing {tid} " in p.read_text()]
@@ -537,6 +538,9 @@ class Hooks(unittest.TestCase):
         env = json.loads(saved)
         self.assertEqual((env["format"], len(env["cleaned"]), "vault-set command" in env["cleaned"]), (2, 2, True))
         self.assertNotIn(gw.RESERVE_CLEANED, env["task"], "the mark is the envelope's, never the task's")
+        name = self.saved(tid).stem
+        self.assertIsNone(re.fullmatch(r"v1-[0-9a-f]{32}", name),
+                          "an earlier bridge reads only v1- copies, so a redacted one fails there, never re-intercepted")
         fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
         self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
         gw._ATTEMPTS.take_ownership()                                   # a restart before it runs
@@ -588,6 +592,20 @@ class Hooks(unittest.TestCase):
         self.assertTrue(set(types) <= set(found) and "vault-set command" in found)
         self.assertNotIn(gw.QUESTION_REDACTED, out)
 
+    def test_a_v2_copy_without_its_redaction_record_is_lost_not_read_raw(self):
+        tid = "task-reserve-v2-format1"
+        env = {"format": 1, "owner": {"task": tid, "candidate_run": f"{tid}~~2", "lease": "L2"},
+               "task": _task(tid, lease_id="L2", task="vault set K hunter2secret")}
+        env["sha256"] = gw._digest(env["task"])
+        rid = gw._reserve_id(tid, f"{tid}~~2", "L2")
+        self.assertTrue(rid.startswith("v2-"))
+        gw._reserve_dir().mkdir(parents=True, exist_ok=True)
+        (gw._reserve_dir() / f"{rid}.json").write_text(json.dumps(env))
+        self.addCleanup((gw._reserve_dir() / f"{rid}.json").unlink, missing_ok=True)
+        with self.assertRaises(gw._ReserveLost):
+            gw._read_reserve(tid, {"id": rid, "run": f"{tid}~~2", "lease": "L2", "sha256": env["sha256"]},
+                             f"{tid}~~2", "L2")
+
     def test_a_broker_field_never_marks_a_task_as_already_redacted(self):
         tid = "task-reserve-forged"
         self.assertIsNotNone(gw._write_task(_task(tid, task="vault set K hunter2secret", **{gw.RESERVE_CLEANED: []})))
@@ -600,7 +618,7 @@ class Hooks(unittest.TestCase):
         env = {"format": 1, "owner": {"task": tid, "candidate_run": f"{tid}~~2", "lease": "L2"},
                "task": _task(tid, lease_id="L2", task="x", **{gw.RESERVE_CLEANED: []})}
         env["sha256"] = gw._digest(env["task"])
-        rid = gw._reserve_id(tid, f"{tid}~~2", "L2")
+        rid = gw._reserve_id(tid, f"{tid}~~2", "L2", 1)
         (gw._reserve_dir() / f"{rid}.json").write_text(json.dumps(env))
         self.addCleanup((gw._reserve_dir() / f"{rid}.json").unlink, missing_ok=True)
         ref = {"id": rid, "run": f"{tid}~~2", "lease": "L2", "sha256": env["sha256"]}

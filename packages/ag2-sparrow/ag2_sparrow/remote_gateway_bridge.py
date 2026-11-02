@@ -6259,7 +6259,8 @@ class _ReserveLost(Exception):
     """The saved serve is missing, damaged, or not the one its reference names."""
 
 
-_RESERVE_ID_RE = re.compile(r"v1-[0-9a-f]{32}")
+# v1: a raw copy (an earlier bridge's); v2: a redacted one, a name an earlier bridge refuses.
+_RESERVE_ID_RE = re.compile(r"v[12]-[0-9a-f]{32}")
 
 
 # A saved serve's copy whose envelope says it was redacted: its render must not redact it again.
@@ -6313,9 +6314,9 @@ def _digest(body: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _reserve_id(wire_tid: str, run, lease) -> str:
-    """The one name a serve's copy has: its owner (task, candidate run, lease)."""
-    return "v1-" + hashlib.sha256(f"{wire_tid}\0{run}\0{lease}".encode()).hexdigest()[:32]
+def _reserve_id(wire_tid: str, run, lease, version: int = 2) -> str:
+    """The one name a serve's copy has: its owner (task, candidate run, lease), under `version`."""
+    return f"v{version}-" + hashlib.sha256(f"{wire_tid}\0{run}\0{lease}".encode()).hexdigest()[:32]
 
 
 def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
@@ -6338,7 +6339,9 @@ def _read_reserve(wire_tid: str, ref, run: str, lease: "str | None") -> dict:
                 or _digest(body) != ref.get("sha256")):
             raise _ReserveLost("the saved serve is not the one its reference names")
         body = {k: v for k, v in body.items() if k != RESERVE_CLEANED}
-        if env.get("format") == _RESERVE_FORMAT and isinstance(env.get("cleaned"), list):
+        if ref["id"].startswith("v2-"):
+            if env.get("format") != _RESERVE_FORMAT or not isinstance(env.get("cleaned"), list):
+                raise _ReserveLost("a redacted serve's copy without its redaction record")
             body[RESERVE_CLEANED] = env["cleaned"]
         return body
     except FileNotFoundError as e:
@@ -6353,7 +6356,8 @@ def _drop_reserve(wire_tid: str, ref) -> None:
     if ref is None:
         _unlink_reserve(_reserve_path(wire_tid))
         return
-    if not (isinstance(ref, dict) and ref.get("id") == _reserve_id(wire_tid, ref.get("run"), ref.get("lease"))):
+    if not (isinstance(ref, dict) and ref.get("id") in {_reserve_id(wire_tid, ref.get("run"), ref.get("lease"), v)
+                                                         for v in (1, 2)}):
         _log(f"task {wire_tid}: a saved-serve reference not its own — nothing removed")
         return
     _ATTEMPTS.with_reserves(lambda named: ref["id"] in named or _unlink_reserve(_reserve_dir() / f"{ref['id']}.json"),
