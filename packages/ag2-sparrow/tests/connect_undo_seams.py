@@ -7,11 +7,17 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 from unittest import mock
 
-from ag2_sparrow import connect_bridge as cb, connect_common as cm, task_io
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
+from ag2_sparrow import connect_bridge as cb, connect_common as cm, task_io  # noqa: E402
 
 MANAGERS = (("systemd", False), ("launchd", True))
 STOPS = {"stop", "bootout", "disable"}

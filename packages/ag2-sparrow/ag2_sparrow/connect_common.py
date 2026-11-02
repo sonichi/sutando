@@ -500,12 +500,12 @@ def start_supervisor(shape: Shape, restart: bool = True, seen: "dict | None" = N
     """Register and start the unit on disk: '' when the manager accepted, else why not. Never readiness.
     restart=False only starts it if inactive (systemd `start`; launchd's bootstrap of a loaded job is a no-op).
     `seen` gets what the call itself did: 'by_call' (launchd: its bootstrap loaded the job; systemd: the
-    start verb succeeded) and the clocks around that verb ('t0'/'t1' monotonic µs, 'wall0' seconds)."""
+    start verb succeeded) and the monotonic clocks around that verb ('t0'/'t1', µs)."""
     path = supervisor_path(shape)
     seen = {} if seen is None else seen
     if is_macos():
         log_path(shape).parent.mkdir(parents=True, exist_ok=True)
-        seen.update(wall0=time.time(), t0=_now_us())
+        seen.update(t0=_now_us())
         r = _sm._run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
         seen.update(by_call=_ok(r), t1=_now_us())
         return "" if _ok(r) or (not restart and agent_loaded(shape) == "active") else \
@@ -520,7 +520,7 @@ def start_supervisor(shape: Shape, restart: bool = True, seen: "dict | None" = N
                       (f"start {unit}", lambda: _sm._systemctl(("--user", "start"), unit=unit, timeout=bound))):
         last = verb.startswith(("restart", "start"))
         if last:
-            seen.update(wall0=time.time(), t0=_now_us())
+            seen.update(t0=_now_us())
         r = run()
         if last:
             seen.update(by_call=_ok(r), t1=_now_us())
@@ -1268,8 +1268,7 @@ def _own_run(shape: Shape, prior: "dict | None", seen: dict) -> "tuple[dict | No
             return None, f"showed no process within {START_SEEN_S:.0f} s of this operation's start"
         time.sleep(POLL_S)
     if is_macos():
-        floor = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(seen["wall0"])))
-        return (now, "") if now["start"] >= floor else (None, f"runs as pid {now['pid']}, which predates this start")
+        return now, ""
     fresh = now["invocation"] and now["invocation"] != (prior or {}).get("invocation")
     if fresh and now["since"] is not None and seen["t0"] <= now["since"] <= seen["t1"]:
         return now, ""
