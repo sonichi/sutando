@@ -121,11 +121,11 @@ class FakeRepo:
         self.watcher_pid_file = self.tmp / "watcher.pid"
         self.err = self.tmp / "notifier.err"
 
-    def start(self) -> subprocess.Popen:
+    def start(self, poll: str = "3") -> subprocess.Popen:
         env = isolated_child_env(SUTANDO_TASKS_DIR=str(self.ws / "tasks"), SUTANDO_WORKSPACE_DIR=str(self.ws),
                                  SUTANDO_TMUX_SOCKET=str(self.tmp / "no-tmux.sock"),
                                  WATCHER_PID_FILE=str(self.watcher_pid_file),
-                                 SUTANDO_NOTIFIER_RETRY_POLL_SEC="3", SUTANDO_NOTIFIER_RETRY_INTERVAL="3")
+                                 SUTANDO_NOTIFIER_RETRY_POLL_SEC=poll, SUTANDO_NOTIFIER_RETRY_INTERVAL=poll)
         env.pop("SUTANDO_INSTANCE_ID", None)
         # stderr to a file: an unread pipe fills and blocks the notifier, and the watcher inherits it.
         with open(self.err, "w") as err:
@@ -184,6 +184,28 @@ class NotifierHonoursTerm(unittest.TestCase):
 
     def test_the_codex_notifier(self):
         self.run_case("codex/cli/task-notifier.sh")
+
+    def run_prompt(self, notifier: str):
+        # The default 30 s read: a TERM that waited for the read to return would take up to 30 s.
+        f = FakeRepo(notifier, RESPONSIVE_WATCHER)
+        proc = f.start(poll="30")
+        wpid = f.watcher_pid()
+        self.addCleanup(kill_quietly, proc.pid, wpid)
+        time.sleep(1.5)
+        started = time.monotonic()
+        os.kill(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail(f"{notifier} took longer than 20 s to honour TERM")
+        self.assertLess(time.monotonic() - started, 8, "TERM ends the read at once, not at its 30 s timeout")
+        self.assertTrue(wait_gone(wpid), "TERM left the watcher running")
+
+    def test_the_claude_notifier_promptly_at_the_default_read(self):
+        self.run_prompt("claude/cli/task-notifier.sh")
+
+    def test_the_codex_notifier_promptly_at_the_default_read(self):
+        self.run_prompt("codex/cli/task-notifier.sh")
 
 
 def bash(script: str, cwd=None, **env) -> subprocess.CompletedProcess:

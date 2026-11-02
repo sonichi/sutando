@@ -45,8 +45,13 @@ stop_group_bounded() {
 # So during the events read a signal is only recorded; the caller exits once the read returns.
 NOTIFIER_IN_READ=0
 NOTIFIER_STOP=""
+NOTIFIER_WAKE_PID=""
+# In the read, only record the signal, and end the read now: stopping the events writer's group gives it EOF.
 notifier_signal() {
-  if [ "$NOTIFIER_IN_READ" = 1 ]; then NOTIFIER_STOP="$1"; else exit "$1"; fi
+  if [ "$NOTIFIER_IN_READ" = 1 ]; then
+    NOTIFIER_STOP="$1"
+    [ -z "$NOTIFIER_WAKE_PID" ] || kill -TERM "-$NOTIFIER_WAKE_PID" 2>/dev/null || kill -TERM "$NOTIFIER_WAKE_PID" 2>/dev/null || true
+  else exit "$1"; fi
 }
 
 # A process's exact start time (C locale, UTC), so a recorded pid is acted on only while it is that process.

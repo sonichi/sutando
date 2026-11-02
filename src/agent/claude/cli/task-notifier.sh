@@ -866,6 +866,7 @@ mkdir -p "$queue_dir" "$PAYLOAD_DIR"
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 notifier_record_watcher "$watcher_pid" "${SUTANDO_NOTIFIER_WATCHER_PIDFILE:-}"
+NOTIFIER_WAKE_PID="$watcher_pid"
 log_notifier "standby armed for $TASKS_DIR (standby watcher pid $watcher_pid)"
 
 # A narrower net than the watcher's own routing, for a worker claim that
