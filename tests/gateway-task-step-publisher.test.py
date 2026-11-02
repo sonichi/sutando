@@ -205,6 +205,28 @@ class Publisher(unittest.TestCase):
         self.assertEqual(len(snapshots), 1, "the switch ends the loop before the next snapshot")
         live.clear()
 
+    def test_a_set_that_changes_mid_copy_is_retried_on_the_next_interval(self):
+        class Shifting(set):
+            """A live set whose first copy fails as a set does when another thread mutates it."""
+            raised = False
+            def __iter__(self):
+                if not self.raised:
+                    self.raised = True
+                    raise RuntimeError("Set changed size during iteration")
+                return super().__iter__()
+        live, snapshots = Shifting({"task-dev~task-a"}), []
+        def snapshot(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            if len(snapshots) == 2:
+                live.clear()
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot):
+            gw._publish_task_steps_now({"task-dev~task-a"}, live)
+        self.assertEqual(snapshots, [{"task-dev~task-a"}, {"task-dev~task-a"}],
+                         "the failed copy skips one interval; the next copy publishes")
+        self.assertTrue(live.raised)
+
     def test_switch_declared_off_in_manifest(self):
         repo = Path(__file__).resolve().parents[1]
         manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())
