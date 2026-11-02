@@ -138,8 +138,8 @@ class TestRoomOpsCli(Base):
         pathlib.Path(f).write_bytes(b"IMG")
         sent = {}
 
-        def fake(method, url, headers=None, data=None):
-            sent.update(url=url, auth=headers.get("Authorization"))
+        def fake(method, url, headers=None, data=None, timeout=None):
+            sent.update(url=url, auth=headers.get("Authorization"), timeout=timeout)
             return 200, b"{}", {}
         with mock.patch.object(md, "http_request", side_effect=fake):
             rc, res = self.run_cli(["send", DEV_ROOM, f])
@@ -147,6 +147,7 @@ class TestRoomOpsCli(Base):
         self.assertEqual(r.rooms, [DEV_ROOM])
         self.assertTrue(sent["url"].startswith(DEV_GW + "/v1/rooms/"), sent)
         self.assertEqual(sent["auth"], "Bearer dev-secret")
+        self.assertGreaterEqual(sent["timeout"], md.HTTP_TIMEOUT, "the upload carries its own timeout")
 
     def test_say_posts_through_the_rooms_connection(self):
         r = self.route(Routed((DEV_GW, "dev-secret")))
