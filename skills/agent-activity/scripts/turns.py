@@ -70,6 +70,21 @@ def open_dialog(ws: Path, task_id: str) -> "dict | None":
     return max(found, key=lambda d: d.get("at") or 0, default=None)
 
 
+def has_open_tool(ws: Path, task_id: str) -> bool:
+    """Whether a task's unended turn has an unmatched tool start."""
+    try:
+        data = json.loads(path(ws).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    turns = data.get("turns") if isinstance(data, dict) else None
+    if not isinstance(turns, dict):
+        return False
+    return any(isinstance(t, dict) and t.get("ended") is None
+               and isinstance(t.get("tasks"), list) and task_id in t["tasks"]
+               and isinstance(t.get("open_tools"), dict) and bool(t["open_tools"])
+               for t in turns.values())
+
+
 def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
     """Fold one hook payload into its turn's record."""
     event, pid = payload.get("hook_event_name"), payload.get("prompt_id")
@@ -96,10 +111,22 @@ def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
             # Only that a dialog is open: its tool input may carry secrets and nothing reads it.
             tool = payload.get("tool_name")
             turn["dialog"] = {"tool": tool if type(tool) is str else None, "at": now}
-        elif event in ("PreToolUse", "PostToolUse"):
+        elif event in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
             turn["dialog"] = None
+            tool_id = payload.get("tool_use_id")
+            tool_name = payload.get("tool_name")
+            key = ("id:" + tool_id if isinstance(tool_id, str) and tool_id
+                   else "name:" + tool_name if isinstance(tool_name, str) and tool_name else None)
+            opened = turn.setdefault("open_tools", {})
+            if key and event == "PreToolUse":
+                opened[key] = opened.get(key, 0) + 1 if key.startswith("name:") else 1
+            elif key and key in opened:
+                if opened[key] > 1:
+                    opened[key] -= 1
+                else:
+                    del opened[key]
         elif event == "Stop":
-            turn.update(ended=now, dialog=None)
+            turn.update(ended=now, dialog=None, open_tools={})
         turn["seen"] = now
         turns[pid] = turn
         for old in sorted(turns, key=lambda k: turns[k].get("seen") or 0)[:-TURNS_KEPT]:

@@ -131,7 +131,7 @@ def _owner_notice(workspace, task_id, state, path):
     os.replace(tmp, result)
 
 
-def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s=SILENCE_S):
+def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s=SILENCE_S, active_tool=False):
     """Overlay accepted work only. Unknown, finished, queued and delegated work stays untouched.
     Signals are current observations, not events: their absence clears a signature's episode."""
     if not valid_local_task_id(task_id):
@@ -170,7 +170,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                 break
             if kind is None and waiting.get("reason") == "permission":
                 kind = "pane-prompt-blocked"
-            if (kind is None and (status.get("phase") != "Waiting" or accepted)
+            if (kind is None and not active_tool and (status.get("phase") != "Waiting" or accepted)
                     and snap.get("phase") != "WAITING" and last is not None and now - last >= silence_s):
                 kind = "activity-silent"
         if kind is None:
@@ -200,9 +200,9 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
                 "waiting": {"reason": "blocked", "kind": kind}}
 
 
-def status_for(workspace, task_id, status, *, now=None, signals=None, silence_s=SILENCE_S):
+def status_for(workspace, task_id, status, *, now=None, signals=None, silence_s=SILENCE_S, active_tool=False):
     """An unreadable observation is unknown, never a blocker or permission to replace state."""
     try:
-        return _status_for(workspace, task_id, status, now=now, signals=signals, silence_s=silence_s)
+        return _status_for(workspace, task_id, status, now=now, signals=signals, silence_s=silence_s, active_tool=active_tool)
     except (OSError, ValueError, TypeError, AttributeError):
         return status

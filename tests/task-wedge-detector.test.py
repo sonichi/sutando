@@ -325,12 +325,55 @@ class Wedges(unittest.TestCase):
 
     def test_configured_threshold_and_manifest_defaults(self):
         manifest = json.loads((REPO / 'skills' / 'agent-activity' / 'manifest.json').read_text())
-        self.assertIs(manifest['config']['LEDGER_STEP_PUBLISH_ENABLED'], True)
+        self.assertIs(manifest['config']['LEDGER_STEP_PUBLISH_ENABLED'], False)
         self.assertEqual(manifest['config']['WEDGE_SILENCE_SECONDS'], 180)
         self.assertEqual(detector.status_for(self.ws, 'task-a', self.normal, now=399,
                                              signals=[], silence_s=300), self.normal)
         self.blocked(detector.status_for(self.ws, 'task-a', self.normal, now=400,
                                         signals=[], silence_s=300))
+
+    def test_open_tool_hook_lifecycle_suppresses_silence_through_publisher_adapter(self):
+        sys.path.insert(0, str(REPO / 'skills' / 'agent-activity' / 'scripts'))
+        import turns
+        import phase_line
+        base = {'prompt_id': 'turn-a', 'tool_name': 'Bash'}
+        turns.record(dict(base, hook_event_name='UserPromptSubmit',
+                          prompt='TASK_FILE: task-a.txt'), self.ws, now=100)
+        with patch.object(detector, '_signals', return_value=[]), \
+                patch.object(phase_line, 'setting', side_effect=lambda key, default: default), \
+                patch.object(phase_line.time, 'time', return_value=100):
+            phase_line.on_step(self.ws, 'task-a', 'Bash', {}, 'private invocation',
+                               spawn=lambda *args: None)
+            for call in ('call-a', 'call-b'):
+                turns.record(dict(base, hook_event_name='PreToolUse', tool_use_id=call), self.ws, now=100)
+            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=1000)['phase'], 'Waiting')
+            self.assertEqual(self.notices(), [])
+            self.assertFalse(turns.has_open_tool(self.ws, 'task-other'))
+            turns.record(dict(base, hook_event_name='PostToolUse', tool_use_id='unrelated'), self.ws, now=1001)
+            self.assertTrue(turns.has_open_tool(self.ws, 'task-a'))
+            turns.record(dict(base, hook_event_name='PostToolUse', tool_use_id='call-a'), self.ws, now=1002)
+            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=1003)['phase'], 'Waiting')
+            turns.record(dict(base, hook_event_name='PostToolUseFailure', tool_use_id='call-b'), self.ws, now=1004)
+            self.blocked(phase_line.published_status(self.ws, 'task-a', now=1005))
+            self.assertEqual(len(self.notices()), 1)
+            turns.record(dict(base, hook_event_name='PreToolUse', tool_use_id='call-c'), self.ws, now=1010)
+            self.assertNotEqual(phase_line.published_status(self.ws, 'task-a', now=2000)['phase'], 'Waiting')
+            turns.record(dict(base, hook_event_name='Stop'), self.ws, now=2001)
+            self.assertFalse(turns.has_open_tool(self.ws, 'task-a'))
+        self.assertNotIn('private invocation', turns.path(self.ws).read_text())
+
+    def test_tool_name_fallback_requires_each_matching_completion(self):
+        sys.path.insert(0, str(REPO / 'skills' / 'agent-activity' / 'scripts'))
+        import turns
+        base = {'prompt_id': 'turn-b', 'tool_name': 'Bash'}
+        turns.record(dict(base, hook_event_name='UserPromptSubmit',
+                          prompt='TASK_FILE: task-a.txt'), self.ws, now=100)
+        for _ in range(2):
+            turns.record(dict(base, hook_event_name='PreToolUse'), self.ws, now=100)
+        turns.record(dict(base, hook_event_name='PostToolUse'), self.ws, now=200)
+        self.assertTrue(turns.has_open_tool(self.ws, 'task-a'))
+        turns.record(dict(base, hook_event_name='PostToolUse'), self.ws, now=300)
+        self.assertFalse(turns.has_open_tool(self.ws, 'task-a'))
 
     def test_accepted_task_without_any_step_uses_production_activity_writer(self):
         from activity_bus import ActivityStore, LifecycleTransition

@@ -823,7 +823,9 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
             silence_s = 180.0
     except (TypeError, ValueError):
         silence_s = 180.0
-    return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s)
+    import turns
+    return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s,
+                                     active_tool=turns.has_open_tool(Path(workspace), task_id))
 
 
 # The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a
