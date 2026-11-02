@@ -391,16 +391,18 @@ def handoff_post(ws: Path, tool, inp, tool_use_id, outcome: str = "done") -> Non
         pass
 
 
-def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> None:
-    """The phase sidecar's rules record (and, when switched on, the detached model call); never raises."""
+def step_phase(ws: Path, task_id: str, tool: str, inp, line: str | None) -> str | None:
+    """The phase sidecar's rules record (and, when switched on, the detached model call): the phase word
+    when it changed for this task since the last one shown, else None. Never raises."""
     try:
         scripts = str(Path(__file__).resolve().parents[1] / "scripts")  # lint-workspace-resolution: allow-repo-root (sibling skill scripts, not a data root)
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
         import phase_line
-        phase_line.on_step(ws, task_id, tool, inp, line)
+        phase = phase_line.on_step(ws, task_id, tool, inp, line)
+        return phase if phase and phase_line.phase_shown(ws, task_id, phase) else None
     except Exception:  # noqa: BLE001 - the live status must never break a tool call
-        pass
+        return None
 
 
 def stop_rulings(ws: Path) -> None:
@@ -471,7 +473,11 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         line = working_line(tool, inp) if isinstance(tool, str) else None
         task, room = bound_task(p, sid)
         if task and isinstance(tool, str):
-            step_phase(p["ws"], task["id"], tool, inp, line)
+            # The client shows a room's newest working row: the phase word alone, never step text.
+            phase = step_phase(p["ws"], task["id"], tool, inp, line)
+            if phase and room:
+                emit("working", phase, task, room, p["ws"], run)
+                out.append(("working", phase))
         if line and task:
             emit("working", line, task, room, p["ws"], run)
             out.append(("working", line))

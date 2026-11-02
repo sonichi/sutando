@@ -603,12 +603,15 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.handle(self.pre("S-side", "Bash", {"command": "x", "description": "private owner narration"}), self.p, self.run), [])
         self.assertEqual(self.runs, [])
         out = hook.handle(self.pre("S-dm", "Bash", {"command": "x", "description": "Run the gates"}), self.p, self.run)
-        self.assertEqual(out, [("working", "Run the gates")])
+        # The task's first phase is its own row, ahead of the step line; both reach only the bound task.
+        self.assertEqual(out, [("working", "Running a command"), ("working", "Run the gates")])
+        self.assertEqual([c[c.index("--room") + 1] for c in self.runs], ["!dm:s", "!dm:s"])
         cmd = self.runs[-1]
         self.assertEqual((cmd[cmd.index("--task-id") + 1], cmd[cmd.index("--room") + 1], cmd[cmd.index("--workspace") + 1]), ("t-dm", "!dm:s", str(self.ws)))
         self.assertEqual(cmd[cmd.index("--from") + 1], "@q:s")
         out = hook.handle(self.pre("S-team", "Edit", {"file_path": "/x", "description": "Edit the doc"}), self.p, self.run)
-        self.assertEqual((out, self.runs[-1][self.runs[-1].index("--room") + 1]), ([("working", "Edit the doc")], "!team:s"))
+        self.assertEqual((out, self.runs[-1][self.runs[-1].index("--room") + 1]),
+                         ([("working", "Editing code"), ("working", "Edit the doc")], "!team:s"))
         self.log({"ts": 3, "task": {"id": "t-dm"}, "line": "done", "done": True})
         self.assertEqual(hook.handle(self.pre("S-dm", "Bash", {"command": "x", "description": "After done"}), self.p, self.run), [], "a closed task takes no more rows")
 
