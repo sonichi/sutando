@@ -191,6 +191,57 @@ class Publisher(unittest.TestCase):
                     release.set()
                     gw._STEP_PUSH_THREAD.join(2)
 
+    def test_the_publisher_keeps_stepping_while_tasks_stay_in_flight(self):
+        live, snapshots = {"task-dev~task-a"}, []
+        def snapshot(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            if len(snapshots) == 3:
+                live.clear()  # the outbound worker retired the last task
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot):
+            gw._publish_task_steps_now(set(live), live)
+        self.assertEqual(len(snapshots), 3, "one snapshot now, then one per INTERVAL until the set empties")
+        snapshots.clear()
+        live.add("task-dev~task-a")
+        def snapshot_until_off(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            gw.TASK_STEP_PUBLICATION_ENABLED = lambda: False  # the switch turned off mid-flight
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot_until_off):
+            gw._publish_task_steps_now(set(live), live)
+        self.assertEqual(len(snapshots), 1, "the switch ends the loop before the next snapshot")
+        live.clear()
+
+    def test_a_set_that_changes_mid_copy_is_retried_on_the_next_interval(self):
+        class Shifting:
+            """A live set whose first copy fails as a set does when another thread mutates it
+            (a set subclass would not do: set(s) copies a set without calling __iter__)."""
+            def __init__(self, items):
+                self.items, self.raised = set(items), False
+            def __bool__(self):
+                return bool(self.items)
+            def __iter__(self):
+                if not self.raised:
+                    self.raised = True
+                    raise RuntimeError("Set changed size during iteration")
+                return iter(self.items)
+            def clear(self):
+                self.items.clear()
+        live, snapshots = Shifting({"task-dev~task-a"}), []
+        def snapshot(inflight, live_set=None):
+            snapshots.append(set(inflight))
+            if len(snapshots) == 2:
+                live.clear()
+        with patch.multiple(gw, TASK_STEP_PUBLICATION_ENABLED=lambda: True), \
+                patch.object(gw.task_step_publisher, "INTERVAL", 0.01), \
+                patch.object(gw, "_publish_task_steps_snapshot", side_effect=snapshot):
+            gw._publish_task_steps_now({"task-dev~task-a"}, live)
+        self.assertEqual(snapshots, [{"task-dev~task-a"}, {"task-dev~task-a"}],
+                         "the failed copy skips one interval; the next copy publishes")
+        self.assertTrue(live.raised)
+
     def test_switch_declared_off_in_manifest(self):
         repo = Path(__file__).resolve().parents[1]
         manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())

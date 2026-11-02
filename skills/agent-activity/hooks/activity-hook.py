@@ -260,13 +260,27 @@ def answered(ws: Path, task_id: str) -> bool:
     return find_result(ws / "results", task_id) is not None
 
 
+# Tools that name a file and carry no description: their step line is the verb and the file.
+FILE_TOOLS = {"Edit": "Editing", "MultiEdit": "Editing", "Write": "Writing", "NotebookEdit": "Editing"}
+
+
+def short_path(path: str) -> str:
+    """The file's last two path segments: enough to recognise it, never the home directory."""
+    parts = [p for p in re.split(r"[\\/]+", path.strip()) if p]
+    return "/".join(parts[-2:])
+
+
 def working_line(tool_name: str, tool_input) -> str | None:
     if tool_name in SKIP_TOOLS or not isinstance(tool_input, dict):
         return None
     desc = tool_input.get("description")
-    if not isinstance(desc, str) or not desc.strip():
-        return None
-    return re.split(r"(?<=[.;])\s", desc.strip(), maxsplit=1)[0][:MAXLEN]
+    if isinstance(desc, str) and desc.strip():
+        return re.split(r"(?<=[.;])\s", desc.strip(), maxsplit=1)[0][:MAXLEN]
+    verb = FILE_TOOLS.get(tool_name)
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if verb and isinstance(path, str) and path.strip():
+        return f"{verb} {short_path(path)}"[:MAXLEN]
+    return None
 
 
 TAIL_BYTES = 64 * 1024
