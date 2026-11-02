@@ -576,6 +576,16 @@
    "status": "canonical",
    "canonical_for": "DotSpace resolution: which homeservers are AG2-operated, the well-known block and the core.dotspace config",
    "last_verified": "2026-10-28"
+  },
+  "docs/task-wedge-detection.md": {
+   "title": "Task wedge detection and coverage",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "task wedge classes, detection policy, origin status and measurement limits",
+   "last_verified": "2026-11-02"
   }
  }
 }

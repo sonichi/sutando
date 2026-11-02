@@ -805,9 +805,10 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
     summary is the phase word or the fixed waiting line ("Queued · next"), never a step's text; with
     `share_line` it is the detail line as `shareable_line` lets it leave. The publisher adds the task's source
     message itself. None when `status_for` says nothing."""
+    import wedge_detector
     st = status_for(workspace, task_id, **kw)
     if st is None:
-        return None
+        return wedge_detector.status_for(workspace, task_id, None, now=kw.get("now"))
     waiting = st.get("waiting")
     out = {"phase": st["phase"], "summary": st["phase"], "since": st["since"]}
     if waiting:
@@ -816,7 +817,11 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
             out["summary"] = st["line"]
     if share_line:
         out["summary"] = shareable_line(workspace, task_id, st)
-    return out
+    try:
+        silence_s = max(1.0, float(setting("WEDGE_SILENCE_SECONDS", "180")))
+    except (TypeError, ValueError):
+        silence_s = 180.0
+    return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s)
 
 
 # The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a

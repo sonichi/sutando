@@ -242,10 +242,10 @@ class Publisher(unittest.TestCase):
                          "the failed copy skips one interval; the next copy publishes")
         self.assertTrue(live.raised)
 
-    def test_switch_declared_off_in_manifest(self):
+    def test_switch_enabled_for_task_wedge_notices(self):
         repo = Path(__file__).resolve().parents[1]
         manifest = json.loads((repo / "skills/agent-activity/manifest.json").read_text())
-        self.assertIs(manifest["config"]["LEDGER_STEP_PUBLISH_ENABLED"], False)
+        self.assertIs(manifest["config"]["LEDGER_STEP_PUBLISH_ENABLED"], True)
 
 
     def test_truncated_malformed_or_missing_activity_is_best_effort(self):

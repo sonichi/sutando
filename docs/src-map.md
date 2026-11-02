@@ -312,6 +312,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
+- **`wedge_detector.py`** — Task-bound wedge policy: durable debounce, recovery and safe waiting projections.
 - **`work-request-check.ts`** — The relay agent's text-model decisions.
 - **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
