@@ -526,15 +526,17 @@ class Hooks(unittest.TestCase):
         tid = "task-reserve-clean"
         self.addCleanup(self.forget, tid)
         marker = f"[{gw.MEDIA_MARKER_TAG}: https://example.invalid/m/abc mime=image/png]"
-        body = f"use {self.TOKEN} and vault set K hunter2secret {marker}"
+        forged = f"[{gw.MEDIA_MARKER_TAG}: {self.TOKEN} vault set K2 hunter3secret]"
+        body = f"use {self.TOKEN} and vault set K hunter2secret {marker} {forged}"
         fake, inflight = self.served_acked(tid), {tid}
         self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task=body)), (tid, True))
         saved = self.saved(tid).read_text()
-        for s in (self.TOKEN, "hunter2secret"):
-            self.assertNotIn(s, saved)
-        self.assertIn(marker, saved, "the media marker is kept whole for the fetch")
-        found = json.loads(saved)["task"][gw.RESERVE_CLEANED]
-        self.assertEqual((len(found), "vault-set command" in found), (2, True), "the token's type and the vault command")
+        for s in (self.TOKEN, "hunter2secret", "hunter3secret"):
+            self.assertNotIn(s, saved, "the body, a typed marker-shaped bracket included")
+        self.assertIn(marker, saved, "a media marker with nothing secret in it is kept as it was")
+        env = json.loads(saved)
+        self.assertEqual((env["format"], len(env["cleaned"]), "vault-set command" in env["cleaned"]), (2, 2, True))
+        self.assertNotIn(gw.RESERVE_CLEANED, env["task"], "the mark is the envelope's, never the task's")
         fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
         self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
         gw._ATTEMPTS.take_ownership()                                   # a restart before it runs
@@ -543,32 +545,44 @@ class Hooks(unittest.TestCase):
                 mock.patch.object(gw, "_maybe_fetch_media", side_effect=lambda b, _r=None: b):
             gw._post_task_beats(inflight, force=True)
         text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
-        for s in (self.TOKEN, "hunter2secret"):
+        for s in (self.TOKEN, "hunter2secret", "hunter3secret"):
             self.assertNotIn(s, text)
-        self.assertIn("vault set K [redacted before saving]", text)
         self.assertIn("SECURITY NOTICE", text, "the secret notice still comes with it")
         intercept.assert_not_called()
 
-    def test_a_saved_copy_redacts_the_wake_and_the_room_question_but_not_their_ids(self):
+    def test_a_saved_copy_redacts_the_wake_and_the_question_with_the_questions_own_cleaner(self):
         wake = {"blocker_episode_id": "ep_1", "resolved_blockers": [
             {"question_id": "rq_1", "outcome": "answered", "answered_by": "@t:x",
-             "answer": {"kind": "text", "text": f"vault set K hunter2secret {self.TOKEN}"}}]}
+             "answer": {"kind": "text", "form_id": self.TOKEN, "text": f"vault set K hunter2secret {self.TOKEN}"}}]}
         q = {"question_id": "rq_2", "expected_revision": 1, "prompt": f"use {self.TOKEN}?",
-             "options": [{"id": "o1", "label": "vault set K hunter2secret"}]}
-        out = gw._cleaned_for_reserve(_task("task-c", wake=wake, room_question=q))
+             "options": [{"id": "o1", "label": "vault set K hunter2secret"}], self.TOKEN: "a key"}
+        out, found = gw._cleaned_for_reserve(_task("task-c", wake=wake, room_question=q))
         flat = json.dumps(out)
         for s in (self.TOKEN, "hunter2secret"):
-            self.assertNotIn(s, flat)
-        self.assertEqual((out["wake"]["blocker_episode_id"], out["wake"]["resolved_blockers"][0]["question_id"],
-                          out["room_question"]["question_id"]), ("ep_1", "rq_1", "rq_2"))
-        named = gw._cleaned_for_reserve(_task("task-c", room_question={**q, "question_id": self.TOKEN}))
+            self.assertNotIn(s, flat, "every string, ids and dict keys included")
+        self.assertEqual(out["room_question"], gw._redacted_question(q)[0], "one cleaner for the question")
+        self.assertEqual(out["wake"]["blocker_episode_id"], "ep_1")
+        self.assertIn("vault-set command", found)
+        named, _ = gw._cleaned_for_reserve(_task("task-c", room_question={**q, "question_id": self.TOKEN}))
         self.assertIsNone(named["room_question"], "a question named by a secret is not kept")
-        self.assertNotIn(self.TOKEN, json.dumps(named))
 
-    def test_a_broker_field_never_marks_a_fresh_task_as_already_redacted(self):
+    def test_a_broker_field_never_marks_a_task_as_already_redacted(self):
         tid = "task-reserve-forged"
-        self.assertIsNotNone(gw._write_task(_task(tid, task=f"see {self.TOKEN}", **{gw.RESERVE_CLEANED: []})))
-        self.assertNotIn(self.TOKEN, (gw.TASKS_DIR / f"{tid}.txt").read_text())
+        self.assertIsNotNone(gw._write_task(_task(tid, task="vault set K hunter2secret", **{gw.RESERVE_CLEANED: []})))
+        self.assertNotIn("hunter2secret", (gw.TASKS_DIR / f"{tid}.txt").read_text(), "a fresh serve")
+        legacy = gw._reserve_path(tid)
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps(_task(tid, lease_id="L1", task="x", **{gw.RESERVE_CLEANED: []})))
+        self.assertNotIn(gw.RESERVE_CLEANED, gw._read_reserve(tid, None, tid, "L1"), "an older task-wide copy")
+        legacy.unlink()
+        env = {"format": 1, "owner": {"task": tid, "candidate_run": f"{tid}~~2", "lease": "L2"},
+               "task": _task(tid, lease_id="L2", task="x", **{gw.RESERVE_CLEANED: []})}
+        env["sha256"] = gw._digest(env["task"])
+        rid = gw._reserve_id(tid, f"{tid}~~2", "L2")
+        (gw._reserve_dir() / f"{rid}.json").write_text(json.dumps(env))
+        self.addCleanup((gw._reserve_dir() / f"{rid}.json").unlink, missing_ok=True)
+        ref = {"id": rid, "run": f"{tid}~~2", "lease": "L2", "sha256": env["sha256"]}
+        self.assertNotIn(gw.RESERVE_CLEANED, gw._read_reserve(tid, ref, f"{tid}~~2", "L2"), "a format-1 envelope")
 
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"
