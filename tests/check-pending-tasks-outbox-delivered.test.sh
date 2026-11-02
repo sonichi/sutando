@@ -1,16 +1,5 @@
 #!/bin/bash
-# A reply the gateway outbox delivered must read as answered to the Stop hook,
-# unanswered-tasks.py and task_disposition.py alike.
-#
-# Delivery through the outbox retires results/<id>.txt, and the settle path can
-# archive the task with no archive copy of the result left behind. The outbox
-# item (results/.outbox[.<instance>]/.items/*.json, status DELIVERED) is then the
-# only trace of the reply; a predicate that reads only result files re-blocks
-# every turn end on a task that was answered long ago.
-#
-# The receipts are written by the producer (src/outbox.py:record_delivered).
-# Isolation follows check-pending-tasks-workspace.test.sh.
-#
+# An outbox-DELIVERED reply reads as answered to the Stop hook, unanswered-tasks.py and task_disposition.py.
 # Run: bash tests/check-pending-tasks-outbox-delivered.test.sh
 set -u
 
@@ -98,8 +87,12 @@ case "$OUT" in
 esac
 
 # 4. unanswered-tasks.py and task_disposition.py agree with the hook.
-old="$(( $(date +%s) - 600 ))"
-touch -t "$(date -r "$old" +%Y%m%d%H%M.%S)" "$WS/tasks/$LANE_ID.txt"
+AGE="$("$PYBIN" -c 'import os, sys, time
+t = time.time() - 600; os.utime(sys.argv[1], (t, t)); print(int(time.time() - os.stat(sys.argv[1]).st_mtime))' "$WS/tasks/$LANE_ID.txt")"
+case "$AGE" in ''|*[!0-9]*) AGE=0 ;; esac
+if [ "$AGE" -lt 590 ]; then
+  bad "the task file is backdated past unanswered-tasks.py's min age" "age ${AGE:-unknown}s"
+fi
 UA="$("$PYBIN" "$REPO/scripts/unanswered-tasks.py" --workspace "$WS" 2>/dev/null)"; UA_RC=$?
 [ "$UA_RC" -eq 0 ] && ok "unanswered-tasks.py reads the delivered task as answered" \
   || bad "unanswered-tasks.py reads the delivered task as answered" "rc $UA_RC: $UA"

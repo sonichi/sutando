@@ -1553,6 +1553,22 @@ class OutboxReceiptTest(unittest.TestCase):
         self.assertFalse(outbox_delivered(self.results, "task-lane1~task-x"))
         self.assertFalse(outbox_delivered(self.results, "../task-r"))
 
+    def test_a_malformed_id_has_no_item(self):
+        self._deliver(".outbox", "task-m")
+        self.assertFalse(outbox_delivered(self.results, "task-m~~1"))      # malformed run suffix
+        self.assertFalse(outbox_delivered(self.results, "task-m~~x"))
+        self.assertFalse(outbox_delivered(self.results, "ask-m~task-x"))   # `~` outside a lane id
+        self.assertFalse(outbox_delivered(self.results, "task-b!d~task-x"))  # bad instance name
+
+    def test_an_unreadable_outbox_reads_as_not_delivered(self):
+        self._deliver(".outbox", "task-u")
+        self.assertTrue(outbox_delivered(self.results, "task-u"))   # CONTROL
+        import outbox
+        with mock.patch.object(outbox, "read_item", side_effect=PermissionError("denied")):
+            self.assertFalse(outbox_delivered(self.results, "task-u"))
+        with mock.patch.dict(sys.modules, {"outbox": None}):     # import fails
+            self.assertFalse(outbox_delivered(self.results, "task-u"))
+
     def test_a_wake_turn_is_not_answered_by_the_receipt(self):
         self._deliver(".outbox", "task-w")
         task = Path(self._tmp.name) / "task-w.txt"
