@@ -49,6 +49,8 @@ from delivery.task_dispatch import (  # noqa: E402
     find_ready_result_for_filename,
     has_ready_result,
     next_pending_task,
+    outbox_delivered,
+    ready_result_filenames,
     owned_task_ids,
     _WORKER_HOLD_SUFFIXES,
     pending_candidates,
@@ -1516,6 +1518,46 @@ class OwnedTaskIdsTest(unittest.TestCase):
         self.assertEqual(r2.returncode, 2)
         self.assertIn("owned-by", r2.stderr)
 
+
+
+class OutboxReceiptTest(unittest.TestCase):
+    """A result the outbox delivered is retired from results/; its DELIVERED item answers the task."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.results = Path(self._tmp.name) / "results"
+        self.results.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _deliver(self, root: str, item: str):
+        from outbox import record_delivered
+        record_delivered(self.results / root, item)
+
+    def test_a_delivered_item_is_a_ready_result_for_every_reader(self):
+        self._deliver(".outbox", "task-a")
+        self._deliver(".outbox.lane1", "task-b")
+        self.assertTrue(has_ready_result(self.results, "task-a.txt"))
+        self.assertTrue(has_ready_result(self.results, "task-lane1~task-b.txt"))
+        self.assertEqual(ready_result_filenames(self.results, ["task-a.txt", "task-lane1~task-b.txt", "task-c.txt"]),
+                         {"task-a.txt", "task-lane1~task-b.txt"})
+
+    def test_only_the_ids_own_delivered_first_run_counts(self):
+        from outbox import park_item
+        park_item(self.results / ".outbox", "task-p", "test")
+        self._deliver(".outbox", "task-r")
+        self._deliver(".outbox", "task-lane1~task-x")   # a lane id is never a primary item
+        self.assertFalse(outbox_delivered(self.results, "task-p"))
+        self.assertFalse(outbox_delivered(self.results, "task-r~~2"))
+        self.assertFalse(outbox_delivered(self.results, "task-lane1~task-x"))
+        self.assertFalse(outbox_delivered(self.results, "../task-r"))
+
+    def test_a_wake_turn_is_not_answered_by_the_receipt(self):
+        self._deliver(".outbox", "task-w")
+        task = Path(self._tmp.name) / "task-w.txt"
+        task.write_text("wake_episode: 2\ntask: again\n")
+        self.assertFalse(has_ready_result(self.results, "task-w.txt", task_file=task))
 
 
 if __name__ == "__main__":

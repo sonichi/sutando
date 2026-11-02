@@ -70,13 +70,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import (index_result_candidates, iter_result_candidates,  # noqa: E402
-                                 parse_task_headers)
+from local_task_protocol import (INSTANCE_ID_RE, index_result_candidates,  # noqa: E402
+                                 iter_result_candidates, parse_task_headers, split_run_id,
+                                 valid_broker_id)
 
 from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
 __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
+    "outbox_delivered",
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
     "mark_partial_paste", "partial_paste_leftover",
@@ -152,7 +154,8 @@ def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | st
 
 def has_ready_result(results_dir: "Path | str", filename: str, *,
                      task_file: "Path | str | None" = None) -> bool:
-    """True iff task file `filename` has a ready result, live or in any archive layout.
+    """True iff task file `filename` has a ready result, live or in any archive layout, or the
+    gateway outbox records its delivery (`outbox_delivered`).
 
     An empty or whitespace-only file — live or archived — is not a delivery and
     does not stop the search; `find_ready_result` walks past it. With `task_file` a wake
@@ -164,7 +167,43 @@ def has_ready_result(results_dir: "Path | str", filename: str, *,
         def reader(path):
             written = _mtime(path)
             return None if written is not None and written < since else read_ready_result(path)
-    return find_ready_result_for_filename(results_dir, filename, reader=reader) is not None
+    if find_ready_result_for_filename(results_dir, filename, reader=reader) is not None:
+        return True
+    # A wake's own outbox item is not the first run's, so only a non-wake turn trusts the receipt.
+    return since is None and outbox_delivered(results_dir, _task_id_for_filename(filename))
+
+
+def _outbox_item(results_dir: Path, task_id: str) -> "tuple[Path, str] | None":
+    """(outbox root, item id) the gateway delivers `task_id`'s first-run result under, or None."""
+    try:
+        base, seq = split_run_id(task_id)
+    except ValueError:
+        return None
+    if seq != 1:
+        return None
+    if "~" not in base:
+        return (results_dir / ".outbox", base) if valid_broker_id(base) else None
+    inst, sep, broker = base[len("task-"):].partition("~")
+    if base.startswith("task-") and sep and INSTANCE_ID_RE.fullmatch(inst) and valid_broker_id(broker):
+        return results_dir / f".outbox.{inst}", broker
+    return None
+
+
+def outbox_delivered(results_dir: "Path | str", task_id: str) -> bool:
+    """True iff the gateway outbox records `task_id`'s result as DELIVERED.
+
+    Delivery through the outbox retires the live result, and a settle can leave no archive copy
+    behind, so the receipt is the only trace that the reply went out. Unreadable reads as False.
+    """
+    where = _outbox_item(Path(results_dir), task_id)
+    if where is None:
+        return False
+    try:
+        from outbox import read_item
+        record = read_item(*where)
+    except (ImportError, OSError):
+        return False
+    return isinstance(record, dict) and record.get("status") == "DELIVERED"
 
 
 def is_wake_turn(task_file: "Path | str") -> bool:
@@ -199,6 +238,9 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
     for task_id, candidates in index.items():
         if any(reader(c) is not None for c in candidates):
             ready.update(by_id[task_id])
+    for task_id, names in by_id.items():
+        if not ready.issuperset(names) and outbox_delivered(results_dir, task_id):
+            ready.update(names)
     return ready
 
 

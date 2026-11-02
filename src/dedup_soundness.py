@@ -132,7 +132,9 @@ def dedup_problem(results: Path, task_id: str, tasks: Path | None = None,
     if text is None:
         text = read(result_path(results, task_id))
     if text is None:
-        return "no result file"
+        # The outbox retires the result it delivered; its receipt is that reply.
+        from delivery.task_dispatch import outbox_delivered
+        return None if outbox_delivered(results, task_id) else "no result file"
     target = dedup_target(text, src_dir)
     if target is None:
         return None          # a real reply, or a deliberate skip for THIS task
