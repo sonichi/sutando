@@ -530,6 +530,61 @@ branch that archives a result and retires its id does both as one step under the
 recovery judgement that a result was already disposed of is made inside that step too, and a
 settle never archives a task whose open wake has not delivered its own result.
 
+A task that asks this agent a room question (`task["room_question"]`) carries the question's
+`question_id`, `expected_revision`, `prompt`, `options`, `allow_free_text`, `response_mode`,
+`target_members` and `expires_at` as one line of quoted room data. Every string in it goes through
+the same secret redaction as the task body (types found join the body's secret notice); a question
+whose `question_id` or `expected_revision` a redaction would change is withheld whole. The line is
+capped at 2,000 characters.
+
+Unless its `can_answer` is `false`, a second writer-owned line tells the agent to answer it once:
+call `room.question.inspect`, answer only if that returns `can_answer` true, choose the response
+solely from the prompt, options and constraints it returns (with its `expected_revision`), send it
+with `room.question.answer` through `room.action.execute_safe`, then write a `[no-send]` one-line
+result. Locally only `can_answer: false` withholds the rule; `target_members` and `expires_at` are
+left to the broker, which refuses an answer it does not permit. The rule, and the offer it records,
+go only to owner tasks: an answer is an irreversible room write, which the guest, team and
+collaborator rulebooks all forbid. Those tasks still get the data line, followed (after their
+rulebook) by a line that it is context only and must not be answered.
+
+An answer cannot be undone, so the attempt ledger's `questions` map, by question id, decides who
+may answer. Each entry is exactly one of three shapes, and any entry that is not refuses every offer:
+- free `{}`: left only by a previous version; offered again like a new one;
+- held `{"holder": <task id>}`: one task may answer it;
+- closed `{"answered": true}` or `{"answered": "unknown"}`: answered, or it cannot be told; never
+  offered again.
+
+Evidence is a `room.question.answer` intent in the journal naming this task and this question
+(`question_id` at top level or in its arguments; both present and different means either), joined
+to its outcome by `operation_id`. Succeeded means answered; only `failed` means not. Any other
+outcome, none yet, an answer naming no question, a damaged line naming the task, or a journal that
+did not hold still while read, means it cannot be told; what an earlier read saw is kept across
+re-reads.
+- Free, or held by this task with no answer in its journal: it is held by this task, and the rule given.
+- Answered: a note not to answer again; the entry is closed as soon as the answer is seen.
+- Held by another open task: a note that it is being answered elsewhere.
+- Closed unknown, or it cannot be told: a note to leave it unanswered.
+
+The settle fences the task's turn first, then reads the journal, so no answer of that turn can land
+after the read; a turn whose fence cannot be had yet keeps the attempt for the next pass. It then
+**closes** the question for good: `true` when the journal proves the answer, else `"unknown"`. No
+answer found never frees a question, since it may have rotated away or (with no turn to fence) still
+be on its way, so the same agent never offers a question twice. The cost is deliberate: a task that
+ends without answering leaves its question closed, and no later task of this agent is offered it, so
+a question left unanswered here is not a bug. A newer generation replacing a run
+closes that run's question in the same write, since the earlier run may still answer. Only an offer
+creates an entry, within 2,000: free and expired entries are forgotten first, then the oldest closed
+ones (the broker refuses a second answer from the same respondent, so a forgotten question is never
+answered twice). A live hold is never forgotten, even past `expires_at` (a clock ahead of the broker's would hand it
+to a second task); only 2,000 of them at once withhold a new offer. A settle whose entry was
+forgotten as expired writes nothing.
+
+A task the broker closed is withdrawn from the inbox if the core has not taken it. Once taken, and
+offered a question, its journal decides: answered, the answer is recorded and no stop is sent;
+cannot be told, the close stays owed for the next pass; not answered, the normal stop. The turn gate reads only outcomes about its own task: an
+outcome naming another task's `task_id` neither suspends nor settles this one. A resolved blocker
+that carries an `answers` list is rendered answer by answer.
+
 ### `GET /v1/setup` *(optional)*
 
 The agent's own `agent.setup.steps` result (served text, tunables, package pin), for the
