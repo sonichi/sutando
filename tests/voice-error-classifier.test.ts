@@ -7,6 +7,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	classifyTransportClose,
+	fatalCloseForRecovery,
+	formatVoiceOfflineNotification,
 	protocolFailureFor,
 	recordTerminalClassification,
 	lastTerminalClassification,
@@ -43,6 +45,35 @@ test('auth_invalid: revoked or malformed key', () => {
 	assert.equal(r2.category, 'auth_invalid');
 });
 
+// The close reasons Gemini Live sent for a dead ephemeral token (1011, gemini-3.8-live, 2026-10-17).
+const DEAD_TOKEN_REASONS = [
+	'Token has expired',
+	'Token has been used too many times',
+	'new_session_expire_time deadline exceeded',
+];
+
+test('token_expired: a dead ephemeral token is terminal, so the redial ladder stops', () => {
+	for (const reason of DEAD_TOKEN_REASONS) {
+		const r = classifyTransportClose(1011, reason);
+		assert.equal(r.category, 'token_expired', reason);
+		assert.equal(r.retryable, false, reason);
+		assert.match(r.userMessage, /token/i, reason);
+		assert.deepEqual(fatalCloseForRecovery(1011, reason), { category: 'token_expired', code: 1011, reason }, reason);
+	}
+});
+
+test('token_expired: 1011 deadline and outage closes stay retryable', () => {
+	// Real transient closes from a voice-agent log: same code, unrelated to the token.
+	for (const reason of [
+		'Deadline expired before operation could complete.',
+		'The service is currently unavailable.',
+		'Internal error occurred.',
+	]) {
+		assert.equal(classifyTransportClose(1011, reason).retryable, true, reason);
+		assert.equal(fatalCloseForRecovery(1011, reason), null, reason);
+	}
+});
+
 test('model_not_found: configured model unavailable', () => {
 	const r = classifyTransportClose(
 		1011,
@@ -50,6 +81,17 @@ test('model_not_found: configured model unavailable', () => {
 	);
 	assert.equal(r.category, 'model_not_found');
 	assert.equal(r.retryable, false);
+});
+
+test('model_not_found: the fix it names is the workspace voice config, where voice-agent reads its model', () => {
+	const r = classifyTransportClose(
+		1008,
+		'models/gemini-3.8-live is not found for API version v1beta, or is not supported for bidiGenerateContent.',
+	);
+	assert.equal(r.category, 'model_not_found');
+	assert.match(r.userMessage, /config\/voice-agent\.json/);
+	assert.doesNotMatch(r.userMessage, /\.env\b|VOICE_NATIVE_AUDIO_MODEL/);
+	assert.match(formatVoiceOfflineNotification(r.userMessage, new Date(0)), /config\/voice-agent\.json/);
 });
 
 test('rate_limit: transient 429 stays retryable', () => {
@@ -107,6 +149,13 @@ test('protocol mapper: credits_depleted → failed/quota with its own reason cod
 	const c = classifyTransportClose(1011, 'Your prepayment credits are depleted.');
 	const p = protocolFailureFor(c);
 	assert.deepEqual(p, { upstream: 'failed', reason: 'credits-depleted', category: 'quota' });
+});
+
+test('protocol mapper: token_expired → failed/auth with its own reason code', () => {
+	for (const reason of DEAD_TOKEN_REASONS) {
+		const p = protocolFailureFor(classifyTransportClose(1011, reason));
+		assert.deepEqual(p, { upstream: 'failed', reason: 'credential-expired', category: 'auth' }, reason);
+	}
 });
 
 test('protocol mapper: model_not_found → failed/other', () => {

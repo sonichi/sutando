@@ -18,6 +18,12 @@ Exit 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import subprocess
@@ -60,6 +66,11 @@ class CredentialProxyStalenessTests(unittest.TestCase):
         patcher = patch.object(hc, "REPO_DIR", self.repo)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Isolate from this host's real quota-state.json (check_credential_proxy now
+        # reads it too); this tmpdir has none, so that read is a silent no-op here.
+        ws_patcher = patch.object(hc, "WORKSPACE_DIR", self.repo)
+        ws_patcher.start()
+        self.addCleanup(ws_patcher.stop)
 
         self.now = time.time()
         self.proc_start = self.now - 2 * 3600

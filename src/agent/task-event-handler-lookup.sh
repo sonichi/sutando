@@ -1,38 +1,43 @@
 #!/bin/bash
-# Optional capability lookup for the watcher's task-event handler. A skill that
-# provides one publishes an executable at skills/<skill>/task-event-handler
-# (a symlink to its script is fine). This helper names no skill: exactly one
-# publisher wins; none sets nothing; several is ambiguous and sets nothing,
-# loudly, so the operator pins SUTANDO_TASK_EVENT_HANDLER explicitly.
+# Reads the task-event handler declared in a small JSON config file.
 #
-# resolve_task_event_handler <repo>  -> prints the path (rc 0) | rc 1 none | rc 2 ambiguous
+#     <workspace>/state/task-event-handler.json   {"handler": "<abs path>"}
+#
+# A skill's own "in use" touchpoint is the one production writer (e.g.
+# worker-pool's register_worker() calls publish_task_event_handler() on every
+# worker registration) -- see src/util_paths.py's task_event_handler_config_path.
+# No manifest scan, no symlink: the watcher reads this one file, and a caller
+# that also watches it (fswatch) can reload the moment it changes, in-process.
+#
+# read_task_event_handler_config <path> -> prints the handler path (rc 0) | rc 1 none/unusable
 
-resolve_task_event_handler() {
-  local repo="$1" h
-  set --
-  for h in "$repo"/skills/*/task-event-handler; do
-    [ -x "$h" ] && set -- "$@" "$h"
-  done
-  case $# in
-    0) return 1 ;;
-    1) printf '%s\n' "$1"; return 0 ;;
-    *) printf 'task-event-handler: %s skills publish one (%s); set SUTANDO_TASK_EVENT_HANDLER explicitly\n' "$#" "$*" >&2; return 2 ;;
-  esac
+read_task_event_handler_config() {
+  local cfg="$1" py="${SUTANDO_PY_BIN:-python3}"
+  [ -f "$cfg" ] || return 1
+  "$py" -c '
+import json, os, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        handler = (json.load(fh) or {}).get("handler")
+except (OSError, ValueError):
+    sys.exit(1)
+if not isinstance(handler, str) or not handler or not os.access(handler, os.X_OK):
+    sys.exit(1)
+print(handler)
+' "$cfg"
 }
 
-# A publisher created only at worker-registration time never re-runs for a pool
-# that already existed before this repo stopped shipping the file, so each
-# skill gets one chance, here, to republish before every resolution. Names no
-# skill: `skills/*/task-event-handler-ensure`, same neutral glob as above.
+# task_event_handler <config-path> -> path (rc 0) | rc 1 none
 #
-# Returns nonzero if ANY hook that ran failed: a hook that could not confirm
-# "no pool" and could not repair one either leaves the caller unable to tell
-# a fixed pool from a broken one, so it must refuse rather than resolve.
-ensure_task_event_handlers_published() {
-  local repo="$1" ensure rc=0
-  for ensure in "$repo"/skills/*/task-event-handler-ensure; do
-    [ -x "$ensure" ] || continue
-    "$ensure" "$repo" || rc=1
-  done
-  return "$rc"
+# An explicit SUTANDO_TASK_EVENT_HANDLER pin always wins over the declared
+# config, checked live every call: an operator pin can be set or cleared at
+# any time and must never be shadowed by a cached config-file read.
+task_event_handler() {
+  local cfg="$1"
+  if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 1
+    printf '%s\n' "$SUTANDO_TASK_EVENT_HANDLER"
+    return 0
+  fi
+  read_task_event_handler_config "$cfg"
 }

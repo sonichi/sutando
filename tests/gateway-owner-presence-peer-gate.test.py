@@ -18,6 +18,11 @@ import tempfile
 import pathlib
 
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 OWNER = "@qingyun:ag2.space"          # the human owner — NOT in /v1/agents
 PEER = "@qingyun-air.agent:ag2.space"  # a fleet agent — IN /v1/agents
 

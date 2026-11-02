@@ -13,6 +13,12 @@ rendered as the calmest wording in the message. `test_over_cap_*` fails on that
 draft.
 """
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import subprocess
@@ -43,7 +49,7 @@ _GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
 def _git(cwd: Path, *args: str, env: "dict | None" = None) -> None:
     subprocess.run(["git", *_GIT_PIN, "-C", str(cwd), *args], check=True,
                    capture_output=True,
-                   env={**os.environ, **_GIT_ENV, **(env or {})})
+                   env={**isolated_child_env(), **_GIT_ENV, **(env or {})})
 
 
 def _repo_with_sizes(tmp: Path, sizes: "list[int]", ago_h: float = 0.0) -> Path:

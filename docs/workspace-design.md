@@ -19,6 +19,8 @@ Through 2026-05-18 a workspace-vs-repo bug class surfaced ~28 sites across Pytho
 
 That's it. Two top-level spaces. Sync is configured per-sub-path inside Workspace, not by having a separate "synced" container.
 
+**One deliberate exception, for locks only.** `src/holder_lock.py` (and its bundled copy in `ag2-sparrow`) keeps its lock files in a host-local, per-uid, never-synced runtime directory: `<home of the effective uid>/.local/state/ag2-sparrow/locks/<hash of the work root directory's device and inode>/`. It is outside both spaces on purpose: a lock must resolve to one place for every launch context of a user and must never be synced or mirrored. It holds only `lock`, `holder` and `waiting.<pid>` files, and it is not a third state container for anything else.
+
 ## Quick decision: which space?
 
 When adding code that reads or writes a file, ask: **does it ship with every install (same on every clone)?**
@@ -70,12 +72,13 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `notes/` | ✅ yes (default) | Persistent, user-authored | Long-form notes, research, daily logs |
 | `.claude-sutando/projects/<slug>/memory/` | ✅ yes (default) | Persistent, agent-authored | Auto-memory files written by `/remember` etc. |
 | `build_log.md` | ✅ yes (default) | Append-only | Session changelogs from proactive-loop |
-| `pending-questions.md` | ✅ yes (default) | Persistent | User-deferred questions |
+| `pending-questions.md` | ✅ yes (default) | Persistent | Legacy per-host file, read-only history; live questions are rows of the room database (`src/pending_questions_reader.py list`) |
 | `tasks/`, `results/` | ❌ no | Ephemeral | Per-tick task queue + replies (per-host runtime) |
 | `state/cores/<host>.alive` | ❌ no | Per-host heartbeat | Per-host structural state, not synced |
 | `state/auth/`, `state/cloud-auth.json`, `state/device.json` | ❌ no | Per-host durable | Install/identity state, per-host |
 | `logs/conversation.log` | ❌ no | Per-host runtime | Voice/phone/discord log; large + per-host |
 | `data/conversation.sqlite` | ❌ no | Per-host runtime | SQLite mirror of conversation log |
+| `skills/<name>/` | opt-in (`vault.sync.include`) | Persistent, user-authored | Your own skills; `skills/install.sh` links them next to the shipped ones and survives an engine update. A synced workspace runs them on every host, so only skills you trust belong here |
 | `skill-repos/<repo-name>/` | ❌ no | Per-host clone | Git checkouts of skill **source** repos; each is linked by its OWN installer, not by `skills/install.sh` |
 | `.env` | ❌ no | Per-host secret | Tokens, API keys — must NOT sync |
 
@@ -89,7 +92,7 @@ Clone skill repos there rather than into `$HOME`. A checkout outside the workspa
 
 `skill-repos/` is **not** synced. The blanket `*` in the carrier-set gitignore already excludes it, which is what you want: these are independent git repos with their own remotes and history, some of them large, and the vault should not be carrying a nested checkout.
 
-**`skills/install.sh` does not manage these.** It iterates only its own directory — `for skill_dir in "$SKILLS_DIR"/*/` — so it links the built-in `skills/*/` of this repo and nothing else; the string `skill-repos` does not appear in it. Each external checkout is linked by **its own** installer, at `skill-repos/<repo-name>/scripts/install.sh`. Measured on this host: 58 links point into this repo, 35 into `skill-repos/`, 3 elsewhere.
+**`skills/install.sh` does not manage these.** It iterates its own directory — `for skill_dir in "$SKILLS_DIR"/*/` — and `<workspace>/skills/*/`, so it links the built-in `skills/*/` of this repo and the owner's own skills and nothing else; the string `skill-repos` does not appear in it. Each external checkout is linked by **its own** installer, at `skill-repos/<repo-name>/scripts/install.sh`. Measured on this host: 58 links point into this repo, 35 into `skill-repos/`, 3 elsewhere.
 
 Relocating a clone therefore depends on which installer owns it, because they differ on the one step that matters:
 

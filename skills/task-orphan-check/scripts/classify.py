@@ -67,8 +67,17 @@ case-insensitive). A path or a bare skill-name mention ("… touches
 skills/import-claude-context/SKILL.md") is NOT one — review 4177: the bare
 substring parked unrelated owner tasks forever.
 
-Age comes from the immutable `timestamp:` header, then the epoch-ms in the
-id, and only then the file mtime (mtime resets on rsync / checkout / sync).
+Age is how long the task has waited in THIS inbox: the `local_time:` header the
+local writer stamps at intake, then the immutable `timestamp:` header, then the
+epoch-ms in the id, and only then the file mtime (mtime resets on rsync /
+checkout / sync). `timestamp:` is when the sender sent it, so a message that
+waited at a broker while the app was down is not old on arrival. `local_time:`
+counts only above `task:` (the strict parse): a writer that never stamps it must
+not let a body line supply it. task-bridge.ts stamps it from the timestamp it has
+just taken; a requeued task (`build_requeued_task`) keeps the original's, so a
+requeue does not make a task look fresh. status-ack's deadline
+(`status_ack_policy.intake_at`) stays on the sender's `timestamp:` on purpose: it
+measures how long the sender has waited, not this inbox.
 
 Usage:
   python3 skills/task-orphan-check/scripts/classify.py [--workspace DIR] [--now EPOCH]
@@ -153,8 +162,13 @@ def parse_iso(value: str) -> float | None:
     return dt.timestamp()
 
 
-def task_queued_at(headers: dict, task_id: str, path: Path) -> tuple[float, str]:
-    """(epoch, how) — header timestamp, else id epoch-ms, else mtime."""
+def task_queued_at(headers: dict, task_id: str, path: Path, local_time: str = "") -> tuple[float, str]:
+    """(epoch, how) — local_time, else header timestamp, else id epoch-ms, else mtime.
+    `local_time` comes from the strict pre-`task:` headers only, never from `headers`."""
+    # `local_time:` is "<ISO with offset> <IANA zone>"; the zone name is display only.
+    written = parse_iso((local_time.split() or [""])[0])
+    if written is not None:
+        return written, "local_time"
     ts = parse_iso(headers.get("timestamp", ""))
     if ts is not None:
         return ts, "timestamp"
@@ -230,7 +244,8 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     parsed = ltp.parse_task_headers_lenient(text)
     headers = parsed.headers
     task_id = (headers.get("id") or path.stem).strip()
-    queued_at, age_from = task_queued_at(headers, task_id, path)
+    queued_at, age_from = task_queued_at(headers, task_id, path,
+                                         ltp.parse_task_headers(text).headers.get("local_time", ""))
     age_s = max(0, int(now - queued_at))
     source = (headers.get("source") or "").strip()
     tier = ltp.canonical_access_tier(headers.get("access_tier") or "owner")

@@ -119,6 +119,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+import gateway_sessions  # noqa: E402
 from access_store import (  # noqa: E402  — single locked writer for access.json (#3318)
     mutate_access_file,
     read_access_for_transaction,
@@ -157,13 +158,14 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from result_publish import publish_text  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -560,7 +562,7 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
     the caller routes or sends, because those are async here."""
     try:
         return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-                                   channel_id, f"task-{int(time.time() * 1000)}")
+                                   channel_id, fresh_reask_id())
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
         # A planner that raised proved nothing about the asker being answered.
@@ -2730,6 +2732,48 @@ async def _supervise_loop(coro_fn, name):
         await asyncio.sleep(POLL_LOOP_RESTART_SEC)
 
 
+# discord.py's DEBUG records that say why a session ended; every other DEBUG record (raw gateway
+# payloads among them, which carry message content) stays out of the log.
+GATEWAY_REASON_TEMPLATES = frozenset({
+    "Shard ID %s has sent the IDENTIFY payload.",
+    "Shard ID %s has sent the RESUME payload.",
+    "Received RECONNECT opcode.",
+    "Timed out receiving packet. Attempting a reconnect.",
+    "Websocket closed with %s, attempting a reconnect.",
+    "Websocket closed with %s, cannot reconnect.",
+    "Got a request to %s the websocket.",
+})
+GATEWAY_SESSIONS_FILE = REPO / "state" / "discord-bridge.sessions.json"
+
+
+def _gateway_reason_filter(record) -> bool:
+    import logging
+    return record.levelno >= logging.INFO or record.msg in GATEWAY_REASON_TEMPLATES
+
+
+def _log_gateway_reasons(stream=None) -> None:
+    """Send discord.py's gateway and client records to the bridge log: they alone say why a session
+    ended (close code, timeout, invalidated session, missed heartbeat)."""
+    import logging
+    handler = logging.StreamHandler(stream or sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s",
+                                           "%Y-%m-%dT%H:%M:%S"))
+    handler.addFilter(_gateway_reason_filter)
+    for name in ("discord.gateway", "discord.client"):
+        log = logging.getLogger(name)
+        log.setLevel(logging.DEBUG)
+        log.addHandler(handler)
+        # On the logger, not only this handler: any handler on it or above sees only the filtered records.
+        log.addFilter(_gateway_reason_filter)
+        log.propagate = False
+
+
+def _run_bridge() -> None:
+    _single_instance_acquire("discord-bridge")
+    _log_gateway_reasons()
+    client.run(TOKEN, log_handler=None)
+
+
 @client.event
 async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
     global _resume_count
@@ -2757,6 +2801,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
+    gateway_sessions.record(GATEWAY_SESSIONS_FILE, time.time())
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
@@ -4275,6 +4320,7 @@ async def _handle_discord_message(message, force=False):
             # sender can set (channel_name, guild_name) may precede the tier.
             f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"local_time: {local_task_protocol.local_time_value()}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
             f"{media_headers}"
@@ -4986,10 +5032,7 @@ async def poll_results():
                 # skipped the cleanup block at the bottom of this loop.
                 # Non-owner results are scanned before ANY marker below. The tier
                 # map dies on restart, so unknown is re-read from the task file.
-                _guard_tier = _task_tier
-                if _guard_tier == "unknown":
-                    _guard_tf = find_task_file(TASKS_DIR, task_id)
-                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                _guard_tier = resolve_route_tier(_task_tier, TASKS_DIR, task_id)
                 # A Discord channel is a human surface: the suppression is journaled
                 # under STATE_DIR and closed silently rather than posted as prose.
                 try:
@@ -5007,79 +5050,21 @@ async def poll_results():
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
-                    # [no-send] / [REPLIED] / [deduped:] — normally a silent
-                    # archive. GUARD: dedup is per-channel only. A
-                    # `[deduped: task-X]` whose holder X came from a DIFFERENT
-                    # channel is invalid (it would leave the asking channel
-                    # silent). Reject it and RE-QUEUE the original task with a
-                    # trusted ===SYSTEM=== note so the core re-answers it in its
-                    # own channel. Loop guard: a task that comes back
-                    # cross-channel-deduped a SECOND time is not re-queued again
-                    # — notify in-channel instead (owner-directed).
+                    # All dedup boundaries and retry limits belong to the shared
+                    # plan; Discord only routes the re-ask or sends its report.
                     if _skip.value == "deduped":
                         _act, _delivered = "defer", None
                         try:
-                            # find_task_file globs unchecked; an id failing the
-                            # gate find_result applies is "holder not found".
-                            _holder_file = (
-                                find_task_file(TASKS_DIR, _skip.extra)
-                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
-                                else None)
-                            _holder_text = _holder_file.read_text() if _holder_file else None
-                            _target = dedup_cross_channel_target(channel.id, _holder_text)
-                            # Cross-channel is an unconfirmed report: the asker is
-                            # only served once the notify or the re-queue lands.
-                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("report", None))
+                            _act, _pl = _dedup_recover(task_id, _skip.extra, channel.id)
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 pending_admitted_ms[_pl] = int(time.time() * 1000)
                                 save_pending_replies()
-                            elif _act == "report" and not _target:
-                                # Cross-channel carries a None payload and is
-                                # delivered by the _target block below instead.
+                            elif _act == "report":
                                 await channel.send(_pl)
                                 _delivered = True
-                            if _target:
-                                _orig_file = find_task_file(TASKS_DIR, task_id)
-                                _orig_text = _orig_file.read_text() if _orig_file else None
-                                _count = dedup_requeue_count(_orig_text)
-                                if _count >= 1:
-                                    # Second time — don't loop; flag it.
-                                    print(
-                                        f"  [dedup] cross-channel retry failed for {task_id} "
-                                        f"(holder {_skip.extra} in #{_target}) — notifying",
-                                        flush=True,
-                                    )
-                                    await channel.send(
-                                        f"⚠️ Couldn't auto-correct a cross-channel dedup for "
-                                        f"`{task_id}` (folded into `{_skip.extra}` in <#{_target}>) "
-                                        f"even after a re-queue — flagging instead of looping. "
-                                        f"This needs a direct answer here."
-                                    )
-                                    _delivered = True
-                                else:
-                                    # First time — reject + re-queue for an
-                                    # in-channel answer.
-                                    _new_id = f"task-{int(time.time() * 1000)}"
-                                    _requeued = build_requeued_task(
-                                        _orig_text or "", _new_id, _count + 1,
-                                        channel.id, _skip.extra,
-                                    )
-                                    (TASKS_DIR / f"{_new_id}.txt").write_text(_requeued)
-                                    # Route the re-answer back to THIS channel.
-                                    pending_replies[_new_id] = channel
-                                    pending_admitted_ms[_new_id] = int(time.time() * 1000)
-                                    save_pending_replies()
-                                    print(
-                                        f"  [dedup] cross-channel reject: {task_id} (#{channel.id}) "
-                                        f"folded into {_skip.extra} (#{_target}) — re-queued as "
-                                        f"{_new_id} for in-channel answer",
-                                        flush=True,
-                                    )
-                                    _delivered = True
                         except Exception as e:
-                            print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                            print(f"  [dedup] recovery routing failed: {e}", flush=True)
                         if report_disposition(_act, _delivered) == "retain":
                             # Nobody was told. Keep the result AND the task so a
                             # later pass retries; archiving loses the question.
@@ -5550,14 +5535,21 @@ async def poll_proactive():
             # state/last-owner-activity.json; default discord on missing
             # state).
             from proactive_routing import (  # noqa: E402
-                redirect_target_is_foreign, should_claim_proactive_file)
+                redirect_target_is_foreign, should_claim_proactive_peeked)
+
+            def _discord_claims(f):
+                # Peek before claiming: a claim hides the file from the bridge
+                # its body addresses (#5368). Policy: proactive_routing.
+                try:
+                    peek = f.read_text(errors="ignore")
+                except OSError:
+                    return False
+                return should_claim_proactive_peeked(
+                    f.name, peek, STATE_DIR / "last-owner-activity.json", "discord")
+
             for f in RESULTS_DIR.iterdir():
-                # Per-FILE decision: an explicit .to-<channel> destination
-                # outranks activity routing (see proactive_routing).
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
-                        and should_claim_proactive_file(
-                            f.name, STATE_DIR / "last-owner-activity.json",
-                            "discord"):
+                        and _discord_claims(f):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
@@ -6109,12 +6101,9 @@ async def poll_dm_fallback():
                         )
                     # Either non-owner or unresolved-channel path: rewrite the
                     # result file with the marker stripped so the dm-result.py
-                    # subprocess (below) DMs clean text. Atomic-ish write —
-                    # the only other consumer of results/ at this point is
-                    # voice-agent's task-bridge, which is read-only and would
-                    # tolerate an intermediate marker-vs-clean view.
+                    # subprocess (below) DMs clean text.
                     try:
-                        f.write_text(clean_body + ("\n" if not clean_body.endswith("\n") else ""), encoding="utf-8")
+                        publish_text(f, clean_body + ("\n" if not clean_body.endswith("\n") else ""))
                     except OSError as e:
                         print(f"  [dm-fallback channel-redirect] write-back failed on {f.name}: {e}", flush=True)
 
@@ -6303,5 +6292,4 @@ if __name__ == "__main__":
                              "<body|--body-file PATH>")
         _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
-        _single_instance_acquire("discord-bridge")
-        client.run(TOKEN, log_handler=None)
+        _run_bridge()

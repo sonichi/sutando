@@ -64,13 +64,25 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+from proactive_routing import (body_claimable_by, claims_unless_routed_elsewhere,  # noqa: E402
+                               other_bridges_configured)
 
 
-def _slack_claims_name(name: str) -> bool:
+def _other_bridges_configured() -> bool:
+    """Another bridge installed beside Slack on this host (channels/<bridge>/)."""
+    try:
+        return other_bridges_configured("slack", claude_home_path("channels"))
+    except Exception:
+        return False
+
+
+def _slack_claims_name(name: str, body=None) -> bool:
     """Filename-level claim decision — the policy lives in proactive_routing;
-    this adapter only binds its channel."""
-    return fallback_claims_name(name, "slack")
+    this adapter only binds its channel. A tag outranks; a body addressed to
+    Slack outranks activity routing; an untagged file is Slack's when the
+    owner was last active here, or with no record on a Slack-only install."""
+    return claims_unless_routed_elsewhere(name, OWNER_ACTIVITY_FILE, "slack",
+                                          body=body, other_bridges_configured=_other_bridges_configured())
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 import slack_access  # noqa: E402
 
@@ -83,9 +95,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -556,7 +569,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+            (target or {}).get("channel", ""), fresh_reask_id())
         if action == "requeue":
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
@@ -570,6 +583,17 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
     return report_disposition(action, delivered)
+
+
+def _guard_reply(task_id: str, target, reply_text: str) -> str:
+    """The body this reply leg may deliver: the shared guard's verdict for the asker's tier.
+    A route without a tier re-reads it from the task file; no task file guards as guest."""
+    tier = resolve_route_tier((target or {}).get("access_tier"), TASKS_DIR, task_id)
+    safe, withheld = guard_result_for_tier(reply_text, tier, REPO,
+                                           suppress_journal=(STATE_DIR, task_id))
+    if withheld:
+        print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
+    return safe
 
 
 def _pop_pending_reply(task_id: str):
@@ -604,7 +628,8 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
         _pop_pending_reply(task_id)
         raise
 
-# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# Per-task NUDGE timer, NOT task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (which
+# abandons a task at its deadline; this keeps waiting, hence still 10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
 # loops on the API error), no result file is ever written and the Slack user
 # gets silence. After this many seconds we post a one-time "still working /
@@ -1243,6 +1268,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_content = (
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        f"local_time: {local_task_protocol.local_time_value()}\n"
         f"source: slack\n"
         f"interaction_type: message\n"
         f"{media_headers}"
@@ -1715,6 +1741,9 @@ def result_watcher():
                     archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
                     continue
 
+                # Non-owner results pass the shared egress guard before ANY marker below.
+                reply_text = _guard_reply(task_id, target, reply_text)
+
                 # Skip-marker check via unified parser (#873). Equivalent to
                 # the prior startswith trio but routed through one source of
                 # truth so future skip markers added in result_markers.py
@@ -1782,8 +1811,8 @@ def result_watcher():
                         continue
                     if not body_claimable_by(peek, "slack"):
                         continue
-                    # Explicit filename destination outranks the race.
-                    if not _slack_claims_name(f.name):
+                    # Tag, then a Slack address in the body, then activity routing.
+                    if not _slack_claims_name(f.name, peek):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

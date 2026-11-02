@@ -37,6 +37,11 @@ pb = _sibling("pool_beat")
 pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
 prr = _sibling("pool_routing_receipt")
+pd = _sibling("pool_delivery")
+
+_SRC = _HERE.parents[2] / "src"
+import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
+from delivery import pane_gate, task_dispatch as td  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -51,8 +56,29 @@ def state_path(workspace) -> Path:
 
 
 def is_paused(workspace, worker_id) -> bool:
-    """Only the owner writes or removes this file; nothing here ever does."""
+    """Only the owner writes or removes this file, through `set_paused`."""
     return (wi.worker_dir(workspace, worker_id) / PAUSED_MARKER).exists()
+
+
+def set_paused(workspace, worker_id, paused: bool) -> None:
+    """The owner's pause (`pool_manage.py stop` / `enable`)."""
+    marker = wi.worker_dir(workspace, worker_id) / PAUSED_MARKER
+    if paused:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def run_socket(workspace, worker_id) -> str | None:
+    """The tmux socket of the worker's open run, else of its last run; None when it never ran.
+    A wrong socket answers "no server running" for a host whose real socket is fine."""
+    runs = [r for r in wi.incarnations(workspace, worker_id) if isinstance(r, dict)]
+    open_runs = [r for r in runs if r.get("ended_at") is None]
+    for run in reversed(open_runs or runs):
+        if (run.get("tmux") or {}).get("socket"):
+            return str(run["tmux"]["socket"])
+    return None
 
 
 def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
@@ -61,11 +87,17 @@ def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None
     The socket is read from the recorded incarnation, never assumed: a wrong
     socket answers "no server running" for a host whose real socket is fine.
     """
-    open_runs = [r for r in wi.incarnations(workspace, worker_id)
-                 if isinstance(r, dict) and r.get("ended_at") is None]
-    if not open_runs:
+    runs = [r for r in wi.incarnations(workspace, worker_id) if isinstance(r, dict)]
+    open_runs = [r for r in runs if r.get("ended_at") is None]
+    if open_runs:
+        run = open_runs[-1]
+    elif runs and runs[-1].get("end_reason") == "crashed":
+        # A failed recovery closes its attempted run. The last crashed run
+        # still names the socket to probe, so escalation must keep its evidence.
+        run = runs[-1]
+    else:
         return None
-    tmux = open_runs[-1].get("tmux") or {}
+    tmux = run.get("tmux") or {}
     socket = tmux.get("socket")
     name = tmux.get("session_name") or wi.tmux_session_name(worker_id)
     if not socket:
@@ -83,6 +115,74 @@ def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None
     if "no server" in err or "can't find session" in err or "session not found" in err:
         return False
     return None
+
+
+def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
+    """(socket, session) of the worker's open run; socket None when there is none."""
+    open_runs = [r for r in wi.incarnations(workspace, worker_id)
+                 if isinstance(r, dict) and r.get("ended_at") is None]
+    tmux = (open_runs[-1].get("tmux") or {}) if open_runs else {}
+    return tmux.get("socket") or None, tmux.get("session_name") or wi.tmux_session_name(worker_id)
+
+
+def work_outstanding(workspace, worker_id) -> bool | None:
+    """Does this worker owe a reply? What task_dispatch says was handed to it, less
+    what already has a ready result (live or archived). None when undecidable."""
+    try:
+        owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
+        names = [f"{t}.txt" for t in owned]
+        # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
+        return bool(set(names) - td.ready_result_filenames(pd.results_dir(workspace), names))
+    except (OSError, ValueError):
+        return None
+
+
+def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,
+                       socket=None, session=None) -> str:
+    """One capture as a pool_supervision PANE_* kind. The gate and the abnormal
+    text are the core's readers (pane_gate, cli_wedge); only the mapping is here."""
+    if not text or not text.strip():
+        return ps.PANE_UNKNOWN
+    adapter = pane_gate.ADAPTERS.get(runtime, pane_gate.CLAUDE)
+    verdict = pane_gate.classify_pane(text, adapter, workspace, socket, session)
+    if verdict.state == "abnormal":
+        abn = cw.frame_abnormal(text)
+        if abn and abn.kind == "provider-limit":
+            return ps.PANE_LIMIT
+        if abn and "needs-login" in abn.names:
+            return ps.PANE_LOGGED_OUT
+        return ps.PANE_ABNORMAL
+    if verdict.state == "busy":
+        # A limit banner under the composer is status, not a dialog: a live turn above it runs.
+        if verdict.reason == "working" or (verdict.reason == "usage-limit" and cw.frame_working(text)):
+            return ps.PANE_WORKING
+        return ps.PANE_GATE
+    if verdict.state in ("idle-ready", "pending"):
+        return ps.PANE_IDLE
+    return ps.PANE_UNKNOWN
+
+
+def observe_pane(workspace, worker_id, runtime: str = "claude", *,
+                 runner=subprocess.run) -> tuple[str | None, str | None]:
+    """(pane kind, frame id) of this worker's pane; (None, None) when unread."""
+    socket, name = _open_tmux(workspace, worker_id)
+    if not socket:
+        return None, None
+    try:
+        done = runner(["tmux", "-S", str(socket), "capture-pane", "-p", "-t", f"={name}:0"],
+                      capture_output=True, text=True, timeout=8)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None, None
+    text = done.stdout if done.returncode == 0 else None
+    if not text or not text.strip():
+        return None, None
+    return (classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name),
+            frame_id(text))
+
+
+def frame_id(text: str) -> str:
+    """"raw:progress": the raw frame proves a frozen turn, the progress half a waiting one."""
+    return f"{cw.raw_state_id(text)}:{pane_gate.progress_id(text)}"
 
 
 def supervised_workers(workspace) -> dict:
@@ -117,12 +217,53 @@ def observe(workspace, now: float, *, worker_ids=None,
         rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
     for wid, row in rows.items():
+        session_alive = probe_session(workspace, wid, runner=runner)
+        watcher_beat = pb.classify(pb.beat_path(workspace, "watcher", wid), now)
+        # The process table is read only when the beat cannot answer: a live
+        # beat proves the watcher, and a dead session has no watcher ladder.
+        held = None
+        if session_alive is True and watcher_beat != pb.LIVE:
+            held = session_watcher_holds(workspace, wid, runner=runner)
+        pane, pane_id = (observe_pane(workspace, wid, row.get("runtime") or "claude",
+                                      runner=runner)
+                         if session_alive is True else (None, None))
         obs[wid] = ps.Observation(
             beat=pb.classify(pb.beat_path(workspace, "worker", wid), now),
-            session_alive=probe_session(workspace, wid, runner=runner),
+            session_alive=session_alive,
             paused=is_paused(workspace, wid),
+            watcher_beat=watcher_beat,
+            watcher_held=held,
+            work_outstanding=work_outstanding(workspace, wid),
+            pane=pane,
+            pane_id=pane_id,
         )
     return obs
+
+
+def session_watcher_holds(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
+    """Does a session-role watcher provably serve this worker's inbox?
+
+    True: one holds it. False: the table was read, nothing undecidable was seen,
+    and no session-role holder exists. None: unobservable, or undecided lines
+    remain, because refusing evidence is cheaper than a re-arm on a watcher that
+    merely could not be read.
+    """
+    inbox = pd.deliveries_dir(workspace, worker_id)
+    try:
+        done = runner([sys.executable, str(_SRC / "watcher_identity.py"),
+                       "inbox-holders", "--inbox", str(inbox)],
+                      capture_output=True, text=True, timeout=15)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    roles = [line.split()[1] for line in (done.stdout or "").splitlines()
+             if len(line.split()) == 2]
+    if "session" in roles:
+        return True
+    if "undecided=" in (done.stderr or ""):
+        return None
+    return False
 
 
 def routing_status(workspace) -> dict:
@@ -179,6 +320,15 @@ def load_state(workspace) -> ps.SupervisionState:
                 consecutive=int(ev.get("consecutive") or 0),
                 recover_issued_at=ev.get("recover_issued_at"),
                 escalated=bool(ev.get("escalated")),
+                watcher_first_detected_at=ev.get("watcher_first_detected_at"),
+                watcher_consecutive=int(ev.get("watcher_consecutive") or 0),
+                rearm_issued_at=ev.get("rearm_issued_at"),
+                watcher_escalated=bool(ev.get("watcher_escalated")),
+                wedge_first_detected_at=ev.get("wedge_first_detected_at"),
+                wedge_consecutive=int(ev.get("wedge_consecutive") or 0),
+                wedge_escalated=bool(ev.get("wedge_escalated")),
+                wedge_kind=ev.get("wedge_kind"),
+                last_pane_id=ev.get("last_pane_id"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -194,7 +344,16 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
         "workers": {w: {"first_detected_at": e.first_detected_at,
                         "consecutive": e.consecutive,
                         "recover_issued_at": e.recover_issued_at,
-                        "escalated": e.escalated}
+                        "escalated": e.escalated,
+                        "watcher_first_detected_at": e.watcher_first_detected_at,
+                        "watcher_consecutive": e.watcher_consecutive,
+                        "rearm_issued_at": e.rearm_issued_at,
+                        "watcher_escalated": e.watcher_escalated,
+                        "wedge_first_detected_at": e.wedge_first_detected_at,
+                        "wedge_consecutive": e.wedge_consecutive,
+                        "wedge_escalated": e.wedge_escalated,
+                        "wedge_kind": e.wedge_kind,
+                        "last_pane_id": e.last_pane_id}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -205,6 +364,13 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def acknowledge_cards(workspace, worker_ids) -> None:
+    """Persist that these workers' wedge cards were created; a card that was not
+    stays owed, and the next tick asks again."""
+    if worker_ids:
+        save_state(workspace, ps.acknowledge(load_state(workspace), worker_ids))
 
 
 def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
@@ -222,11 +388,20 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     if persist:
         save_state(workspace, new_state)
     asked = list(worker_ids or [])
+    # Reported on every tick, not only when a card decision is due: a dry run must
+    # show the finding after the real sweep already raised (and acknowledged) the card.
     return {"decisions": decisions,
+            "auth_expired": sorted(w for w, o in obs.items() if o.pane == ps.PANE_LOGGED_OUT),
+            "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
+            "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
+                            if e.wedge_consecutive and e.wedge_kind},
             "routing": routing_status(workspace),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
-                                 "paused": o.paused} for w, o in obs.items()},
+                                 "paused": o.paused, "watcher_beat": o.watcher_beat,
+                                 "watcher_held": o.watcher_held,
+                                 "work_outstanding": o.work_outstanding,
+                                 "pane": o.pane} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
 
 
@@ -253,10 +428,15 @@ def main(argv=None) -> int:
     else:
         for wid, decision in sorted(out["decisions"].items()):
             o = out["observations"][wid]
-            print(f"{wid[:8]}  {decision:8}  beat={o['beat']:7} "
-                  f"session={o['session_alive']!s:5} paused={o['paused']}")
+            print(f"{wid[:8]}  {decision:13}  beat={o['beat']:7} "
+                  f"session={o['session_alive']!s:5} paused={o['paused']!s:5} "
+                  f"watcher={o['watcher_beat']:7} held={o['watcher_held']} "
+                  f"work={o['work_outstanding']} pane={o['pane']}")
         for wid in out["not_supervised"]:
             print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
+        for wid in out["auth_expired"]:
+            print(f"{wid[:8]}  login expired: the session is alive but cannot work until "
+                  f"/login is run in tmux session {wi.tmux_session_name(wid)}")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
         if out["routing"]["alarm"]:

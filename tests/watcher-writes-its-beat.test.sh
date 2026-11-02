@@ -34,7 +34,7 @@ check "the injected beat script exists" '[ -f "$SUTANDO_WATCHER_BEAT" ]'
 # Own process group (no setsid on macOS): the watcher's cleanup sends a GROUP
 # TERM, which kills this test instead of the watcher if they share one.
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" >"$SB/out" 2>"$SB/err" &
+    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" --role standby --inbox "$WORKSPACE_DIR/tasks" >"$SB/out" 2>"$SB/err" &
 WATCHER_PID=$!
 
 for _ in $(seq 1 60); do [ -f "$BEAT" ] && break; sleep 0.25; done
@@ -67,7 +67,7 @@ SB3="$(mktemp -d)"
 export WORKSPACE_DIR="$SB3/ws"
 mkdir -p "$WORKSPACE_DIR/tasks" "$WORKSPACE_DIR/state"
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" >/dev/null 2>&1 &
+    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" --role standby --inbox "$WORKSPACE_DIR/tasks" >/dev/null 2>&1 &
 W3=$!
 for _ in $(seq 1 60); do [ -f "$WORKSPACE_DIR/state/watchers/core.alive" ] && break; sleep 0.25; done
 B3="$(beat_child_of "$W3")"
@@ -86,7 +86,7 @@ export WORKSPACE_DIR="$SB2/ws"
 mkdir -p "$WORKSPACE_DIR/tasks" "$WORKSPACE_DIR/state"
 unset SUTANDO_WATCHER_BEAT
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" >/dev/null 2>&1 &
+    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" --role standby --inbox "$WORKSPACE_DIR/tasks" >/dev/null 2>&1 &
 W2=$!
 sleep 3
 check "no beat when SUTANDO_WATCHER_BEAT is unset" '[ ! -d "$WORKSPACE_DIR/state/watchers" ]'

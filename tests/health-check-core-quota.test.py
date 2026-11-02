@@ -19,6 +19,11 @@ Run: python3 tests/health-check-core-quota.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import time
@@ -188,11 +193,30 @@ class TestCoreQuotaExhausted(unittest.TestCase):
 
     def test_per_window_rejected_status_counts_even_below_the_utilization_bar(self):
         self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
-            "anthropic-ratelimit-unified-overage-utilization": "0.5",
-            "anthropic-ratelimit-unified-overage-status": "rejected"})
+            "anthropic-ratelimit-unified-7d_oi-utilization": "0.5",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected"})
         c = self.hc.check_core_quota_exhausted()
         self.assertEqual(c["status"], "fail")
-        self.assertIn("overage (50%, rejected)", c["detail"])
+        self.assertIn("7d_oi (50%, rejected)", c["detail"])
+
+    def test_serving_on_extra_usage_does_not_page(self):
+        # Issue #5283: 7d rejected but overage allowed and requests succeed.
+        self._write(available=False, status="rejected", util=(0.2, 1.0), extra={
+            "anthropic-ratelimit-unified-7d-status": "rejected",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("extra usage", c["detail"])
+
+    def test_a_rejected_overage_window_never_pages_on_its_own(self):
+        # overage-status: rejected is permanent with overage off and carries no
+        # utilization; with both limit windows low it is another client's gate.
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-overage-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("shared credential proxy", c["detail"])
+        self.assertIn("overage: on", c["detail"])
 
     def test_rejected_with_a_window_near_full_still_fails(self):
         self._write(available=False, status="rejected", util=(0.97, 0.52))

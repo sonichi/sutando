@@ -11,6 +11,12 @@ The pre-fix reader took `watcher_sentinel_paths(...)[0]`, which is the historic
 name whenever one exists and otherwise the alphabetically-first instance --
 never a recency choice, despite the comment that said so.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import contextlib
