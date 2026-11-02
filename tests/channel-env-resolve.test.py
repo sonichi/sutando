@@ -356,6 +356,10 @@ class TestActiveLane(_Base):
         self.assertEqual(m.channel_values(channels, "ag2space", names),
                          {"AG2_REMOTE_TOKEN": self.LANE_TOKEN, "REMOTE_TASK_URL": "https://gw.example/relay"})
 
+    def test_a_doubly_quoted_lane_key_reads_as_the_clean_relay_token(self):
+        channels = self._install(f'''AG2_REMOTE_TOKEN_S_DSPACE="'{self.LANE_TOKEN}'"\n''')
+        self.assertEqual(m.channel_values(channels, "ag2space", self.NAMES), {"AG2_REMOTE_TOKEN": self.LANE_TOKEN})
+
     def test_a_lane_identity_key_in_the_device_file_wins(self):
         channels = self._install(f'AG2_REMOTE_TOKEN_S_DSPACE="{self.LANE_TOKEN}"\n'
                                  "AGENT_MXID_S_DSPACE=@key.agent:example.test\n")

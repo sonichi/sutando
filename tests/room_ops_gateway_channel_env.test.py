@@ -283,6 +283,14 @@ class SecondaryLaneOnlyInstall(_Base):
                 self.assertEqual(base, "https://gw.example/relay", "the lane's secret must go to the lane's relay")
                 self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
 
+    def test_a_doubly_quoted_lane_key_is_split_into_url_and_bearer(self):
+        root = self._install("AG2_REMOTE_TOKEN_S_DSPACE")
+        (root / "channels" / "ag2space" / ".env").write_text(
+            '''AG2_REMOTE_TOKEN_S_DSPACE="'https://gw.example/relay|lane-secret'"\n''')
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
     def test_the_lanes_own_url_key_is_used_with_its_token(self):
         self._install("AG2_REMOTE_TOKEN_S_DSPACE", "REMOTE_TASK_URL_S_DSPACE=https://gw.example/relay\n"
                                                   "REMOTE_TASK_URL=https://leftover.example/relay\n")
