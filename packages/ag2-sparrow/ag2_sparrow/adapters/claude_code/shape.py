@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ... import claude_local_records as records, holder_lock
+from ... import claude_local_records as records, task_io
 from ...claude_local_card import HITL_ID_PREFIX, HITL_ROOT_NAME, RUNTIME  # noqa: F401  (the bridge owns them)
 from ...connect_bridge import bridge_shape
 from ...connect_common import Shape
@@ -21,11 +21,11 @@ def session_launcher(root, rec: dict) -> "int | None":
     pane, server = gen.get("pane_pid"), gen.get("server_pid")
     if not (pane and server and holder and launcher.get("pid")):
         return None
-    if holder != pane and holder_lock.parent_pid(holder) != pane:
+    if holder != pane and task_io.parent_pid(holder) != pane:
         return None
-    if holder_lock.parent_pid(pane) != server or holder_lock.verify_lineage(server, gen.get("server_start")) is not True:
+    if task_io.parent_pid(pane) != server or task_io.verify_lineage(server, gen.get("server_start")) is not True:
         return None
-    return launcher["pid"] if holder_lock.verify_lineage(launcher["pid"], launcher.get("start")) is True else None
+    return launcher["pid"] if task_io.verify_lineage(launcher["pid"], launcher.get("start")) is True else None
 
 
 LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
