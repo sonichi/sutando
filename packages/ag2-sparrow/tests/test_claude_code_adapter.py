@@ -276,25 +276,6 @@ class InboxCli(ConnectBase):
             self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
 
-    def test_a_collaborator_is_refused_by_default_and_under_allow_non_owner_alone_naming_allow_collaborator(self):
-        for i, over in enumerate(({}, {"ALLOW_NON_OWNER": "1"})):
-            self.configure(**over)
-            t = self.task("task-c%d" % i, "team", "collaborator: true\n")
-            rc, out = self.verb("claim", t)
-            self.assertEqual((rc, "--allow-collaborator is off" in out.get("refused", "")), (1, True), (over, out))
-            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, over)
-
-    def test_allow_collaborator_claims_a_collaborator_with_its_admission_and_still_refuses_team_and_guest(self):
-        self.configure(ALLOW_COLLABORATOR="1")
-        t = self.task("task-c", "team", "collaborator: true\n")
-        rc, out = self.verb("claim", t)
-        self.assertEqual((rc, out.get("admission"), out.get("access_tier"), out.get("collaborator")),
-                         (0, "collaborator", "team", True), out)
-        self.assertFalse((self.results / (t + ".txt")).exists(), "submitted to the session, never refused")
-        for t, tier, extra in (("task-t", "team", ""), ("task-g", "guest", ""), ("task-gc", "guest", "collaborator: true\n")):
-            rc, out = self.verb("claim", self.task(t, tier, extra))
-            self.assertEqual((rc, (self.results / (t + ".txt")).read_text()), (1, task_io.NON_OWNER_REFUSED), t)
-
     def resolved(self, out):
         return (out.get("resolved"), out.get("answered"), out.get("interrupted"), out.get("retry"))
 

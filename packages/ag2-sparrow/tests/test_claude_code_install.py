@@ -29,7 +29,7 @@ isolate_os_environ()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
-    ADAPTER, alive, cli, cm, ConnectBase, covered_code, hermetic_env, hmac_policy, hold, HOLD_DRIVER, hold_mod,
+    ADAPTER, alive, cli, cm, ConnectBase, covered_code, hermetic_env, hmac_policy, hold, hold_consumer, HOLD_DRIVER, hold_mod,
     holder_lock, inbox, L, launcher, NONCE, NOT_LOADED, OP_HOLDER, oplock_free, PKG, REAL_SOCKET_PROBLEM,
     REAL_TMUX_VERSION, records, REGISTER, Runner, SERVICE_TARGET, SESSION_ID, SHOW, SHOWING, sm, stamp, SUITE_FILES,
     task_io, task_io_lock_holder, TOKEN, unhold, UNPUBLISHED, verify_py, wait_for, wait_gone,
@@ -1507,6 +1507,53 @@ class ConnectOccupancy(ConnectBase):
                           (SHOWING(LoadState="loaded", ActiveState="failed", SubState="failed", UnitFileState="enabled"), "failed/failed")):
             with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): got})):
                 self.assertEqual(cm.manager_detail(L), want, got)
+
+
+class CollaboratorAdmission(ConnectBase):
+    """--allow-collaborator through the real inbox verbs: refused by default and under --allow-non-owner
+    alone, claimed with its admission when set; plain team and guest stay with --allow-non-owner."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        self.holder, _ = hold_consumer(self.work)
+        self.addCleanup(unhold, self.holder)
+
+    def verb(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["inbox", "--root", str(self.work), *args])
+        return rc, json.loads(out.getvalue())
+
+    def task(self, task_id, tier, extra=""):
+        (self.inbox / (task_id + ".txt")).write_text("id: %s\n%saccess_tier: %s\ntask: hi\n" % (task_id, extra, tier))
+        return task_id
+
+    def test_a_collaborator_is_refused_by_default_and_under_allow_non_owner_alone_naming_allow_collaborator(self):
+        for i, over in enumerate(({}, {"ALLOW_NON_OWNER": "1"})):
+            self.configure(**over)
+            t = self.task("task-c%d" % i, "team", "collaborator: true\n")
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, "--allow-collaborator is off" in out.get("refused", "")), (1, True), (over, out))
+            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, over)
+        rc, out = self.verb("interrupt", self.task("task-ci", "team", "collaborator: true\n"))
+        self.assertEqual((rc, out.get("answered"), out.get("interrupted")), (0, True, False), out)
+        self.assertEqual((self.results / "task-ci.txt").read_text(), task_io.NON_OWNER_REFUSED, "interrupt refuses it too")
+
+    def test_allow_collaborator_claims_a_collaborator_with_its_admission_and_still_refuses_team_and_guest(self):
+        self.configure(ALLOW_COLLABORATOR="1")
+        t = self.task("task-c", "team", "collaborator: true\n")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("admission"), out.get("access_tier"), out.get("collaborator")),
+                         (0, "collaborator", "team", True), out)
+        self.assertFalse((self.results / (t + ".txt")).exists(), "submitted to the session, never refused")
+        for t, tier, extra in (("task-t", "team", ""), ("task-g", "guest", ""), ("task-gc", "guest", "collaborator: true\n")):
+            rc, out = self.verb("claim", self.task(t, tier, extra))
+            self.assertEqual((rc, (self.results / (t + ".txt")).read_text()), (1, task_io.NON_OWNER_REFUSED), t)
+        rc, out = self.verb("interrupt", self.task("task-ci", "team", "collaborator: true\n"))
+        self.assertEqual((rc, out.get("interrupted")), (0, True), out)
+        self.assertEqual((self.results / "task-ci.txt").read_text(), inbox.INTERRUPTED_BODY, "admitted: the interrupted answer")
 
 
 class ConnectReadme(unittest.TestCase):
