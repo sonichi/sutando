@@ -238,6 +238,7 @@ REAL_LAUNCHER = ("import os, subprocess, sys, time; sys.path.insert(0, %r)\n"
                  "    child.kill(); child.wait(); return 0\n"
                  "rc = cm.hold_and_supervise(LOCAL, root, state, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
                  "                           supervise, lambda c: (c.kill(), c.wait()), 'run', 'test')\n"
+                 "if os.path.exists(acted + '.stop-fails'): rc = cm.EXIT_RETRY   # its stop did not finish\n"
                  "rc = cm.retired(state, rc)\n"
                  "print('refused', rc, flush=True); sys.exit(rc)")
 # launchd's shape: the job's pid is a shim whose child is the launcher; the stop signal is forwarded.
@@ -279,7 +280,7 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
 # the launcher with itself in the supervisor record; argv as REAL_LAUNCHER's, and its stop ends the server too.
 TMUX_TREE = ("import os, signal, subprocess, sys, time; sys.path.insert(0, %r)\n"
              "from ag2_sparrow import claude_local_records as records, task_io\n"
-             "root = sys.argv[1]\n"
+             "root, acted = sys.argv[1], sys.argv[3]\n"
              "server_code = ('import os, subprocess, sys\\n'\n"
              "    'p = subprocess.Popen([sys.executable, \"-c\", sys.argv[1]] + sys.argv[2:], stdin=subprocess.PIPE)\\n'\n"
              "    'print(os.getpid(), p.pid, flush=True); sys.exit(p.wait())')\n"
@@ -288,6 +289,8 @@ TMUX_TREE = ("import os, signal, subprocess, sys, time; sys.path.insert(0, %r)\n
              "                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)\n"
              "server, pane = map(int, f.stdout.readline().split()); f.wait()\n"
              "def stop(signum=None, frame=None):\n"
+             "    if signum == signal.SIGURG and os.path.exists(acted + '.stop-fails'):\n"
+             "        os._exit(74)    # the session stop failed: the launcher's retry, its server left\n"
              "    try:\n"
              "        os.killpg(server, signal.SIGTERM)\n"
              "    except OSError:\n"
@@ -383,6 +386,7 @@ class Runner:
         self.real, self.pause, self.acted, self.shim, self.spawned, self.tmux = False, "", "", False, [], False
         self.stop_timeout = 10
         self.keep_alive, self.loaded, self.throttle, self.started_at, self.respawns = False, False, 30.0, 0.0, 0
+        self.last_rc = None
 
     def respawn_if_due(self, launchd):
         """The manager's restart policy, when `keep_alive` models it: a started job whose run ended other than
@@ -393,7 +397,7 @@ class Runner:
         if self.session.returncode == (0 if launchd else 75):
             return
         if time.monotonic() - self.started_at >= self.throttle:
-            old, self.session = self.session, None
+            old, self.session, self.last_rc = self.session, None, self.session.returncode
             for pipe in (old.stdin, old.stdout):
                 pipe.close()
             self.respawns += 1
@@ -422,7 +426,7 @@ class Runner:
                 except ProcessLookupError:
                     pass
             unhold(self.session)
-            self.session = None
+            self.session, self.last_rc = None, self.session.returncode
 
     def alive(self):
         return self.session is not None and self.session.poll() is None
@@ -447,19 +451,28 @@ class Runner:
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
 
+    def exit_words(self):
+        """The manager's record of how the last run ended: systemd's ExecMainCode/Status, launchd's line."""
+        rc = self.session.returncode if self.session is not None and self.session.poll() is not None else self.last_rc
+        if rc is None:
+            return {"ExecMainCode": "0", "ExecMainStatus": "0"}, ""
+        if rc < 0:
+            return {"ExecMainCode": "2", "ExecMainStatus": str(-rc)}, f"\tlast terminating signal = {-rc}\n"
+        return {"ExecMainCode": "1", "ExecMainStatus": str(rc)}, f"\tlast exit code = {rc}\n"
+
     def answer(self, verb, cmd):
         if verb == "print":
             if self.alive():
                 return (0, f"\tpid = {self.session.pid}\n\tstate = running\n", "")
             if self.keep_alive and self.loaded:
-                return (0, "\tstate = spawn scheduled\n", "")
-            return (0, "\tstate = waiting\n", "") if self.registered else NOT_LOADED
+                return (0, "\tstate = spawn scheduled\n" + self.exit_words()[1], "")
+            return (0, "\tstate = waiting\n" + self.exit_words()[1], "") if self.registered else NOT_LOADED
         if verb == "show":
             loaded = cm.service_path(L).exists() or self.registered
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
                      "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
                      "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
-                     "ExecMainStartTimestampMonotonic": str(self.since)}
+                     "ExecMainStartTimestampMonotonic": str(self.since), **self.exit_words()[0]}
             props = cmd[cmd.index("-p") + 1].split(",")
             shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in props)
             return (0, "".join(w + "\n" for w in shown), "")

@@ -62,7 +62,7 @@ class LauncherJob(fx.Runner):
                  "SubState": "running" if self.alive() else "dead",
                  "UnitFileState": "enabled" if self.enabled else "disabled",
                  "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
-                 "ExecMainStartTimestampMonotonic": str(self.since)}
+                 "ExecMainStartTimestampMonotonic": str(self.since), **self.exit_words()[0]}
         shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in cmd[cmd.index("-p") + 1].split(","))
         return (0, "".join(w + "\n" for w in shown), "")
 
