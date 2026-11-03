@@ -25,6 +25,7 @@ from util_paths import claude_home_path, personal_path, shared_personal_path  # 
 import pending_questions_reader  # noqa: E402
 import skill_roots  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -280,7 +281,7 @@ def main():
         for i, issue in enumerate(all_issues, 1):
             summary += f"  {i}. {issue}\n"
 
-    output_path.write_text(summary)
+    publish_text(output_path, summary)
     print(f"Friction check → {output_path}")
     print(summary)
 

@@ -1323,6 +1323,15 @@ describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
 		assert.match(describeAgentFailure('r', 'network').detail, /reach/i);
 		assert.match(describeAgentFailure('r', undefined).detail, /upstream failed/i);
 	});
+
+	it('describeAgentFailure: a dead token asks for a new token, not a key fix', () => {
+		const d = describeAgentFailure('credential-expired', 'auth');
+		assert.match(d.detail, /token has expired or been used up \(credential-expired\)/);
+		assert.match(d.remediation, /new voice token/);
+		assert.doesNotMatch(d.remediation, /Fix your Gemini key/);
+		// Other auth failures keep the key-fix remediation.
+		assert.match(describeAgentFailure('auth-invalid', 'auth').remediation, /Fix your Gemini key/);
+	});
 });
 
 describe('close-code decoding (Step 18 — W5 client-busy 4409 + superseded 4410)', () => {

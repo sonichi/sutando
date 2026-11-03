@@ -11,11 +11,13 @@ Run: python3 tests/delivery-pointer-retirement.test.py
 from __future__ import annotations
 # ruff: noqa: E402
 
+import ast
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -111,6 +113,33 @@ class RetireOnArchive(Base):
         self.assertEqual(sorted(p.name for p in self.inbox.glob("*.txt")), [])
 
 
+class GatewayArchive(Base):
+    def archive(self, tid):
+        source = REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"
+        tree = ast.parse(source.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_archive_task_file")
+        namespace = {"TASKS_DIR": self.tasks, "find_task_file": ta.find_task_file,
+                     "retire_delivery_pointers": ta.retire_delivery_pointers,
+                     "deliveries_root_for": ta.deliveries_root_for, "_log": lambda m: None}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+        return namespace["_archive_task_file"](tid)
+
+    def test_success_retires_pointer(self):
+        body = self.task("task-gateway")
+        pointer = self.pointer("task-gateway")
+        self.assertTrue(self.archive("task-gateway"))
+        self.assertFalse(body.exists())
+        self.assertFalse(pointer.exists())
+
+    def test_failed_archive_keeps_task_and_pointer_for_retry(self):
+        body = self.task("task-gateway")
+        pointer = self.pointer("task-gateway")
+        with patch.object(Path, "rename", side_effect=OSError("blocked")):
+            self.assertFalse(self.archive("task-gateway"))
+        self.assertTrue(body.exists())
+        self.assertTrue(pointer.exists())
+
+
 class Migration(Base):
     def test_retires_archived_keeps_pending_and_unarchived_and_is_idempotent(self):
         for i in range(5):
@@ -148,7 +177,7 @@ class OneLayout(unittest.TestCase):
 
     def test_the_gateway_archive_step_retires_through_the_shared_owner(self):
         src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-        body = src.split("def _archive_result(", 1)[1].split("\ndef ", 1)[0]
+        body = src.split("def _archive_task_file(", 1)[1].split("\ndef ", 1)[0]
         self.assertIn("retire_delivery_pointers(deliveries_root_for(TASKS_DIR), tid", body)
 
     def test_the_vendored_copy_is_the_same_module(self):

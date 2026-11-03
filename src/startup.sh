@@ -574,11 +574,13 @@ if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1
 
 # Check macOS permissions (can't grant programmatically, just warn)
 # Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
-if ! pgrep -q caffeinate; then
+# Only a caffeinate holding -s keeps a lid-closed Mac on AC awake; short-lived `-i -t N` ones must not count.
+SLEEP_GUARD_PATTERN='(^|/)caffeinate( [^ ]+)* -[a-zA-Z]*s( |$)'
+if ! pgrep -qf "$SLEEP_GUARD_PATTERN"; then
   caffeinate -d -i -s &
-  echo "  ✓ caffeinate started (prevents display sleep)"
+  echo "  ✓ caffeinate started (prevents display and system sleep on AC)"
 else
-  echo "  ✓ caffeinate already running"
+  echo "  ✓ caffeinate -s already running"
 fi
 
 echo "Checking permissions..."
@@ -703,20 +705,16 @@ fi
 # Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
 # Foundation for multi-core / cross-machine "who's running?" checks. Single
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
-if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
-  echo "  Starting core heartbeat..."
-  # The ✓ must live INSIDE the guard. `[ -n "$PY" ] && cmd &` followed by an
-  # unconditional echo claims a start that never happened when no interpreter
-  # resolved — and this one is the per-host liveness signal, so a false ✓ makes
-  # the node look alive with nothing writing .alive.
-  if [ -n "$PY" ]; then
-    "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
-    echo "  ✓ core heartbeat"
+# --ensure is anchored to THIS checkout: a bare `pgrep -f src/core_heartbeat.py` matched another
+# checkout's writer on a multi-lane host and skipped starting ours.
+if [ -n "$PY" ]; then
+  if _hb_out="$("$PY" "$REPO/src/core_heartbeat.py" --ensure 2>&1)"; then
+    echo "  ✓ ${_hb_out#core_heartbeat: }"
   else
-    echo "  ⊘ core heartbeat skipped — no runnable python3"
+    echo "  ✗ core heartbeat --ensure failed: $_hb_out"
   fi
 else
-  echo "  ✓ core heartbeat (already running)"
+  echo "  ⊘ core heartbeat skipped — no runnable python3"
 fi
 
 # Services-status emitter — aggregates sidecar liveness into
@@ -840,27 +838,8 @@ if obs_collector_enabled; then
 else
   echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
-# A port can LISTEN while the service never responds (single-threaded server
-# blocked on a silent connection, hung event loop). The lsof guards below only
-# check LISTEN, so a wedged service is "already running" forever — exactly how
-# the dashboard stayed unreachable for hours and voice-agent for 26h
-# (2026-06-10). Probe with a real HTTP request before each guard; on timeout,
-# kill the listener so the normal start path takes over. Any response byte
-# counts as alive (a 404 or a WS handshake rejection is fine — curl exits 28
-# only when nothing came back before the deadline). Probe path matches
-# health-check.py's check_port: a cheap unknown path, NOT "/" (dashboard's "/"
-# runs health-check.py as a subprocess — probing it from here would recurse).
-reap_wedged_listener() {
-  local port="$1" name="$2" rc=0
-  lsof -i :"$port" -sTCP:LISTEN > /dev/null 2>&1 || return 0
-  curl -s -o /dev/null -m 10 "http://127.0.0.1:$port/__liveness_probe__" || rc=$?
-  if [ "$rc" -eq 28 ]; then
-    echo "  ⚠ $name (port $port) listening but unresponsive — killing wedged listener"
-    lsof -ti :"$port" -sTCP:LISTEN | xargs kill 2>/dev/null || true
-    sleep 1
-  fi
-  return 0
-}
+# shellcheck source=local_services.sh
+source "$REPO/src/local_services.sh"
 
 # 1. Voice agent (Gemini Live on port 9900; optional)
 if [ "${SKIP_VOICE:-}" = "1" ]; then
@@ -974,18 +953,7 @@ else
 fi
 
 # 4. Agent API (port 7843)
-reap_wedged_listener 7843 agent-api
-if ! lsof -i :7843 > /dev/null 2>&1; then
-  echo "  Starting agent API (port 7843)..."
-  if [ -n "$PY" ]; then
-    "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
-    echo "  ✓ agent API"
-  else
-    echo "  ~ agent API skipped (no runnable python3)"
-  fi
-else
-  echo "  ✓ agent API (already running)"
-fi
+ensure_agent_api "$REPO" "$PY" "$LOGS_DIR"
 
 # 5. Screen capture server (port 7845)
 # Skip when Screen Recording perm is missing — otherwise we'd start a server

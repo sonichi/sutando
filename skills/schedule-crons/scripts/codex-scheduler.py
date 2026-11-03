@@ -24,6 +24,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_archive import find_task_file  # noqa: E402
+from result_publish import publish_text  # noqa: E402
+from cron_loop_policy import is_core_main_loop, main_loop_problem  # noqa: E402
+from loop_completion import write_completion  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -161,7 +164,11 @@ def cron_matches(expression: str, local_dt: datetime) -> bool:
 
 
 def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dict[str, Any]]:
-    raw = json.loads(config_path.read_text())
+    try:
+        text = config_path.read_text()
+    except FileNotFoundError:
+        return []  # A fresh install has no crons.json yet: nothing is configured.
+    raw = json.loads(text)
     if not isinstance(raw, list):
         raise ValueError("crons.json must contain a JSON array")
     jobs: list[dict[str, Any]] = []
@@ -170,17 +177,14 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
     for raw_entry in raw:
         if not isinstance(raw_entry, dict):
             continue
-        canonical_main_loop = (
-            raw_entry.get("name") == "main-loop"
-            and raw_entry.get("prompt_skill") == "proactive-loop"
-            and not raw_entry.get("launchd")
-        )
+        canonical_main_loop = is_core_main_loop(raw_entry)
         implicit_main_loop = (
             include_main_loop and canonical_main_loop and raw_entry.get("execution") is None
         )
         if raw_entry.get("execution") != "codex-task" and not implicit_main_loop:
             continue
         entry = dict(raw_entry)
+        entry["_core_main_loop"] = canonical_main_loop
         if canonical_main_loop:
             # Codex has no session CronCreate surface. Turn the canonical loop
             # into one low-priority task per fire while keeping crons.json
@@ -311,7 +315,7 @@ def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
 def _alert(workspace: Path, job_name: str, message: str, now: datetime) -> Path:
     stamp = int(now.timestamp())
     path = workspace / "results" / f"proactive-schedule-alert-{safe_name(job_name)}-{stamp}.txt"
-    atomic_text(path, f"Schedule alert — {job_name}: {message}\n")
+    publish_text(path, f"Schedule alert — {job_name}: {message}\n")
     return path
 
 
@@ -350,6 +354,8 @@ def tick(
             state = json.loads(state_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             state = {"version": STATE_VERSION, "jobs": {}}
+        if state.get("host_label") != host_label:
+            state = {"version": STATE_VERSION, "jobs": {}}
         state.setdefault("jobs", {})
         events: list[dict[str, Any]] = []
         slots = _minute_slots(parse_iso(state.get("last_tick_at")), now)
@@ -369,6 +375,9 @@ def tick(
                 task_ids = _current_task_ids(current)
                 result_path = _find_result(workspace, task_ids)
                 if result_path is not None:
+                    if job.get("_core_main_loop"):
+                        write_completion(workspace, host_label,
+                                         now=min(now.timestamp(), result_path.stat().st_mtime))
                     job_state["last_success_at"] = iso(now)
                     job_state["last_success_slot"] = current["slot"]
                     job_state["last_result"] = str(result_path)
@@ -459,7 +468,22 @@ def health(workspace: Path, host_label: str, now: datetime | None = None) -> tup
         state = json.loads(state_path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return 1, {"ok": False, "problems": ["scheduler has no readable state"], "state_path": str(state_path)}
+    if codex_runtime_selected():
+        try:
+            entries = json.loads((workspace / "hosts" / host_label / "crons.json").read_text())
+            if not isinstance(entries, list):
+                raise ValueError("crons.json must contain a JSON array")
+            problem = main_loop_problem(entries, "codex")
+            if problem:
+                problems.append(problem)
+            load_jobs(workspace / "hosts" / host_label / "crons.json", include_main_loop=True)
+        except (OSError, ValueError, TypeError) as exc:
+            problems.append(f"cannot load schedules: {exc}")
+    if state.get("host_label") != host_label:
+        problems.append("scheduler state does not belong to this host")
     last_tick = parse_iso(state.get("last_tick_at"))
+    if last_tick is not None and last_tick > now:
+        problems.append("scheduler heartbeat is future-dated")
     if last_tick is None or (now - last_tick).total_seconds() > 180:
         problems.append("scheduler heartbeat is older than 3 minutes")
     for name, job_state in state.get("jobs", {}).items():
@@ -487,7 +511,7 @@ def install(
     *,
     write_only: bool = False,
     include_main_loop: bool | None = None,
-) -> Path:
+) -> Path | None:
     config_path = workspace / "hosts" / host_label / "crons.json"
     jobs = load_jobs(
         config_path,
@@ -496,7 +520,8 @@ def install(
         ),
     )
     if not jobs:
-        raise ValueError("no crons.json entries opt in with execution=codex-task")
+        # The launcher reconciles on every start; an empty schedule is valid, not a failure.
+        return None
     logs = workspace / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -578,7 +603,8 @@ def main() -> int:
             print(json.dumps(report, indent=2, sort_keys=True))
             return code
         else:
-            print(install(workspace, host_label, repo, write_only=args.write_only))
+            path = install(workspace, host_label, repo, write_only=args.write_only)
+            print(path or "codex-scheduler: no crons.json entries opt in with execution=codex-task; nothing to install")
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"codex-scheduler: {exc}", file=sys.stderr)
         return 1

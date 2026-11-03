@@ -43,6 +43,7 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
@@ -59,7 +60,7 @@ import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -497,7 +498,7 @@ def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str | None, str]:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
-            f"task-{int(time.time() * 1000)}")
+            fresh_reask_id())
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
             requeued = payload
@@ -666,7 +667,11 @@ def poll_progress(pending_replies: dict) -> None:
         try:
             created = int(task_id.split("-")[1]) / 1000.0
         except (ValueError, IndexError):
-            created = now
+            task_file = find_task_file(TASKS_DIR, task_id)
+            try:
+                created = task_file.stat().st_mtime if task_file else now
+            except OSError:
+                created = now
         if progress_stream.should_post_placeholder(now - created):
             text = _render_progress_text(now - created, task_id)
             resp = api("sendMessage", chat_id=chat_id, text=text)
@@ -835,6 +840,12 @@ def main():  # pragma: no cover
                     print(f"  Dropped message from non-allowed @{username}")
                     continue
 
+                task_id = provider_task_id(f"tg{chat_id}", str(msg["message_id"]))
+                if already_admitted(
+                        task_id, TASKS_DIR, RESULTS_DIR,
+                        lambda tid: local_task_protocol.find_archived_task(TASKS_DIR, tid) is not None):
+                    continue
+
                 # Record owner activity for status-aware-pivot
                 write_owner_activity("telegram", text, channel_id=chat_id)
 
@@ -923,8 +934,6 @@ def main():  # pragma: no cover
                         parent_line = f"parent_message_id: {_rep_mid}\n"
 
                 # Write as task (same format as voice bridge)
-                ts = int(time.time() * 1000)
-                task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
 
@@ -1012,6 +1021,7 @@ def main():  # pragma: no cover
                 _task_content = (
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+                    f"local_time: {local_task_protocol.local_time_value()}\n"
                     f"source: telegram\n"
                     f"interaction_type: message\n"
                     f"{media_headers}"
@@ -1066,8 +1076,7 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import (body_claimable_by,
-                                       should_claim_proactive_file)
+        from proactive_routing import should_claim_proactive_peeked
         try:
             if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
@@ -1079,22 +1088,17 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
-                def _tg_claims(name: str) -> bool:
-                    # Destination outranks activity routing, uniformly;
-                    # discord's DM fallback stays the after-grace catch-all.
-                    return should_claim_proactive_file(
-                        name, OWNER_ACTIVITY_FILE, "telegram")
-
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
-                            and f.suffix == ".txt" and _tg_claims(f.name):
+                            and f.suffix == ".txt":
                         # Peek before claiming: a body addressed to another bridge
                         # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if not body_claimable_by(peek, "telegram"):
+                        if not should_claim_proactive_peeked(
+                                f.name, peek, OWNER_ACTIVITY_FILE, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

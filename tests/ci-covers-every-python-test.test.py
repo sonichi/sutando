@@ -10,6 +10,7 @@ This guard makes that gap self-detecting instead of silent. It failed to exist
 when five suites -- including the transport gate and the src/-vs-package drift
 guard -- had never run in CI.
 """
+import ast
 import glob
 import re
 import subprocess
@@ -292,11 +293,49 @@ def orphans_in(all_files, discovered, named):
     return sorted(set(all_files) - set(discovered) - set(named))
 
 
+def run_whole_by(delegator_text: str) -> set:
+    """Paths a discovered suite runs whole via `runpy.run_path(p, run_name="__main__")`.
+
+    The path must be spelled as adjacent string literals (`"src" / "x.test.py"`);
+    a docstring or an import-and-call-some-cases delegator credits nothing."""
+    try:
+        tree = ast.parse(delegator_text)
+    except SyntaxError:
+        return set()
+    runs_main = any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "run_path"
+        and isinstance(n.func.value, ast.Name) and n.func.value.id == "runpy"
+        and any(k.arg == "run_name" and isinstance(k.value, ast.Constant) and k.value.value == "__main__"
+                for k in n.keywords)
+        for n in ast.walk(tree))
+    if not runs_main:
+        return set()
+    docs = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Expr)}
+    strs = sorted((n for n in ast.walk(tree) if isinstance(n, ast.Constant)
+                   and isinstance(n.value, str) and id(n) not in docs),
+                  key=lambda n: (n.lineno, n.col_offset))
+    parts = [part for n in strs for part in n.value.split("/")]
+    # Every suffix of adjacent parts ending in a .py basename is a candidate path.
+    return {"/".join(parts[i:j + 1]) for j, p in enumerate(parts) if p.endswith(".py")
+            for i in range(j + 1)}
+
+
+def delegated_by(discovered) -> set:
+    out = set()
+    for f in discovered:
+        try:
+            out |= run_whole_by((REPO / f).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return out
+
+
 class TestCICoversEveryPythonTest(unittest.TestCase):
     def test_no_python_test_is_invisible_to_ci(self):
         import os
         os.chdir(REPO)
-        orphans = orphans_in(test_looking_files(), discovered_by_find(), named_in_workflows())
+        discovered = discovered_by_find()
+        orphans = orphans_in(test_looking_files(), discovered | delegated_by(discovered), named_in_workflows())
         self.assertEqual(
             orphans, [],
             "these test files are never executed by CI — either move them to "
@@ -317,6 +356,18 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
 
     def test_a_discovered_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"tests/x.test.py"}, {"tests/x.test.py"}, set()), [])
+
+    def test_a_file_a_discovered_suite_runs_whole_is_not_an_orphan(self):
+        text = 'import runpy\nT = R / "packages" / "p" / "tests" / "test_x.py"\nrunpy.run_path(str(T), run_name="__main__")\n'
+        self.assertIn("packages/p/tests/test_x.py", run_whole_by(text))
+
+    def test_a_docstring_or_partial_delegator_credits_nothing(self):
+        doc = '"""Runs packages/p/tests/test_x.py."""\nimport runpy\nrunpy.run_path(str(T), run_name="__main__")\n'
+        self.assertNotIn("packages/p/tests/test_x.py", run_whole_by(doc))
+        partial = 'import importlib.util\nS = R / "packages/p/tests/test_x.py"\nimportlib.util.spec_from_file_location("m", S)\n'
+        self.assertEqual(run_whole_by(partial), set())
+        not_main = 'import runpy\nT = R / "packages/p/tests/test_x.py"\nrunpy.run_path(str(T))\n'
+        self.assertEqual(run_whole_by(not_main), set())
 
     def test_a_workflow_named_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])

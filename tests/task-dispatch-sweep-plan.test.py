@@ -79,7 +79,7 @@ class Plan(unittest.TestCase):
         self.ptr("task-low", priority="low")
         self.ptr("task-urgent", priority="urgent")
         keep, _ = self.plan()
-        self.assertEqual(keep, [p.name for p in td.sort_tasks_by_priority(self.inbox.glob("*.txt"))])
+        self.assertEqual(keep, ["task-urgent.txt", "task-low.txt"])
 
     def test_a_resolver_without_batch_keeps_every_entry(self):
         old = self.ws / "old-resolver"
@@ -120,6 +120,14 @@ class Plan(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, f"{self.inbox}/task-live.txt\n{td.SWEEP_PLAN_DONE}\n")
         self.assertIn("sweep plan over 2 entries: 1 stale, 0 answered, 1 to dispatch", r.stderr)
+
+    def test_cli_requests_fallback_when_batch_is_unavailable(self):
+        self.ptr("task-live")
+        r = subprocess.run([sys.executable, str(REPO / "src/delivery/task_dispatch.py"), "sweep-plan",
+                            str(self.inbox), str(self.results), "--resolver", str(self.ws / "missing")],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
 
     def test_batch_header_is_one_constant_on_both_sides(self):
         self.assertEqual(td.RESOLVER_BATCH_HEADER, rie.BATCH_HEADER)
