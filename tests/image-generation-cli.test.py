@@ -43,6 +43,20 @@ def png_1x1() -> bytes:
 PNG = png_1x1()
 NOT_A_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32  # the signature and nothing behind it
 
+# A real, decodable 1x1 grayscale JPEG — genuine magic/EOI, distinguishable from PNG, so a
+# "mislabel" assertion exercises the claimed format rather than just round-tripping bytes.
+JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb00430050373c463c32504641465a55505f78c882786e6e78f5"
+    "afb991c8ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc0000b08"
+    "0001000101011100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b51000"
+    "02010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f0"
+    "2433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768"
+    "696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c"
+    "4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda0008010100003f002bff"
+    "d9"
+)
+assert JPEG[:3] == b"\xff\xd8\xff" and JPEG[-2:] == b"\xff\xd9", "fixture must carry real JPEG magic"
+
 
 def response(parts=None, finish=None, block=None):
     body = {"candidates": [{"content": {"parts": parts or []}}]}
@@ -72,10 +86,17 @@ class Base(unittest.TestCase):
                         mock.patch.object(gen, "resolve_key", lambda: ("k-test", "managed"))]
         for p in self.patches:
             p.start()
+        # Plain dict save/restore, not mock.patch.dict (a test that stops self.patches early
+        # would then double-stop it): isolates the default from the invoking shell's env.
+        self._env_backup = dict(os.environ)
+        os.environ.pop("IMAGE_MODEL", None)
+        os.environ.pop("VIDEO_MODEL", None)
 
     def tearDown(self):
         for p in self.patches:
             p.stop()
+        os.environ.clear()
+        os.environ.update(self._env_backup)
         self.tmp.cleanup()
 
     def opener(self, body=None, error=None):
@@ -139,6 +160,18 @@ class Success(Base):
             _, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
         manifest = json.loads((ROOT / "skills" / "image-generation" / "manifest.json").read_text())
         self.assertEqual(line["model"], manifest["config"]["IMAGE_MODEL"])
+
+    def test_the_effective_default_is_the_literal_stable_model(self):
+        """No --model, no env: the request goes to the literal id, so editing both the constant and
+        the manifest to another model fails here."""
+        parts = [{"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG).decode()}}]
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[0].full_url,
+                         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent")
+        self.assertEqual(line["model"], "gemini-3.1-flash-image")
+        self.assertEqual(gen.manifest_config("IMAGE_MODEL"), "gemini-3.1-flash-image")
+        self.assertEqual(gen.DEFAULT_IMAGE_MODEL, "gemini-3.1-flash-image")
 
 
 class Failures(Base):
@@ -421,9 +454,135 @@ class InputsAndOutputs(Base):
             rc, line = self.run_main("--prompt", "x", "--output", str(out2), opener=self.opener(response(parts)))
         self.assertEqual(Path(line["path"]).suffix, ".png", "no Pillow: the returned png keeps its own extension")
         self.assertEqual(Path(line["path"]).read_bytes(), PNG)
-        out3 = self.ws / "pic3.bmp"
+        out3 = self.ws / "pic3.tiff"  # genuinely unsupported (unlike .bmp, which save_image now handles)
         rc, line = self.run_main("--prompt", "x", "--output", str(out3), opener=self.opener(response(parts)))
         self.assertEqual(Path(line["path"]).suffix, ".png", "an unknown extension is never a mislabel")
+
+    def test_a_jpeg_response_to_the_default_png_output_path_is_never_mislabelled(self):
+        """A real JPEG reply (what the Gemini image models return) to the default .png output path:
+        Pillow converts it to PNG, and without Pillow it lands as a real .jpg. The model is a literal
+        --model argument, so this test does not cover the default model; see
+        test_the_effective_default_is_the_literal_stable_model."""
+        FakeImage.saved.clear()
+        parts = [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(JPEG).decode()}}]
+        with mock.patch.dict(sys.modules, fake_pil()):
+            rc, line = self.run_main("--prompt", "x", "--model", "gemini-nano-banana-2.1", opener=self.opener(response(parts)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[0].full_url, gen.ENDPOINT.format(model="gemini-nano-banana-2.1"),
+                          "pin the literal model id, not the mutable symbols")
+        path = Path(line["path"])
+        self.assertEqual(path.suffix, ".png")
+        self.assertEqual(path.read_bytes(), b"FAKE-PNG", "converted to real PNG bytes, not raw JPEG under .png")
+        self.assertEqual(FakeImage.saved, [("PNG", None)])
+        self.calls.clear()
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            rc, line = self.run_main("--prompt", "x", "--model", "gemini-nano-banana-2.1", opener=self.opener(response(parts)))
+        self.assertEqual(self.calls[0].full_url, gen.ENDPOINT.format(model="gemini-nano-banana-2.1"))
+        path = Path(line["path"])
+        self.assertEqual(path.suffix, ".jpg", "no Pillow: suffix follows the returned bytes, never .png")
+        written = path.read_bytes()
+        self.assertEqual(written, JPEG)
+        self.assertTrue(written.startswith(b"\xff\xd8\xff"), "the bytes under .jpg are genuinely JPEG")
+
+    def test_an_unsupported_requested_suffix_never_mislabels_a_jpeg_response_either(self):
+        """The same mislabel class for an explicit, less-common requested suffix: .gif was already
+        excluded from the 'fall back to the returned extension' branch without being covered by
+        conversion either, so a JPEG response requested as .gif silently kept the .gif name."""
+        out = self.ws / "pic.gif"
+        with pillow_present():
+            saved = gen.save_image(JPEG, "image/jpeg", out, 90)
+        content = saved.read_bytes()
+        self.assertTrue(content.startswith(b"\xff\xd8\xff") or saved.suffix == ".gif",
+                         "either converted to a real GIF or kept the real JPEG bytes under .jpg — never JPEG bytes under .gif")
+        if saved.suffix == ".gif":
+            from PIL import Image
+            with Image.open(saved) as img:
+                self.assertEqual(img.format, "GIF")
+        else:
+            self.assertEqual(saved.suffix, ".jpg")
+            self.assertEqual(content, JPEG)
+
+    def test_an_unrecognized_mime_never_hides_jpeg_bytes_behind_a_default_png(self):
+        """mime isn't trusted blindly: an unrecognized/nonstandard spelling (image/jpg, not
+        image/jpeg) must not make wanted == assumed-returned and skip conversion/fallback.
+        Uses fake_pil() (not pillow_present()), deterministic regardless of the host's real
+        Pillow — pillow_present() previously made this fail under -S (no site-packages)."""
+        FakeImage.saved.clear()
+        out = self.ws / "default.png"
+        with mock.patch.dict(sys.modules, fake_pil()):
+            saved = gen.save_image(JPEG, "image/jpg", out, 90)  # nonstandard mime spelling
+        self.assertEqual(saved.suffix, ".png", "real bytes sniffed as JPEG, Pillow converts to real PNG")
+        self.assertEqual(saved.read_bytes(), b"FAKE-PNG")
+        self.assertEqual(FakeImage.saved, [("PNG", None)])
+        out2 = self.ws / "default2.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved2 = gen.save_image(JPEG, "image/jpg", out2, 90)
+        self.assertEqual(saved2.suffix, ".jpg", "no Pillow: falls back to the sniffed extension, never .png")
+        self.assertEqual(saved2.read_bytes(), JPEG)
+
+    def test_bmp_is_sniffed_and_recognized_not_left_under_png(self):
+        """BMP magic is now a recognized, convertible format in its own right."""
+        bmp = b"BM" + b"\x00" * 10  # real BMP magic, not a full valid file
+        out = self.ws / "chart.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(bmp, "image/bmp", out, 90)
+        self.assertEqual(saved.suffix, ".bmp", "sniffed BMP magic, not left as .png")
+        self.assertEqual(saved.read_bytes(), bmp)
+
+    def test_gif_magic_is_sniffed_and_recognized_not_left_under_png(self):
+        """GIF magic (GIF87a/GIF89a) is a recognized, convertible format in its own right —
+        the other half of sniff_image_ext's magic-byte table, alongside BMP and WEBP below."""
+        gif = b"GIF89a" + b"\x00" * 10  # real GIF magic, not a full valid file
+        out = self.ws / "chart.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(gif, "image/gif", out, 90)
+        self.assertEqual(saved.suffix, ".gif", "sniffed GIF magic, not left as .png")
+        self.assertEqual(saved.read_bytes(), gif)
+
+    def test_webp_magic_is_sniffed_and_recognized_not_left_under_png(self):
+        """WEBP magic (RIFF....WEBP) is a recognized, convertible format in its own right."""
+        webp = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 8  # real WEBP magic
+        out = self.ws / "chart.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(webp, "image/webp", out, 90)
+        self.assertEqual(saved.suffix, ".webp", "sniffed WEBP magic, not left as .png")
+        self.assertEqual(saved.read_bytes(), webp)
+
+    def test_riff_that_is_not_webp_is_not_called_webp(self):
+        riff = b"RIFF" + b"\x00\x00\x00\x00" + b"WAVE" + b"\x00" * 8
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(riff, "image/webp", self.ws / "chart.png", 90)
+        self.assertEqual(saved.suffix, ".bin")
+
+    def test_a_jpeg_requested_as_jpeg_is_written_as_is_not_re_encoded(self):
+        FakeImage.saved.clear()
+        with mock.patch.dict(sys.modules, fake_pil()):
+            saved = gen.save_image(JPEG, "image/jpeg", self.ws / "photo.jpeg", 90)
+        self.assertEqual((saved.suffix, saved.read_bytes(), FakeImage.saved), (".jpeg", JPEG, []))
+
+    def test_without_pillow_the_saved_suffix_always_matches_the_bytes(self):
+        """For every returned format and every requested suffix, whatever the model sent: the
+        suffix on disk is the one the magic bytes name, so a reader never meets a mislabel."""
+        blobs = {".jpg": JPEG, ".png": PNG, ".gif": b"GIF89a" + b"\x00" * 10,
+                 ".webp": b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 8, ".bmp": b"BM" + b"\x00" * 10,
+                 ".bin": b"%PDF-1.4 not an image"}
+        for kind, data in blobs.items():
+            for wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ""):
+                with self.subTest(kind=kind, wanted=wanted), \
+                        mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+                    saved = gen.save_image(data, "image/png", self.ws / f"o{kind[1:]}{wanted[1:]}{wanted}", 90)
+                    self.assertEqual(saved.read_bytes(), data)
+                    self.assertEqual(saved.suffix.replace(".jpeg", ".jpg"), kind)
+
+    def test_genuinely_unidentifiable_bytes_never_trust_a_misleading_mime_either(self):
+        """Bytes sniff_image_ext cannot recognize at all (not jpg/png/gif/webp/bmp magic) must
+        get a neutral extension even when the API's mime field claims a specific, wrong format
+        — the whole point of sniffing is to stop trusting that same untrusted channel."""
+        mystery = b"%PDF-1.4 not actually an image, just unidentifiable bytes"
+        out = self.ws / "chart.png"
+        saved = gen.save_image(mystery, "image/png", out, 90)  # mime lies; bytes aren't png
+        self.assertEqual(saved.suffix, ".bin", "unidentified bytes never borrow the mime's claimed format")
+        self.assertEqual(saved.read_bytes(), mystery)
 
 
 class FakeGenai:

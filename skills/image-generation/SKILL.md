@@ -22,8 +22,18 @@ python3 "$G" --video --prompt "A timelapse of a city at sunset" [--aspect 9:16] 
 ```
 
 Output lands at `<workspace>/results/media/generated-<ts>.png` (`.mp4` for video), which is inside
-the attachment allowlist, so the file can be sent as-is. `--model` overrides `IMAGE_MODEL` /
-`VIDEO_MODEL` (env, then this skill's `manifest.json` `config`).
+the attachment allowlist, so the file can be sent as-is. The extension always matches the bytes:
+without Pillow a JPEG reply is saved as `.jpg`, so always attach the JSON `path`, never the name you
+asked for. `--model` overrides `IMAGE_MODEL` / `VIDEO_MODEL` (env, then this skill's
+`manifest.json` `config`).
+
+**Other model tiers.** The default is `gemini-3.1-flash-image`, fast and cheap. It returns JPEG
+bytes even for a `.png` request, so a PNG file needs Pillow's conversion; without Pillow the file
+is a real `.jpg`. Two opt-in alternatives:
+- `--model gemini-nano-banana-2.1` ("Nano Banana 2.1") is a newer release of the same tier, and
+  also returns JPEG.
+- `--model gemini-3-pro-image` ("Nano Banana Pro") trades speed/cost for quality — a final hero
+  image, a logo, anything going out the door. Not a newer default, just a pricier/slower tradeoff.
 
 ## Read the result
 

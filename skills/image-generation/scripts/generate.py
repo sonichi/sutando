@@ -14,6 +14,8 @@ Usage:
   python3 generate.py --input photo.jpg --prompt "Replace the background"
   python3 generate.py --video --prompt "A timelapse of a city" --output city.mp4
 Output defaults to <workspace>/results/media/generated-<ts>.png (.mp4), inside the attachment allowlist.
+The saved suffix always matches the bytes: without Pillow a JPEG reply lands as .jpg, so attach
+the JSON "path", never the requested name.
 """
 from __future__ import annotations
 
@@ -35,7 +37,9 @@ SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution:
 # makes); a copied install has no core tree, and every import below degrades to env-only.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
-DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
+NANO_BANANA_IMAGE_MODEL = "gemini-nano-banana-2.1"  # newer release of the default tier; select via --model/IMAGE_MODEL
+PRO_IMAGE_MODEL = "gemini-3-pro-image"  # higher quality/cost tier ("Nano Banana Pro"); select via --model/IMAGE_MODEL
 DEFAULT_VIDEO_MODEL = "veo-3.1-generate-preview"
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TIMEOUT_S = 180
@@ -215,21 +219,42 @@ def first_image(response: dict) -> tuple[bytes | None, str, str, str]:
     return None, "", text.strip(), reason
 
 
+def sniff_image_ext(data: bytes) -> str | None:
+    """The real format from magic bytes, not the API's self-reported (and sometimes unrecognized
+    or nonstandard) mime string. None when truly unidentified — never claim a format we didn't see."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:2] == b"BM":
+        return ".bmp"
+    return None
+
+
 def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     """Write the bytes; convert to the requested extension only when Pillow can, else keep the
     returned format under its own extension so the file is never mislabelled."""
     wanted = out.suffix.lower()
-    returned = {"image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(mime, ".png")
+    # Never fall back to the mime string for the format guess either — it's the same untrusted
+    # channel this function stopped trusting; truly unidentified bytes get a neutral extension.
+    returned = sniff_image_ext(data) or ".bin"
     out.parent.mkdir(parents=True, exist_ok=True)
-    if wanted in (".jpg", ".jpeg", ".webp") and wanted != returned:
+    if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp") and wanted.replace(".jpeg", ".jpg") != returned:
         try:
             from PIL import Image  # noqa: PLC0415
             import io  # noqa: PLC0415
             img = Image.open(io.BytesIO(data))
-            fmt = "JPEG" if wanted in (".jpg", ".jpeg") else "WEBP"
+            fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP", ".png": "PNG", ".gif": "GIF", ".bmp": "BMP"}[wanted]
             if fmt == "JPEG":
                 img = img.convert("RGB")
-            img.save(str(out), fmt, quality=quality)
+            if fmt in ("JPEG", "WEBP"):
+                img.save(str(out), fmt, quality=quality)
+            else:
+                img.save(str(out), fmt)
             return out
         except ImportError:
             out = out.with_suffix(returned)
@@ -237,7 +262,7 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
         except OSError as err:
             out = out.with_suffix(returned)
             log(f"Pillow could not convert the returned {mime} ({err}): saved it as {out.name}")
-    elif wanted not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+    elif wanted not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
         out = out.with_suffix(returned)
     tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
     tmp.write_bytes(data)
@@ -322,7 +347,7 @@ def main(argv: list[str] | None = None, opener=None) -> int:
     ap.add_argument("--prompt", "-p", required=True, help="Text prompt")
     ap.add_argument("--input", "-i", action="append", default=[], help="Input image path(s) to edit or reference")
     ap.add_argument("--output", "-o", default=None, help="Output file path (default: <workspace>/results/media/generated-<ts>.png|.mp4)")
-    ap.add_argument("--model", "-m", default=None, help="Model id (default: IMAGE_MODEL / VIDEO_MODEL from env or the manifest)")
+    ap.add_argument("--model", "-m", default=None, help=f"Model id (default: IMAGE_MODEL / VIDEO_MODEL from env or the manifest; pass {NANO_BANANA_IMAGE_MODEL!r} for the newer Nano Banana 2.1 release, or {PRO_IMAGE_MODEL!r} for the higher quality/cost image tier)")
     ap.add_argument("--quality", "-q", type=int, default=90, help="JPEG/WEBP quality 1-100 when converting with Pillow (default: 90)")
     ap.add_argument("--video", "-v", action="store_true", help="Generate a video instead of an image (needs google-genai)")
     ap.add_argument("--aspect", default=None, help="Video aspect ratio: 16:9 (default) or 9:16")
