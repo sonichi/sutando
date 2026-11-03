@@ -1021,7 +1021,7 @@ class TestMarkDoneCli(Base):
         rc, out = self._main("prune-spent")
 
         self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out), {"retired": ["task-finished"],
+        self.assertEqual(json.loads(out), {"archived": [], "retired": ["task-finished"],
                                            "stale": [], "kept": ["task-inflight"]})
         self.assertFalse(finished.exists())
         self.assertTrue(inflight.exists())

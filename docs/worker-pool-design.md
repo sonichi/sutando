@@ -113,7 +113,17 @@ tasks/task-123.txt                                              the payload: imm
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
 tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  a finished task's sentinel, moved; nothing reads it as owed
 ```
+
+**A finished task's sentinel moves to `archive/`.** Once a task is answered or archived
+(`src/task_disposition.py`) and its payload has left `tasks/`, `pool_delivery.archive_finished`
+moves its sentinels into the recipient's `archive/` under the folder lock, re-checking the
+payload there. Nothing is deleted, and every reader lists only the folder's top level, so an
+archived sentinel is no hold. A worker watcher runs it before its startup sweep, and
+`prune_spent` runs it first. `pool_delivery.py archive-finished <worker> --dry-run` prints the
+counts. A sentinel stays while the payload is in `tasks/`, even with a result: until the bridge
+archives the task, the sentinel still tells it whose reply it is delivering.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from

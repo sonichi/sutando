@@ -7,6 +7,7 @@ worker — receives work as *sentinels* in `deliveries/<recipient>/`:
     tasks/<task-id>.txt                      the payload; immutable, never copied
     deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
     deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
+    deliveries/<me>/archive/<sentinel>       a finished task's sentinel, moved; never read as owed
 
 Creating the sentinel assigns (the router's job, not this module's). Renaming it
 records that the ASSIGNED recipient accepted the work — a worker never selects
@@ -56,6 +57,8 @@ LOCK_NAME = ".lock"
 # A folder holding this file takes claims, not deliveries: the core's held-readers count
 # its sentinels, but the router never reads it as a recipient committed to the task.
 NON_EXCLUSIVE_MARKER = ".non-exclusive"
+# Where a finished task's sentinels go. Readers list only the folder's top level.
+ARCHIVE_DIR = "archive"
 
 # One suffix, substituted never appended: an accepted sentinel must not still
 # read as pending, or a reader re-takes its own in-flight work.
@@ -509,7 +512,8 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
     """
     ws = Path(workspace)
     seen = set()
-    actions = {"retired": [], "stale": [], "kept": []}
+    actions = {"archived": archive_finished(ws, recipient)["archived"],
+               "retired": [], "stale": [], "kept": []}
     for p in accepted(ws, recipient) + pending(ws, recipient):
         task_id = parse_sentinel(p.name)[0]
         if task_id in seen:
@@ -525,6 +529,79 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
         else:
             actions["kept"].append(task_id)
     return actions
+
+
+def archive_finished(workspace, recipient: str, *, dry_run: bool = False) -> dict:
+    """Move every sentinel whose task is finished into `archive/`; open tasks keep theirs.
+
+    Finished means answered or archived (`task_disposition`) with the payload gone from
+    `tasks/`: until the bridge archives a delivered task, its sentinel still tells the
+    bridge whose reply it is. The payload is re-checked under the folder lock the router
+    delivers under, so a task re-queued meanwhile keeps its hold. Moved, never deleted.
+    Returns {"archived": [task ids], "kept": {disposition: count}, "sentinels": n}.
+    """
+    import task_disposition as tdisp
+    from task_archive import find_task_file
+
+    ws = Path(workspace)
+    tasks = ws / "tasks"
+    d = deliveries_dir(ws, recipient)
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        names = []
+    by_id: dict[str, list[str]] = {}
+    for name in names:
+        got = parse_sentinel(name)
+        if got is not None and is_regular_file(d / name):
+            by_id.setdefault(got[0], []).append(name)
+    disp = tdisp.task_dispositions(ws, by_id)
+    finished = sorted(t for t in by_id if disp.get(t) in tdisp.SETTLED
+                      and find_task_file(tasks, t) is None)
+    kept: dict[str, int] = {}
+    for t in set(by_id) - set(finished):
+        state = disp.get(t, "unreadable-id")
+        if state in tdisp.SETTLED:
+            state += "-payload-live"
+        kept[state] = kept.get(state, 0) + 1
+    out = {"archived": [], "kept": kept, "sentinels": sum(len(v) for v in by_id.values())}
+    if dry_run or not finished:
+        out["archived"] = finished if dry_run else []
+        return out
+    with arbitration(ws, recipient) as dfd:
+        afd = _open_archive(dfd)
+        try:
+            for t in finished:
+                if find_task_file(tasks, t) is not None:
+                    kept["re-queued"] = kept.get("re-queued", 0) + 1
+                    continue
+                for name in sentinel_names(t):
+                    if regular_file_state(name, dir_fd=dfd) == "regular":
+                        _move_into_archive(dfd, afd, name)
+                out["archived"].append(t)
+        finally:
+            os.close(afd)
+    return out
+
+
+def _open_archive(dfd: int) -> int:
+    """The recipient's `archive/`, created if absent and opened without following a link."""
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(ARCHIVE_DIR, 0o755, dir_fd=dfd)
+    return os.open(ARCHIVE_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+
+
+def _move_into_archive(dfd: int, afd: int, name: str) -> None:
+    # link() refuses an existing name where rename() would replace an earlier record.
+    dst, n = name, 0
+    while True:
+        try:
+            os.link(name, dst, src_dir_fd=dfd, dst_dir_fd=afd)
+            break
+        except FileExistsError:
+            n += 1
+            dst = f"{name}.{n}"
+    os.unlink(name, dir_fd=dfd)
 
 
 def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
@@ -597,7 +674,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
     ap.add_argument("command", choices=("sweep", "pending", "watch", "prune-spent", "residue",
-                                       "payload", "mark-done", "writer-path"))
+                                       "payload", "mark-done", "writer-path", "archive-finished"))
+    ap.add_argument("worker", nargs="?", help="for `archive-finished`: the recipient (or --recipient)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="for `archive-finished`: print the counts, move nothing")
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel")
     ap.add_argument("--stage", choices=("pending", "done", "abandon"),
@@ -641,6 +721,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.command == "prune-spent":
         print(json.dumps(prune_spent(ws, a.recipient), indent=2))
+        return 0
+    if a.command == "archive-finished":
+        recipient = a.worker or a.recipient
+        got = archive_finished(ws, recipient, dry_run=a.dry_run)
+        print(json.dumps({"recipient": recipient, "dry_run": a.dry_run, "sentinels": got["sentinels"],
+                          "archive" if a.dry_run else "archived": len(got["archived"]),
+                          "keep": got["kept"]}, indent=2, sort_keys=True))
         return 0
 
     # A release puts the name back as pending, and pending-at-boot is exactly
