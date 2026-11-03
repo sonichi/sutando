@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
+	isModelUnavailableClose,
 	formatVoiceOfflineNotification,
 	protocolFailureFor,
 	recordTerminalClassification,
@@ -94,6 +95,37 @@ test('model_not_found: the fix it names is the workspace voice config, where voi
 	assert.match(formatVoiceOfflineNotification(r.userMessage, new Date(0)), /config\/voice-agent\.json/);
 });
 
+// Google's verbatim region refusal, as Gemini Live closes with it (1007).
+const REGION_REFUSAL = 'User location is not supported for the API use.';
+
+test('location_unsupported: Google\'s region refusal names the region and the VPN route, not the model or a key', () => {
+	const r = classifyTransportClose(1007, REGION_REFUSAL);
+	assert.equal(r.category, 'location_unsupported');
+	assert.equal(r.retryable, false);
+	assert.match(r.userMessage, /isn't available from your network's region/);
+	assert.match(r.userMessage, /user location not supported/);
+	assert.match(r.userMessage, /VPN or proxy, route generativelanguage\.googleapis\.com through a supported region/);
+	assert.doesNotMatch(r.userMessage, /config\/voice-agent\.json|model|API key|GEMINI_API_KEY/i);
+	assert.equal(r.userActionUrl, 'https://aistudio.google.com/docs/available-regions');
+	assert.deepEqual(fatalCloseForRecovery(1007, REGION_REFUSAL), { category: 'location_unsupported', code: 1007, reason: REGION_REFUSAL });
+	assert.equal(isModelUnavailableClose(1007, REGION_REFUSAL), false);
+});
+
+test('model_not_found: a real model refusal still classifies after "not supported for" was narrowed', () => {
+	for (const reason of [
+		'models/gemini-3.8-live is not found for API version v1beta, or is not supported for bidiGenerateContent.',
+		// Close reasons are cut at 123 bytes; this one ends mid-method.
+		'models/gemini-live-2.5-flash-preview-native-audio-09-2025 is not found for API version v1main, or is not supported for bidi',
+		'models/gemini-2.5-flash-native-audio is not supported for bidiGenerateContent.',
+		'models/gemini-2.5-flash is not supported for generateContent.',
+		'models/gemini-2.5-flash is not supported for streamGenerateContent.',
+	]) {
+		const r = classifyTransportClose(1008, reason);
+		assert.equal(r.category, 'model_not_found', reason);
+		assert.equal(isModelUnavailableClose(1008, reason), true, reason);
+	}
+});
+
 test('rate_limit: transient 429 stays retryable', () => {
 	const r = classifyTransportClose(1011, 'Too Many Requests: rate-limit exceeded');
 	assert.equal(r.category, 'rate_limit');
@@ -162,6 +194,11 @@ test('protocol mapper: model_not_found → failed/other', () => {
 	const c = classifyTransportClose(1011, 'models/gemini-3.1-flash-live-preview is not found for API version v1beta');
 	const p = protocolFailureFor(c);
 	assert.deepEqual(p, { upstream: 'failed', reason: 'model-not-found', category: 'other' });
+});
+
+test('protocol mapper: location_unsupported → failed/network with its own reason code', () => {
+	const p = protocolFailureFor(classifyTransportClose(1007, REGION_REFUSAL));
+	assert.deepEqual(p, { upstream: 'failed', reason: 'location-unsupported', category: 'network' });
 });
 
 test('protocol mapper: retryable classifications never map to failed', () => {
