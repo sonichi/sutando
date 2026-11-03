@@ -3,6 +3,7 @@
 # once, also when renamed in with an old mtime, never if answered; a stale inbox does not slow it.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/tests/fixtures/clean-watcher-env.sh"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 
