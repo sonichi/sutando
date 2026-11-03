@@ -13,13 +13,16 @@ unconfirmed. These are the guards that came out of it:
 - a pane judged abnormal or not idle is saved, bounded per seat;
 - a notifier stalled for STALL_ROUNDS rounds reaches the supervisor's report.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
@@ -180,9 +183,6 @@ check("pane_gate imports and classifies where fcntl is unavailable",
       (out.returncode, out.stdout.strip()), (0, "idle-ready"))
 
 # In process, so the CLI branches and the failure paths are measured, not only exercised.
-import contextlib  # noqa: E402
-import io  # noqa: E402
-from unittest import mock  # noqa: E402
 
 
 def cli(argv, stdin=""):
