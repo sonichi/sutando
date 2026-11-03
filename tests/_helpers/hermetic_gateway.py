@@ -19,7 +19,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
+# The host's home, read before isolation replaces HOME with a temp one.
+HOST_HOME = Path.home().resolve()
 ROOT = Path(tempfile.mkdtemp(prefix="hermetic-gateway-"))
 
 
@@ -34,13 +39,8 @@ def _isolated_env(root: Path) -> "dict[str, str]":
     }
 
 
-_ENV = _isolated_env(ROOT)
-_UNSET = ("AG2_DEVICE_ENV", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-
-
 def _forbidden_roots() -> "list[Path]":
-    home = Path.home().resolve()
-    return [home, (REPO / "workspace").resolve()]
+    return [HOST_HOME, (REPO / "workspace").resolve()]
 
 
 def host_reads(reads: "list[tuple[str, str]]") -> "list[str]":
@@ -67,18 +67,16 @@ def host_reads(reads: "list[tuple[str, str]]") -> "list[str]":
 
 
 def isolate_then_import(root: "Path | None" = None, env: "dict[str, str] | None" = None):
-    """Isolate the environment, then import the bridge while recording reads.
+    """Replace the environment with an allowlisted one, then import the bridge while recording reads.
 
     `root` reuses a workspace, so a second process (a restarted bridge) finds what
-    the first left there; `env` overrides variables, such as the relay URL."""
+    the first left there; `env` adds variables, such as the relay URL."""
     global ROOT
     if root is not None:
         ROOT = Path(root)
-    for d in ("claude-config", "tasks", "results", "state"):
+    for d in ("claude-config", "tasks", "results", "state", "home"):
         (ROOT / d).mkdir(parents=True, exist_ok=True)
-    os.environ.update({**_isolated_env(ROOT), **(env or {})})
-    for name in _UNSET:
-        os.environ.pop(name, None)
+    isolate_os_environ(ROOT / "home", **{**_isolated_env(ROOT), **(env or {})})
     sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
     reads: "list[tuple[str, str]]" = []
     real_open, real_io_open, real_os_open = builtins.open, io.open, os.open

@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import os
 import tempfile
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, HTTPError, URLError)
@@ -58,19 +59,60 @@ def _inbox_dir(dest_dir=None):
     return d, urllib.parse
 
 
+def _media_context(ref, room_id):
+    parsed = urlsplit(ref)
+    if parsed.scheme not in ("mxc", "https", "http") or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("expected an MXC ref or gateway media link")
+    if parsed.scheme != "mxc":
+        rooms = parse_qs(parsed.query).get("room_id", [])
+        if len(rooms) > 1 or (rooms and room_id and rooms[0] != room_id):
+            raise ValueError("media link room_id conflicts with --room")
+        room_id = room_id or (rooms[0] if rooms else None)
+    if not room_id:
+        raise ValueError("media fetch requires --room (or room_id in a gateway media link)")
+    return parsed, room_id
+
+
+def _mxc_ref(parsed, base):
+    if parsed.scheme == "mxc":
+        if parsed.query:
+            raise ValueError("MXC refs cannot contain a query")
+        parts = [parsed.netloc, parsed.path.removeprefix("/")]
+    else:
+        gateway_url = urlsplit(base)
+        def origin(url):
+            return url.scheme, url.hostname, url.port or {"https": 443, "http": 80}.get(url.scheme)
+        prefix = gateway_url.path.rstrip("/") + "/v1/media/"
+        if origin(parsed) != origin(gateway_url) or not parsed.path.startswith(prefix):
+            raise ValueError("media link is not under the selected gateway")
+        parts = parsed.path[len(prefix):].split("/")
+    parts = [unquote(part) for part in parts]
+    if len(parts) != 2 or any(not p or p in (".", "..") or "/" in p or "\\" in p
+                              or not p.isprintable() or any(c.isspace() for c in p) for p in parts):
+        raise ValueError("expected media server and media id")
+    return "mxc://" + "/".join(parts)
+
+
 def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None):
     """Ask the gateway to fetch media `ref` and save it locally; return its path."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not ref:
         return _result(False, reason="no media ref given", room_id=room_id)
+    try:
+        parsed, room_id = _media_context(ref, room_id)
+    except ValueError as e:
+        return _result(False, ref=ref, room_id=room_id, reason=str(e))
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, ref=ref, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, ref=ref, room_id=room_id, reason="no gateway configured")
     from _gateway import urlencode
-    q = {"ref": ref}
+    try:
+        q = {"ref": _mxc_ref(parsed, base)}
+    except ValueError as e:
+        return _result(False, ref=ref, room_id=room_id, reason=str(e))
     if room_id:
         q["room_id"] = room_id
     url = f"{base}/v1/media/fetch?" + urlencode(q)
@@ -117,7 +159,7 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
         return _result(False, room_id=room_id, reason=f"stat failed: {e}")
     if size > MAX_BYTES:
         return _result(False, room_id=room_id, path=path, reason=f"file exceeds {MAX_BYTES} bytes")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, reason="no gateway configured")
     try:

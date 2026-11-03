@@ -24,6 +24,12 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlparse
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[3]
 SKILL = REPO / "skills" / "owner-agent-consult"
 ROOM_OPS_CLI = REPO / "skills" / "agent-room-ops" / "room_ops.py"
@@ -159,7 +165,7 @@ def pending_ids(ws):
 class TestInert(unittest.TestCase):
     def _cli(self, *argv, env=None):
         out = io.StringIO()
-        clean = {k: v for k, v in os.environ.items() if k not in CONFIG_KEYS}
+        clean = hermetic_env()
         tr = FakeTransport()
         with mock.patch.dict(os.environ, {**clean, **(env or {})}, clear=True), \
                 contextlib.redirect_stdout(out):
@@ -1481,7 +1487,7 @@ class TestProductionAdapter(unittest.TestCase):
 class TestCliAndEdges(unittest.TestCase):
     def _cli(self, *argv, transport=None, env=None, workspace=None):
         out = io.StringIO()
-        clean = {k: v for k, v in os.environ.items() if k not in CONFIG_KEYS}
+        clean = hermetic_env()
         with mock.patch.dict(os.environ, {**clean, policy.CONFIG_ROOM: ROOM,
                                           policy.CONFIG_ROOM_CLI: "/x", **(env or {})},
                              clear=True), contextlib.redirect_stdout(out):

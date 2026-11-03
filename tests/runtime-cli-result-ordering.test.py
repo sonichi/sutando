@@ -6,6 +6,11 @@ State and sockets follow TMPDIR; publications are synthetic local results.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import json
 import os
@@ -63,7 +68,7 @@ class ResultOrderingCliTests(unittest.TestCase):
             path.mkdir(parents=True)
         self.socket = self.base / "rt.sock"
         self.env = {
-            **os.environ,
+            **isolated_child_env(),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self.base / "tmp"),
             "TMP": str(self.base / "tmp"),

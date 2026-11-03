@@ -5,6 +5,12 @@ The lane selector runs exactly ONE lane and parks the others, so on a lane-only
 host `state/gateway-status.json` is never written. An absent primary sidecar is
 not evidence of health, and the running lane's own sidecar is the signal.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import shutil

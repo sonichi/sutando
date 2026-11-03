@@ -43,6 +43,11 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "shared"))
 from ag2_gateway_credentials import (  # noqa: E402

@@ -5,6 +5,15 @@ reconcile / resolve, the reminder with --notify), and core finds the adapter onl
 manifest declaration — refusing when two skills declare it. No real room or workspace is
 touched: a temp workspace, the fake room-collab capability and the in-process database
 store of the room-db test."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

@@ -1,5 +1,11 @@
 """The wedge-recovery model downgrade must be visible in health output.
 Exercised against a real tmux socket in both directions."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import os

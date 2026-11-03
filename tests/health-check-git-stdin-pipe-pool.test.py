@@ -13,6 +13,12 @@ the run (~1 s when fixed, BOUND_S when broken), so it is opt-in:
 
 Skipped off macOS, without the opt-in, and when the pool cannot be spent.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import atexit
 import os
 import signal
@@ -27,7 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src" / "health-check.py"
 BOUND_S = 20
 
-GENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+GENV = isolated_child_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
             GIT_CONFIG_NOSYSTEM="1")
 GIT = ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.fsmonitor=false"]
 
