@@ -19,6 +19,7 @@ export type FailureCategory =
 	| 'auth_invalid'        // Key revoked, expired, or malformed
 	| 'token_expired'       // Ephemeral token (auth_tokens/…) expired, used up, or past its session-start window
 	| 'model_not_found'     // Configured model name no longer valid
+	| 'location_unsupported' // Google refused the caller's network region (IP geolocation)
 	| 'rate_limit'          // Transient 429 — bodhi will retry, no user action
 	| 'transient'           // Normal close (1000) or other expected closures
 	| 'unknown';            // Did not match any pattern — assume transient
@@ -39,6 +40,14 @@ const PATTERNS: Array<{
 	userMessage: string;
 	userActionUrl: string;
 }> = [
+	{
+		// Checked first so no broader pattern below can claim Google's region refusal; every redial gets it again.
+		rx: /user location is not supported/i,
+		category: 'location_unsupported',
+		retryable: false,
+		userMessage: 'Voice is offline — Gemini Live isn\'t available from your network\'s region (Google refused the connection: user location not supported). Text chat still works. If you use a VPN or proxy, route generativelanguage.googleapis.com through a supported region (e.g. US, Japan, Singapore, Taiwan) and try again.',
+		userActionUrl: 'https://aistudio.google.com/docs/available-regions',
+	},
 	{
 		rx: /prepayment.{0,20}credits.{0,20}depleted|prepayment.{0,20}depleted/i,
 		category: 'credits_depleted',
@@ -73,8 +82,9 @@ const PATTERNS: Array<{
 		// Real Gemini API errors put the full model path between "model" and
 		// "not found" (e.g. "models/gemini-3.1-flash-live-preview is not
 		// found for API version v1beta") — match on the API's verbatim
-		// phrasing rather than requiring tight proximity.
-		rx: /is not found for API version|not supported for|\bmodels?\/\S+\s+(is\s+)?not\s+found|\b404\b|\bdeprecated\b/i,
+		// phrasing rather than requiring tight proximity. "Not supported for" counts only when a model
+		// method follows: close reasons are cut at 123 bytes, so "…for bidi" must still match.
+		rx: /is not found for API version|\bnot supported for (?:bidi|(?:stream)?generatecontent)|\bmodels?\/\S+\s+(is\s+)?not\s+found|\b404\b|\bdeprecated\b/i,
 		category: 'model_not_found',
 		retryable: false,
 		userMessage: 'Voice is offline — configured Gemini voice model is unavailable. Change the model in config/voice-agent.json in the Sutando workspace, then restart Sutando.',
@@ -177,6 +187,8 @@ const PROTOCOL_MAP: Partial<Record<FailureCategory, { reason: string; category: 
 	quota_exceeded: { reason: 'quota-exceeded', category: 'quota' },
 	credits_depleted: { reason: 'credits-depleted', category: 'quota' },
 	model_not_found: { reason: 'model-not-found', category: 'other' },
+	// Additive: a client that predates the reason code reads 'network' and names no key fix.
+	location_unsupported: { reason: 'location-unsupported', category: 'network' },
 };
 
 /**
