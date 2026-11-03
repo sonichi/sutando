@@ -27,6 +27,13 @@ _ROOM = re.compile(r"^[!#][^\s:]+:\S+$")
 _DB_PAGE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
+def app_origin_for(room_id: str) -> str:
+    """The room server's registered app origin, or empty for an unknown server; no network I/O."""
+    server = dotspace.server_of_matrix_id(room_id)
+    instance = dotspace.dotspace_for(server, fetch=dotspace.NO_FETCH)
+    return f"https://{instance.gateway_host}" if instance.is_dotspace and instance.gateway_host else ""
+
+
 def default_via(room_id: str = "") -> str:
     """`?via=` for `room_id`: its own server's DotSpace (rooms are `!x:server`), else the install's."""
     if dotspace.server_of_matrix_id(room_id):

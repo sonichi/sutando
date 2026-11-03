@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import unittest
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -32,6 +33,22 @@ pq = _load("pq_room_db_links", "skills/pending-questions/scripts/pending_questio
 
 
 class TestShapes(unittest.TestCase):
+    def test_app_origin_uses_registered_gateway_without_network(self):
+        with mock.patch.object(links.dotspace, "default_fetch", side_effect=AssertionError("network")):
+            for room, expected in (("!r:s.space", "https://chat.s.space"),
+                                   ("!r:ag2.space", "https://chat.ag2.space"),
+                                   ("#room:dev.s.space", "https://dev-chat.s.space"),
+                                   ("!r:unknown.example", "")):
+                with self.subTest(room=room):
+                    self.assertEqual(links.app_origin_for(room), expected)
+
+    def test_app_origin_delegates_to_dotspace_registry(self):
+        instance = links.dotspace.DotSpace(server="custom.example", operator="ag2",
+                                           gateway_host="app.custom.example")
+        with mock.patch.object(links.dotspace, "dotspace_for", return_value=instance) as resolve:
+            self.assertEqual(links.app_origin_for("!r:custom.example"), "https://app.custom.example")
+        resolve.assert_called_once_with("custom.example", fetch=links.dotspace.NO_FETCH)
+
     def test_room_and_event_links_are_matrix_to_permalinks(self):
         self.assertEqual(links.room_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
         self.assertEqual(links.room_link("!r:ag2.space", "$e"), "https://matrix.to/#/!r:ag2.space/$e?via=ag2.space")
@@ -97,6 +114,21 @@ class TestCallersDelegate(unittest.TestCase):
             self.assertEqual(pq.db_link("https://x.test", "!r:x", "pendingq"), "L")
         dl.assert_called_once_with("https://x.test", "!r:x", "pendingq")
         self.assertIsNone(pq.db_link("not-a-url", "!r:x", "pendingq"))
+
+    def test_pending_questions_uses_the_rooms_app_before_collab_fallback(self):
+        for server, origin in (("s.space", "https://chat.s.space"),
+                               ("ag2.space", "https://chat.ag2.space"),
+                               ("unknown.example", "https://collab.example")):
+            with self.subTest(server=server):
+                resolve = mock.Mock(return_value="https://collab.example/relay")
+                capability = types.SimpleNamespace(resolve_url=resolve)
+                with mock.patch.dict(sys.modules, {"room_collab": capability}):
+                    self.assertEqual(pq._db_link(REPO / "src", f"!room:{server}", "override"),
+                                     f"{origin}/home/!room%3A{server}?surface=database&page=pendingq")
+                if server == "unknown.example":
+                    resolve.assert_called_once_with("override")
+                else:
+                    resolve.assert_not_called()
 
     def test_no_other_module_builds_an_app_link(self):
         rx = r"matrix\.to/#/|/#/room/|[?&]surface=|surface=db"
