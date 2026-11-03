@@ -2214,6 +2214,9 @@ exit 0
             SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="1",
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
         )
+        # Never the live workspace or seat a host's own environment names.
+        env.pop("SUTANDO_INSTANCE_ID", None)
+        env["SUTANDO_WORKSPACE_DIR"] = str(workspace)
         env.update(extra_env or {})
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=10)

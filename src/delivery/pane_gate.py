@@ -35,11 +35,14 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -794,7 +797,7 @@ _SEAT_NAME = re.compile(r"[^A-Za-z0-9._-]")
 def save_frame(workspace, seat: str, kind: str, text: str, now: Optional[float] = None,
                keep: int = FRAMES_KEEP) -> Optional[Path]:
     """Write `text` to state/pane-frames/<seat>/<UTC stamp>-<kind>.txt and keep the newest
-    `keep` per seat. Best effort: None when nothing was written, never raises."""
+    `keep` per seat. Best effort: None when nothing was written; filesystem errors are swallowed."""
     if not text or not text.strip():
         return None
     seat_dir = _SEAT_NAME.sub("_", seat or "")
@@ -804,10 +807,11 @@ def save_frame(workspace, seat: str, kind: str, text: str, now: Optional[float] 
         d = Path(workspace) / FRAMES_REL / seat_dir
         d.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-        path = d / f"{stamp}-{_SEAT_NAME.sub('_', kind) or 'frame'}.txt"
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        base = f"{stamp}-{_SEAT_NAME.sub('_', kind) or 'frame'}"
+        path, n = d / f"{base}.txt", 1
+        while path.exists():  # a second frame in the same second sits beside the first
+            path, n = d / f"{base}.{n}.txt", n + 1
+        _write_atomic(path, text)
         frames = sorted(f for f in d.glob("*.txt") if f.is_file() and not f.is_symlink())
         for old in frames[:-keep] if keep > 0 else frames:
             old.unlink(missing_ok=True)
@@ -822,6 +826,26 @@ STALLS_REL = Path("state") / "notifier-stalls"
 STALL_ROUNDS = 3
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+@contextlib.contextmanager
+def _stall_lock(path: Path):
+    """One writer per seat: the count is read, bumped and replaced (or cleared) under it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(f".{path.name}.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def _stall_path(workspace, seat: str) -> Path:
     name = _SEAT_NAME.sub("_", seat or "")
     return Path(workspace) / STALLS_REL / f"{name if name not in ('', '.', '..') else 'unknown'}.json"
@@ -832,25 +856,27 @@ def note_idle_timeout(workspace, seat: str, now: Optional[float] = None) -> int:
     path = _stall_path(workspace, seat)
     now = time.time() if now is None else now
     try:
-        rec = json.loads(path.read_text(encoding="utf-8"))
-        rec = rec if isinstance(rec, dict) else {}
-    except (OSError, ValueError):
-        rec = {}
-    rec = {"seat": seat, "since": rec.get("since", now), "last": now,
-           "rounds": int(rec.get("rounds", 0) or 0) + 1}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        os.replace(tmp, path)
+        with _stall_lock(path):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                rec = rec if isinstance(rec, dict) else {}
+            except (OSError, ValueError):
+                rec = {}
+            rec = {"seat": seat, "since": rec.get("since", now), "last": now,
+                   "rounds": int(rec.get("rounds", 0) or 0) + 1}
+            _write_atomic(path, json.dumps(rec))
     except OSError:
         return 0
     return rec["rounds"]
 
 
 def clear_idle_timeouts(workspace, seat: str) -> bool:
+    path = _stall_path(workspace, seat)
+    if not path.exists():
+        return False
     try:
-        _stall_path(workspace, seat).unlink()
+        with _stall_lock(path):
+            path.unlink()
         return True
     except OSError:
         return False

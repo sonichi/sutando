@@ -145,8 +145,10 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
         return ps.PANE_UNKNOWN
     adapter = pane_gate.ADAPTERS.get(runtime, pane_gate.CLAUDE)
     verdict = pane_gate.classify_pane(text, adapter, workspace, socket, session)
+    # cli_wedge's banners anchor at line start; an -e capture's SGR would hide them.
+    plain = pane_gate.SGR_STRIP.sub("", text)
     if verdict.state == "abnormal":
-        abn = cw.frame_abnormal(text)
+        abn = cw.frame_abnormal(plain)
         if abn and abn.kind == "provider-limit":
             return ps.PANE_LIMIT
         if abn and "needs-login" in abn.names:
@@ -154,7 +156,7 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
         return ps.PANE_ABNORMAL
     if verdict.state == "busy":
         # A limit banner under the composer is status, not a dialog: a live turn above it runs.
-        if verdict.reason == "working" or (verdict.reason == "usage-limit" and cw.frame_working(text)):
+        if verdict.reason == "working" or (verdict.reason == "usage-limit" and cw.frame_working(plain)):
             return ps.PANE_WORKING
         return ps.PANE_GATE
     if verdict.state in ("idle-ready", "pending"):
@@ -184,8 +186,10 @@ def observe_pane(workspace, worker_id, runtime: str = "claude", *,
 
 
 def frame_id(text: str) -> str:
-    """"raw:progress": the raw frame proves a frozen turn, the progress half a waiting one."""
-    return f"{cw.raw_state_id(text)}:{pane_gate.progress_id(text)}"
+    """"raw:progress": the raw frame proves a frozen turn, the progress half a waiting one.
+    Read without SGR: an -e capture's colour changes are not progress, so they must not reset it."""
+    plain = pane_gate.SGR_STRIP.sub("", text)
+    return f"{cw.raw_state_id(plain)}:{pane_gate.progress_id(plain)}"
 
 
 def supervised_workers(workspace) -> dict:

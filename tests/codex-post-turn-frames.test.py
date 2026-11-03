@@ -75,6 +75,10 @@ for name, frame in FRAMES.items():
           (pg.classify_pane(frame, pg.CODEX).state, sup.classify_pane_text(frame, "codex")), WANT[name])
 check("the typed prompt is the pending text", pg.classify_pane(FRAMES["typed prompt"], pg.CODEX).pending,
       "please also run the smoke test")
+for banner in ("Please log in to continue", "Run /login to continue"):
+    coloured = f"\x1b[31m{banner}\x1b[0m\n\n{COMPOSER}\n"
+    check(f"a coloured '{banner}' still reads logged out, not abnormal",
+          sup.classify_pane_text(coloured, "codex"), ps.PANE_LOGGED_OUT)
 plain = re.sub(r"\x1b\[[0-9;]*m", "", FRAMES["post-turn idle"])
 check("without -e the dim placeholder reads as typed text", pg.classify_pane(plain, pg.CODEX).state, "pending")
 
@@ -133,6 +137,31 @@ lines = [subprocess.run([sys.executable, str(REPO / "src/delivery/pane_gate.py")
          for _ in range(3)]
 check("the CLI says surface exactly once, on round STALL_ROUNDS", lines,
       ["2", f"surface {pg.STALL_ROUNDS}", str(pg.STALL_ROUNDS + 1)])
+# Concurrent notifiers on one seat: every round counts, and exactly one says surface.
+procs = [subprocess.Popen([sys.executable, str(REPO / "src/delivery/pane_gate.py"), "idle-timeout",
+                           "--workspace", str(ws), "--seat", "seat-race"],
+                          stdout=subprocess.PIPE, text=True) for _ in range(12)]
+outs = sorted(p.communicate()[0].strip() for p in procs)
+check("12 concurrent rounds are all counted", json.loads(
+    (ws / "state" / "notifier-stalls" / "seat-race.json").read_text())["rounds"], 12)
+check("and exactly one of them surfaces", [o for o in outs if o.startswith("surface")],
+      [f"surface {pg.STALL_ROUNDS}"])
+check("no temp file is left behind", sorted(p.name for p in (ws / "state" / "notifier-stalls").iterdir()
+                                             if p.name.startswith(".") and not p.name.endswith(".lock")), [])
+
+# Two frames in the same second are both kept.
+a1 = pg.save_frame(ws, "seat-d", "abnormal", "one\n", now=3000.0)
+a2 = pg.save_frame(ws, "seat-d", "abnormal", "two\n", now=3000.0)
+check("a same-second frame sits beside the first", (a1 != a2, a1.read_text(), a2.read_text()),
+      (True, "one\n", "two\n"))
+
+# The frame identity ignores presentation: a colour change is not progress, a text change is.
+red = "\x1b[31m• Working on it\x1b[0m\n" + COMPOSER + "\n"
+green = "\x1b[32m• Working on it\x1b[0m\n" + COMPOSER + "\n"
+moved = "\x1b[31m• Working on it, step 2\x1b[0m\n" + COMPOSER + "\n"
+check("a colour-only change keeps the frame id", sup.frame_id(red) == sup.frame_id(green), True)
+check("a text change moves it", sup.frame_id(red) == sup.frame_id(moved), False)
+
 pg.clear_idle_timeouts(ws, session)
 check("an idle pane clears the report", sup.notifier_stalls(ws, [wid]), {})
 check("the record file is gone", (ws / "state" / "notifier-stalls" / f"{session}.json").exists(), False)
