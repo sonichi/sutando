@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -130,6 +131,104 @@ class TestArchiveFinished(Base):
         self.assertEqual(acts["archived"], ["task-done"])
         self.assertEqual(self.live_names(), ["task-open.txt"])
 
+
+class TestPruneSpentFailOpen(Base):
+    """A broken `archive/` never stops `prune_spent` retiring a spent sentinel."""
+
+    def spent(self):
+        self.archived("task-1")
+        return self.sentinel("task-1")
+
+    def assert_still_retires(self):
+        acts = pd.prune_spent(self.root, W)
+        self.assertEqual(acts["archived"], [])
+        self.assertIn("archive_error", acts)
+        self.assertEqual(acts["stale"], ["task-1"])
+        self.assertEqual(self.live_names(), [])
+
+    def test_a_regular_file_at_archive(self):
+        self.spent()
+        self.archive.write_text("not a dir")
+        self.assert_still_retires()
+        self.assertEqual(self.archive.read_text(), "not a dir")
+
+    def test_a_symlink_to_a_dir_at_archive(self):
+        self.spent()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        self.archive.symlink_to(elsewhere)
+        self.assert_still_retires()
+        self.assertEqual(os.listdir(elsewhere), [])
+
+
+class TestPruneArchive(Base):
+    DAY = 86400
+
+    def aged(self, name, days):
+        p = self.archive / name
+        p.write_bytes(b"")
+        t = 1_000_000_000 - days * self.DAY
+        os.utime(p, (t, t), follow_symlinks=False)
+        return p
+
+    def prune(self):
+        return pd.prune_archive(self.root, W, now=1_000_000_000)
+
+    def test_old_files_go_and_new_ones_stay(self):
+        self.archive.mkdir()
+        self.aged("task-old.txt", 15)
+        self.aged("task-new.txt", 13)
+        self.assertEqual(self.prune(), ["task-old.txt"])
+        self.assertEqual(self.archived_names(), ["task-new.txt"])
+
+    def test_the_default_age_is_fourteen_days(self):
+        self.assertEqual(pd.ARCHIVE_MAX_AGE_DAYS, 14)
+
+    def test_an_absent_archive_is_nothing_to_do(self):
+        self.assertEqual(self.prune(), [])
+
+    def test_links_and_subdirectories_inside_are_left_alone(self):
+        self.archive.mkdir()
+        target = self.root / "keep-me.txt"
+        target.write_bytes(b"")
+        t = 1_000_000_000 - 30 * self.DAY
+        os.utime(target, (t, t))
+        (self.archive / "task-link.txt").symlink_to(target)
+        os.utime(self.archive / "task-link.txt", (t, t), follow_symlinks=False)
+        sub = self.archive / "nested"
+        sub.mkdir()
+        self.aged("nested/task-deep.txt", 30)
+        os.utime(sub, (t, t))
+        self.assertEqual(self.prune(), [])
+        self.assertTrue(target.exists())
+        self.assertTrue((sub / "task-deep.txt").exists())
+
+    def test_a_symlinked_archive_is_never_followed(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        old = elsewhere / "task-old.txt"
+        old.write_bytes(b"")
+        t = 1_000_000_000 - 30 * self.DAY
+        os.utime(old, (t, t))
+        self.archive.symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            self.prune()
+        self.assertTrue(old.exists())
+        acts = pd.prune_spent(self.root, W)
+        self.assertEqual(acts["pruned"], [])
+        self.assertIn("prune_error", acts)
+        self.assertTrue(old.exists())
+
+    def test_prune_spent_prunes_in_the_same_pass(self):
+        self.archive.mkdir()
+        old = self.aged("task-old.txt", 0)
+        t = time.time() - 15 * self.DAY
+        os.utime(old, (t, t))
+        self.answered("task-done"); self.archived("task-done"); self.sentinel("task-done")
+        acts = pd.prune_spent(self.root, W)
+        self.assertEqual(acts["pruned"], ["task-old.txt"])
+        self.assertEqual(acts["archived"], ["task-done"])
+        self.assertEqual(self.archived_names(), ["task-done.txt"])
 
 class TestReadersAfterArchive(Base):
     """A held, still-open task is never read as unowned; an archived one is not held."""

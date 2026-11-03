@@ -59,6 +59,8 @@ LOCK_NAME = ".lock"
 NON_EXCLUSIVE_MARKER = ".non-exclusive"
 # Where a finished task's sentinels go. Readers list only the folder's top level.
 ARCHIVE_DIR = "archive"
+# `prune_spent` removes archived sentinels older than this, so `archive/` stays bounded.
+ARCHIVE_MAX_AGE_DAYS = 14
 
 # One suffix, substituted never appended: an accepted sentinel must not still
 # read as pending, or a reader re-takes its own in-flight work.
@@ -505,15 +507,26 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
 
 def prune_spent(workspace: Path, recipient: str) -> dict:
     """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
-    re-offer. A sentinel is spent when its payload is gone (`stale-sentinel`),
-    or the work is finished AND nothing could hand it back — the flag alone is
-    not enough, because the core re-queues a payload whose sentinel is gone and
-    whose result it cannot find. Safe beside a live watcher, which `sweep` is not.
+    re-offer. First `archive_finished` moves every finished task's sentinels into
+    `archive/`, and `prune_archive` drops archived files older than
+    ARCHIVE_MAX_AGE_DAYS; both are fail-open (an OSError lands in `archive_error`
+    / `prune_error` and the pass goes on). The loop below then retires what is
+    left: a sentinel whose payload is gone (`stale-sentinel`), or a residual
+    finished one that nothing could hand back — the flag alone is not enough,
+    because the core re-queues a payload whose sentinel is gone and whose result
+    it cannot find. Safe beside a live watcher, which `sweep` is not.
     """
     ws = Path(workspace)
     seen = set()
-    actions = {"archived": archive_finished(ws, recipient)["archived"],
-               "retired": [], "stale": [], "kept": []}
+    actions = {"archived": [], "pruned": [], "retired": [], "stale": [], "kept": []}
+    try:
+        actions["archived"] = archive_finished(ws, recipient)["archived"]
+    except OSError as e:
+        actions["archive_error"] = f"{type(e).__name__}: {e}"
+    try:
+        actions["pruned"] = prune_archive(ws, recipient)
+    except OSError as e:
+        actions["prune_error"] = f"{type(e).__name__}: {e}"
     for p in accepted(ws, recipient) + pending(ws, recipient):
         task_id = parse_sentinel(p.name)[0]
         if task_id in seen:
@@ -589,6 +602,43 @@ def _open_archive(dfd: int) -> int:
     with contextlib.suppress(FileExistsError):
         os.mkdir(ARCHIVE_DIR, 0o755, dir_fd=dfd)
     return os.open(ARCHIVE_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+
+
+def prune_archive(workspace, recipient: str, *, max_age_days: float = ARCHIVE_MAX_AGE_DAYS,
+                  now: Optional[float] = None) -> list[str]:
+    """Remove regular files at the top of `recipient`'s `archive/` older than `max_age_days`.
+
+    Nothing is followed: the folder and `archive/` are opened O_NOFOLLOW, and a symlink,
+    a directory or anything not regular inside is left alone. A per-file OSError skips
+    that file; one opening the folder or `archive/` propagates (absent means nothing to do).
+    Returns the names removed.
+    """
+    cutoff = (time.time() if now is None else now) - max_age_days * 86400
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dfd = os.open(str(deliveries_dir(workspace, recipient)), flags)
+    except FileNotFoundError:
+        return []
+    try:
+        try:
+            afd = os.open(ARCHIVE_DIR, flags, dir_fd=dfd)
+        except FileNotFoundError:
+            return []
+    finally:
+        os.close(dfd)
+    removed = []
+    try:
+        for name in sorted(os.listdir(afd)):
+            try:
+                st = os.stat(name, dir_fd=afd, follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                    os.unlink(name, dir_fd=afd)
+                    removed.append(name)
+            except OSError:
+                continue
+    finally:
+        os.close(afd)
+    return removed
 
 
 def _move_into_archive(dfd: int, afd: int, name: str) -> None:

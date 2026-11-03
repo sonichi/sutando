@@ -119,11 +119,12 @@ deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  a finished tas
 **A finished task's sentinel moves to `archive/`.** Once a task is answered or archived
 (`src/task_disposition.py`) and its payload has left `tasks/`, `pool_delivery.archive_finished`
 moves its sentinels into the recipient's `archive/` under the folder lock, re-checking the
-payload there. Nothing is deleted, and every reader lists only the folder's top level, so an
+payload there. The move deletes nothing, and every reader lists only the folder's top level, so an
 archived sentinel is no hold. A worker watcher runs it before its startup sweep, and
 `prune_spent` runs it first. `pool_delivery.py archive-finished <worker> --dry-run` prints the
 counts. A sentinel stays while the payload is in `tasks/`, even with a result: until the bridge
 archives the task, the sentinel still tells it whose reply it is delivering.
+`prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from
