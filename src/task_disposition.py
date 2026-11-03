@@ -27,13 +27,14 @@ PENDING, CLAIMED, ANSWERED, ARCHIVED, MISSING = "pending", "claimed", "answered"
 SETTLED = frozenset((ANSWERED, ARCHIVED))
 
 
-def task_disposition(workspace, task_id: str) -> str:
-    """The task's state, answered first: a ready result anywhere settles it whatever the task file says."""
+def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> str:
+    """The task's state, answered first: a ready result anywhere settles it whatever the task file says.
+    `unanswered=True` is a caller that already looked for a result in bulk; the lookup is skipped."""
     if not valid_archive_lookup_id(task_id):
         raise ValueError("not a task id")
     root = Path(workspace)
     tasks, results = root / "tasks", root / "results"
-    if find_ready_result(results, task_id) is not None:
+    if not unanswered and find_ready_result(results, task_id) is not None:
         return ANSWERED
     live = find_task_file(tasks, task_id)
     if live is not None:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """The supervision caller: observe the pool, decide, persist. It never remedies.
+Its one other write is housekeeping: the sweep archives spent delivery sentinels.
 
 Two samplers, one ladder. A delivery-time check runs when someone is actually
 waiting on a worker; the design's five-minute sweep covers workers nobody is
@@ -42,6 +43,7 @@ pd = _sibling("pool_delivery")
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
 from delivery import pane_gate, task_dispatch as td  # noqa: E402
+from task_disposition import CLAIMED, PENDING, task_disposition  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -49,6 +51,11 @@ STATE_REL = Path("state") / "pool-supervision.json"
 PAUSED_MARKER = "paused"
 # States that are not candidates for recovery at all.
 NOT_SUPERVISED = ("retired",)
+# Only a task still in tasks/ can be owed; archived or vanished payloads are not.
+_OWED = (PENDING, CLAIMED)
+# A sentinel younger than this is left alone: its payload may still be landing.
+SENTINEL_RETIRE_AFTER_S = 3600
+DELIVERY_ARCHIVE_REL = Path("state") / "delivery-archive"
 
 
 def state_path(workspace) -> Path:
@@ -125,16 +132,46 @@ def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
     return tmux.get("socket") or None, tmux.get("session_name") or wi.tmux_session_name(worker_id)
 
 
+def owed_task_ids(workspace, worker_id) -> list[str]:
+    """What task_dispatch says was handed to this worker, less what has a ready
+    result (live or archived) and less what task_disposition calls settled or missing."""
+    owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
+    names = [f"{t}.txt" for t in owned]
+    # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
+    ready = td.ready_result_filenames(pd.results_dir(workspace), names)
+    return [t for t in owned
+            if f"{t}.txt" not in ready
+            and task_disposition(workspace, t, unanswered=True) in _OWED]
+
+
 def work_outstanding(workspace, worker_id) -> bool | None:
-    """Does this worker owe a reply? What task_dispatch says was handed to it, less
-    what already has a ready result (live or archived). None when undecidable."""
+    """Does this worker owe a reply? None when undecidable."""
     try:
-        owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
-        names = [f"{t}.txt" for t in owned]
-        # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
-        return bool(set(names) - td.ready_result_filenames(pd.results_dir(workspace), names))
+        return bool(owed_task_ids(workspace, worker_id))
     except (OSError, ValueError):
         return None
+
+
+def retire_spent_sentinels(workspace, worker_id, now: float,
+                           min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
+    """Move sentinels that owe nothing and are older than `min_age_s` out of the inbox,
+    to state/delivery-archive/<worker>/<YYYY-MM>/, so it holds what is owed. Returns their names."""
+    inbox = pd.deliveries_dir(workspace, worker_id)
+    owed = set(owed_task_ids(workspace, worker_id))
+    moved = []
+    for f in sorted(inbox.iterdir()) if inbox.is_dir() else []:
+        tid = next((f.name[:-len(x)] for x in td.WORKER_HOLD_SUFFIXES if f.name.endswith(x)), None)
+        if not tid or tid in owed or not f.is_file() or f.is_symlink():
+            continue
+        mtime = f.stat().st_mtime
+        if now - mtime < min_age_s:
+            continue
+        dest = (Path(workspace) / DELIVERY_ARCHIVE_REL / worker_id
+                / time.strftime("%Y-%m", time.localtime(mtime)))
+        dest.mkdir(parents=True, exist_ok=True)
+        os.replace(f, dest / f.name)
+        moved.append(f.name)
+    return moved
 
 
 def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,
@@ -385,8 +422,16 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
+    retired = {}
     if persist:
         save_state(workspace, new_state)
+        if worker_ids is None:  # the sweep only: a delivery-time check stays read-only
+            for wid in obs:
+                try:
+                    if n := len(retire_spent_sentinels(workspace, wid, now)):
+                        retired[wid] = n
+                except (OSError, ValueError):
+                    pass
     asked = list(worker_ids or [])
     # Reported on every tick, not only when a card decision is due: a dry run must
     # show the finding after the real sweep already raised (and acknowledged) the card.
@@ -396,6 +441,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
                             if e.wedge_consecutive and e.wedge_kind},
             "routing": routing_status(workspace),
+            "sentinels_retired": retired,
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
