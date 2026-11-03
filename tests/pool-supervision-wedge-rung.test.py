@@ -5,7 +5,7 @@ A worker whose session answers alive never reaches the death ladder, so a limit
 menu, a permission dialog or a frozen turn used to hold its work with nobody
 acting. The wedge rung reads the pane the caller captured (pane_gate + cli_wedge)
 and what the worker owes (task_dispatch): sustained past the stale line it asks
-once per episode for the owner — a gate or limit escalates, abnormal text asks for
+once per episode for the owner — a gate or limit asks for a terminal card, abnormal text asks for
 a card naming its cause, a frozen turn for a card offering Escape. No wedge kind
 restarts a session. Every subprocess here is a stub answered by argv.
 """
@@ -46,6 +46,7 @@ def check(name, got, want):
 
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
+HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
 LOGGED_OUT = getattr(ps, "PANE_LOGGED_OUT", "logged-out")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
@@ -70,7 +71,7 @@ def run(seq, period=300.0, ack=True):
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if ack and d["w"] in (CAUSE, FROZEN, LOGIN):
+        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN):
             st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
@@ -82,11 +83,11 @@ E = ps.ESCALATE
 # --- the policy ----------------------------------------------------------------
 
 got, _ = run([obs(GATE)] * 5)
-check("a gate held with work outstanding escalates at the sustain, once, never restarts",
-      got, [N, N, E, N, N])
+check("a gate held with work outstanding asks for a card at the sustain, once, never restarts",
+      got, [N, N, HUMAN, N, N])
 
 got, _ = run([obs(LIMIT)] * 4)
-check("a limit is a human's wait-or-spend decision: escalate, never restart", got, [N, N, E, N])
+check("a limit is a human's wait-or-spend decision: card, never restart", got, [N, N, HUMAN, N])
 
 got, _ = run([obs(ABN)] * 5)
 check("abnormal text sustained asks once for a card naming its cause, never a restart",
@@ -156,7 +157,7 @@ check("an acknowledged login card does not silence the abnormal text that follow
       (got, getattr(st.workers["w"], "wedge_kind", None)), ([LOGIN, N, CAUSE, N], "abnormal"))
 
 got, _ = run([obs(LOGGED_OUT, work=False), obs(LIMIT), obs(LIMIT), obs(LIMIT)])
-check("...nor a limit that follows it: that escalates at the episode's sustain", got, [LOGIN, N, E, N])
+check("...nor a limit that follows it: that cards at the episode's sustain", got, [LOGIN, N, HUMAN, N])
 
 got, _ = run([obs(ABN)] * 3 + [obs(LOGGED_OUT)] * 2)
 check("an expiry after an acknowledged cause card is carded on the tick that reads it",
@@ -228,6 +229,89 @@ for label, (text, want) in PANES.items():
     check(f"pane: {label}", classify(text, workspace=ws) if classify else "missing", want)
 
 
+# --- a stale limit banner over a session that is still progressing -----------------
+# After a re-login the CLI can leave its limit banner painted under a live session.
+
+STALE = ("  \u26a0 Usage limit reached \u00b7 continuing automatically at 2am \u00b7 esc to cancel\n"
+         "  \u26a0 /usage-credits to continue now\n")
+RULE = "\u2500" * 40 + "\n"
+
+
+def framed(body):
+    return f"{body}{RULE}\u276f \n{RULE}{STALE}{FOOTER}\n"
+
+
+def frame_obs(text):
+    """What observe() hands the ladder for this capture: its kind and its frame id."""
+    return obs(classify(text, workspace=ws), sup.frame_id(text))
+
+
+def turn_done(i):
+    """The pane after turn i finished: every earlier turn is still on screen above it."""
+    return framed("".join(f"\u25cf Sent a cross-session message ({k}).\n"
+                          f"\u273b Worked for {k + 2}s \u00b7 done 2:{10 + k:02d} PM\n"
+                          for k in range(i + 1)))
+
+
+def thinking(i):
+    return framed(f"\u25cf Sent a cross-session message.\n"
+                  f"\u2733 Thinking\u2026 ({i}s \u00b7 esc to interrupt)\n")
+
+
+check("a live turn under a stale banner reads as working", classify(thinking(3), workspace=ws), WORK)
+check("an idle seat under a stale banner reads as a wait", classify(turn_done(0), workspace=ws), GATE)
+got, _ = run([frame_obs(thinking(i)) for i in range(6)])
+check("a live turn under a stale banner is no gate: no card", got, [N] * 6)
+got, _ = run([frame_obs(turn_done(i)) for i in range(6)])
+check("turns finishing under a stale banner are progress: no card", got, [N] * 6)
+got, _ = run([frame_obs(turn_done(0))] * 4)
+check("control: a banner on a frozen screen, work owed, is carded", got, [N, N, HUMAN, N])
+got, _ = run([obs(GATE, "r:n", work=False)] * 4)
+check("...and with no work owed it is not", got, [N] * 4)
+got, _ = run([frame_obs(framed(f"\u25cf Paused.\n\u273b Worked for {n}s \u00b7 done 2:10 PM\n"))
+              for n in range(2, 6)])
+check("a frozen screen whose only change is a clock is not progress", got, [N, N, HUMAN, N])
+got, _ = run([frame_obs(turn_done(0))] * 2 + [frame_obs(turn_done(1))] * 4)
+check("a move clears the sustain, which starts over once the frame settles",
+      got, [N, N, N, N, N, HUMAN])
+got, _ = run([obs(WORK, "turn:t")] + [obs(GATE, "dialog:d")] * 3)
+check("entering a gate changes the frame, which is not progress under it", got, [N, N, N, HUMAN])
+got, _ = run([obs(LIMIT, "f1")] * 3)
+check("a bare raw id carries no progress evidence", got, [N, N, HUMAN])
+got, _ = run([obs(LIMIT, "r1:n1"), obs(LIMIT, "r1:n1"), obs(LIMIT, None)])
+check("an unread frame id is no evidence of progress", got, [N, N, HUMAN])
+
+# A worker genuinely held by the limit: idle prompt, the banner, no turn since, deliveries
+# piling up. Only the footer's counters change, and they are status, not work.
+
+
+def held(n_tasks, monitors):
+    return (f"● Picked up the next delivery.\n✻ Worked for 4m 12s · done 1:36 PM\n"
+            f"{RULE}❯ \n{RULE}{STALE}  ⏵⏵ bypass permissions on · {n_tasks} tasks"
+            f" · {monitors} monitor · ← for agents\n")
+
+
+HELD = [held(23, 1), held(24, 1), held(24, 2), held(25, 2)]
+check("a held worker under the banner reads as a wait", classify(HELD[0], workspace=ws), GATE)
+got, _ = run([frame_obs(f) for f in HELD])
+check("a held worker whose footer counters tick is still carded", got, [N, N, HUMAN, N])
+carded = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
+    wedge_first_detected_at=400.0, wedge_consecutive=26, wedge_escalated=True,
+    wedge_kind="human", last_pane_id="064e072fcb5c")})
+st, out = carded, []
+for i, f in enumerate(HELD):
+    st, d = ps.evaluate(st, {"w": frame_obs(f)}, 1095.0 + 95 * i)
+    out.append(d["w"])
+check("an episode already carded under a bare id stays carded and asks no more",
+      (out, st.workers["w"].wedge_kind, st.workers["w"].wedge_escalated), ([N] * 4, "human", True))
+
+REFUSED = (f"\u276f check the inbox\n  \u23bf  You've hit your session limit \u00b7 resets 2am\n"
+           f"\u273b Worked for 0s\n\u276f \n{FOOTER}\n")
+for label, text in (("a refused limit turn", REFUSED), ("the limit menu", PANES["limit menu"][0]),
+                    ("a permission dialog", PANES["permission"][0])):
+    got, _ = run([frame_obs(text)] * 4)
+    check(f"control: {label} on a frozen screen, work owed, is carded", got, [N, N, HUMAN, N])
+
 class Done:
     def __init__(self, rc=0, out="", err=""):
         self.returncode, self.stdout, self.stderr = rc, out, err
@@ -258,6 +342,42 @@ o = sup.observe(ws, 1000.0, runner=Stub(PANES["permission"][0]))[WID]
 check("observe reads the worker's pane and queue",
       (getattr(o, "pane", None), getattr(o, "work_outstanding", None)), (GATE, True))
 check("observe carries a raw frame id for the stuck test", bool(getattr(o, "pane_id", None)), True)
+
+
+def observed(frames):
+    """observe() over captured frames, each fed to the ladder: the real observer's id."""
+    return run([sup.observe(ws, 1000.0 + 300 * i, runner=Stub(f))[WID]
+                for i, f in enumerate(frames)])[0]
+
+
+check("observed: turns finishing under a stale banner are progress: no card",
+      observed([turn_done(i) for i in range(6)]), [N] * 6)
+check("observed: a held worker whose footer counters tick is still carded",
+      observed(HELD), [N, N, HUMAN, N])
+
+# The same worker when what ticks is ABOVE the composer: the done line's monitor count, or
+# the status glyph the CLI cycles. Nothing finished, so the wait is one frame, not a swing.
+
+
+def held_above(monitors, glyph="\u273b"):
+    return framed(f"\u25cf Picked up the next delivery.\n{glyph} Worked for 4m 12s \u00b7 done 1:36 PM"
+                  f" \u00b7 {monitors} monitor still running\n")
+
+
+TICKING = [held_above(1), held_above(2), held_above(3), held_above(2)]
+CYCLING = [held_above(1, g) for g in "\u273b\u2736\u2733\u273b"]
+ADVANCING = [framed(f"\u25cf {w}.\n\u273b Worked for 4m 12s \u00b7 done 1:36 PM\n")
+             for w in ("Read the inbox", "Drafted the reply", "Sent the reply", "Archived the task")]
+check("a held worker whose only change above the composer is a counter is still carded",
+      run([frame_obs(f) for f in TICKING])[0], [N, N, HUMAN, N])
+check("a held worker whose only change above the composer is the status glyph is still carded",
+      run([frame_obs(f) for f in CYCLING])[0], [N, N, HUMAN, N])
+check("a worker whose turn text advances under the banner is not carded",
+      run([frame_obs(f) for f in ADVANCING])[0], [N] * 4)
+check("observed: a held worker whose counter above the composer ticks is still carded",
+      observed(TICKING), [N, N, HUMAN, N])
+check("observed: a worker whose turn text advances under the banner is not carded",
+      observed(ADVANCING), [N] * 4)
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_supervision wedge rung")
 for f in fails:

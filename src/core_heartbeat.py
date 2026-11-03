@@ -43,6 +43,7 @@ Runs forever until killed. Exit codes:
 """
 from __future__ import annotations
 import argparse
+import errno
 import json
 import os
 import re
@@ -65,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from tmux_probe import classify as _classify_session_probe  # noqa: E402
 import core_lineage  # noqa: E402
+import session_runtime  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 
@@ -437,13 +439,9 @@ def _session_runtime(sock: str, sess: str) -> "str | None":
     Returns None rather than guessing: callers must treat unknown as "no
     discrimination possible" and keep their pre-existing behaviour.
     """
-    r = _tmux(sock, "show-environment", "-t", f"={sess}", "SUTANDO_CORE_RUNTIME")
-    if r is not None and r.returncode == 0:
-        line = r.stdout.strip()
-        if line.startswith("SUTANDO_CORE_RUNTIME=") and not line.startswith("-"):
-            val = line.split("=", 1)[1].strip()
-            if val:
-                return val
+    val = session_runtime.read(sess, lambda *a: _tmux(sock, *a))
+    if val:
+        return val
     # Config fallback. Import `resolve_core_runtime` directly rather than
     # shelling out to `scripts/sutando-config.sh` — that shell-out had to walk
     # two levels up from `__file__` to locate the script, which is the repo-root
@@ -571,6 +569,9 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     absent_streak = 0
     global _LAST_SESSION_PROBE
     while not _SHUTDOWN_REQUESTED:
+        if not _SCRIPT.exists():
+            # Checkout removed (a scratch copy): nothing can re-ensure this writer, so leave.
+            return 0
         _LAST_SESSION_PROBE = False
         present = core_pid() is not None
         saw_core = saw_core or present
@@ -686,7 +687,6 @@ def stop_other_writers(timeout_s: float = 5.0) -> int:
     interpreter running exactly this script — and wait for exit (SIGKILL past the timeout). Nothing
     is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
     me, parent = os.getpid(), os.getppid()
-    script = str(Path(__file__).resolve())
     pids = []
     for pid in _recorded_writer_pids():
         if pid in (me, parent) or pid <= 1:
@@ -695,8 +695,14 @@ def stop_other_writers(timeout_s: float = 5.0) -> int:
             r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
         except Exception:
             continue
-        if r.returncode == 0 and _is_writer_argv((r.stdout or "").strip(), script):
+        if r.returncode == 0 and _this_checkouts_writer(pid, (r.stdout or "").strip()):
             pids.append(pid)
+    _terminate(pids, timeout_s)
+    return len(pids)
+
+
+def _terminate(pids: list[int], timeout_s: float) -> None:
+    """SIGTERM, wait for exit, SIGKILL past the timeout."""
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -713,7 +719,6 @@ def stop_other_writers(timeout_s: float = 5.0) -> int:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    return len(pids)
 
 
 def mark_stopped() -> None:
@@ -730,6 +735,187 @@ def mark_stopped() -> None:
     _alive_path().with_suffix(".stopped").write_text(str(time.time()))
 
 
+_SCRIPT = Path(__file__).resolve()
+# The writer's own argv carries no flags (every launcher starts it bare); one-shot CLI calls do.
+_ONE_SHOT_FLAGS = ("--ensure", "--stop", "--once", "--mark-stopped", "--helper-receipt-dir")
+ENSURE_LOG = Path("/tmp/core-heartbeat.log")
+
+
+def _writer_argv(args: str) -> bool:
+    """`<python> <...>core_heartbeat.py` with no one-shot flag, whatever path form launched it."""
+    forms = [str(_SCRIPT), os.path.abspath(__file__)]  # absolute paths may hold spaces
+    forms += [tok for tok in args.split() if tok.endswith(_SCRIPT.name)]
+    for form in forms:
+        if form in args and _is_writer_argv(args, form):
+            return not any(f in args.split(form, 1)[1] for f in _ONE_SHOT_FLAGS)
+    return False
+
+
+def _pid_cwd(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return next((line[1:] for line in (r.stdout or "").splitlines() if line.startswith("n")), None)
+
+
+def _this_checkouts_writer(pid: int, args: str) -> bool:
+    """A writer argv whose script is THIS file: an absolute form directly, a relative one
+    (`python3 src/core_heartbeat.py`) only when it resolves here from the pid's own cwd."""
+    if not _writer_argv(args):
+        return False
+    if any(_is_writer_argv(args, s) for s in (str(_SCRIPT), os.path.abspath(__file__))):
+        return True
+    rel = [t for t in args.split() if t.endswith(_SCRIPT.name) and not os.path.isabs(t)]
+    cwd = _pid_cwd(pid) if rel else None
+    return bool(cwd) and any(_is_writer_argv(args, t) and Path(cwd, t).resolve() == _SCRIPT for t in rel)
+
+
+def running_writer_pids() -> list[int]:
+    """Live heartbeat writers of THIS checkout: the pids its own records name (any argv form,
+    e.g. a relative `python3 src/core_heartbeat.py`), plus writers launched by this exact path."""
+    me = os.getpid()
+    candidates = set(_recorded_writer_pids())
+    scripts = sorted({str(_SCRIPT), os.path.abspath(__file__)})
+    pattern = "|".join(re.sub(r"([.\\[\](){}*+?|^$])", r"\\\1", s) for s in scripts)
+    try:
+        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            if not (r.stdout or "").strip():
+                return [0]  # pgrep matched but named nothing to inspect: never start a second writer
+            candidates.update(int(t) for t in r.stdout.split() if t.isdigit())
+    except Exception:
+        pass
+    found = []
+    for pid in sorted(candidates - {me}):
+        if pid <= 1:
+            continue
+        try:
+            args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+        except Exception:
+            continue
+        if _this_checkouts_writer(pid, args):
+            found.append(pid)
+    return found
+
+
+def ensure_running(log_path: Path = ENSURE_LOG) -> tuple[bool, int]:
+    """Start a detached writer unless this checkout already has one. Returns (started, pid).
+
+    Every core launch path calls this: the writer exits by design when its core pane is gone,
+    so a core relaunched without startup.sh would otherwise run with no .alive at all."""
+    lock_dir = WORKSPACE / "state" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    from file_lock import lock_fd, unlock_fd
+    with open(lock_dir / "core-heartbeat-ensure.lock", "w") as handle:
+        lock_fd(handle.fileno())
+        try:
+            existing = running_writer_pids()
+            if existing:
+                return False, existing[0]
+            _take_over_from_another_checkout()
+            with open(log_path, "ab") as log:
+                child = subprocess.Popen([sys.executable, str(_SCRIPT)], stdin=subprocess.DEVNULL,
+                                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            # Hold the lock until the child's argv is its own, so a racing ensure sees it.
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and child.pid not in running_writer_pids():
+                if child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            # Started means the child holds the writer lock, not merely that it was spawned.
+            deadline = time.monotonic() + 5
+            while child.poll() is None and time.monotonic() < deadline:
+                if _writer_lock_holder() == child.pid:
+                    return True, child.pid
+                time.sleep(0.05)
+            if child.poll() is None:
+                return True, child.pid
+            if child.returncode == 0:
+                return False, _writer_lock_holder() or 0
+            raise RuntimeError(f"writer exited {child.returncode} at start; see {log_path}")
+        finally:
+            unlock_fd(handle.fileno())
+
+
+_WRITER_LOCK = None
+
+
+def _writer_lock_path() -> Path:
+    return WORKSPACE / "state" / "locks" / f"core-heartbeat-{_hostname()}.lock"
+
+
+def _writer_lock_holder() -> int | None:
+    """The pid the current lock holder wrote into the lock file; read-only, so it never contends."""
+    try:
+        head = _writer_lock_path().read_text().strip()
+    except OSError:
+        return None
+    return int(head) if head.isdigit() else None
+
+
+def _is_contention(exc: OSError) -> bool:
+    """Only a lock someone else holds; ENOLCK, EOPNOTSUPP and the like are errors, not contention."""
+    return isinstance(exc, BlockingIOError) or (os.name == "nt" and exc.errno in (errno.EACCES, errno.EDEADLK))
+
+
+def _take_over_from_another_checkout(timeout_s: float = 5.0) -> int | None:
+    """No writer of this checkout runs, so a held lock is another checkout's writer beating this
+    host and workspace: the launching checkout stops it, then starts its own. Returns the pid stopped."""
+    from file_lock import lock_fd, unlock_fd
+    path = _writer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as probe:
+        try:
+            lock_fd(probe.fileno(), blocking=False)
+        except OSError as exc:
+            if not _is_contention(exc):
+                return None
+        else:
+            unlock_fd(probe.fileno())
+            return None
+    pid = _writer_lock_holder()
+    if not pid or pid <= 1 or pid in (os.getpid(), os.getppid()):
+        return None
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None
+    if not _writer_argv(args):
+        return None
+    _terminate([pid], timeout_s)
+    return pid
+
+
+def _take_writer_lock() -> bool:
+    """One beating writer per host and workspace, held until exit (the OS releases it on any death).
+    False only on real contention; any other lock error propagates."""
+    global _WRITER_LOCK
+    from file_lock import lock_fd
+    path = _writer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a")
+    try:
+        lock_fd(handle.fileno(), blocking=False)
+    except OSError as exc:
+        handle.close()
+        if _is_contention(exc):
+            return False
+        raise
+    handle.truncate(0)
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    _WRITER_LOCK = handle
+    return True
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--interval", type=float, default=30.0, help="seconds between beats (default: 30)")
@@ -739,12 +925,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
     p.add_argument("--stop", action="store_true",
                    help="stop every other heartbeat writer of this checkout and wait for it to exit (restart handoff)")
+    p.add_argument("--ensure", action="store_true",
+                   help="start a detached writer unless this checkout already runs one, then exit")
+    p.add_argument("--log", default=str(ENSURE_LOG), help="where an --ensure-started writer logs")
     p.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    writer = not (args.once or args.stop or args.mark_stopped or args.ensure)
+    if writer:
+        try:
+            held = _take_writer_lock()
+        except OSError as exc:
+            print(f"core_heartbeat: cannot take the writer lock {_writer_lock_path()}: {exc}",
+                  file=sys.stderr, flush=True)
+            return 1
+        if not held:
+            print(f"core_heartbeat: another writer already beats {_hostname()} for this workspace; exiting",
+                  file=sys.stderr, flush=True)
+            return 0
     if args.helper_receipt_dir:
         from external_core_helpers import publish
         publish(args.helper_receipt_dir, "heartbeat", __file__, WORKSPACE,
@@ -755,6 +956,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.stop:
         print(f"core_heartbeat: stopped {stop_other_writers()} writer(s)", flush=True)
+        return 0
+    if args.ensure:
+        try:
+            started, pid = ensure_running(Path(args.log))
+        except RuntimeError as exc:
+            print(f"core_heartbeat: {exc}", file=sys.stderr, flush=True)
+            return 1
+        print(f"core_heartbeat: {'started writer' if started else 'writer already running'}"
+              f" (pid {pid})", flush=True)
         return 0
     if args.once:
         write_beat(status=args.status)

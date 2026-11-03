@@ -1,11 +1,11 @@
 ---
 name: report-feedback
-description: THE way a bug, feature request or feedback about Sutando, AG2 Space or the desktop app reaches the AG2 team; the only path to the tracker (Slack #product-feedback, a GitHub issue, the master DB). Posting it in chat, a room or a DM, or asking another agent to log it, is not reporting it. Use when the owner says "report this bug", "report this issue", "report an issue", "report a bug", "file a bug", "log this bug", "submit feedback", "feature request", "tell the team this is broken", "something's broken, file it", in a DM, a room or by voice (not "report this on the PR" or "to <someone>": that is a comment or a message); or automatically (--auto) when the agent itself hits a Sutando/AG2 Space bug. Files through the cloud /api/feedback API with diagnostic context and replies with the reference id. A non-owner asking is told to file it through their own report-feedback skill or the app's Report a bug button.
+description: THE way a bug, feature request or feedback about Sutando, s.space or the desktop app reaches the AG2 team; the only path to the tracker (Slack #product-feedback, a GitHub issue, the master DB). Posting it in chat, a room or a DM, or asking another agent to log it, is not reporting it. Use when the owner says "report this bug", "report this issue", "report an issue", "report a bug", "file a bug", "log this bug", "submit feedback", "feature request", "tell the team this is broken", "something's broken, file it", in a DM, a room or by voice (not "report this on the PR" or "to <someone>": that is a comment or a message); or automatically (--auto) when the agent itself hits a Sutando/s.space bug. Files through the cloud /api/feedback API with diagnostic context and replies with the reference id. A non-owner asking is told to file it through their own report-feedback skill or the app's Report a bug button.
 ---
 
 # Report Feedback
 
-When the user asks to **report a bug / issue / feature request / feedback about Sutando, AG2 Space or the desktop app** — e.g. "report this bug", "report this issue", "report an issue", "file a bug", "log this bug", "submit feedback", "I have a feature request", "tell the team this is broken" — use this skill to file it, whether the ask comes in a DM, in a room or by voice. "Report this on the PR" or "report this to <someone>" asks for a PR comment or a message, not a report.
+When the user asks to **report a bug / issue / feature request / feedback about Sutando, s.space or the desktop app** — e.g. "report this bug", "report this issue", "report an issue", "file a bug", "log this bug", "submit feedback", "I have a feature request", "tell the team this is broken" — use this skill to file it, whether the ask comes in a DM, in a room or by voice. "Report this on the PR" or "report this to <someone>" asks for a PR comment or a message, not a report.
 
 **This is the only path that reaches the AG2 team.** The report goes skill → `/api/feedback` → Slack #product-feedback, a GitHub issue on sonichi/sutando and the master feedback DB. A message in a room or a DM, a hand-opened GitHub issue, or asking another agent (another Sutando included) to "add a row" or pass it on never gets there; do not do those instead of filing. After filing, reply with the reference id the script prints.
 
@@ -72,14 +72,14 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
 
 ## Automatic reports (`--auto`)
 
-When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — queue it with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
+When **you** (not the user) determine that a bug or error is caused by Sutando itself or s.space — engine services, bridges, the desktop app, s.space connectivity, or the AG2 cloud — queue it with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
 
-`--auto` enforces the owner's Settings toggles (read from `<workspace>/state/feedback-prefs.json`, written by the desktop app). When the file is absent the two defaults differ:
+`--auto` enforces the owner's Settings toggles (read from `<workspace>/state/feedback-prefs.json`, written by the desktop app). When the file or a key is absent, both default OFF:
 
-- **File automatic bug reports** — defaults **ON**. Off → the script prints `SKIPPED` and exits 3. Respect it — do not retry or route around it.
+- **File automatic bug reports** — defaults **OFF** (absence of the prefs file is not consent). Off → the script prints `SKIPPED` and exits 3. Respect it — do not retry or route around it.
 - **Send logs with bug reports** — defaults **OFF**, i.e. opt-in. Off → the log excerpt is omitted from every report (auto and manual), same as `--no-logs`.
 
-The split is deliberate. Absence of the file must not disable reporting on installs that predate the toggles, but absence is not consent either, and the log excerpt is the part that carries incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never opened Settings ships no logs.
+Absence is not consent. An automatic report sends the owner's error context to the cloud, and the log excerpt adds incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never turned the toggles on files nothing automatically and ships no logs.
 
 Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. Only after `OK: filed` (not `HELD`), tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
 
@@ -153,7 +153,7 @@ Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
 - Every report includes Sutando and AG2Space version/commit identifiers in both structured context and a readable body section, even with `--no-logs`. Packaged apps use build-stamped metadata; source checkouts include the Git revision and tracked local-edit marker. Parked reports retain their incident-time versions across upgrades; older drafts and unavailable identifiers are explicitly `unknown`.
 
-- Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. For `--auto` reports, don't nag: mention it at most once.
+- Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. `ACCOUNT_REFUSED` (also exit 2) means its credentials are another account than the desktop app's, or could not be verified right now: relay the line as printed, not as a sign-in request. For `--auto` reports, don't nag: mention it at most once.
 - On success it prints `OK: filed <kind> report (<status>). Reference: <id>.` (the id the feedback API returned; the line has no `Reference:` when the API named none). Tell the user it is filed and give the reference. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
 - Exit codes: `0` filed, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
 
@@ -161,8 +161,8 @@ Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
 **Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Run it only for `access_tier: owner` (or an unauthenticated local/voice owner task). The script has no tier check of its own.
 
-Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to a read-only `codex exec --sandbox` agent with no cloud token, which cannot run this script. AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
+Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to a read-only `codex exec --sandbox` agent with no cloud token, which cannot run this script. s.space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
 
 ### When a non-owner asks
 
-This applies to every task whose `access_tier` is not `owner`, a collaborator's included. A teammate, a guest or another agent asking you to report a bug cannot be filed under your owner's identity. Never stay silent and never hand it to another agent. Answer them in one line: file it through your own `report-feedback` skill (a person: through their own Sutando), or with the **Report a bug** button in the AG2 Space app (the bug icon in the composer), which files it under their own account. If your owner asks you to file it for them, it is the owner's report: file it as usual.
+This applies to every task whose `access_tier` is not `owner`, a collaborator's included. A teammate, a guest or another agent asking you to report a bug cannot be filed under your owner's identity. Never stay silent and never hand it to another agent. Answer them in one line: file it through your own `report-feedback` skill (a person: through their own Sutando), or with the **Report a bug** button in the s.space app (the bug icon in the composer), which files it under their own account. If your owner asks you to file it for them, it is the owner's report: file it as usual.

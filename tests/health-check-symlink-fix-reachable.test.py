@@ -16,6 +16,12 @@ The load-bearing assertion is the FIRST one. The second (warn + unrelated
 failure) passed before the fix too, so on its own it proves nothing; it is here
 to show the fix did not simply move the breakage to the other branch.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import io
 import sys

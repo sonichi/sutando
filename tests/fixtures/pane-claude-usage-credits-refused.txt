@@ -1,0 +1,7 @@
+❯ /startup
+  ⎿  You're out of usage credits. Run /usage-credits to adjust your monthly spend limit or /model to switch models.
+✻ Cooked for 1s · done 11:12 PM
+────────
+❯ 
+────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

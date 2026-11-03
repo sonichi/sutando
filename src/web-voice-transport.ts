@@ -277,6 +277,14 @@ export function describeAgentFailure(
   category?: AgentStateCategory,
 ): { detail: string; remediation: string } {
   const code = reason ? ' (' + reason + ')' : '';
+  // An ephemeral token that can no longer open a session: there is no key to fix, and retrying
+  // presents the same token. Only a newly issued token helps.
+  if (reason === 'credential-expired') {
+    return {
+      detail: 'Voice agent token has expired or been used up' + code + '.',
+      remediation: 'Get a new voice token in voice setup, then retry.',
+    };
+  }
   switch (category) {
     case 'auth':
       return {

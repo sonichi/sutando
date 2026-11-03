@@ -92,13 +92,39 @@ for _arg in "$@"; do
   esac
 done
 
+if [ -z "$requested_runtime" ] && [ -n "${SUTANDO_CORE_RUNTIME:-}" ]; then
+  echo "start-cli: SUTANDO_CORE_RUNTIME=$runtime overrides core.runtime for this invocation." >&2
+  echo "start-cli: use --runtime codex or --runtime claude to select the intended runtime explicitly." >&2
+fi
+
 export SUTANDO_CORE_RUNTIME="$runtime"
+
+# On a desktop install the core lives on the app's private socket, under its bundled tmux. A
+# terminal launch that names neither took the /tmp default and started a second core beside
+# the app's on a Homebrew tmux, both reading one inbox (2026-10-23, a core-suggested command).
+desktop_app_support="${SUTANDO_APP_SUPPORT:-}"
+if [ -z "$desktop_app_support" ] && [ "$(basename "$(dirname "$REPO")")" = engine ]; then
+  desktop_app_support="$(dirname "$(dirname "$REPO")")"
+fi
+[ -n "$desktop_app_support" ] && [ -d "$desktop_app_support" ] || desktop_app_support=""
+desktop_socket="${desktop_app_support:+$desktop_app_support/run/tmux.sock}"
+if [ -n "$desktop_app_support" ]; then
+  if [ -z "${SUTANDO_TMUX_SOCKET:-}" ]; then
+    export SUTANDO_TMUX_SOCKET="$desktop_socket"
+    echo "start-cli: desktop install: using its core socket $desktop_socket." >&2
+  fi
+  if [ -z "${SUTANDO_TMUX_BIN:-}" ] && [ -x "$desktop_app_support/engine/bin/tmux" ]; then
+    export SUTANDO_TMUX_BIN="$desktop_app_support/engine/bin/tmux"
+  fi
+fi
 
 # A config switch may find the other runtime still occupying the canonical
 # tmux session. Detect it before delegation and turn a normal start into a
 # restart; otherwise the selected launcher could attach to/reuse the wrong CLI.
 tmux_socket="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 session="${SUTANDO_TMUX_SESSION:-sutando-core}"
+. "$REPO/src/agent/tmux-socket-guard.sh"
+sutando_tmux_socket_guard "$tmux_socket" "$REPO" || exit 3
 active_runtime=""
 if command -v tmux >/dev/null 2>&1 && tmux -S "$tmux_socket" has-session -t "=$session" 2>/dev/null; then
   active_runtime="$(tmux -S "$tmux_socket" show-environment -t "=$session" SUTANDO_CORE_RUNTIME 2>/dev/null | sed 's/^SUTANDO_CORE_RUNTIME=//' || true)"
@@ -113,10 +139,42 @@ if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] \
   set -- --restart "$@"
 fi
 
+# A restart the launcher will refuse must refuse here too, before any helper is reaped:
+# otherwise the still-running core keeps its pane but loses task intake and observation.
+. "$REPO/src/agent/restart-guard.sh"
+case "${1:-}" in
+  --restart|--force-restart)
+    if sutando_restart_guard_refuses "${SUTANDO_CORE_SESSION:-}"; then
+      sutando_restart_guard_explain
+      sutando_restart_attempt_log "$REPO" "${1#--}" "$SUTANDO_RESTART_GUARD_REASON"
+      exit 1
+    fi
+    ;;
+esac
+
+# An explicit --runtime on the desktop's socket is a switch the desktop must select too. Refuse
+# here if that selection is unwritable; the launcher writes it once the new core is confirmed.
+unset SUTANDO_DESKTOP_RUNTIME_SELECT
+if [ -n "$requested_runtime" ] && [ -n "$desktop_app_support" ]; then
+  if [ "$tmux_socket" != "$desktop_socket" ]; then
+    echo "start-cli: $tmux_socket is not the desktop's core socket; its runtime selection is unchanged." >&2
+  elif ! bash "$REPO/scripts/sutando-config.sh" desktop-runtime-select "$runtime" --check >/dev/null; then
+    echo "start-cli: refusing to launch $runtime: the desktop would still select another runtime." >&2
+    exit 1
+  else
+    export SUTANDO_DESKTOP_RUNTIME_SELECT="$runtime"
+  fi
+fi
+
 # The Codex notifier is runtime-specific. Always reap it before launching a
 # non-Codex core, including upgrades from sessions that predate runtime markers.
 if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-watcher" 2>/dev/null || true
+  tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
 fi
+
+# Every launch (startup.sh execs here; so does the desktop) starts the installed skills' launch
+# hooks, detached; src/launch_hooks.py names no skill, and a launch never waits on or fails for one.
+_hook_py="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)" && "$_hook_py" "$REPO/src/launch_hooks.py" || true
 
 exec bash "$launcher" "$@"

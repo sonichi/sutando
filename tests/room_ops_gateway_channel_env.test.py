@@ -24,6 +24,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _VAULT_STORE: dict = {}
 
 
@@ -119,6 +124,27 @@ class ChannelEnvLocator(_Base):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d,
                                           "REMOTE_TASK_CHANNEL_DIR": "dev-ag2space"}):
             self.assertIsNone(_gateway._channel_env_file())
+
+    def test_secondary_lane_only_install_resolves_the_lane_token(self):
+        # The device file holds only the lane's suffixed key, and that key is the token; the lane dir's is never read.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        channels = os.path.join(d, "channels")
+        os.makedirs(os.path.join(channels, "ag2space"))
+        os.makedirs(os.path.join(channels, "s.space"))
+        device = os.path.join(channels, "ag2space", ".env")
+        with open(device, "w") as fh:
+            fh.write("AG2_REMOTE_TOKEN_S_DSPACE=https://gw.example/relay|lane-secret\n"
+                     "REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n")
+        with open(os.path.join(channels, "s.space", ".env"), "w") as fh:
+            fh.write("AG2_REMOTE_TOKEN=https://other.example/relay|dir-secret\n")
+        with open(os.path.join(channels, "active-gateway-lane"), "w") as fh:
+            fh.write("s_dspace\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d, "SUTANDO_APP_SUPPORT": d,
+                                          "AG2_DEVICE_ENV": device}):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
 
     def test_none_when_absent(self):
         d = tempfile.mkdtemp()
@@ -222,6 +248,61 @@ class GatewayPrecedence(_Base):
         with mock.patch.object(_gateway, "_channel_env_file", lambda: f):
             _, headers = _gateway.gateway()
         self.assertEqual(headers.get("Authorization"), "Bearer legacy")
+
+
+class SecondaryLaneOnlyInstall(_Base):
+    """A device file holding only the active lane's own token key: gateway() uses that token."""
+
+    def _install(self, key, extra=""):
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "channels" / "ag2space").mkdir(parents=True)
+        (root / "channels" / "active-gateway-lane").write_text("s_dspace\n")
+        device = root / "channels" / "ag2space" / ".env"
+        device.write_text(f'{key}="https://gw.example/relay|lane-secret"\n{extra}')
+        patch = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(root), "SUTANDO_APP_SUPPORT": str(root),
+                                             "AG2_DEVICE_ENV": str(device)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("REMOTE_TASK_CHANNEL_DIR", None)
+        return root
+
+    def test_the_active_lanes_token_is_used(self):
+        self._install("AG2_REMOTE_TOKEN_S_DSPACE")
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
+    def test_a_leftover_url_never_pairs_with_the_lane_token(self):
+        root = self._install("AG2_REMOTE_TOKEN_S_DSPACE", "REMOTE_TASK_URL=https://leftover.example/relay\n")
+        (root / "channels" / "s_dspace-ag2space").mkdir()
+        (root / "channels" / "s_dspace-ag2space" / ".env").write_text("REMOTE_TASK_URL=https://lane-dir.example/x\n")
+        for env in ({}, {"GATEWAY_URL": "https://env.example/relay", "REMOTE_TASK_URL": "https://env2.example/r"}):
+            with self.subTest(env=sorted(env)), mock.patch.dict(os.environ, env):
+                base, headers = _gateway.gateway()
+                self.assertEqual(base, "https://gw.example/relay", "the lane's secret must go to the lane's relay")
+                self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
+    def test_a_doubly_quoted_lane_key_is_split_into_url_and_bearer(self):
+        root = self._install("AG2_REMOTE_TOKEN_S_DSPACE")
+        (root / "channels" / "ag2space" / ".env").write_text(
+            '''AG2_REMOTE_TOKEN_S_DSPACE="'https://gw.example/relay|lane-secret'"\n''')
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
+    def test_the_lanes_own_url_key_is_used_with_its_token(self):
+        self._install("AG2_REMOTE_TOKEN_S_DSPACE", "REMOTE_TASK_URL_S_DSPACE=https://gw.example/relay\n"
+                                                  "REMOTE_TASK_URL=https://leftover.example/relay\n")
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer lane-secret")
+
+    def test_another_lanes_token_is_not_used(self):
+        self._install("AG2_REMOTE_TOKEN_OTHER")
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "")
+        self.assertNotIn("Authorization", headers)
 
 
 if __name__ == "__main__":

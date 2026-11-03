@@ -284,6 +284,46 @@ def test_a_slack_address_in_the_body_outranks_activity_routing():
     _with_state({"nope": 1}, run)
 
 
+def test_peeked_claim_never_takes_another_bridges_address():
+    """#5368: a body addressed to another bridge is declined BEFORE the claim,
+    whatever activity routing or a matching tag says, so the bridge it names
+    keeps seeing it in its glob."""
+    from proactive_routing import should_claim_proactive_peeked as peeked
+    matrix = "[channel: !XLdYRwrweOuCCtaSnE:ag2.space]\nroom body\n"
+    d7 = "**[core: 2]**\n" + matrix
+    discord = "[channel: 123456789012345678]\nheads up\n"
+    disarmed = "[dm-only]\n[channel: !XLdYRwrweOuCCtaSnE:ag2.space]\nprivate\n"
+
+    def run(state):
+        for body in (matrix, d7):
+            assert peeked("proactive-1.txt", body, state, "discord") is False
+            assert peeked("proactive-1.txt", body, state, "telegram") is False
+            assert peeked("proactive-1.to-discord.txt", body, state, "discord") is False
+        assert peeked("proactive-1.txt", discord, state, "discord") is True
+        assert peeked("proactive-1.txt", discord, state, "telegram") is False
+        assert peeked("proactive-1.to-telegram.txt", "plain\n", state, "discord") is False
+        assert peeked("proactive-1.to-discord.txt", "plain\n", state, "discord") is True
+    _with_state({"channel": "discord", "ts": 1}, run)
+    _with_state(None, run)
+
+    def activity(state):
+        # No executable address: activity routing decides, as before.
+        assert peeked("proactive-1.txt", "plain\n", state, "telegram") is True
+        assert peeked("proactive-1.txt", "plain\n", state, "discord") is False
+        assert peeked("proactive-1.txt", disarmed, state, "telegram") is True
+        assert peeked("proactive-1.txt", "[channel: nonsense]\nx\n", state, "telegram") is True
+    _with_state({"channel": "telegram", "ts": 1}, activity)
+
+
+def test_bridges_delegate_the_pre_claim_peek():
+    """Discord and Telegram take the pre-claim decision from the shared helper,
+    not a private composition of tag/body/activity legs that can drift."""
+    for name in ("discord-bridge.py", "telegram-bridge.py"):
+        src = (REPO / "src" / name).read_text()
+        assert "should_claim_proactive_peeked(" in src, name
+        assert "should_claim_proactive_file(" not in src, name
+
+
 def test_bridge_channels_set_is_documented():
     """Pin the BRIDGE_CHANNELS constant: a future contributor adding
     a new bridge (e.g. matrix) must update both this constant AND
@@ -314,6 +354,8 @@ def main():
     test_claims_unless_routed_elsewhere_yields_only_to_another_bridge()
     test_no_record_on_a_multi_bridge_install_keeps_the_discord_default()
     test_a_slack_address_in_the_body_outranks_activity_routing()
+    test_peeked_claim_never_takes_another_bridges_address()
+    test_bridges_delegate_the_pre_claim_peek()
     test_bridge_channels_set_is_documented()
     print("All proactive-routing tests passed.")
 

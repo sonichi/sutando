@@ -17,6 +17,15 @@ never did: `runtime-rundir-resolver.test.sh` pinned only the shell copies and
 Run: python3 tests/runtime-api-locator.test.py
 Exit: 0 on pass, 1 on fail.
 """
+
+import tempfile
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives. HOME under /tmp:
+# the default run dir derives from it, and a macOS TMPDIR home exceeds the sun_path cap.
+isolate_os_environ(tempfile.mkdtemp(prefix="loc-home-", dir="/tmp"))
+
 import json
 import os
 import shutil
@@ -55,7 +64,7 @@ class LocatorAgreement(unittest.TestCase):
         self.state.mkdir(parents=True)
 
     def env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if k not in _CLEARED}
+        env = {k: v for k, v in isolated_child_env().items() if k not in _CLEARED}
         env.update({"SUTANDO_RUN_DIR": str(self.base / "run"),
                     "SUTANDO_RUNTIME_STATE": str(self.state),
                     "SUTANDO_INSTANCE_REGISTRY": str(self.base / "instances"),

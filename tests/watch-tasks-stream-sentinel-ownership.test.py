@@ -46,6 +46,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -121,10 +123,9 @@ class Watcher:
                 "  Spawning would write the operator's real sentinel. Fix the\n"
                 "  isolation before running this test."
             )
-        self.proc = subprocess.Popen(
+        self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", *args], cwd=str(REPO), env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
         )
 
     @property

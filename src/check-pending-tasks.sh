@@ -24,6 +24,11 @@
 # looped forever. The earlier rule read identity from the cwd's git repo instead,
 # which cannot tell a guest in the checkout from the core in the checkout.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# An explicit non-core session owns no inbox unless enrolled as a pool worker.
+if [ "${SUTANDO_CORE_SESSION:-}" = "0" ] && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo '{}'
+  exit 0
+fi
 UNIDENTIFIED=""
 if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_CORE_SESSION:-}" != "1" ]; then
   UNIDENTIFIED=1
@@ -146,10 +151,12 @@ claimed_by_a_worker() {
 # archive-YYYY-MM-DD layout and the prefix-collision case the shared module's
 # own test suite pins), which is exactly the duplicated-policy failure mode
 # the shared owner exists to close off.
+# With the queued file as $2: when it is a wake turn, an older result answered an earlier turn.
 already_delivered() {
-  local task_id="$1"
+  local task_id="$1" since=()
   [ -n "$PYBIN" ] || return 1
-  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" >/dev/null 2>&1
+  [ -z "${2:-}" ] || since=(--task-file "$2")
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" ${since[@]+"${since[@]}"} >/dev/null 2>&1
 }
 
 # A task the core is on RIGHT NOW is not a stop-time orphan (user report
@@ -157,8 +164,18 @@ already_delivered() {
 # life of a task it was working, ~6/hour). The scheduler's own activity snapshot
 # (src/activity_bus.py, state/activity/<task-id>.json) says RUNNING with fresh
 # activity; queued, waiting on a person, stale, unreadable or absent still blocks.
+# A wake turn ($2) left unanswered by a turn that recorded a no-send is not in progress.
 task_in_progress() {
   [ -n "$PYBIN" ] || return 1
+  if [ -z "${NO_SEND_THIS_TURN:-}" ]; then
+    NO_SEND_THIS_TURN=no
+    "$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" no-send-this-turn >/dev/null 2>&1 \
+      && NO_SEND_THIS_TURN=yes
+  fi
+  if [ "$NO_SEND_THIS_TURN" = yes ] && [ -n "${2:-}" ] \
+    && "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" wake-turn "$(dirname "$2")" "$(basename "$2")" >/dev/null 2>&1; then
+    return 1
+  fi
   [ -f "$REPO_DIR/src/activity_bus.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/activity_bus.py" in-progress "$1" --workspace "$WORKSPACE" \
     --max-age "${SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE:-1800}" >/dev/null 2>&1
@@ -211,8 +228,8 @@ else
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
     claimed_by_a_worker "$TASK_ID" && continue
-    already_delivered "$TASK_ID" && continue
-    task_in_progress "$TASK_ID" && continue
+    already_delivered "$TASK_ID" "$f" && continue
+    task_in_progress "$TASK_ID" "$f" && continue
     UNPROCESSED_NAMES="$UNPROCESSED_NAMES $BASENAME"
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
       # Readiness is owned by src/delivery/readiness.py; existence is not
@@ -299,18 +316,15 @@ fi
 # A turn must not end with this session's own inbox unwatched: nothing announces
 # a delivery then, and a turn end is the one moment the session can re-arm.
 if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
-  if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-    COVERAGE_INBOX="$WORKSPACE/deliveries/$SUTANDO_INSTANCE_ID"
-    COVERAGE_REARM='bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR" --role session --inbox "$SUTANDO_TASKS_DIR"'
-  else
-    COVERAGE_INBOX="$TASKS_DIR"
-    # Absolute: the core may run from a foreign cwd (SUTANDO_CLAUDE_WORKING_DIR).
-    COVERAGE_REARM="bash \"$REPO_DIR/src/watch-tasks-stream.sh\" --role session --inbox \"$TASKS_DIR\""
-  fi
+  # Inbox and re-arm command are shared with the SessionStart re-arm hint.
+  COVERAGE_TARGET="$("$PYBIN" "$REPO_DIR/src/watcher_rearm.py" target --repo "$REPO_DIR" --workspace "$WORKSPACE" 2>/dev/null)" || COVERAGE_TARGET=""
+  COVERAGE_INBOX="$(printf '%s\n' "$COVERAGE_TARGET" | sed -n 1p)"
+  COVERAGE_REARM="$(printf '%s\n' "$COVERAGE_TARGET" | sed -n 2p)"
   # Consecutive unwatched turn ends, per runtime instance: a watcher that cannot
   # start must not wedge the session, so the gate fails open past the cap, logged.
   COVERAGE_FAIL_OPEN_AFTER="${SUTANDO_STOP_HOOK_UNWATCHED_FAIL_OPEN_AFTER:-3}"
-  COVERAGE_VERDICT="$("$PYBIN" "$REPO_DIR/src/watcher_identity.py" role-present session --inbox "$COVERAGE_INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" || COVERAGE_VERDICT=""
+  COVERAGE_VERDICT=""
+  [ -n "$COVERAGE_INBOX" ] && { COVERAGE_VERDICT="$("$PYBIN" "$REPO_DIR/src/watcher_identity.py" role-present session --inbox "$COVERAGE_INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" || COVERAGE_VERDICT=""; }
   case "$COVERAGE_VERDICT" in
     yes) "$PYBIN" "$REPO_DIR/src/stop_hook_unwatched.py" clear --state "$WORKSPACE/state" 2>/dev/null || true ;;
     no)
@@ -331,6 +345,13 @@ if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
       ;;
     *) : ;;  # unknown or unobservable is not evidence of an unwatched inbox
   esac
+fi
+
+# A worker owes messages only for its own deliveries, judged above: a turn with none
+# owed (a watcher re-arm, a restart) has nobody waiting, so no message is due.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo '{}'
+  exit 0
 fi
 
 # Only a real Stop event may move the turn boundary; a hand run (no Stop payload,
