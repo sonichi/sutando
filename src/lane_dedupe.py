@@ -14,7 +14,7 @@ owner's claim and settles as a duplicate once it appears; past the wait it claim
 message the owner never receives is still answered once.
 
 Claims expire after `TTL_S` and expired rows are pruned on each claim. A task without a
-`source_message_id`, or a hook task, is never deduped. Any store failure (unwritable
+`source_message_id`, or a hook or Summon task, is never deduped. Any store failure (unwritable
 directory, malformed or locked database) fails OPEN: the task is delivered and one warning
 line is logged per distinct failure, because a missed duplicate is better than a dropped
 message.
@@ -43,7 +43,9 @@ def lane_label(lane: str) -> str:
 
 def key_of(task: Mapping[str, object]) -> Optional[str]:
     """The event a broker task answers, or None when the task must never be deduped."""
-    if task.get("hook"):
+    # A Commons context task (a hook fire or a Summon) answers a row change, not a message: its
+    # identity is its own fire/summon key, so a message id it carries must not fold it into another task.
+    if task.get("hook") or task.get("summon"):
         return None
     message_id = str(task.get("source_message_id") or "").strip()
     if not message_id:
