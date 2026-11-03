@@ -84,6 +84,12 @@ FAKE_CLIENT = textwrap.dedent('''
         def row_body(self, db, row):
             return ""
 
+        async def put_database(self, writes):
+            self.database.update(writes)
+
+        async def put_row_body(self, db, row, body):
+            pass
+
         async def settle(self, sec):
             return None
 
@@ -115,12 +121,28 @@ class ServeProcess(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def serve(self, req=ROWS, **env):
-        argv = [sys.executable, str(ADAPTER), "serve", "--room", ROOM, "--user-id", AGENT,
+    def serve(self, req=ROWS, room=ROOM, **env):
+        argv = [sys.executable, str(ADAPTER), "serve", "--room", room, "--user-id", AGENT,
                 "--skill-scripts", str(self.scripts)]
         p = subprocess.run(argv, input=json.dumps(req), capture_output=True, text=True, timeout=60,
                            env={**self.env, **env}, cwd=str(self.tmp))
         return json.loads(p.stdout.strip().splitlines()[-1]), p
+
+    def test_post_write_link_uses_room_app_not_relay(self):
+        req = {**ROWS, "op": "add_row", "row": "ask1", "cells": {}, "body": "Question"}
+        for server, origin in (("s.space", "https://chat.s.space"),
+                               ("ag2.space", "https://chat.ag2.space"),
+                               ("dev.s.space", "https://dev-chat.s.space"),
+                               ("unknown.example", None)):
+            with self.subTest(server=server):
+                reply, p = self.serve(req, room=f"!room:{server}",
+                                      REMOTE_TASK_URL="https://relay.test.invalid/relay",
+                                      REMOTE_TASK_TOKEN="fixture-token")
+                self.assertTrue(reply["ok"], p.stderr)
+                self.assertTrue(reply["result"]["created"])
+                expected = f"{origin}/home/!room%3A{server}?surface=database&page=pendingq" if origin else None
+                self.assertEqual(reply["result"]["link"], expected)
+                self.assertEqual(self.opened()["url"], "https://relay.test.invalid/relay")
 
     def opened(self) -> dict:
         return json.loads(self.seen.read_text())
