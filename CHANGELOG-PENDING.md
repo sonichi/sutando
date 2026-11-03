@@ -21,6 +21,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- tmux probe (core and ag2-sparrow): the liveness probe and the tasks-active check find tmux at its usual install locations when it is not on PATH, as under launchd, instead of reporting the core as down. ([#6131])
 - ag2-sparrow (claude-local): new `install --allow-collaborator` (persisted, shown by `verify`, off by default) submits an attested collaborator's task (team tier, `collaborator: true`) into the session with the shared non-owner note, as the relay loop and the routine and cloud-session adapters gate it. `--allow-non-owner` no longer covers collaborators: an install that served them through it refuses them until reinstalled with `--allow-collaborator`. The collaborator is served in the owner's session, not on an isolated turn. ([#6195])
 - worker-pool: the remedy timer keeps the launcher's `SUTANDO_STOP_INTERRUPT` (including the `0` opt-out) in its LaunchAgent, so a worker it relaunches keeps the Stop setting. A spawner with a different value reinstalls the timer once; one without the setting, or an explicit install without it, keeps the saved value. ([#6186])
 - ag2-sparrow: the Hatch hook's timed steps now fit its 30 s script timeout (12 + 4 + 4 s, each with a 1 s kill grace), a step whose child ignores SIGTERM is killed, and no child the hook starts keeps holding its poll lock. ([#6184])

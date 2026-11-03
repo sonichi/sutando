@@ -50,6 +50,9 @@ _load_channel_env() {
         tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
         [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
     fi
+    # The bridge re-reads the file holding the token on an auth rejection, to pick up a rotated one.
+    local held="$dot"; [ -n "$tok" ] && [ -f "$tok" ] && held="$tok"
+    [ -n "$held" ] && [ -f "$held" ] && export REMOTE_TASK_TOKEN_FILE="$held"
     # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
     local v rc
     for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do

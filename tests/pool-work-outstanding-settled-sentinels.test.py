@@ -93,9 +93,10 @@ young = sentinel("task-s-space~task-dddddddddddddddddd", age_s=60)
 sentinel("task-eeeeeeeeeeeeeeeeee", suffix=".accepted")
 (tasks / "task-eeeeeeeeeeeeeeeeee.txt").write_text("task: x\n")
 moved = sup.retire_spent_sentinels(ws, WID, time.time())
-check("retired: the three old spent sentinels", sorted(moved), sorted([
-    "task-s-space~task-aaaaaaaaaaaaaaaaaa.txt", "task-s-space~task-bbbbbbbbbbbbbbbbbb.txt",
-    "task-cccccccccccccccccc.txt"]))
+check("retired: the two old spent sentinels", sorted(moved), sorted([
+    "task-s-space~task-aaaaaaaaaaaaaaaaaa.txt", "task-s-space~task-bbbbbbbbbbbbbbbbbb.txt"]))
+check("kept: an answered task still claimed in tasks/ with no done flag (the bridge's hold)",
+      (inbox / "task-cccccccccccccccccc.txt").exists(), True)
 check("kept: the young one, still in the inbox", young.exists(), True)
 check("kept: the owed .accepted one", (inbox / "task-eeeeeeeeeeeeeeeeee.accepted").exists(), True)
 arch = inbox / pd.ARCHIVE_DIR
@@ -155,10 +156,13 @@ def shaped():
 boot, sweep = shaped(), shaped()
 pruned = pd.prune_spent(boot, WID)
 swept = {n[:-4] for n in sup.retire_spent_sentinels(sweep, WID, time.time())}
-check("boot prune and sweep retire the same tasks", sorted(pruned["retired"] + pruned["stale"]), sorted(swept))
-check("and keep the same ones as owed", sorted(pruned["kept"]), sorted(sup.owed_task_ids(sweep, WID)))
-check("owed: pending, claimed by a lane, and live-in-tasks/ despite an archived copy",
-      sorted(pruned["kept"]), ["task-claimed-core", "task-live-and-archived", "task-pending"])
+check("boot prune and sweep retire the same tasks",
+      sorted(pruned["archived"] + pruned["retired"] + pruned["stale"]), sorted(swept))
+check("kept: pending, a lane's claim, live-in-tasks/ despite an archived copy, and an answered task "
+      "still in tasks/ with no done flag (the bridge still reads whose reply it is)",
+      sorted(pruned["kept"]), ["task-answered-noflag", "task-claimed-core", "task-live-and-archived", "task-pending"])
+check("owed is kept minus that answered one: it owes no work, it only keeps its hold",
+      sorted(sup.owed_task_ids(sweep, WID)), ["task-claimed-core", "task-live-and-archived", "task-pending"])
 
 # The boot prune keeps a sentinel whose name is a sentinel but no lookup-able task id.
 odd = Path(tempfile.mkdtemp(prefix="pool-odd-id-"))
@@ -169,11 +173,11 @@ long_id = "task-" + "a" * 130
 check("prune_spent keeps a sentinel whose id task_disposition refuses",
       pd.prune_spent(odd, WID)["kept"], [long_id])
 
-# sentinel_spent is the shared predicate itself.
-from task_disposition import sentinel_spent  # noqa: E402
+# sentinel_retirable is the shared predicate itself.
+sentinel_retirable = pd.sentinel_retirable
 spent_ws = shaped()
-check("sentinel_spent: missing and answered are spent, pending and claimed are not",
-      [sentinel_spent(spent_ws, t) for t in ("task-missing", "task-answered-flag", "task-pending",
+check("sentinel_retirable: missing and answered-with-payload-gone leave; pending and claimed stay",
+      [sentinel_retirable(spent_ws, WID, t) for t in ("task-missing", "task-answered-flag", "task-pending",
                                              "task-claimed-core")], [True, True, False, False])
 
 # The sweep's text report names an archive failure instead of dropping it.

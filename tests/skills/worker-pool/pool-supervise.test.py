@@ -479,7 +479,7 @@ class TheCommandLine(Base):
         self.assertEqual(set(json.loads(out)),
                          {"decisions", "observations", "resumed", "not_supervised", "routing",
                           "wedged", "wedge_kinds", "auth_expired", "sentinels_retired",
-                      "sentinel_retire_errors"})
+                          "sentinel_retire_errors", "notifier_stalls"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)

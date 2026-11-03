@@ -5,6 +5,7 @@ claude_code_fixtures.py."""
 from __future__ import annotations
 
 import contextlib
+import errno
 import functools
 import io
 import json
@@ -30,14 +31,16 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
+import dataclasses  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     _dirs, _Resp, AGENT, AGENT_LOCK_HOLDER, AgentRootBase, Backend, BASE, BEARER, card, cb, cli, cm, CODE,
     ConnectBase, CONTENDER, hold, hold_mod, inbox, L, launcher, PKG, ran, records, RELAY, REPLACER, SEAT_HOLDER,
     REAL_TMUX_VERSION, seed_seat, SESSION_ID, shape_mod, sm, START_VERBS, SUCCESSOR_WRITER, task_io, tmux_pane_keys,
     TOKEN, unhold,
-    UNPUBLISHED,
+    UNPUBLISHED, wait_for, wait_gone,
 )
+from connect_undo_seams import UndoSeams, bridge_verbs  # noqa: E402
 
 
 class ConnectVerify(ConnectBase):
@@ -54,8 +57,8 @@ class ConnectVerify(ConnectBase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out).values()), {"PASS"}, out)
         self.assertEqual(set(self.checks(out)), {"config", "claude", "login", "tmux", "socket", "plugin", "inbox", "results",
-                                                 "hmac", "hitl", "bridge", "supervisor"})
-        self.assertIn(f"INFO job: {cli.SERVICE_NAME} active", out)
+                                                 "hmac", "hitl", "bridge", "supervisor", "job"})
+        self.assertIn(f"PASS job: {cli.SERVICE_NAME} active", out)
         self.assertIn(f"INFO session: {self.work} held by hold pid {runner.pid()}, no live claude attached (manager", out,
                       "the shared tri-state, naming the lock's holder")
         self.assertNotIn("launcher pid", out)
@@ -64,7 +67,11 @@ class ConnectVerify(ConnectBase):
         self.assertIn("PASS hitl store: %s (the bridge's, beside its default store under %s)"
                       % (cli.hitl_store_root(), _dirs.state_dir()), out)
         runner.stop_session()
-        self.assertIn(f"INFO session: {self.work} free", self.main("verify")[1])
+        rc, out, _ = self.main("verify")
+        self.assertIn(f"INFO session: {self.work} free", out)
+        self.assertNotEqual(rc, 0, "a configured bridge with no session job is a failed verify")
+        self.assertIn(f"FAIL job: {cli.SERVICE_NAME} is unknown, so no session answers the tasks its configured bridge "
+                      f"passes on: run {cli.COMMAND} install again, or {cli.COMMAND} uninstall", out)
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
         self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
         self.configure(BRIDGE_STATE_DIR="", HITL_STORE="/elsewhere/hitl/requirements-claude-local")
@@ -129,9 +136,243 @@ class ConnectVerify(ConnectBase):
             self.assertEqual(_dirs.device_env_path(), Path("/elsewhere/relay.env"))
 
 
-class ConnectCode(AgentRootBase):
+
+class UndoUnits(ConnectBase):
+    """The undo's refusals one by one: every unreadable, ambiguous or failed step leaves the job and says so."""
+
+    def ident(self, **over):
+        return dict({"pid": 4242, "start": "2026-01-01T00:00:00Z", "invocation": "inv-a", "since": 5}, **over)
+
+    def test_an_unreadable_manager_is_no_identity(self):
+        with mock.patch.object(sm, "_run", return_value=None):
+            self.assertIsNone(cm.job_identity(L))
+            with mock.patch.object(cm, "is_macos", return_value=True):
+                self.assertIsNone(cm.job_identity(L))
+        with mock.patch.object(sm, "_run", return_value=subprocess.CompletedProcess([], 0, "MainPID=\n", "")):
+            self.assertIsNone(cm.job_identity(L), "no MainPID word")
+        shown = subprocess.CompletedProcess([], 0, "InvocationID=inv-a\nMainPID=4242\nExecMainStartTimestampMonotonic=9\n", "")
+        with mock.patch.object(sm, "_run", return_value=shown), mock.patch.object(task_io, "start_time", return_value=None):
+            self.assertIsNone(cm.job_identity(L), "a pid whose start cannot be read")
+
+    def test_how_the_last_run_ended_says_whether_its_manager_restarts_the_job(self):
+        def systemd(code, status):
+            return subprocess.CompletedProcess([], 0, f"InvocationID=inv-a\nMainPID=0\nExecMainStartTimestampMonotonic=9\n"
+                                                      f"ExecMainCode={code}\nExecMainStatus={status}\n", "")
+        for shown, restarts in ((systemd(1, cm.EXIT_HELD), False), (systemd(1, 74), True), (systemd(1, 0), True),
+                                (systemd(2, 15), True), (systemd(0, 0), None)):
+            with self.subTest(shown.stdout), mock.patch.object(sm, "_run", return_value=shown):
+                self.assertEqual(cm.job_identity(L)["restarts"], restarts)
+        for text, restarts in (("last exit code = 0", False), ("last exit code = 74", True),
+                               ("last terminating signal = Terminated: 15", True), ("last exit code = (never exited)", None)):
+            with self.subTest(text), mock.patch.object(cm, "is_macos", return_value=True), \
+                    mock.patch.object(sm, "_run", return_value=subprocess.CompletedProcess([], 0, f"\tstate = not running\n\t{text}\n", "")):
+                self.assertEqual(cm.job_identity(L)["restarts"], restarts)
+                self.assertTrue(cm.job_identity(dataclasses.replace(L, keep_alive_on_success=None))["restarts"] in (True, None),
+                                "KeepAlive=true restarts any end")
+
+    def test_an_exact_signal_without_pidfds_and_its_failures(self):
+        nofd = mock.patch.object(os, "pidfd_open", side_effect=OSError(errno.ENOSYS, "x"), create=True)
+        started = mock.patch.object(task_io, "start_time", return_value="2026-01-01T00:00:00Z")
+        with nofd, started, mock.patch.object(os, "kill") as kill:
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM), "")
+        kill.assert_called_once_with(4242, signal.SIGTERM)
+        with nofd, started, mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM), cm._GONE)
+        with nofd, started, mock.patch.object(os, "kill", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM),
+                             "could not be signalled (Operation not permitted)")
+        with nofd, mock.patch.object(task_io, "start_time", return_value=None):
+            self.assertEqual(cm._signal_exact(4242, "2026-01-01T00:00:00Z", signal.SIGTERM), cm._GONE)
+
+    def test_a_process_that_cannot_be_read_counts_as_running_until_the_bound(self):
+        with mock.patch.object(subprocess, "run", side_effect=OSError("no ps")):
+            self.assertTrue(cm._runs(4242, "x"))
+            self.assertFalse(cm._await_exit(4242, "x", 0))
+
+    def test_a_new_invocation_after_the_call_is_not_ours(self):
+        now = self.ident(invocation="inv-b", since=50)
+        with mock.patch.object(cm, "job_identity", return_value=now):
+            got = cm._own_run(L, self.ident(), {"by_call": True, "t0": 10, "t1": 20})
+        self.assertEqual(got, (None, "runs an invocation (pid 4242) that did not begin inside this operation's start"))
+
+    def test_a_systemd_start_that_never_shows_a_main_pid_is_not_ours(self):
+        idle = {"pid": None, "start": None, "invocation": "", "since": None}
+        with mock.patch.object(cm, "job_identity", return_value=idle), mock.patch.object(cm, "START_SEEN_S", 0):
+            got = cm._own_run(L, None, {"by_call": True, "t0": 0, "t1": 1})
+        self.assertEqual(got, (None, "showed no process within 0 s of this operation's start"))
+
+    def test_a_pane_holder_is_ours_only_through_a_live_launcher_run_that_recorded_its_generation(self):
+        server = subprocess.Popen([sys.executable, "-c", "import subprocess, sys; p = subprocess.Popen([sys.executable, "
+                                   "'-c', 'import time; time.sleep(60)']); print(p.pid, flush=True); p.wait()"],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(server.pid, signal.SIGKILL), server.wait(), server.stdout.close()))
+        pane = int(server.stdout.readline())
+        root = self.home / "pane-root"
+        records.supervisor_path(root).parent.mkdir(parents=True)
+        me = task_io.process_identity()
+        gen = {"server_pid": server.pid, "server_start": wait_for(lambda: task_io.start_time(server.pid)), "pane_pid": pane}
+
+        def proof(launcher=me, holder=pane, **over):
+            records.save_supervisor(root, dict(records.empty_supervisor(), launcher=launcher, generation=dict(gen, **over)))
+            return shape_mod.session_launcher(root, {"owner_pid": holder})
+        self.assertEqual(proof(), os.getpid(), "the pane of our run's generation, our launcher live")
+        self.assertIsNone(proof(launcher=dict(me, start="2000-01-01T00:00:00Z")), "a launcher run that is gone")
+        self.assertIsNone(proof(holder=os.getpid()), "a holder that is not that generation's pane")
+        self.assertIsNone(proof(server_pid=os.getpid()), "a pane that is not that server's")
+        self.assertIsNone(proof(server_start="2000-01-01T00:00:00Z"), "a server that is not the recorded one")
+        records.supervisor_path(root).unlink()
+        self.assertIsNone(shape_mod.session_launcher(root, {"owner_pid": pane}), "no record, no proof")
+        with mock.patch.object(records, "load_supervisor", side_effect=records.RecordError("torn")):
+            self.assertIsNone(shape_mod.session_launcher(root, {"owner_pid": pane}))
+
+    def test_the_undo_outside_the_agent_lock_stops_nothing(self):
+        p = {"shape": L, "root": str(self.work), "owned": True, "why": "", "unit": b"", "undo": [], "ident": self.ident()}
+        with mock.patch.object(cm, "_retire_run") as retire:
+            line = cm._undo_start(p)
+        retire.assert_not_called()
+        self.assertIn("this operation does not hold the agent lock, so nothing was stopped", line)
+        self.assertIn(cm.stop_command(L), line)
+
+    def test_stop_started_with_nothing_recorded_or_not_ours(self):
+        self.work.mkdir(parents=True)
+        with cm.agent_lock(str(self.work)):
+            with mock.patch.dict(cm._STARTED, clear=True):
+                self.assertIn("no job started by this connect was recorded", cm.stop_started(L, str(self.work)))
+                cm._STARTED[L.name] = {"shape": L, "root": str(self.work), "owned": False,
+                                       "why": "was already running when this operation asked for it"}
+                self.assertIn("so it is not this operation's", cm.stop_started(L, str(self.work)))
+                self.assertIn(L.name, cm._STARTED, "a run that is not ours stays recorded as it is")
+
+    def _run(self, retires=True):
+        code = ("import signal, sys, time\n"
+                + ("signal.signal(signal.SIGURG, lambda *a: sys.exit(75))\n" if retires else "")
+                + "print('ready', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()) if child.poll() is None else None)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        return child, {"pid": child.pid, "start": wait_for(lambda: task_io.start_time(child.pid)), "invocation": ""}
+
+    def test_a_run_asked_to_retire_ends_for_good_and_its_manager_is_never_named(self):
+        child, ident = self._run()
+        idle = {"pid": None, "start": None, "invocation": "", "since": None, "restarts": False}
+        with mock.patch.object(cm, "job_identity", return_value=idle), mock.patch.object(cm, "stop_supervisor") as stop, \
+                mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as sig:
+            self.assertEqual(cm._retire_run(L, ident), "")
+        self.assertEqual(child.wait(timeout=10), cm.EXIT_HELD, "the exit neither manager restarts")
+        self.assertEqual({c.args[2] for c in sig.call_args_list}, {cm.RETIRE_SIGNAL})
+        stop.assert_not_called()
+
+    def test_a_run_that_does_not_retire_is_asked_again_then_left(self):
+        child, ident = self._run(retires=False)
+        quick = dataclasses.replace(L, stop_timeout_s=1)
+        with mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as sig, \
+                mock.patch.object(cm, "stop_supervisor") as stop:
+            self.assertEqual(cm._retire_run(quick, ident), f"pid {child.pid} did not retire within 1 s")
+        self.assertGreater(len(sig.call_args_list), 1, "a request sent before its handler was in place is repeated")
+        self.assertIsNone(child.poll(), "a run that does not retire is left, never killed")
+        stop.assert_not_called()
+
+    def test_a_run_seen_after_ours_retired_is_left(self):
+        child, ident = self._run()
+        again = {"pid": 999999, "start": "x", "invocation": "", "since": None}
+        with mock.patch.object(cm, "job_identity", return_value=again), mock.patch.object(cm, "stop_supervisor") as stop:
+            line = cm._retire_run(L, ident)
+        self.assertEqual(line, f"pid {child.pid} retired, but the job runs again as pid 999999, which this operation "
+                               "did not start")
+        stop.assert_not_called()
+
+    def test_a_run_that_ended_asking_to_be_restarted_is_never_reported_stopped(self):
+        for restarts, said in ((True, "ended with an exit its manager restarts, not as a retirement, so the job starts "
+                                      "again after its restart delay"),
+                               (None, "ended, but how it ended cannot be read, so its manager may start the job again")):
+            with self.subTest(restarts=restarts):
+                child, ident = self._run()
+                ended = {"pid": None, "start": None, "invocation": "", "since": None, "restarts": restarts}
+                with mock.patch.object(cm, "job_identity", return_value=ended), mock.patch.object(cm, "stop_supervisor") as stop:
+                    self.assertEqual(cm._retire_run(L, ident), f"pid {child.pid} {said}")
+                stop.assert_not_called()
+
+    def test_each_failed_retire_step_leaves_the_job_and_says_why(self):
+        ident = self.ident()
+        with mock.patch.object(cm, "_signal_exact", return_value=cm._OTHER):
+            self.assertEqual(cm._retire_run(L, ident), f"pid 4242 {cm._OTHER}; nothing was signalled")
+        with mock.patch.object(cm, "_signal_exact", return_value=""), mock.patch.object(cm, "_await_exit", return_value=True), \
+                mock.patch.object(cm, "job_identity", return_value=None):
+            self.assertEqual(cm._retire_run(L, ident), "its state after pid 4242 retired cannot be read")
+
+    def test_retiring_is_a_run_s_own_exit_through_the_launchd_shim(self):
+        state = cm.stop_state()
+        self.assertEqual(cm.retired(state, 143), 143, "an ordinary stop keeps its code")
+        state["retire"] = True
+        self.assertEqual(cm.retired(state, 143), cm.EXIT_HELD)
+        self.assertEqual(cm.retired(state, cm.EXIT_RETRY), cm.EXIT_RETRY, "a run that asks to be retried still is")
+        child = ("import signal, sys, time; sys.path.insert(0, %r)\n"
+                 "from ag2_sparrow import connect_common as cm\n"
+                 "state = cm.stop_state(); cm.stop_handlers(state)\n"
+                 "import os; print('ready', os.getpid(), flush=True)\n"
+                 "while state['sig'] is None: time.sleep(0.05)\n"
+                 "sys.exit(cm.retired(state, 128 + state['sig']))") % str(PKG)
+        shim = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
+                "sys.exit(cm.run_launchd([sys.executable, '-c', %r]))") % (str(PKG), child)
+        p = subprocess.Popen([sys.executable, "-c", shim], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (p.kill(), p.wait()) if p.poll() is None else None)
+        ready = p.stdout.readline().split()
+        self.assertEqual(ready[:1], ["ready"])
+        self.addCleanup(lambda: wait_gone(int(ready[1]), 0) or os.kill(int(ready[1]), signal.SIGKILL))
+        deadline = time.monotonic() + 10
+        while p.poll() is None and time.monotonic() < deadline:
+            os.kill(p.pid, cm.RETIRE_SIGNAL)            # until the shim's forwarding is in place
+            time.sleep(0.1)
+        p.stdout.close()
+        self.assertEqual(p.wait(timeout=10), 0, "the shim's 0, which SuccessfulExit=false does not restart")
+
+
+class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
+
+    local, tmux_tree = L, True
+
+    def seam_fake(self):
+        return self.bridged()
+
+    def backend(self):
+        return Backend()
+
+    def install_seat(self, fake):
+        seed_seat(cli.bridge_home(self.root), BEARER)
+        return self.install_default(fake, "--token-env-file", str(cli.bridge_home(self.root) / "channels" / "ag2space" / ".env"))
+
+    def test_an_exact_signal_reaches_only_the_process_with_the_recorded_start(self):
+        child = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (child.kill(), child.wait()) if child.poll() is None else None)
+        start = wait_for(lambda: task_io.start_time(child.pid))
+        self.assertEqual(cm._signal_exact(child.pid, "2000-01-01T00:00:00Z", signal.SIGTERM), cm._OTHER)
+        self.assertIsNone(child.poll(), "a pid whose start differs is never signalled")
+        self.assertEqual(cm._signal_exact(child.pid, start, signal.SIGTERM), "")
+        self.assertEqual(child.wait(timeout=10), -signal.SIGTERM)
+        self.assertEqual(cm._signal_exact(child.pid, start, signal.SIGTERM), cm._GONE)
+
+    def test_a_holder_record_that_cannot_be_written_releases_the_agent_lock_and_refuses(self):
+        self.root.mkdir(parents=True)
+        root = str(self.root)
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(cm, "_say_holder", side_effect=full):
+            with self.assertRaises(cm.Busy) as refused:
+                cm.agent_lock(root).__enter__()
+            self.assertIn("its holder could not be recorded (No space left on device); it was released", str(refused.exception))
+            self.assertFalse(cm.agent_lock_held(root))
+            self.assertEqual(cm.agent_lock_busy(root), "", "released at once, not at exit")
+            fd, why = cm.launch_admission(root, wait_s=0)
+            self.assertIsNone(fd)
+            self.assertIn("its holder could not be recorded", why)
+            self.assertEqual(cm.agent_lock_busy(root), "")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(cm.install(L, {}, root), 1)
+            self.assertIn("its holder could not be recorded", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+        with cm.agent_lock(root):
+            self.assertTrue(cm.agent_lock_held(root), "the next operation takes it")
 
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-"),
                 plugin=True):
@@ -141,7 +382,7 @@ class ConnectCode(AgentRootBase):
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
-        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
+        with mock.patch.object(sm, "_run", side_effect=fake), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 mock.patch.object(cm, "redeem_code", side_effect=functools.partial(
                     cm.redeem_code, sleep=lambda s: (sleeps if sleeps is not None else []).append(s))), \
@@ -719,7 +960,7 @@ class ConnectCode(AgentRootBase):
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
 
-    def test_a_root_replaced_while_the_bridge_is_wired_unwinds_this_attempt(self):
+    def test_a_root_replaced_while_the_bridge_is_wired_leaves_the_running_bridge_and_unwinds_the_rest(self):
         fake, real = self.bridged(), cb.wire_bridge
 
         def wired_then_replaced(*a, **kw):
@@ -731,12 +972,26 @@ class ConnectCode(AgentRootBase):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"the bridge this attempt wired ({cm.job_name(cli.BRIDGE)}) was removed; {cm.job_name(L)}, which held "
-                      f"the directory that was there, was stopped; nothing at {self.root} was touched", err)
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "this attempt's bridge unit is gone")
+        self.assertIn(f"the bridge this attempt wired ({cm.job_name(cli.BRIDGE)}) is active and was left, since stopping it would "
+                      f"name whatever runs as it now: stop it by hand ({cm.stop_command(cli.BRIDGE)})", err)
+        self.assertIn(f"{cm.job_name(L)}, which held the directory that was there, was stopped; nothing at {self.root} was "
+                      "touched", err)
+        self.assertTrue(cm.service_path(cli.BRIDGE).exists(), "a running bridge is left: its manager stops it only by name")
+        self.assertTrue(fake.active, "and it still runs")
+        self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
         self.assertIsNone(fake.runner.pid(), "this attempt's job is stopped")
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
+
+    def test_a_bridge_left_unregistered_by_a_refused_start_is_the_only_bridge_removed(self):
+        fake = self.bridged()
+        fake.table["bootstrap"] = 5
+        with mock.patch.object(cm, "is_macos", return_value=True):
+            rc, out, err = self.connect(Backend(), fake)
+            plist = cm.supervisor_path(cli.BRIDGE)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"the bridge unit this attempt wrote ({plist}) was removed", err)
+        self.assertFalse(plist.exists(), "an unregistered unit holding this attempt's bytes is removed")
 
     def test_connect_changes_no_jobs_definition_and_refuses_when_it_would(self):
         fake = self.running_job()
@@ -1021,30 +1276,34 @@ class ConnectCode(AgentRootBase):
                 with mock.patch.object(sm, "_run", side_effect=fake), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cm.uninstall(L), 0)
 
-    def test_a_launcher_held_past_the_operations_wait_never_acts_on_the_root(self):
+    def test_a_launcher_holding_the_agent_lock_past_the_wait_is_left_and_reported(self):
         for shim in (False, True):
             with self.subTest("launchd shim child" if shim else "systemd direct"):
                 fake = self.bridged()
                 r = fake.runner
-                r.real, r.shim, r.stop_timeout = True, shim, 2       # the stop times out on the paused launcher
+                r.real, r.shim = True, shim
                 r.pause, r.acted = str(self.home / f"resume-{shim}"), str(self.home / f"acted-{shim}")
-                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim):
+                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim), \
+                        mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
                     rc, out, err = self.connect(Backend(), fake)
-                Path(r.pause).touch()                       # the paused launcher resumes after the failure
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not Path(r.acted).exists() \
-                        and any(launcher.poll() is None for launcher in r.spawned):
-                    time.sleep(0.1)
-                acted, held = Path(r.acted).exists(), task_io.lock_held(str(self.root))
-                for launcher in r.spawned:                  # cleanup, so one shape cannot leak into the next
-                    if launcher.poll() is None:
-                        os.killpg(launcher.pid, signal.SIGKILL)
-                        launcher.wait(timeout=30)
-                self.assertFalse(acted, "the late launcher never held or acted on the root")
-                self.assertEqual(held, "free")
-                self.assertNotEqual(rc, 0, out + err)
-                self.assertNotIn("next:", out)
-                self.assertIn("did not acquire", err)
+                    by_hand = f"({cm.stop_command(L)})"
+                verbs, job = [r.verb(c) for c in r.calls], r.pid()
+                Path(r.pause).touch()
+                try:
+                    self.assertNotEqual(rc, 0, out + err)
+                    self.assertNotIn("next:", out)
+                    self.assertIn("did not acquire", err)
+                    self.assertIn("so nothing was stopped", err)
+                    self.assertIn(by_hand, err, "what is left comes with the command that stops it")
+                    self.assertFalse({"stop", "bootout", "disable"} & set(verbs), "no cleanup without the agent lock")
+                    signalled.assert_not_called()
+                    self.assertIsNotNone(job, "the job is left, as reported")
+                finally:
+                    for launcher in r.spawned:              # cleanup, so one shape cannot leak into the next
+                        if launcher.poll() is None:
+                            os.killpg(launcher.pid, signal.SIGKILL)
+                            launcher.wait(timeout=30)
+                    r.session = None
 
     def test_the_real_launcher_through_launchds_shim_ends_up_alive(self):
         fake = self.bridged()

@@ -3,9 +3,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ... import claude_local_records as records, task_io
 from ...claude_local_card import HITL_ID_PREFIX, HITL_ROOT_NAME, RUNTIME  # noqa: F401  (the bridge owns them)
 from ...connect_bridge import bridge_shape
 from ...connect_common import Shape
+
+
+def session_launcher(root, rec: dict) -> "int | None":
+    """The launcher run that spawned the pane process holding `root`: the supervisor record's launcher (its
+    pid and start live) when the holder is that run's generation's pane process (or the pane's own child)
+    and the pane is a child of the generation's tmux server, live as recorded. None otherwise."""
+    try:
+        sup = records.load_supervisor(root)
+    except (records.RecordError, OSError):
+        return None
+    gen, launcher, holder = sup.get("generation") or {}, sup.get("launcher") or {}, rec.get("owner_pid", rec.get("pid"))
+    pane, server = gen.get("pane_pid"), gen.get("server_pid")
+    if not (pane and server and holder and launcher.get("pid")):
+        return None
+    if holder != pane and task_io.parent_pid(holder) != pane:
+        return None
+    if task_io.parent_pid(pane) != server or task_io.verify_lineage(server, gen.get("server_start")) is not True:
+        return None
+    return launcher["pid"] if task_io.verify_lineage(launcher["pid"], launcher.get("start")) is True else None
+
 
 LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
               description="a Claude Code session in a tmux pane as an s.space agent", cli="Claude Code CLI",
@@ -18,7 +39,7 @@ LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
                            "BRIDGE_STATE_DIR", "TMUX"),
               env_keep=("PATH", "HOME", "USER", "TERM", "ANTHROPIC_BASE_URL"), kept="the Claude login",
               kill_mode="process", stop_timeout_s=180, run_args=("run", "--launchd"), keep_alive_on_success=False,
-              manager_timeout_s=240)
+              manager_timeout_s=240, holder_launcher=session_launcher)
 # The agent's own gateway bridge, when install runs it.
 BRIDGE = bridge_shape(LOCAL)
 # The marker the plugin reads at session.start: with it, the watch arms itself, no model turn.

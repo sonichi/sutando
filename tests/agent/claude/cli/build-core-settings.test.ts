@@ -242,6 +242,21 @@ describe('build-core-settings.mjs', () => {
 		assert.equal(shellParsedPath(blk.hooks[0].command), NATIVE_PIM_GUARD);
 	});
 
+	it('registers the shell-trap guard on Bash with its checkout as --repo, after every earlier guard', () => {
+		const hook = '/x y/hooks/shell-trap-guard.py';
+		const o = JSON.parse(
+			execFileSync('node', [CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD, NATIVE_PIM_GUARD, hook], {
+				encoding: 'utf8',
+			}),
+		);
+		assert.deepEqual(
+			o.hooks.PreToolUse.map((b: any) => b.matcher),
+			['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'mcp__.*__composio_exec', 'Bash|Write|Edit|MultiEdit|NotebookEdit', 'Bash'],
+		);
+		const blk = o.hooks.PreToolUse.find((b: any) => b.hooks.some((h: any) => h.command.includes('shell-trap-guard')));
+		assert.deepEqual(shellParsedWords(blk.hooks[0].command), [hook, '--repo', '/x y']);
+	});
+
 	it('omitting the native PIM guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);

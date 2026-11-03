@@ -310,7 +310,7 @@ def case_f_run_all_checks_emits_slack_configured_not_running() -> list[str]:
     def fake_run(argv, *args, **kwargs):
         # Intercept ONLY the slack-bridge pgrep so it reports "not running".
         if (isinstance(argv, list) and len(argv) >= 3
-                and argv[0] == "/usr/bin/pgrep" and "slack-bridge" in argv[2]):
+                and Path(argv[0]).name == "pgrep" and "slack-bridge" in argv[2]):
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         return real_run(argv, *args, **kwargs)
 
