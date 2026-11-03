@@ -38,7 +38,7 @@ from claude_code_fixtures import (  # noqa: E402
     ConnectBase, CONTENDER, hold, hold_mod, inbox, L, launcher, PKG, ran, records, RELAY, REPLACER, SEAT_HOLDER,
     REAL_TMUX_VERSION, seed_seat, SESSION_ID, shape_mod, sm, START_VERBS, SUCCESSOR_WRITER, task_io, tmux_pane_keys,
     TOKEN, unhold,
-    UNPUBLISHED, wait_for,
+    UNPUBLISHED, wait_for, wait_gone,
 )
 from connect_undo_seams import UndoSeams  # noqa: E402
 
@@ -211,9 +211,9 @@ class UndoUnits(ConnectBase):
 
     def test_the_undo_outside_the_agent_lock_stops_nothing(self):
         p = {"shape": L, "root": str(self.work), "owned": True, "why": "", "unit": b"", "undo": [], "ident": self.ident()}
-        with mock.patch.object(cm, "_stop_run") as stop:
+        with mock.patch.object(cm, "_retire_run") as retire:
             line = cm._undo_start(p)
-        stop.assert_not_called()
+        retire.assert_not_called()
         self.assertIn("this operation does not hold the agent lock, so nothing was stopped", line)
         self.assertIn(cm.stop_command(L), line)
 
@@ -227,53 +227,78 @@ class UndoUnits(ConnectBase):
                 self.assertIn("so it is not this operation's", cm.stop_started(L, str(self.work)))
                 self.assertIn(L.name, cm._STARTED, "a run that is not ours stays recorded as it is")
 
-    def _ignoring_term(self):
-        child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, "
-                                  "signal.SIG_IGN); print('ready', flush=True); time.sleep(60)"],
-                                 stdout=subprocess.PIPE, text=True)
+    def _run(self, retires=True):
+        code = ("import signal, sys, time\n"
+                + ("signal.signal(signal.SIGURG, lambda *a: sys.exit(75))\n" if retires else "")
+                + "print('ready', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()) if child.poll() is None else None)
         self.assertEqual(child.stdout.readline().strip(), "ready")
         return child, {"pid": child.pid, "start": wait_for(lambda: task_io.start_time(child.pid)), "invocation": ""}
 
-    def test_a_run_that_ignores_sigterm_past_the_stop_bound_gets_the_exact_sigkill(self):
-        child, ident = self._ignoring_term()
-        quick = dataclasses.replace(L, stop_timeout_s=0.5)
+    def test_a_run_asked_to_retire_ends_for_good_and_its_manager_is_never_named(self):
+        child, ident = self._run()
         idle = {"pid": None, "start": None, "invocation": "", "since": None}
-        with mock.patch.object(cm, "job_identity", return_value=idle), \
-                mock.patch.object(cm, "stop_supervisor", return_value="") as stop, \
+        with mock.patch.object(cm, "job_identity", return_value=idle), mock.patch.object(cm, "stop_supervisor") as stop, \
                 mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as sig:
-            self.assertEqual(cm._stop_run(quick, ident), "")
-        self.assertEqual([c.args[2] for c in sig.call_args_list], [signal.SIGTERM, signal.SIGKILL])
-        self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
-        stop.assert_called_once_with(quick)
-
-    def test_a_run_seen_again_after_the_exit_is_left_without_the_manager_stop(self):
-        child, ident = self._ignoring_term()
-        quick = dataclasses.replace(L, stop_timeout_s=0.5)
-        again = {"pid": 999999, "start": "x", "invocation": "", "since": None}
-        with mock.patch.object(cm, "job_identity", return_value=again), \
-                mock.patch.object(cm, "stop_supervisor") as stop:
-            line = cm._stop_run(quick, ident)
-        self.assertEqual(line, f"pid {child.pid} exited, but it runs again as pid 999999, which is not provably this "
-                               "operation's, so that run was left")
+            self.assertEqual(cm._retire_run(L, ident), "")
+        self.assertEqual(child.wait(timeout=10), cm.EXIT_HELD, "the exit neither manager restarts")
+        self.assertEqual({c.args[2] for c in sig.call_args_list}, {cm.RETIRE_SIGNAL})
         stop.assert_not_called()
-        self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
 
-    def test_each_failed_stop_step_leaves_the_job_and_says_why(self):
+    def test_a_run_that_does_not_retire_is_asked_again_then_left(self):
+        child, ident = self._run(retires=False)
+        quick = dataclasses.replace(L, stop_timeout_s=1)
+        with mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as sig, \
+                mock.patch.object(cm, "stop_supervisor") as stop:
+            self.assertEqual(cm._retire_run(quick, ident), f"pid {child.pid} did not retire within 1 s")
+        self.assertGreater(len(sig.call_args_list), 1, "a request sent before its handler was in place is repeated")
+        self.assertIsNone(child.poll(), "a run that does not retire is left, never killed")
+        stop.assert_not_called()
+
+    def test_a_run_seen_after_ours_retired_is_left(self):
+        child, ident = self._run()
+        again = {"pid": 999999, "start": "x", "invocation": "", "since": None}
+        with mock.patch.object(cm, "job_identity", return_value=again), mock.patch.object(cm, "stop_supervisor") as stop:
+            line = cm._retire_run(L, ident)
+        self.assertEqual(line, f"pid {child.pid} retired, but the job runs again as pid 999999, which this operation "
+                               "did not start")
+        stop.assert_not_called()
+
+    def test_each_failed_retire_step_leaves_the_job_and_says_why(self):
         ident = self.ident()
         with mock.patch.object(cm, "_signal_exact", return_value=cm._OTHER):
-            self.assertEqual(cm._stop_run(L, ident), f"pid 4242 {cm._OTHER}; nothing was signalled")
-        with mock.patch.object(cm, "_signal_exact", return_value="") as sig, \
-                mock.patch.object(cm, "_await_exit", side_effect=[False, False]):
-            self.assertEqual(cm._stop_run(L, ident), "pid 4242 did not exit after SIGTERM and SIGKILL")
-        self.assertEqual([c.args[2] for c in sig.call_args_list], [signal.SIGTERM, signal.SIGKILL])
-        with mock.patch.object(cm, "_signal_exact", return_value=""), \
-                mock.patch.object(cm, "_await_exit", side_effect=[False, True]), \
-                mock.patch.object(cm, "job_identity", return_value=None), \
-                mock.patch.object(cm, "stop_supervisor") as stop:
-            self.assertEqual(cm._stop_run(L, ident), "its state after pid 4242 exited cannot be read, so nothing more "
-                                                     "was stopped")
-        stop.assert_not_called()
+            self.assertEqual(cm._retire_run(L, ident), f"pid 4242 {cm._OTHER}; nothing was signalled")
+        with mock.patch.object(cm, "_signal_exact", return_value=""), mock.patch.object(cm, "_await_exit", return_value=True), \
+                mock.patch.object(cm, "job_identity", return_value=None):
+            self.assertEqual(cm._retire_run(L, ident), "its state after pid 4242 retired cannot be read")
+
+    def test_retiring_is_a_run_s_own_exit_through_the_launchd_shim(self):
+        state = cm.stop_state()
+        self.assertEqual(cm.retired(state, 143), 143, "an ordinary stop keeps its code")
+        state["retire"] = True
+        self.assertEqual(cm.retired(state, 143), cm.EXIT_HELD)
+        self.assertEqual(cm.retired(state, cm.EXIT_RETRY), cm.EXIT_RETRY, "a run that asks to be retried still is")
+        child = ("import signal, sys, time; sys.path.insert(0, %r)\n"
+                 "from ag2_sparrow import connect_common as cm\n"
+                 "state = cm.stop_state(); cm.stop_handlers(state)\n"
+                 "import os; print('ready', os.getpid(), flush=True)\n"
+                 "while state['sig'] is None: time.sleep(0.05)\n"
+                 "sys.exit(cm.retired(state, 128 + state['sig']))") % str(PKG)
+        shim = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
+                "sys.exit(cm.run_launchd([sys.executable, '-c', %r]))") % (str(PKG), child)
+        p = subprocess.Popen([sys.executable, "-c", shim], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (p.kill(), p.wait()) if p.poll() is None else None)
+        ready = p.stdout.readline().split()
+        self.assertEqual(ready[:1], ["ready"])
+        self.addCleanup(lambda: wait_gone(int(ready[1]), 0) or os.kill(int(ready[1]), signal.SIGKILL))
+        deadline = time.monotonic() + 10
+        while p.poll() is None and time.monotonic() < deadline:
+            os.kill(p.pid, cm.RETIRE_SIGNAL)            # until the shim's forwarding is in place
+            time.sleep(0.1)
+        p.stdout.close()
+        self.assertEqual(p.wait(timeout=10), 0, "the shim's 0, which SuccessfulExit=false does not restart")
+
 
 class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its

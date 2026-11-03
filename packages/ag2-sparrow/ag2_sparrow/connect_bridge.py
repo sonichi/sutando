@@ -394,14 +394,22 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
 
 
 def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wired: bytes) -> str:
-    """The undo of this attempt's wiring, under the start's undo: only while the bridge unit still holds the
-    bytes this attempt wrote; the line saying what was done."""
+    """The undo of this attempt's wiring, under the start's undo. Its manager stops a bridge job only by
+    name, which could stop a start this attempt did not make, so a registered or running bridge is left and
+    said; only an unregistered unit that still holds the bytes this attempt wrote is removed."""
     if _bytes(artifact) != wired:
         return (f"{cm.job_name(bridge)} is no longer the unit this attempt wrote, so it was left: stop it by hand "
                 f"({cm.stop_command(bridge)})")
-    problem = unwire_bridge(cfg, command, bridge)
-    return (f"{cm.job_name(bridge)} could not be removed ({problem})" if problem else
-            f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed")
+    state = cm.manager_state(bridge)
+    if state != "absent":
+        return (f"the bridge this attempt wired ({cm.job_name(bridge)}) is {state} and was left, since stopping it "
+                f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run {command} "
+                "uninstall")
+    try:
+        artifact.unlink()
+    except OSError as e:
+        return f"{artifact} could not be removed ({e.strerror or e})"
+    return f"the bridge unit this attempt wrote ({artifact}) was removed"
 
 
 def _replaced(root: str, local: cm.Shape, stopped: str, bridge_note: str) -> str:

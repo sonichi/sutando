@@ -24,7 +24,6 @@ from ag2_sparrow import claude_local_records as records, connect_bridge as cb, c
 from ag2_sparrow import service_manager as sm, task_io  # noqa: E402
 
 MANAGERS = (("systemd", False), ("launchd", True))
-SYSTEMD = MANAGERS[:1]      # launchd's undo signals no pid: it boots out the registration its bootstrap loaded
 FOREIGN_PLIST = b"<?xml version='1.0'?>\n<!-- another writer's plist -->\n<plist><dict/></plist>\n"
 STOPS = {"stop", "bootout", "disable"}
 STARTS = {"restart", "start", "bootstrap"}
@@ -35,6 +34,10 @@ def after_start(fake) -> set:
     verbs = [fake.runner.verb(c) for c in fake.runner.calls]
     first = next((i for i, v in enumerate(verbs) if v in STARTS), len(verbs))
     return set(verbs[first:])
+
+
+def bridge_verbs(fake) -> set:
+    return {c[1] if c[0] == "launchctl" else next(a for a in c[1:] if not a.startswith("--")) for c in fake.calls}
 
 
 def cb_cfg(local):
@@ -59,7 +62,7 @@ class UndoSeams:
         fake = self.seam_fake()
         fake.runner.real, fake.runner.shim = True, mac
         fake.runner.pause, fake.runner.acted = "", str(self.home / f"acted-{tag}-{int(mac)}")
-        fake.runner.keep_alive, fake.runner.throttle = mac, 0.0     # launchd: a run that ends respawns at once
+        fake.runner.keep_alive, fake.runner.throttle = True, 0.0    # a run that ends is restarted at once
         fake.runner.tmux = self.tmux_tree
         return fake
 
@@ -79,9 +82,14 @@ class UndoSeams:
             p.wait(timeout=30)
         r.session = None
 
-    def _reaped(self, fake):
-        """The old run, exited after a signal, reaped as its manager would, before the manager starts another."""
+    def _reaped(self, fake, sig=None):
+        """The old run, exited after a signal (repeated: one sent before its handler is lost), reaped as its
+        manager would, before the manager starts another."""
         old, fake.runner.session = fake.runner.session, None
+        deadline = time.monotonic() + 30
+        while old.poll() is None and sig is not None and time.monotonic() < deadline:
+            os.kill(old.pid, sig)
+            time.sleep(0.2)
         old.wait(timeout=30)
         for pipe in (old.stdin, old.stdout):
             pipe.close()
@@ -169,7 +177,7 @@ class UndoSeams:
 
     def test_seam_a_successor_between_the_identity_check_and_the_signal_is_never_signalled(self):
         for how in ("connect", "install"):
-            for name, mac in SYSTEMD:
+            for name, mac in MANAGERS:
                 with self.subTest(how=how, manager=name):
                     fake, real, successor = self._real(mac, f"check-{how}"), cm._signal_exact, []
 
@@ -190,20 +198,20 @@ class UndoSeams:
                         self.assertIs(fake.runner.session, successor[0])
                         self.assertFalse(STOPS & set(verbs), "nothing stopped the job by name")
                         if how == "connect":
-                            self.assertIn("which is not provably this operation's, so that run was left", err)
+                            self.assertIn("has exited; nothing was signalled", err)
                     finally:
                         self._done(fake)
 
     def test_seam_a_successor_after_the_signal_is_never_stopped(self):
         for how in ("connect", "install"):
-            for name, mac in SYSTEMD:
+            for name, mac in MANAGERS:
                 with self.subTest(how=how, manager=name):
                     fake, real, successor = self._real(mac, f"after-{how}"), cm._signal_exact, []
 
                     def signalled_then_replaced(pid, start, sig):
                         got = real(pid, start, sig)
                         if not successor:
-                            self._reaped(fake)
+                            self._reaped(fake, sig)
                             fake.runner.start_session(by_manager=True)   # a run it did not start, at once
                             successor.append(fake.runner.session)
                         return got
@@ -218,7 +226,33 @@ class UndoSeams:
                         self.assertIsNone(successor[0].poll(), "the successor is alive")
                         self.assertFalse(STOPS & set(verbs), "the job was not stopped by name over it")
                         if how == "connect":
-                            self.assertIn("runs again as pid", err)
+                            self.assertIn("retired, but the job runs again as pid", err)
+                    finally:
+                        self._done(fake)
+
+    def test_seam_a_successor_at_the_final_manager_stop_is_never_stopped(self):
+        for how in ("connect", "install"):
+            for name, mac in MANAGERS:
+                with self.subTest(how=how, manager=name):
+                    fake, real, successor, ours = self._real(mac, f"final-{how}"), cm.stop_supervisor, [], []
+
+                    def replaced_first(shape, *a, **kw):
+                        started = STARTS & {fake.runner.verb(c) for c in fake.runner.calls}
+                        if shape.name == self.local.name and started and not successor:
+                            ours.append(fake.runner.session)
+                            fake.runner.start_session(by_manager=True)  # another actor's start, past the lock
+                            successor.append(fake.runner.session)
+                        return real(shape, *a, **kw)
+                    refused = []
+                    with mock.patch.object(cm, "is_macos", return_value=mac), \
+                            mock.patch.object(cm, "stop_supervisor", side_effect=replaced_first):
+                        rc, out, err = self._fail(how, fake, refused)
+                    try:
+                        self.assertTrue(rc or refused, out + err)
+                        for run in successor:
+                            self.assertIsNone(run.poll(), "a start this operation did not make is never stopped")
+                        self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned if p not in successor),
+                                        "this operation's own run is gone")
                     finally:
                         self._done(fake)
 
@@ -231,15 +265,13 @@ class UndoSeams:
                     with mock.patch.object(cm, "is_macos", return_value=mac), \
                             mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
                         rc, out, err = self._fail(how, fake, refused)
-                    verbs = [fake.runner.verb(c) for c in fake.runner.calls]
+                    verbs = after_start(fake)
                     try:
                         self.assertTrue(rc or refused, out + err)
-                        if mac:
-                            signalled.assert_not_called()
-                        else:
-                            self.assertEqual(signalled.call_args_list[0].args[2], signal.SIGTERM)
+                        self.assertEqual({c.args[2] for c in signalled.call_args_list}, {cm.RETIRE_SIGNAL})
                         self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned), "its run is gone")
-                        self.assertIn("bootout" if mac else "stop", verbs, "and the manager will not respawn it")
+                        self.assertEqual(fake.runner.respawns, 0, "and retired: its manager does not start it again")
+                        self.assertFalse(STOPS & set(verbs), "no step named the job to its manager")
                         self.assertFalse(Path(fake.runner.acted).exists(), "it never acted on the root")
                     finally:
                         self._done(fake)
@@ -258,8 +290,6 @@ class UndoSeams:
                             if changed:
                                 fake.runner.start_session(by_manager=True)   # the manager's run is no longer ours
                                 successor.append(fake.runner.session)
-                                if mac:                 # launchd: a pid under our registration is still ours
-                                    cm.supervisor_path(self.local).write_bytes(FOREIGN_PLIST)
                             with cm.agent_lock(str(self.root)), contextlib.redirect_stdout(io.StringIO()), \
                                     mock.patch.object(sm, "_run", side_effect=fake):
                                 line = cm.stop_started(self.local, str(self.root))
@@ -270,8 +300,9 @@ class UndoSeams:
                             self.assertFalse(STOPS & verbs)
                         else:
                             self.assertEqual(line, "")
-                            self.assertIsNotNone(ours.wait(timeout=30), "its own run exited")
-                            self.assertIn("bootout" if mac else "stop", verbs)
+                            self.assertIsNotNone(ours.wait(timeout=30), "its own run retired")
+                            self.assertEqual(fake.runner.respawns, 0)
+                            self.assertFalse(STOPS & verbs, "no step named the job to its manager")
                             self.assertNotIn(self.local.name, cm._STARTED)
                     finally:
                         self._done(fake)
@@ -279,43 +310,43 @@ class UndoSeams:
                                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                             cm.uninstall(self.local)
 
-    def test_a_launchd_run_respawned_under_our_registration_is_booted_out(self):
+    def test_a_run_that_ended_on_its_own_and_was_restarted_is_left_with_the_command(self):
         for how in ("connect", "install"):
-            for due in (True, False):
-                with self.subTest(how=how, throttle_due=due):
-                    fake, ended = self._real(True, f"respawn-{how}-{int(due)}"), []
-                    r = fake.runner
-                    r.throttle = 0.0 if due else 600.0
+            for name, mac in MANAGERS:
+                for due in (True, False):
+                    with self.subTest(how=how, manager=name, restart_due=due):
+                        fake, ended = self._real(mac, f"ended-{how}-{int(due)}"), []
+                        r = fake.runner
+                        r.throttle = 0.0 if due else 600.0
 
-                    def run_ended_then_refused(*a, **kw):
-                        ended.append(r.session.pid)
-                        os.kill(r.session.pid, signal.SIGTERM)  # the run ends; launchd answers per its throttle
-                        r.session.wait(timeout=30)
-                        if how == "install":
-                            raise OSError("bridge write failed")
-                        return "the bridge was refused"
-                    with mock.patch.object(cm, "is_macos", return_value=True), \
-                            mock.patch.object(cb, "wire_bridge", side_effect=run_ended_then_refused), \
-                            mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
+                        def run_ended_then_refused(*a, **kw):
+                            ended.append(r.session.pid)
+                            os.kill(r.session.pid, signal.SIGTERM)  # the run ends; its manager answers per policy
+                            r.session.wait(timeout=30)
+                            if how == "install":
+                                raise OSError("bridge write failed")
+                            return "the bridge was refused"
+                        with mock.patch.object(cm, "is_macos", return_value=mac), \
+                                mock.patch.object(cb, "wire_bridge", side_effect=run_ended_then_refused), \
+                                mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
+                            try:
+                                rc, out, err = self.connect(self.backend(), fake) if how == "connect" else \
+                                    self.install_seat(fake)
+                            except OSError:
+                                rc, out, err = 1, "", ""
+                            by_hand = cm.stop_command(self.local)
                         try:
-                            rc, out, err = self.connect(self.backend(), fake) if how == "connect" else \
-                                self.install_seat(fake)
-                        except OSError:
-                            rc, out, err = 1, "", ""
-                    try:
-                        self.assertTrue(ended, "the run ended before the undo")
-                        self.assertEqual(r.respawns, 1 if due else 0, "launchd respawned it only past its throttle")
-                        self.assertNotEqual(rc, 0, out + err)
-                        if how == "connect":
-                            self.assertIn("the job its install started, was stopped", err)
-                            self.assertNotIn("not provably", err)
-                        self.assertFalse(r.loaded, "the registration was booted out")
-                        self.assertIsNone(r.pid(), "and no run of it is left")
-                        self.assertTrue(all(p.poll() is not None for p in r.spawned))
-                        self.assertIn("bootout", after_start(fake))
-                        signalled.assert_not_called()
-                    finally:
-                        self._done(fake)
+                            self.assertTrue(ended, "the run ended before the undo")
+                            self.assertEqual(r.respawns, 1 if due else 0, "restarted only once its policy allows")
+                            self.assertNotEqual(rc, 0, out + err)
+                            if how == "connect":
+                                self.assertIn("is no longer the job this connect started", err)
+                                self.assertIn(by_hand, err, "what is left comes with the command that stops it")
+                            self.assertEqual(r.pid() is not None, due, "a restarted run is left, never stopped by name")
+                            self.assertFalse(STOPS & after_start(fake))
+                            signalled.assert_not_called()
+                        finally:
+                            self._done(fake)
 
     def test_a_launchd_registration_whose_plist_is_not_ours_is_left(self):
         for how in ("connect", "install"):
@@ -344,7 +375,7 @@ class UndoSeams:
                     self._done(fake)
                     cm.plist_path(self.local).unlink(missing_ok=True)
 
-    def test_a_failed_install_unwires_the_bridge_it_wired_and_only_that_one(self):
+    def test_a_failed_install_reports_the_bridge_it_wired_and_never_stops_it_by_name(self):
         bridge = cb.bridge_shape(self.local)
         for changed in (False, True):
             for name, mac in MANAGERS:
@@ -359,18 +390,19 @@ class UndoSeams:
                     with mock.patch.object(cm, "is_macos", return_value=mac), \
                             mock.patch.object(cm, "_holder_problem", side_effect=refused_after_the_wiring):
                         rc, out, err = self.install_seat(fake)
-                        wired, bridge_job = cm.supervisor_path(bridge).exists(), cm.job_name(bridge)
+                        wired, bridge_job, cm_stop = (cm.supervisor_path(bridge).exists(), cm.job_name(bridge),
+                                                      cm.stop_command(bridge))
                     try:
                         self.assertNotEqual(rc, 0, out + err)
                         self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned), "the session job stopped")
+                        self.assertTrue(wired, "the manager stops a bridge job only by name, so it is left")
+                        self.assertTrue(fake.active, "and still running")
+                        self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
                         if changed:
-                            self.assertTrue(wired, "a bridge unit with other bytes is left")
-                            self.assertTrue(fake.active, "and still running")
                             self.assertIn(f"{bridge_job} is no longer the unit this attempt wrote, so it was left", err)
                         else:
-                            self.assertFalse(wired, "the bridge unit this attempt wrote is removed")
-                            self.assertFalse(fake.active, "and its job stopped")
-                            self.assertIn(f"the bridge this attempt wired ({bridge_job}) was removed", err)
+                            self.assertIn(f"the bridge this attempt wired ({bridge_job}) is active and was left", err)
+                            self.assertIn(cm_stop, err, "with the command that stops it")
                     finally:
                         self._done(fake)
                         with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \
@@ -401,7 +433,7 @@ class UndoSeams:
                             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         cm.uninstall(self.local)
 
-    def test_a_launchd_registration_that_shows_no_pid_is_still_ours(self):
+    def test_a_launchd_job_that_shows_no_pid_is_left_with_the_command(self):
         fake = self._real(True, "late")
         r, blank, real = fake.runner, [10 ** 6], fake.runner.answer     # launchd never shows its pid
 
@@ -415,8 +447,8 @@ class UndoSeams:
             rc, out, err = self._fail("connect", fake, [])
         try:
             self.assertNotEqual(rc, 0, out + err)
-            self.assertLess(blank[0], 10 ** 6, "the undo read the job while it showed no pid")
-            self.assertIn("the job its install started, was stopped", err)
-            self.assertTrue(all(p.poll() is not None for p in r.spawned), "its run is gone")
+            self.assertLess(blank[0], 10 ** 6, "the start read the job while it showed no pid")
+            self.assertIn("showed no process within 5 s of this operation's start, so it is not this operation's", err)
+            self.assertFalse(STOPS & after_start(fake), "nothing named the job to its manager")
         finally:
             self._done(fake)

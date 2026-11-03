@@ -134,7 +134,8 @@ CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connec
              "print('install', cm.install(other.LOCAL, {}, %r), flush=True)\n"
              "print('launch', cm.launch_admission(%r)[1] or 'admitted', flush=True)")
 # The manager's start, as every Runner start does it: the production admission, then the root.
-LAUNCHED = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
+LAUNCHED = ("import os, signal, sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
+            "signal.signal(cm.RETIRE_SIGNAL, lambda *a: os._exit(75))\n"
             "install = %r\n"
             "if install: holder_lock.install_id = lambda: install\n"
             "fd, why = cm.launch_admission(sys.argv[1], wait_s=5)\n"
@@ -166,12 +167,14 @@ REAL_LAUNCHER = ("import os, subprocess, sys, time; sys.path.insert(0, %r)\n"
                  "    child.kill(); child.wait(); return 0\n"
                  "rc = cm.hold_and_supervise(LOCAL, root, state, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
                  "                           supervise, lambda c: (c.kill(), c.wait()), 'run', 'test')\n"
-                 "print('refused', rc, flush=True)")
+                 "rc = cm.retired(state, rc)\n"
+                 "print('refused', rc, flush=True); sys.exit(rc)")
 # launchd's shape: the job's pid is a shim whose child is the launcher; the stop signal is forwarded.
 SHIM = ("import signal, subprocess, sys\n"
         "child = subprocess.Popen([sys.executable, '-c', sys.argv[1]] + sys.argv[2:])\n"
         "signal.signal(signal.SIGTERM, lambda *a: child.terminate())\n"
-        "sys.exit(child.wait())")
+        "signal.signal(signal.SIGURG, lambda *a: child.send_signal(signal.SIGURG))\n"
+        "rc = child.wait(); sys.exit(0 if rc == 75 else rc if rc > 0 else 1)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -227,10 +230,13 @@ class Runner:
         self.pause, self.acted, self.shim, self.spawned, self.stop_timeout = "", "", False, [], 10
         self.keep_alive, self.loaded, self.throttle, self.started_at, self.respawns = False, False, 30.0, 0.0, 0
 
-    def respawn_if_due(self):
-        """launchd's KeepAlive, when `keep_alive` models it: a loaded job whose run ended is spawned again
-        once `throttle` has passed since that run started (at once for a run that lasted longer)."""
+    def respawn_if_due(self, launchd):
+        """The manager's restart policy, when `keep_alive` models it: a started job whose run ended other than
+        the policy's terminal exit (launchd's 0 under SuccessfulExit=false, systemd's RestartPreventExitStatus 75)
+        is spawned again once `throttle` has passed since that run started (at once for a longer run)."""
         if not (self.keep_alive and self.loaded and self.session is not None and self.session.poll() is not None):
+            return
+        if self.session.returncode == (0 if launchd else 75):
             return
         if time.monotonic() - self.started_at >= self.throttle:
             old, self.session = self.session, None
@@ -295,8 +301,7 @@ class Runner:
     def __call__(self, cmd, timeout=30):
         self.calls.append(list(cmd))
         verb = self.verb(cmd)
-        if cmd[0] == "launchctl":
-            self.respawn_if_due()
+        self.respawn_if_due(cmd[0] == "launchctl")
         loaded = (37, "", "Bootstrap failed: 37: Operation already in progress\n")   # launchd, on a loaded job
         held = self.alive() or (self.keep_alive and self.loaded)
         got = self.table[(cmd[0], verb)] if (cmd[0], verb) in self.table else \
@@ -306,8 +311,8 @@ class Runner:
         rc, out, err = got if isinstance(got, tuple) else (got, "", "exit %s" % got)
         if rc == 0 and verb in ("enable", "disable"):
             self.enabled = verb == "enable"
-        if rc == 0 and verb in ("bootstrap", "bootout"):
-            self.loaded = verb == "bootstrap"
+        if rc == 0 and verb in START_VERBS + STOP_VERBS:
+            self.loaded = verb in START_VERBS
         if self.root and rc == 0:
             if verb in START_VERBS and not (verb == "start" and self.alive()):     # start is a no-op when active
                 self.start_session(by_manager=True)
