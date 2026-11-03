@@ -26,8 +26,8 @@ from typing import Callable, Tuple
 from . import gateway_instance
 
 DISCOVERY_PATH = "/v1/mcp/discovery"
-# Claude Code gives a headersHelper 10 s in all; the bridge import takes ~1.5 s of it.
-HTTP_TIMEOUT_S = 4
+# Claude Code gives a headersHelper 10 s in all: the bridge import (~1.5 s) plus two calls fit.
+HTTP_TIMEOUT_S = 3
 USER_AGENT = "sutando-gateway-client/1.0"
 SERVER_NAME = "ag2-space"
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
@@ -89,11 +89,16 @@ def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[in
 
 
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
+    from .remote_gateway_bridge import _same_origin
     status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:
         detail = body.get("error") or "no detail"
         raise McpAuthError(f"MCP discovery answered {status} ({detail})")
-    return _safe_url("mint_url", body.get("mint_url")), _safe_url("mcp_url", body.get("mcp_url"))
+    mint_url = _safe_url("mint_url", body.get("mint_url"))
+    # The relay secret goes only to the relay's own origin, as the bridge's own mint does.
+    if not _same_origin(mint_url, relay_url):
+        raise McpAuthError("mint_url is not on the relay's origin; the relay token is not sent there")
+    return mint_url, _safe_url("mcp_url", body.get("mcp_url"))
 
 
 def mint(mint_url: str, bearer: str) -> str:
@@ -126,7 +131,14 @@ def _helper_command(env_file: str) -> str:
     root = Path(__file__).resolve().parents[1]
     if root.is_file():  # running from the zipapp
         parts.append(f"PYTHONPATH={shlex.quote(str(root))}")
-    parts += [shlex.quote(sys.executable), "-m", "ag2_sparrow.mcp_auth", "headers"]
+        parts += [shlex.quote(sys.executable), "-m", "ag2_sparrow.mcp_auth", "headers"]
+        return " ".join(parts)
+    # The console script, not `python -m`: -m puts the client's cwd first on sys.path.
+    script = Path(sys.executable).with_name("ag2-sparrow-mcp")
+    if script.is_file():
+        parts += [shlex.quote(str(script)), "headers"]
+    else:
+        parts += [shlex.quote(sys.executable), "-m", "ag2_sparrow.mcp_auth", "headers"]
     return " ".join(parts)
 
 

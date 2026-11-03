@@ -140,6 +140,18 @@ class HeadersTest(unittest.TestCase):
         self.assertIn("mint_url", err)
         self.assertEqual([m for m, *_ in self.stub.seen], ["GET"])
 
+    def test_a_foreign_origin_mint_url_is_refused_with_nothing_sent(self):
+        # A discovery that names another https host must not receive the relay secret.
+        for mint_url in ("https://evil.example/mint", f"{self.stub.base}x/mint",
+                         self.stub.base.replace("127.0.0.1", "localhost") + "/mint"):
+            self.stub.seen.clear()
+            self.stub.discovery = (200, {"mint_url": mint_url, "mcp_url": "https://mcp.example/mcp"})
+            rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
+            self.assertEqual((rc, out), (1, ""), mint_url)
+            self.assertIn("relay's origin", err)
+            self.assertEqual([m for m, *_ in self.stub.seen], ["GET"], mint_url)
+            self.assertNotIn(SECRET, err)
+
     def test_unconfigured_discovery_fails_with_nothing_on_stdout(self):
         self.stub.discovery = (404, {"error": "mcp discovery not configured"})
         rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
@@ -253,6 +265,15 @@ class HelperCommandTest(unittest.TestCase):
             cmd = mcp_auth._helper_command("")
         self.assertIn(f"PYTHONPATH={os.path.realpath(pyz)} ", cmd)
         self.assertNotIn("AG2_DEVICE_ENV", cmd)
+
+    def test_an_installed_package_launches_the_console_script_not_python_m(self):
+        bindir = tempfile.mkdtemp(prefix="mcp-bin-")
+        script = os.path.join(bindir, "ag2-sparrow-mcp")
+        open(script, "w").close()
+        with mock.patch.object(mcp_auth.sys, "executable", os.path.join(bindir, "python3")):
+            cmd = mcp_auth._helper_command("")
+        self.assertEqual(cmd, f"{script} headers")
+        self.assertNotIn(" -m ", cmd)
 
     def test_an_installed_package_needs_no_pythonpath(self):
         self.assertNotIn("PYTHONPATH", mcp_auth._helper_command("/e/.env"))
