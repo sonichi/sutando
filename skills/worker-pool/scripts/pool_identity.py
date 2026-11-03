@@ -24,9 +24,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
-for _p in (str(_HERE), str(_REPO / "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
 import connections
 import pool_roster as pr

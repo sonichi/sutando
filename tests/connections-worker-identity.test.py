@@ -191,6 +191,9 @@ class CoreLookups(Base):
         self.assertEqual(C.lane_worker("nope", self.ws), "")
         self.assertEqual(C.worker_identity(W, self.ws)["instance"], WORKER_INST)
         self.assertIsNone(C.worker_identity("b" * 32, self.ws))
+        C.record_path(self.ws).write_text("{not json")
+        self.assertIsNone(C.worker_identity(W, self.ws), "an unreadable record names no identity")
+        self.assertEqual(C.lane_worker(WORKER_INST, self.ws), "")
 
     def test_its_launch_runs_as_its_own_agent_without_the_proactive_room(self):
         entry = C.plan_entry(WORKER_INST, {}, workspace=self.ws)
@@ -235,6 +238,15 @@ class Lifecycle(Base):
             self.assertEqual(pool_manage._retire_identity(self.ws, W)["result"], "removed")
             self.assertEqual(pool_manage._retire_identity(self.ws, W), {"result": "none"})
         self.assertIsNone(C.worker_identity(W, self.ws))
+
+    def test_pool_manage_retire_reports_a_failed_retirement(self):
+        import pool_manage
+
+        def refuse(*a, **kw):
+            raise C.SchemaError("record unreadable")
+        with unittest.mock.patch.object(C, "retire_worker_identity", refuse):
+            out = pool_manage._retire_identity(self.ws, W)
+        self.assertEqual((out["result"], out["why"]), ("failed", "SchemaError: record unreadable"))
 
 
 def _load_shim():
@@ -291,6 +303,9 @@ class TheLane(unittest.TestCase):
         self.assertEqual(h.get("requested_worker"), W)
         _, h = self.queued("task-w2", requested_worker="b" * 32)
         self.assertEqual(h.get("requested_worker"), W, "the lane's own worker wins over the gateway's copy")
+        self.rgb.TASK_ADDRESSEE = lambda: ""
+        _, h = self.queued("task-w4")
+        self.assertIsNone(h.get("requested_worker"), "no addressee on either side writes no field")
         nudge = self.tmp / "results" / "proactive-1.txt"
         nudge.write_text(f"[room: {ROOM}]\nfrom the core\n")
         self.assertFalse(self.rgb.PROACTIVE_CLAIM_GATE(nudge))
@@ -357,6 +372,75 @@ class OwnerCommand(Base):
         self.assertIn("refused (worker_identity_shared)", err)
         with self.assertRaises(SystemExit):
             self.run_cmd("show", "Nobody")
+
+    def add_args(self, *extra):
+        return ("add", "Reviewer", *extra, "--repo", str(self.ws), "--logs-dir", str(self.ws))
+
+    def test_add_asks_before_saving_and_reports_a_lane_that_did_not_start(self):
+        rc, _, err = self.run_cmd(*self.add_args("-", "--yes"), stdin=TOKEN_W)
+        self.assertEqual(rc, 2)
+        self.assertIn("--yes needs --expected-server", err)
+        with unittest.mock.patch("builtins.input", lambda prompt: "n"):
+            rc, out, _ = self.run_cmd(*self.add_args(TOKEN_W))
+        self.assertEqual(rc, 1)
+        self.assertIn(f"agent:   {WORKER_AGENT}", out)
+        self.assertIn("token:   accepted", out)
+        self.assertNotIn("secret-reviewer", out)
+        self.assertIn("not saved", out)
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        with unittest.mock.patch("getpass.getpass", lambda prompt: TOKEN_W), \
+                unittest.mock.patch("builtins.input", lambda prompt: "y"), \
+                unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": False, "reason": "no python"}):
+            rc, _, err = self.run_cmd(*self.add_args())
+        self.assertEqual(rc, 1)
+        self.assertIn("not started: no python", err)
+        self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], WORKER_AGENT)
+
+    def test_preview_text_names_an_unverified_server_and_its_error(self):
+        text = self.pi.preview_text({"server": "x.net", "verified": False, "authenticated": False, "error": "boom"})
+        self.assertIn("x.net  (unverified)", text)
+        self.assertIn("the gateway did not name one agent", text)
+        self.assertIn("token:   REJECTED", text)
+        self.assertIn("error:   boom", text)
+
+    def test_show_rotate_and_remove_without_an_identity_then_rotate_with_one(self):
+        rc, out, _ = self.run_cmd("show", "Reviewer")
+        self.assertEqual(rc, 1)
+        self.assertIn("no agent of its own", out)
+        rc, _, err = self.run_cmd("rotate", "Reviewer", "-", "--repo", str(self.ws), "--logs-dir", str(self.ws))
+        self.assertEqual(rc, 1)
+        self.assertIn("no agent of its own to rotate", err)
+        rc, out, _ = self.run_cmd("remove", "Reviewer")
+        self.assertEqual(rc, 0)
+        self.assertIn("has no agent of its own", out)
+        self.run_cmd(*self.add_args("-", "--yes", "--expected-server", "alpha-fixture.net"), stdin=TOKEN_W)
+        real = C.update_token
+        new = "https://chat.alpha-fixture.net|secret-reviewer-2"
+
+        def update(instance, token, **kw):
+            return real(instance, token, vault=self.vault, spawn=lambda *a: H.DEAD_PID, kill=lambda *a: None,
+                        environ={}, fetch=H.agents(WORKER_AGENT), **kw)
+        with unittest.mock.patch.object(C, "update_token", update):
+            rc, out, _ = self.run_cmd("rotate", "Reviewer", "-", "--repo", str(self.ws), "--logs-dir", str(self.ws),
+                                      stdin=new)
+        self.assertEqual(rc, 0)
+        self.assertIn(f"rotated {WORKER_INST}", out)
+        self.assertEqual(self.vault.store[C.worker_identity(W, self.ws)["token_ref"]], new)
+
+    def test_an_ambiguous_label_and_an_unreadable_record(self):
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "bindings": {}, "workers": {W: {"state": "live", "label": "Reviewer"},
+                                                        "b" * 32: {"state": "live", "label": "Reviewer"}}}))
+        rc, _, err = self.run_cmd("show", "Reviewer")
+        self.assertEqual(rc, 2, err)
+        self.assertTrue(err.startswith("pool_identity: "), err)
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "workers": {W: {"state": "live", "label": "Reviewer"}}, "bindings": {}}))
+        C.record_path(self.ws).write_text("{not json")
+        rc, _, err = self.run_cmd(*self.add_args("-", "--yes", "--expected-server", "alpha-fixture.net"),
+                                  stdin=TOKEN_W)
+        self.assertEqual(rc, 1)
+        self.assertTrue(err.startswith("pool_identity: "), err)
 
 
 if __name__ == "__main__":
