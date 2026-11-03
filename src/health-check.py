@@ -68,6 +68,7 @@ from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
+import wedge_probes  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -6760,21 +6761,21 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
         # half-written file caught between os.write() syscalls. Fall through
         # to ok so the next tick sees a (re-)written status.
         return {"name": name, "status": "ok", "detail": f"core-status.json unreadable: {str(e)[:60]}"}
-    state = data.get("status")
-    ts = data.get("ts")
+    state = data.get("status") if isinstance(data, dict) else None
+    ts = data.get("ts") if isinstance(data, dict) else None
     if state != "running":
         return {"name": name, "status": "ok", "detail": f"status={state}"}
-    if not isinstance(ts, (int, float)):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return {"name": name, "status": "ok", "detail": "running, no ts"}
-    age = int(time.time() - ts)
-    if age > threshold_sec:
-        step = data.get("step", "?")
+    now = time.time()
+    stale = wedge_probes.core_status_verdict(data, now, threshold_sec)  # the wedge detector's rule too
+    if stale:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"running for {age}s on '{step}' — last heartbeat > {threshold_sec}s ago",
+            "detail": f"running for {stale['age']}s on '{stale['step']}' — last heartbeat > {threshold_sec}s ago",
         }
-    return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
+    return {"name": name, "status": "ok", "detail": f"running ({int(now - ts)}s ago)"}
 
 
 def check_core_supervisor() -> dict:
@@ -6811,7 +6812,7 @@ def check_core_supervisor() -> dict:
     prompt = data.get("prompt")
     if prompt:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
-    needs_user = {"blocked-human", "logged-out"}
+    needs_user = wedge_probes.NEEDS_USER
     degraded = {"crashed", "hung", "gateway-down"}
     # `gateway-down` means "core up, relay gateway not running". On a host with no
     # gateway configured that is the DESIGNED state — startup.sh never launches the

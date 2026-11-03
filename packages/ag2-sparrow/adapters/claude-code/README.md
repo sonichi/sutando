@@ -193,7 +193,16 @@ as its result, which the bridge delivers to that room. A task file with no
 writes one on every task, in `remote_gateway_bridge._write_task`); the shared
 resolver's "no tier means owner" is not relied on here. `install
 --allow-non-owner` (persisted in the config, shown by `verify`, off by default)
-submits non-owner tasks as data, each carrying the shared
+submits team and guest tasks without collaborator access as data. `install
+--allow-collaborator` (the same: persisted, shown by `verify`, off by default)
+submits an attested collaborator's task (the team tier with the broker's
+`collaborator: true`), as the relay loop and the routine and cloud-session
+adapters gate it; `--allow-non-owner` does not imply it. Unlike those adapters,
+which answer a collaborator on an isolated read-only turn, this one submits it
+into the owner's session: the session holds the owner's history, tools and
+credentials with permission prompts off, and the note below is the only guard.
+An isolated collaborator turn here is follow-up work. Each submitted non-owner
+task carries the shared
 `ag2_sparrow.task_io.NON_OWNER_NOTE`, the one policy text every adapter renders
 (pinned in `register.ts`; a CI test holds it byte-identical to the shared owner):
 
@@ -717,8 +726,9 @@ mtime delta.
   machine is the owner's path meanwhile.
 - On macOS the launchd user agent stops at logout; on Linux `install` asks
   for linger.
-- `--allow-non-owner` hands team and guest text to a session running under
+- With `--allow-collaborator` an attested collaborator's text, and with
+  `--allow-non-owner` any other team or guest text, reaches a session running under
   `bypassPermissions` (the default mode): the only guard between that text and
   every tool, file and credential the session can reach is the
-  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn it on only for
-  rooms whose members you would let type into that session yourself.
+  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn either flag
+  on only for people and rooms you would let type into that session yourself.
