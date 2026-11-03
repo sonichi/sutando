@@ -57,7 +57,7 @@ from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
-from ag2space_links import app_origin_for, database_link
+from ag2space_links import database_link
 from workspace_default import status_path
 from owner_room_access import agent_identity, capability_scripts, channel_credentials, owner_dm, owner_routing
 from owner_room_access import resolve_credentials as _credentials
@@ -107,25 +107,11 @@ def configured_room(workspace: Path, environ) -> str:
     return room
 
 
-def db_link(origin: str, room: str, db: str) -> Optional[str]:
+def db_link(room: str, db: str) -> Optional[str]:
     """The database's page in the room, as the app opens it; None when origin or room is unusable."""
     try:
-        return database_link(origin, room, db)
+        return database_link(room, db)
     except ValueError:
-        return None
-
-
-def _db_link(scripts: Path, room: str, url_override: str) -> Optional[str]:
-    """Use the room server's app, falling back to the capability URL for unknown servers."""
-    try:
-        origin = app_origin_for(room)
-        if not origin:
-            if str(scripts) not in sys.path:
-                sys.path.insert(0, str(scripts))
-            from room_collab import resolve_url  # noqa: PLC0415 — the injected capability
-            origin = resolve_url(url_override or None)
-        return db_link(origin, room, DB_SCHEMA["id"])
-    except Exception:  # noqa: BLE001 — a link is a convenience, never a precondition
         return None
 
 
@@ -153,7 +139,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0, collab_url:
         argv += ["--collab-url", url_override]
     return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's {'room' if shared else 'DM room'} {room}",
                        lock=status_path("pending-questions-db.lock", Path(workspace)), host=host_label(),
-                       link=_db_link(scripts, room, url_override)), room
+                       link=db_link(room, DB_SCHEMA["id"])), room
 
 
 # ---- the reader -------------------------------------------------------------------
@@ -590,7 +576,7 @@ async def _serve(args, req: dict) -> object:
     cap = _load_capability(args.skill_scripts)
     from room_collab_client import open_room_collab  # noqa: PLC0415
     url, token = _credentials(cap, args.collab_url or None, args.room)
-    link = db_link(url, args.room, req["schema"]["id"])
+    link = db_link(args.room, req["schema"]["id"])
     async with open_room_collab(url, args.room, token, kind="db") as doc:
         result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)
         await doc.settle(SETTLE_SEC)

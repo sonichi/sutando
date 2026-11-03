@@ -12,7 +12,6 @@ import re
 import subprocess
 import sys
 import unittest
-import types
 from pathlib import Path
 from unittest import mock
 
@@ -33,7 +32,7 @@ pq = _load("pq_room_db_links", "skills/pending-questions/scripts/pending_questio
 
 
 class TestShapes(unittest.TestCase):
-    def test_app_origin_uses_registered_gateway_without_network(self):
+    def test_app_origin_uses_registered_app_without_network(self):
         with mock.patch.object(links.dotspace, "default_fetch", side_effect=AssertionError("network")):
             for room, expected in (("!r:s.space", "https://chat.s.space"),
                                    ("!r:ag2.space", "https://chat.ag2.space"),
@@ -44,7 +43,7 @@ class TestShapes(unittest.TestCase):
 
     def test_app_origin_delegates_to_dotspace_registry(self):
         instance = links.dotspace.DotSpace(server="custom.example", operator="ag2",
-                                           gateway_host="app.custom.example")
+                                           gateway_host="relay.custom.example", app_origin="https://app.custom.example")
         with mock.patch.object(links.dotspace, "dotspace_for", return_value=instance) as resolve:
             self.assertEqual(links.app_origin_for("!r:custom.example"), "https://app.custom.example")
         resolve.assert_called_once_with("custom.example", fetch=links.dotspace.NO_FETCH)
@@ -55,27 +54,27 @@ class TestShapes(unittest.TestCase):
         self.assertEqual(links.room_link("!r:ag2.space", via=""), "https://matrix.to/#/!r:ag2.space")
 
     def test_a_surface_link_is_the_home_route_with_the_room_encoded(self):
-        self.assertEqual(links.surface_link("https://chat.ag2.space/", "!abc:ag2.space", "doc", "readme"),
+        self.assertEqual(links.surface_link("!abc:ag2.space", "doc", "readme"),
                          "https://chat.ag2.space/home/!abc%3Aag2.space?surface=doc&page=readme")
-        self.assertEqual(links.surface_link("https://chat.ag2.space/relay", "#a/b:ag2.space", "database"),
+        self.assertEqual(links.surface_link("#a/b:ag2.space", "database"),
                          "https://chat.ag2.space/home/%23a%2Fb%3Aag2.space?surface=database")
 
     def test_a_surface_link_is_never_the_hash_room_route(self):
-        self.assertNotIn("#/room/", links.surface_link("https://chat.ag2.space", "!abc:ag2.space", "database"))
+        self.assertNotIn("#/room/", links.surface_link("!abc:ag2.space", "database"))
 
     def test_a_database_page_rides_only_in_the_shape_the_app_reads(self):
-        self.assertEqual(links.database_link("https://x.test", "!r:x.test", "d1ab"),
+        self.assertEqual(links.database_link("!r:x.test", "d1ab", origin="https://x.test"),
                          "https://x.test/home/!r%3Ax.test?surface=database&page=d1ab")
-        self.assertEqual(links.database_link("https://x.test", "!r:x.test", "pendingq"),
+        self.assertEqual(links.database_link("!r:x.test", "pendingq", origin="https://x.test"),
                          "https://x.test/home/!r%3Ax.test?surface=database&page=pendingq")
         for bad in ("a|b", "-x", "a/b", "x" * 65):
-            self.assertEqual(links.database_link("https://x.test", "!r:x.test", bad),
+            self.assertEqual(links.database_link("!r:x.test", bad, origin="https://x.test"),
                              "https://x.test/home/!r%3Ax.test?surface=database", bad)
 
     def test_an_unusable_origin_or_room_is_refused(self):
         for origin, room in (("chat.ag2.space", "!r:x"), ("https://x.test", "r:x"), ("https://x.test", "!r")):
             with self.assertRaises(ValueError):
-                links.surface_link(origin, room, "database")
+                links.surface_link(room, "database", origin=origin)
 
 
 class TestModuleSurface(unittest.TestCase):
@@ -111,24 +110,20 @@ class TestCallersDelegate(unittest.TestCase):
 
     def test_pending_questions_link_is_database_link(self):
         with mock.patch.object(pq, "database_link", return_value="L") as dl:
-            self.assertEqual(pq.db_link("https://x.test", "!r:x", "pendingq"), "L")
-        dl.assert_called_once_with("https://x.test", "!r:x", "pendingq")
-        self.assertIsNone(pq.db_link("not-a-url", "!r:x", "pendingq"))
+            self.assertEqual(pq.db_link("!r:x", "pendingq"), "L")
+        dl.assert_called_once_with("!r:x", "pendingq")
+        self.assertIsNone(pq.db_link("!r:x", "pendingq"))
 
-    def test_pending_questions_uses_the_rooms_app_before_collab_fallback(self):
+    def test_pending_questions_uses_room_registry_and_unknown_has_no_link(self):
         for server, origin in (("s.space", "https://chat.s.space"),
                                ("ag2.space", "https://chat.ag2.space"),
-                               ("unknown.example", "https://collab.example")):
+                               ("dev.s.space", "https://dev-chat.s.space")):
             with self.subTest(server=server):
-                resolve = mock.Mock(return_value="https://collab.example/relay")
-                capability = types.SimpleNamespace(resolve_url=resolve)
-                with mock.patch.dict(sys.modules, {"room_collab": capability}):
-                    self.assertEqual(pq._db_link(REPO / "src", f"!room:{server}", "override"),
-                                     f"{origin}/home/!room%3A{server}?surface=database&page=pendingq")
-                if server == "unknown.example":
-                    resolve.assert_called_once_with("override")
-                else:
-                    resolve.assert_not_called()
+                self.assertEqual(pq.db_link(f"!room:{server}", "pendingq"),
+                                 f"{origin}/home/!room%3A{server}?surface=database&page=pendingq")
+        self.assertIsNone(pq.db_link("!room:unknown.example", "pendingq"))
+        with self.assertRaises(ValueError):
+            links.database_link("!room:unknown.example", "pendingq")
 
     def test_no_other_module_builds_an_app_link(self):
         rx = r"matrix\.to/#/|/#/room/|[?&]surface=|surface=db"
