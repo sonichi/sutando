@@ -14,7 +14,8 @@ owner's claim and settles as a duplicate once it appears; past the wait it claim
 message the owner never receives is still answered once.
 
 Claims expire after `TTL_S` and expired rows are pruned on each claim. A task without a
-`source_message_id`, or a hook or Summon task, is never deduped. Any store failure (unwritable
+`source_message_id` is never deduped; a hook or Summon task dedupes on its own fire or Summon,
+never on a message id, and is delivered when that identity is missing. Any store failure (unwritable
 directory, malformed or locked database) fails OPEN: the task is delivered and one warning
 line is logged per distinct failure, because a missed duplicate is better than a dropped
 message.
@@ -41,12 +42,30 @@ def lane_label(lane: str) -> str:
     return lane or "primary"
 
 
+def _context_identity(task: Mapping[str, object]) -> "tuple[bool, Optional[str]]":
+    """(is a Commons context task, its lane-independent identity or None).
+
+    A hook fire is its fire_id; a Summon is the backend's summon key (room, database, row, update).
+    Neither includes the agent, unlike the broker task id, so each lane's copy of one fire shares it."""
+    hook, summon = task.get("hook"), task.get("summon")
+    if not hook and not summon:
+        return False, None
+    if isinstance(hook, Mapping):
+        fire = str(hook.get("fire_id") or "").strip()
+        return True, f"hook\n{fire}" if fire else None
+    if isinstance(summon, Mapping):
+        parts = [str(summon.get(k) if summon.get(k) is not None else "").strip()
+                 for k in ("room_id", "database", "row_id", "update_id")]
+        return True, "summon\n" + "|".join(parts) if all(parts) else None
+    return True, None
+
+
 def key_of(task: Mapping[str, object]) -> Optional[str]:
     """The event a broker task answers, or None when the task must never be deduped."""
-    # A Commons context task (a hook fire or a Summon) answers a row change, not a message: its
-    # identity is its own fire/summon key, so a message id it carries must not fold it into another task.
-    if task.get("hook") or task.get("summon"):
-        return None
+    context, identity = _context_identity(task)
+    if context:
+        # One task per fire or Summon across lanes; a message id it carries never folds it into another task.
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest() if identity else None
     message_id = str(task.get("source_message_id") or "").strip()
     if not message_id:
         return None
