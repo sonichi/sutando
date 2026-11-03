@@ -356,7 +356,7 @@ export async function targetRoom(name: string | undefined, deps: ReadRoomDeps): 
 export function mcpFailure(why: string): 'timeout' | 'no_credential' | 'credential_refused' | 'unavailable' {
 	if (/timed out/.test(why)) return 'timeout';
 	if (/no registry bearer/.test(why)) return 'no_credential';
-	if (/\bAGENT_CREDENTIAL_[A-Z_]+\b|authentication failed after re-mint/.test(why)) return 'credential_refused';
+	if (/\bbearer rejected \(AGENT_CREDENTIAL_[A-Z_]+\b|authentication failed after re-mint/.test(why)) return 'credential_refused';
 	return 'unavailable';
 }
 

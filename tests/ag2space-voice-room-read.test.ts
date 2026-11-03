@@ -235,6 +235,7 @@ describe('the room index: the rooms the agent can read, with their real names', 
 		// A code-less 401 is a wrong endpoint, not a refused credential.
 		assert.equal(mcpFailure("room.list: AG2 MCP could not obtain a token (no call was made): mint: 401 without a `code` field — x is not core-api's mint endpoint (wrong mint_url), not a bad bearer"), 'unavailable');
 		assert.equal(mcpFailure('ag2-space MCP exited (1)'), 'unavailable');
+		assert.equal(mcpFailure('upstream mentioned AGENT_CREDENTIAL_REVOKED after dispatch'), 'unavailable');
 	});
 
 	it('list_rooms reports a missing credential as no_credential, not unavailable', async () => {
@@ -605,6 +606,10 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(noBearer.client, [])), { ok: false, error: 'no_credential' });
 		const revoked = fake(() => new Error('room.action.execute: mint: bearer rejected (AGENT_CREDENTIAL_REVOKED, not recoverable)'));
 		assert.deepEqual(await sendMessage({ room: '!a:x', text: 'hi' }, deps(revoked.client, [])), { ok: false, error: 'credential_refused' });
+		const mentioned = fake(() => new Error('upstream mentioned AGENT_CREDENTIAL_REVOKED after dispatch'));
+		const ambiguous = await sendMessage({ room: '!a:x', text: 'hi' }, deps(mentioned.client, []));
+		assert.equal((ambiguous as { error: string }).error, 'outcome_unknown');
+		assert.equal(typeof (ambiguous as { operation_id?: string }).operation_id, 'string');
 		const broke = fake(() => new Error('ag2-space MCP exited (1)'));
 		const r = await sendMessage({ room: '!a:x', text: 'hi' }, deps(broke.client, []));
 		assert.equal((r as { error: string }).error, 'outcome_unknown');

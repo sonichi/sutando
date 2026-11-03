@@ -292,7 +292,8 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
                 return {"ensured": False, "conflict": True, "plist": legacy["plist"],
                         "why": "legacy timer is installed but not loaded; "
                                "run an explicit install to migrate it"}
-            if st.get("loaded"):
+            want = prt.stop_interrupt_setting()
+            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):
                 return {"ensured": False, "why": "already installed",
                         "plist": st["plist"], "label": st["label"]}
 

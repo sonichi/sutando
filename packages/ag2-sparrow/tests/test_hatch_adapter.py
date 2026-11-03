@@ -220,7 +220,7 @@ class Base(unittest.TestCase):
         self.bin = self.home / "bin"
         self.bin.mkdir()
         executable(self.bin / "flock", "#!/bin/sh\nexit 0\n")
-        executable(self.bin / "timeout", '#!/bin/sh\nshift\nexec "$@"\n')
+        executable(self.bin / "timeout", '#!/bin/sh\n[ "$1" = -k ] && shift 2\nshift\nexec "$@"\n')
         # Stands in for the console script pip installs; only PATH finds it here.
         self.reply_stub = self.bin / hatch_cli.REPLY_COMMAND
         executable(self.reply_stub, "#!/bin/sh\nexit 0\n")
@@ -271,6 +271,9 @@ class Base(unittest.TestCase):
 class HookScript(Base):
     def setUp(self):
         super().setUp()
+        self.hook_setup()
+
+    def hook_setup(self):
         (self.home / "runtime.sh").write_text(RUNTIME)
         self.config = self.home / "config"
         self.sparrow_state = self.home / "sparrow_state"
@@ -867,6 +870,110 @@ class HookScript(Base):
         self.assertEqual(second["snippet"], broken)
         self.run_script()
         self.assertNotIn("reply_context", self.payload()["worker_note"])
+
+
+TIMEOUT_CALL = re.compile(r"\btimeout(?: -k (\d+))? (\d+) ")
+# Seconds the hook keeps outside its bounded steps for jq, the state write and the wake.
+UNBOUNDED_MARGIN_S = 6
+
+
+class HookTimeBudget(Base):
+    """The bounded steps fit the scheduler's script timeout, a child that ignores SIGTERM
+    still dies, and no child keeps the hook's lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.hook_setup()
+
+    hook_setup = HookScript.hook_setup
+    sparrow_status = HookScript.sparrow_status
+    run_script = HookScript.run_script
+    events_list = HookScript.events_list
+
+    def test_worst_case_of_the_bounded_steps_fits_the_script_timeout(self):
+        calls = TIMEOUT_CALL.findall(SCRIPT.read_text())
+        self.assertEqual(len(calls), 3, calls)
+        self.assertTrue(all(k for k, _ in calls), f"every timeout needs -k: {calls}")
+        worst = sum(int(k) + int(t) for k, t in calls)
+        limit = json.loads((HATCH / "hook-definition.json").read_text())["script_timeout_secs"]
+        self.assertLessEqual(worst + UNBOUNDED_MARGIN_S, limit, calls)
+
+    def real_tools(self):
+        for stub in ("timeout", "flock"):
+            (self.bin / stub).unlink()
+        missing = [t for t in ("timeout", "flock") if shutil.which(t, path=os.environ["PATH"]) is None]
+        if missing:
+            self.skipTest(f"needs {', '.join(missing)} on PATH")
+
+    def fake_python(self, body):
+        fake = self.bin / "fakepy"
+        executable(fake, "#!/bin/bash\n" + body)
+        self.config.write_text(self.config.read_text().replace(
+            f"SPARROW_PYTHON={sys.executable}", f"SPARROW_PYTHON={fake}"))
+
+    def lock_is_free(self):
+        import fcntl
+        with open(self.home / "hooks" / "state" / "ag2-sparrow-hatch.lock", "w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            return True
+
+    def kill_on_cleanup(self, pid_file):
+        def reap():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        self.addCleanup(reap)
+
+    def test_a_child_that_ignores_sigterm_is_killed_and_the_lock_released(self):
+        self.real_tools()
+        pid_file = self.home / "child.pid"
+        self.kill_on_cleanup(pid_file)
+        self.fake_python(f"trap '' TERM\necho $$ >{pid_file}\nwhile :; do sleep 1; done\n")
+        step = max(int(k or 0) + int(t) for k, t in TIMEOUT_CALL.findall(SCRIPT.read_text()))
+        env = py_env(self.home)
+        env.update({"PATH": f"{self.bin}:{os.environ['PATH']}",
+                    "HATCH_HOOK_RUNTIME": str(self.home / "runtime.sh"),
+                    "SPARROW_HATCH_CONFIG": str(self.config), "STATE_FILE": str(self.state),
+                    "EVENTS": str(self.events), "WAKE_OUT": str(self.wake_out)})
+        start = time.monotonic()
+        proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc.wait(timeout=step + 10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            self.fail(f"the hook outlived its {step}s step bound: the child survived SIGTERM")
+        self.assertLess(time.monotonic() - start, step + 5)
+        self.assertIn("SILENT", self.events_list())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+        self.assertTrue(self.lock_is_free())
+
+    def test_a_child_that_outlives_the_hook_does_not_hold_its_lock(self):
+        self.real_tools()
+        pid_file = self.home / "escaped.pid"
+        self.kill_on_cleanup(pid_file)
+        escape = (
+            "import os, sys, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    fd = os.open(os.devnull, os.O_RDWR)\n"
+            "    for n in (0, 1, 2): os.dup2(fd, n)\n"
+            f"    open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    os._exit(0)\n")
+        self.fake_python(
+            f'if [ "$2" = ag2_sparrow.adapters.hatch.task_fields ]; then\n'
+            f"  {sys.executable} -c {shlex.quote(escape)}\n"
+            f"  while [ ! -s {pid_file} ]; do sleep 0.05; done\n"
+            f"fi\nexec {sys.executable} \"$@\"\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.kill(int(pid_file.read_text()), 0)
+        self.assertTrue(self.lock_is_free(), "a child the hook started still holds fd 9")
 
 
 class TaskFields(Base):
@@ -4958,7 +5065,7 @@ class DocumentedCommands(unittest.TestCase):
         shipped = runtime_text.builtin()
         self.assertEqual(shipped["worker_note"], note("REMAINING_WORK_NOTE"))
         # task_io owns the non-owner policy: the hook reads it and the built-in text is it.
-        self.assertIn('NON_OWNER_NOTE="$(timeout 10 "$PY" -m ag2_sparrow.task_io --non-owner-note',
+        self.assertIn('NON_OWNER_NOTE="$(timeout -k 1 4 "$PY" -m ag2_sparrow.task_io --non-owner-note',
                       script)
         self.assertEqual(shipped["tier_notes"], [task_io.non_owner_note()])
         raw = json.loads((HATCH / "builtin-runtime-text.json").read_text())

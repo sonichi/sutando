@@ -49,6 +49,9 @@ from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_hold
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
 EXIT_RETRY = 76         # an operation held the agent lock past admission: the manager restarts later
+# Asks one launcher run to end for good (exit EXIT_HELD, which neither manager restarts). Ignored by default,
+# so a run that has not installed its handler yet is not killed (and restarted): the request is repeated.
+RETIRE_SIGNAL = signal.SIGURG
 EXIT_UNUSABLE = 2
 EXIT_CHILD_HELD = 1     # a child's own 75 is reported as this, so 75 means only "another holder"
 TERM_GRACE_S = 15.0
@@ -94,6 +97,9 @@ class Shape:
     keep_alive_on_success: "bool | None" = None
     manager_timeout_s: int = RUN_TIMEOUT_S
     service_args: tuple = ("run",)      # systemd's ExecStart arguments
+    # (root, holder record) -> the launcher pid whose run spawned that holder outside its own process
+    # tree (a tmux pane), proven from the shape's records; None when it cannot be proven.
+    holder_launcher: object = None
     writer: str = ""        # the install that writes the unit, when it is not `command`'s own
 
     @property
@@ -492,13 +498,22 @@ def stop_command(shape: Shape) -> str:
     return f"systemctl --user stop {shape.service_name}"
 
 
-def start_supervisor(shape: Shape, restart: bool = True) -> str:
+def _now_us() -> int:
+    return int(time.monotonic() * 1_000_000)
+
+
+def start_supervisor(shape: Shape, restart: bool = True, seen: "dict | None" = None) -> str:
     """Register and start the unit on disk: '' when the manager accepted, else why not. Never readiness.
-    restart=False only starts it if inactive (systemd `start`; launchd's bootstrap of a loaded job is a no-op)."""
+    restart=False only starts it if inactive (systemd `start`; launchd's bootstrap of a loaded job is a no-op).
+    `seen` gets what the call itself did: 'by_call' (launchd: its bootstrap loaded the job; systemd: the
+    start verb succeeded) and the monotonic clocks around that verb ('t0'/'t1', µs)."""
     path = supervisor_path(shape)
+    seen = {} if seen is None else seen
     if is_macos():
         log_path(shape).parent.mkdir(parents=True, exist_ok=True)
+        seen.update(t0=_now_us())
         r = _sm._run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
+        seen.update(by_call=_ok(r), t1=_now_us())
         return "" if _ok(r) or (not restart and agent_loaded(shape) == "active") else \
             f"launchctl bootstrap failed ({_why(r)})"
     if not _sm.systemd_user_available():
@@ -509,7 +524,12 @@ def start_supervisor(shape: Shape, restart: bool = True) -> str:
                       (f"restart {unit}", lambda: _sm._systemctl(("--user", "restart"), unit=unit, timeout=bound))
                       if restart else
                       (f"start {unit}", lambda: _sm._systemctl(("--user", "start"), unit=unit, timeout=bound))):
+        last = verb.startswith(("restart", "start"))
+        if last:
+            seen.update(t0=_now_us())
         r = run()
+        if last:
+            seen.update(by_call=_ok(r), t1=_now_us())
         if not _ok(r):
             return f"systemctl --user {verb} failed ({_why(r)})"
     return ""
@@ -769,8 +789,14 @@ class agent_lock:
                     raise Busy(f"another operation on this agent is in progress (lock {self.path}); wait for it, "
                                "then try again")
                 time.sleep(0.1)
+        try:
+            _say_holder(self.path, "operation")
+        except OSError as e:
+            _unsay_holder(self.path)
+            os.close(fd)
+            raise Busy(f"the agent lock {self.path} was taken but its holder could not be recorded "
+                       f"({e.strerror or e}); it was released and nothing was done")
         _AGENT_HELD[key] = [fd, 1]
-        _say_holder(self.path, "operation")
         self.entered = True
         return self
 
@@ -831,6 +857,92 @@ def manager_pid(shape: Shape) -> "int | None":
     return int(value) if value.isdigit() and value != "0" else None
 
 
+def job_identity(shape: Shape) -> "dict | None":
+    """The manager's word for the job's current run, None when it cannot be read: 'pid' (None: no process)
+    and that pid's 'start' time; systemd adds its 'invocation' (InvocationID) and 'since' (the main
+    process's ExecMainStartTimestampMonotonic, µs). A reused pid never matches a recorded run."""
+    if is_macos():
+        r = _sm._run(["launchctl", "print", launchd_service(shape)])
+        if r is None:
+            return None
+        if r.returncode != 0:
+            gone = "could not find service" in ((r.stderr or "") + (r.stdout or "")).lower()
+            return {"pid": None, "start": None, "invocation": "", "since": None} if gone else None
+        m = re.search(r"^\s*pid = (\d+)", r.stdout or "", re.M)
+        pid, invocation, since = (int(m.group(1)) if m else None), "", None
+    else:
+        r = _sm._systemctl(("--user", "show", "-p", "InvocationID,MainPID,ExecMainStartTimestampMonotonic"),
+                           unit=shape.service_name)
+        if not _ok(r):
+            return None
+        words = dict(ln.strip().split("=", 1) for ln in (r.stdout or "").splitlines() if "=" in ln)
+        main, mono = words.get("MainPID", ""), words.get("ExecMainStartTimestampMonotonic", "")
+        if not main.isdigit():
+            return None
+        pid, invocation = int(main) or None, words.get("InvocationID", "")
+        since = int(mono) if mono.isdigit() and mono != "0" else None
+    start = task_io.start_time(pid) if pid else None
+    if pid and start is None:
+        return None
+    return {"pid": pid, "start": start, "invocation": invocation, "since": since}
+
+
+_GONE, _OTHER = "has exited", "now names another process"
+
+
+def _signal_exact(pid: int, start: str, sig) -> str:
+    """Signal `pid` only while it is the process that started at `start`: '' once sent, else why not.
+    Where pidfds exist the check and the signal name one process, so a reused pid is never signalled."""
+    fd = None
+    try:
+        if hasattr(os, "pidfd_open"):
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return _GONE
+            except OSError:
+                fd = None
+        seen = task_io.start_time(pid)
+        if seen is None:
+            return _GONE
+        if seen != start:
+            return _OTHER
+        if fd is not None:
+            signal.pidfd_send_signal(fd, sig)
+        else:
+            os.kill(pid, sig)
+        return ""
+    except ProcessLookupError:
+        return _GONE
+    except OSError as e:
+        return f"could not be signalled ({e.strerror or e})"
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _runs(pid: int, start: str) -> bool:
+    """Whether that very process still runs (an exited one awaiting its reaper does not)."""
+    try:
+        r = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True,
+                           env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}, timeout=10)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
+    state = r.stdout.strip()
+    if not state or state.startswith("Z"):
+        return False
+    return task_io.verify_lineage(pid, start) is not False
+
+
+def _await_exit(pid: int, start: str, bound: float) -> bool:
+    deadline = time.monotonic() + bound
+    while _runs(pid, start):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_S)
+    return True
+
+
 def _parent_pid(pid) -> "int | None":
     try:
         r = subprocess.run(["ps", "-o", "ppid=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10)
@@ -857,10 +969,17 @@ def launch_admission(root, state: "dict | None" = None, wait_s: "float | None" =
             return None, f"the agent lock {path} cannot be used ({e.strerror or e})"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _say_holder(path, "launcher")
-            return fd, ""
         except BlockingIOError:
             os.close(fd)
+        else:
+            try:
+                _say_holder(path, "launcher")
+            except OSError as e:
+                _unsay_holder(path)
+                os.close(fd)
+                return None, (f"the agent lock {path} was taken but its holder could not be recorded "
+                              f"({e.strerror or e}); it was released and the launcher does not act on the root")
+            return fd, ""
         if time.monotonic() >= deadline:
             return None, (f"an operation on this agent held {path} for longer than {wait:.0f} s; the launcher does "
                           "not act on the root, and the manager starts it again")
@@ -953,30 +1072,22 @@ def _free_root_problem(root: str) -> str:
 
 
 def stop_started(shape: Shape, root: str) -> str:
-    """'' once the job this connect's install started is stopped: only while its unit holds the bytes
-    install published and its launcher is still the process install saw start (pid and start time); a
-    unit or process that is not this attempt's is left, with the command that stops it."""
-    by_hand = f"stop it by hand ({stop_command(shape)})"
+    """'' once the job this connect's install started is stopped (_undo_start's rule: under the agent lock,
+    only the run its own start began, while its unit holds the bytes install published); anything else is
+    left, with the command that stops it."""
     pending = pending_start(shape)
     if pending is not None:
         _PENDING[threading.get_ident()].remove(pending)
         line = _undo_start(pending)
-        return "" if line.endswith("was stopped") else line
+        return "" if STOPPED in line else line
     started = _STARTED.get(shape.name)
     if started is None:
-        return f"no job started by this connect was recorded, so {job_name(shape)} was left as it is: {by_hand}"
-    try:
-        unit_now = supervisor_path(shape).read_bytes()
-    except OSError:
-        unit_now = None
-    if unit_now != started["unit"] or task_io.verify_lineage(started["pid"], started["start"]) is not True:
-        return (f"{job_name(shape)} is no longer the job this connect started (its unit or launcher changed), so "
-                f"it was left as it is: {by_hand}")
-    problem = stop_supervisor(shape)
-    if problem:
-        return f"{job_name(shape)} could not be stopped ({problem}): {by_hand}"
+        return (f"no job started by this connect was recorded, so {job_name(shape)} was left as it is: stop it by "
+                f"hand ({stop_command(shape)})")
+    line = _undo_start(started)
+    if STOPPED not in line:
+        return line
     _STARTED.pop(shape.name, None)
-    print(f"stopped: {job_name(shape)} (the job this connect started, launcher pid {started['pid']})")
     return ""
 
 
@@ -1128,6 +1239,7 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
 
 
 _PENDING: dict = {}
+START_SEEN_S = 5.0      # a manager may report no main pid just after a start it accepted
 
 
 def _start_pending(shape: Shape, root: str, before: dict, restart: bool, unit: str, root_id, holder,
@@ -1135,15 +1247,41 @@ def _start_pending(shape: Shape, root: str, before: dict, restart: bool, unit: s
     """Start `shape`'s job as the last step of an operation that holds the agent lock: its launcher waits
     in launch_admission until that lock is released, and the start is settled then (await_started), never
     while the lock is held. '' or the manager's refusal."""
-    running = manager_pid(shape)
-    problem = start_supervisor(shape, restart=restart)
+    prior = job_identity(shape)
+    seen: dict = {}
+    problem = start_supervisor(shape, restart=restart, seen=seen)
     if not problem:
-        job = manager_pid(shape)
+        ident, why = _own_run(shape, prior, seen)
         _PENDING.setdefault(threading.get_ident(), []).append(
             {"shape": shape, "root": root, "before": before, "unit": unit.encode("utf-8"), "root_id": root_id,
-             "holder": holder, "advice": advice, "undo": [], "job": job,
-             "owned": running is None and job is not None})
+             "holder": holder, "advice": advice, "undo": [], "ident": ident, "owned": ident is not None,
+             "why": why})
     return problem
+
+
+def _own_run(shape: Shape, prior: "dict | None", seen: dict) -> "tuple[dict | None, str]":
+    """(the run, '') only when it provably began inside this operation's own start call: launchd's
+    bootstrap loaded the job (it refuses a loaded one), and the run is the first pid it shows; systemd's
+    run is a new invocation whose main process started between the call's two clocks. The pid is polled
+    for (a manager may show none at first); anything ambiguous is (None, why), never ours."""
+    if not seen.get("by_call"):
+        return None, "was already running when this operation asked for it"
+    deadline = time.monotonic() + START_SEEN_S
+    while True:
+        now = job_identity(shape)
+        if now is not None and now["pid"] is not None:
+            break
+        if time.monotonic() >= deadline:
+            return None, f"showed no process within {START_SEEN_S:.0f} s of this operation's start"
+        time.sleep(POLL_S)
+    if is_macos():
+        return now, ""
+    fresh = now["invocation"] and now["invocation"] != (prior or {}).get("invocation")
+    if fresh and now["since"] is not None and seen["t0"] <= now["since"] <= seen["t1"]:
+        return now, ""
+    if not fresh or (now["since"] is not None and now["since"] < seen["t0"]):
+        return None, "was already running when this operation asked for it"
+    return None, f"runs an invocation (pid {now['pid']}) that did not begin inside this operation's start"
 
 
 def abort_pending(root) -> None:
@@ -1171,9 +1309,8 @@ def settle(root, rc: int) -> int:
 
 def await_started() -> int:
     """0 once every pending start has a fresh launcher of its own on its root, else 1. The wait runs
-    without the agent lock; a failure is decided under it (so no launcher can be between admission and
-    the root), and then the job this operation started is stopped while its unit is still the one it
-    published, so it can never act on the root after the failure is reported."""
+    without the agent lock; a failure is decided and undone only under it (so no launcher can be between
+    admission and the root); when the lock stays busy nothing is stopped and what is left is reported."""
     failed = 0
     for p in _PENDING.pop(threading.get_ident(), []):
         shape, root = p["shape"], p["root"]
@@ -1187,12 +1324,12 @@ def await_started() -> int:
                     why = _holder_problem(shape, root, rec, p)
                     undone = _undo_start(p) if why else ""
             except Busy:
-                undone = _undo_unlocked(p)
+                undone = _left_unlocked(p)
         if why:
             failed = 1
             print(f"error: {why}{p['advice']}; {undone}", file=sys.stderr)
             continue
-        _STARTED[shape.name] = {"pid": rec["pid"], "start": rec["start"], "unit": p["unit"]}
+        _STARTED[shape.name] = dict(p, undo=[])
         linger(shape)
         holder = p["holder"]
         print(f"the managed launcher acquired the expected root: {root} "
@@ -1206,7 +1343,9 @@ def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:
                 f"its refusal is in {launcher_log(shape)}")
     launcher = rec.get("owner_pid", rec.get("pid"))
     job = manager_pid(shape)
-    if job is None or job not in (launcher, _parent_pid(launcher)):
+    spawner = _spawning_launcher(shape, root, rec) if job is not None and job not in (launcher, _parent_pid(launcher)) \
+        else None
+    if job is None or job not in (launcher, _parent_pid(launcher), spawner, _parent_pid(spawner) if spawner else None):
         return (f"the launcher holding {root} (pid {launcher}) is not the process {job_name(shape)} runs as "
                 f"({job or 'none'}); it was not started by this operation")
     if p["root_id"] is not None and dir_identity(root) != p["root_id"]:
@@ -1215,42 +1354,82 @@ def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:
     return ""
 
 
-def _undo_unlocked(p: dict) -> str:
-    """The undo when the agent lock stays busy: only while its recorded holder is this job's own
-    launcher (the manager's process, or the launchd shim's child), which holds it just until it takes
-    the root; any other holder is another operation, and the job is left to it."""
+def _spawning_launcher(shape: Shape, root: str, rec: dict) -> "int | None":
+    """The launcher whose run spawned the holder, from the shape's own proof (None without one), polled
+    briefly: the launcher records its run just after the holder may already have taken the root."""
+    if shape.holder_launcher is None:
+        return None
+    deadline = time.monotonic() + START_SEEN_S
+    while True:
+        found = shape.holder_launcher(root, rec)
+        if found is not None or time.monotonic() >= deadline:
+            return found
+        time.sleep(POLL_S)
+
+
+def _left_unlocked(p: dict) -> str:
+    """No cleanup runs without the agent lock: what is left, and the command that stops it."""
     shape, holder = p["shape"], lock_holder_role(p["root"])
-    job = manager_pid(shape)
-    if holder.get("role") == "launcher" and job is not None and job in (holder["pid"], _parent_pid(holder["pid"])):
-        return _undo_start(p)
     who = f"{holder.get('role', 'an unrecorded holder')} pid {holder.get('pid', '?')}"
-    return (f"another operation holds the agent lock ({who}), so {job_name(shape)} was left to it; stop it by hand "
-            f"once that ends if it should not run ({stop_command(shape)})")
+    return (f"another operation holds the agent lock ({who}), so nothing was stopped; {job_name(shape)} is left "
+            f"as it is (manager {manager_detail(shape)}): stop it by hand if it should not run ({stop_command(shape)})")
+
+
+def _same_run(now: "dict | None", ident: dict) -> bool:
+    return now is not None and all(now[k] == ident[k] for k in ("pid", "start", "invocation"))
 
 
 def _undo_start(p: dict) -> str:
-    """Stop the job this operation started, and run its other undos, while the unit is the one it
-    published and the manager still runs the job instance it started (or none); else leave it. The line
-    saying what was done."""
+    """Under the agent lock only, while the unit on disk is the one this operation published and the
+    manager still runs the run its own start began (re-verified just before the signal): ask exactly that
+    run to retire. No step names the job to its manager, so no other start is ever stopped; what such a
+    step would remove is left, with the command. The line saying what was done."""
     shape = p["shape"]
+    by_hand = f"stop it by hand ({stop_command(shape)})"
+    if not agent_lock_held(p["root"]):
+        return (f"this operation does not hold the agent lock, so nothing was stopped; {job_name(shape)} is left as "
+                f"it is (manager {manager_detail(shape)}): {by_hand} if it should not run")
     if not p["owned"]:
-        return (f"{job_name(shape)} was already running when this operation asked for it, so it is not this "
-                f"operation's and was left as it is: stop it by hand if it should not run ({stop_command(shape)})")
+        return (f"{job_name(shape)} {p['why']}, so it is not this operation's and was left as it is: "
+                f"{by_hand} if it should not run")
     try:
         unit_now = supervisor_path(shape).read_bytes()
     except OSError:
         unit_now = None
-    job = manager_pid(shape)
-    if unit_now != p["unit"] or job not in (p["job"], None):
+    if unit_now != p["unit"] or not _same_run(job_identity(shape), p["ident"]):
         return (f"{job_name(shape)} is no longer the job this connect started (its unit or launcher changed), so "
-                f"it was left as it is: stop it by hand ({stop_command(shape)})")
-    for undo in p["undo"]:
-        undo()
-    problem = stop_supervisor(shape)
+                f"it was left as it is: {by_hand}")
+    notes = "".join(f"{line}; " for line in (undo() for undo in p["undo"]) if line)
+    problem = _retire_run(shape, p["ident"])
     if problem:
-        return f"{job_name(shape)} could not be stopped ({problem}): stop it by hand ({stop_command(shape)})"
-    print(f"stopped: {job_name(shape)} (the job this operation started)")
-    return f"{job_name(shape)}, the job this operation started, was stopped"
+        return f"{notes}{job_name(shape)} could not be stopped ({problem}): {by_hand}"
+    left = f"it stays installed and starts again at your next login: {shape.command} uninstall removes it"
+    print(f"stopped: {job_name(shape)} (the job this operation started, pid {p['ident']['pid']}); {left}")
+    return f"{notes}{job_name(shape)}, {STOPPED}; {left}"
+
+
+STOPPED = "the job this operation started, was stopped"
+RETIRE_REPEAT_S = 0.5
+
+
+def _retire_run(shape: Shape, ident: dict) -> str:
+    """'' once the run `ident` names has retired (signalled by pid, its start rechecked) and the manager
+    shows no run after it; else why not. A run that does not retire within the bound is left."""
+    pid, start = ident["pid"], ident["start"]
+    why = _signal_exact(pid, start, RETIRE_SIGNAL)
+    if why:
+        return f"pid {pid} {why}; nothing was signalled"
+    deadline = time.monotonic() + shape.stop_timeout_s
+    while not _await_exit(pid, start, RETIRE_REPEAT_S):
+        if time.monotonic() >= deadline:
+            return f"pid {pid} did not retire within {shape.stop_timeout_s} s"
+        _signal_exact(pid, start, RETIRE_SIGNAL)
+    after = job_identity(shape)
+    if after is None:
+        return f"its state after pid {pid} retired cannot be read"
+    if after["pid"] is not None:
+        return f"pid {pid} retired, but the job runs again as pid {after['pid']}, which this operation did not start"
+    return ""
 
 
 _STARTED: dict = {}
@@ -1300,7 +1479,7 @@ def managed_problem(shape: Shape, environ=None) -> str:
 
 
 def stop_state() -> dict:
-    return {"child": None, "pidfd": None, "sig": None, "installed": None}
+    return {"child": None, "pidfd": None, "sig": None, "installed": None, "retire": False}
 
 
 def stop_handlers(state: dict) -> dict:
@@ -1310,11 +1489,18 @@ def stop_handlers(state: dict) -> dict:
     SIGCHLD=SIG_IGN would let the kernel reap the child before wait() could: reset to SIG_DFL."""
     def on_stop(signum, frame):
         state["sig"] = state["sig"] or signum
-    before = {sig: signal.signal(sig, on_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+        state["retire"] = state.get("retire") or signum == RETIRE_SIGNAL
+    before = {sig: signal.signal(sig, on_stop) for sig in (signal.SIGTERM, signal.SIGINT, RETIRE_SIGNAL)}
     if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
         before[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     state["installed"] = True
     return before
+
+
+def retired(state: dict, rc: int) -> int:
+    """A run asked to retire (RETIRE_SIGNAL) that ended without asking to be retried exits EXIT_HELD, so its
+    manager does not start it again; any other run keeps `rc`."""
+    return EXIT_HELD if state.get("retire") and rc != EXIT_RETRY else rc
 
 
 def restore_handlers(state: dict, before: dict) -> None:
@@ -1479,7 +1665,7 @@ def run_launchd(child_argv: list, popen=subprocess.Popen) -> int:
         if child.poll() is None:
             child.send_signal(signum)
             forwarded.append(signum)
-    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT)}
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT, RETIRE_SIGNAL)}
     try:
         rc = child.wait()
     finally:
@@ -1520,7 +1706,13 @@ def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None, relay=No
     text, problem = supervisor_text(sup)
     check(results, text is not None and marked(text, supervisor_marker(shape)), "supervisor",
           problem or (f"{sup} missing; run {shape.command} install" if text is None else str(sup)))
-    print(f"INFO job: {job_name(shape)} {manager_state(shape)}")
+    state = manager_state(shape)
+    if cfg.get("BRIDGE"):
+        check(results, state == "active", "job", f"{job_name(shape)} {state}" if state == "active" else
+              f"{job_name(shape)} is {state}, so no session answers the tasks its configured bridge passes on: run "
+              f"{shape.command} install again, or {shape.command} uninstall")
+    else:
+        print(f"INFO job: {job_name(shape)} {state}")
     root = work_root(cfg)
     print(f"INFO session: {root} {occupancy(root) if occupancy is not None else occupancy_line(shape, root)}")
     if not is_macos():

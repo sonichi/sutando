@@ -114,7 +114,7 @@ describe('find_room_actions / describe_room_action', () => {
 		assert.deepEqual(await findActions({ query: 'x' }, fake(() => err('ROOM_ACCESS_DENIED')).deps), { ok: false, error: 'ROOM_ACCESS_DENIED' });
 		assert.deepEqual(await findActions({ query: 'x' }, fake(() => new Error('boom')).deps), { ok: false, error: 'unavailable' });
 		assert.deepEqual(await findActions({ query: 'x' }, fake(() => new Error('room.actions.search: no registry bearer in lane env')).deps), { ok: false, error: 'no_credential' });
-		assert.deepEqual(await findActions({ query: 'x' }, fake(() => new Error('mint: AGENT_CREDENTIAL_REVOKED')).deps), { ok: false, error: 'credential_refused' });
+		assert.deepEqual(await findActions({ query: 'x' }, fake(() => new Error('mint: bearer rejected (AGENT_CREDENTIAL_REVOKED, not recoverable)')).deps), { ok: false, error: 'credential_refused' });
 		for (const create of [createFindActionsTool, createDescribeActionTool, createRunActionTool]) {
 			assert.match(create(fake(() => null).deps).description, /"no_credential" or "credential_refused".*reconnect/);
 		}
