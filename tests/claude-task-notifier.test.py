@@ -195,6 +195,7 @@ class FakeTmuxHarness(unittest.TestCase):
         script = self.bin / "tmux"
         glob_limit = self.HISTORY_LIMIT if self.GLOBAL_HISTORY_LIMIT is None else self.GLOBAL_HISTORY_LIMIT
         script.write_text(f'''#!/bin/bash
+. "{REPO}/tests/lib/tmux-fake-unwrap.sh"
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
 PANE="{self.pane_file}"

@@ -47,6 +47,9 @@ else
         exit 1
     fi
 fi
+# Sutando's own GitHub repo is queried only from a git-attached (developer-mode) checkout;
+# the packaged engine ships without .git, and its owner never asked about the repo.
+DEV_CHECKOUT=0; [ -e "$REPO/.git" ] && DEV_CHECKOUT=1
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
 # Claude Code hooks pass transcript_path via stdin JSON ONLY — there is no
@@ -230,10 +233,12 @@ record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact
   git -C "$REPO" log --oneline -10 2>/dev/null
   echo ""
 
-  # Open PRs
-  echo "## Open PRs"
-  gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
-  echo ""
+  # Open PRs — developer-mode checkouts only (DEV_CHECKOUT).
+  if [ "$DEV_CHECKOUT" = 1 ]; then
+    echo "## Open PRs"
+    gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
+    echo ""
+  fi
 
   # Pending questions — through the one reader (the skill's adapter); never the file. The count
   # and where they live, never their text: a listed question is re-read as prose next session.
@@ -299,18 +304,18 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
   fi
   echo ""
 
-  # Stars
-  echo "## Repo Stats"
-  # Same unreachable-fallback shape as the tasks section: `||` bound to `awk`,
-  # which exits 0 with no input records, so "(couldn't fetch)" never printed and
-  # a failed API call rendered as an empty line.
-  _stats=$(gh api repos/sonichi/sutando --jq '.stargazers_count, .forks_count' 2>/dev/null | tr '\n' ' ')
-  if [ -n "${_stats// /}" ]; then
-    printf '%s\n' "$_stats" | awk '{print $1 " stars, " $2 " forks"}'
-  else
-    echo "(couldn't fetch)"
+  # Stars — developer-mode checkouts only (DEV_CHECKOUT).
+  if [ "$DEV_CHECKOUT" = 1 ]; then
+    echo "## Repo Stats"
+    # `||` bound to `awk` exits 0 with no input, so test the captured value instead.
+    _stats=$(gh api repos/sonichi/sutando --jq '.stargazers_count, .forks_count' 2>/dev/null | tr '\n' ' ')
+    if [ -n "${_stats// /}" ]; then
+      printf '%s\n' "$_stats" | awk '{print $1 " stars, " $2 " forks"}'
+    else
+      echo "(couldn't fetch)"
+    fi
+    unset _stats
   fi
-  unset _stats
 
   # Relay notes — drain any unprocessed workspace/relay/*.md files written by
   # the proactive-loop (step 7) or /relay skill. These carry cross-session

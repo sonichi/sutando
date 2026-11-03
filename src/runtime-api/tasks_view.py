@@ -30,6 +30,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
+from activity_bus import in_progress
 from delivery.readiness import read_ready_result
 from file_lock import locked_file
 from local_task_protocol import (KNOWN_HEADER_KEYS, find_archived_task,  # noqa: E402
@@ -85,9 +86,12 @@ class TasksView:
 
     # ── task.submit ─────────────────────────────────────────────────────────
     def submit(self, task_text: str, priority: str = "normal") -> dict:
+        return self._publish(task_text, priority)
+
+    def _publish(self, task_text: str, priority: str, control: "str | None" = None) -> dict:
         text = self._validated_submission(task_text, priority)
         task_id = f"{TASK_PREFIX}{uuid.uuid4().hex[:12]}"
-        content = self._submission_text(task_id, text, priority)
+        content = self._submission_text(task_id, text, priority, control)
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.tasks_dir / f".{task_id}.tmp"
         tmp.write_text(content)
@@ -152,7 +156,7 @@ class TasksView:
             raise ValueError("priority must be urgent|normal|low")
         return text
 
-    def _submission_text(self, task_id: str, text: str, priority: str) -> str:
+    def _submission_text(self, task_id: str, text: str, priority: str, control: "str | None" = None) -> str:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         content = (f"id: {task_id}\n"
                    f"timestamp: {stamp}\n"
@@ -163,6 +167,8 @@ class TasksView:
                    f"priority: {priority}\n"
                    + (f"instance_id: {_one_line(self.instance)}\n"
                       if self.instance else "")
+                   # Only task.cancel writes it: no submitted text can, being below `task:`.
+                   + (f"interaction_type: {control}\n" if control else "")
                    + f"task: {text}\n")
         # HMAC envelope (#3014 writer census): stamp at this writer's edge,
         # fail-open so a stamping error costs the stamp, never the submit.
@@ -241,8 +247,13 @@ class TasksView:
                 return {"taskId": task_id, "state": waiting["state"],
                         "waitingOn": waiting["requests"]}
             claimed = ".claimed-" in live.name
+            try:
+                active = claimed or in_progress(self.tasks_dir.parent, task_id)
+            except (UnicodeError, TypeError, OverflowError):
+                # Malformed activity must not block task reads or cancellation.
+                active = False
             return {"taskId": task_id,
-                    "state": "in_progress" if claimed else "pending"}
+                    "state": "in_progress" if active else "pending"}
         if find_archived_task(self.tasks_dir, task_id) is not None:
             # Archived task, result already delivered and rotated away.
             return {"taskId": task_id, "state": "done"}
@@ -270,8 +281,8 @@ class TasksView:
         return None
 
     def _result_files(self) -> "list[tuple[Path, int]]":
-        """(path, mtime) newest first, for `task-rtapi-` results only — source
-        isolation: other sources' results must not leak into this channel.
+        """(path, integer seconds), newest first by full filesystem precision.
+        Only `task-rtapi-` results: other sources must not leak into this channel.
 
         Returns the mtime it already read rather than letting callers stat
         again: archival unlinks a live name, so a second stat can raise on a
@@ -284,12 +295,12 @@ class TasksView:
         for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt"):
             try:
                 st = f.stat()
-            except OSError:
+            except FileNotFoundError:
                 continue  # archived mid-scan — absent, not an error
             if stat_module.S_ISREG(st.st_mode):
-                found.append((f, int(st.st_mtime)))
-        found.sort(key=lambda pair: pair[1], reverse=True)
-        return found
+                found.append((f, int(st.st_mtime), st.st_mtime_ns))
+        found.sort(key=lambda entry: entry[2], reverse=True)
+        return [(path, ts) for path, ts, _ns in found]
 
     # ── task.list_results ────────────────────────────────────────────────────
     def list_results(self, limit: int = 50) -> dict:
@@ -337,20 +348,28 @@ class TasksView:
         return out
 
     # ── task.list ───────────────────────────────────────────────────────────
-    def list_tasks(self, limit: int = 200) -> dict:
-        """Enumerate LIVE tasks (pending / claimed / waiting) so a fresh
-        client can render "what's waiting" without knowing any taskId — the
-        acceptance-test enumeration gap. Scoped to this channel's OWN tasks:
-        enumeration is the same ownership boundary as a per-id read, so other
-        sources' task text never appears here. Results/archive are
-        deliberately not walked: done work is fetched per-id, not listed."""
+    def list_tasks(self, limit: int = 200, *, unfinished_only: bool = False) -> dict:
+        """List this channel's live task files, newest first, without walking archives.
+
+        By default the limit counts files, including tasks with ready results.
+        Unfinished mode excludes done states before counting rows and truncation.
+        """
         entries = []
         if self.tasks_dir.is_dir():
-            files = [f for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt")
-                     if f.is_file()]
-            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-            truncated = len(files) > limit
-            for f in files[:limit]:
+            files = []
+            for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt"):
+                try:
+                    metadata = f.stat()
+                except FileNotFoundError:
+                    continue
+                if stat_module.S_ISREG(metadata.st_mode):
+                    files.append((f, metadata.st_mtime))
+            files.sort(key=lambda item: item[1], reverse=True)
+            truncated = False
+            if not unfinished_only:
+                truncated = len(files) > limit
+                files = files[:limit]
+            for f, _mtime in files:
                 # Not a .claimed- split: the lead also renames to .assigned-<inst>,
                 # and a compound id has no result written under it, ever.
                 task_id = task_id_from_filename(f.name)
@@ -360,8 +379,15 @@ class TasksView:
                     continue
                 entry = {"taskId": task_id,
                          "state": self.status(task_id)["state"]}
+                if unfinished_only:
+                    if entry["state"] == "done":
+                        continue
+                    if len(entries) >= limit:
+                        truncated = True
+                        break
                 try:
                     th = parse_task_headers_lenient(f.read_text())
+                    entry["preview"] = " ".join(th.body.split())[:160]
                     for k in ("source", "priority", "timestamp", "instance_id"):
                         v = th.get(k)
                         if v:
@@ -386,7 +412,7 @@ class TasksView:
         if st == "done":
             return {"taskId": task_id, "state": "done", "cancelled": False,
                     "note": "already completed — nothing to cancel"}
-        sub = self.submit(f"CANCEL_INSTRUCTION: {task_id}", priority="urgent")
+        sub = self._publish(f"CANCEL_INSTRUCTION: stop processing {task_id}", "urgent", control="task_cancel")
         return {"taskId": task_id, "state": st, "cancelled": "requested",
                 "cancelTaskId": sub["taskId"]}
 

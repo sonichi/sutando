@@ -54,9 +54,10 @@ check "both terminal paths (failure published, answer already there) settle the 
       "2" "$(printf '%s\n' "$ptf" | grep -c 'settle_worker_record "\$filename"')"
 # 2 -> 1: settle_own_claims_on_shutdown no longer falls back to the live core
 # at all (it leaves an in-flight claim to the next watcher's sweep, which
-# re-runs the handler), so run_handler_now's failure switch is the only site.
-check "every fallback-to-live-core site withdraws the pending hold first" \
-      "1" "$(grep -c 'record_worker_done "\$filename" abandon "\$WORKSPACE_DIR"' "$WATCHER")"
+# re-runs the handler), so run_handler_now's failure switch is the only fallback
+# site; its vanished-payload branch withdraws the hold too, publishing nothing.
+check "every fallback-to-live-core site, and the vanished-payload branch, withdraws the pending hold" \
+      "2" "$(grep -c 'record_worker_done "\$filename" abandon "\$WORKSPACE_DIR"' "$WATCHER")"
 
 # ── functional: the real runner, the real writer ──
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT

@@ -148,30 +148,45 @@ export function keychainServiceCandidates(configDir = process.env.CLAUDE_CONFIG_
 	return [...new Set(services)];
 }
 
+function readKeychainSecret(service: string): string {
+	return execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+		encoding: 'utf-8',
+		timeout: 5000,
+	});
+}
+
 // Read the full cred object from one keychain service (not just accessToken).
-function readCredFromService(service: string): StoredClaudeOAuth | null {
+// A blank accessToken counts as absent, so it cannot eclipse a later candidate.
+export function readCredFromService(
+	service: string,
+	readSecret: (service: string) => string = readKeychainSecret,
+): StoredClaudeOAuth | null {
 	try {
-		const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-			encoding: 'utf-8',
-			timeout: 5000,
-		}).trim();
-		const parsed = JSON.parse(raw);
+		const parsed = JSON.parse(readSecret(service).trim());
 		const oauth = parsed?.claudeAiOauth;
-		return oauth && typeof oauth.accessToken === 'string' ? { service, oauth: oauth as ClaudeOAuth } : null;
+		return oauth && typeof oauth.accessToken === 'string' && oauth.accessToken.trim() !== ''
+			? { service, oauth: oauth as ClaudeOAuth }
+			: null;
 	} catch {
 		return null;
 	}
 }
 
 // All keychain candidates that currently hold a credential, scoped item first.
-function readCredCandidates(): StoredClaudeOAuth[] {
-	return keychainServiceCandidates()
-		.map(readCredFromService)
+export function readCredCandidates(
+	services: string[] = keychainServiceCandidates(),
+	readSecret: (service: string) => string = readKeychainSecret,
+): StoredClaudeOAuth[] {
+	return services
+		.map((service) => readCredFromService(service, readSecret))
 		.filter((s): s is StoredClaudeOAuth => s !== null);
 }
 
-function readCred(): StoredClaudeOAuth | null {
-	return readCredCandidates()[0] ?? null;
+export function readCred(
+	services: string[] = keychainServiceCandidates(),
+	readSecret: (service: string) => string = readKeychainSecret,
+): StoredClaudeOAuth | null {
+	return readCredCandidates(services, readSecret)[0] ?? null;
 }
 
 // Pure: pick the credential to serve. First candidate whose token is usable

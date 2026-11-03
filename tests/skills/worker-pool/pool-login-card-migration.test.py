@@ -95,7 +95,7 @@ class LoginCardMigration(unittest.TestCase):
                                   side_effect=AssertionError("unexpected subprocess")), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(rem.main(["--workspace", str(self.ws), "--repo", str(REPO),
-                                       "--sweep", *flags]), 0)
+                                       "--sweep", *flags], runner=self.runner), 0)
         return json.loads(output.getvalue())
 
     def assert_login_cards(self, count):

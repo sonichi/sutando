@@ -7,6 +7,10 @@ exception guard around json.loads does not stop `.get` from AttributeError-ing
 
 Run: python3 tests/runtime-api-state-records.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import json
 import sys
 import tempfile

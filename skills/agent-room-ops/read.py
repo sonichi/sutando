@@ -171,7 +171,7 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, reason=f"client gate denied for {agent_mxid}", room_id=room_id)
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, reason="no gateway configured", room_id=room_id)
     # `limit` here means MESSAGES, but the gateway applies its limit to RAW TIMELINE

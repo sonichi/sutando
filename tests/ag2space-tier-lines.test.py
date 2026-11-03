@@ -64,7 +64,7 @@ class TierLines(unittest.TestCase):
     def test_guest_is_the_sandboxed_delegation_with_the_guest_scope(self):
         lines = guardrail.ag2space_tier_lines("guest", False, self.PATH)
         self.assertEqual(lines, guardrail.sandboxed_delegation_lines(
-            "AG2 Space", "GUEST tier", self.PATH, guardrail.AG2SPACE_GUEST_SCOPE))
+            "s.space", "GUEST tier", self.PATH, guardrail.AG2SPACE_GUEST_SCOPE))
         self.assertEqual(sum(FENCE in line for line in lines), 1)
 
 

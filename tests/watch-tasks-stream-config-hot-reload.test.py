@@ -25,6 +25,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import kill_group, popen_bound, unbind  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 LAST_STDERR = [""]
@@ -51,10 +54,10 @@ def start_watcher(ws, errf, instance=None, inbox=None):
     else:
         env.pop("SUTANDO_INSTANCE_ID", None)
     env.pop("SUTANDO_TASK_EVENT_HANDLER", None)  # no operator pin -- config file only
-    return subprocess.Popen(
+    return popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)], cwd=str(REPO),
         env=env, stdout=subprocess.PIPE, stderr=errf,
-        text=True, start_new_session=True)
+        text=True)
 
 
 def write_task(inbox, name, body="probe"):
@@ -113,6 +116,8 @@ def stop(p):
         p.wait(timeout=5)
     except Exception:
         pass
+    kill_group(p.pid)
+    unbind(p.pid)
 
 
 tmp = Path(tempfile.mkdtemp(prefix="teh-hotreload-"))

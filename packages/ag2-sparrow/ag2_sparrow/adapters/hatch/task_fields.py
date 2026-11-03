@@ -1,25 +1,33 @@
 """Print the routing fields of every open task file in a task dir as one JSON array.
 
 The Hatch hook script calls this so its wake payload carries structured fields read
-with Sparrow's own header parser, never prose scraped by the shell."""
+with Sparrow's own header parser, never prose scraped by the shell. A hook that tells its
+worker what `held: true` means runs this with HELD_AWARE_ENV=1; for any other hook (one
+registered before the held branch, which a package upgrade does not rewrite) a held task is
+left out of the list, so that hook never wakes a worker for it."""
 from __future__ import annotations
 
 import argparse
 import ipaddress
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-from ... import gateway_instance, local_task_protocol
+from ... import gateway_instance, local_task_protocol, task_hold
+from ...task_io import attested_headers
 
 SNIPPET_MAX = 500
+REPLY_CONTEXT_MAX = 2000
 # Matrix user id: @localpart:server_name (DNS name, IPv4 or [IPv6], optional :port).
 # fullmatch only: `$` would also match before a trailing newline.
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
                      rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
+HELD_AWARE_ENV = "HATCH_HOOK_HELD_AWARE"
+CHANNEL_KINDS = ("dm", "room")
 _SENDER_PREFIX = re.compile(r"\[AG2Space\s+[^\]]+\]\s*")
 # The gateway folds a message onto one line, so a reply fallback ("> <@sender> quoted"
 # lines, a blank line, the reply) arrives as "> <@sender> quoted  reply".
@@ -38,30 +46,32 @@ def valid_mxid(value: str) -> bool:
     return m["port"] is None or 0 < int(m["port"]) <= 65535
 
 
-def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
-    """Headers a tier or routing decision may read: the strict task-last parse, or the
-    trusted last-wins scan only when `task_layout: mid` sits above `task:`, where no
-    body text can claim it. The gateway writes access_tier last, below the body."""
-    strict = local_task_protocol.parse_task_headers(text)
-    if (strict.headers.get("task_layout") or "").strip() == "mid":
-        return local_task_protocol.parse_task_headers_trusted(text)
-    return strict
+def _split(text: str) -> "tuple[str, str]":
+    """(sender prefix, the message after it without a Matrix reply fallback, which is
+    the quoted message replied to, not the reply)."""
+    prefix = _SENDER_PREFIX.match(text)
+    head = prefix.group(0) if prefix else ""
+    rest = text[len(head):]
+    fallback = _REPLY_FALLBACK.match(rest)
+    return head, rest[fallback.end():] if fallback else rest
 
 
 def snippet(body: str) -> str:
-    """The message's first line without a Matrix reply fallback, which is the quoted
-    message replied to, not the reply."""
-    first = body.split("\n", 1)[0].strip()
-    prefix = _SENDER_PREFIX.match(first)
-    head = prefix.group(0) if prefix else ""
-    rest = first[len(head):]
-    fallback = _REPLY_FALLBACK.match(rest)
-    return (head + (rest[fallback.end():] if fallback else rest))[:SNIPPET_MAX]
+    """The message's first line, sender prefix kept, without a reply fallback."""
+    head, rest = _split(body.split("\n", 1)[0].strip())
+    return (head + rest)[:SNIPPET_MAX]
 
 
 def _field(headers: dict, key: str) -> "str | None":
     value = (headers.get(key) or "").strip()
     return value or None
+
+
+def _reply_and_message(parsed: "local_task_protocol.TaskHeaders") -> "tuple[dict | None, str]":
+    # Only an attested reply gets a reply_context; a block a sender typed stays their text.
+    if _field(parsed.headers, "reply_to_event"):
+        return local_task_protocol.split_reply_context(parsed.body)
+    return None, parsed.body
 
 
 def item_id(tid: str, instance: str = "") -> "str | None":
@@ -73,9 +83,10 @@ def item_id(tid: str, instance: str = "") -> "str | None":
     return broker if local_task_protocol.valid_task_id(broker) else None
 
 
-def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict | None":
+def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") -> "dict | None":
+    """`instance` None reads every instance's task."""
     tid = task_file.stem
-    if item_id(tid, instance) is None:
+    if instance is not None and item_id(tid, instance) is None:
         return None
     try:
         text = task_file.read_text(encoding="utf-8", errors="replace")
@@ -83,26 +94,39 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
         return None
     parsed = attested_headers(text)
     h = parsed.headers
+    reply, message = _reply_and_message(parsed)
+    kind = _field(h, "channel_kind")
     tier = local_task_protocol.canonical_access_tier(h.get("access_tier"))
     if tier not in local_task_protocol.BROKER_WIRE_TIERS:
         tier = "guest"  # absent or unknown: the most restricted tier
-    return {
+    item = {
         "task_id": tid,
         "room_id": _field(h, "channel_id") or _field(h, "source_room_id"),
+        "room_name": (_field(h, "room_name") or "")[:SNIPPET_MAX] or None,
+        "channel_kind": kind if kind in CHANNEL_KINDS else None,
         "event_id": _field(h, "source_message_id"),
         "thread_root": _field(h, "thread_root"),
         "sender": _field(h, "user_id"),
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
         "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
-        "snippet": snippet(parsed.body),
+        "snippet": snippet(message),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
+    if reply is not None:
+        label = reply["label"]
+        item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
+                                 "body": reply["body"][:REPLY_CONTEXT_MAX],
+                                 "label": label[:REPLY_CONTEXT_MAX] if label else None}
+    # A parked item is flagged on every wake, so a fresh worker session never answers it.
+    if task_hold.read(result_dir, tid) is not None:
+        item["held"] = True
+    return item
 
 
-def list_open_tasks(task_dir: Path, result_dir: Path, instance: str = "") -> list:
-    """Task files with no result yet, oldest first."""
+def list_open_tasks(task_dir: Path, result_dir: Path, instance: "str | None" = "") -> list:
+    """Task files with no result yet, oldest first; `instance` None lists every instance's."""
     def mtime(p: Path) -> float:
         try:
             return p.stat().st_mtime
@@ -132,7 +156,10 @@ def main(argv=None) -> int:
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2
-    json.dump(list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance), sys.stdout)
+    items = list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance)
+    if os.environ.get(HELD_AWARE_ENV) != "1":
+        items = [item for item in items if not item.get("held")]
+    json.dump(items, sys.stdout)
     sys.stdout.write("\n")
     return 0
 

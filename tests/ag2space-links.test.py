@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """src/ag2space_links.py: the shapes of the links that open AG2 Space inside the app, each
 caller's delegation to it, and no other link builder in the tree."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import re
 import subprocess
@@ -55,6 +61,30 @@ class TestShapes(unittest.TestCase):
                 links.surface_link(origin, room, "database")
 
 
+class TestModuleSurface(unittest.TestCase):
+    def test_default_via_is_resolved_on_each_read_and_other_names_are_absent(self):
+        with mock.patch.object(links.dotspace, "default_link_via", return_value="v.test") as dlv:
+            self.assertEqual(links.DEFAULT_VIA, "v.test")
+            self.assertEqual(links.DEFAULT_VIA, "v.test")
+        self.assertEqual(dlv.call_count, 2)
+        with self.assertRaises(AttributeError):
+            links.NO_SUCH_NAME
+
+    def test_imported_by_file_path_without_src_on_the_path_it_finds_its_sibling_resolver(self):
+        src = (REPO / "src").resolve()
+        saved_path, saved_mod = sys.path[:], sys.modules.pop("dotspace", None)
+        try:
+            sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != src]
+            mod = _load("ag2space_links_by_path", "src/ag2space_links.py")
+            self.assertEqual(Path(mod.dotspace.__file__).resolve(), src / "dotspace.py")
+            self.assertEqual(mod.room_link("!r:s.space"), "https://matrix.to/#/!r:s.space?via=s.space")
+        finally:
+            sys.path[:] = saved_path
+            sys.modules.pop("dotspace", None)
+            if saved_mod is not None:
+                sys.modules["dotspace"] = saved_mod
+
+
 class TestCallersDelegate(unittest.TestCase):
     def test_cron_notify_deep_link_is_room_link(self):
         with mock.patch.object(cron, "room_link", return_value="L") as rl:
@@ -73,6 +103,17 @@ class TestCallersDelegate(unittest.TestCase):
         out = subprocess.run(["git", "grep", "-lE", rx, "--", "src", "scripts", "skills", "packages",
                               ":!*.md"], cwd=REPO, capture_output=True, text=True).stdout.split()
         self.assertEqual([p for p in out if p != "src/ag2space_links.py"], [])
+
+
+class TestExplicitVia(unittest.TestCase):
+    def test_an_explicit_via_that_is_not_a_server_name_is_dropped(self):
+        import ag2space_links as links
+        self.assertEqual(links.room_link("!r:ag2.space", via="a&via=evil.example"), "https://matrix.to/#/!r:ag2.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="evil.example/x"), "https://matrix.to/#/!r:ag2.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="s.space"), "https://matrix.to/#/!r:ag2.space?via=s.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="localhost:8448"), "https://matrix.to/#/!r:ag2.space?via=localhost:8448")
+        self.assertEqual(links.room_link("!r:ag2.space", via=" S.Space "), "https://matrix.to/#/!r:ag2.space?via=s.space",
+                         "the normalised via is what goes out")
 
 
 if __name__ == "__main__":

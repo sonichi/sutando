@@ -19,23 +19,28 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
+# The host's home, read before isolation replaces HOME with a temp one.
+HOST_HOME = Path.home().resolve()
 ROOT = Path(tempfile.mkdtemp(prefix="hermetic-gateway-"))
 
-_ENV = {
-    "CLAUDE_CONFIG_DIR": str(ROOT / "claude-config"),
-    "AGENT_CONNECT_TASK_DIR": str(ROOT / "tasks"),
-    "AGENT_CONNECT_RESULT_DIR": str(ROOT / "results"),
-    "AGENT_CONNECT_STATE_DIR": str(ROOT / "state"),
-    "REMOTE_TASK_TOKEN": "hermetic-test-token",
-    "REMOTE_TASK_URL": "http://127.0.0.1:9",
-}
-_UNSET = ("AG2_DEVICE_ENV", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+
+def _isolated_env(root: Path) -> "dict[str, str]":
+    return {
+        "CLAUDE_CONFIG_DIR": str(root / "claude-config"),
+        "AGENT_CONNECT_TASK_DIR": str(root / "tasks"),
+        "AGENT_CONNECT_RESULT_DIR": str(root / "results"),
+        "AGENT_CONNECT_STATE_DIR": str(root / "state"),
+        "REMOTE_TASK_TOKEN": "hermetic-test-token",
+        "REMOTE_TASK_URL": "http://127.0.0.1:9",
+    }
 
 
 def _forbidden_roots() -> "list[Path]":
-    home = Path.home().resolve()
-    return [home, (REPO / "workspace").resolve()]
+    return [HOST_HOME, (REPO / "workspace").resolve()]
 
 
 def host_reads(reads: "list[tuple[str, str]]") -> "list[str]":
@@ -61,13 +66,17 @@ def host_reads(reads: "list[tuple[str, str]]") -> "list[str]":
     return bad
 
 
-def isolate_then_import():
-    """Isolate the environment, then import the bridge while recording reads."""
-    for d in ("claude-config", "tasks", "results", "state"):
+def isolate_then_import(root: "Path | None" = None, env: "dict[str, str] | None" = None):
+    """Replace the environment with an allowlisted one, then import the bridge while recording reads.
+
+    `root` reuses a workspace, so a second process (a restarted bridge) finds what
+    the first left there; `env` adds variables, such as the relay URL."""
+    global ROOT
+    if root is not None:
+        ROOT = Path(root)
+    for d in ("claude-config", "tasks", "results", "state", "home"):
         (ROOT / d).mkdir(parents=True, exist_ok=True)
-    os.environ.update(_ENV)
-    for name in _UNSET:
-        os.environ.pop(name, None)
+    isolate_os_environ(ROOT / "home", **{**_isolated_env(ROOT), **(env or {})})
     sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
     reads: "list[tuple[str, str]]" = []
     real_open, real_io_open, real_os_open = builtins.open, io.open, os.open

@@ -51,12 +51,24 @@ class DrainStatus(str, Enum):
     NOT_CLAIMED = "not_claimed"
     TERMINAL = "terminal"
     ATTEMPTED = "attempted"
+    # The claim's revalidation refused the send: parked, no provider call.
+    WITHDRAWN = "withdrawn"
+    # The claim's revalidation could not decide yet: released as it was, no provider call.
+    DEFERRED = "deferred"
+
+
+class Defer(str):
+    """A `revalidate` answer that neither sends nor withdraws: the item is released unsent, with
+    no attempt recorded, for a later pass to check again."""
 
 
 @dataclass(frozen=True)
 class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
+    # The deciding call's own account: the receipt's provider_ref (how the
+    # provider vouched for it) and its detail, or the refusal's message.
+    provider_ref: Optional[str] = None
     detail: str = ""
 
     def __post_init__(self):
@@ -237,6 +249,11 @@ class ClaimBackend(Protocol):
         `terminal_reason` parks a definitive refusal in that same transaction,
         regardless of any retry schedule or attempt ceiling.
         True = this incarnation owned the claim and it is now retired."""
+        ...
+
+    def release(self, token: ClaimToken) -> bool:
+        """Retire this incarnation's claim with no outcome and no attempt recorded: the item is
+        claimable again as it was. A stale token changes nothing. True = it owned the claim."""
         ...
 
     def attempts(self, item_id: str) -> int:
