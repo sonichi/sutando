@@ -1078,8 +1078,8 @@ class ConnectCode(Base):
 
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
         fake = fake or self.fake()
-        argv = ["connect", "--experimental-connect", "--base", base, *code_args, "--codex-home", str(self.codex_home),
-                *extra]
+        argv = ["connect", "--experimental-connect", "--base", base, "--agent", AGENT, *code_args, "--codex-home",
+                str(self.codex_home), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \

@@ -499,8 +499,11 @@ def _record_directory(path: Path) -> Path:
 def _owns_its_id(path: Path, field: str) -> bool:
     """A live record may act only while its id is reserved to the body it holds
     and no decision for that id is archived; an archived decision is immutable."""
-    return (path.parent.name != "archive" and not present(_archived(path))
-            and _issued_to(path, field) == _record_digest(path, field))
+    if path.parent.name == "archive" or present(_archived(path)):
+        return False
+    issued = _issued_to(path, field)
+    # "unreadable" names no body, so a reservation holding it owns nothing, not even its twin.
+    return issued != "unreadable" and issued == _record_digest(path, field)
 
 
 def present(path: Path, kind: "int | None" = None) -> bool:

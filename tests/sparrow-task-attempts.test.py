@@ -1230,17 +1230,19 @@ class FormatFence(unittest.TestCase):
     setUp = Attempts.setUp
     mk = Attempts.mk
 
-    def test_a_format_3_reader_refuses_what_this_writes_and_this_upgrades_format_3(self):
+    def test_an_earlier_reader_refuses_what_this_writes_and_this_upgrades_formats_3_and_4(self):
         a = self.mk()
         put(a, "tsk_A", run="tsk_A", owed_publish="tsk_A", owed_reserve={"id": "v1-x"})
         written = json.loads(a.path.read_text())
-        self.assertEqual(written["format"], 4)
-        self.assertNotEqual(written["format"], 3, "the format-3 reader's own check (`format != 3`) refuses it")
-        a._write({**written, "format": 3})
-        self.assertEqual(a.entry("tsk_A")["run"], "tsk_A", "a format-3 ledger is read")
-        put(a, "tsk_B", run="tsk_B")
-        self.assertEqual(json.loads(a.path.read_text())["format"], 4, "and upgraded on its next write")
-        a._write({**written, "format": 5})
+        self.assertEqual(written["format"], 5)
+        with unittest.mock.patch.object(task_attempts, "_READS", (3, 4)):     # the format-4 bridge's reader
+            self.assertIs(a.entry("tsk_A"), task_attempts.UNKNOWN, "a format-4 bridge refuses it, and holds")
+        for earlier in (3, 4):
+            a._write({**written, "format": earlier})
+            self.assertEqual(a.entry("tsk_A")["run"], "tsk_A", f"a format-{earlier} ledger is read")
+            put(a, "tsk_B", run="tsk_B")
+            self.assertEqual(json.loads(a.path.read_text())["format"], 5, "and upgraded on its next write")
+        a._write({**written, "format": 6})
         self.assertIs(a.entry("tsk_A"), task_attempts.UNKNOWN, "a newer format is never read")
 
 

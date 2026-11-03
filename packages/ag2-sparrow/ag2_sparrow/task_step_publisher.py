@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .chat_secret_filter import filter_chat_secrets
+from . import diagnostics
 
 SUMMARY_MAX = 140
 LINE_MAX = 60
@@ -120,12 +121,16 @@ class StepPublisher:
             try:
                 response = self.send(payload)
                 if isinstance(response, dict) and response.get("status") == "not_deployed":
-                    self.log(f"task step {tid}: room.task.progress not deployed; skipping")
+                    code = diagnostics.code_field(response.get("error_code")) or "unavailable"
+                    self.log(f"task step {tid}: room.task.progress not deployed; skipping "
+                             f"(HTTP 404; error_code={code})")
                     continue
                 if not isinstance(response, dict) or response.get("status") != "completed":
                     raise ValueError("Action did not succeed")
             except Exception as exc:
-                self.log(f"task step {tid}: Action failed ({type(exc).__name__}); continuing")
+                code = diagnostics.code_field(getattr(exc, "task_step_error_code", None)) or "unavailable"
+                self.log(f"task step {tid}: Action failed ({diagnostics.describe(exc)}; "
+                         f"error_code={code}); continuing")
                 continue
             self.sent[tid] = identity
 

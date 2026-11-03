@@ -145,6 +145,15 @@ def write_fake_claude(path, py=sys.executable):
     return path
 
 
+def write_fake_tmux(path, version="3.6"):
+    """A tmux that only answers -V, so no suite depends on the host's tmux to resolve one."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('#!/bin/sh\n[ "$1 $2" = "-u -V" ] || [ "$1" = "-V" ] || exit 1\necho "tmux %s"\n' % version)
+    path.chmod(0o755)
+    return path
+
+
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
 NONCE = "0123456789abcdef0123456789abcdef"
 HOLD_DRIVER = ("import sys, os, time; sys.path.insert(0, %r)\n"
@@ -429,6 +438,7 @@ class ConnectBase(unittest.TestCase):
         self.bin = self.home / "bin"
         self.bin.mkdir()
         self.claude = write_fake_claude(self.bin / "claude")
+        self.tmux_bin = write_fake_tmux(self.home / "tmux-bin" / "tmux")
         self.work = self.home / "work"
         self.inbox, self.results = self.work / "tasks", self.work / "results"
         self.plugin = self.home / "plugin"
@@ -440,7 +450,8 @@ class ConnectBase(unittest.TestCase):
         relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
         relay.chmod(0o600)
         self.relay = relay
-        env = {"HOME": str(self.home), "USER": "owner", "PATH": f"{self.bin}:/usr/bin:/bin", cm.MANAGED_VAR: "1",
+        env = {"HOME": str(self.home), "USER": "owner", "PATH": f"{self.bin}:{self.tmux_bin.parent}:/usr/bin:/bin",
+               cm.MANAGED_VAR: "1",
                "SUTANDO_WORKSPACE_DIR": "/secret/ws", "REMOTE_TASK_TOKEN": TOKEN,
                "ANTHROPIC_API_KEY": "sk-ant-should-not-pass", "CLAUDE_CODE_OAUTH_TOKEN": "oauth-should-not-pass",
                "AWS_SECRET_ACCESS_KEY": "aws-should-not-pass"}

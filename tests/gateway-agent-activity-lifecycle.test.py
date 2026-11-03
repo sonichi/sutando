@@ -167,7 +167,7 @@ class Lifecycle(unittest.TestCase):
         tasks = self.bridges.ws / "tasks"
         self.bridges.wait_for((tasks / f"{local}.txt").exists, proc, "generation 1 queued")
         self.relay.queue.append(_task(lease_id="lease-2", task="the second serve's own text"))
-        saved = lambda: sorted(self.state.glob("relay-reserves*/v1-*.json"))  # noqa: E731
+        saved = lambda: sorted(self.state.glob("relay-reserves*/v[12]-*.json"))  # noqa: E731
         self.bridges.wait_for(saved, proc, "the held serve's saved copy")
         self.bridges.wait_for(lambda: any(b.get("lease_id") == "lease-2" for b in self.relay.ack_bodies),
                               proc, "its ack sent, and lost")
