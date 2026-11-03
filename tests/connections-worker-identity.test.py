@@ -17,6 +17,10 @@ The vault, the gateway probe and the process spawn are fakes, from tests/connect
 
 Run: python3 tests/connections-worker-identity.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import contextlib
 import importlib.util
 import io
@@ -30,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 _spec = importlib.util.spec_from_file_location("connections_contract", ROOT / "tests" / "connections.test.py")
 H = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(H)  # isolates the environment and fakes the resolver, as that suite does
+_spec.loader.exec_module(H)  # fakes the resolver, as that suite does
 C = H.C
 sys.path.insert(0, str(ROOT / "skills" / "worker-pool" / "scripts"))
 import local_task_protocol as ltp  # noqa: E402

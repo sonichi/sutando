@@ -2068,9 +2068,8 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
-# Host-injected () -> the recipient every task this lane queues is addressed to (its
-# `requested_worker`), or "": a lane that runs as one worker's own agent hands that worker all it
-# receives. None (standalone default) leaves each task's own field as the gateway sent it.
+# Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
+# or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.

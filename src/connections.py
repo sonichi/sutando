@@ -1340,7 +1340,7 @@ def _check_worker_identity(rows: list, seen: Mapping[str, object], worker: str) 
     """Refuse a worker identity whose agent the gateway did not name, or that another row runs as."""
     agent = str(seen.get("agent_mxid") or "") if seen.get("verified") else ""
     if not agent:
-        raise WorkerIdentityUnverified(f"the gateway did not confirm which agent this code is for"
+        raise WorkerIdentityUnverified("the gateway did not confirm which agent this code is for"
                                        + (f" ({seen['error']})" if seen.get("error") else ""))
     taken = next((r for r in rows if r.get("agent_mxid") == agent), None)
     if taken is not None:
@@ -2088,13 +2088,9 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 
 
 # ── a pool worker's own identity ─────────────────────────────────────────────
-#
-# A pool worker may run as its own agent rather than through the core's. Its identity is one row
-# naming the worker (`worker`), on the same server as a core row if need be: a named, never-primary
-# lane that answers only what is addressed to its agent, stamps each task it queues with the
-# worker (`lane_worker`, read by the bridge host), and posts no proactive messages. The token
-# arrives from wherever the owner got it (`source`): pasted from the agent's settings page today,
-# handed over by the agent-link flow later; both land in the vault under the row's token_ref.
+
+# One row naming the worker: a named, never-primary lane that queues every task to that worker and
+# posts nothing proactive. Its token, however it arrived (`source`), lives in the vault.
 
 WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
 

@@ -28,9 +28,9 @@ for _p in (str(_HERE), str(_REPO / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import connections  # noqa: E402
-import pool_roster as pr  # noqa: E402
-from workspace_default import resolve_workspace  # noqa: E402
+import connections
+import pool_roster as pr
+from workspace_default import resolve_workspace
 
 
 def live_worker(workspace: Path, name: str) -> str:
