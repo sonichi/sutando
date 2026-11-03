@@ -9760,6 +9760,16 @@ def _worker_hard_timeout_s() -> float:
     return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
 
 
+def _bridge_auth_held(channel: str) -> bool:
+    """True while channel-bridge-wrapper.sh holds this bridge on a rejected token (stamp: epoch, wrapper pid)."""
+    stamp = WORKSPACE_DIR / "state" / "channel-bridge-supervisor" / f"{channel}.auth-held"
+    try:
+        lines = stamp.read_text().split()
+        return len(lines) >= 2 and _pid_alive(int(lines[1]))
+    except (OSError, ValueError):
+        return False
+
+
 def _task_claim_thresholds() -> tuple[float, float]:
     """(warn, down) seconds from the handler's configured hard timeout."""
     hard = _worker_hard_timeout_s()
@@ -13367,6 +13377,10 @@ def run_all_checks() -> list[dict]:
                 _apply_pin_findings(_row, _pin_verdicts(name, None))
                 checks.append(_row)
                 continue
+            if _bridge_auth_held(channel_name):
+                checks.append({"name": name, "status": "fail", "detail": (
+                    "held: credential rejected — vault set the token, then bash src/restart.sh")})
+                continue
             # This exact detail string is a contract: fix_down_bridges()
             # matches it as a PREFIX to pick restart candidates (and the
             # health-check-fix-down-bridges test locks it). Change both
@@ -14463,6 +14477,16 @@ def _resolve_launch_env() -> dict:
     return env
 
 
+def _core_limit_hold(now: float) -> "dict | None":
+    """The launcher's provider-limit hold in force now, else None; unreadable is None."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import core_limit_hold
+        return core_limit_hold.active_hold(WORKSPACE_DIR, now)
+    except Exception:
+        return None
+
+
 def _default_core_restart() -> bool:
     """Restart the core out-of-process, setting no model: recovery must not change
     which model the core runs on. True if the restart command exited 0."""
@@ -14568,6 +14592,7 @@ def recover_core_if_wedged(
     restart_fn=None,
     stopped_fn=None,
     sender=None,
+    limit_hold_fn=None,
 ) -> "dict | None":
     """Auto-restart the core when it is alive-but-wedged. Returns a dict
     describing the action taken (for tests / observability), or None when no
@@ -14596,6 +14621,7 @@ def recover_core_if_wedged(
         lambda: _local_core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
     send = sender or _default_slack_sender
+    limit_hold_fn = limit_hold_fn or (lambda: _core_limit_hold(now))
 
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -14686,6 +14712,15 @@ def recover_core_if_wedged(
                 _reset_observation()
                 _save()
             return None
+
+        # The launcher holds a core its provider refused for a limit; relaunching here
+        # would only DM "auto-relaunching" and meet the same hold.
+        hold = limit_hold_fn() if dead else None
+        if hold:
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
+            return {"action": "limit-hold", "until": hold.get("until"), "reason": hold.get("reason")}
 
         # Age alone cannot separate a wedge from one legitimately long task: reset the
         # window when the oldest task changes, the core advances, or the mode flips.

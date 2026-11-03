@@ -161,6 +161,12 @@ def pool(socket):
     (ws / "state" / "roster.json").write_text(json.dumps({"workers": {WID: {"state": "live", "label": "rev"}}}))
     wi.record_session(ws, WID, "s1", runtime="claude", relation=wi.RELATION_NEW)
     wi.start_incarnation(ws, WID, "s1", tmux_socket=str(socket), tmux_session=NAME)
+    # One routed task, still live in tasks/: what the card is about.
+    inbox = rem.pd.deliveries_dir(ws, WID)
+    inbox.mkdir(parents=True)
+    (inbox / "task-owed1.txt").write_bytes(b"")
+    (ws / "tasks").mkdir()
+    (ws / "tasks" / "task-owed1.txt").write_text("id: task-owed1\ntask: x\n")
     return ws
 
 
@@ -185,6 +191,11 @@ check("raising it never acts on the session", [c for c in t.calls if any(a in c 
 out, _, req = card(pool(tmp / "unblocked.sock"), IDLE)
 check("with no fence the card says the cause is unidentified",
       "not identified" in (req.prompt if hasattr(req, "prompt") else str(req.__dict__)), True)
+leftover = pool(fenced)
+(leftover / "tasks" / "task-owed1.txt").unlink()  # archived or gone: only its sentinel remains
+out, _, _ = card(leftover, IDLE)
+check("a seat owed only by a leftover sentinel (no live task file) is not carded",
+      (out.get("outcome"), out.get("pane")), ("cleared", "no-live-task"))
 out, _, _ = card(pool(fenced), f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n")
 check("a seat that is working again is not carded", out.get("outcome"), "cleared")
 AGENT = (f"❯ \n{FOOTER}\n  ⏺ main\n"

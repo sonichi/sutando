@@ -40,7 +40,7 @@ from claude_code_fixtures import (  # noqa: E402
     TOKEN, unhold,
     UNPUBLISHED, wait_for, wait_gone,
 )
-from connect_undo_seams import UndoSeams  # noqa: E402
+from connect_undo_seams import UndoSeams, bridge_verbs  # noqa: E402
 
 
 class ConnectVerify(ConnectBase):
@@ -154,6 +154,22 @@ class UndoUnits(ConnectBase):
         with mock.patch.object(sm, "_run", return_value=shown), mock.patch.object(task_io, "start_time", return_value=None):
             self.assertIsNone(cm.job_identity(L), "a pid whose start cannot be read")
 
+    def test_how_the_last_run_ended_says_whether_its_manager_restarts_the_job(self):
+        def systemd(code, status):
+            return subprocess.CompletedProcess([], 0, f"InvocationID=inv-a\nMainPID=0\nExecMainStartTimestampMonotonic=9\n"
+                                                      f"ExecMainCode={code}\nExecMainStatus={status}\n", "")
+        for shown, restarts in ((systemd(1, cm.EXIT_HELD), False), (systemd(1, 74), True), (systemd(1, 0), True),
+                                (systemd(2, 15), True), (systemd(0, 0), None)):
+            with self.subTest(shown.stdout), mock.patch.object(sm, "_run", return_value=shown):
+                self.assertEqual(cm.job_identity(L)["restarts"], restarts)
+        for text, restarts in (("last exit code = 0", False), ("last exit code = 74", True),
+                               ("last terminating signal = Terminated: 15", True), ("last exit code = (never exited)", None)):
+            with self.subTest(text), mock.patch.object(cm, "is_macos", return_value=True), \
+                    mock.patch.object(sm, "_run", return_value=subprocess.CompletedProcess([], 0, f"\tstate = not running\n\t{text}\n", "")):
+                self.assertEqual(cm.job_identity(L)["restarts"], restarts)
+                self.assertTrue(cm.job_identity(dataclasses.replace(L, keep_alive_on_success=None))["restarts"] in (True, None),
+                                "KeepAlive=true restarts any end")
+
     def test_an_exact_signal_without_pidfds_and_its_failures(self):
         nofd = mock.patch.object(os, "pidfd_open", side_effect=OSError(errno.ENOSYS, "x"), create=True)
         started = mock.patch.object(task_io, "start_time", return_value="2026-01-01T00:00:00Z")
@@ -238,7 +254,7 @@ class UndoUnits(ConnectBase):
 
     def test_a_run_asked_to_retire_ends_for_good_and_its_manager_is_never_named(self):
         child, ident = self._run()
-        idle = {"pid": None, "start": None, "invocation": "", "since": None}
+        idle = {"pid": None, "start": None, "invocation": "", "since": None, "restarts": False}
         with mock.patch.object(cm, "job_identity", return_value=idle), mock.patch.object(cm, "stop_supervisor") as stop, \
                 mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as sig:
             self.assertEqual(cm._retire_run(L, ident), "")
@@ -264,6 +280,17 @@ class UndoUnits(ConnectBase):
         self.assertEqual(line, f"pid {child.pid} retired, but the job runs again as pid 999999, which this operation "
                                "did not start")
         stop.assert_not_called()
+
+    def test_a_run_that_ended_asking_to_be_restarted_is_never_reported_stopped(self):
+        for restarts, said in ((True, "ended with an exit its manager restarts, not as a retirement, so the job starts "
+                                      "again after its restart delay"),
+                               (None, "ended, but how it ended cannot be read, so its manager may start the job again")):
+            with self.subTest(restarts=restarts):
+                child, ident = self._run()
+                ended = {"pid": None, "start": None, "invocation": "", "since": None, "restarts": restarts}
+                with mock.patch.object(cm, "job_identity", return_value=ended), mock.patch.object(cm, "stop_supervisor") as stop:
+                    self.assertEqual(cm._retire_run(L, ident), f"pid {child.pid} {said}")
+                stop.assert_not_called()
 
     def test_each_failed_retire_step_leaves_the_job_and_says_why(self):
         ident = self.ident()
@@ -933,7 +960,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
 
-    def test_a_root_replaced_while_the_bridge_is_wired_unwinds_this_attempt(self):
+    def test_a_root_replaced_while_the_bridge_is_wired_leaves_the_running_bridge_and_unwinds_the_rest(self):
         fake, real = self.bridged(), cb.wire_bridge
 
         def wired_then_replaced(*a, **kw):
@@ -945,12 +972,26 @@ class ConnectCode(UndoSeams, AgentRootBase):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"the bridge this attempt wired ({cm.job_name(cli.BRIDGE)}) was removed; {cm.job_name(L)}, which held "
-                      f"the directory that was there, was stopped; nothing at {self.root} was touched", err)
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "this attempt's bridge unit is gone")
+        self.assertIn(f"the bridge this attempt wired ({cm.job_name(cli.BRIDGE)}) is active and was left, since stopping it would "
+                      f"name whatever runs as it now: stop it by hand ({cm.stop_command(cli.BRIDGE)})", err)
+        self.assertIn(f"{cm.job_name(L)}, which held the directory that was there, was stopped; nothing at {self.root} was "
+                      "touched", err)
+        self.assertTrue(cm.service_path(cli.BRIDGE).exists(), "a running bridge is left: its manager stops it only by name")
+        self.assertTrue(fake.active, "and it still runs")
+        self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
         self.assertIsNone(fake.runner.pid(), "this attempt's job is stopped")
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
+
+    def test_a_bridge_left_unregistered_by_a_refused_start_is_the_only_bridge_removed(self):
+        fake = self.bridged()
+        fake.table["bootstrap"] = 5
+        with mock.patch.object(cm, "is_macos", return_value=True):
+            rc, out, err = self.connect(Backend(), fake)
+            plist = cm.supervisor_path(cli.BRIDGE)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"the bridge unit this attempt wrote ({plist}) was removed", err)
+        self.assertFalse(plist.exists(), "an unregistered unit holding this attempt's bytes is removed")
 
     def test_connect_changes_no_jobs_definition_and_refuses_when_it_would(self):
         fake = self.running_job()

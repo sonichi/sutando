@@ -40,6 +40,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_auth_exit.py`** — Exit contract for a channel bridge whose provider rejected its credential.
 - **`channel_credentials.py`** — Credential variables a room client reads, taken from the AG2 Space channel env file.
 - **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
@@ -67,6 +68,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_gate_notice.py`** — Tell each task waiting behind a blocked core why it is on hold.
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
+- **`core_limit_hold.py`** — Hold the core's relaunch while its provider refuses it for a limit.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.

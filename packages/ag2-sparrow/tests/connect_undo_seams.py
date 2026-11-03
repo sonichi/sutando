@@ -230,29 +230,72 @@ class UndoSeams:
                     finally:
                         self._done(fake)
 
-    def test_seam_a_successor_at_the_final_manager_stop_is_never_stopped(self):
+    def test_seam_a_successor_at_the_former_final_stop_is_left_and_reported(self):
+        """Where the undo once stopped the job by name, once its run retired: no stop names the job after the
+        start, and a run another actor starts there is left running and reported."""
         for how in ("connect", "install"):
             for name, mac in MANAGERS:
                 with self.subTest(how=how, manager=name):
-                    fake, real, successor, ours = self._real(mac, f"final-{how}"), cm.stop_supervisor, [], []
+                    fake, successor, stops = self._real(mac, f"final-{how}"), [], []
+                    real_exit, real_stop = cm._await_exit, cm.stop_supervisor
 
-                    def replaced_first(shape, *a, **kw):
-                        started = STARTS & {fake.runner.verb(c) for c in fake.runner.calls}
-                        if shape.name == self.local.name and started and not successor:
-                            ours.append(fake.runner.session)
+                    def exited_then_replaced(pid, start, bound):
+                        done = real_exit(pid, start, bound)
+                        if done and not successor:
+                            self._reaped(fake)
                             fake.runner.start_session(by_manager=True)  # another actor's start, past the lock
                             successor.append(fake.runner.session)
-                        return real(shape, *a, **kw)
+                        return done
+
+                    def stop_seen(shape, *a, **kw):
+                        if shape.name == self.local.name and STARTS & {fake.runner.verb(c) for c in fake.runner.calls}:
+                            stops.append(shape.name)
+                        return real_stop(shape, *a, **kw)
                     refused = []
                     with mock.patch.object(cm, "is_macos", return_value=mac), \
-                            mock.patch.object(cm, "stop_supervisor", side_effect=replaced_first):
+                            mock.patch.object(cm, "_await_exit", side_effect=exited_then_replaced), \
+                            mock.patch.object(cm, "stop_supervisor", side_effect=stop_seen):
                         rc, out, err = self._fail(how, fake, refused)
+                    verbs = after_start(fake)
                     try:
                         self.assertTrue(rc or refused, out + err)
-                        for run in successor:
-                            self.assertIsNone(run.poll(), "a start this operation did not make is never stopped")
-                        self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned if p not in successor),
-                                        "this operation's own run is gone")
+                        self.assertTrue(successor, "the undo's own run retired, so the former seam was reached")
+                        self.assertEqual(stops, [], "no stop names the job after this operation's start")
+                        self.assertFalse(STOPS & verbs, "and no stop verb reached its manager")
+                        self.assertIsNone(successor[0].poll(), "the successor is alive")
+                        self.assertIs(fake.runner.session, successor[0], "and still the manager's")
+                        if how == "connect":
+                            self.assertIn(f"retired, but the job runs again as pid {successor[0].pid}", err)
+                    finally:
+                        self._done(fake)
+
+    def test_a_retire_whose_own_stop_fails_is_reported_as_restarting(self):
+        for how in ("connect", "install"):
+            for name, mac in MANAGERS:
+                with self.subTest(how=how, manager=name):
+                    fake = self._real(mac, f"stopfails-{how}")
+                    r = fake.runner
+                    r.throttle = 600.0      # its manager's restart delay outlasts the undo's read
+                    Path(r.acted + ".stop-fails").touch()
+                    refused = []
+                    with mock.patch.object(cm, "is_macos", return_value=mac):
+                        rc, out, err = self._fail(how, fake, refused)
+                        by_hand = cm.stop_command(self.local)
+                    try:
+                        self.assertTrue(rc or refused, out + err)
+                        ended = r.session
+                        self.assertIsNotNone(ended.poll(), "its run ended")
+                        self.assertNotEqual(ended.returncode, 0 if mac else cm.EXIT_HELD, "with an exit its manager restarts")
+                        self.assertFalse(STOPS & after_start(fake), "nothing named the job to its manager")
+                        if how == "connect":
+                            self.assertNotIn(cm.STOPPED, err)
+                            self.assertIn("ended with an exit its manager restarts, not as a retirement, so the job "
+                                          "starts again after its restart delay", err)
+                            self.assertIn(by_hand, err, "with the command that stops it")
+                            self.assertIn(f"{self.local.command} uninstall", err, "and the one that removes it")
+                        r.throttle = 0.0
+                        r.respawn_if_due(mac)
+                        self.assertEqual(r.respawns, 1, "and its manager does start it again, as reported")
                     finally:
                         self._done(fake)
 

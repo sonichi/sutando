@@ -126,6 +126,17 @@ def limit_holds(workspace, req, worker_id, runner=None, owes_work=None) -> bool:
 BACKGROUND_AGENT_ROW = re.compile(r"^\s*◯ \S.*\d+[ms](?: \d+s)? · [↓↑]", re.MULTILINE)
 
 
+def live_owed_tasks(workspace, worker_id) -> list[str]:
+    """Owed task ids (no ready result) whose task file is still live in tasks/: the ones a
+    delivery could still type in. A sentinel left over for an archived or vanished task is not."""
+    from delivery import task_dispatch as td
+    from task_archive import find_task_file
+    owned = td.owned_task_ids(sup.pd.deliveries_dir(workspace, worker_id).parent, worker_id)
+    ready = td.ready_result_filenames(sup.pd.results_dir(workspace), [f"{t}.txt" for t in owned])
+    tasks = Path(workspace) / "tasks"
+    return [t for t in owned if f"{t}.txt" not in ready and find_task_file(tasks, t) is not None]
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
@@ -179,6 +190,9 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         if BACKGROUND_AGENT_ROW.search(text):
             # The turn ended but a background agent it started is still running.
             return {"worker_id": worker_id, "outcome": "cleared", "pane": "background-agent"}
+        if not live_owed_tasks(workspace, worker_id):
+            # Owed only by sentinels whose task is archived or gone: nothing to deliver.
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": "no-live-task"}
         cause = sup.delivery_block(socket)
         body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
                 f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "

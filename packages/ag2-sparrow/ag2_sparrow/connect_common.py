@@ -867,12 +867,17 @@ def job_identity(shape: Shape) -> "dict | None":
             return None
         if r.returncode != 0:
             gone = "could not find service" in ((r.stderr or "") + (r.stdout or "")).lower()
-            return {"pid": None, "start": None, "invocation": "", "since": None} if gone else None
+            return {"pid": None, "start": None, "invocation": "", "since": None, "restarts": False} if gone else None
         m = re.search(r"^\s*pid = (\d+)", r.stdout or "", re.M)
         pid, invocation, since = (int(m.group(1)) if m else None), "", None
+        code = re.search(r"^\s*last exit code = (\d+)\s*$", r.stdout or "", re.M)
+        killed = re.search(r"^\s*last terminating signal = ", r.stdout or "", re.M)
+        keep = shape.keep_alive_on_success
+        success = None if not (code or killed) else bool(code) and code.group(1) == "0"
+        restarts = None if success is None else True if keep is None else success == keep
     else:
-        r = _sm._systemctl(("--user", "show", "-p", "InvocationID,MainPID,ExecMainStartTimestampMonotonic"),
-                           unit=shape.service_name)
+        r = _sm._systemctl(("--user", "show", "-p", "InvocationID,MainPID,ExecMainStartTimestampMonotonic,"
+                                                    "ExecMainCode,ExecMainStatus"), unit=shape.service_name)
         if not _ok(r):
             return None
         words = dict(ln.strip().split("=", 1) for ln in (r.stdout or "").splitlines() if "=" in ln)
@@ -881,10 +886,13 @@ def job_identity(shape: Shape) -> "dict | None":
             return None
         pid, invocation = int(main) or None, words.get("InvocationID", "")
         since = int(mono) if mono.isdigit() and mono != "0" else None
+        how, status = words.get("ExecMainCode", ""), words.get("ExecMainStatus", "")
+        # ExecMainCode 1 is an exit (status: its code), 2/3 a signal; Restart=always but for EXIT_HELD.
+        restarts = None if how not in ("1", "2", "3") else not (how == "1" and status == str(EXIT_HELD))
     start = task_io.start_time(pid) if pid else None
     if pid and start is None:
         return None
-    return {"pid": pid, "start": start, "invocation": invocation, "since": since}
+    return {"pid": pid, "start": start, "invocation": invocation, "since": since, "restarts": restarts}
 
 
 _GONE, _OTHER = "has exited", "now names another process"
@@ -1402,7 +1410,8 @@ def _undo_start(p: dict) -> str:
     notes = "".join(f"{line}; " for line in (undo() for undo in p["undo"]) if line)
     problem = _retire_run(shape, p["ident"])
     if problem:
-        return f"{notes}{job_name(shape)} could not be stopped ({problem}): {by_hand}"
+        return (f"{notes}{job_name(shape)} could not be stopped ({problem}): {by_hand}, or remove it with "
+                f"{shape.command} uninstall")
     left = f"it stays installed and starts again at your next login: {shape.command} uninstall removes it"
     print(f"stopped: {job_name(shape)} (the job this operation started, pid {p['ident']['pid']}); {left}")
     return f"{notes}{job_name(shape)}, {STOPPED}; {left}"
@@ -1414,7 +1423,7 @@ RETIRE_REPEAT_S = 0.5
 
 def _retire_run(shape: Shape, ident: dict) -> str:
     """'' once the run `ident` names has retired (signalled by pid, its start rechecked) and the manager
-    shows no run after it; else why not. A run that does not retire within the bound is left."""
+    shows no run after it and no restart due; else why not. A run that does not retire within the bound is left."""
     pid, start = ident["pid"], ident["start"]
     why = _signal_exact(pid, start, RETIRE_SIGNAL)
     if why:
@@ -1429,6 +1438,11 @@ def _retire_run(shape: Shape, ident: dict) -> str:
         return f"its state after pid {pid} retired cannot be read"
     if after["pid"] is not None:
         return f"pid {pid} retired, but the job runs again as pid {after['pid']}, which this operation did not start"
+    if after.get("restarts") is None:
+        return f"pid {pid} ended, but how it ended cannot be read, so its manager may start the job again"
+    if after["restarts"]:
+        return (f"pid {pid} ended with an exit its manager restarts, not as a retirement, so the job starts "
+                "again after its restart delay")
     return ""
 
 
@@ -1497,10 +1511,10 @@ def stop_handlers(state: dict) -> dict:
     return before
 
 
-def retired(state: dict, rc: int) -> int:
-    """A run asked to retire (RETIRE_SIGNAL) that ended without asking to be retried exits EXIT_HELD, so its
-    manager does not start it again; any other run keeps `rc`."""
-    return EXIT_HELD if state.get("retire") and rc != EXIT_RETRY else rc
+def retired(state: dict, rc: int, retry: int = EXIT_RETRY) -> int:
+    """A run asked to retire (RETIRE_SIGNAL) that ended without asking to be retried (`retry`, the caller's
+    retry code) exits EXIT_HELD, so its manager does not start it again; any other run keeps `rc`."""
+    return EXIT_HELD if state.get("retire") and rc != retry else rc
 
 
 def restore_handlers(state: dict, before: dict) -> None:
