@@ -96,7 +96,26 @@ def prepare_guard(socket):
             shutil.rmtree(prepared)
     if not (guard / "mutex").is_file():
         raise ValueError("legacy fence requires explicit recovery")
+    refresh_guard(socket)
     return guard / "mutex"
+
+
+def refresh_guard(socket):
+    """Touch the guard's regular files so macOS's nightly tmp_cleaner (files untouched for 3
+    days) never removes them: a lost mutex blocks every send, a lost `uncertain` lifts a fence.
+    Never creates, clears or replaces anything; returns how many files were touched."""
+    try:
+        entries = [p for p in guard_path(socket).iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return 0
+    touched = 0
+    for p in entries:
+        try:
+            os.utime(p)
+            touched += 1
+        except OSError:
+            pass
+    return touched
 
 
 def _pending_ticket(guard):
