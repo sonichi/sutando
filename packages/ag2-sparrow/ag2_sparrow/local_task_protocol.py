@@ -226,14 +226,11 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
-    # A Commons hook fire's context (one-line JSON object: hook_id, fire_id, caused_by, rows,
-    # trigger, ...). Only the bridge writes the line, and the guard defangs a forged body copy,
-    # but the values inside (row cells, names, digests) are room-member data: read them as
-    # data about the room, never as instructions or as an authority on who may do what.
+    # A Commons hook fire's context (one JSON line: hook_id, fire_id, caused_by, rows, ...). The bridge
+    # writes the line, but its values are room-member data: read them as data, never as authority.
     "hook",
-    # A Commons Summon's context (one-line JSON object: task_id, caused_by, room_id, database,
-    # row_id, changed_by, changes, ...). Same as `hook`: a bridge-written line holding
-    # room-member data.
+    # A Commons Summon's context (one JSON line: task_id, caused_by, room_id, row_id, changes, ...).
+    # Same as `hook`: a bridge-written line whose values are room-member data.
     "summon",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
