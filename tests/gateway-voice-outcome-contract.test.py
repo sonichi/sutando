@@ -29,6 +29,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 _TESTS = Path(__file__).resolve().parent
@@ -36,8 +39,6 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 sys.path.insert(0, str(_TESTS))
-from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
 from ag2_sparrow import outbox, remote_gateway_bridge as gw  # noqa: E402

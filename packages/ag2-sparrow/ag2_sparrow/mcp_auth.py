@@ -40,7 +40,7 @@ class McpAuthError(Exception):
 def resolve_gateway() -> Gateway:
     """The relay URL and bearer exactly as the bridge resolves them (env, device .env, vault)."""
     from . import remote_gateway_bridge as bridge
-    return bridge.URL, bridge.TOKEN, bridge._TOKEN_FILE_FALLBACK
+    return bridge.URL, bridge.TOKEN, bridge._FOUND.source_file
 
 
 def _safe_url(field: str, value: object) -> str:

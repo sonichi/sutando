@@ -730,7 +730,8 @@ def test_a_failing_background_push_is_logged_not_silent():
             raise RuntimeError("relay exploded")
         m._advertisement_or_none = boom
         m._push_pool_advertisement(); m._PUSH_THREAD.join(5)
-        assert any("push failed" in ln and "relay exploded" in ln for ln in lines), lines
+        # The type only: an exception's text never reaches a log (diagnostics.describe).
+        assert any("push failed: RuntimeError" in ln and "relay exploded" not in ln for ln in lines), lines
         print("PASS test_a_failing_background_push_is_logged_not_silent")
 
 

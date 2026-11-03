@@ -170,7 +170,7 @@ clear_automation_leftover() {
   target="$(core_target)" || return 1
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" || return 1
   leftover="$(printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" leftover --runtime codex --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" 2>/dev/null)" || return 1
-  bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-a C-k || return 1
+  bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$target" -- C-a C-k || return 1
   log_notifier "cleared rejected automation input '$leftover' from the composer"
 }
 
@@ -276,7 +276,7 @@ deliver_prompt() {
     target="$(core_target)" || { log_notifier "refusing to type $filename: no core window"; return 1; }
     log_notifier "submitting $filename: typing prompt (attempt $((type_tries + 1)))"
     type_rc=0
-    bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- -l -- "$prompt" || type_rc=$?
+    bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$target" -- -l -- "$prompt" || type_rc=$?
     [ "$type_rc" = 0 ] || log_notifier "typing $filename failed (rc $type_rc); counted as a failed attempt"
     [ "$type_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
     stage_checks=0
@@ -299,7 +299,7 @@ deliver_prompt() {
   fi
   log_notifier "submitting $filename: C-m (attempt 1)"
   submit_rc=0
-  target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
+  target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
   [ "$submit_rc" = 0 ] || log_notifier "C-m for $filename failed (rc $submit_rc)"
   [ "$submit_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
   # Nothing observable staged: the submit is sent and unverifiable — never
@@ -323,7 +323,7 @@ deliver_prompt() {
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
     submit_rc=0
-    target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
+    target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
     [ "$submit_rc" = 0 ] || log_notifier "C-m for $filename failed (rc $submit_rc)"
     [ "$submit_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
   done
@@ -413,8 +413,14 @@ submit_task() {
         clear_workstream_context
         return 0
       fi
+      # A payload removed with no findable result can never be answered; the queue head drop releases it.
+      if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+        SUBMIT_ABANDONED=1
+        clear_workstream_context
+        return 0
+      fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
-        echo "task-notifier: timed out waiting for result: $filename" >&2
+        log_notifier "timed out waiting for result: $filename"
         clear_workstream_context
         return 0
       fi
@@ -541,12 +547,25 @@ process_announced_queue() {
       continue
     fi
     wait_for_core_idle || exit 1
+    # Checked after the idle wait so a file archived during that wait is never typed.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      # No result was published, so the hold is withdrawn, never finished; a failed write keeps the head.
+      if ! mark_worker_stage "$filename" abandon; then
+        log_notifier "keeping $filename at the queue head: could not withdraw its worker hold; will retry on the next idle cycle"
+        return 0
+      fi
+      log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    SUBMIT_ABANDONED=0
     submit_task "$filename" 1
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
+    [ "$SUBMIT_ABANDONED" = 1 ] && continue
     return 0
   done
 }

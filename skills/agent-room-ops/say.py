@@ -145,7 +145,7 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
 
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, reason="no gateway configured")
 

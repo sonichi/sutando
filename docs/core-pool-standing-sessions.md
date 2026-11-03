@@ -1,6 +1,6 @@
 # Core pool + standing sessions: how they compose
 
-Design record for the discussion in the AG2 Space `Sessions` room, 2026-08-25.
+Design record for the discussion in the s.space `Sessions` room, 2026-08-25.
 Nothing here is implemented. It records decisions and the reasoning that
 produced them, so the next change does not re-derive them from scratch.
 
@@ -48,7 +48,7 @@ grouping it collapses to a lookup: *does this room belong to a group that is
 already seated?* That keeps the lead model-free, which is the property #3314 is
 built on and the one most worth not spending.
 
-**The grouping is declared, not inferred.** An AG2 Space room already has a
+**The grouping is declared, not inferred.** An s.space room already has a
 `separate sessions` setting, and it carries exactly the right semantics: a room
 with it on is its own group and wants a dedicated core; rooms without it may be
 grouped. An existing user-facing knob beats a heuristic.

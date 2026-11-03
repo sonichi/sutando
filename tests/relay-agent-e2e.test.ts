@@ -118,29 +118,44 @@ describe('relay agent end to end', () => {
 		assert.equal(readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length, 1);
 		session.clientConnected = true;
 	});
-	it('the client leaves while a result waits its turn: it is not handed to the empty session, it goes to the DM', async () => {
-		// 2026-10-11 00:10-00:14 UTC: four results waited behind the user's talking; the user closed the page;
-		// each was then returned to its work call a minute apart, recorded heard, and never read to anyone.
+	it('the user is talking when a result lands: it goes back through its open call at once (Gemini picks the moment)', async () => {
+		// WHEN_IDLE lets Gemini schedule the call's own response: no hold until the user's turn is over.
 		const id = voiceTask('check PR 5167');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5167' });
 		await tick(0);
-		// The user has just spoken and the model has not answered: the result waits its turn (reply wait, 8 s).
 		session.emit('speech.user_started');
-		session.emit('speech.user_ended');
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 5167 is open.');
-		await tick(2_600); // the watcher (2 s) has taken the result; it waits in the pacer for the model's turn
-		assert.equal(heard(id), false, 'waits while the user\'s turn is open');
-		assert.equal(relay.isWaiting(id), true);
-		session.clientConnected = false; // the user closes the page
+		const out = await Promise.race([call, tick(5_000).then(() => 'timed out')]);
+		assert.match(out, /PR 5167 is open/, 'returned while the user is still speaking');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected', 'handed over, not yet heard');
 		session.emit('speech.user_ended');
 		session.emit('turn.start'); session.emit('response.first_audio'); session.emit('turn.end', { turnId: 't5167' } as never);
-		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
-		assert.doesNotMatch(out, /PR 5167 is open/, 'not handed to a session nobody hears');
-		assert.notEqual(voiceTaskStore.get(id)?.delivery, 'injected');
-		await until(() => voiceTaskStore.get(id)?.delivery === 'dm');
-		assert.equal(voiceTaskStore.get(id)?.delivery, 'dm', 'one DM copy; read on reconnect');
-		session.clientConnected = true;
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'heard once the model has spoken after the hand-off');
+	});
+
+	it('a result handed to its call but lost to a fresh dial before it was spoken is handed over again', async () => {
+		const id = voiceTask('check PR 6100');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'check PR 6100' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6100 is merged.');
+		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6100 is merged/);
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected');
+		session.emit('session.reconnectBoundary', {} as never);
+		assert.equal(voiceTaskStore.get(id)?.delivery, undefined, 'not heard: reconcile hands it over again');
+	});
+
+	it('a resume (RECONNECTING then ACTIVE, no boundary) keeps the open call, and the result returns through it', async () => {
+		const id = voiceTask('check PR 6200');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'check PR 6200' });
+		await tick(0);
+		session.emit('session.stateChange', { toState: 'RECONNECTING' } as never);
+		session.emit('session.stateChange', { toState: 'ACTIVE' } as never);
+		assert.equal(relay.isWaiting(id), true, 'a resumed connection still holds the call');
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6200 is merged.');
+		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6200 is merged/, 'returned through the call');
 	});
 
 	it('a task the core ends with a skip-marked result is not pending for the user', async () => {
@@ -159,24 +174,19 @@ describe('relay agent end to end', () => {
 		assert.equal(voiceTaskCounts(mine()).pending, 0, 'nothing to hear: not pending');
 	});
 
-	it('two results landing in the same moment: both reach the model, the second after the model answered the first', async () => {
+	it('two results landing in the same moment: both go back through their calls at once, each heard after the model speaks', async () => {
 		const [a, b] = ['5275', '5251'].map((pr) => voiceTask(`check PR ${pr}`));
 		const calls = [a, b].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
 		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 5275 is blocked on changes requested.');
 		writeFileSync(join(TMP, 'results', `${b}.txt`), 'PR 5251 is waiting for review.');
-		const first = await Promise.race([calls[0], tick(8_000).then(() => 'timed out')]);
+		const [first, second] = await Promise.all(calls.map((c) => Promise.race([c, tick(8_000).then(() => 'timed out')])));
 		assert.match(first, /PR 5275/);
-		const second = await Promise.race([calls[1], tick(80).then(() => 'not yet')]);
-		assert.equal(second, 'not yet', 'held while the model is answering the first');
+		assert.match(second, /PR 5251/, 'not held behind the first: Gemini schedules each with WHEN_IDLE');
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		session.emit('turn.end', { turnId: 't1' } as never);
-		assert.match(await calls[1], /PR 5251/);
-		assert.equal(voiceTaskStore.get(a)?.delivery, 'spoken', 'the answered one is recorded spoken');
-		session.emit('turn.start');
-		session.emit('response.first_audio');
-		session.emit('turn.end', { turnId: 't2' } as never);
+		assert.equal(voiceTaskStore.get(a)?.delivery, 'spoken', 'recorded heard after the model spoke');
 		assert.equal(voiceTaskStore.get(b)?.delivery, 'spoken');
 	});
 	it('results waiting their turn are not replayed by reconcile (no log line, no replay counted)', async () => {
@@ -186,12 +196,12 @@ describe('relay agent end to end', () => {
 		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 7001 status.');
 		writeFileSync(join(TMP, 'results', `${b}.txt`), 'PR 7002 status.');
 		await calls[0];
-		await tick(700); // two reconcile passes while b waits behind a
-		assert.equal(voiceTaskStore.get(b)?.replays ?? 0, 0, 'waiting is not a lost result');
+		assert.match(await calls[1], /PR 7002/, 'returned at once, not queued behind the first');
+		await tick(700); // two reconcile passes before the model speaks
+		assert.equal(voiceTaskStore.get(b)?.replays ?? 0, 0, 'a result handed to its call is not a lost result');
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		session.emit('turn.end', { turnId: 't9' } as never);
-		assert.match(await calls[1], /PR 7002/);
 	});
 	it('a corrected request: the old task\'s result is not said, its call ends, the new one is', async () => {
 		const old = voiceTask('Check the status and details of PR #51167.');
@@ -232,21 +242,15 @@ describe('relay agent end to end', () => {
 		assert.match(await call, /waits for one approval/, 'its own answer comes back through its call');
 	});
 
-	it('the core answers three requests in one result and marks the other two deduped while it waits its turn: said once, all three named, nothing handed over again', async () => {
+	it('the core marks two requests deduped into a third before answering it: said once, all three named, nothing handed over again', async () => {
 		const [a, b, c] = ['5302', '5229', '5167'].map((pr) => voiceTask(`check PR ${pr}`));
 		const calls = [a, b, c].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
 		const before = sent.length;
-		// The user has just spoken and the model has not answered: the result waits in the queue while the markers land.
-		session.emit('speech.user_started');
-		session.emit('speech.user_ended');
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'Three PRs: 5302 waits for review; 5229 needs a rebase; 5167 waits for you.');
-		await until(() => !existsSync(join(TMP, 'results', `${a}.txt`)) || sent.length > before, 3_000);
 		writeFileSync(join(TMP, 'results', `${b}.txt`), `[deduped: ${a}]`);
 		writeFileSync(join(TMP, 'results', `${c}.txt`), `[deduped: ${a}]`);
 		await until(() => [b, c].every((id) => voiceTaskStore.get(id)?.answeredBy === a));
-		// The model answers the user: the queue moves.
-		session.emit('turn.start'); session.emit('response.first_audio'); session.emit('turn.end', { turnId: 't-reply' } as never);
+		writeFileSync(join(TMP, 'results', `${a}.txt`), 'Three PRs: 5302 waits for review; 5229 needs a rebase; 5167 waits for you.');
 		const said = await calls[0];
 		for (const pr of ['5302', '5229', '5167']) assert.ok(said.includes(`"check PR ${pr}"`), `request ${pr} named to the model`);
 		for (const call of calls.slice(1)) assert.match(await call, /answered_together/);

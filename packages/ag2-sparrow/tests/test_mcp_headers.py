@@ -258,12 +258,30 @@ class HelperCommandTest(unittest.TestCase):
         self.assertNotIn("PYTHONPATH", mcp_auth._helper_command("/e/.env"))
 
 
+def _fresh_bridge():
+    # `from . import` reads the package attribute, so popping sys.modules alone reuses the old import.
+    sys.modules.pop("ag2_sparrow.remote_gateway_bridge", None)
+    sys.modules["ag2_sparrow"].__dict__.pop("remote_gateway_bridge", None)
+
+
 class ResolveTest(unittest.TestCase):
     def test_reads_the_bridges_own_resolution(self):
         relay = "https://gw.example/relay"
         with mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": f"{relay}|{SECRET}"}):
-            sys.modules.pop("ag2_sparrow.remote_gateway_bridge", None)
+            _fresh_bridge()
             self.assertEqual(mcp_auth.resolve_gateway(), (relay, SECRET, ""))
+
+    def test_names_the_device_env_file_that_supplied_the_token(self):
+        relay = "https://gw.example/relay"
+        env_file = os.path.join(tempfile.mkdtemp(prefix="mcp-headers-"), ".env")
+        with open(env_file, "w") as fh:
+            fh.write(f"REMOTE_TASK_TOKEN='{relay}|{SECRET}'\n")
+        os.chmod(env_file, 0o600)
+        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": env_file}):
+            _fresh_bridge()
+            url, bearer, source = mcp_auth.resolve_gateway()
+        self.assertEqual((url, bearer), (relay, SECRET))
+        self.assertEqual(os.path.realpath(source), os.path.realpath(env_file))
 
 
 class EntryPointTest(unittest.TestCase):

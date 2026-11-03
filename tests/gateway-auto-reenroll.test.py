@@ -165,6 +165,22 @@ class _Claim(unittest.TestCase):
         self.assertEqual(self.posted[-1][1]["agent_id"], "@file.agent:ag2.space")
         self.assertEqual(gw._reenroll_state["code"], "beef1234")
 
+    def test_a_pinned_bridge_with_no_identity_never_claims_from_a_file(self):
+        gw.os.environ.pop("AGENT_MXID", None)
+        gw.os.environ.pop("AGENT_ID", None)
+        saved = gw._config_from_channel_env
+        gw._config_from_channel_env = lambda k: "@file.agent:ag2.space"
+        gw.urllib.request.urlopen = lambda *a, **k: self.fail("claimed as a file's identity")
+        try:
+            with mock.patch.dict(gw.os.environ, {gw.agent_identity.PINNED_KEY: "1"}):
+                gw._reenroll_claim()
+        finally:
+            gw.urllib.request.urlopen = urllib.request.urlopen
+            gw._config_from_channel_env = saved
+        self.assertIsNone(gw._reenroll_state["last_attempt_at"])
+        self.assertTrue(any("launcher pinned no agent identity" in line for line in self.logs), self.logs)
+        self.assertFalse(any("into the channel .env" in line for line in self.logs), self.logs)
+
     def test_missing_identity_does_not_consume_the_cadence(self):
         gw.os.environ.pop("AGENT_MXID", None)
         gw.os.environ.pop("AGENT_ID", None)

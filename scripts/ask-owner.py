@@ -12,6 +12,9 @@ The ask belongs to the store adapter an installed skill declares, resolved here 
 installed roots (src/skill_roots.py; --store-adapter overrides): with --task-file it routes
 the question to that task's own conversation, records it as a row of the owner's room
 database, holds it in the workspace outbox while the room is unreachable, and reminds.
+With --default and/or --option, a question bound for AG2 Space is asked as a decision card
+(one button per choice) instead of text; the owner's click comes back as a `hitl_click: true`
+task, and `python3 src/pending_questions_reader.py clicks` hands it to the core.
 Always exits 0 after a non-empty question: every failure is printed, never raised. With
 --unless-open, a question whose title matches one the store holds open is reported
 (`already open: [<id>]`) and not filed again, so a carried list can be filed without doubling rows.

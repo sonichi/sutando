@@ -30,7 +30,7 @@ ROUTING = (
     "post it in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.",
 )
 THREADING = (
-    "- `[thread]` — task-result lead line: AG2 Space threads the answer on the ask. Threading is your call, "
+    "- `[thread]` — task-result lead line: s.space threads the answer on the ask. Threading is your call, "
     "e.g. a side discussion that would crowd the timeline; when unsure, reply in the timeline.",
 )
 # The audience test replaced this: a room's readers, not the data's origin, decide what it may see.

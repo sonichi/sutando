@@ -23,6 +23,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -61,9 +63,9 @@ def run(watcher_instance, receipt_owner, want_state=False):
     else: env.pop("SUTANDO_INSTANCE_ID", None)
     # stderr is kept: a probe that fails with nothing to read cannot be diagnosed.
     errf = open(tmp / "watcher.err", "w+")
-    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)], cwd=str(REPO),
+    p = popen_bound(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)], cwd=str(REPO),
                          env=env, stdout=subprocess.PIPE, stderr=errf,
-                         text=True, start_new_session=True)
+                         text=True)
     out, t0, seen_state = [], time.time(), set()
     # The sentinel lands only after fswatch is confirmed up, so a loaded runner
     # can take longer than a probe that stops at TASK_FILE; give it a real budget.

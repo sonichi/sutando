@@ -18,7 +18,7 @@ Anything not recognized parses as "normal" (fail-open). Order on disk:
 from __future__ import annotations
 import sys
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Callable, Iterable, List, Tuple
 
 # Relative inside the ag2-sparrow package copy; a flat load (importlib in tests, tools,
 # bridges) has no parent package, so src/ goes on sys.path instead.
@@ -89,16 +89,18 @@ def parse_priority_from_file(path: Path) -> str:
         return _DEFAULT
 
 
-def sort_tasks_by_priority(paths: Iterable[Path]) -> List[Path]:
+def sort_tasks_by_priority(
+    paths: Iterable[Path], *, priority_reader: Callable[[Path], str] = parse_priority_from_file,
+) -> List[Path]:
     """Sort an iterable of task file paths so the highest-priority comes first.
-    Tiebreaker: file mtime ascending (oldest first, FIFO within tier)."""
+    Tiebreaker: original entry mtime ascending, even when priority is read elsewhere."""
     enriched: List[Tuple[int, float, Path]] = []
     for p in paths:
         try:
             mtime = p.stat().st_mtime
         except OSError:
             mtime = 0.0
-        prio = parse_priority_from_file(p)
+        prio = priority_reader(p)
         enriched.append((_ORDER.get(prio, _ORDER[_DEFAULT]), mtime, p))
     enriched.sort(key=lambda t: (t[0], t[1]))
     return [p for _, _, p in enriched]

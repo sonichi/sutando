@@ -160,6 +160,26 @@ class TestItRefusesBeforeCreating(Base):
         self.assertEqual(self.spawned, [])
         self.assertIsNone(pr.load_roster(self.ws))
 
+    def test_roster_validation_delegates_before_preview_or_spawn(self):
+        for args in ((), ("--dry-run",)):
+            with self.subTest(args=args), mock.patch.object(
+                    pr, "validate_current_roster", side_effect=pr.RosterError("roster refusal")) as validate, \
+                    mock.patch.object(sw, "plan") as plan, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(self.run_cli(*args), cw.REFUSED)
+                validate.assert_called_once_with(str(self.ws))
+                plan.assert_not_called()
+                self.assertEqual(self.spawned, [])
+                self.assertIn("create-worker: roster refusal", err.getvalue())
+
+    def test_preflight_does_not_broaden_the_validators_policy(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"version": "unchecked", "workers": None}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_cli("--dry-run"), 0)
+        self.assertEqual(self.spawned, [])
+
 
 class TestFailuresAreLoud(Base):
     """The two paths that leave the owner without a usable worker: both must
@@ -341,15 +361,16 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRosterViaTheCli(Base):
         p = pr.roster_path(self.ws)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"version": 7, "workers": {"a" * 32: {
-            "label": "keeper", "state": "idle"}}, "bindings": {}}))
+            "label": "keeper", "state": "live"}}, "bindings": {}}))
         before = p.read_bytes()
         p.chmod(0o000)
         self.addCleanup(lambda: p.chmod(0o644))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            rc = self.run_cli()
-        self.assertNotEqual(rc, 0)
-        self.assertIn(self.spawned[0], err.getvalue())
+        for args in ((), ("--dry-run",)):
+            err = io.StringIO()
+            with self.subTest(args=args), contextlib.redirect_stderr(err):
+                self.assertEqual(self.run_cli(*args), cw.REFUSED)
+                self.assertIn("roster unreadable", err.getvalue())
+                self.assertEqual(self.spawned, [])
         p.chmod(0o644)
         self.assertEqual(p.read_bytes(), before)
 
@@ -357,8 +378,12 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRosterViaTheCli(Base):
         p = pr.roster_path(self.ws)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("{not json")
-        rc = self.run_cli()
-        self.assertNotEqual(rc, 0)
+        for args in ((), ("--dry-run",)):
+            err = io.StringIO()
+            with self.subTest(args=args), contextlib.redirect_stderr(err):
+                self.assertEqual(self.run_cli(*args), cw.REFUSED)
+                self.assertIn("roster is not valid JSON", err.getvalue())
+                self.assertEqual(self.spawned, [])
         self.assertEqual(p.read_text(), "{not json")
 
     def test_an_absent_roster_still_succeeds(self):

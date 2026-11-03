@@ -56,7 +56,7 @@ def post_via_room_ops(room_ops_dir: Path, room_id: str, body: str) -> Tuple[bool
         if str(room_ops_dir) not in sys.path:
             sys.path.insert(0, str(room_ops_dir))
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
-        base, headers = mod.gateway()
+        base, headers = mod.gateway(room_id)
         if not base:
             return False, "no-gateway-configured"
         status, _parsed = mod.http_json(

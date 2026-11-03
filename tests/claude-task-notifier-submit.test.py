@@ -17,6 +17,9 @@ import subprocess
 import time
 import unittest
 from pathlib import Path
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "claude_task_notifier_harness", Path(__file__).resolve().parent / "claude-task-notifier.test.py")
@@ -122,9 +125,8 @@ class EventDispatchTests(FakeTmuxHarness):
     def test_startup_survives_an_unremovable_block_record(self):
         # The startup reset is best-effort: under set -e a failed rm must not kill the notifier.
         self._block_path().mkdir(parents=True)
-        proc = subprocess.Popen(["/bin/bash", str(NOTIFIER)], env=self._env(), cwd=str(self.root),
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                                start_new_session=True)
+        proc = popen_bound(["/bin/bash", str(NOTIFIER)], env=self._env(), cwd=str(self.root),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
             time.sleep(3)
             self.assertIsNone(proc.poll(), proc.stderr.read() if proc.poll() is not None else "")

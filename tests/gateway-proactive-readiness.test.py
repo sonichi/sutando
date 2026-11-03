@@ -22,8 +22,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="gw-ready-cc-")
 os.environ["REMOTE_PROACTIVE_ROOM"] = ""
 
@@ -46,7 +51,7 @@ def drain(tmp: Path, during_hold=None, claim_gate=None) -> list[str]:
     """One `_post_proactive` pass over `tmp`; `during_hold` runs inside the readiness hold."""
     posts: list[str] = []
 
-    def _fake_req(method, path, payload=None, timeout=None):
+    def _fake_req(method, path, payload=None, timeout=None, **_kw):
         if method == "POST":
             posts.append(payload.get("body", ""))
         return {"ok": True, "event_id": "$evt"}

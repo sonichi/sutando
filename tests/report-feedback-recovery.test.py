@@ -39,6 +39,7 @@ class RecoveryTests(unittest.TestCase):
         self.workspace, self.auth, self.post, self.clock, self.versions = [p.start() for p in self.patches]
         for p in self.patches:
             self.addCleanup(p.stop)
+        self.prefs()
 
     def run_cli(self, *args):
         with mock.patch.object(sys, 'argv', ['report-feedback.py', *args]):
@@ -49,9 +50,10 @@ class RecoveryTests(unittest.TestCase):
         return next(r['id'] for r in rf.list_drafts(self.ws) if r['payload']['title'] == title)
 
     def prefs(self, **values):
+        # These cases exercise automatic reporting, so they opt in explicitly.
         path = self.ws / 'state/feedback-prefs.json'
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(values))
+        path.write_text(json.dumps({'autoReport': True, **values}))
 
     def test_auto_does_not_post_before_recovery(self):
         self.run_cli('--auto', '--title', 'transient bridge failure')

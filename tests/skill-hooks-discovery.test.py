@@ -2,6 +2,11 @@
 """A skill declares its own hook; core discovers, never names one."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import shlex

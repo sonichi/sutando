@@ -122,6 +122,7 @@ class HolderLockTest(unittest.TestCase):
         """A live process and its start time."""
         p = subprocess.Popen(["sleep", "30"])
         self.addCleanup(lambda: (p.kill(), p.wait(WAIT)))
+        self.procs = dict(getattr(self, "procs", {}), **{str(p.pid): p})
         start = None
         for _ in range(50):
             start = self.hl.start_time(p.pid)
@@ -129,6 +130,23 @@ class HolderLockTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         return p.pid, start
+
+    def end(self, pid):
+        p = self.procs[str(pid)]
+        p.kill()
+        p.wait(WAIT)
+
+    @staticmethod
+    def kill_quiet(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+    def exit_owner(self, owner):
+        """What the owner's process exit does to a handle release refused: its descriptors close."""
+        for fd in (owner.fd, owner.dir_fd, owner.root_fd):
+            os.close(fd)
+        owner.released = True
+        self.hl._OWNER = None
 
     def dead(self):
         """A pid that ran and is gone, with the start it had."""
@@ -143,6 +161,29 @@ class HolderLockTest(unittest.TestCase):
                "install_id": self.hl.install_id(), "lock": {"dev": 1, "ino": 2}, "acquired_at": 1.5}
         rec.update(over)
         return rec
+
+    def record2(self, pid, start, attached=None, **over):
+        """A schema-2 record whose holder is (pid, start); `attached` = (pid, start) attaches a consumer
+        and moves the fencing pid to it, as attach_consumer does."""
+        rec = dict(self.record(pid, start), schema=2, owner_pid=pid, owner_start=start, consumer=None, tombstone=None)
+        if attached is not None:
+            rec.update(pid=attached[0], start=attached[1], consumer={"pid": attached[0], "start": attached[1]})
+        rec.update(over)
+        return rec
+
+    def main_module(self):
+        """The schema-1 holder_lock checked in as a fixture, loaded as its own module with this test's
+        home. A missing fixture is an error, never a skip."""
+        import importlib.util
+        path = REPO / "tests" / "fixtures" / "old_main" / "holder_lock_schema1.py"
+        spec = importlib.util.spec_from_file_location("holder_lock_main_%s" % self.kind, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod                      # dataclasses resolve the module by name
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(mod)
+        mod._home = lambda: str(self.home)
+        self.addCleanup(lambda: setattr(mod, "_OWNER", None))
+        return mod
 
     def ldir(self, root=None):
         """The lock dir of `root`, which is created if absent (the key is the directory's inode)."""
@@ -386,10 +427,12 @@ class HolderLockTest(unittest.TestCase):
         rec = self.hl.publish(owner, "routine").record
         self.assertEqual(sorted(rec), sorted(self.hl.RECORD_FIELDS))
         self.assertEqual((rec["schema"], rec["adapter"], rec["pid"], rec["start"], rec["host"], rec["install_id"]),
-                         (1, "routine", os.getpid(), self.hl.start_time(os.getpid()), self.hl._host(),
+                         (self.hl.SCHEMA, "routine", os.getpid(), self.hl.start_time(os.getpid()), self.hl._host(),
                           self.hl.install_id()))
         self.assertEqual((rec["lock"]["dev"], rec["lock"]["ino"]), owner.lock_id)
         self.assertIsInstance(rec["acquired_at"], float)
+        self.assertEqual((rec["owner_pid"], rec["owner_start"], rec["consumer"], rec["tombstone"]),
+                         (os.getpid(), owner.start, None, None), "schema 2: the owner fences until a consumer attaches")
         self.assertEqual(self.hl.read_holder(str(self.root)), self.hl.Valid(rec))
         with self.assertRaises(self.hl.LockError) as e:
             self.hl.publish(owner, "routine")
@@ -1918,6 +1961,9 @@ class HolderLockTest(unittest.TestCase):
                  ("acquire with a timeout", lambda: self.hl.acquire(missing, install_id="i", timeout=1)),
                  ("wait", lambda: self.hl.wait(missing, install_id="i", deadline=time.monotonic() + 1)),
                  ("publish", lambda: self.hl.publish(owner, "routine")),
+                 ("occupancy", lambda: self.hl.occupancy(missing)),
+                 ("attach_consumer", lambda: self.hl.attach_consumer(owner, b"", pid=1, start="s")),
+                 ("tombstone_consumer", lambda: self.hl.tombstone_consumer(missing, b"", by="t", reason="r")),
                  ("release", lambda: self.hl.release(owner))]
         for name, call in calls:
             with self.subTest(entry=name):
@@ -2087,7 +2133,8 @@ class HolderLockTest(unittest.TestCase):
         lists, renames or removes takes a descriptor (dir_fd=, src/dst_dir_fd=, or an fd argument),
         and nothing calls the builtin open."""
         tree = ast.parse(Path(self.hl.__file__).read_text())
-        held = {"_attempt", "_lock_still_held", "_write_record", "publish", "release", "_write_waiting", "wait"}
+        held = {"_attempt", "_lock_still_held", "_write_record", "_write_record_at", "_raw_record", "publish",
+                "attach_consumer", "release", "_write_waiting", "wait"}
         io_calls = {"open", "unlink", "remove", "replace", "rename", "mkdir", "rmdir", "listdir", "stat", "lstat"}
         found = set()
         for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in held):
@@ -2104,6 +2151,339 @@ class HolderLockTest(unittest.TestCase):
                 self.assertTrue(keywords & {"dir_fd", "src_dir_fd"} or first.endswith("fd"),
                                 "%s: os.%s(%s) is path-based" % (fn.name, f.attr, first))
         self.assertEqual(found, held)
+
+    # ── schema 2: the consumer, the two CAS writers, occupancy ──
+
+    def test_a_schema_2_record_with_a_live_or_unobserved_consumer_is_held_and_a_dead_one_is_free(self):
+        hpid, hstart = self.dead()
+        cpid, cstart = self.proc()
+        self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
+        r = self.acquire()
+        self.assertEqual((type(r).__name__, r.reason), ("Held", "live consumer"), "a dead holder, a live consumer")
+        self.put(self.record2(hpid, hstart, attached=(cpid, cstart), host="another-host"))
+        self.assertEqual(self.acquire().reason, "unobserved")
+        self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
+        with mock.patch.object(self.hl, "verify_lineage",
+                               lambda pid, start, host=None: False if pid == hpid else None):
+            self.assertEqual(self.acquire().reason, "unobserved consumer")
+        dpid, dstart = self.dead()
+        self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        rec = self.hl.read_holder(str(self.root)).record
+        self.assertEqual((rec["owner_pid"], rec["consumer"]), (os.getpid(), None), "a dead pair is overwritten")
+        self.hl.release(owner)
+        for bad in (dict(consumer={"pid": 5}), dict(consumer={"pid": True, "start": "s"}),
+                    dict(tombstone={"by": "t", "at": 1, "reason": "r"}), dict(owner_pid=0), dict(owner_start="")):
+            with self.subTest(bad=bad):
+                self.put(self.record2(hpid, hstart, **bad))
+                self.assertIsInstance(self.hl.read_holder(str(self.root)), self.hl.Invalid)
+
+    def test_each_unverifiable_read_is_a_refusal_or_unobserved_never_free(self):
+        self.assertIsNone(self.hl.parent_pid("not-a-pid"), "an unusable pid has no parent")
+        d = self.ldir()
+        d.mkdir(parents=True, exist_ok=True)
+        dfd = os.open(str(d), os.O_RDONLY)
+        self.addCleanup(os.close, dfd)
+        self.assertIsNone(self.hl._raw_record(dfd), "no record is None")
+        os.symlink("elsewhere", str(d / "holder"))
+        with self.assertRaises(self.hl.LockError):
+            self.hl._raw_record(dfd)
+        os.unlink(str(d / "holder"))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl._own_record(object(), None)
+        self.assertEqual(str(e.exception), "not this owner's record")
+        with mock.patch.object(self.hl, "verify_lineage", return_value=None):
+            self.assertFalse(self.hl._proven_dead({"owner_pid": 1, "owner_start": "s", "host": "h",
+                                                   "consumer": {"pid": 2, "start": "t"}}))
+        with mock.patch.object(self.hl, "lock_dir", side_effect=PermissionError(13, "denied")):
+            self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        os.symlink("lock", str(d / "lock"))                      # a loop: the lock cannot be opened
+        self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        os.unlink(str(d / "lock"))
+        (d / "lock").touch()
+        with mock.patch.object(self.hl.file_lock, "try_lock_fd", side_effect=OSError(5, "io")):
+            self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        with mock.patch.object(self.hl, "_read_prior", side_effect=ValueError("bad")):
+            self.assertEqual(self.hl.occupancy(str(self.root)), self.hl._occupant(self.hl.Invalid("x", b""))[0],
+                             "an undecodable record reads as an invalid one")
+
+    def test_attach_refuses_a_replaced_lock_and_a_record_it_cannot_validate(self):
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        published = (self.ldir() / "holder").read_bytes()
+        cpid, cstart = self.proc()
+        with mock.patch.object(self.hl, "_same_at", return_value=False), self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "replaced")
+        real = self.hl._record_problem
+        bad = mock.patch.object(self.hl, "_record_problem", lambda rec: "bad" if rec.get("consumer") else real(rec))
+        with bad, self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "invalid record: bad")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), published, "nothing written")
+        self.end(cpid)
+        self.hl.release(owner)
+
+    def test_tombstone_refuses_a_missing_lock_a_schema_1_record_and_an_invalid_result(self):
+        hpid, hstart = self.dead()
+        dpid, dstart = self.dead()
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="r")
+        self.assertTrue(str(e.exception).startswith("no lock to take"), e.exception)
+        (self.ldir() / "lock").touch()
+        old = self.put(self.record(hpid, hstart))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), old, by="launcher", reason="r")
+        self.assertEqual(str(e.exception), "not a schema-2 record")
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        real = self.hl._record_problem
+        bad = mock.patch.object(self.hl, "_record_problem", lambda rec: "bad" if rec.get("tombstone") else real(rec))
+        with mock.patch.object(self.hl, "_proven_dead", return_value=True), bad, self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="r")
+        self.assertEqual(str(e.exception), "invalid record: bad")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), dead, "nothing written")
+
+    def test_attach_consumer_is_a_cas_that_moves_the_fencing_pid_to_the_consumer(self):
+        owner = self.owned()
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, b"", pid=1, start="s")
+        self.assertEqual(str(e.exception), "not published")
+        self.hl.publish(owner, "routine")
+        published = (self.ldir() / "holder").read_bytes()
+        cpid, cstart = self.proc()
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, published + b" ", pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "record changed")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), published, "nothing written on a changed record")
+        got = self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.assertIsInstance(got, self.hl.Published)
+        rec = self.hl.read_holder(str(self.root)).record
+        self.assertEqual(got.record, rec)
+        self.assertEqual((rec["pid"], rec["start"], rec["consumer"]), (cpid, cstart, {"pid": cpid, "start": cstart}),
+                         "the top-level pid now names the consumer")
+        self.assertEqual((rec["owner_pid"], rec["owner_start"]), (os.getpid(), owner.start))
+        self.assertEqual(self.hl._pids_in((self.ldir() / "holder").read_bytes()), [(cpid, cstart)],
+                         "a schema-1 reader scanning the raw bytes finds the consumer")
+        attached = (self.ldir() / "holder").read_bytes()
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, attached, pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "consumer attached")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), attached)
+        self.assertEqual(self.hl.status(str(self.root))["consumer_lineage"], True)
+        self.end(cpid)
+        self.assertEqual(self.hl.release(owner), self.hl.Released(True), "release validates the owner fields")
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        self.hl.release(owner)
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, b"", pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "released")
+
+    def test_release_refuses_while_the_consumer_is_alive_or_unobserved_and_keeps_the_flock(self):
+        owner = self.owned()
+        self.hl.publish(owner, "claude-local")
+        cpid, cstart = self.proc()
+        self.hl.attach_consumer(owner, (self.ldir() / "holder").read_bytes(), pid=cpid, start=cstart)
+        attached = (self.ldir() / "holder").read_bytes()
+        for seen in (True, None):
+            with mock.patch.object(self.hl, "verify_lineage", side_effect=lambda pid, start, host=None:
+                                   seen if pid == cpid else True), self.assertRaises(self.hl.LockError) as e:
+                self.hl.release(owner)
+            self.assertEqual(str(e.exception), "consumer alive")
+            self.assertEqual((self.ldir() / "holder").read_bytes(), attached, "nothing removed")
+            self.assertFalse(owner.released)
+            self.assertFalse(self.lock_free(), "the flock is kept")
+        self.end(cpid)
+        self.assertEqual(self.hl.release(owner), self.hl.Released(True), "a dead consumer: the record goes")
+        code = ("import os, subprocess, time\nroot = %r\n"
+                "o = hl.acquire(root, install_id=hl.install_id()).owner; hl.publish(o, 'claude-local')\n"
+                "c = subprocess.Popen(['sleep', '300'], start_new_session=True, stdin=-3, stdout=-3, stderr=-3)\n"
+                "st = None\nwhile not st: st = hl.start_time(c.pid); time.sleep(0.02)\n"
+                "hl.attach_consumer(o, open(os.path.join(hl.lock_dir(root), 'holder'), 'rb').read(), pid=c.pid, start=st)\n"
+                "try:\n    hl.release(o); print('released', c.pid)\n"
+                "except hl.LockError as e:\n    print('refused', c.pid, e)\n") % str(self.root)
+        out, err = self.run_py(code).communicate(timeout=WAIT)
+        word, pid = out.split()[:2]
+        self.addCleanup(self.kill_quiet, int(pid))
+        self.assertEqual(word, "refused", out + err)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "held", "the holder exited; its live consumer still fences")
+        os.kill(int(pid), signal.SIGKILL)
+        deadline = time.monotonic() + WAIT
+        while self.hl.occupancy(str(self.root)) != "free" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "the consumer gone, nobody fences")
+
+    def test_release_validates_the_owner_fields_of_a_schema_2_record(self):
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        dpid, dstart = self.dead()
+        lock = {"dev": owner.lock_id[0], "ino": owner.lock_id[1]}
+        theirs = self.put(self.record2(dpid, dstart, attached=(os.getpid(), owner.start), lock=lock))
+        self.assertEqual(self.hl.release(owner), self.hl.Released(False),
+                         "a record whose consumer is this pid but whose owner is another is left")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), theirs)
+        self.assertEqual(self.acquire().reason, "live consumer", "and that consumer (this process) still fences")
+        os.unlink(self.ldir() / "holder")
+        owner = self.owned()
+        cpid, cstart = self.dead()
+        lock = {"dev": owner.lock_id[0], "ino": owner.lock_id[1]}
+        self.put(self.record2(os.getpid(), owner.start, attached=(cpid, cstart), lock=lock))
+        self.assertEqual(self.hl.release(owner), self.hl.Released(True),
+                         "a record whose owner fields are this process is removed whatever the fencing pid")
+        self.assertFalse((self.ldir() / "holder").exists())
+
+    def test_tombstone_consumer_refuses_a_lock_file_or_directory_replaced_before_the_write(self):
+        hpid, hstart = self.dead()
+        dpid, dstart = self.dead()
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        (self.ldir() / "lock").touch()
+        directory = self.ldir()
+        for name, swap in (("the lock file", lambda: (os.rename(directory / "lock", directory / "lock.old"),
+                                                       (directory / "lock").touch())),
+                           ("the directory", lambda: (os.rename(directory, str(directory) + ".aside"),
+                                                      os.mkdir(directory)))):
+            def swap_after_the_proof(rec, swap=swap):
+                swap()
+                return True
+            with mock.patch.object(self.hl, "_proven_dead", swap_after_the_proof), \
+                    self.assertRaises(self.hl.LockError) as e:
+                self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="proved gone")
+            self.assertEqual(str(e.exception), "replaced", name)
+            held = Path(str(directory) + ".aside") if name == "the directory" else directory
+            self.assertEqual((held / "holder").read_bytes(), dead, "%s: nothing written" % name)
+            if name == "the lock file":
+                os.rename(directory / "lock.old", directory / "lock")
+
+    def test_attach_consumer_names_only_the_holders_own_live_child(self):
+        owner = self.owned()
+        self.hl.publish(owner, "claude-local")
+        published = (self.ldir() / "holder").read_bytes()
+        stranger = os.getppid()
+        dpid, dstart = self.dead()
+        for pid, start, why in ((stranger, self.hl.start_time(stranger), "another process's child"),
+                                (dpid, dstart, "a dead child")):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.attach_consumer(owner, published, pid=pid, start=start)
+            self.assertEqual(str(e.exception), "not the holder's live child", why)
+            self.assertEqual((self.ldir() / "holder").read_bytes(), published, "%s: nothing written" % why)
+        cpid, cstart = self.proc()
+        self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.end(cpid)
+
+    def test_tombstone_consumer_needs_the_pair_dead_twice_and_never_removes_the_record(self):
+        hpid, hstart = self.dead()
+        cpid, cstart = self.proc()
+        live = self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
+        (self.ldir() / "lock").touch()
+        slept = []
+        with mock.patch.object(self.hl.time, "sleep", slept.append):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.tombstone_consumer(str(self.root), live, by="launcher", reason="proved gone")
+            self.assertEqual(str(e.exception), "not proven dead")
+            self.assertEqual((self.ldir() / "holder").read_bytes(), live, "a live consumer: nothing written")
+            dpid, dstart = self.dead()
+            dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.tombstone_consumer(str(self.root), dead + b" ", by="launcher", reason="proved gone")
+            self.assertEqual(str(e.exception), "record changed")
+            with self.flock_elsewhere():
+                with self.assertRaises(self.hl.LockError) as e:
+                    self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="proved gone")
+                self.assertEqual(str(e.exception), "held")
+            self.assertEqual((self.ldir() / "holder").read_bytes(), dead)
+            checks = []
+            real = self.hl.verify_lineage
+            with mock.patch.object(self.hl, "verify_lineage",
+                                   lambda pid, start, host=None: (checks.append(pid), real(pid, start, host))[1]):
+                got = self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="proved gone")
+        self.assertEqual([x for x in slept if x == self.hl.TOMBSTONE_RECHECK_S], [self.hl.TOMBSTONE_RECHECK_S],
+                         "verified twice, one pause apart (subprocess's own waits aside)")
+        self.assertEqual(checks, [hpid, dpid, hpid, dpid])
+        self.assertIsInstance(got, self.hl.Published)
+        rec = self.hl.read_holder(str(self.root)).record
+        self.assertEqual(got.record, rec)
+        self.assertEqual((rec["pid"], rec["start"], rec["consumer"]), (hpid, hstart, None), "fenced by the dead holder")
+        tombstoned = (self.ldir() / "holder").read_bytes()
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+
+        def swap_during_the_pause(seconds):
+            if seconds == self.hl.TOMBSTONE_RECHECK_S:
+                self.put(self.record2(hpid, hstart, attached=(dpid, dstart), adapter="other"))
+        with mock.patch.object(self.hl.time, "sleep", swap_during_the_pause):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="proved gone")
+        self.assertEqual(str(e.exception), "record changed", "the compare is repeated after the pause")
+        self.assertEqual(json.loads((self.ldir() / "holder").read_bytes())["adapter"], "other", "nothing written")
+        self.put(tombstoned)
+        self.assertEqual((rec["tombstone"]["by"], rec["tombstone"]["reason"]), ("launcher", "proved gone"))
+        self.assertIsInstance(rec["tombstone"]["at"], float)
+        self.assertEqual(sorted(os.listdir(self.ldir())), ["holder", "lock"], "never removed, no temp")
+        self.assertTrue(self.lock_free())
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), (self.ldir() / "holder").read_bytes(), by="l", reason="r")
+        self.assertEqual(str(e.exception), "no consumer")
+        self.assertIsInstance(self.acquire(), self.hl.Acquired, "the tombstoned root is free")
+
+    def test_occupancy_is_the_shared_tri_state_reader_with_the_sticky_rule(self):
+        self.assertEqual(self.hl.occupancy(str(self.tmp / "absent")), "free")
+        self.root.mkdir()
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "no lock dir yet")
+        with self.flock_elsewhere():
+            self.assertEqual(self.hl.occupancy(str(self.root)), "held")
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "the probe released its flock")
+        hpid, hstart = self.dead()
+        cpid, cstart = self.proc()
+        self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
+        self.assertEqual(self.hl.occupancy(str(self.root)), "held", "a free flock, a live consumer: sticky")
+        self.put(self.record2(hpid, hstart, attached=(cpid, cstart), host="another-host"))
+        self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        with mock.patch.object(self.hl, "verify_lineage", lambda pid, start, host=None: False if pid == hpid else None):
+            self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
+            self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved", "an unverifiable consumer is never free")
+        dpid, dstart = self.dead()
+        self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "both dead")
+        self.put(self.record2(hpid, hstart, tombstone={"by": "l", "at": 1.0, "reason": "r"}))
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "tombstoned")
+        self.put(self.record(cpid, cstart))
+        self.assertEqual(self.hl.occupancy(str(self.root)), "held", "a schema-1 live holder")
+        self.put(b'{"pid": %d, "torn' % cpid)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved", "a torn record naming a live pid, no start")
+        invalid = self.record(cpid, cstart)
+        del invalid["adapter"]
+        self.put(invalid)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "held", "an invalid record naming a live pid")
+        self.put(b'{"pid": %d, "torn' % dpid)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free")
+        os.unlink(self.ldir() / "holder")
+        os.mkdir(self.ldir() / "holder")
+        self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved", "unreadable is never free")
+        os.rmdir(self.ldir() / "holder")
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "no record")
+
+    def test_a_schema_1_reader_from_main_refuses_a_live_consumer_and_frees_a_dead_one(self):
+        old = self.main_module()
+        self.assertEqual(old.SCHEMA, 1, "the rolling pin needs the schema-1 reader")
+        owner = self.owned()
+        self.hl.publish(owner, "claude-local")
+        cpid, cstart = self.proc()
+        self.hl.attach_consumer(owner, (self.ldir() / "holder").read_bytes(), pid=cpid, start=cstart)
+        attached = json.loads((self.ldir() / "holder").read_bytes())
+        with self.assertRaises(self.hl.LockError):
+            self.hl.release(owner)
+        self.exit_owner(owner)
+        hpid, hstart = self.dead()
+        self.put(dict(attached, owner_pid=hpid, owner_start=hstart))   # the holder died, its consumer lives on
+        self.assertIsInstance(old.read_holder(str(self.root)), old.Invalid, "schema 2 is unsupported there")
+        r = old.acquire(str(self.root), install_id="i")
+        self.assertEqual((type(r).__name__, r.reason), ("Held", "invalid record naming a live or unobserved pid"))
+        dpid, dstart = self.dead()
+        self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        r = old.acquire(str(self.root), install_id="i")
+        self.assertEqual(type(r).__name__, "Acquired", "a dead consumer frees the root for the old reader")
+        old.release(r.owner)
 
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)
