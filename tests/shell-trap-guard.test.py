@@ -8,6 +8,7 @@ Run:  python3 tests/shell-trap-guard.test.py
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -85,16 +86,25 @@ class Rules(unittest.TestCase):
                 (bsd / tool).write_text("")
             (gnu / "link-sed").mkdir()
             os.symlink(bsd / "sed", gnu / "link-sed" / "sed")
+            g, b, q = (shlex.quote(str(x)) for x in (gnu, bsd, d))
             with mock.patch.object(stg, "BSD_DIR", str(bsd)):
-                self.assertSilent(f"{gnu}/timeout 5 ls")
-                self.assertSilent(f"{bsd}/timeout 5 ls")  # no BSD timeout exists
-                self.assertSilent(f"{gnu}/sed -i 's/a/b/' f")
-                self.assertSilent(f"{gnu}/base64 f")
-                self.assertSilent(f"{d}/missing/sed -i 's/a/b/' f")
-                self.assertFires(f"{bsd}/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
-                self.assertFires(f"{bsd}/base64 f", "base64_file", stg.BLOCK)
-                self.assertFires(f"{gnu}/link-sed/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
+                self.assertSilent(f"{g}/timeout 5 ls")
+                self.assertSilent(f"{b}/timeout 5 ls")  # no BSD timeout exists
+                self.assertSilent(f"{g}/sed -i 's/a/b/' f")
+                self.assertSilent(f"{g}/base64 f")
+                self.assertSilent(f"{q}/missing/sed -i 's/a/b/' f")
+                self.assertFires(f"{b}/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
+                self.assertFires(f"{b}/base64 f", "base64_file", stg.BLOCK)
+                self.assertFires(f"{g}/link-sed/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
                 self.assertFires("sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)  # bare names: PATH gating
+
+    def test_path_fixtures_survive_a_dir_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="a b ") as d:
+            bsd = Path(d, "bsd")
+            bsd.mkdir()
+            (bsd / "sed").write_text("")
+            with mock.patch.object(stg, "BSD_DIR", str(bsd)):
+                self.assertFires(f"{shlex.quote(str(bsd))}/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
 
     def test_gnubin_full_path_on_this_host(self):
         self.assertSilent("/opt/homebrew/opt/coreutils/libexec/gnubin/timeout 5 ls")
@@ -160,8 +170,27 @@ class Rules(unittest.TestCase):
                   "sleep 1 &"]:
             self.assertSilent(c)
 
+    def test_env_prefix_and_ampersand_redirect(self):
+        self.assertFires("env -i FOO=1 timeout 5 ls", "timeout", stg.BLOCK)
+        self.assertSilent("ls &>/dev/null")
+        self.assertFires("pgrep -f probe &>/dev/null", "pgrep_self", stg.WARN)
+
+    def test_base64_option_arguments(self):
+        self.assertFires("base64 -b 76 f", "base64_file", stg.BLOCK)
+        self.assertSilent("base64 -o out.txt -i f")
+
+    def test_unresolvable_path_is_not_bsd(self):
+        with mock.patch.object(stg.os.path, "realpath", side_effect=OSError):
+            self.assertSilent("/usr/bin/sed -i 's/a/b/' f")
+
     def test_disabled_rule_does_not_fire(self):
         self.assertEqual(stg.analyze("timeout 5 ls", {"pgrep_self"}), [])
+
+
+def no_shell_probe_env():
+    """os.environ with no rule override and no shell-PATH cache location, so no probe runs."""
+    drop = ("SHELL_TRAP_GUARD_RULES", "SHELL_TRAP_GUARD_SHELL_PATH_CACHE", "SUTANDO_REPO_ROOT")
+    return {k: v for k, v in os.environ.items() if k not in drop}
 
 
 class HostRules(unittest.TestCase):
@@ -171,7 +200,7 @@ class HostRules(unittest.TestCase):
 
     def test_gnu_host_gets_no_bsd_rules(self):
         """A Linux host has GNU sed/base64 and coreutils timeout: blocking them would be wrong."""
-        env = {k: v for k, v in os.environ.items() if k != "SHELL_TRAP_GUARD_RULES"}
+        env = no_shell_probe_env()
         env["SHELL"] = "/bin/bash"
         which = {"timeout": "/usr/bin/timeout", "sed": "/usr/bin/sed", "base64": "/usr/bin/base64"}.get
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(stg.sys, "platform", "linux"), \
@@ -179,7 +208,7 @@ class HostRules(unittest.TestCase):
             self.assertEqual(stg.host_rules(), {"pgrep_self"})
 
     def test_stock_macos_zsh_gets_every_rule(self):
-        env = {k: v for k, v in os.environ.items() if k != "SHELL_TRAP_GUARD_RULES"}
+        env = no_shell_probe_env()
         env["SHELL"] = "/bin/zsh"
         which = {"sed": "/usr/bin/sed", "base64": "/usr/bin/base64"}.get
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(stg.sys, "platform", "darwin"), \
@@ -187,13 +216,142 @@ class HostRules(unittest.TestCase):
             self.assertEqual(stg.host_rules(), ALL)
 
     def test_gnu_tools_first_on_macos_path_are_not_blocked(self):
-        env = {k: v for k, v in os.environ.items() if k != "SHELL_TRAP_GUARD_RULES"}
+        env = no_shell_probe_env()
         which = {"timeout": "/opt/homebrew/opt/coreutils/libexec/gnubin/timeout",
                  "sed": "/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed",
                  "base64": "/opt/homebrew/opt/coreutils/libexec/gnubin/base64"}.get
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(stg.sys, "platform", "darwin"), \
                 mock.patch.object(stg.shutil, "which", which):
             self.assertFalse(stg.host_rules() & {"timeout", "sed_inplace", "base64_file"})
+
+
+class ShellPath(unittest.TestCase):
+    """`timeout` on the user's shell PATH only (e.g. gnubin added in .zshrc) is not blocked."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="stg shell ")
+        self.tmp = Path(self._tmp.name)
+        self.empty = self.tmp / "empty"
+        self.gnubin = self.tmp / "gnu bin"
+        self.empty.mkdir(), self.gnubin.mkdir()
+        tool = self.gnubin / "timeout"
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+        self.calls = self.tmp / "calls"
+        self.cache = self.tmp / "cache.json"
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        (self.home / ".zshrc").write_text("")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def fake_shell(self, body):
+        (self.tmp / "bin").mkdir(exist_ok=True)
+        sh = self.tmp / "bin" / "zsh"
+        sh.write_text("#!/bin/sh\necho x >> %s\n%s\n" % (shlex.quote(str(self.calls)), body))
+        sh.chmod(0o755)
+        return sh
+
+    def reporting_shell(self):
+        return self.fake_shell("echo 'rc noise'; printf '\\n%s%%s\\n' %s" % (
+            stg.PATH_MARK, shlex.quote("/usr/bin:%s:~/rel" % self.gnubin)))
+
+    def spawns(self):
+        return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
+
+    def env(self, shell, cache=True):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SHELL_TRAP_GUARD_RULES", "SHELL_TRAP_GUARD_SHELL_PATH_CACHE", "SUTANDO_REPO_ROOT")}
+        env.update(SHELL=str(shell), PATH=str(self.empty), HOME=str(self.home))
+        if cache:
+            env["SHELL_TRAP_GUARD_SHELL_PATH_CACHE"] = str(self.cache)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_timeout_only_on_shell_path_is_allowed(self):
+        with self.env(self.reporting_shell()):
+            self.assertNotIn("timeout", stg.host_rules())
+            self.assertEqual(stg.analyze("timeout 5 ls"), [])
+        self.assertEqual(json.loads(self.cache.read_text())["path"], "/usr/bin:%s" % self.gnubin)
+
+    def test_cache_hit_does_not_respawn(self):
+        with self.env(self.reporting_shell()):
+            for _ in range(3):
+                self.assertNotIn("timeout", stg.host_rules())
+        self.assertEqual(self.spawns(), 1)
+
+    def test_expired_cache_reprobes(self):
+        with self.env(self.reporting_shell()), mock.patch.object(stg, "SHELL_PATH_TTL", 0):
+            stg.host_rules()
+            stg.host_rules()
+        self.assertEqual(self.spawns(), 2)
+
+    def test_commands_without_timeout_never_probe(self):
+        with self.env(self.reporting_shell()):
+            stg.analyze("ls -la")
+        self.assertEqual(self.spawns(), 0)
+
+    def test_failed_probe_falls_back_and_is_cached(self):
+        for body in ("exit 1", "echo 'no marker'", "printf '\\n%srelative:~/x\\n'" % stg.PATH_MARK):
+            self.cache.unlink(missing_ok=True)
+            with self.subTest(body=body), self.env(self.fake_shell(body)):
+                self.assertIn("timeout", stg.host_rules())
+                n = self.spawns()
+                self.assertIn("timeout", stg.host_rules())
+                self.assertEqual(self.spawns(), n)
+
+    def test_hung_probe_times_out_and_falls_back(self):
+        with self.env(self.fake_shell("/bin/sleep 30")), mock.patch.object(stg, "SHELL_PROBE_TIMEOUT", 0.3):
+            t0 = time.monotonic()
+            self.assertIn("timeout", stg.host_rules())
+            self.assertLess(time.monotonic() - t0, 5)
+
+    def test_rc_change_invalidates_the_cache(self):
+        with self.env(self.reporting_shell()):
+            stg.host_rules()
+            os.utime(self.home / ".zshrc", ns=(1, 1))
+            stg.host_rules()
+        self.assertEqual(self.spawns(), 2)
+
+    def test_missing_shell_falls_back(self):
+        with self.env(self.tmp / "no-such-shell"):
+            self.assertIn("timeout", stg.host_rules())
+        self.assertIsNone(json.loads(self.cache.read_text())["path"])
+
+    def test_unwritable_cache_still_answers(self):
+        self.cache.mkdir()
+        with self.env(self.reporting_shell()):
+            self.assertNotIn("timeout", stg.host_rules())
+
+    def test_lookup_error_falls_back(self):
+        with self.env(self.reporting_shell()), mock.patch.object(stg, "user_shell_path", side_effect=RuntimeError):
+            self.assertIn("timeout", stg.host_rules())
+
+    def test_cache_under_the_configured_workspace(self):
+        ws = self.tmp / "ws"
+        with self.env(self.reporting_shell(), cache=False), \
+                mock.patch.dict(os.environ, {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(ws)}):
+            self.assertNotIn("timeout", stg.host_rules(["--repo", str(REPO)]))
+        self.assertTrue((ws / "state" / "guards" / "shell_path_cache.json").is_file())
+
+    def test_clean_path(self):
+        self.assertEqual(stg._clean_path("/a:rel:~/b::/c"), "/a:/c")
+        self.assertIsNone(stg._clean_path("rel:~/b"))
+        self.assertIsNone(stg._clean_path("/a\0/b"))
+        self.assertIsNone(stg._clean_path("/" * 70000))
+
+    def test_no_cache_location_skips_the_probe(self):
+        with self.env(self.reporting_shell(), cache=False):
+            self.assertIn("timeout", stg.host_rules())
+        self.assertEqual(self.spawns(), 0)
+
+    def test_hook_allows_timeout_found_on_shell_path(self):
+        env = {k: v for k, v in os.environ.items() if k != "SHELL_TRAP_GUARD_RULES"}
+        env.update(SHELL=str(self.reporting_shell()), PATH=str(self.empty),
+                   SHELL_TRAP_GUARD_SHELL_PATH_CACHE=str(self.cache), SHELL_TRAP_GUARD_LOG=str(self.tmp / "log"))
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "timeout 5 ls"}})
+        p = subprocess.run(PYBASE + [str(HOOK)], input=payload, capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual((p.returncode, p.stderr), (0, ""))
 
 
 class Hook(unittest.TestCase):
@@ -240,6 +398,14 @@ class Hook(unittest.TestCase):
             self.assertNotIn(secret, logged)
         self.assertIn("timeout 5 curl", logged)
         self.assertIn("[REDACTED]", logged)
+
+    def test_unimportable_scanner_fails_open_in_process(self):
+        spec = importlib.util.spec_from_file_location("shell_trap_guard_noscan", HOOK)
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"_shell_scan": None}):
+            spec.loader.exec_module(mod)
+        self.assertIsNone(mod._shell_scan)
+        self.assertEqual(mod.decide(self.payload("timeout 5 ls")), (0, "", ""))
 
     def test_missing_or_broken_scanner_fails_open(self):
         for scanner in (None, "raise ImportError('boom')\n", "def (:\n"):

@@ -13,6 +13,12 @@ Warns (exit 0, JSON ``additionalContext``; the call still runs):
   for_unquoted_var  `for x in $VAR` where VAR holds command output, when $SHELL is zsh
                     (zsh does not word-split it, so the loop runs once)
 
+`timeout` counts as present when it is on the hook's PATH or on the user's shell PATH:
+the PATH a login `$SHELL` reports after sourcing its rc file, as Claude Code's shell
+snapshot does. That probe runs at most once per SHELL_PATH_TTL (2s timeout, failures
+cached too) and is cached at ``<workspace>/state/guards/shell_path_cache.json``
+(``SHELL_TRAP_GUARD_SHELL_PATH_CACHE`` overrides); with no cache location it is skipped.
+
 A command named by path (`<dir>/timeout`) is checked against that path, not
 PATH: it is blocked only when it resolves to the BSD tool in /usr/bin.
 
@@ -31,11 +37,13 @@ replaces the host-derived rule set; ``SHELL_TRAP_GUARD_DISABLE=1`` turns the hoo
 Fail-OPEN: any internal error exits 0 with no output.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -48,6 +56,12 @@ except Exception:
 BLOCK, WARN = "blocked", "warned"
 ALL_RULES = ("timeout", "sed_inplace", "base64_file", "pgrep_self", "for_unquoted_var")
 LOG_CMD_CHARS = 2000
+SHELL_PATH_TTL = 600
+SHELL_PROBE_TIMEOUT = 2
+PATH_MARK = "__shell_trap_guard_path__"
+RC_FILES = {"zsh": (".zshenv", ".zprofile", ".zshrc", ".zlogin"),
+            "bash": (".bash_profile", ".bash_login", ".profile", ".bashrc")}
+RC_SOURCED = {"zsh": ".zshrc", "bash": ".bashrc"}
 BSD_DIR = "/usr/bin"
 PROBE_WORDS = {"command", "type", "which", "hash", "whence"}
 PROBE_SKIP = {"if", "elif", "!", "while", "until", "then", "do", "{", "&&", "||"}
@@ -83,14 +97,14 @@ MSG = {
 }
 
 
-def host_rules():
+def host_rules(argv=(), need_timeout=True):
     """The rules that apply on this host, unless SHELL_TRAP_GUARD_RULES names them."""
     override = os.environ.get("SHELL_TRAP_GUARD_RULES")
     if override is not None:
         return {r.strip() for r in override.split(",") if r.strip() in ALL_RULES}
     rules = {"pgrep_self"}
     darwin = sys.platform == "darwin"
-    if shutil.which("timeout") is None:
+    if need_timeout and shutil.which("timeout") is None and not _on_shell_path("timeout", argv):
         rules.add("timeout")
     if darwin and shutil.which("sed") == "/usr/bin/sed":
         rules.add("sed_inplace")
@@ -99,6 +113,93 @@ def host_rules():
     if os.path.basename(os.environ.get("SHELL", "")) == "zsh":
         rules.add("for_unquoted_var")
     return rules
+
+
+def _on_shell_path(tool, argv):
+    try:
+        path = user_shell_path(argv)
+        return bool(path) and shutil.which(tool, path=path) is not None
+    except Exception:
+        return False
+
+
+def _shell_cache_key(shell):
+    home = os.path.expanduser("~")
+    parts = [shell, os.environ.get("PATH", "")]
+    for rc in RC_FILES.get(os.path.basename(shell), ()):
+        try:
+            parts.append("%s:%s" % (rc, os.stat(os.path.join(home, rc)).st_mtime_ns))
+        except OSError:
+            parts.append(rc + ":-")
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+
+def _clean_path(text):
+    """Absolute entries only (a relative or `~` entry is skipped); None when nothing is left."""
+    if len(text) >= 65536 or "\0" in text:
+        return None
+    return ":".join(e for e in text.split(":") if e.startswith("/")) or None
+
+
+def probe_shell_path(shell):
+    """PATH from a login `shell` that sources its rc file; None on any failure."""
+    rc = RC_SOURCED.get(os.path.basename(shell))
+    src = '[ -f "$HOME/%s" ] && . "$HOME/%s"; ' % (rc, rc) if rc else ""
+    script = src + "printf '\\n%s%%s\\n' \"$PATH\"" % PATH_MARK
+    env = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG")
+           if k in os.environ}
+    env.update(SHELL=shell, TERM="dumb")
+    p = subprocess.Popen([shell, "-l", "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=SHELL_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # Kill the whole group: a grandchild holding stdout open would block communicate().
+        with contextlib.suppress(OSError):
+            os.killpg(p.pid, 9)
+        p.stdout.close()
+        p.wait()
+        return None
+    lines = [ln[len(PATH_MARK):] for ln in out.decode("utf-8", "replace").splitlines()
+             if ln.startswith(PATH_MARK)]
+    return _clean_path(lines[-1]) if lines else None
+
+
+def _shell_cache_path(argv):
+    override = os.environ.get("SHELL_TRAP_GUARD_SHELL_PATH_CACHE")
+    if override:
+        return override
+    ws = _workspace(argv)
+    return os.path.join(ws, "state", "guards", "shell_path_cache.json") if ws else None
+
+
+def user_shell_path(argv=()):
+    """The user's shell PATH, cached on disk; None when unknown (the caller then ignores it)."""
+    shell = os.environ.get("SHELL", "")
+    cache = _shell_cache_path(argv)
+    if not shell.startswith("/") or not cache:
+        return None
+    key = _shell_cache_key(shell)
+    try:
+        with open(cache) as f:
+            rec = json.load(f)
+        if rec.get("key") == key and 0 <= time.time() - rec.get("ts", 0) < SHELL_PATH_TTL:
+            return rec.get("path") or None
+    except Exception:
+        pass
+    try:
+        path = probe_shell_path(shell)
+    except Exception:
+        path = None
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        tmp = "%s.%d.tmp" % (cache, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump({"key": key, "ts": time.time(), "path": path}, f)
+        os.replace(tmp, cache)
+    except Exception:
+        pass
+    return path
 
 
 def strip_heredocs(cmd):
@@ -299,10 +400,10 @@ def check_for_unquoted(pipes, body):
 SEGMENT_RULES = (("timeout", check_timeout), ("sed_inplace", check_sed), ("base64_file", check_base64))
 
 
-def analyze(cmd, rules=None):
+def analyze(cmd, rules=None, argv=()):
     """[(rule, action, message), ...] for the rules enabled (default: this host's)."""
-    rules = host_rules() if rules is None else set(rules)
     body = strip_heredocs(cmd)
+    rules = host_rules(argv, need_timeout="timeout" in body) if rules is None else set(rules)
     pipes = pipelines(body)
     hits, seen = [], set()
     if "timeout" in rules and probes_for(pipes, "timeout"):
@@ -338,10 +439,7 @@ def _repo_root(argv):
     return os.environ.get("SUTANDO_REPO_ROOT") or None
 
 
-def log_path(argv):
-    override = os.environ.get("SHELL_TRAP_GUARD_LOG")
-    if override:
-        return override
+def _workspace(argv):
     repo = _repo_root(argv)
     if not repo:
         return None
@@ -349,8 +447,15 @@ def log_path(argv):
     # The resolver may print migration notices; a blocking hook's stderr reaches the model.
     with contextlib.redirect_stderr(io.StringIO()):
         from workspace_default import resolve_workspace
-        ws = resolve_workspace(migrate=False)
-    return os.path.join(str(ws), "state", "guards", "shell_trap_hits.jsonl")
+        return str(resolve_workspace(migrate=False))
+
+
+def log_path(argv):
+    override = os.environ.get("SHELL_TRAP_GUARD_LOG")
+    if override:
+        return override
+    ws = _workspace(argv)
+    return os.path.join(ws, "state", "guards", "shell_trap_hits.jsonl") if ws else None
 
 
 def redact(cmd):
@@ -384,7 +489,7 @@ def decide(raw, argv=()):
     cmd = (data.get("tool_input") or {}).get("command") or ""
     if not isinstance(cmd, str) or not cmd.strip():
         return 0, "", ""
-    hits = analyze(cmd)
+    hits = analyze(cmd, argv=list(argv))
     if not hits:
         return 0, "", ""
     log_hits(hits, cmd, list(argv))

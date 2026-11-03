@@ -318,8 +318,8 @@ host** before they run. Three are **blocked** (exit 2, the fix on stderr), each 
 where the host's tool is the BSD one, so a Linux host or a GNU tool first on `PATH` is
 not blocked:
 
-- `timeout ...` when no `timeout` is on `PATH` (stock macOS has none) and the command
-  does not probe for it (`command -v` / `type` / `which` / `hash timeout`) — use the
+- `timeout ...` when no `timeout` is on the hook's `PATH` or on the user's shell `PATH`
+  (stock macOS has none) and the command does not probe for it (`command -v` / `type` / `which` / `hash timeout`) — use the
   Bash tool's `timeout` parameter or a Python `subprocess.run(..., timeout=N)`;
 - GNU `sed -i` / `--in-place` with no suffix argument, with `/usr/bin/sed` on macOS —
   use `sed -i '' ...`;
@@ -339,6 +339,16 @@ A command named by path (`/opt/homebrew/opt/coreutils/libexec/gnubin/timeout`) i
 judged by that path, not by the hook's `PATH`: it is blocked only when it resolves to
 the BSD tool in `/usr/bin` (so a path `timeout` is never blocked on macOS).
 
+The user's shell `PATH` is what Claude Code's Bash tool sees: its shell snapshot is
+taken from a login `$SHELL` that sources the rc file (`~/.zshrc`, `~/.bashrc`), so the
+hook asks the same shell, `$SHELL -l -c '. ~/.zshrc; printf "$PATH"'` (stdin closed,
+minimal env, 2 s timeout, relative entries dropped). It runs only when the command
+mentions `timeout` and the hook's own `PATH` has none, and the answer (a failure
+included) is cached for 10 minutes in `<workspace>/state/guards/shell_path_cache.json`,
+keyed by `$SHELL`, the hook's `PATH` and the rc files' mtimes
+(`SHELL_TRAP_GUARD_SHELL_PATH_CACHE` overrides the path). With no cache location, or on
+any probe failure, it falls back to the hook's `PATH` alone.
+
 The command is read with the shared `_shell_scan` scanner, so quoted text, comments
 and heredoc bodies are data, not commands.
 
@@ -352,9 +362,9 @@ decides. `SHELL_TRAP_GUARD_RULES=pgrep_self,timeout` replaces the host-derived r
 set; `SHELL_TRAP_GUARD_DISABLE=1` turns it off. Fail-OPEN on any internal error.
 
 **Known limits.** Five patterns only; a warning is advice and nothing records whether
-it was followed. The hook sees only its own `PATH`, so a bare `timeout` that a
-`.zshrc`-only `PATH` or an earlier `brew install coreutils &&` would provide is still
-blocked; call it by path or probe for it first. `xargs sed -i` and `find -exec sed -i`
+it was followed. A `timeout` that an earlier `brew install coreutils &&` in the same
+command would provide, or one added through a file the rc file sources (its mtime is
+not in the cache key) until the 10-minute cache expires, is still blocked; call it by path or probe for it first. `xargs sed -i` and `find -exec sed -i`
 are not caught.
 
 ### Registration
