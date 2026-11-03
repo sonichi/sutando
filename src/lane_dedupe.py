@@ -14,7 +14,8 @@ owner's claim and settles as a duplicate once it appears; past the wait it claim
 message the owner never receives is still answered once.
 
 Claims expire after `TTL_S` and expired rows are pruned on each claim. A task without a
-`source_message_id`, or a hook or Summon task, is never deduped. Any store failure (unwritable
+`source_message_id` is never deduped; a hook or Summon task dedupes on its own fire or Summon,
+never on a message id, and is delivered when that identity is missing. Any store failure (unwritable
 directory, malformed or locked database) fails OPEN: the task is delivered and one warning
 line is logged per distinct failure, because a missed duplicate is better than a dropped
 message.
@@ -22,12 +23,14 @@ message.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 STORE_NAME = "gateway-seen.sqlite3"
+# One agent's store, shared by its lanes only: keys leave the agent out, so two agents must never share one.
 TTL_S = 24 * 3600
 BUSY_TIMEOUT_S = 2.0
 # Outlasts the owner lane's own poll of the same event; past it the message is answered, never dropped.
@@ -41,12 +44,33 @@ def lane_label(lane: str) -> str:
     return lane or "primary"
 
 
+_SUMMON_FIELDS = ("room_id", "database", "row_id", "update_id")
+
+
+def _context_identity(task: Mapping[str, object]) -> "tuple[bool, Optional[str]]":
+    """(is a Commons context task, its lane-independent identity or None).
+
+    A hook fire is its fire_id; a Summon is the backend's summon key (room, database, row, update).
+    Neither includes the agent, unlike the broker task id, so each lane's copy of one fire shares it."""
+    hook, summon = task.get("hook"), task.get("summon")
+    if not hook and not summon:
+        return False, None
+    kind, fields = ("hook", ("fire_id",)) if isinstance(hook, Mapping) else ("summon", _SUMMON_FIELDS)
+    source = hook if kind == "hook" else summon
+    if not isinstance(source, Mapping):
+        return True, None
+    parts = [str(source.get(k) if source.get(k) is not None else "").strip() for k in fields]
+    # A kind-tagged JSON array: one field cannot spill into the next, and it has no raw newline,
+    # so it never equals a message key's "room\nmessage_id".
+    return True, json.dumps([kind, *parts], ensure_ascii=True, separators=(",", ":")) if all(parts) else None
+
+
 def key_of(task: Mapping[str, object]) -> Optional[str]:
     """The event a broker task answers, or None when the task must never be deduped."""
-    # A Commons context task (a hook fire or a Summon) answers a row change, not a message: its
-    # identity is its own fire/summon key, so a message id it carries must not fold it into another task.
-    if task.get("hook") or task.get("summon"):
-        return None
+    context, identity = _context_identity(task)
+    if context:
+        # One task per fire or Summon across lanes; a message id it carries never folds it into another task.
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest() if identity else None
     message_id = str(task.get("source_message_id") or "").strip()
     if not message_id:
         return None
