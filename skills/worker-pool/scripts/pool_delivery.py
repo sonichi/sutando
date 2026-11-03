@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.task_dispatch import find_ready_result  # noqa: E402
+from task_disposition import MISSING, SPENT, task_disposition  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
                          RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
                          require_recipient, workers_root)
@@ -502,10 +503,10 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
 
 def prune_spent(workspace: Path, recipient: str) -> dict:
     """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
-    re-offer. A sentinel is spent when its payload is gone (`stale-sentinel`),
-    or the work is finished AND nothing could hand it back — the flag alone is
-    not enough, because the core re-queues a payload whose sentinel is gone and
-    whose result it cannot find. Safe beside a live watcher, which `sweep` is not.
+    re-offer. Spent is task_disposition.SPENT, the rule the supervisor's sweep
+    also applies: answered (a result the core can find, so nothing re-queues it),
+    archived, or gone (`stale`). A malformed id is kept. Safe beside a live
+    watcher, which `sweep` is not.
     """
     ws = Path(workspace)
     seen = set()
@@ -515,26 +516,16 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
         if task_id in seen:
             continue
         seen.add(task_id)
-        state = residue(ws, recipient, task_id)
-        if state == "stale-sentinel":
+        try:
+            disposition = task_disposition(ws, task_id)
+        except ValueError:
+            disposition = None
+        if disposition in SPENT:
             p.unlink()
-            actions["stale"].append(task_id)
-        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
-            p.unlink()
-            actions["retired"].append(task_id)
+            actions["stale" if disposition == MISSING else "retired"].append(task_id)
         else:
             actions["kept"].append(task_id)
     return actions
-
-
-def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
-    """True when removing the sentinel cannot put the task back in the core's
-    queue: either the payload is gone, or a result the core can find remains."""
-    if not payload_path(ws, task_id).is_file():
-        return True
-    if find_ready_result(results_dir(ws), task_id) is not None:
-        return True
-    return archived_payload(ws, task_id).is_file()
 
 
 def sweep(workspace: Path, recipient: str) -> dict:

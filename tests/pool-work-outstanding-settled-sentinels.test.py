@@ -102,10 +102,60 @@ check("the inbox gained no subfolder", [p.name for p in inbox.iterdir() if p.is_
 check("still owed after retirement", sup.work_outstanding(ws, WID), True)
 check("a second pass moves nothing", sup.retire_spent_sentinels(ws, WID, time.time()), [])
 
-# A symlink at a sentinel name is malformed state, never moved.
-(inbox / "task-ffffffffffffffffff.txt").symlink_to(tasks / "nowhere")
+# A symlink at a sentinel name is malformed state, never moved, even to a live regular file.
+live = ws / "elsewhere.txt"
+live.write_text("x")
+os.utime(live, (1.0, 1.0))
+(inbox / "task-ffffffffffffffffff.txt").symlink_to(live)
+check("fixture: the symlink resolves to a regular file", (inbox / "task-ffffffffffffffffff.txt").is_file(), True)
 check("a symlinked sentinel is not moved", "task-ffffffffffffffffff.txt"
       in sup.retire_spent_sentinels(ws, WID, time.time() + 10 * 3600), False)
+check("the symlink is still in the inbox", (inbox / "task-ffffffffffffffffff.txt").is_symlink(), True)
+
+# An earlier archive of the same name is never overwritten.
+again = sentinel("task-s-space~task-aaaaaaaaaaaaaaaaaa")
+sup.retire_spent_sentinels(ws, WID, time.time())
+check("a re-delivered, re-retired name sits beside the first, not over it",
+      sorted(p.name for p in arch.glob("*/task-s-space~task-aaaaaaaaaaaaaaaaaa*")),
+      ["task-s-space~task-aaaaaaaaaaaaaaaaaa.txt", "task-s-space~task-aaaaaaaaaaaaaaaaaa.txt.1"])
+
+# A sentinel whose name is no task id is in neither set: the worker stays decidable.
+sentinel("task-bad id")
+check("a malformed id does not make the worker undecidable", sup.work_outstanding(ws, WID), True)
+check("a malformed id is never retired", "task-bad id.txt" in sup.retire_spent_sentinels(ws, WID, time.time()), False)
+
+# One rule: the boot prune (pool_delivery.prune_spent) and the sweep agree on every shape.
+def shaped():
+    w = Path(tempfile.mkdtemp(prefix="pool-agree-"))
+    (w / "state").mkdir()
+    box = pd.deliveries_dir(w, WID)
+    box.mkdir(parents=True)
+    t = w / "tasks"
+    (t / "archive" / "2026-11").mkdir(parents=True)
+    res = pd.results_dir(w)
+    (res / "archive").mkdir(parents=True)
+    for tid in ("task-pending", "task-claimed-core", "task-answered-noflag", "task-answered-flag",
+                "task-archived", "task-missing", "task-live-and-archived"):
+        (box / f"{tid}.txt").write_bytes(b"")
+        os.utime(box / f"{tid}.txt", (1.0, 1.0))
+    (t / "task-pending.txt").write_text("id: task-pending\n")
+    (t / "task-claimed-core.claimed-core-1.txt").write_text("id: task-claimed-core\n")
+    (t / "task-answered-noflag.txt").write_text("id: task-answered-noflag\n")
+    (res / "task-answered-noflag.txt").write_text("answered\n")
+    (res / "archive" / "task-answered-flag.txt").write_text("answered\n")
+    pd.mark_done(w, WID, "task-answered-flag", published=True)
+    (t / "archive" / "2026-11" / "task-archived.txt").write_text("id: task-archived\n")
+    (t / "task-live-and-archived.txt").write_text("id: task-live-and-archived\n")
+    pd.archived_payload(w, "task-live-and-archived").write_text("archived")
+    return w
+
+boot, sweep = shaped(), shaped()
+pruned = pd.prune_spent(boot, WID)
+swept = {n[:-4] for n in sup.retire_spent_sentinels(sweep, WID, time.time())}
+check("boot prune and sweep retire the same tasks", sorted(pruned["retired"] + pruned["stale"]), sorted(swept))
+check("and keep the same ones as owed", sorted(pruned["kept"]), sorted(sup.owed_task_ids(sweep, WID)))
+check("owed: pending, claimed by a lane, and live-in-tasks/ despite an archived copy",
+      sorted(pruned["kept"]), ["task-claimed-core", "task-live-and-archived", "task-pending"])
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — settled sentinels owe nothing")
 for f in fails:
