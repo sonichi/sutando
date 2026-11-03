@@ -16,6 +16,7 @@ a card instead, through the engine's hitl store:
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -121,6 +122,10 @@ def limit_holds(workspace, req, worker_id, runner=None, owes_work=None) -> bool:
     return tui_gate.limit_card_holds(req, text, worker_runtime(workspace, worker_id), outrun)
 
 
+# Claude Code's footer row for a background agent still running ("◯ general-purpose  … 37m 31s · ↓ 159.5k tokens").
+BACKGROUND_AGENT_ROW = re.compile(r"^\s*◯ \S.*\d+[ms](?: \d+s)? · [↓↑]", re.MULTILINE)
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
@@ -171,10 +176,13 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     elif which == ps.CARD_UNDELIVERED:
         if pane != ps.PANE_IDLE:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+        if BACKGROUND_AGENT_ROW.search(text):
+            # The turn ended but a background agent it started is still running.
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": "background-agent"}
         cause = sup.delivery_block(socket)
         body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
-                f"has sat idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
-                "the task was never typed in."]
+                f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
+                "its task appears not to have been delivered."]
         if cause == "pane-key-fence":
             body += ["", f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
                      "(docs/codex-core.md). Once no send can still be in flight, clear it with:",

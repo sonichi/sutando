@@ -206,6 +206,9 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     if ev.wedge_escalated and (ev.wedge_kind not in (None, kind)
                               or (ev.wedge_kind is None and kind == "login")):
         ev = replace(ev, wedge_escalated=False)
+    if kind == "undelivered" and ev.wedge_kind != "undelivered":
+        # Its threshold is time spent idle and owing, not time since an earlier wedge began.
+        ev = replace(ev, wedge_first_detected_at=None, wedge_consecutive=0)
     ev = replace(
         ev,
         wedge_kind=kind,

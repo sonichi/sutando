@@ -421,7 +421,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
                                       runner=runner, spawn=spawn)
         elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN, ps.CARD_HUMAN,
                           ps.CARD_UNDELIVERED):
-            if decision == ps.CARD_HUMAN and sup.is_paused(workspace, worker_id):
+            if decision in (ps.CARD_HUMAN, ps.CARD_UNDELIVERED) and sup.is_paused(workspace, worker_id):
                 continue
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)

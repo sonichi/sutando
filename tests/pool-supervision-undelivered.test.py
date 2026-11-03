@@ -62,7 +62,7 @@ def run(observations, start=1000.0, step=ps.SAMPLE_PERIOD_S):
     for o in observations:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if d["w"] == ps.CARD_UNDELIVERED:
+        if d["w"] in (ps.CARD_UNDELIVERED, ps.CARD_HUMAN):
             st = ps.acknowledge(st, ["w"])
         t += step
     return out
@@ -82,6 +82,11 @@ check("a stale watcher is the watcher rung's case, not this one",
 cleared = run([obs()] * ticks + [obs(pane=ps.PANE_WORKING, pane_id="moved")] + [obs()] * ticks)
 check("a pane that starts working ends the episode; the clock restarts",
       ps.CARD_UNDELIVERED in cleared, False)
+
+# Its clock starts when the seat becomes idle-and-owing, not when an earlier wedge began.
+after_gate = run([obs(pane=ps.PANE_GATE)] * 3 + [obs()] * (ticks + 1))
+check("a gate's card, then idle: no undelivered card until a full UNDELIVERED_AFTER_S idle",
+      after_gate[3:], [ps.NOTHING] * ticks + [ps.CARD_UNDELIVERED])
 
 # --- the guard: kept fresh, never recreated -----------------------------------------------
 tmp = Path(tempfile.mkdtemp(prefix="pool-undelivered-"))
@@ -171,6 +176,21 @@ check("with no fence the card says the cause is unidentified",
       "not identified" in (req.prompt if hasattr(req, "prompt") else str(req.__dict__)), True)
 out, _, _ = card(pool(fenced), f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n")
 check("a seat that is working again is not carded", out.get("outcome"), "cleared")
+AGENT = (f"❯ \n{FOOTER}\n  ⏺ main\n"
+         "  ◯ general-purpose  Checking a mutant in the retire path                37m 31s · ↓ 159.5k tokens\n")
+out, _, _ = card(pool(fenced), AGENT)
+check("a seat whose background agent still runs is not carded", (out.get("outcome"), out.get("pane")),
+      ("cleared", "background-agent"))
+out, _, req = card(pool(fenced), IDLE)
+check("the card's words are diagnostic, not a claim", "appears not to have been delivered" in json.dumps(req.__dict__, default=str), True)
+
+# A pause that lands between the sweep and the remedy stops the card, as it does a gate's.
+ws_p = pool(fenced)
+raised = []
+with mock.patch.object(rem.sup, "is_paused", return_value=True), \
+        mock.patch.object(rem.wc, "raise_card", side_effect=lambda *a, **k: raised.append(a) or {}):
+    rem.apply(ws_p, str(REPO), {WID: ps.CARD_UNDELIVERED}, runner=Tmux(IDLE))
+check("a seat paused after the sweep is not carded", raised, [])
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — undelivered work escalates")
 for f in fails:
