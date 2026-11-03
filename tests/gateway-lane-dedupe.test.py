@@ -144,8 +144,17 @@ def main():
     on_lane("", "task-S3", summon={**summon, "update_id": 42}, **room)
     on_lane("sspace", "task-M3", source_message_id="$ev3", **room)
     on_lane("", "task-S4", source_message_id="$ev3", summon={**summon, "update_id": 43}, **room)
-    check("a later update of the same row is a new Summon",
-          (rgb.TASKS_DIR / "task-S3.txt").exists())
+    # On the OTHER lane, so dropping update_id from the key would fail here (same-lane claims always pass).
+    on_lane("sspace", "task-S3b", summon={**summon, "update_id": 44}, **room)
+    check("a later update of the same row is a new Summon, on the same lane or the other",
+          (rgb.TASKS_DIR / "task-S3.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-S3b.txt").exists())
+    # Distinct fields that would join to the same string must stay distinct Summons.
+    piped = {**summon, "update_id": 1}
+    on_lane("", "task-P1", summon={**piped, "database": "db|part", "row_id": "row"}, **room)
+    on_lane("sspace", "task-P2", summon={**piped, "database": "db", "row_id": "part|row"}, **room)
+    check("two distinct Summons whose fields share a joined form are both delivered",
+          (rgb.TASKS_DIR / "task-P1.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-P2.txt").exists()
+          and not (rgb.RESULTS_DIR / "task-sspace~task-P2.txt").exists())
     check("a Summon is never folded into a message task that shares its message id",
           (rgb.TASKS_DIR / "task-sspace~task-M3.txt").exists() and (rgb.TASKS_DIR / "task-S4.txt").exists())
     key = lane_dedupe.key_of
@@ -153,6 +162,10 @@ def main():
           key({"source_message_id": "$x", "hook": fire}) == key({"hook": fire})
           != key({"channel_id": "!r", "source_message_id": "$x"})
           and key({"summon": summon}) == key({"summon": {**summon, "task_id": "other"}}) is not None)
+    check("no context key equals a message key, whatever the room and message id",
+          key({"hook": {"fire_id": "f"}}) != key({"channel_id": "hook", "source_message_id": "f"})
+          and key({"summon": summon}) != key({"channel_id": "summon", "source_message_id":
+                                               "!room:example.org|db1|r1|41"}))
     check("a context missing its identity has no key, so it is delivered",
           key({"source_message_id": "$x", "hook": {"hook_id": "h"}}) is None
           and key({"source_message_id": "$x", "summon": {"task_id": "t"}}) is None

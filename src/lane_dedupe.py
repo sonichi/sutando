@@ -23,12 +23,14 @@ message.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 STORE_NAME = "gateway-seen.sqlite3"
+# One agent's store, shared by its lanes only: keys leave the agent out, so two agents must never share one.
 TTL_S = 24 * 3600
 BUSY_TIMEOUT_S = 2.0
 # Outlasts the owner lane's own poll of the same event; past it the message is answered, never dropped.
@@ -42,6 +44,9 @@ def lane_label(lane: str) -> str:
     return lane or "primary"
 
 
+_SUMMON_FIELDS = ("room_id", "database", "row_id", "update_id")
+
+
 def _context_identity(task: Mapping[str, object]) -> "tuple[bool, Optional[str]]":
     """(is a Commons context task, its lane-independent identity or None).
 
@@ -50,14 +55,14 @@ def _context_identity(task: Mapping[str, object]) -> "tuple[bool, Optional[str]]
     hook, summon = task.get("hook"), task.get("summon")
     if not hook and not summon:
         return False, None
-    if isinstance(hook, Mapping):
-        fire = str(hook.get("fire_id") or "").strip()
-        return True, f"hook\n{fire}" if fire else None
-    if isinstance(summon, Mapping):
-        parts = [str(summon.get(k) if summon.get(k) is not None else "").strip()
-                 for k in ("room_id", "database", "row_id", "update_id")]
-        return True, "summon\n" + "|".join(parts) if all(parts) else None
-    return True, None
+    kind, fields = ("hook", ("fire_id",)) if isinstance(hook, Mapping) else ("summon", _SUMMON_FIELDS)
+    source = hook if kind == "hook" else summon
+    if not isinstance(source, Mapping):
+        return True, None
+    parts = [str(source.get(k) if source.get(k) is not None else "").strip() for k in fields]
+    # A kind-tagged JSON array: one field cannot spill into the next, and it has no raw newline,
+    # so it never equals a message key's "room\nmessage_id".
+    return True, json.dumps([kind, *parts], ensure_ascii=True, separators=(",", ":")) if all(parts) else None
 
 
 def key_of(task: Mapping[str, object]) -> Optional[str]:
