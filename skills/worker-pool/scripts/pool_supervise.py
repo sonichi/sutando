@@ -53,7 +53,6 @@ PAUSED_MARKER = "paused"
 NOT_SUPERVISED = ("retired",)
 # A sentinel younger than this is left alone: its payload may still be landing.
 SENTINEL_RETIRE_AFTER_S = 3600
-DELIVERY_ARCHIVE_REL = Path("state") / "delivery-archive"
 
 
 def state_path(workspace) -> Path:
@@ -164,8 +163,8 @@ def work_outstanding(workspace, worker_id) -> bool | None:
 
 def retire_spent_sentinels(workspace, worker_id, now: float,
                            min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
-    """Move spent sentinels older than `min_age_s` out of the inbox, to
-    state/delivery-archive/<worker>/<YYYY-MM>/, so it holds what is owed. Returns their names."""
+    """Move spent sentinels older than `min_age_s` into the inbox's archive/ (pool_delivery's
+    archive_sentinel), so the inbox holds what is owed. Returns the names moved."""
     inbox = pd.deliveries_dir(workspace, worker_id)
     spent = sentinel_ids(workspace, worker_id)[1]
     moved = []
@@ -176,14 +175,8 @@ def retire_spent_sentinels(workspace, worker_id, now: float,
         mtime = f.stat().st_mtime
         if now - mtime < min_age_s:
             continue
-        dest = (Path(workspace) / DELIVERY_ARCHIVE_REL / worker_id
-                / time.strftime("%Y-%m", time.localtime(mtime)))
-        dest.mkdir(parents=True, exist_ok=True)
-        target, n = dest / f.name, 1
-        while target.exists() or target.is_symlink():  # never overwrite an earlier archive
-            target, n = dest / f"{f.name}.{n}", n + 1
-        os.replace(f, target)
-        moved.append(f.name)
+        if pd.archive_sentinel(f):
+            moved.append(f.name)
     return moved
 
 

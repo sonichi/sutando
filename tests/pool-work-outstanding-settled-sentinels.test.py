@@ -98,10 +98,10 @@ check("retired: the three old spent sentinels", sorted(moved), sorted([
     "task-cccccccccccccccccc.txt"]))
 check("kept: the young one, still in the inbox", young.exists(), True)
 check("kept: the owed .accepted one", (inbox / "task-eeeeeeeeeeeeeeeeee.accepted").exists(), True)
-arch = ws / "state" / "delivery-archive" / WID
-check("moved, not deleted: archived under state/delivery-archive/<worker>/<month>/",
-      sorted(p.name for p in arch.glob("*/*")), sorted(moved))
-check("the inbox gained no subfolder", [p.name for p in inbox.iterdir() if p.is_dir()], [])
+arch = inbox / pd.ARCHIVE_DIR
+check("moved, not deleted: archived under deliveries/<worker>/archive/",
+      sorted(p.name for p in arch.glob("*")), sorted(moved))
+check("the inbox's only subfolder is archive/", [p.name for p in inbox.iterdir() if p.is_dir()], ["archive"])
 check("still owed after retirement", sup.work_outstanding(ws, WID), True)
 check("a second pass moves nothing", sup.retire_spent_sentinels(ws, WID, time.time()), [])
 
@@ -119,7 +119,7 @@ check("the symlink is still in the inbox", (inbox / "task-ffffffffffffffffff.txt
 again = sentinel("task-s-space~task-aaaaaaaaaaaaaaaaaa")
 sup.retire_spent_sentinels(ws, WID, time.time())
 check("a re-delivered, re-retired name sits beside the first, not over it",
-      sorted(p.name for p in arch.glob("*/task-s-space~task-aaaaaaaaaaaaaaaaaa*")),
+      sorted(p.name for p in arch.glob("task-s-space~task-aaaaaaaaaaaaaaaaaa*")),
       ["task-s-space~task-aaaaaaaaaaaaaaaaaa.txt", "task-s-space~task-aaaaaaaaaaaaaaaaaa.txt.1"])
 
 # A sentinel whose name is no task id is in neither set: the worker stays decidable.

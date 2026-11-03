@@ -273,7 +273,7 @@ class TheLadderSurvivesBetweenTicks(Base):
         out = sup.tick(self.ws, 10000.0, runner=Tmux())
         self.assertFalse(s.exists())
         self.assertEqual(out["sentinels_retired"], {wid: 1})
-        self.assertTrue((self.ws / "state" / "delivery-archive" / wid).is_dir())
+        self.assertTrue((sup.pd.deliveries_dir(self.ws, wid) / "archive" / "task-spent.txt").is_file())
 
     def test_an_archive_failure_is_reported_not_swallowed(self):
         wid = make_worker(self.ws)

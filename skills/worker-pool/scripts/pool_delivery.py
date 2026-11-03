@@ -501,6 +501,45 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     return _residue_state(ws, recipient, task_id, sentinel.name if sentinel else None)
 
 
+# Spent sentinels move here rather than vanish (the layout #6214 settles); the watcher acts
+# only on files directly in the inbox, so nothing under it is ever read as owed.
+ARCHIVE_DIR = "archive"
+
+
+def archive_sentinel(path: Path) -> bool:
+    """Move one sentinel into its inbox's `archive/`, never over an earlier one. False, with the
+    sentinel left where it is, when `archive/` is a file or a link or cannot be made: never raises."""
+    path = Path(path)
+    try:
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return False
+    try:
+        try:
+            os.mkdir(ARCHIVE_DIR, 0o755, dir_fd=dfd)
+        except FileExistsError:
+            pass
+        afd = os.open(ARCHIVE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+    except OSError:
+        os.close(dfd)
+        return False
+    try:
+        target, n = path.name, 1
+        while True:
+            try:
+                os.stat(target, dir_fd=afd, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            target, n = f"{path.name}.{n}", n + 1
+        os.rename(path.name, target, src_dir_fd=dfd, dst_dir_fd=afd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(afd)
+        os.close(dfd)
+
+
 def _spent(ws: Path, task_id: str) -> bool:
     """sentinel_spent for one id; a malformed id is never spent."""
     try:
@@ -528,8 +567,7 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
             disposition = task_disposition(ws, task_id)
         except ValueError:
             disposition = None
-        if disposition in SPENT:
-            p.unlink()
+        if disposition in SPENT and archive_sentinel(p):
             actions["stale" if disposition == MISSING else "retired"].append(task_id)
         else:
             actions["kept"].append(task_id)
@@ -562,11 +600,9 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "finished":
             # The flag says done and the task is spent. Leaving the sentinel
             # would hand finished work back as ready on the next boot.
-            p.unlink()
-            actions["retired"].append(task_id)
+            actions["retired" if archive_sentinel(p) else "kept"].append(task_id)
         elif state == "stale-sentinel":
-            p.unlink()
-            actions["stale"].append(task_id)
+            actions["stale" if archive_sentinel(p) else "kept"].append(task_id)
         else:
             raise AssertionError(f"unmapped residue state {state!r} for {task_id}")
     return actions

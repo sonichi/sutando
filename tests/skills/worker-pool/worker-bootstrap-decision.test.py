@@ -198,7 +198,7 @@ class TestMain(Base):
         self.assertEqual(len(sweep), 1, out)
         self.assertIn("stale=3", sweep[0])
         self.assertIn("kept=1", sweep[0])
-        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-owed.txt"])
+        self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file()), ["task-owed.txt"])
 
     def test_the_prune_never_releases_an_accepted_delivery(self):
         """On `skip` this worker's own watcher is live, so an accepted sentinel is
@@ -210,7 +210,7 @@ class TestMain(Base):
         (d / f"task-live{pd.ACCEPTED_SUFFIX}").touch()
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
+        self.assertEqual([p.name for p in d.iterdir() if p.is_file()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
                          "an in-flight delivery was renamed back to pending")
 
     def test_every_way_a_finished_sentinel_can_be_spent(self):
@@ -234,7 +234,7 @@ class TestMain(Base):
         arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertEqual(out, "retired=1 stale=1 kept=1")
-        self.assertEqual([p.name for p in d.iterdir()], ["task-arch.txt"])
+        self.assertEqual([p.name for p in d.iterdir() if p.is_file()], ["task-arch.txt"])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
         """The same task can sit in the folder as `.accepted` and `.txt`; the
@@ -246,7 +246,7 @@ class TestMain(Base):
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("stale=1", out)
         self.assertNotIn("stale=2", out)
-        self.assertEqual(len(list(d.iterdir())), 1, "the second name was judged again")
+        self.assertEqual(len([p for p in d.iterdir() if p.is_file()]), 1, "the second name was judged again")
 
     def test_a_finished_sentinel_whose_payload_could_be_re_queued_is_kept(self):
         """A done flag alone is not spent: with the payload still in tasks/ and no
@@ -263,7 +263,7 @@ class TestMain(Base):
         arch.write_text("archived")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertEqual(out, "retired=0 stale=0 kept=2")
-        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-done.txt", "task-fin.txt"])
+        self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file()), ["task-done.txt", "task-fin.txt"])
 
     def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
         """A prune that raises must leave the decision, its exit code and its first

@@ -568,6 +568,64 @@ class TestSweepNeverDropsAHoldOnLiveWork(Base):
                 self.assertIn(tid, present(ra), f"sweep dropped the hold on live work: {tid}")
 
 
+class TestSpentSentinelsAreArchived(Base):
+    """A spent sentinel moves to deliveries/<worker>/archive/, never over an earlier one, and a
+    file or link where archive/ should be leaves it in place rather than aborting the walk."""
+
+    def spent(self, tid="task-1"):
+        return self.ws.deliver("worker-3", tid)   # no payload anywhere: missing, so spent
+
+    def test_prune_moves_a_spent_sentinel_into_archive(self):
+        self.spent()
+        self.assertEqual(pd.prune_spent(self.root, "worker-3")["stale"], ["task-1"])
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.assertTrue((box / pd.ARCHIVE_DIR / "task-1.txt").is_file())
+        self.assertIsNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_sweep_moves_rather_than_deletes(self):
+        self.spent()
+        self.assertEqual(pd.sweep(self.root, "worker-3")["stale"], ["task-1"])
+        self.assertTrue((pd.deliveries_dir(self.root, "worker-3") / pd.ARCHIVE_DIR / "task-1.txt").is_file())
+
+    def test_an_earlier_archived_name_is_never_overwritten(self):
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.spent()
+        pd.prune_spent(self.root, "worker-3")
+        (box / pd.ARCHIVE_DIR / "task-1.txt").write_text("first")
+        self.spent()
+        pd.prune_spent(self.root, "worker-3")
+        self.assertEqual(sorted(q.name for q in (box / pd.ARCHIVE_DIR).iterdir()),
+                         ["task-1.txt", "task-1.txt.1"])
+        self.assertEqual((box / pd.ARCHIVE_DIR / "task-1.txt").read_text(), "first")
+
+    def test_a_file_at_archive_keeps_the_sentinel_and_the_walk_goes_on(self):
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.spent("task-1")
+        self.spent("task-2")
+        (box / pd.ARCHIVE_DIR).write_text("not a folder")
+        out = pd.prune_spent(self.root, "worker-3")
+        self.assertEqual(sorted(out["kept"]), ["task-1", "task-2"])
+        self.assertTrue((box / "task-1.txt").exists() and (box / "task-2.txt").exists())
+        self.assertEqual(pd.sweep(self.root, "worker-3")["kept"], ["task-1", "task-2"])
+
+    def test_an_archive_that_cannot_happen_is_false_never_an_error(self):
+        self.assertFalse(pd.archive_sentinel(self.root / "deliveries" / "nobody" / "task-1.txt"))
+        gone = self.spent()
+        gone.unlink()  # the sentinel left between the walk and the move
+        self.assertFalse(pd.archive_sentinel(gone))
+
+    def test_a_link_at_archive_is_never_followed(self):
+        box = pd.deliveries_dir(self.root, "worker-3")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (box).mkdir(parents=True, exist_ok=True)
+        (box / pd.ARCHIVE_DIR).symlink_to(outside)
+        self.spent()
+        self.assertEqual(pd.prune_spent(self.root, "worker-3")["kept"], ["task-1"])
+        self.assertEqual(list(outside.iterdir()), [], "a sentinel was moved through the link")
+        self.assertTrue((box / "task-1.txt").exists())
+
+
 class TestSweepTotality(Base):
     def test_one_task_under_both_names_is_visited_once(self):
         """`accepted + pending` can list the same id twice; a second visit would
