@@ -23,6 +23,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Tuple
 
+from . import gateway_instance
+
 DISCOVERY_PATH = "/v1/mcp/discovery"
 # Claude Code gives a headersHelper 10 s in all; the bridge import takes ~1.5 s of it.
 HTTP_TIMEOUT_S = 4
@@ -61,21 +63,24 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
-
-
-def _call(method: str, url: str, bearer: str) -> Tuple[int, dict]:
-    req = urllib.request.Request(url, method=method, data=b"" if method == "POST" else None,
-                                 headers={"Authorization": f"Bearer {bearer}",
-                                          "User-Agent": USER_AGENT,
-                                          "Accept": "application/json"})
-    try:
-        with _OPENER.open(req, timeout=HTTP_TIMEOUT_S) as resp:
-            status, raw = resp.status, resp.read()
-    except urllib.error.HTTPError as exc:
-        status, raw = exc.code, exc.read()
-    except (urllib.error.URLError, OSError) as exc:
-        raise McpAuthError(f"{method} {url}: {getattr(exc, 'reason', exc)}") from None
+def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[int, dict]:
+    scrub, reason = gateway_url or url, None
+    with gateway_instance.gateway_call(scrub):
+        req = urllib.request.Request(url, method=method, data=b"" if method == "POST" else None,
+                                     headers={"Authorization": f"Bearer {bearer}",
+                                              "User-Agent": USER_AGENT,
+                                              "Accept": "application/json"})
+        try:
+            with urllib.request.build_opener(_NoRedirect).open(req, timeout=HTTP_TIMEOUT_S) as resp:
+                status, raw = resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        except (urllib.error.URLError, OSError) as exc:
+            reason = str(getattr(exc, "reason", exc))
+    # Raised outside gateway_call so the request stays named, with the URL and reason redacted.
+    if reason is not None:
+        raise McpAuthError(f"{method} {gateway_instance.redact_url(url)}: "
+                           f"{gateway_instance.redact_text(reason, scrub)}")
     try:
         body = json.loads(raw or b"{}")
     except ValueError:
@@ -84,7 +89,7 @@ def _call(method: str, url: str, bearer: str) -> Tuple[int, dict]:
 
 
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
-    status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer)
+    status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:
         detail = body.get("error") or "no detail"
         raise McpAuthError(f"MCP discovery answered {status} ({detail})")
