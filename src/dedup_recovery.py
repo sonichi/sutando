@@ -120,6 +120,7 @@ def plan_dedup_recovery(
     commit_identity=None,
     channel_dir: str = "",
     holder_delivery_state=None,
+    state_dir: "Path | None" = None,
 ) -> tuple[str, str | None]:
     """Decide and perform the filesystem half of dedup recovery.
 
@@ -166,10 +167,12 @@ def plan_dedup_recovery(
     template = (CROSS_CHANNEL_TEMPLATE if cross_channel else
                 CROSS_SENDER_TEMPLATE if cross_sender else REPORT_TEMPLATE)
     def record_origins():
-        state_dir = Path(tasks_dir).parent / "state"
+        # state and task dirs resolve independently, so the sibling is only the
+        # default-layout fallback: a split layout must inject state_dir.
+        resolved = Path(state_dir) if state_dir is not None else Path(tasks_dir).parent / "state"
         origins = [*origins_from_text(holder_task), *origins_from_text(orig_text),
-                   *read_origins(state_dir, task_id)]
-        if not append_origins(state_dir, holder, origins):
+                   *read_origins(resolved, task_id)]
+        if not append_origins(resolved, holder, origins):
             print(f"[dedup] could not record origins for {holder}", file=sys.stderr)
 
     if holder_delivery_state is not None and holder and not (cross_channel or cross_sender):

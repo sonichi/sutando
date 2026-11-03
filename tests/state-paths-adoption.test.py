@@ -138,8 +138,8 @@ TS_CANONICAL = re.compile(
 ALLOWLIST = {
     # agent-api resolves the workspace and injects it into this read projection.
     "src/activity_projection.py",
-    # Dedup recovery receives the adapter's task directory; its sibling state is
-    # part of that same workspace, including when this module is vendored.
+    # The bridge injects the resolved state dir; the module's "state/" token is
+    # only the default-layout fallback (task_origins_split_layout.test.py).
     "src/dedup_recovery.py",
     # task_lifecycle names tasks/, results/ and state/ under a caller-given work
     # dir and is vendored where src/ (the resolver) is not importable.

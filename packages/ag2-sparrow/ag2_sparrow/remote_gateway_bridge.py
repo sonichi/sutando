@@ -8442,7 +8442,8 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
             action, payload = plan_dedup_recovery(
                 RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
                 _reask_id(tid), commit_identity=_commit,
-                channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
+                channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state,
+                state_dir=_STATE)
     except OSError as e:
         _log(f"dedup decision for {tid} deferred: {diagnostics.describe(e)}")
         return "defer", None, room
