@@ -57,7 +57,7 @@ from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
-from ag2space_links import database_link
+from ag2space_links import app_origin_for, database_link
 from workspace_default import status_path
 from owner_room_access import agent_identity, capability_scripts, channel_credentials, owner_dm, owner_routing
 from owner_room_access import resolve_credentials as _credentials
@@ -116,12 +116,15 @@ def db_link(origin: str, room: str, db: str) -> Optional[str]:
 
 
 def _db_link(scripts: Path, room: str, url_override: str) -> Optional[str]:
-    """The database's page in the room, from the capability's own URL resolution; None if unknown."""
+    """Use the room server's app, falling back to the capability URL for unknown servers."""
     try:
-        if str(scripts) not in sys.path:
-            sys.path.insert(0, str(scripts))
-        from room_collab import resolve_url  # noqa: PLC0415 — the injected capability
-        return db_link(resolve_url(url_override or None), room, DB_SCHEMA["id"])
+        origin = app_origin_for(room)
+        if not origin:
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            from room_collab import resolve_url  # noqa: PLC0415 — the injected capability
+            origin = resolve_url(url_override or None)
+        return db_link(origin, room, DB_SCHEMA["id"])
     except Exception:  # noqa: BLE001 — a link is a convenience, never a precondition
         return None
 
