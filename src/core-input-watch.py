@@ -71,6 +71,7 @@ from worker_auth_state import authenticated_turn, login_expired, refusal_answere
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
+import tmux_probe  # noqa: E402
 
 import argparse
 import hashlib
@@ -97,10 +98,9 @@ def _ensure_tmux_on_path():
     runtime-health probes, which share this process env."""
     if shutil.which("tmux"):
         return
-    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
-        if os.path.exists(cand):
-            os.environ["PATH"] = os.path.dirname(cand) + os.pathsep + os.environ.get("PATH", "")
-            return
+    found = tmux_probe.tmux_binary()
+    if os.path.isabs(found):
+        os.environ["PATH"] = os.path.dirname(found) + os.pathsep + os.environ.get("PATH", "")
 
 
 # ---- Shared derivation core: runtime-health.py (#2092). -------------------- #
