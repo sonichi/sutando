@@ -521,6 +521,13 @@ class TestSweepNeverDropsAHoldOnLiveWork(Base):
         self.assertEqual(out["stale"], [])
         self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
 
+    def test_a_sentinel_whose_id_is_no_task_id_is_kept(self):
+        long_id = "task-" + "a" * 130  # sentinel-shaped, but past the lookup id's 128 characters
+        self.ws.deliver("worker-3", long_id)
+        out = pd.sweep(self.root, "worker-3")
+        self.assertEqual(out["kept"], [long_id])
+        self.assertIsNotNone(pd.find(self.root, "worker-3", long_id))
+
     def test_sweep_removes_only_what_prune_spent_also_removes(self):
         """The one rule (task_disposition.SPENT): on every shape, what the boot sweep
         deletes is a subset of what prune_spent deletes, and neither re-offers spent work."""
