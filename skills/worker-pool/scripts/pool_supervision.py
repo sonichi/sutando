@@ -316,7 +316,11 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
     for worker_id, obs in observations.items():
         if obs.paused:
             # Owner-paused outranks every signal, and observing a paused worker
-            # never clears the pause. Its evidence is left exactly as it was.
+            # never clears the pause. Its evidence is left as it was, except that an
+            # undelivered episode ends: a pause is not time a delivery was refused.
+            ev = workers.get(worker_id)
+            if ev is not None and ev.wedge_kind == "undelivered":
+                workers[worker_id] = _cleared_wedge(ev)
             decisions[worker_id] = NOTHING
             continue
 

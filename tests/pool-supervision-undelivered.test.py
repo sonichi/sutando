@@ -88,6 +88,17 @@ after_gate = run([obs(pane=ps.PANE_GATE)] * 3 + [obs()] * (ticks + 1))
 check("a gate's card, then idle: no undelivered card until a full UNDELIVERED_AFTER_S idle",
       after_gate[3:], [ps.NOTHING] * ticks + [ps.CARD_UNDELIVERED])
 
+# A pause is not time a delivery was refused: the clock starts over on resume.
+paused = ps.Observation(beat=ps.LIVE, session_alive=True, watcher_beat=ps.LIVE, watcher_held=True,
+                        work_outstanding=True, pane=ps.PANE_IDLE, pane_id="same", paused=True)
+resumed = run([obs(), paused, paused] + [obs()] * (ticks + 1))
+check("paused time does not age the undelivered clock",
+      resumed[3:], [ps.NOTHING] * ticks + [ps.CARD_UNDELIVERED])
+gate_kept = ps.evaluate(ps.SupervisionState(workers={"w": ps.WorkerEvidence(
+    wedge_kind="human", wedge_consecutive=2, wedge_first_detected_at=1.0)}), {"w": paused}, 1000.0)[0]
+check("a pause leaves another ladder's evidence exactly as it was",
+      (gate_kept.workers["w"].wedge_kind, gate_kept.workers["w"].wedge_consecutive), ("human", 2))
+
 # --- the guard: kept fresh, never recreated -----------------------------------------------
 tmp = Path(tempfile.mkdtemp(prefix="pool-undelivered-"))
 sock = tmp / "tmux.sock"
