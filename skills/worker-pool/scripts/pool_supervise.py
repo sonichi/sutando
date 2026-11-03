@@ -42,6 +42,7 @@ pd = _sibling("pool_delivery")
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
 from delivery import pane_gate, task_dispatch as td  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -216,6 +217,7 @@ def observe(workspace, now: float, *, worker_ids=None,
         # retired or unknown id must not reach the ladder through this door.
         rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
+    blocks = {}
     for wid, row in rows.items():
         session_alive = probe_session(workspace, wid, runner=runner)
         watcher_beat = pb.classify(pb.beat_path(workspace, "watcher", wid), now)
@@ -227,6 +229,9 @@ def observe(workspace, now: float, *, worker_ids=None,
         pane, pane_id = (observe_pane(workspace, wid, row.get("runtime") or "claude",
                                       runner=runner)
                          if session_alive is True else (None, None))
+        socket = _open_tmux(workspace, wid)[0] if session_alive is True else None
+        if socket and socket not in blocks:
+            blocks[socket] = delivery_block(socket)
         obs[wid] = ps.Observation(
             beat=pb.classify(pb.beat_path(workspace, "worker", wid), now),
             session_alive=session_alive,
@@ -236,8 +241,16 @@ def observe(workspace, now: float, *, worker_ids=None,
             work_outstanding=work_outstanding(workspace, wid),
             pane=pane,
             pane_id=pane_id,
+            delivery_block=blocks.get(socket) if socket else None,
         )
     return obs
+
+
+def delivery_block(socket) -> str | None:
+    """Why typed delivery cannot reach panes on this tmux socket, or None. Keeps the guard's
+    files fresh first, so a nightly /tmp sweep cannot be what raises the block."""
+    tmux_pane_keys.refresh_guard(socket)
+    return "pane-key-fence" if tmux_pane_keys.fence_status(socket) == "uncertain" else None
 
 
 def session_watcher_holds(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
@@ -396,6 +409,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
                             if e.wedge_consecutive and e.wedge_kind},
             "routing": routing_status(workspace),
+            "delivery_blocks": {w: o.delivery_block for w, o in obs.items() if o.delivery_block},
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
@@ -439,6 +453,8 @@ def main(argv=None) -> int:
                   f"/login is run in tmux session {wi.tmux_session_name(wid)}")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
+        for wid, cause in sorted(out.get("delivery_blocks", {}).items()):
+            print(f"{wid[:8]}  typed delivery is blocked ({cause}); see the card for the remedy")
         if out["routing"]["alarm"]:
             print(out["routing"]["alarm"])
     return 0

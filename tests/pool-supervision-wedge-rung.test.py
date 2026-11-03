@@ -48,6 +48,7 @@ CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+UNDELIVERED = getattr(ps, "CARD_UNDELIVERED", "card_undelivered")
 LOGGED_OUT = getattr(ps, "PANE_LOGGED_OUT", "logged-out")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
     ("PANE_GATE", "gate"), ("PANE_LIMIT", "limit"), ("PANE_ABNORMAL", "abnormal"),
@@ -71,7 +72,7 @@ def run(seq, period=300.0, ack=True):
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN):
+        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED):
             st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
@@ -113,7 +114,8 @@ got, _ = run([obs(GATE, work=False)] * 5)
 check("an idle worker parked on a limit owes nothing: not wedged", got, [N] * 5)
 
 got, _ = run([obs(IDLE)] * 5)
-check("at its prompt with work queued is the watcher rung's case, not a wedge", got, [N] * 5)
+check("at its prompt with work queued and a live watcher: carded once UNDELIVERED_AFTER_S passes",
+      got, [N, N, N, UNDELIVERED, N])
 
 got, _ = run([obs(ABN), obs(ABN), obs(IDLE, work=False), obs(ABN), obs(ABN)])
 check("one clean tick clears the wedge clock", got, [N, N, N, N, N])

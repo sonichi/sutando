@@ -168,6 +168,26 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             [_jump(session)], f"{SOURCE}:{session}:human", subject, runtime=runtime,
             title=f"{seat} · needs your decision", device=device, kind="core-blocked",
             turn_on_action=False)
+    elif which == ps.CARD_UNDELIVERED:
+        if pane != ps.PANE_IDLE:
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+        cause = sup.delivery_block(socket)
+        body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
+                f"has sat idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
+                "the task was never typed in."]
+        if cause == "pane-key-fence":
+            body += ["", f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
+                     "(docs/codex-core.md). Once no send can still be in flight, clear it with:",
+                     f"  python3 src/tmux_pane_keys.py recover {socket}",
+                     "The retained tasks are typed in on the notifier's next wake."]
+        else:
+            body += ["", f"Cause: not identified. The {session}-watcher session logs each delivery "
+                     "attempt and why it was refused."]
+        subject.update(cause=[cause] if cause else [])
+        req = choice_request(
+            "\n".join(body), [_jump(session)], f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
+            subject, runtime=runtime, title=f"{seat} · tasks not delivered", device=device,
+            kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_FROZEN:
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
