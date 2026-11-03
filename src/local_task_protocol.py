@@ -226,6 +226,12 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # A Commons hook fire's context (one-line JSON object: hook_id, fire_id, caused_by, rows,
+    # trigger, ...). Written by the trusted bridge; the guard defangs a forged body copy.
+    "hook",
+    # A Commons Summon's context (one-line JSON object: task_id, caused_by, room_id, database,
+    # row_id, changed_by, changes, ...). Same trust and guard as `hook`.
+    "summon",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
     # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
