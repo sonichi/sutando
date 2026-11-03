@@ -35,8 +35,6 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import contextlib
-import fcntl
 import json
 import os
 import re
@@ -53,6 +51,7 @@ sys.path.insert(0, str(_SRC))
 from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
                        core_target, frame_abnormal, frame_working, needs_login_line, normalize,
                        state_id)
+from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl directly)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from worker_auth_state import signed_in_since  # noqa: E402
@@ -837,13 +836,9 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
-@contextlib.contextmanager
 def _stall_lock(path: Path):
     """One writer per seat: the count is read, bumped and replaced (or cleared) under it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_name(f".{path.name}.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+    return locked_file(path.with_name(f".{path.name}.lock"))
 
 
 def _stall_path(workspace, seat: str) -> Path:

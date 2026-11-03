@@ -166,6 +166,19 @@ pg.clear_idle_timeouts(ws, session)
 check("an idle pane clears the report", sup.notifier_stalls(ws, [wid]), {})
 check("the record file is gone", (ws / "state" / "notifier-stalls" / f"{session}.json").exists(), False)
 
+# The stall lock must not make the shared classifier POSIX-only: without fcntl it still imports.
+# The stdlib that branches on msvcrt is imported first, so only file_lock sees the stand-in.
+probe = (
+    "import subprocess, tempfile, selectors, threading, sys, types; sys.modules['fcntl'] = None; "
+    "m = types.ModuleType('msvcrt'); m.LK_LOCK, m.LK_NBLCK, m.LK_UNLCK = 1, 2, 0; "
+    "m.locking = lambda *a: None; sys.modules['msvcrt'] = m; "
+    f"sys.path.insert(0, {str(REPO / 'src')!r}); from delivery import pane_gate as pg; "
+    "print(pg.classify_pane(sys.stdin.read(), pg.CODEX).state)")
+out = subprocess.run([sys.executable, "-c", probe], input=FRAMES["post-turn idle"],
+                     capture_output=True, text=True)
+check("pane_gate imports and classifies where fcntl is unavailable",
+      (out.returncode, out.stdout.strip()), (0, "idle-ready"))
+
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — Codex post-turn frames")
 for f in fails:
     print("   ", f)
