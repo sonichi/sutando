@@ -237,13 +237,21 @@ class TestFlagAfterDrain(Base):
     def test_a_done_flag_with_no_result_is_finished_not_died(self):
         """The bridge drains results/<id>.txt on delivery. A crash between the
         flag and the archive, then a drain, leaves .accepted + flag + payload and
-        NO result. Reading that as died-mid-work re-runs finished work."""
+        NO result. Reading that as died-mid-work re-runs finished work; dropping
+        the sentinel hands the live payload back to the core, which re-runs it too."""
         self.ws.payload("task-1")
         pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.flag("core", "task-1")                  # result already drained
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "finished")
         out = pd.sweep(self.root, "core")
-        self.assertEqual(out["released"], [])
+        self.assertEqual((out["released"], out["ready"]), ([], []))
+        self.assertEqual(out["kept"], ["task-1"])
+        self.assertIsNotNone(pd.find(self.root, "core", "task-1"))
+
+    def test_a_done_flag_whose_payload_is_gone_is_retired(self):
+        pd.accept(self.ws.deliver("core", "task-1"))
+        self.ws.flag("core", "task-1")
+        self.assertEqual(pd.sweep(self.root, "core")["retired"], ["task-1"])
         self.assertIsNone(pd.find(self.root, "core", "task-1"))
 
 
@@ -443,7 +451,7 @@ class TestCliDispatch(Base):
         rc, out = self._main("sweep")
         got = json.loads(out)
         self.assertEqual(rc, 0)
-        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale"})
+        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale", "kept"})
         self.assertEqual(got["ready"], ["task-1"])
 
 
@@ -486,6 +494,71 @@ class TestWatch(Base):
             with self.assertRaises(KeyboardInterrupt):
                 pd.main(["--workspace", str(self.root), "--recipient", "core", "watch"])
         self.assertIn("task-live", seen)
+
+
+class TestSweepNeverDropsAHoldOnLiveWork(Base):
+    """`sweep` deletes on residue's verdict, but residue reads only the bare payload
+    path and the done flag. Removing the sentinel of a task still live in tasks/ with
+    no ready result hands it back to the core's queue: a duplicate run."""
+
+    def test_a_flag_with_a_live_unanswered_payload_is_kept(self):
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("worker-3", "task-1"))
+        self.ws.flag("worker-3", "task-1")
+        self.assertEqual(pd.residue(self.root, "worker-3", "task-1"), "finished")
+        out = pd.sweep(self.root, "worker-3")
+        self.assertEqual(out["kept"], ["task-1"])
+        self.assertEqual((out["ready"], out["released"], out["retired"]), ([], [], []))
+        self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_a_task_a_core_lane_claimed_is_kept_not_stale(self):
+        (self.root / "tasks" / "task-1.claimed-core-1.txt").write_text(
+            "id: task-1\nsource: test\ntask: x\n", encoding="utf-8")
+        self.ws.deliver("worker-3", "task-1")
+        self.assertEqual(pd.residue(self.root, "worker-3", "task-1"), "stale-sentinel")
+        out = pd.sweep(self.root, "worker-3")
+        self.assertEqual(out["kept"], ["task-1"])
+        self.assertEqual(out["stale"], [])
+        self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_sweep_removes_only_what_prune_spent_also_removes(self):
+        """The one rule (task_disposition.SPENT): on every shape, what the boot sweep
+        deletes is a subset of what prune_spent deletes, and neither re-offers spent work."""
+        from task_disposition import SPENT, task_disposition
+
+        def shaped(d):
+            ws = Workspace(d)
+            for tid in ("task-pending", "task-died", "task-claimed", "task-flag-live",
+                        "task-flag-gone", "task-answered", "task-answered-flag",
+                        "task-archived", "task-missing"):
+                ws.deliver("worker-3", tid)
+            for tid in ("task-pending", "task-died", "task-flag-live", "task-answered", "task-answered-flag"):
+                ws.payload(tid)
+            pd.accept(ws.root / "deliveries/worker-3/task-died.txt")
+            (ws.root / "tasks/task-claimed.claimed-core-1.txt").write_text("id: task-claimed\ntask: x\n")
+            for tid in ("task-flag-live", "task-flag-gone", "task-answered-flag"):
+                ws.flag("worker-3", tid)
+            for tid in ("task-answered", "task-answered-flag"):
+                ws.result(tid)
+            (ws.root / "tasks/archive/task-archived.txt").write_text("id: task-archived\ntask: x\n")
+            return ws.root
+
+        def present(root):
+            return {pd.parse_sentinel(q.name)[0] for q in (root / "deliveries/worker-3").iterdir()
+                    if pd.parse_sentinel(q.name)}
+
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            ra, rb = shaped(a), shaped(b)
+            before = present(ra)
+            swept = pd.sweep(ra, "worker-3")
+            pruned = pd.prune_spent(rb, "worker-3")
+            swept_gone, pruned_gone = before - present(ra), before - present(rb)
+            self.assertLessEqual(swept_gone, pruned_gone, swept)
+            spent = {t for t in before if task_disposition(rb, t) in SPENT}
+            self.assertEqual(pruned_gone, spent)
+            self.assertEqual(set(swept["ready"] + swept["released"]) & spent, set(), swept)
+            for tid in ("task-pending", "task-died", "task-claimed", "task-flag-live"):
+                self.assertIn(tid, present(ra), f"sweep dropped the hold on live work: {tid}")
 
 
 class TestSweepTotality(Base):

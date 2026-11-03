@@ -131,8 +131,9 @@ def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
 
 
 def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
-    """(owed, spent) ids among this worker's sentinels. Spent is task_disposition.SPENT,
-    the rule pool_delivery.prune_spent applies at boot; a malformed id is in neither."""
+    """(owed, spent) ids among this worker's sentinels. Spent is task_disposition.SPENT, the rule
+    pool_delivery applies at boot; answered is spent even with its task file still live in tasks/,
+    since the core never re-queues an answered task. A malformed id is in neither."""
     owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
     # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
     ready = td.ready_result_filenames(pd.results_dir(workspace), [f"{t}.txt" for t in owned])

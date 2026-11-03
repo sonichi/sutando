@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.task_dispatch import find_ready_result  # noqa: E402
-from task_disposition import MISSING, SPENT, task_disposition  # noqa: E402
+from task_disposition import MISSING, SPENT, sentinel_spent, task_disposition  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
                          RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
                          require_recipient, workers_root)
@@ -501,6 +501,14 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     return _residue_state(ws, recipient, task_id, sentinel.name if sentinel else None)
 
 
+def _spent(ws: Path, task_id: str) -> bool:
+    """sentinel_spent for one id; a malformed id is never spent."""
+    try:
+        return sentinel_spent(ws, task_id)
+    except ValueError:
+        return False
+
+
 def prune_spent(workspace: Path, recipient: str) -> dict:
     """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
     re-offer. Spent is task_disposition.SPENT, the rule the supervisor's sweep
@@ -533,14 +541,18 @@ def sweep(workspace: Path, recipient: str) -> dict:
     so a reader that only streams never learns about it."""
     ws = Path(workspace)
     seen = set()
-    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": []}
+    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": [], "kept": []}
     for p in accepted(ws, recipient) + pending(ws, recipient):
         task_id = parse_sentinel(p.name)[0]
         if task_id in seen:
             continue
         seen.add(task_id)
         state = residue(ws, recipient, task_id)
-        if state == "pending":
+        if state in ("finished", "stale-sentinel") and not _spent(ws, task_id):
+            # residue reads only the bare payload and the flag; a task still live in
+            # tasks/ (a lane's claim too) with no result would go back to the core's queue.
+            actions["kept"].append(task_id)
+        elif state == "pending":
             actions["ready"].append(task_id)
         elif state == "died-mid-work":
             release(p)
@@ -548,8 +560,8 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "completed":
             actions["completed"].append(task_id)
         elif state == "finished":
-            # Both result and flag exist, so the delivery is spent. Leaving the
-            # sentinel would hand finished work back as ready on the next boot.
+            # The flag says done and the task is spent. Leaving the sentinel
+            # would hand finished work back as ready on the next boot.
             p.unlink()
             actions["retired"].append(task_id)
         elif state == "stale-sentinel":
