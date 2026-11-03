@@ -196,7 +196,7 @@ class TestMain(Base):
         self.assertEqual(out[0], "start")
         sweep = [l for l in out if l.startswith("sweep=")]
         self.assertEqual(len(sweep), 1, out)
-        self.assertIn("stale=3", sweep[0])
+        self.assertIn("archived=3", sweep[0])
         self.assertIn("kept=1", sweep[0])
         self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")), ["task-owed.txt"])
 
@@ -214,8 +214,8 @@ class TestMain(Base):
                          "an in-flight delivery was renamed back to pending")
 
     def test_every_way_a_finished_sentinel_can_be_spent(self):
-        """Spent is task_disposition.SPENT: the payload is gone (stale) or a ready
-        result is on disk (retired). A payload still live in tasks/ is kept even
+        """Spent is sentinel_retirable: the payload is gone or a ready result is on
+        disk, and both are archived. A payload still live in tasks/ is kept even
         with an archived copy, since the core's queue reads tasks/ and would re-run it."""
         pd = self._pd()
         d = self._inbox_dir()
@@ -233,7 +233,7 @@ class TestMain(Base):
         arch = pd.archived_payload(Path(self.ws), "task-arch")
         arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertEqual(out, "archived=0 pruned=0 retired=2 stale=0 kept=1")
+        self.assertEqual(out, "archived=2 pruned=0 kept=1")
         self.assertEqual([p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")], ["task-arch.txt"])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
@@ -244,8 +244,8 @@ class TestMain(Base):
         (d / f"task-two{pd.ACCEPTED_SUFFIX}").touch()
         (d / "task-two.txt").touch()
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("stale=1", out)
-        self.assertNotIn("stale=2", out)
+        self.assertIn("archived=1", out)
+        self.assertNotIn("archived=2", out)
         # Judged once, and both of its names leave together, as archive_finished moves them.
         self.assertEqual([p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")], [])
 
@@ -263,7 +263,7 @@ class TestMain(Base):
         arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
         arch.write_text("archived")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertEqual(out, "archived=0 pruned=0 retired=0 stale=0 kept=2")
+        self.assertEqual(out, "archived=0 pruned=0 kept=2")
         self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")), ["task-done.txt", "task-fin.txt"])
 
     def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):

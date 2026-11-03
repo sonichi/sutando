@@ -164,7 +164,8 @@ def work_outstanding(workspace, worker_id) -> bool | None:
 def retire_spent_sentinels(workspace, worker_id, now: float,
                            min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
     """Move spent sentinels older than `min_age_s` into the inbox's archive/ through
-    pool_delivery.archive_spent, so the inbox holds what is owed. Returns the names moved."""
+    pool_delivery.archive_finished, so the inbox holds what is owed. Returns the names moved.
+    An archive/ that cannot be used raises, and the sweep reports it."""
     inbox = pd.deliveries_dir(workspace, worker_id)
     spent = sentinel_ids(workspace, worker_id)[1]
     old: dict[str, list[str]] = {}
@@ -175,7 +176,10 @@ def retire_spent_sentinels(workspace, worker_id, now: float,
         if now - f.stat().st_mtime < min_age_s:
             continue
         old.setdefault(tid, []).append(f.name)
-    return sorted(n for t in pd.archive_spent(workspace, worker_id, sorted(old)) for n in old[t])
+    if not old:
+        return []
+    moved = pd.archive_finished(workspace, worker_id, task_ids=sorted(old))["archived"]
+    return sorted(n for t in moved for n in old[t])
 
 
 def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,

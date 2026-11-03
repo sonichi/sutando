@@ -116,14 +116,16 @@ tasks/archive/task-123.txt                                      finish (sentinel
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  a finished task's sentinel, moved; nothing reads it as owed
 ```
 
-**A finished task's sentinel moves to `archive/`.** Once a task is answered or archived
-(`src/task_disposition.py`) and its payload has left `tasks/`, `pool_delivery.archive_finished`
-moves its sentinels into the recipient's `archive/` under the folder lock, re-checking the
-payload there. The move deletes nothing, and every reader lists only the folder's top level, so an
-archived sentinel is no hold. A worker watcher runs it before its startup sweep, and
-`prune_spent` runs it first. `pool_delivery.py archive-finished <worker> --dry-run` prints the
-counts. A sentinel stays while the payload is in `tasks/`, even with a result: until the bridge
-archives the task, the sentinel still tells it whose reply it is delivering.
+**A spent task's sentinel moves to `archive/`, and nothing deletes one.** One rule,
+`pool_delivery.sentinel_retirable`, says when a sentinel may leave: its task is archived or gone
+from everywhere, or answered with its payload out of `tasks/` or this recipient's done flag
+written. Until then the bridge still reads it for whose reply it is delivering.
+`pool_delivery.archive_finished` is the only mover: it moves such sentinels into the recipient's
+`archive/` under the folder lock and re-checks the rule there, so a task re-queued meanwhile keeps
+its hold. `task_ids=` narrows it to some tasks. `prune_spent`, the boot `sweep` and the
+supervisor's retire all go through it. A move that cannot happen (an unusable `archive/`) leaves
+the sentinel in the inbox. Every reader lists only the folder's top level, so an archived sentinel
+is no hold. `pool_delivery.py archive-finished <worker> --dry-run` prints the counts.
 `prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:

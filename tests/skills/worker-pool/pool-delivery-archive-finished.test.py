@@ -69,21 +69,22 @@ class TestArchiveFinished(Base):
         self.live("task-open"); self.sentinel("task-open")                       # pending
         self.live("task-held", "task-held.claimed-core-1.txt"); self.sentinel("task-held")
         self.live("task-sent"); self.answered("task-sent"); self.sentinel("task-sent")  # bridge not done
-        self.sentinel("task-gone")                                               # missing everywhere
+        self.sentinel("task-gone")                                     # missing everywhere: spent too
 
     def test_finished_sentinels_move_and_open_ones_stay(self):
         self.fixture()
         got = pd.archive_finished(self.root, W)
-        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped"])
-        self.assertEqual(self.archived_names(), ["task-acc.accepted", "task-done.txt", "task-dropped.txt"])
-        self.assertEqual(self.live_names(), ["task-gone.txt", "task-held.txt", "task-open.txt", "task-sent.txt"])
-        self.assertEqual(got["kept"], {"pending": 1, "claimed": 1, "answered-payload-live": 1, "missing": 1})
+        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped", "task-gone"])
+        self.assertEqual(self.archived_names(),
+                         ["task-acc.accepted", "task-done.txt", "task-dropped.txt", "task-gone.txt"])
+        self.assertEqual(self.live_names(), ["task-held.txt", "task-open.txt", "task-sent.txt"])
+        self.assertEqual(got["kept"], {"pending": 1, "claimed": 1, "answered-payload-live": 1})
 
     def test_dry_run_moves_nothing_and_counts_the_same(self):
         self.fixture()
         before = self.live_names()
         got = pd.archive_finished(self.root, W, dry_run=True)
-        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped"])
+        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped", "task-gone"])
         self.assertEqual(self.live_names(), before)
         self.assertFalse(self.archive.exists())
 
@@ -91,7 +92,7 @@ class TestArchiveFinished(Base):
         self.fixture()
         pd.archive_finished(self.root, W)
         self.assertEqual(pd.archive_finished(self.root, W)["archived"], [])
-        self.assertEqual(len(self.archived_names()), 3)
+        self.assertEqual(len(self.archived_names()), 4)
 
     def test_an_archived_record_of_the_same_name_is_never_overwritten(self):
         self.answered("task-done"); self.archived("task-done")
@@ -124,6 +125,20 @@ class TestArchiveFinished(Base):
         self.assertEqual(got["archived"], [])
         self.assertEqual(self.live_names(), ["task-done.txt"])
 
+    def test_a_flagged_answer_moves_though_its_payload_is_still_live(self):
+        self.live("task-sent"); self.answered("task-sent"); self.sentinel("task-sent")
+        flag = pd.done_flag(self.root, W, "task-sent")
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text("done\n")
+        self.assertEqual(pd.archive_finished(self.root, W)["archived"], ["task-sent"])
+
+    def test_an_id_subset_moves_only_those_tasks(self):
+        self.fixture()
+        got = pd.archive_finished(self.root, W, task_ids=["task-done", "task-open"])
+        self.assertEqual(got["archived"], ["task-done"])
+        self.assertEqual(got["kept"], {"pending": 1})
+        self.assertIn("task-gone.txt", self.live_names())
+
     def test_prune_spent_archives_finished_work_it_used_to_keep(self):
         self.answered("task-done"); self.archived("task-done"); self.sentinel("task-done")
         self.live("task-open"); self.sentinel("task-open")
@@ -133,23 +148,23 @@ class TestArchiveFinished(Base):
 
 
 class TestPruneSpentFailOpen(Base):
-    """A broken `archive/` never stops `prune_spent` retiring a spent sentinel."""
+    """A broken `archive/` never stops `prune_spent`, and never costs a sentinel: it stays."""
 
     def spent(self):
         self.archived("task-1")
         return self.sentinel("task-1")
 
-    def assert_still_retires(self):
+    def assert_still_kept(self):
         acts = pd.prune_spent(self.root, W)
         self.assertEqual(acts["archived"], [])
         self.assertIn("archive_error", acts)
-        self.assertEqual(acts["stale"], ["task-1"])
-        self.assertEqual(self.live_names(), [])
+        self.assertEqual(acts["kept"], ["task-1"])
+        self.assertEqual(self.live_names(), ["task-1.txt"])
 
     def test_a_regular_file_at_archive(self):
         self.spent()
         self.archive.write_text("not a dir")
-        self.assert_still_retires()
+        self.assert_still_kept()
         self.assertEqual(self.archive.read_text(), "not a dir")
 
     def test_a_symlink_to_a_dir_at_archive(self):
@@ -157,7 +172,7 @@ class TestPruneSpentFailOpen(Base):
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
         self.archive.symlink_to(elsewhere)
-        self.assert_still_retires()
+        self.assert_still_kept()
         self.assertEqual(os.listdir(elsewhere), [])
 
 

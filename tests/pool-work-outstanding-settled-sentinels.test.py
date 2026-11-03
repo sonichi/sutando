@@ -157,7 +157,7 @@ boot, sweep = shaped(), shaped()
 pruned = pd.prune_spent(boot, WID)
 swept = {n[:-4] for n in sup.retire_spent_sentinels(sweep, WID, time.time())}
 check("boot prune and sweep retire the same tasks",
-      sorted(pruned["archived"] + pruned["retired"] + pruned["stale"]), sorted(swept))
+      sorted(pruned["archived"]), sorted(swept))
 check("kept: pending, a lane's claim, live-in-tasks/ despite an archived copy, and an answered task "
       "still in tasks/ with no done flag (the bridge still reads whose reply it is)",
       sorted(pruned["kept"]), ["task-answered-noflag", "task-claimed-core", "task-live-and-archived", "task-pending"])
