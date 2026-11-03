@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import signal
 import sys
 import time
@@ -19,7 +20,8 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
 isolate_os_environ()
 
-from ag2_sparrow import connect_bridge as cb, connect_common as cm, service_manager as sm, task_io  # noqa: E402
+from ag2_sparrow import claude_local_records as records, connect_bridge as cb, connect_common as cm  # noqa: E402
+from ag2_sparrow import service_manager as sm, task_io  # noqa: E402
 
 MANAGERS = (("systemd", False), ("launchd", True))
 SYSTEMD = MANAGERS[:1]      # launchd's undo signals no pid: it boots out the registration its bootstrap loaded
@@ -35,6 +37,14 @@ def after_start(fake) -> set:
     return set(verbs[first:])
 
 
+def cb_cfg(local):
+    """The config the install wrote, for unwiring its bridge in a test's own cleanup ({} when there is none)."""
+    try:
+        return cm.read_config(cm.config_path(local))
+    except OSError:
+        return {}
+
+
 def _until(predicate, seconds=15.0):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline and not predicate():
@@ -43,17 +53,22 @@ def _until(predicate, seconds=15.0):
 
 
 class UndoSeams:
+    tmux_tree = False       # a suite whose launcher hosts the holder in a tmux pane runs that real tree
 
     def _real(self, mac, tag=""):
         fake = self.seam_fake()
         fake.runner.real, fake.runner.shim = True, mac
         fake.runner.pause, fake.runner.acted = "", str(self.home / f"acted-{tag}-{int(mac)}")
         fake.runner.keep_alive, fake.runner.throttle = mac, 0.0     # launchd: a run that ends respawns at once
+        fake.runner.tmux = self.tmux_tree
         return fake
 
     def _done(self, fake):
         """The test's own cleanup: every run it spawned gone, so one manager cannot leak into the next."""
         r = fake.runner
+        gen = records.load_supervisor(str(self.root)).get("generation") or {}
+        if gen.get("server_pid") and task_io.verify_lineage(gen["server_pid"], gen.get("server_start")) is True:
+            os.killpg(gen["server_pid"], signal.SIGKILL)       # a tree's server is no descendant of its launcher
         for p in r.spawned:
             try:
                 os.killpg(p.pid, signal.SIGKILL)    # the group too: a shim's child can outlive the shim
@@ -328,6 +343,63 @@ class UndoSeams:
                 finally:
                     self._done(fake)
                     cm.plist_path(self.local).unlink(missing_ok=True)
+
+    def test_a_failed_install_unwires_the_bridge_it_wired_and_only_that_one(self):
+        bridge = cb.bridge_shape(self.local)
+        for changed in (False, True):
+            for name, mac in MANAGERS:
+                with self.subTest(manager=name, bridge_changed=changed):
+                    fake = self._real(mac, f"bridge-{int(changed)}")
+                    real_problem = cm._holder_problem
+
+                    def refused_after_the_wiring(shape, root, rec, p):
+                        if changed:
+                            cm.supervisor_path(bridge).write_text(cm.supervisor_path(bridge).read_text() + "\n")
+                        return real_problem(shape, root, rec, p) or "the launcher was refused (test)"
+                    with mock.patch.object(cm, "is_macos", return_value=mac), \
+                            mock.patch.object(cm, "_holder_problem", side_effect=refused_after_the_wiring):
+                        rc, out, err = self.install_seat(fake)
+                        wired, bridge_job = cm.supervisor_path(bridge).exists(), cm.job_name(bridge)
+                    try:
+                        self.assertNotEqual(rc, 0, out + err)
+                        self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned), "the session job stopped")
+                        if changed:
+                            self.assertTrue(wired, "a bridge unit with other bytes is left")
+                            self.assertTrue(fake.active, "and still running")
+                            self.assertIn(f"{bridge_job} is no longer the unit this attempt wrote, so it was left", err)
+                        else:
+                            self.assertFalse(wired, "the bridge unit this attempt wrote is removed")
+                            self.assertFalse(fake.active, "and its job stopped")
+                            self.assertIn(f"the bridge this attempt wired ({bridge_job}) was removed", err)
+                    finally:
+                        self._done(fake)
+                        with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \
+                                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            cb.unwire_bridge(cb_cfg(self.local), self.local.command, bridge)
+                            cm.uninstall(self.local)
+
+    def test_verify_fails_when_the_session_job_is_gone_but_a_bridge_is_configured(self):
+        for name, mac in MANAGERS:
+            with self.subTest(name):
+                fake = self.seam_fake()
+                try:
+                    with mock.patch.object(cm, "is_macos", return_value=mac):
+                        rc, out, err = self.connect(self.backend(), fake)
+                        self.assertEqual(rc, 0, out + err)
+                        with mock.patch.object(sm, "_run", side_effect=fake):
+                            served = self.main("verify")[1]
+                            fake.runner.stop_session()
+                            rc, gone, _ = self.main("verify")
+                            job = cm.job_name(self.local)
+                    self.assertIn(f"PASS job: {job} active", served)
+                    self.assertNotEqual(rc, 0, gone)
+                    self.assertRegex(gone, rf"FAIL job: {re.escape(job)} is (absent|registered), so no session answers the "
+                                           "tasks its configured bridge passes on")
+                finally:
+                    self._done(fake)
+                    with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        cm.uninstall(self.local)
 
     def test_a_launchd_registration_that_shows_no_pid_is_still_ours(self):
         fake = self._real(True, "late")

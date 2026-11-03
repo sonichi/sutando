@@ -94,6 +94,9 @@ class Shape:
     keep_alive_on_success: "bool | None" = None
     manager_timeout_s: int = RUN_TIMEOUT_S
     service_args: tuple = ("run",)      # systemd's ExecStart arguments
+    # (root, holder record) -> the launcher pid whose run spawned that holder outside its own process
+    # tree (a tmux pane), proven from the shape's records; None when it cannot be proven.
+    holder_launcher: object = None
     writer: str = ""        # the install that writes the unit, when it is not `command`'s own
 
     @property
@@ -1337,13 +1340,28 @@ def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:
                 f"its refusal is in {launcher_log(shape)}")
     launcher = rec.get("owner_pid", rec.get("pid"))
     job = manager_pid(shape)
-    if job is None or job not in (launcher, _parent_pid(launcher)):
+    spawner = _spawning_launcher(shape, root, rec) if job is not None and job not in (launcher, _parent_pid(launcher)) \
+        else None
+    if job is None or job not in (launcher, _parent_pid(launcher), spawner, _parent_pid(spawner) if spawner else None):
         return (f"the launcher holding {root} (pid {launcher}) is not the process {job_name(shape)} runs as "
                 f"({job or 'none'}); it was not started by this operation")
     if p["root_id"] is not None and dir_identity(root) != p["root_id"]:
         return (f"the launcher did not hold {root} as the directory connect wrote the seat for (it was replaced "
                 "while the job started)")
     return ""
+
+
+def _spawning_launcher(shape: Shape, root: str, rec: dict) -> "int | None":
+    """The launcher whose run spawned the holder, from the shape's own proof (None without one), polled
+    briefly: the launcher records its run just after the holder may already have taken the root."""
+    if shape.holder_launcher is None:
+        return None
+    deadline = time.monotonic() + START_SEEN_S
+    while True:
+        found = shape.holder_launcher(root, rec)
+        if found is not None or time.monotonic() >= deadline:
+            return found
+        time.sleep(POLL_S)
 
 
 def _left_unlocked(p: dict) -> str:
@@ -1379,14 +1397,13 @@ def _undo_start(p: dict) -> str:
     if unit_now != p["unit"] or (not launchd and not _same_run(job_identity(shape), p["ident"])):
         return (f"{job_name(shape)} is no longer the job this connect started (its unit or launcher changed), so "
                 f"it was left as it is: {by_hand}")
-    for undo in p["undo"]:
-        undo()
+    notes = "".join(f"{line}; " for line in (undo() for undo in p["undo"]) if line)
     problem = stop_supervisor(shape) if launchd else _stop_run(shape, p["ident"])
     if problem:
-        return f"{job_name(shape)} could not be stopped ({problem}): {by_hand}"
+        return f"{notes}{job_name(shape)} could not be stopped ({problem}): {by_hand}"
     print(f"stopped: {job_name(shape)} (the job this operation started"
           + ("" if launchd else f", pid {p['ident']['pid']}") + ")")
-    return f"{job_name(shape)}, the job this operation started, was stopped"
+    return f"{notes}{job_name(shape)}, the job this operation started, was stopped"
 
 
 def _stop_run(shape: Shape, ident: dict) -> str:
@@ -1677,7 +1694,13 @@ def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None, relay=No
     text, problem = supervisor_text(sup)
     check(results, text is not None and marked(text, supervisor_marker(shape)), "supervisor",
           problem or (f"{sup} missing; run {shape.command} install" if text is None else str(sup)))
-    print(f"INFO job: {job_name(shape)} {manager_state(shape)}")
+    state = manager_state(shape)
+    if cfg.get("BRIDGE"):
+        check(results, state == "active", "job", f"{job_name(shape)} {state}" if state == "active" else
+              f"{job_name(shape)} is {state}, so no session answers the tasks its configured bridge passes on: run "
+              f"{shape.command} install again, or {shape.command} uninstall")
+    else:
+        print(f"INFO job: {job_name(shape)} {state}")
     root = work_root(cfg)
     print(f"INFO session: {root} {occupancy(root) if occupancy is not None else occupancy_line(shape, root)}")
     if not is_macos():

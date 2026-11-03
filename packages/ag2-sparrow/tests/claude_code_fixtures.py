@@ -272,11 +272,49 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
     return p
 
 
-def launched(root, adapter, install="", real=False, pause="", acted="", shim=False):
+# claude-local's real tree: the launcher starts a tmux server that daemonizes (not its descendant) and whose
+# pane runs `hold`, which takes the root; the launcher records that generation and itself in the supervisor
+# record. argv: root, pause, acted (the pane's, as REAL_LAUNCHER's). Its stop takes the server down with it.
+TMUX_TREE = ("import os, signal, subprocess, sys, time; sys.path.insert(0, %r)\n"
+             "from ag2_sparrow import claude_local_records as records, task_io\n"
+             "root = sys.argv[1]\n"
+             "server_code = ('import os, subprocess, sys\\n'\n"
+             "    'p = subprocess.Popen([sys.executable, \"-c\", sys.argv[1]] + sys.argv[2:], stdin=subprocess.PIPE)\\n'\n"
+             "    'print(os.getpid(), p.pid, flush=True); sys.exit(p.wait())')\n"
+             "daemon = 'import subprocess, sys; subprocess.Popen(sys.argv[1:], start_new_session=True)'\n"
+             "f = subprocess.Popen([sys.executable, '-c', daemon, sys.executable, '-c', server_code, %r] + sys.argv[1:4],\n"
+             "                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)\n"
+             "server, pane = map(int, f.stdout.readline().split()); f.wait()\n"
+             "def stop(*a):\n"
+             "    try:\n"
+             "        os.killpg(server, signal.SIGTERM)\n"
+             "    except OSError:\n"
+             "        pass\n"
+             "    while task_io.verify_lineage(server, start) is True:\n"
+             "        time.sleep(0.05)\n"
+             "    os._exit(0)\n"
+             "start = task_io.start_time(server)\n"
+             "signal.signal(signal.SIGTERM, stop)\n"
+             "from ag2_sparrow.adapters.claude_code import inbox\n"
+             "inbox.prepare_root(root)\n"
+             "records.save_supervisor(root, dict(records.load_supervisor(root), launcher=task_io.process_identity(),\n"
+             "    generation={'server_pid': server, 'server_start': start, 'pane_pid': pane, 'pane_id': '%%0',\n"
+             "                'session_id': '$0', 'session_created': '0', 'start_command': 'hold', 'nonce': '0' * 32}))\n"
+             "sys.stdin.read(); stop()")
+
+
+def tree_server(root):
+    """The fake tmux server a TMUX_TREE launcher recorded for `root`, while it still runs as recorded."""
+    gen = records.load_supervisor(root).get("generation") or {}
+    alive = gen.get("server_pid") and task_io.verify_lineage(gen["server_pid"], gen.get("server_start")) is True
+    return gen["server_pid"] if alive else None
+
+
+def launched(root, adapter, install="", real=False, pause="", acted="", shim=False, tmux=False):
     """The manager's start, not waited for: its launcher waits in admission until the operation that
     started it releases the agent lock."""
     if real:
-        code = REAL_LAUNCHER % (str(PKG),)
+        code = TMUX_TREE % (str(PKG), REAL_LAUNCHER % (str(PKG),)) if tmux else REAL_LAUNCHER % (str(PKG),)
         argv = [sys.executable, "-c", SHIM, code] if shim else [sys.executable, "-c", code]
         argv += [str(root), pause, acted or os.devnull]
     else:
@@ -340,7 +378,7 @@ class Runner:
         self.session, self.adapter, self.install = None, adapter, install
         self.invocation, self.since = "", 0
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
-        self.real, self.pause, self.acted, self.shim, self.spawned = False, "", "", False, []
+        self.real, self.pause, self.acted, self.shim, self.spawned, self.tmux = False, "", "", False, [], False
         self.stop_timeout = 10
         self.keep_alive, self.loaded, self.throttle, self.started_at, self.respawns = False, False, 30.0, 0.0, 0
 
@@ -361,7 +399,7 @@ class Runner:
         self.invocation, self.since = secrets.token_hex(16), int(time.monotonic() * 1_000_000)
         self.started_at = time.monotonic()
         self.session = launched(self.root, self.adapter, self.install, self.real, self.pause, self.acted,
-                                self.shim) if by_manager else \
+                                self.shim, self.tmux) if by_manager else \
             hold(self.root, self.adapter, install=self.install)
         self.spawned.append(self.session)
 

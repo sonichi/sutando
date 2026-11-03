@@ -375,9 +375,9 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
     problem = bridge_owner_problem(local, root, cfg.get("AGENT_ID", "")) or wire_bridge(cfg, command, bridge)
     replaced = root_id is not None and cm.dir_identity(root) != root_id
     if root_id is None or not (problem or replaced):
-        pending = cm.pending_start(local) if root_id is not None else None
-        if not problem and pending is not None and before is None and _bytes(artifact) is not None:
-            pending["undo"].append(lambda: unwire_bridge(cfg, command, bridge))
+        pending, wired = cm.pending_start(local), _bytes(artifact)
+        if not problem and pending is not None and before is None and wired is not None:
+            pending["undo"].append(lambda: _unwire_ours(cfg, command, bridge, artifact, wired))
         return problem
     after = _bytes(artifact)
     note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
@@ -391,6 +391,17 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
         return _replaced(root, local, stopped, note)
     return (f"{problem}; this attempt was undone: {note}"
             + (stopped or f"{cm.job_name(local)}, the job its install started, was stopped"))
+
+
+def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wired: bytes) -> str:
+    """The undo of this attempt's wiring, under the start's undo: only while the bridge unit still holds the
+    bytes this attempt wrote; the line saying what was done."""
+    if _bytes(artifact) != wired:
+        return (f"{cm.job_name(bridge)} is no longer the unit this attempt wrote, so it was left: stop it by hand "
+                f"({cm.stop_command(bridge)})")
+    problem = unwire_bridge(cfg, command, bridge)
+    return (f"{cm.job_name(bridge)} could not be removed ({problem})" if problem else
+            f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed")
 
 
 def _replaced(root: str, local: cm.Shape, stopped: str, bridge_note: str) -> str:

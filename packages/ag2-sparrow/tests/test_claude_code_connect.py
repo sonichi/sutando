@@ -57,8 +57,8 @@ class ConnectVerify(ConnectBase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out).values()), {"PASS"}, out)
         self.assertEqual(set(self.checks(out)), {"config", "claude", "login", "tmux", "socket", "plugin", "inbox", "results",
-                                                 "hmac", "hitl", "bridge", "supervisor"})
-        self.assertIn(f"INFO job: {cli.SERVICE_NAME} active", out)
+                                                 "hmac", "hitl", "bridge", "supervisor", "job"})
+        self.assertIn(f"PASS job: {cli.SERVICE_NAME} active", out)
         self.assertIn(f"INFO session: {self.work} held by hold pid {runner.pid()}, no live claude attached (manager", out,
                       "the shared tri-state, naming the lock's holder")
         self.assertNotIn("launcher pid", out)
@@ -67,7 +67,11 @@ class ConnectVerify(ConnectBase):
         self.assertIn("PASS hitl store: %s (the bridge's, beside its default store under %s)"
                       % (cli.hitl_store_root(), _dirs.state_dir()), out)
         runner.stop_session()
-        self.assertIn(f"INFO session: {self.work} free", self.main("verify")[1])
+        rc, out, _ = self.main("verify")
+        self.assertIn(f"INFO session: {self.work} free", out)
+        self.assertNotEqual(rc, 0, "a configured bridge with no session job is a failed verify")
+        self.assertIn(f"FAIL job: {cli.SERVICE_NAME} is unknown, so no session answers the tasks its configured bridge "
+                      f"passes on: run {cli.COMMAND} install again, or {cli.COMMAND} uninstall", out)
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
         self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
         self.configure(BRIDGE_STATE_DIR="", HITL_STORE="/elsewhere/hitl/requirements-claude-local")
@@ -181,6 +185,30 @@ class UndoUnits(ConnectBase):
             got = cm._own_run(L, None, {"by_call": True, "t0": 0, "t1": 1})
         self.assertEqual(got, (None, "showed no process within 0 s of this operation's start"))
 
+    def test_a_pane_holder_is_ours_only_through_a_live_launcher_run_that_recorded_its_generation(self):
+        server = subprocess.Popen([sys.executable, "-c", "import subprocess, sys; p = subprocess.Popen([sys.executable, "
+                                   "'-c', 'import time; time.sleep(60)']); print(p.pid, flush=True); p.wait()"],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(server.pid, signal.SIGKILL), server.wait(), server.stdout.close()))
+        pane = int(server.stdout.readline())
+        root = self.home / "pane-root"
+        records.supervisor_path(root).parent.mkdir(parents=True)
+        me = task_io.process_identity()
+        gen = {"server_pid": server.pid, "server_start": wait_for(lambda: task_io.start_time(server.pid)), "pane_pid": pane}
+
+        def proof(launcher=me, holder=pane, **over):
+            records.save_supervisor(root, dict(records.empty_supervisor(), launcher=launcher, generation=dict(gen, **over)))
+            return shape_mod.session_launcher(root, {"owner_pid": holder})
+        self.assertEqual(proof(), os.getpid(), "the pane of our run's generation, our launcher live")
+        self.assertIsNone(proof(launcher=dict(me, start="2000-01-01T00:00:00Z")), "a launcher run that is gone")
+        self.assertIsNone(proof(holder=os.getpid()), "a holder that is not that generation's pane")
+        self.assertIsNone(proof(server_pid=os.getpid()), "a pane that is not that server's")
+        self.assertIsNone(proof(server_start="2000-01-01T00:00:00Z"), "a server that is not the recorded one")
+        records.supervisor_path(root).unlink()
+        self.assertIsNone(shape_mod.session_launcher(root, {"owner_pid": pane}), "no record, no proof")
+        with mock.patch.object(records, "load_supervisor", side_effect=records.RecordError("torn")):
+            self.assertIsNone(shape_mod.session_launcher(root, {"owner_pid": pane}))
+
     def test_the_undo_outside_the_agent_lock_stops_nothing(self):
         p = {"shape": L, "root": str(self.work), "owned": True, "why": "", "unit": b"", "undo": [], "ident": self.ident()}
         with mock.patch.object(cm, "_stop_run") as stop:
@@ -251,7 +279,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
 
-    local = L
+    local, tmux_tree = L, True
 
     def seam_fake(self):
         return self.bridged()
