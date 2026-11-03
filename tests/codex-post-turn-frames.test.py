@@ -179,6 +179,61 @@ out = subprocess.run([sys.executable, "-c", probe], input=FRAMES["post-turn idle
 check("pane_gate imports and classifies where fcntl is unavailable",
       (out.returncode, out.stdout.strip()), (0, "idle-ready"))
 
+# In process, so the CLI branches and the failure paths are measured, not only exercised.
+import contextlib  # noqa: E402
+import io  # noqa: E402
+from unittest import mock  # noqa: E402
+
+
+def cli(argv, stdin=""):
+    buf = io.StringIO()
+    with mock.patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stdout(buf):
+        rc = pg.main(argv)
+    return rc, buf.getvalue()
+
+
+rc, out = cli(["save-frame", "--workspace", str(ws), "--seat", "seat-e", "--kind", "abnormal"], "frame\n")
+check("save-frame CLI writes and prints the path", (rc, out.strip().endswith("-abnormal.txt")), (0, True))
+check("save-frame CLI on a blank capture exits 1", cli(["save-frame", "--workspace", str(ws), "--seat",
+                                                        "seat-e", "--kind", "x"], "  \n"), (1, ""))
+check("idle-timeout CLI counts in process", [cli(["idle-timeout", "--workspace", str(ws), "--seat", "seat-f"])[1].strip()
+                                             for _ in range(pg.STALL_ROUNDS)][-1], f"surface {pg.STALL_ROUNDS}")
+check("idle-ok CLI clears", (cli(["idle-ok", "--workspace", str(ws), "--seat", "seat-f"])[0],
+                             (ws / "state" / "notifier-stalls" / "seat-f.json").exists()), (0, False))
+
+blocked = Path(tempfile.mkdtemp(prefix="codex-post-turn-blocked-"))
+(blocked / "state").write_text("a file where the state folder should be")
+check("save_frame swallows a filesystem error", pg.save_frame(blocked, "s", "k", "x"), None)
+check("note_idle_timeout reports 0 when it cannot write", pg.note_idle_timeout(blocked, "s"), 0)
+check("clear on an absent record is False", pg.clear_idle_timeouts(ws, "never-stalled"), False)
+pg.note_idle_timeout(ws, "seat-g")
+with mock.patch.object(pg, "_stall_lock", side_effect=OSError("locked out")):
+    check("clear that cannot lock is False, record kept", (pg.clear_idle_timeouts(ws, "seat-g"),
+          (ws / "state" / "notifier-stalls" / "seat-g.json").exists()), (False, True))
+target = ws / "atomic.txt"
+with mock.patch.object(pg.os, "replace", side_effect=OSError("replace failed")):
+    try:
+        pg._write_atomic(target, "x")
+        raised = False
+    except OSError:
+        raised = True
+check("a failed atomic write raises and leaves no temp file",
+      (raised, [p.name for p in ws.glob(".atomic.txt.*")]), (True, []))
+(ws / "state" / "notifier-stalls" / "garbled.json").write_text("{not json")
+check("an unreadable stall record is skipped", "garbled" in pg.idle_stalls(ws), False)
+
+pg.note_idle_timeout(ws, session)
+pg.note_idle_timeout(ws, session)
+pg.note_idle_timeout(ws, session)
+buf = io.StringIO()
+with mock.patch.object(sup, "tick", return_value={
+        "decisions": {}, "observations": {}, "not_supervised": [], "auth_expired": [], "resumed": False,
+        "routing": {"alarm": None}, "notifier_stalls": sup.notifier_stalls(ws, [wid])}), \
+        contextlib.redirect_stdout(buf):
+    sup.main(["--workspace", str(ws), "--sweep"])
+check("the sweep's text report names the stalled worker",
+      f"{wid[:8]}  notifier has not seen an idle pane for {pg.STALL_ROUNDS} rounds" in buf.getvalue(), True)
+
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — Codex post-turn frames")
 for f in fails:
     print("   ", f)
