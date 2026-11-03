@@ -262,10 +262,10 @@ class InboxCli(ConnectBase):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%s%stask: hi\n" % (task_id, extra, lines))
         return task_id
 
-    def test_claim_admits_the_owner_and_answers_every_non_owner_and_a_tierless_task_with_the_refusal(self):
+    def test_claim_admits_the_owner_and_answers_every_other_non_owner_and_a_tierless_task_with_the_refusal(self):
         rc, out = self.verb("claim", self.task("task-o"))
         self.assertEqual((rc, out["admission"], out["access_tier"], out["collaborator"]), (0, "owner", "owner", False))
-        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-c": ("team", "collaborator: true\n"),
+        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-gc": ("guest", "collaborator: true\n"),
                    "task-n": (None, "")}
         for t, (tier, extra) in refused.items():
             rc, out = self.verb("claim", self.task(t, tier, extra))
@@ -275,6 +275,17 @@ class InboxCli(ConnectBase):
             rc, out = self.verb("claim", t)
             self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
+
+    def test_claim_serves_an_attested_collaborator_without_allow_non_owner_as_the_shared_admission_does(self):
+        t = self.task("task-c", "team", "collaborator: true\n")
+        self.assertEqual(task_io.admission(task_io.parse_task(str(self.inbox / (t + ".txt")))[0], False), "collaborator")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("admission"), out.get("access_tier"), out.get("collaborator")),
+                         (0, "collaborator", "team", True), out)
+        self.assertFalse((self.results / (t + ".txt")).exists(), "submitted to the session, never refused")
+        for t, tier in (("task-t", "team"), ("task-g", "guest")):
+            rc, out = self.verb("claim", self.task(t, tier))
+            self.assertEqual((rc, (self.results / (t + ".txt")).read_text()), (1, task_io.NON_OWNER_REFUSED), t)
 
     def resolved(self, out):
         return (out.get("resolved"), out.get("answered"), out.get("interrupted"), out.get("retry"))
@@ -322,7 +333,7 @@ class InboxCli(ConnectBase):
                 key.write_text("ab" * 32)
             elif sc.get("key") == "missing" and key.exists():
                 key.unlink()
-            self.task(sc["task"], sc["tier"])
+            self.task(sc["task"], sc["tier"], sc.get("extra", ""))
             if "result" in sc:
                 (self.results / (sc["task"] + ".txt")).write_text(sc["result"])
             if "archived" in sc:
@@ -342,7 +353,7 @@ class InboxCli(ConnectBase):
 
     def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
         names = [sc["name"] for sc in contract_scenarios()]
-        self.assertEqual(len(names), 31)
+        self.assertEqual(len(names), 32)
         self.assertEqual(contract_set_problem(names), "")
         for i in (0, 17, len(names) - 1):
             self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)

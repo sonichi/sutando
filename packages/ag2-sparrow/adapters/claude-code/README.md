@@ -185,15 +185,17 @@ Reply with the ag2space_reply tool (task_id <id>); the reply is published to res
 
 **Who is served.** Admission is the shared `task_io.admission` over the attested
 headers, decided by the inbox CLI's `claim` (the Mod renders its answer and
-re-implements no policy). By default only the owner is served: a team or guest
-task, collaborator or not, is never submitted to the session; `claim` answers it
-with the shared owner-only refusal ("This agent only answers its owner here.")
-as its result, which the bridge delivers to that room. A task file with no
+re-implements no policy). By default the owner and an attested collaborator
+(the team tier with the broker's `collaborator: true`, as the Codex adapter
+serves it) are served; any other team or guest task is never submitted to the
+session: `claim` answers it with the shared owner-only refusal ("This agent only
+answers its owner here.") as its result, which the bridge delivers to that room. A
+collaborator's task is submitted as data under the non-owner frame below. A task file with no
 `access_tier:` header is refused the same way as malformed (Sparrow's bridge
 writes one on every task, in `remote_gateway_bridge._write_task`); the shared
 resolver's "no tier means owner" is not relied on here. `install
 --allow-non-owner` (persisted in the config, shown by `verify`, off by default)
-submits non-owner tasks as data, each carrying the shared
+also submits the other non-owner tasks as data. Each non-owner task carries the shared
 `ag2_sparrow.task_io.NON_OWNER_NOTE`, the one policy text every adapter renders
 (pinned in `register.ts`; a CI test holds it byte-identical to the shared owner):
 
@@ -717,8 +719,10 @@ mtime delta.
   machine is the owner's path meanwhile.
 - On macOS the launchd user agent stops at logout; on Linux `install` asks
   for linger.
-- `--allow-non-owner` hands team and guest text to a session running under
+- An attested collaborator's text, and with `--allow-non-owner` any team or
+  guest text, reaches a session running under
   `bypassPermissions` (the default mode): the only guard between that text and
   every tool, file and credential the session can reach is the
-  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn it on only for
-  rooms whose members you would let type into that session yourself.
+  `NON_OWNER_NOTE` in its frame and the model honouring it. Grant collaborator
+  access, and turn the flag on, only for people and rooms you would let type
+  into that session yourself.

@@ -414,7 +414,8 @@ def verify(_args) -> int:
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
-                                      if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
+                                      if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else
+                                      "attested collaborators submitted with the non-owner note; others refused"))
     root = cm.work_root(cfg)
     if cfg.get("BRIDGE_STATE_DIR"):
         want = card.store_root(bridge_state(cfg))
@@ -541,8 +542,9 @@ def session_options(p) -> None:
                     "--hmac-key-file)")
     hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
                     "unverifiable envelopes")
-    p.add_argument("--allow-non-owner", action="store_true", help="submit team and guest tasks (collaborator or not) "
-                   "with the non-owner note; off: they get the owner-only refusal and never reach the session")
+    p.add_argument("--allow-non-owner", action="store_true", help="also submit team and guest tasks without "
+                   "collaborator access (an attested collaborator always is), with the non-owner note; off: they get "
+                   "the owner-only refusal and never reach the session")
     p.add_argument("--permission-mode", default="bypassPermissions",
                    help="the session's --permission-mode; bypassPermissions (default) suits an unattended "
                         "session, a narrower mode makes a prompting tool stall the queue")

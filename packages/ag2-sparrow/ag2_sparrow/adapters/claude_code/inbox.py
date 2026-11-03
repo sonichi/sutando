@@ -135,8 +135,8 @@ def envelope(verdict: str, environ=None, key_seen=None) -> dict:
 
 def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.admission. A
-    file with no access_tier header is malformed (Sparrow's bridge always writes one); a collaborator is
-    served only under --allow-non-owner, like every other non-owner."""
+    file with no access_tier header is malformed (Sparrow's bridge always writes one); an attested
+    collaborator is served as the shared rule serves it, any other non-owner only under --allow-non-owner."""
     path = os.path.join(root, "tasks", task_id + ".txt")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = task_io.attested_headers(f.read()).headers
@@ -144,8 +144,6 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
         return None, {}, "malformed: no access_tier header"
     headers, _, _ = task_io.parse_task(path)
     kind = task_io.admission(headers, allow)
-    if kind == "collaborator" and not allow:
-        kind = None
     why = "" if kind else "sender tier %s (collaborator %s) and --allow-non-owner is off" % (
         headers["access_tier"], headers["collaborator"])
     return kind, headers, why

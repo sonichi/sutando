@@ -1084,7 +1084,7 @@ class ConnectStrict(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "")
-        self.assertIn("INFO non-owner tasks: refused (owner only)", self.main("verify")[1])
+        self.assertIn("INFO non-owner tasks: attested collaborators submitted with the non-owner note; others refused", self.main("verify")[1])
         self.assertFalse(inbox.allow_non_owner())
         self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")
