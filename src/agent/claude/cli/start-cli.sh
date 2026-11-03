@@ -445,13 +445,14 @@ ensure_core_heartbeat() {
 
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
-  local ws mon_out mon_log relay_pid_file relay_state
+  local ws mon_out mon_log relay_log relay_pid_file relay_state
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  # Per workspace: a scratch core on another socket must not truncate the production log.
+  # Per workspace: a scratch core on another socket must not truncate or mix into the production logs.
   mon_log="$ws/logs/core-input-watch.log"
-  mkdir -p "$ws/logs" 2>/dev/null || mon_log=/dev/null
+  relay_log="$ws/logs/core-supervisor-relay.log"
+  mkdir -p "$ws/logs" 2>/dev/null || { mon_log=/dev/null; relay_log=/dev/null; }
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
   if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
@@ -500,7 +501,7 @@ ensure_core_monitor() {
         fi
         "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30 || exit 1; done' \
         relay-loop "$PY" "$REPO/src/core-supervisor-relay.py" "$mon_out" "$relay_state" "$ws/state/last-owner-activity.json" "$TMUX_SOCKET" "$SESSION" \
-        >> /tmp/core-supervisor-relay.log 2>&1 < /dev/null &
+        >> "$relay_log" 2>&1 < /dev/null &
       echo $! > "$relay_pid_file"
     fi
   fi
