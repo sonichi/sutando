@@ -34,7 +34,8 @@ original pull/result protocol.
 Config (env / .env):
   REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
                         (combined "https://<gateway>|<secret>" or a bare secret)
-  REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
+  REMOTE_TASK_URL        gateway base URL; set it only with a bare secret, since it
+                        overrides the gateway named in a combined token
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
   REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
