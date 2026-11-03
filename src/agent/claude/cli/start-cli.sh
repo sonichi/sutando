@@ -582,7 +582,7 @@ if claude_named_tmux_session_exists; then
   ensure_core_monitor
   # new-window returning an index proves tmux ACCEPTED the command, not that the
   # child lives; poll before opening intake, same bound as the fresh-start path.
-  for _ in $(seq 1 25); do
+  for _ in $(seq 1 "$CORE_READY_TICKS"); do
     claude_named_session_running && break
     sleep 0.2
   done
@@ -592,7 +592,7 @@ if claude_named_tmux_session_exists; then
     CORE_WINDOW="$healed_idx"
     ensure_task_notifier
   else
-    echo "  ⚠ healed window did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ healed window did not come up — sentinel NOT cleared, no core is serving. pane: $(claude_session_pane_tail)" >&2
     # A surviving sibling window keeps the session alive; a watcher would type into it.
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   fi
@@ -676,8 +676,8 @@ apply_claude_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   if ! launch_claude_session; then
-    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
-    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
+    echo "  ⚠ $SESSION did not come up within the readiness bound — start FAILED." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up (pane: $(claude_session_pane_tail))"
     exit 1
   fi
   record_confirmed_core_runtime claude "$PY"
@@ -692,8 +692,8 @@ else
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
   # the same false-success class as the --restart kill race above.
   if ! launch_claude_session; then
-    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
-    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
+    echo "  ⚠ $SESSION did not come up within the readiness bound — start FAILED." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up (pane: $(claude_session_pane_tail))"
     exit 1
   fi
   # Verified live above, so this is the first point at which clearing the

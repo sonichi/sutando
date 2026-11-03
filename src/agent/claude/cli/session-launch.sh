@@ -392,18 +392,30 @@ install_claude_personal_hook() {
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then
-# polls up to ~5s for it to actually come up (a `new-session` accepting the
+# polls up to CORE_READY_TICKS for it to actually come up (a `new-session`
+# accepting the
 # command proves tmux liked it, not that the child process is alive). Reads
 # TMUX_SOCKET, SESSION, ENV_ARGS, CWD_ARGS, SURFACE_ARGS, SETTINGS_ARGS,
 # SESSION_ARGS, BOOT_PROMPT. Returns 0 if the session came up live, 1 otherwise
 # (caller decides what that means — abort, retry, or a heal path).
+# Ticks of 0.2s to wait for a launched session's claude process to appear. 5s
+# was too tight for a shim-resolved `claude`, and a miss leaves the host coreless.
+CORE_READY_TICKS="${SUTANDO_CORE_READY_TICKS:-150}"
+
+# Last non-blank lines of the session's pane, so a launch that never came up is
+# logged with what the pane showed instead of a bare timeout.
+claude_session_pane_tail() {
+  tmux -S "$TMUX_SOCKET" capture-pane -p -t "=$SESSION" 2>/dev/null \
+    | grep -v '^[[:space:]]*$' | tail -"${1:-6}" | tr '\n' '|'
+}
+
 launch_claude_session() {
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
-  for _ in $(seq 1 25); do
+  for _ in $(seq 1 "$CORE_READY_TICKS"); do
     claude_named_session_running && return 0
     sleep 0.2
   done
