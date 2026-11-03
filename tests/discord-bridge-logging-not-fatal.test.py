@@ -42,6 +42,11 @@ under test and would let the shipped lines rot untested.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import atexit
 import importlib.util
@@ -213,8 +218,10 @@ class OnReadyStartsSupervisedLoopsTest(unittest.TestCase):
         saved = {
             "_recover_orphan_sending_files": BRIDGE._recover_orphan_sending_files,
             "_catchup_missed_dms": BRIDGE._catchup_missed_dms,
+            "GATEWAY_SESSIONS_FILE": BRIDGE.GATEWAY_SESSIONS_FILE,
         }
         BRIDGE._recover_orphan_sending_files = lambda: 0
+        BRIDGE.GATEWAY_SESSIONS_FILE = Path(tempfile.mkdtemp()) / "discord-bridge.sessions.json"
 
         async def _noop_catchup():
             return None

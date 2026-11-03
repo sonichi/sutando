@@ -95,9 +95,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -568,7 +569,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+            (target or {}).get("channel", ""), fresh_reask_id())
         if action == "requeue":
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
@@ -582,6 +583,17 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
     return report_disposition(action, delivered)
+
+
+def _guard_reply(task_id: str, target, reply_text: str) -> str:
+    """The body this reply leg may deliver: the shared guard's verdict for the asker's tier.
+    A route without a tier re-reads it from the task file; no task file guards as guest."""
+    tier = resolve_route_tier((target or {}).get("access_tier"), TASKS_DIR, task_id)
+    safe, withheld = guard_result_for_tier(reply_text, tier, REPO,
+                                           suppress_journal=(STATE_DIR, task_id))
+    if withheld:
+        print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
+    return safe
 
 
 def _pop_pending_reply(task_id: str):
@@ -1256,6 +1268,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_content = (
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        f"local_time: {local_task_protocol.local_time_value()}\n"
         f"source: slack\n"
         f"interaction_type: message\n"
         f"{media_headers}"
@@ -1727,6 +1740,9 @@ def result_watcher():
                     archive_file(result_file, "results", task_id)
                     archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
                     continue
+
+                # Non-owner results pass the shared egress guard before ANY marker below.
+                reply_text = _guard_reply(task_id, target, reply_text)
 
                 # Skip-marker check via unified parser (#873). Equivalent to
                 # the prior startswith trio but routed through one source of

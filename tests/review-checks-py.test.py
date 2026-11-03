@@ -4,6 +4,12 @@ review-checks.sh). Imports the module under coverage and exercises token_at /
 allowed / main across the diff-parsing branches. The shell-level behaviour is
 covered by tests/review-checks.test.sh; this pins the Python internals + gives
 the diff-coverage gate real coverage of the new file."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

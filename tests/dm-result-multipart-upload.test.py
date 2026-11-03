@@ -21,6 +21,11 @@ included — so the test can assert on the actual envelope shape that
 goes over the wire.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import hashlib
 import importlib.util

@@ -88,7 +88,12 @@ yours, not the owner's: plain sentences, no quotes from their message.
 |---|---|
 | 0 | done: a match, all apps connected, a wait recorded (or `card` found every app connected), a wait claimed, the account verified |
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
-| 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+| 2 | a setup problem to relay, never retry: `not_signed_in`, `wrong_account`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+
+`card` and `await` exit 1 with `"reason": "account_changed"` (plus `cloud_user_id`,
+`stamp_cloud_user_id`, `base`) when this agent's AG2 Cloud credential is not the account the desktop
+started the core's station for: no wait and no card are made. Post no card; Step 4 says what to
+tell the owner and where.
 
 `card` prints everything `await` prints plus `mode` (`dm` or `private`), `apps` (each with
 `connected`), `all_connected`, and for `mode: dm` a `message` object (`body`, `extra_content`,
@@ -116,12 +121,12 @@ re-ask your task.
 A card and a wait only when **all** of these hold for the task:
 
 - `access_tier: owner`, and no `collaborator: true` header;
-- `source: ag2space` (a message in AG2 Space; its room is `channel_id` / `source_room_id`).
+- `source: ag2space` (a message in s.space; its room is `channel_id` / `source_room_id`).
 
 `card` and `await` check the same on the task file and refuse anything else with `not_owner_task`.
 Everything else (cron, a proactive-loop pass, voice, phone, Slack, Discord, Telegram, local chat, a
 collaborator or any non-owner) gets text only when an app isn't connected: "Google Calendar isn't
-connected yet; connect it in AG2 Space." No card, no wait. A non-owner never gets the owner's
+connected yet; connect it in s.space." No card, no wait. A non-owner never gets the owner's
 connected-app data either.
 
 ## Step 1: are the Station tools loaded?
@@ -276,8 +281,8 @@ unless the ask names another (then pass `account` to composio_exec, as in Rules)
 ## Step 3c: switch an app to another account
 
 For a request to sign an app that is already connected in with a different account. Step 0 applies:
-anything but the owner's own AG2 Space task gets text only, "You can switch your Linear account in
-AG2 Space: Settings → Integrations."
+anything but the owner's own s.space task gets text only, "You can switch your Linear account in
+s.space: Settings → Integrations."
 
 1. **The request.** When the owner asked something that needs the other account ("check my work Gmail
    instead"), that is the request to redo. When they only asked to switch, the request is their
@@ -364,10 +369,23 @@ The `card` call from step 3 already armed the wait; read its output:
   --room` lists them). Say: "I'll pick this up once <its apps> are connected; for <the other apps>,
   tell me once they're connected and I'll check." In the DM that is the result; from 3b put it on the
   waiting card with `note` and write the result `[no-send]`.
+- **Exit 2 with `"error": "wrong_account"`:** the only AG2 Cloud credentials this agent can find
+  belong to another account than the one your desktop app started it for, so it refuses to act as
+  them. Relay `detail` in plain words. In the DM that is the result; from 3b send it to the owner's
+  confirmed DM and write the result `[no-send]` (no confirmed DM: `[no-send]` alone). Never in the
+  shared room.
+- **Exit 2 with `"error": "cloud_error"`, `"code": "account_unverified"`:** AG2 Cloud could not be
+  reached to check which account the credentials belong to. It is temporary: say so and that you
+  can try again shortly; nothing to sign in to. Same destinations as the bullet above.
 - **Any other exit 2:** no automatic resume is possible. Say: "Once you've connected Google
   Calendar, tell me and I'll check." In the DM that is the result; from 3b there is no private card
   to carry it, so send it to the owner's confirmed DM and write the result `[no-send]` (no confirmed
   DM: `[no-send]` alone). Never in the shared room.
+- **Exit 1 with `"reason": "account_changed"`:** no card and no wait were made. Say: "I'm signed in
+  to a different AG2 Cloud account (`<cloud_user_id>`) than your desktop app (`<stamp_cloud_user_id>`),
+  so I can't see what Settings → Integrations shows as connected." In the DM that is the result; from
+  3b there is no private card to carry it, so send it to the owner's confirmed DM and write the
+  result `[no-send]` (no confirmed DM: `[no-send]` alone). Never in the shared room.
 
 ## Step 5: resume
 
@@ -442,7 +460,7 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 
 ## Rules
 
-- Never paste a sign-in or OAuth link. The card (or AG2 Space → Marketplace) is the only way to connect.
+- Never paste a sign-in or OAuth link. The card (or s.space → Marketplace) is the only way to connect.
 - The place to see, switch or disconnect the owner's connected apps is **Settings → Integrations**.
   Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
   connecting new apps.
@@ -464,7 +482,7 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes
   on the private card (`--private`, `note`).
 - Never restart the engine, and never ask for a restart except the one step 1 case.
-- No cards and no waits from cron, proactive passes, voice, phone, or any channel other than AG2 Space.
+- No cards and no waits from cron, proactive passes, voice, phone, or any channel other than s.space.
 - Only `connectors.py` writes a resume task. Never write one yourself.
 - Report only what an action's result shows. Whose name a message was sent under, who can see it, or
   whether it went out at all: say it only if the `composio_exec` result says so; otherwise say you don't know.

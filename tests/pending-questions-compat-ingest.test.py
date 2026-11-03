@@ -70,6 +70,42 @@ class _Ws(rdb._Ws):
                            "**Ask id:** ask-archived\n**Sent:** x\n")
 
 
+class TestArchiveBoundary(_Ws):
+    def test_hidden_archive_divider_refuses_all_import_writes(self):
+        for suffix in ("", "\n# Resolved\n\n## Later archive\nold\n"):
+            with self.subTest(later_visible_divider=bool(suffix)):
+                text = ("# Open\n\n## Current question\n\n**Status:** open\n"
+                        "A `span crosses the archive boundary\n\n# Resolved\n\n"
+                        "## Archived question\n\nold content without status\nend of span`\n" + suffix)
+                self.pq.write_text(text)
+                db = self.db()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+                self.assertEqual(moved, [])
+                self.assertTrue(any("archive boundary" in e for e in errors), errors)
+                self.assertEqual(db.client.calls, [])
+                self.assertEqual(self.pq.read_text(), text)
+
+    def test_deliberately_quoted_divider_does_not_block_migration(self):
+        for example in ("Example `# Resolved`\n", "```\n# Resolved\n```\n"):
+            with self.subTest(example=example):
+                self.pq.write_text(example + "\n" + MAIN_PROSE + "# Resolved\n\n## Old\nold\n")
+                db = self.db()
+                moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(moved), 1)
+                self.assertEqual([r["title"] for r in db.open_entries()], ["Rename the repo before the launch?"])
+
+    def test_damage_after_visible_archive_does_not_block_active_entries(self):
+        self.pq.write_text(MAIN_PROSE + "# Resolved\n\nText `crosses\n# Resolved\n"
+                           "## Archived question\nold\nend`\n")
+        db = self.db()
+        moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(moved), 1)
+        self.assertEqual([r["title"] for r in db.open_entries()], ["Rename the repo before the launch?"])
+
+
 class TestIngest(_Ws):
     def test_an_old_head_entry_gets_its_row_and_is_marked_moved_once(self):
         self.file(legacy_entry("ask-old"))

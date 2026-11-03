@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -58,6 +64,7 @@ def test_wrapper_restart_signal() -> None:
         (config / "channels" / "slack").mkdir(parents=True)
         workspace.mkdir()
         shutil.copy2(WRAPPER, repo / "src" / "launchd" / WRAPPER.name)
+        shutil.copy2(WRAPPER.parents[1] / "result_publish.py", repo / "src")
         (repo / "src" / "slack-bridge.py").write_text("# dummy\n")
         (config / "channels" / "slack" / ".env").write_text("SLACK_BOT_TOKEN=x-test\n")
 
@@ -72,7 +79,7 @@ def test_wrapper_restart_signal() -> None:
         # Exit 1: this file covers CRASH recovery, and the wrapper treats a
         # clean exit as a deliberate stand-down rather than something to respawn.
         fake_python.write_text(
-            "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\nexit 1\n")
+            "#!/bin/bash\n" + _PUBLISH_FOR_REAL + "printf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\nexit 1\n")
         fake_python.chmod(0o755)
         exec_log = root / "exec.log"
         # Crash path alerts too: shim the sink here as well, not only in
@@ -80,7 +87,7 @@ def test_wrapper_restart_signal() -> None:
         shims = root / "shims"; shims.mkdir(exist_ok=True)
         (shims / "osascript").write_text("#!/bin/bash\nexit 0\n")
         (shims / "osascript").chmod(0o755)
-        env = os.environ.copy()
+        env = isolated_child_env()
         env.update({
             "PATH": f"{shims}:{env.get('PATH','')}",
             "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),
@@ -107,6 +114,10 @@ def test_wrapper_restart_signal() -> None:
         check(len(exec_log.read_text().splitlines()) >= 2, "wrapper restarts an exited bridge child")
 
 
+# The wrapper publishes its alert with the bridge interpreter: let that call through, unlogged.
+_PUBLISH_FOR_REAL = f"case \"$1\" in *result_publish.py) exec '{sys.executable}' \"$@\";; esac\n"
+
+
 def _stage_clean_exit(root, rc=75):
     """Wrapper + config staged with a child exiting `rc` (75 = declared stand-down)."""
     repo, workspace, config = root / "repo", root / "workspace", root / "config"
@@ -115,6 +126,7 @@ def _stage_clean_exit(root, rc=75):
     (config / "channels" / "slack").mkdir(parents=True)
     workspace.mkdir()
     shutil.copy2(WRAPPER, repo / "src" / "launchd" / WRAPPER.name)
+    shutil.copy2(WRAPPER.parents[1] / "result_publish.py", repo / "src")
     (repo / "src" / "slack-bridge.py").write_text("# dummy\n")
     (config / "channels" / "slack" / ".env").write_text("SLACK_BOT_TOKEN=x-test\n")
     helper = repo / "scripts" / "sutando-config.sh"
@@ -126,7 +138,7 @@ def _stage_clean_exit(root, rc=75):
     helper.chmod(0o755)
     fake_python = root / "python"
     fake_python.write_text(
-        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\n"
+        "#!/bin/bash\n" + _PUBLISH_FOR_REAL + "printf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\n"
         f"exit {rc}\n")
     fake_python.chmod(0o755)
     exec_log = root / "exec.log"
@@ -134,7 +146,7 @@ def _stage_clean_exit(root, rc=75):
     shims = root / "shims"; shims.mkdir(exist_ok=True)
     (shims / "osascript").write_text("#!/bin/bash\nexit 0\n")
     (shims / "osascript").chmod(0o755)
-    env = os.environ.copy()
+    env = isolated_child_env()
     env.update({
         "PATH": f"{shims}:{env.get('PATH','')}",
         "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),

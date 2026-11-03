@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """The notify-cooldown stamp belongs under state/, not the workspace root; pins the
 move, the legacy-stamp retirement, and the deliberate absence of a read-fallback."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import unittest

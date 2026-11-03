@@ -3,6 +3,11 @@
 Separate file: the sibling suites seed a notify.py stub, so neither can gate this."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

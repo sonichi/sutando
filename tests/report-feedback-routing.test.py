@@ -23,7 +23,7 @@ TRIGGERS = ("report this bug", "report this issue", "report an issue", "report a
             "log this bug", "submit feedback", "feature request", "tell the team this is broken")
 # In a dev room these mean a PR comment or a message, not a feedback row.
 NOT_TRIGGERS = ("report this to teammate-a", "report this on the PR")
-RULE = ("Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop app, in a DM "
+RULE = ("Asked to report or file a bug or feature about Sutando, s.space or the desktop app, in a DM "
         "or a room, use the `report-feedback` skill, never a chat post or another agent; reply with the "
         "reference id it returns.")
 
@@ -59,7 +59,7 @@ class TheDescriptionFiresOnPlainAsks(unittest.TestCase):
 
     def test_it_says_it_is_the_only_path_and_what_is_not_reporting(self):
         desc = _description()
-        self.assertIn("THE way a bug, feature request or feedback about Sutando, AG2 Space or the desktop "
+        self.assertIn("THE way a bug, feature request or feedback about Sutando, s.space or the desktop "
                       "app reaches the AG2 team", desc)
         self.assertIn("the only path to the tracker", desc)
         self.assertIn("Posting it in chat, a room or a DM, or asking another agent to log it, is not "
@@ -93,13 +93,13 @@ class TheSkillBody(unittest.TestCase):
         for words in ("This applies to every task whose `access_tier` is not `owner`, a collaborator's "
                       "included.", "Never stay silent and never hand it to another agent.",
                       "file it through your own `report-feedback` skill",
-                      "**Report a bug** button in the AG2 Space app (the bug icon in the composer)"):
+                      "**Report a bug** button in the s.space app (the bug icon in the composer)"):
             self.assertIn(words, section)
         self.assertNotIn("their own agent", section)
 
     def test_the_access_tier_does_not_claim_collaborators_are_sandboxed(self):
         self.assertNotIn("Non-owner tasks never reach this skill", self.text)
-        self.assertIn("AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's "
+        self.assertIn("s.space Team tasks, broker-attested collaborators included, and a Discord channel's "
                       "listed collaborators run in the owner's core with its normal tools", self.text)
         self.assertIn("Nothing structural stops them from running this script", self.text)
 

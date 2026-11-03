@@ -19,6 +19,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -70,10 +73,10 @@ class Harness:
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
         env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
         env.pop("SUTANDO_INSTANCE_ID", None)
-        self.proc = subprocess.Popen(
+        self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+            stderr=subprocess.DEVNULL, text=True)
 
     def drain_stdout(self) -> None:
         try:
@@ -142,10 +145,10 @@ def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlo
         env["SUTANDO_PY"] = str(stub_py)
         env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
         env.pop("SUTANDO_INSTANCE_ID", None)
-        h.proc = subprocess.Popen(
+        h.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", str(h.ws / "tasks"), "--role", "standby", "--inbox", str(h.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+            stderr=subprocess.DEVNULL, text=True)
 
         ok = wait_for(lambda: len(h.announce_order()) >= 2, timeout=15)
         order = h.announce_order()

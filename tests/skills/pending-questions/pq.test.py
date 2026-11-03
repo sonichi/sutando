@@ -5,6 +5,15 @@ reconcile / resolve, the reminder with --notify), and core finds the adapter onl
 manifest declaration — refusing when two skills declare it. No real room or workspace is
 touched: a temp workspace, the fake room-collab capability and the in-process database
 store of the room-db test."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
@@ -60,7 +69,7 @@ class TestAsk(_Ws):
                               "--urgency", "durable", "--workspace", str(self.ws))
         self.assertEqual(rc, 0, out)
         self.assertIn("recorded: Pending questions database", out)
-        self.assertIn(f"row: https://collab.test.invalid/#/room/{ROOM}?surface=db&page=pendingq", out)
+        self.assertIn("row: https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq", out)
         [body] = json.loads(self.state.read_text())["bodies"].values()
         self.assertIn("**Approve** -> merge\n**Hold** -> wait", body)
         self.assertIn("**Sent:** queued owner-dm", body)
@@ -286,7 +295,7 @@ class TestSharedRoom(rdb._Ws):
         store, room = self.store_room({})
         self.assertEqual(room, self.SHARED)
         self.assertNotIn("DM", store.label)
-        self.assertIn(self.SHARED, store.link)
+        self.assertIn("/home/!shared%3Atest.invalid?", store.link)
 
     def test_env_wins_over_the_state_file(self):
         (self.ws / "state" / "pending-questions-room").write_text("!fromstate:test.invalid")

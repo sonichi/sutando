@@ -33,6 +33,9 @@ class LongPromptTests(FakeTmuxHarness):
     WRAP_COLS = 118
     WRAP_STYLE = "word"
     LONG = "task-" + "l" * 200 + ".txt"
+    # These ids are longer than the result lookup's 128-char id pattern, so the
+    # completion wait can never match; cap it instead of running out the default.
+    NO_PICKUP = {"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"}
 
     def _finish_on(self, name, predicate):
         import threading
@@ -47,7 +50,7 @@ class LongPromptTests(FakeTmuxHarness):
     def _run_long(self, name, env=None):
         self.write_task(name)
         t = self._finish_on(name, lambda log: "ENTER" in log)
-        r = self.run_event(name, env, timeout=40)
+        r = self.run_event(name, {**self.NO_PICKUP, **(env or {})}, timeout=40)
         t.join()
         return r
 
@@ -108,7 +111,7 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual(self.expected_prompt(name).encode()[255:257], "é".encode())
         self.write_task(name)
         t = self._finish_on(name, lambda log: "ENTER" in log)
-        r = self.run_event(name, timeout=40)
+        r = self.run_event(name, self.NO_PICKUP, timeout=40)
         t.join()
         chunks = [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
         self.assertEqual(len(chunks[0].encode()), 255, len(chunks[0].encode()))
@@ -176,7 +179,7 @@ class LongPromptTests(FakeTmuxHarness):
         self._pick_with_a_dropped_chunk()
         before = len(self._chunks())
         t = self._finish_on(self.LONG, lambda log: "ENTER" in log)
-        r = self.run_event(self.LONG, timeout=40)
+        r = self.run_event(self.LONG, self.NO_PICKUP, timeout=40)
         t.join()
         self.assertIn("resuming it there", r.stderr)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -299,7 +302,7 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual(self.expected_prompt(name)[255], ";")
         self.write_task(name)
         t = self._finish_on(name, lambda log: "ENTER" in log)
-        r = self.run_event(name, timeout=40)
+        r = self.run_event(name, self.NO_PICKUP, timeout=40)
         t.join()
         chunks = [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
         self.assertTrue(chunks[0].endswith(r"\;"), chunks[0][-10:])
