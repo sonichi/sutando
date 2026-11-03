@@ -310,6 +310,7 @@ class WorkerStartupTest(unittest.TestCase):
         resolver = self.root / "fault-resolver"
         resolver.write_text(
             "#!/usr/bin/env python3\nimport json, os, signal, sys, time\nfrom pathlib import Path\n"
+            "if sys.argv[1] == '--batch': sys.exit(2)\n"
             f"with open({str(calls)!r}, 'a') as log:\n"
             "    log.write(json.dumps({'entry': Path(sys.argv[1]).stem, 'pid': os.getpid()}) + '\\n')\n"
             f"if Path(sys.argv[1]).stem == {ids['refused']!r}:\n    sys.exit(1)\n"
