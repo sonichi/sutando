@@ -3,8 +3,9 @@
 take them, and where a given task stands in that order.
 
 `pending(workspace)` lists <workspace>/tasks/task-*.txt minus the core's own bookkeeping files
-(task-cron-*, task-bench-*, task-workstream-*, task-project-grouping-*), sorted the way the
-consumer sorts (task_priority: urgent → normal → low, then oldest first). `position(workspace, id)`
+(task-cron-*, task-bench-*, task-workstream-*, task-project-grouping-*) and canonical tasks with
+ready results, sorted like the consumer (task_priority: urgent → normal → low, then oldest first).
+`position(workspace, id)`
 is {depth, position}: how many are pending and this task's 1-based rank (0 when it is not pending).
 `write_snapshot(workspace)` publishes the same list to <workspace>/state/task-queue.json — the
 fresh queue for readers (voice's get_core_status, the desktop). core-status.json stays its own
@@ -80,12 +81,11 @@ def pending_files(workspace: Path | None = None, inbox: Path | str | None = None
     except (FileNotFoundError, NotADirectoryError):
         return []
     if inbox:
-        # A sentinel is never retired on a live host: an entry is pending only while its task
-        # has no ready result, resolved for the whole inbox at once (listed, not globbed per entry).
-        from delivery.task_dispatch import ready_result_filenames
         paths = [p for p in paths if p.name.endswith(".txt")]
-        ready = ready_result_filenames(ws / "results", [p.name for p in paths])
-        paths = [p for p in paths if p.name not in ready]
+    from delivery.task_dispatch import ready_result_filenames
+    # Only canonical filenames participate in completion lookup; other core entries stay admitted.
+    ready = ready_result_filenames(ws / "results", [p.name for p in paths if p.name.endswith(".txt")])
+    paths = [p for p in paths if p.name not in ready]
     return sort_tasks_by_priority(paths)
 
 

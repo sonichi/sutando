@@ -6,6 +6,12 @@ ENOSPC, and health-check reported "All systems operational" because no check
 looked at free space. A health check that stays green through the failure it
 should catch is worse than no check — it actively certifies a broken system.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import shutil
 import tempfile

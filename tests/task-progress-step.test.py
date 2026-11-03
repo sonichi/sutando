@@ -7,6 +7,12 @@ media route under the `[file:]` allowlist plus the screenshot dir. A
 
 Run: python3 tests/task-progress-step.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import base64
 import contextlib
 import io

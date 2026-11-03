@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""`ag2-sparrow-hatch reply` reports posted only when Sparrow's real drain sent it.
+"""`ag2-sparrow-hatch reply` reports posted, and `no-reply` settled, only when Sparrow's real drain
+sent it.
 
 The worker's command writes the result file and waits; the bridge's own
 `_post_ready_results` drains it through the delivery core to a stand-in gateway.
@@ -19,13 +20,16 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
+
+from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()
+
 REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / 'packages' / 'ag2-sparrow'
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()
-from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw
+from ag2_sparrow import agent_identity, delivery_destination, gateway_instance, outbox, remote_gateway_bridge as gw
 from ag2_sparrow.adapters.hatch import task_fields
 
 TID = 'task-1784700000001'
@@ -77,27 +81,26 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
             'access_tier: owner\ntask: what is 2+2?\n')
         gw._record_task_room(self.tid, '!r:ag2.space')
 
-    def reply(self, body):
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(('REMOTE_', 'AG2_', 'AGENT_CONNECT_', 'SPARROW_'))
-               and k != 'CLAUDE_CONFIG_DIR'}
+    def reply(self, body, *cmd):
+        env = hermetic_env()
         env.update(HOME=str(self.home), PYTHONPATH=str(PKG),
                    AGENT_CONNECT_RESULT_DIR=str(self.results),
                    AGENT_CONNECT_TASK_DIR=str(self.tasks),
                    AGENT_CONNECT_STATE_DIR=str(self.home / 'state'),
                    GATEWAY_INSTANCE=self.instance)
         proc = subprocess.Popen(
-            [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', 'reply',
+            [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', *(cmd or ('reply',)),
              str(self.results / f'{self.tid}.txt'), '--wait', '20'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=str(self.home))
         done = {}
+        self.inflight = {self.tid}
         waiter = threading.Thread(target=lambda: done.update(
             out=proc.communicate(input=body, timeout=30)))
         waiter.start()
         while waiter.is_alive():
             if (self.results / f'{self.tid}.txt').exists():
-                gw._post_ready_results({self.tid})
+                gw._post_ready_results(self.inflight)
             time.sleep(0.05)
         waiter.join()
         out, err = done['out']
@@ -126,6 +129,87 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertIn('NOT posted', err)
         self.assertNotIn('posted:', out)
         self.assertEqual(len(self.server.calls), 1)
+
+    def test_no_reply_posts_nothing_and_settles_the_task(self):
+        self.start()
+        rc, out, err = self.reply('', 'no-reply', '--reason', 'an acknowledgement')
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
+        self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls],
+                         [('[no-send]', True)])
+        self.assertEqual(self.inflight, set())
+        self.assertFalse((self.results / f'{self.tid}.txt').exists())
+        self.assertEqual(outbox.item_status(self.results / '.outbox', TID), 'DELIVERED')
+
+    def test_no_reply_is_not_settled_when_the_gateway_refused_it(self):
+        self.start(refuse=True)
+        rc, out, err = self.reply('', 'no-reply')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('NOT settled', err)
+        self.assertEqual(self.inflight, {self.tid})
+
+    def lane(self, lifecycle=None):
+        """The running drain's lane record, as the bridge publishes it, naming its lifecycle."""
+        agent_identity.publish_lane(self.home / 'state', self.instance, '@agent:ag2.space',
+                                    send_lock=delivery_destination.SEND_LOCK_PROTOCOL, lifecycle=lifecycle)
+
+    def wake_run(self, base_delivered=False, bridge_keeps_ledger=True):
+        """A wake opened in a lifecycle-2 ledger: its run's own task file, and the episode's item."""
+        from ag2_sparrow import task_attempts
+        att = task_attempts.TaskAttempts(self.home / 'state', log=lambda *_: None)  # where the CLI reads it
+        att.take_ownership()
+        if bridge_keeps_ledger:
+            stack = contextlib.ExitStack()
+            stack.enter_context(patch.object(gw, '_ATTEMPTS', att))
+            self.addCleanup(stack.close)
+        if base_delivered:
+            outbox.record_delivered(self.results / '.outbox', TID)
+        with att.transition(TID) as t:
+            episode, run = t.open_wake({'blocker_episode_id': 'e1'}, self.tid,
+                                       used=lambda local: (self.tasks / f'{local}.txt').exists())
+        (self.tasks / f'{run}.txt').write_text((self.tasks / f'{self.tid}.txt').read_text())
+        self.tid, item = run, att.run_item(run)
+        self.assertEqual(item, f'{TID}.wake-{episode}')
+        return item
+
+    def test_no_reply_settles_a_wake_run_under_its_own_item(self):
+        for base_delivered in (False, True):
+            with self.subTest(base_delivered=base_delivered):
+                self.start()
+                self.lane(lifecycle=2)
+                item = self.wake_run(base_delivered)
+                rc, out, err = self.reply('', 'no-reply')
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
+                self.assertEqual(outbox.item_status(self.results / '.outbox', item), 'DELIVERED')
+                self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls], [('[no-send]', True)])
+                self.assertEqual(self.inflight, set())
+
+    def test_with_lifecycle_2_off_a_ledger_left_behind_is_never_read(self):
+        for ledger, base_delivered in (('valid', False), ('damaged', False), ('valid', True)):
+            with self.subTest(ledger=ledger, base_delivered=base_delivered):
+                self.start()
+                self.lane()                                   # the running drain keeps no ledger
+                self.wake_run(base_delivered, bridge_keeps_ledger=False)
+                if ledger == 'damaged':
+                    (self.home / 'state' / 'relay-task-ledger.json').write_text('{not json')
+                rc, out, err = self.reply('', 'no-reply')
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f'settled: {self.tid}.txt, nothing posted', out)
+                # Under the task's own item; one already delivered closes on its own record.
+                item = f'{TID}.lease-close' if base_delivered else TID
+                self.assertEqual(outbox.item_status(self.results / '.outbox', item), 'DELIVERED')
+                self.assertEqual([(c['body'], c.get('no_send')) for c in self.server.calls], [('[no-send]', True)])
+                self.assertEqual(self.inflight, set())
+
+    def test_with_no_running_drain_a_run_the_ledger_names_is_not_guessed(self):
+        self.start()
+        self.wake_run()
+        rc, out, err = self.reply('', 'no-reply')
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn('Sparrow is not running', err)
+        self.assertFalse((self.results / f'{self.tid}.txt').exists(), 'nothing written')
+        self.assertEqual(self.server.calls, [])
 
     def test_a_skip_behind_a_redirect_is_refused_before_anything_is_sent(self):
         self.start()

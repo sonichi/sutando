@@ -4274,7 +4274,7 @@ th{color:#999;font-weight:normal}.pending td{color:#fff}.done td{color:#777}
 .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;background:#333}
 .tag.working{background:#1d4ed8}.tag.queued{background:#6d28d9}.tag.unheard{background:#b45309}.tag.heard{background:#166534}.tag.retired{background:#444}.tag.cancelled{background:#444}.tag.dm{background:#7c2d12}
 </style></head><body>
-<h1>Pending for the user: <span id="pending">…</span></h1>
+<h1>Pending (the core is still working on): <span id="pending">…</span></h1>
 <div class="sub" id="sub"></div>
 <table><thead><tr><th>time</th><th>request</th><th>core</th><th>heard</th></tr></thead><tbody id="rows"></tbody></table>
 <script>

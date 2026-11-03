@@ -14,14 +14,15 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 from ag2_sparrow import remote_gateway_bridge as gw  # noqa: E402
 

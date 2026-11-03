@@ -13,14 +13,19 @@ def resolve_proactive_owner_id(access_data: Dict[str, Any]) -> Optional[str]:
     Prefer the TOFU-enrolled owner when it is still owner-eligible, otherwise
     use the first owner-tier entry in the persisted list order.
 
-    Unmapped allowlist entries retain Slack's legacy owner default.
+    Owner is read as the inbound tier resolver reads it: once a ``tierMap``
+    key exists, an unmapped allowlist entry is not owner. Only a legacy file
+    with no ``tierMap`` key keeps the grandfathered all-owner default.
     """
     allow_list = access_data.get("allowFrom") or []
-    tier_map = access_data.get("tierMap") or {}
+    unmapped = "owner" if "tierMap" not in access_data else None
+    tier_map = access_data.get("tierMap")
+    if not isinstance(tier_map, dict):
+        tier_map = {}
     owner_ids = [
         str(uid)
         for uid in allow_list
-        if tier_map.get(str(uid), "owner") == "owner"
+        if tier_map.get(str(uid), unmapped) == "owner"
     ]
     if not owner_ids:
         return None

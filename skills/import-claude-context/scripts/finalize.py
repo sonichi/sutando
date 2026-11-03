@@ -1702,14 +1702,13 @@ def write_digest_files(*, data_dir: Path, results_dir: Path) -> dict:
         raise SystemExit("nothing is staged: no staged/review.md to post")
     text = review.read_text(encoding="utf-8")
     parts = digest_parts(text)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(REPO / "src"))
+    from result_publish import publish_text  # noqa: PLC0415
     stamp = int(time.time() * 1000)
     files = []
     for i, part in enumerate(parts, 1):
         name = f"proactive-{stamp}.txt" if len(parts) == 1 else f"proactive-{stamp}-{i:02d}.txt"
-        tmp = results_dir / f".{name}.tmp"
-        tmp.write_text(part, encoding="utf-8")
-        os.replace(tmp, results_dir / name)
+        publish_text(results_dir / name, part)
         files.append(name)
     return {"parts": len(parts), "bytes": len(text.encode("utf-8")),
             "largest_part_bytes": max(len(p.encode("utf-8")) for p in parts), "files": files}

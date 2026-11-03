@@ -145,10 +145,19 @@ class RenotifyTests(unittest.TestCase):
         sent = self.drive()
         self.assertEqual([p["op"] for p in sent], ["edit", "message"])
         self.assertEqual(sent[0]["extra_content"][WIRE_FIELD]["status"], "resolved")
-        self.assertIn("✓ Reconnected — Claude Code needs to sign in again; resuming 3 queued tasks.",
-                      sent[1]["body"])
+        self.assertIn("✓ Signed in (core-1) — resuming 3 queued tasks.", sent[1]["body"])
+        self.assertNotIn("econnect", sent[1]["body"])
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])  # once, and no reminder after resolution
+
+    def test_two_signed_in_seats_are_told_apart(self):
+        a, b = blocking(), blocking(guard="g2")
+        b.device = {"id": "core-2", "name": "core-2"}
+        got = {renotify.body(renotify.RECOVERY, r, T0) for r in (a, b)}
+        self.assertEqual(got, {"✓ Signed in (core-1) — Sutando has continued its work.",
+                               "✓ Signed in (core-2) — Sutando has continued its work."})
+        b.device = None
+        self.assertEqual(renotify.body(renotify.RECOVERY, b, T0), "✓ Signed in — Sutando has continued its work.")
 
     # -- one seat, many cards ---------------------------------------------------------
 

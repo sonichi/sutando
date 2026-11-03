@@ -9,7 +9,8 @@
 # Fire-and-forget through the skill's own writer (which decides whether the file names a room);
 # it must never delay or fail the emit, and it is inert when TASKS_DIR is unset (tests, probes).
 # The scheduler owns the task's lifecycle: QUEUED when the file lands, RUNNING once a live core was
-# told, CANCELLED for the task a CANCEL_INSTRUCTION names. Through the activity bus (state, then rows),
+# told, CANCELLED for the task a CANCEL_INSTRUCTION names (a stop request instead, when a skill's
+# stop handler takes it and rules it). Through the activity bus (state, then rows),
 # fire-and-forget: it can neither delay nor fail the emit, and it is inert when TASKS_DIR is unset.
 # `$2` is a basename (joined to TASKS_DIR) or an absolute resolved path: rejoining
 # an absolute one to TASKS_DIR would read an existing payload as missing.
@@ -30,15 +31,24 @@ activity_transition() {
 	( "${SUTANDO_PY_BIN:-python3}" "$bus" transition "$to" --task-file "$task_file" --ts "$(date +%s)" >/dev/null 2>&1 & ) 2>/dev/null || true
 	return 0
 }
+# The task a CANCEL_INSTRUCTION names: a stop request when a skill's handler takes it, else CANCELLED.
 activity_cancel_target() {
 	local filename="$1" target task_file
 	task_file="$(_activity_task_file "$filename")"
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local bus="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/activity_bus.py"
 	[ -f "$bus" ] || return 0
-	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._-]+$' | head -1)"
-	[ -n "$target" ] || return 0
-	( "${SUTANDO_PY_BIN:-python3}" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1 & ) 2>/dev/null || true
+	grep -q 'CANCEL_INSTRUCTION' "$task_file" 2>/dev/null || return 0
+	# Only a stop from a trusted source (activity_bus.trusted_cancel_target) names a task; a skill's stop
+	# handler (src/stop_hooks.py) may take it and rule it, else it is cancelled at once.
+	local py="${SUTANDO_PY_BIN:-python3}" hooks="$(dirname "$bus")/stop_hooks.py"
+	( target="$("$py" "$bus" stop-target --task-file "$task_file" 2>/dev/null)"
+	[ -n "$target" ] || exit 0
+	if "$py" "$hooks" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" --control-file "$task_file" >/dev/null; then
+		"$py" "$bus" stop-requested --task-id "$target" >/dev/null 2>&1
+	else
+		"$py" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1
+	fi & ) || true
 	return 0
 }
 queued_activity_row() { activity_transition QUEUED "$1"; activity_cancel_target "$1"; }

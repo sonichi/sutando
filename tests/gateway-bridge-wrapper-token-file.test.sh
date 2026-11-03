@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gateway-bridge-wrapper.sh must hand the bridge REMOTE_TASK_TOKEN_FILE pointing at
-# the channel .env it sourced, so the bridge can re-read a rotated token on 401.
+# the file that holds its token, so the bridge can re-read a rotated token on 401.
 #
 # Run: bash tests/gateway-bridge-wrapper-token-file.test.sh
 set -uo pipefail
@@ -29,15 +29,27 @@ printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
 printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
 chmod +x "$d/shims/python3" "$d/shims/osascript"
 
-( cd "$d"; env -u AG2_REMOTE_TOKEN -u REMOTE_TASK_TOKEN -u REMOTE_TASK_TOKEN_FILE \
-    PATH="$d/shims:$PATH" bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 )
-got=$(grep '^REMOTE_TASK_TOKEN_FILE=' "$d/o.log" | head -1 | cut -d= -f2-)
-echo "sourced env file: \$TMP${ENV_FILE#"$d"}"
-shown="${got:-<no output>}"; [ "${got#"$d"}" != "$got" ] && shown="\$TMP${got#"$d"}"
-echo "bridge saw REMOTE_TASK_TOKEN_FILE: $shown"
-if [ "$got" = "$ENV_FILE" ]; then
-  echo "PASS: the bridge can re-read a rotated token from the file the wrapper sourced"
-  exit 0
-fi
-echo "FAIL: REMOTE_TASK_TOKEN_FILE does not point at the sourced channel .env"
-exit 1
+run_wrapper() {
+  ( cd "$d"; env -u AG2_REMOTE_TOKEN -u REMOTE_TASK_TOKEN -u REMOTE_TASK_TOKEN_FILE \
+      PATH="$d/shims:$PATH" bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 )
+  grep '^REMOTE_TASK_TOKEN_FILE=' "$d/o.log" | head -1 | cut -d= -f2-
+}
+fail=0
+check() {  # <case> <expected file> <got>
+  local shown="${3:-<no output>}"; [ "${3#"$d"}" != "$3" ] && shown="\$TMP${3#"$d"}"
+  if [ "$3" = "$2" ]; then echo "PASS: $1 (bridge saw $shown)"; else
+    echo "FAIL: $1: expected \$TMP${2#"$d"}, bridge saw $shown"; fail=1; fi
+}
+
+# Token in the channel .env: the bridge re-reads the .env.
+check "token held in the channel .env" "$ENV_FILE" "$(run_wrapper)"
+
+# The shared resolver names a separate token file: the bridge re-reads that file.
+TOK_FILE="$d/channels/ag2space/token.env"
+printf 'REMOTE_TASK_TIER=owner\n' > "$ENV_FILE"
+printf 'REMOTE_TASK_TOKEN=fake-test-token\n' > "$TOK_FILE"
+printf '#!/bin/bash\necho "%s"\n' "$TOK_FILE" > "$d/scripts/channel-env.sh"
+chmod +x "$d/scripts/channel-env.sh"
+check "token held in the file the resolver names" "$TOK_FILE" "$(run_wrapper)"
+
+exit "$fail"
