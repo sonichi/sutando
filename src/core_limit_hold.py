@@ -306,7 +306,12 @@ def _admit_arrivals(workspace: Path, hold: dict) -> dict:
 
 
 def held_task_ids(workspace: Path) -> frozenset:
-    """Ids of the tasks the last hold took in; they wait for the core, never orphans. Read-only."""
+    """Ids of the tasks the last hold took in; they wait for the core, never orphans. Read-only.
+
+    Kept after release on purpose: the boot that follows a release runs the orphan check, and these
+    tasks arrived during the hold, so the age rule alone would archive them unanswered. The core's
+    watcher hands every file in tasks/ to the core on that boot; the next hold carries only the ids
+    still live, so a stale id never outlives its task file."""
     hold = read_hold(workspace) or {}
     return frozenset(t for t in hold.get("held_tasks") or [] if isinstance(t, str))
 
