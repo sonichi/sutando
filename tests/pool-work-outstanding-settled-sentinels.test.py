@@ -7,13 +7,16 @@ read an idle worker as owing work. `task_disposition` settles it: pending or cla
 is owed; answered, archived or missing is not. The sweep then moves spent sentinels
 older than an hour out of the inbox, and leaves owed or young ones in place.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
@@ -156,6 +159,32 @@ check("boot prune and sweep retire the same tasks", sorted(pruned["retired"] + p
 check("and keep the same ones as owed", sorted(pruned["kept"]), sorted(sup.owed_task_ids(sweep, WID)))
 check("owed: pending, claimed by a lane, and live-in-tasks/ despite an archived copy",
       sorted(pruned["kept"]), ["task-claimed-core", "task-live-and-archived", "task-pending"])
+
+# The boot prune keeps a sentinel whose name is a sentinel but no lookup-able task id.
+odd = Path(tempfile.mkdtemp(prefix="pool-odd-id-"))
+(odd / "state").mkdir()
+long_id = "task-" + "a" * 130
+(pd.deliveries_dir(odd, WID)).mkdir(parents=True)
+(pd.deliveries_dir(odd, WID) / f"{long_id}.txt").write_bytes(b"")
+check("prune_spent keeps a sentinel whose id task_disposition refuses",
+      pd.prune_spent(odd, WID)["kept"], [long_id])
+
+# sentinel_spent is the shared predicate itself.
+from task_disposition import sentinel_spent  # noqa: E402
+spent_ws = shaped()
+check("sentinel_spent: missing and answered are spent, pending and claimed are not",
+      [sentinel_spent(spent_ws, t) for t in ("task-missing", "task-answered-flag", "task-pending",
+                                             "task-claimed-core")], [True, True, False, False])
+
+# The sweep's text report names an archive failure instead of dropping it.
+buf = io.StringIO()
+with mock.patch.object(sup, "tick", return_value={
+        "decisions": {}, "observations": {}, "not_supervised": [], "auth_expired": [], "resumed": False,
+        "routing": {"alarm": None}, "sentinel_retire_errors": {WID: "OSError: read-only"}}), \
+        contextlib.redirect_stdout(buf):
+    sup.main(["--workspace", str(ws), "--sweep"])
+check("the text report names the archive failure",
+      f"{WID[:8]}  could not archive spent sentinels: OSError: read-only" in buf.getvalue(), True)
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — settled sentinels owe nothing")
 for f in fails:
