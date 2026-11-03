@@ -214,9 +214,9 @@ class TestMain(Base):
                          "an in-flight delivery was renamed back to pending")
 
     def test_every_way_a_finished_sentinel_can_be_spent(self):
-        """`_nothing_can_re_queue` has three ways to say yes, and each is a real
-        shape: the payload is gone, a ready result is still on disk, or the
-        payload is archived. All three retire; none of them can re-queue."""
+        """Spent is task_disposition.SPENT: the payload is gone (stale) or a ready
+        result is on disk (retired). A payload still live in tasks/ is kept even
+        with an archived copy, since the core's queue reads tasks/ and would re-run it."""
         pd = self._pd()
         d = self._inbox_dir()
         tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
@@ -232,13 +232,9 @@ class TestMain(Base):
         (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
         arch = pd.archived_payload(Path(self.ws), "task-arch")
         arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
-        # Each one alone, so a shared fixture cannot mask a branch that never runs.
-        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-gone"), "payload gone")
-        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-result"), "ready result")
-        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("retired=3", out)
-        self.assertEqual(list(d.iterdir()), [])
+        self.assertEqual(out, "retired=1 stale=1 kept=1")
+        self.assertEqual([p.name for p in d.iterdir()], ["task-arch.txt"])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
         """The same task can sit in the folder as `.accepted` and `.txt`; the
@@ -253,8 +249,8 @@ class TestMain(Base):
         self.assertEqual(len(list(d.iterdir())), 1, "the second name was judged again")
 
     def test_a_finished_sentinel_whose_payload_could_be_re_queued_is_kept(self):
-        """`residue` calls a done flag alone `finished`, but with the payload still
-        in tasks/ and no findable result, removing the sentinel re-queues it."""
+        """A done flag alone is not spent: with the payload still in tasks/ and no
+        findable result, removing the sentinel re-queues it, archived copy or not."""
         pd = self._pd()
         d = self._inbox_dir()
         tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
@@ -262,13 +258,12 @@ class TestMain(Base):
             (tasks / f"{tid}.txt").write_text(f"id: {tid}\nsource: test\ntask: x\n")
             (d / f"{tid}.txt").touch()
             pd.mark_done(self.ws, WORKER, tid, published=True)
-        # task-done's reply is archived, so nothing can re-queue it; task-fin's is not.
+        # task-done also has an archived copy, but its live tasks/ file is what the core queues.
         arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
         arch.write_text("archived")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("retired=1", out)
-        self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], ["task-fin.txt"])
+        self.assertEqual(out, "retired=0 stale=0 kept=2")
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-done.txt", "task-fin.txt"])
 
     def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
         """A prune that raises must leave the decision, its exit code and its first

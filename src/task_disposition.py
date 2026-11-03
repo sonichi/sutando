@@ -25,6 +25,8 @@ from task_archive import find_task_file  # noqa: E402
 
 PENDING, CLAIMED, ANSWERED, ARCHIVED, MISSING = "pending", "claimed", "answered", "archived", "missing"
 SETTLED = frozenset((ANSWERED, ARCHIVED))
+# A worker's delivery sentinel for a task in one of these owes nothing (boot prune and sweep both ask).
+SPENT = frozenset((ANSWERED, ARCHIVED, MISSING))
 
 
 def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> str:
@@ -42,6 +44,11 @@ def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> st
     if find_archived_task(tasks, task_id) is not None:
         return ARCHIVED
     return MISSING
+
+
+def sentinel_spent(workspace, task_id: str, *, unanswered: bool = False) -> bool:
+    """The one rule for a spent delivery sentinel: its task is answered, archived or gone."""
+    return task_disposition(workspace, task_id, unanswered=unanswered) in SPENT
 
 
 def _task_id(arg: str) -> str:

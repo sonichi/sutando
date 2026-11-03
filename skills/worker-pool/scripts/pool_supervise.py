@@ -43,7 +43,7 @@ pd = _sibling("pool_delivery")
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
 from delivery import pane_gate, task_dispatch as td  # noqa: E402
-from task_disposition import CLAIMED, PENDING, task_disposition  # noqa: E402
+from task_disposition import SPENT, task_disposition  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -51,8 +51,6 @@ STATE_REL = Path("state") / "pool-supervision.json"
 PAUSED_MARKER = "paused"
 # States that are not candidates for recovery at all.
 NOT_SUPERVISED = ("retired",)
-# Only a task still in tasks/ can be owed; archived or vanished payloads are not.
-_OWED = (PENDING, CLAIMED)
 # A sentinel younger than this is left alone: its payload may still be landing.
 SENTINEL_RETIRE_AFTER_S = 3600
 DELIVERY_ARCHIVE_REL = Path("state") / "delivery-archive"
@@ -132,16 +130,27 @@ def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
     return tmux.get("socket") or None, tmux.get("session_name") or wi.tmux_session_name(worker_id)
 
 
-def owed_task_ids(workspace, worker_id) -> list[str]:
-    """What task_dispatch says was handed to this worker, less what has a ready
-    result (live or archived) and less what task_disposition calls settled or missing."""
+def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
+    """(owed, spent) ids among this worker's sentinels. Spent is task_disposition.SPENT,
+    the rule pool_delivery.prune_spent applies at boot; a malformed id is in neither."""
     owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
-    names = [f"{t}.txt" for t in owned]
     # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
-    ready = td.ready_result_filenames(pd.results_dir(workspace), names)
-    return [t for t in owned
-            if f"{t}.txt" not in ready
-            and task_disposition(workspace, t, unanswered=True) in _OWED]
+    ready = td.ready_result_filenames(pd.results_dir(workspace), [f"{t}.txt" for t in owned])
+    owed, spent = [], set()
+    for t in owned:
+        try:
+            done = f"{t}.txt" in ready or task_disposition(workspace, t, unanswered=True) in SPENT
+        except ValueError:
+            continue
+        if done:
+            spent.add(t)
+        else:
+            owed.append(t)
+    return owed, spent
+
+
+def owed_task_ids(workspace, worker_id) -> list[str]:
+    return sentinel_ids(workspace, worker_id)[0]
 
 
 def work_outstanding(workspace, worker_id) -> bool | None:
@@ -154,14 +163,14 @@ def work_outstanding(workspace, worker_id) -> bool | None:
 
 def retire_spent_sentinels(workspace, worker_id, now: float,
                            min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
-    """Move sentinels that owe nothing and are older than `min_age_s` out of the inbox,
-    to state/delivery-archive/<worker>/<YYYY-MM>/, so it holds what is owed. Returns their names."""
+    """Move spent sentinels older than `min_age_s` out of the inbox, to
+    state/delivery-archive/<worker>/<YYYY-MM>/, so it holds what is owed. Returns their names."""
     inbox = pd.deliveries_dir(workspace, worker_id)
-    owed = set(owed_task_ids(workspace, worker_id))
+    spent = sentinel_ids(workspace, worker_id)[1]
     moved = []
     for f in sorted(inbox.iterdir()) if inbox.is_dir() else []:
         tid = next((f.name[:-len(x)] for x in td.WORKER_HOLD_SUFFIXES if f.name.endswith(x)), None)
-        if not tid or tid in owed or not f.is_file() or f.is_symlink():
+        if tid not in spent or f.is_symlink() or not f.is_file():
             continue
         mtime = f.stat().st_mtime
         if now - mtime < min_age_s:
@@ -169,7 +178,10 @@ def retire_spent_sentinels(workspace, worker_id, now: float,
         dest = (Path(workspace) / DELIVERY_ARCHIVE_REL / worker_id
                 / time.strftime("%Y-%m", time.localtime(mtime)))
         dest.mkdir(parents=True, exist_ok=True)
-        os.replace(f, dest / f.name)
+        target, n = dest / f.name, 1
+        while target.exists() or target.is_symlink():  # never overwrite an earlier archive
+            target, n = dest / f"{f.name}.{n}", n + 1
+        os.replace(f, target)
         moved.append(f.name)
     return moved
 
@@ -422,7 +434,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
-    retired = {}
+    retired, retire_errors = {}, {}
     if persist:
         save_state(workspace, new_state)
         if worker_ids is None:  # the sweep only: a delivery-time check stays read-only
@@ -430,8 +442,8 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                 try:
                     if n := len(retire_spent_sentinels(workspace, wid, now)):
                         retired[wid] = n
-                except (OSError, ValueError):
-                    pass
+                except (OSError, ValueError) as e:
+                    retire_errors[wid] = f"{type(e).__name__}: {e}"
     asked = list(worker_ids or [])
     # Reported on every tick, not only when a card decision is due: a dry run must
     # show the finding after the real sweep already raised (and acknowledged) the card.
@@ -442,6 +454,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                             if e.wedge_consecutive and e.wedge_kind},
             "routing": routing_status(workspace),
             "sentinels_retired": retired,
+            "sentinel_retire_errors": retire_errors,
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
@@ -485,6 +498,8 @@ def main(argv=None) -> int:
                   f"/login is run in tmux session {wi.tmux_session_name(wid)}")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
+        for wid, err in sorted(out.get("sentinel_retire_errors", {}).items()):
+            print(f"{wid[:8]}  could not archive spent sentinels: {err}")
         if out["routing"]["alarm"]:
             print(out["routing"]["alarm"])
     return 0
