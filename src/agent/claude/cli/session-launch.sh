@@ -256,6 +256,16 @@ PY
 # Built by node helpers, not shell string interpolation (a $REPO with a space
 # or a `"` broke hand-rolled interpolation in the past). Reads REPO. Sets
 # SETTINGS_ARGS and exports SUTANDO_OBS_ENDPOINT.
+# A host with no denylist gets only the gate's built-in checks; say so where the
+# launch log is read, since the hook's own stderr is not shown. Arg: workspace (optional).
+warn_unseeded_public_denylist() {
+  local ws="${1:-}"
+  [ -n "$ws" ] || ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+  [ -n "$ws" ] || return 0
+  [ -f "$ws/state/privacy/public-denylist.txt" ] && return 0
+  echo "public-write privacy gate: no denylist at $ws/state/privacy/public-denylist.txt — only home paths, Matrix IDs and room IDs are checked. Seed it once by running scripts/seed-public-denylist.py" >&2
+}
+
 resolve_claude_settings_args() {
   OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
   export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
@@ -275,10 +285,12 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
+  [ -n "${PY:-}" ] || resolve_claude_py
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/public-write-privacy-guard.py" "$PY")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
+    warn_unseeded_public_denylist
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi

@@ -560,3 +560,112 @@ string at a time, the same scope limit the other two hooks accept. Deploy is the
 per-node registration as `context-source-guard.py`'s "Deploy (per node)" section above
 (`PreToolUse` → `Bash` matcher, `$CLAUDE_CONFIG_DIR` awareness) — not done as part of
 landing this hook's source.
+
+## `public-write-privacy-guard.py`
+
+Denies a `gh` write to a repo that is not private when the text it would publish
+names something private. Prose asked every agent to check before posting; a subagent
+that never applied it named a private repo and a private agent in a public PR body, and
+GitHub's edit history kept the first version after the fix. This moves the check to the
+command itself.
+
+- **Writes covered:** `gh pr create|edit|comment|review|merge|close|reopen`,
+  `gh issue create|comment|edit|close|reopen`, `gh release create|edit|upload` (text assets
+  included),
+  `gh label create|edit` (name and description), `gh gist create --public`, `gh gist edit`,
+  `gh repo create --public|edit`, and `gh api` POST/PATCH/PUT to any `repos/<o>/<r>/…`
+  endpoint (issues, pulls, releases, commit comments, base64 `content` decoded, …), a new
+  repo via `user/repos` or `orgs/<o>/repos` unless it is created private or internal, `gists`,
+  or a GraphQL mutation.
+  `gh api` is recognised by the first non-flag word after `gh`.
+- **Text read:** title/body/notes/comment/subject/description flags in every pflag form
+  (`--body x`, `--body=x`, `-bx`, `-b=x`, clusters such as `-dtx`), their `-file` forms, a
+  `"$(cat FILE)"` or `"$(cat <<'EOF' … EOF)"` value, stdin from the gh command's own heredoc,
+  here-string or `<` file (exactly one source: a pipe, a `<&` dup, or two sources where bash's
+  last would win are refused; so are stream paths such as `/dev/stdin`, `/dev/fd/N` and
+  `/proc/self/fd/N`, symlinked or not), and every
+  `gh api` field (`-f`, `-F k=@file`, `-fk=v`, `--input`).
+- **Where gh is found:** behind assignments and wrappers (`env` with flags, `timeout`,
+  `nice`, `nohup`, `time`, `command`, `exec`, `sudo`, `stdbuf`, `ionice`, `setsid`, …), shell
+  keywords (`if`/`then`/`do`/`{`/`!`, …), inside `` `…` `` and `$(…)` (also within double
+  quotes and unquoted heredocs), in `bash -c` / `eval` strings, and in a script fed to a
+  shell on stdin (`bash <<'EOF'`, `bash <<< …`, `cat <<'EOF' | bash`).
+- **Repo:** a PR/issue URL (gh posts there whatever `--repo` says; a disagreeing `--repo` is
+  scanned too), `--repo`, an `o/r` argument to `gh repo`, else `GH_REPO`
+  (inline, via `env`, `export`/`unset` earlier in the command, or the session's environment,
+  carried into `bash -c`, `sh -c`, `eval`, shell stdin scripts and substitutions),
+  else the cwd's git remote the way gh picks it (the gh-resolved remote, then upstream,
+  github, origin). A bare `GH_REPO=x;` that may or may not be exported counts both ways: the
+  text is scanned unless every possible target is private.
+- **What is private** is `src/public_write_privacy.py`: the terms in
+  `<workspace>/state/privacy/public-denylist.txt`, plus, with no list, home-directory
+  paths, Matrix room IDs and MXIDs (any case; example servers and placeholder user names
+  such as `runner`, `ubuntu` and `linuxbrew` excepted). Names already public go in
+  `public-allowlist.txt` beside it; the agent's own `SUTANDO_AGENT_MXID` is always
+  allowed, so this gate and `comment-signature-guard.py` cannot deadlock.
+- **No denylist yet:** the built-in shapes are still enforced, the list check is skipped,
+  and a stderr warning names `python3 scripts/seed-public-denylist.py`. A host is never
+  locked out of public writes for want of a seed.
+- **The denylist never lives in the repo** (listing the terms would leak them).
+  `python3 scripts/seed-public-denylist.py` builds it from this host's data: private
+  repo names of the gh user and its orgs, room names and IDs from the workspace room
+  stores, person and agent names and account IDs from the collaboration rosters. It
+  drops GitHub logins, public repo names, names the public tree already uses, and
+  single dictionary words; it keeps lines under its `manual` marker and prints counts
+  only.
+- **Visibility** comes from `gh repo view --json visibility`, cached in
+  `state/privacy/repo-visibility.json` (PUBLIC 7 days, PRIVATE 10 minutes). Only PRIVATE
+  skips the scan; an unknown repo (no `--repo`, `{owner}` placeholders, gh failing) is
+  scanned as public. A write that makes its target public (`gh repo create --public[=true]`,
+  `gh repo edit --visibility public`, `gh api` PATCH `repos/o/r` with `private=false` or
+  `visibility=public`) is judged as public whatever the lookup says, and any visibility
+  change drops that repo's cached answer.
+- **Directories:** `cd`, `cd -`, `pushd` and `popd` are tracked for relative body files.
+  After a `pushd +N`, a `cd "$X"`, or any directory change on a line with a subshell or
+  substitution, the cwd is unknown and a relative body file is refused.
+- **Command runners refused:** a gh write or `gh api` started by `xargs`, `parallel`, `sem`,
+  `rush`, `watch`, `script`, `find -exec`, `flock`, `su`, `runuser`, `ssh`, `entr`, `tmux`,
+  `screen`, `chroot`, `nsenter`, `dbus-run-session`, `fswatch` or `env -S` is refused: the
+  runner builds gh's arguments at run time, where this guard cannot see them. gh reads under
+  a runner (`watch gh pr checks`) pass.
+- **Quoting** cannot hide gh: the precheck runs on the command with quotes and backslashes
+  removed (`g''h`, `g\h`, `gh p''r`).
+- **Body files** are read through `src/body_file.py`, the shared bounded reader: over
+  65,536 bytes, not a regular file (FIFO, device) or not UTF-8 is refused.
+- **Fails closed:** a body file that does not exist, stdin that is not the gh command's
+  own heredoc or here-string, a value that expands at run time (`"$BODY"`, backticks), an
+  unquoted heredoc or here-string that bash expands (escape parity is parsed, so `\\$X`
+  expands), a body file this command may write (a redirect other than a plain heredoc into
+  `cat`/`tee`, an append, `cat FILE > body`, a redirect to a target that expands, `tee -a`,
+  or any program other than a known reader that names the file, wrappers included), a
+  shell or `eval` command string that expands when the line holds a gh write, a line that
+  does not lex, a hook crash or unreadable hook input on a `gh` write: all refused. Imports
+  load only once the command looks like a `gh` write. There is no override variable; the
+  allowlist is the escape.
+
+### Registration
+
+Auto-registered as `PreToolUse[Bash]` through `src/agent/claude/cli/build-core-settings.mjs`
+(arg7), run by the interpreter the launcher resolved (arg8, the same `$PY` as the rest of
+the launch; bare `python3` only when none resolves), which `session-launch.sh` passes to every core and worker session as `--settings`.
+That reaches each session's Agent-tool subagents, whatever their cwd: they run in the
+same process and fire the parent's PreToolUse hooks. It takes effect on a session's next
+launch.
+
+### Not covered
+
+- a Codex core (no Claude hooks), or a `claude` run started without the launcher;
+- `git push` / commit messages, and `gh pr create --fill` text;
+- a write made by a script the command runs (`python3 post.py`, `bash post.sh`), or a body
+  file written by a program that does not name it on its command line;
+- text piped into a shell from anything but a heredoc, or gh started by a runner not listed
+  above;
+- gh aliases (`gh alias set`), and gh reached through a variable or function (`$GH pr …`,
+  `"${cmd[@]}"`);
+- text split so no single span matches (a zero-width character inside a name, a name
+  assembled from parts at run time), and `env -S` / `watch` command strings;
+- a secret (non-`--public`) gist, which anyone with its URL can still read;
+- a release asset that is binary or over 65,536 bytes, which cannot be scanned as text;
+- gh named through ANSI-C quoting (`$'\x67h'`).
+
+Tests: `python3 tests/public-write-privacy-guard.test.py`
