@@ -272,9 +272,8 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
     return p
 
 
-# claude-local's real tree: the launcher starts a tmux server that daemonizes (not its descendant) and whose
-# pane runs `hold`, which takes the root; the launcher records that generation and itself in the supervisor
-# record. argv: root, pause, acted (the pane's, as REAL_LAUNCHER's). Its stop takes the server down with it.
+# claude-local's tree: a daemonized server (no descendant of the launcher) whose pane takes the root, recorded by
+# the launcher with itself in the supervisor record; argv as REAL_LAUNCHER's, and its stop ends the server too.
 TMUX_TREE = ("import os, signal, subprocess, sys, time; sys.path.insert(0, %r)\n"
              "from ag2_sparrow import claude_local_records as records, task_io\n"
              "root = sys.argv[1]\n"
