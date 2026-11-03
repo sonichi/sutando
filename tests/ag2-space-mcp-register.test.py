@@ -152,7 +152,7 @@ def main_dry_run_prints_the_entry_and_writes_the_descriptor():
     ws, p = ws_and_env()
     rc, out, _ = run_main(["--env-file", str(p)], resolve_workspace=lambda: ws, which=which({"node"}))
     assert rc == 0, rc
-    assert "dry run" in out and '"AG2_MCP_DESCRIPTOR"' in out, out
+    assert "not registered yet" in out and '"AG2_MCP_DESCRIPTOR"' in out, out
     assert (ws / "state" / "ag2-mcp" / "descriptor.json").is_file()
     assert SECRET not in out, "dry run printed the secret"
 
@@ -240,6 +240,31 @@ def http_discover_maps_errors():
                 assert words in str(e) and SECRET not in str(e), (code, str(e))
                 continue
         raise AssertionError(f"HTTP {code} was not reported")
+
+
+def http_discover_reports_an_unreachable_relay():
+    for exc in (urllib.error.URLError("Name or service not known"), TimeoutError("timed out"),
+                ConnectionRefusedError(61, "Connection refused")):
+        def urlopen(req, timeout, exc=exc):
+            raise exc
+        with Patch(urlopen=urlopen):
+            try:
+                register.http_discover("https://chat.example/relay", SECRET)
+            except register.RegisterError as e:
+                assert "could not reach the relay" in str(e) and SECRET not in str(e), (exc, str(e))
+                continue
+        raise AssertionError(f"{type(exc).__name__} escaped as a traceback")
+
+
+def a_leftover_tmp_file_does_not_keep_its_mode():
+    out = Path(tempfile.mkdtemp()) / "descriptor.json"
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text("stale")
+    os.chmod(tmp, 0o644)
+    register.write_descriptor(out, {"mcp_url": URLS["mcp_url"]})
+    mode = stat.S_IMODE(os.stat(out).st_mode)
+    assert mode == 0o600, oct(mode)
+    assert not tmp.exists() and json.loads(out.read_text()) == {"mcp_url": URLS["mcp_url"]}
 
 
 def empty_env_file_is_refused():

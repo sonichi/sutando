@@ -5,13 +5,14 @@ Finds the agent credential in the ag2space channel env, asks the relay for the m
 MCP URLs (GET <relay>/v1/mcp/discovery), writes the proxy's descriptor (no secret in it),
 then prints, or with --apply runs, the command that adds the `ag2-space` stdio server.
 
-  python3 skills/ag2-space-mcp/scripts/register.py            # dry run: show what it would do
+  python3 skills/ag2-space-mcp/scripts/register.py            # write the descriptor, show the command
   python3 skills/ag2-space-mcp/scripts/register.py --apply    # Claude Code: claude mcp add-json
   python3 skills/ag2-space-mcp/scripts/register.py --runtime codex   # print the config.toml entry
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -80,6 +81,9 @@ def http_discover(relay: str, secret: str) -> dict:
         if e.code == 401:
             raise RegisterError("the relay refused the agent credential; reconnect the agent") from None
         raise RegisterError(f"discovery failed: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", None) or e
+        raise RegisterError(f"discovery failed: could not reach the relay ({reason})") from None
 
 
 def build_descriptor(env_file: Path, discover: Callable[[str, str], dict]) -> dict:
@@ -94,7 +98,10 @@ def build_descriptor(env_file: Path, discover: Callable[[str, str], dict]) -> di
 def write_descriptor(path: Path, descriptor: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_CREAT keeps a leftover file's mode, so start from a fresh file to make 0600 hold.
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(json.dumps(descriptor, indent=2) + "\n")
     os.replace(tmp, path)
@@ -166,7 +173,7 @@ def main(argv: Optional[list] = None, discover: Callable[[str, str], dict] = htt
     cmd = ["claude", "mcp", "add-json", "--scope", "user", SERVER_KEY, json.dumps(entry)]
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(claude_home_path()))
     if not args.apply:
-        print(f"dry run; with --apply this runs (CLAUDE_CONFIG_DIR={env['CLAUDE_CONFIG_DIR']}):\n  "
+        print(f"not registered yet (the descriptor is written); with --apply this runs (CLAUDE_CONFIG_DIR={env['CLAUDE_CONFIG_DIR']}):\n  "
               + " ".join(cmd[:6]) + " '<entry>'\n" + json.dumps(entry, indent=2))
         return 0
     if not which("claude"):
