@@ -43,7 +43,7 @@ from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holde
 from ag2_sparrow import gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # the shared seam suite, also under runpy
-from connect_undo_seams import UndoSeams  # noqa: E402
+from connect_undo_seams import UndoSeams, bridge_verbs  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
 # The wrapper survives an interpreter path with a space: exec of the quoted path on the body beside it.
@@ -167,6 +167,7 @@ REAL_LAUNCHER = ("import os, subprocess, sys, time; sys.path.insert(0, %r)\n"
                  "    child.kill(); child.wait(); return 0\n"
                  "rc = cm.hold_and_supervise(LOCAL, root, state, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
                  "                           supervise, lambda c: (c.kill(), c.wait()), 'run', 'test')\n"
+                 "if os.path.exists(acted + '.stop-fails'): rc = cm.EXIT_RETRY   # its stop did not finish\n"
                  "rc = cm.retired(state, rc)\n"
                  "print('refused', rc, flush=True); sys.exit(rc)")
 # launchd's shape: the job's pid is a shim whose child is the launcher; the stop signal is forwarded.
@@ -229,6 +230,7 @@ class Runner:
         self.invocation, self.since = "", 0
         self.pause, self.acted, self.shim, self.spawned, self.stop_timeout = "", "", False, [], 10
         self.keep_alive, self.loaded, self.throttle, self.started_at, self.respawns = False, False, 30.0, 0.0, 0
+        self.last_rc = None
 
     def respawn_if_due(self, launchd):
         """The manager's restart policy, when `keep_alive` models it: a started job whose run ended other than
@@ -239,7 +241,7 @@ class Runner:
         if self.session.returncode == (0 if launchd else 75):
             return
         if time.monotonic() - self.started_at >= self.throttle:
-            old, self.session = self.session, None
+            old, self.session, self.last_rc = self.session, None, self.session.returncode
             for pipe in (old.stdin, old.stdout):
                 pipe.close()
             self.respawns += 1
@@ -264,7 +266,7 @@ class Runner:
                 except ProcessLookupError:
                     pass
             unhold(self.session)
-            self.session = None
+            self.session, self.last_rc = None, self.session.returncode
 
     def alive(self):
         return self.session is not None and self.session.poll() is None
@@ -282,17 +284,26 @@ class Runner:
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
 
+    def exit_words(self):
+        """The manager's record of how the last run ended: systemd's ExecMainCode/Status, launchd's line."""
+        rc = self.session.returncode if self.session is not None and self.session.poll() is not None else self.last_rc
+        if rc is None:
+            return {"ExecMainCode": "0", "ExecMainStatus": "0"}, ""
+        if rc < 0:
+            return {"ExecMainCode": "2", "ExecMainStatus": str(-rc)}, f"\tlast terminating signal = {-rc}\n"
+        return {"ExecMainCode": "1", "ExecMainStatus": str(rc)}, f"\tlast exit code = {rc}\n"
+
     def answer(self, verb, cmd):
         if verb == "print":
             if self.keep_alive and self.loaded and not self.alive():
-                return (0, "\tstate = spawn scheduled\n", "")
+                return (0, "\tstate = spawn scheduled\n" + self.exit_words()[1], "")
             return (0, f"\tpid = {self.session.pid}\n\tstate = running\n", "") if self.alive() else NOT_LOADED
         if verb == "show":
             loaded = cm.service_path(L).exists()
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
                      "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
                      "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
-                     "ExecMainStartTimestampMonotonic": str(self.since)}
+                     "ExecMainStartTimestampMonotonic": str(self.since), **self.exit_words()[0]}
             props = cmd[cmd.index("-p") + 1].split(",")
             shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in props)
             return (0, "".join(w + "\n" for w in shown), "")
@@ -1921,7 +1932,7 @@ class ConnectCode(UndoSeams, Base):
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
 
-    def test_a_root_replaced_while_the_bridge_is_wired_unwinds_this_attempt(self):
+    def test_a_root_replaced_while_the_bridge_is_wired_leaves_the_running_bridge_and_unwinds_the_rest(self):
         fake, real = self.fake(), cb.wire_bridge
 
         def wired_then_replaced(*a, **kw):
@@ -1933,9 +1944,13 @@ class ConnectCode(UndoSeams, Base):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"the bridge this attempt wired ({cm.job_name(B)}) was removed; {cm.job_name(L)}, which held "
-                      f"the directory that was there, was stopped; nothing at {self.root} was touched", err)
-        self.assertFalse(cm.service_path(B).exists(), "this attempt's bridge unit is gone")
+        self.assertIn(f"the bridge this attempt wired ({cm.job_name(B)}) is active and was left, since stopping it would "
+                      f"name whatever runs as it now: stop it by hand ({cm.stop_command(B)})", err)
+        self.assertIn(f"{cm.job_name(L)}, which held the directory that was there, was stopped; nothing at {self.root} was "
+                      "touched", err)
+        self.assertTrue(cm.service_path(B).exists(), "a running bridge is left: its manager stops it only by name")
+        self.assertTrue(fake.active, "and it still runs")
+        self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
         self.assertIsNone(fake.runner.pid(), "this attempt's job is stopped")
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")

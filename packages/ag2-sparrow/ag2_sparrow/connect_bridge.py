@@ -345,8 +345,8 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None" = None, agent_id: s
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
     """wire_bridge under the agent lock, held to connect's root (`root_id`, None outside connect): refused
     unless the root path names that directory before wiring and after. On a mismatch, or a wiring that
-    fails under connect, this attempt is undone: the bridge artifact it created (none was there before)
-    and the job its install started (cm.stop_started); nothing at the new `root` is touched."""
+    fails under connect, this attempt is undone: the bridge artifact it created (none was there before), as
+    _unwire_ours allows, and the job its install started (cm.stop_started); nothing at the new `root` is touched."""
     root = cm.work_root(cfg)
     try:
         with cm.agent_lock(root):
@@ -383,9 +383,7 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
     note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
         f"the bridge declaration is left for {command} uninstall to remove; "
     if before is None and after is not None:
-        unwired = unwire_bridge(cfg, command, bridge)
-        note = (f"{cm.job_name(bridge)} could not be removed ({unwired}); " if unwired else
-                f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed; ")
+        note = f"{_unwire_ours(cfg, command, bridge, artifact, after)}; "
     stopped = cm.stop_started(local, root)
     if replaced:
         return _replaced(root, local, stopped, note)
