@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -783,6 +784,91 @@ def _read_stdin() -> str:
     return sys.stdin.read()
 
 
+# A pane judged abnormal or not idle is kept for diagnosis: the live area a TUI
+# redraws (a retry banner, a dialog) is gone from scrollback once it clears.
+FRAMES_REL = Path("state") / "pane-frames"
+FRAMES_KEEP = 5
+_SEAT_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def save_frame(workspace, seat: str, kind: str, text: str, now: Optional[float] = None,
+               keep: int = FRAMES_KEEP) -> Optional[Path]:
+    """Write `text` to state/pane-frames/<seat>/<UTC stamp>-<kind>.txt and keep the newest
+    `keep` per seat. Best effort: None when nothing was written, never raises."""
+    if not text or not text.strip():
+        return None
+    seat_dir = _SEAT_NAME.sub("_", seat or "")
+    if seat_dir in ("", ".", ".."):
+        seat_dir = "unknown"
+    try:
+        d = Path(workspace) / FRAMES_REL / seat_dir
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+        path = d / f"{stamp}-{_SEAT_NAME.sub('_', kind) or 'frame'}.txt"
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+        frames = sorted(f for f in d.glob("*.txt") if f.is_file() and not f.is_symlink())
+        for old in frames[:-keep] if keep > 0 else frames:
+            old.unlink(missing_ok=True)
+        return path
+    except OSError:
+        return None
+
+
+# A notifier that times out waiting for idle restarts as a new process, so its rounds
+# are counted on disk; the third surfaces once, and an idle pane clears the record.
+STALLS_REL = Path("state") / "notifier-stalls"
+STALL_ROUNDS = 3
+
+
+def _stall_path(workspace, seat: str) -> Path:
+    name = _SEAT_NAME.sub("_", seat or "")
+    return Path(workspace) / STALLS_REL / f"{name if name not in ('', '.', '..') else 'unknown'}.json"
+
+
+def note_idle_timeout(workspace, seat: str, now: Optional[float] = None) -> int:
+    """Count one more idle-wait timeout for `seat`; returns the rounds so far (0 if unwritable)."""
+    path = _stall_path(workspace, seat)
+    now = time.time() if now is None else now
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        rec = rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        rec = {}
+    rec = {"seat": seat, "since": rec.get("since", now), "last": now,
+           "rounds": int(rec.get("rounds", 0) or 0) + 1}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps(rec), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return 0
+    return rec["rounds"]
+
+
+def clear_idle_timeouts(workspace, seat: str) -> bool:
+    try:
+        _stall_path(workspace, seat).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def idle_stalls(workspace) -> dict:
+    """{seat: record} for every seat whose notifier has timed out STALL_ROUNDS times or more."""
+    out = {}
+    for f in sorted((Path(workspace) / STALLS_REL).glob("*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and int(rec.get("rounds", 0) or 0) >= STALL_ROUNDS:
+            out[str(rec.get("seat") or f.stem)] = rec
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="pane_gate")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -813,6 +899,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
     hp.add_argument("--session", default=None, help="the seat the record must vouch for")
     hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    sf = sub.add_parser("save-frame")
+    sf.add_argument("--workspace", required=True)
+    sf.add_argument("--seat", required=True)
+    sf.add_argument("--kind", required=True)
+    for name in ("idle-timeout", "idle-ok"):
+        it = sub.add_parser(name)
+        it.add_argument("--workspace", required=True)
+        it.add_argument("--seat", required=True)
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -826,6 +920,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Emitting the SAFE set keeps a caller's membership test fail-closed: anything
         # absent -- a new state, a typo, an empty read -- refuses without being listed.
         print(" ".join(s for s in STATES if not state_is_unsafe(s)))
+        return 0
+    if a.cmd == "save-frame":
+        path = save_frame(a.workspace, a.seat, a.kind, _read_stdin())
+        print(path or "", end="\n" if path else "")
+        return 0 if path else 1
+    if a.cmd == "idle-timeout":
+        # "surface N" exactly once, on the round that reaches STALL_ROUNDS; later rounds stay quiet.
+        rounds = note_idle_timeout(a.workspace, a.seat)
+        print(f"surface {rounds}" if rounds == STALL_ROUNDS else str(rounds))
+        return 0
+    if a.cmd == "idle-ok":
+        clear_idle_timeouts(a.workspace, a.seat)
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":

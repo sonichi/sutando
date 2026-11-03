@@ -169,15 +169,18 @@ def observe_pane(workspace, worker_id, runtime: str = "claude", *,
     if not socket:
         return None, None
     try:
-        done = runner(["tmux", "-S", str(socket), "capture-pane", "-p", "-t", f"={name}:0"],
+        # -e as the notifier captures: both read the same bytes, so a dim placeholder is one verdict.
+        done = runner(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-t", f"={name}:0"],
                       capture_output=True, text=True, timeout=8)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None, None
     text = done.stdout if done.returncode == 0 else None
     if not text or not text.strip():
         return None, None
-    return (classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name),
-            frame_id(text))
+    kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
+    if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
+        pane_gate.save_frame(workspace, name, kind, text)
+    return kind, frame_id(text)
 
 
 def frame_id(text: str) -> str:
@@ -396,6 +399,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
                             if e.wedge_consecutive and e.wedge_kind},
             "routing": routing_status(workspace),
+            "notifier_stalls": notifier_stalls(workspace, obs),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
@@ -403,6 +407,14 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                                  "work_outstanding": o.work_outstanding,
                                  "pane": o.pane} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
+
+
+def notifier_stalls(workspace, workers) -> dict:
+    """{worker id: stall record} for supervised workers whose notifier has timed out waiting
+    for an idle pane pane_gate.STALL_ROUNDS times running; the notifier writes the record."""
+    by_seat = pane_gate.idle_stalls(workspace)
+    return {wid: by_seat[wi.tmux_session_name(wid)] for wid in workers
+            if wi.tmux_session_name(wid) in by_seat}
 
 
 def main(argv=None) -> int:
@@ -439,6 +451,9 @@ def main(argv=None) -> int:
                   f"/login is run in tmux session {wi.tmux_session_name(wid)}")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
+        for wid, rec in sorted(out.get("notifier_stalls", {}).items()):
+            print(f"{wid[:8]}  notifier has not seen an idle pane for {rec.get('rounds')} rounds; "
+                  f"tasks are waiting (frames in state/pane-frames/)")
         if out["routing"]["alarm"]:
             print(out["routing"]["alarm"])
     return 0
