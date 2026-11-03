@@ -140,6 +140,14 @@ class HeadersTest(unittest.TestCase):
         self.assertIn("mint_url", err)
         self.assertEqual([m for m, *_ in self.stub.seen], ["GET"])
 
+    def test_a_plaintext_relay_is_refused_before_the_bearer_is_sent(self):
+        # The bearer's first stop is discovery, so the relay URL itself must be TLS (or loopback).
+        rc, out, err = _run_main(["headers"], ("http://relay.example/", SECRET, ""))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("the relay URL", err)
+        self.assertNotIn(SECRET, err)
+        self.assertEqual(self.stub.seen, [])
+
     def test_a_foreign_origin_mint_url_is_refused_with_nothing_sent(self):
         # A discovery that names another https host must not receive the relay secret.
         for mint_url in ("https://evil.example/mint", f"{self.stub.base}x/mint",
@@ -286,6 +294,36 @@ class HelperCommandTest(unittest.TestCase):
             cmd = mcp_auth._helper_command("")
         self.assertEqual(cmd, f"{script} headers")
         self.assertNotIn(" -m ", cmd)
+
+    def test_a_source_checkout_runs_isolated_with_no_pythonpath(self):
+        root = str(pathlib.Path(mcp_auth.__file__).resolve().parents[1])
+        cmd = mcp_auth._helper_command("/e/.env", root)
+        self.assertTrue(cmd.startswith("AG2_DEVICE_ENV=/e/.env "), cmd)
+        self.assertIn(" -I -c ", cmd)
+        self.assertNotIn("PYTHONPATH", cmd)
+        self.assertNotIn(" -m ", cmd)
+
+    def test_the_source_checkout_helper_never_imports_a_planted_package_from_its_cwd(self):
+        # A client's cwd holding an ag2_sparrow of its own must not be what runs.
+        root = str(pathlib.Path(mcp_auth.__file__).resolve().parents[1])
+        cwd = tempfile.mkdtemp(prefix="mcp-cwd-")
+        os.makedirs(os.path.join(cwd, "ag2_sparrow"))
+        with open(os.path.join(cwd, "ag2_sparrow", "__init__.py"), "w") as f:
+            f.write("raise SystemExit('planted package imported')\n")
+        argv = shlex.split(mcp_auth._helper_command("", root))
+        argv[-1] = argv[-1].replace("main(['headers'])", "print(__import__('ag2_sparrow').__file__) or 0")
+        done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=hermetic_env(), timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.strip().startswith(root), done.stdout)
+
+    def test_setup_entry_is_the_http_entry_with_the_helper(self):
+        stub = Stub(); self.addCleanup(stub.close)
+        entry = mcp_auth.setup_entry((stub.relay, SECRET, "/e/.env"), "/src/pkg")
+        self.assertEqual(entry["type"], "http")
+        self.assertTrue(entry["url"].endswith("/mcp"), entry)
+        self.assertIn("AG2_DEVICE_ENV=/e/.env", entry["headersHelper"])
+        self.assertIn("/src/pkg", entry["headersHelper"])
+        self.assertNotIn(SECRET, json.dumps(entry))
 
     def test_an_installed_package_needs_no_pythonpath(self):
         self.assertNotIn("PYTHONPATH", mcp_auth._helper_command("/e/.env"))

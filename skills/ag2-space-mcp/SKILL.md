@@ -7,11 +7,15 @@ description: Connect this Sutando install to AG2 Space's hosted MCP as its own a
 
 The hosted AG2 Space MCP runs every room Action on the server, as the agent itself:
 membership and permissions are checked on each call, and nothing room-specific runs on
-this machine. This skill holds the connector only: `ag2-mcp-proxy.mjs`, a stdio MCP
-server that exchanges the agent credential for a 15-minute token in memory and forwards
-calls, and `scripts/register.py`, which registers it. It contains no Commons logic.
+this machine. This skill holds the connector only: `scripts/register.py` registers an
+`ag2-space` http MCP entry whose `headersHelper` is `ag2-sparrow-mcp headers`
+(`packages/ag2-sparrow/ag2_sparrow/mcp_auth.py`). That helper owns discovery and the
+mint rules. It exchanges the agent credential for a short-lived token on each connect,
+and the token never touches disk. This skill contains no Commons logic.
 
-The desktop app registers the same proxy itself. Use this skill on any other install.
+The desktop app registers its own connector. Use this skill on any other Claude Code
+install. A Codex core without the app follows `docs/codex-core.md`
+(s.space MCP without the desktop app) instead.
 
 ## Connect (once)
 
@@ -20,20 +24,19 @@ The desktop app registers the same proxy itself. Use this skill on any other ins
    - Keep the canonical copy in the vault: send `vault set REMOTE_TASK_TOKEN <token>` over
      Slack or Discord (the bridge stores it in the Keychain before it touches disk), or run
      `python3 skills/secret-vault/secret-vault.py set REMOTE_TASK_TOKEN` and paste it.
-   - The proxy reads the token from the ag2space channel env file on each mint, so that
-     file also holds it as `REMOTE_TASK_TOKEN='<relay-url>|<secret>'`
+   - The helper reads the token from the ag2space channel env file on each connect, so
+     that file also holds it as `REMOTE_TASK_TOKEN='<relay-url>|<secret>'`
      (`bash scripts/sutando-config.sh claude-home-path channels/ag2space/.env` prints the
      path). Make it readable only by you: `chmod 600 <that file>`. `register.py` warns
      when it is not.
 2. **Register the server.**
-   `python3 skills/ag2-space-mcp/scripts/register.py` shows what it will do;
-   add `--apply` to run `claude mcp add-json`, or `--runtime codex` for the
-   `config.toml` entry. It asks the relay for the MCP endpoints and writes the proxy's
-   descriptor. The secret stays in the env file; neither the descriptor nor the MCP
-   config holds it.
-   Where the descriptor, the proxy log and the room-action record go is declared in
-   `manifest.json` `config` (`AG2_MCP_DESCRIPTOR`, `AG2_MCP_LOG`, `AG2_MCP_ROOM_ACTIONS`,
-   relative to the workspace). An env var of the same name overrides it.
+   `python3 skills/ag2-space-mcp/scripts/register.py` shows the entry; add `--apply` to
+   run `claude mcp add-json --scope user`. It writes into the Claude config your shell
+   already uses, and passes `CLAUDE_CONFIG_DIR` only when you have set it. The relay URL
+   must be https. The secret stays in the env file: neither the MCP config nor the
+   command line holds it. To re-register, run
+   `claude mcp remove --scope user ag2-space` first, because `add-json` refuses an
+   existing entry.
 3. **Restart the core** and call `ag2.whoami`: it names the agent.
 4. **Get invited.** Agents do not join rooms on their own; a member invites the agent,
    and membership is the authorization.
@@ -81,6 +84,8 @@ messages or state events.
 
 ## Troubleshooting
 
-- `register.py` says the relay has no hosted MCP: that deployment has none; nothing to fix here.
-- `mint: bearer rejected`: the agent credential was revoked or is not an agent's; connect again.
-- The proxy logs to `AG2_MCP_LOG`, by default `<workspace>/logs/ag2-mcp-proxy.log` (no secrets).
+- `register: MCP discovery answered 404`: that relay has no hosted MCP; nothing to fix here.
+- `register: the relay URL must be https`: the token's relay URL is plain http; reconnect the agent.
+- `the MCP access-token exchange answered 401`: the agent credential was revoked or is not an agent's; connect again.
+- Check the helper on its own: run the `headersHelper` command from `claude mcp get ag2-space`. It prints
+  `{"Authorization": "Bearer …"}` on success, or one `ag2-sparrow-mcp:` line saying why not.
