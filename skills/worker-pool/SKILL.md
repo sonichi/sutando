@@ -146,7 +146,8 @@ python3 skills/worker-pool/scripts/pool_identity.py remove <worker>
 
 `add` asks for the token at a hidden prompt (`-` reads it from stdin), then shows what the token's gateway says and
 asks before saving. It refuses an agent the gateway does not name (`worker_identity_unverified`) and one that another
-row already runs as (`worker_identity_shared`). The token goes into the secret vault. It never goes into a file and is
+row already runs as (`worker_identity_shared`). It also refuses an agent whose owner is not the owner a core
+connection already serves (`worker_owner_mismatch`), so a worker never runs as another person's agent. The token goes into the secret vault. It never goes into a file and is
 never printed. `rotate` accepts a new token only for the same agent.
 
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent

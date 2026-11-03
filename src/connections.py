@@ -400,6 +400,13 @@ class WorkerIdentityUnverified(Refusal):
     CODE = "worker_identity_unverified"
 
 
+class WorkerOwnerMismatch(Refusal):
+    """A worker's agent must be held by an owner a core row already serves (`owner_mxid`): a token
+    for another person's agent would bring that person's messages in at owner tier."""
+
+    CODE = "worker_owner_mismatch"
+
+
 class WorkerIdentityShared(Refusal):
     """The code is for an agent another row already runs as: a worker's identity is its own."""
 
@@ -1337,7 +1344,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
 
 
 def _check_worker_identity(rows: list, seen: Mapping[str, object], worker: str) -> None:
-    """Refuse a worker identity whose agent the gateway did not name, or that another row runs as."""
+    """Refuse a worker identity whose agent the gateway did not name, that another row runs as, or
+    that an owner no core row serves holds."""
     agent = str(seen.get("agent_mxid") or "") if seen.get("verified") else ""
     if not agent:
         raise WorkerIdentityUnverified("the gateway did not confirm which agent this code is for"
@@ -1347,6 +1355,14 @@ def _check_worker_identity(rows: list, seen: Mapping[str, object], worker: str) 
         whose = f"worker {taken['worker']}" if taken.get("worker") else "the core"
         raise WorkerIdentityShared(f"agent {agent} is already {whose}'s ({taken['instance'] or '<legacy>'}); "
                                    f"worker {worker} needs an agent of its own")
+    owner = str(seen.get("owner_mxid") or "")
+    owners = sorted({str(r["owner_mxid"]) for r in _core_rows(rows) if r.get("owner_mxid")})
+    if not owner or owner not in owners:
+        logging.getLogger(__name__).error("connections: worker %s refused: agent %s is held by %s, not the core's "
+                                          "owner (%s)", worker, agent, owner or "no named owner",
+                                          ", ".join(owners) or "none recorded")
+        raise WorkerOwnerMismatch(f"agent {agent} is held by {owner or 'no owner the gateway names'}, not the "
+                                  f"core's owner ({', '.join(owners) or 'no core row names one'})")
 
 
 def _readopts_legacy(row: Mapping[str, object], seen: Mapping[str, object], token: str, vault,

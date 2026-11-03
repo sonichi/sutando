@@ -53,6 +53,7 @@ def read_token(arg, prompt: str) -> str:
 def preview_text(p: dict) -> str:
     return "\n".join([f"server:  {p.get('server')}" + ("" if p.get("verified") else "  (unverified)"),
                       f"agent:   {p.get('agent_mxid') or '(the gateway did not name one agent)'}",
+                      f"owner:   {p.get('owner_mxid') or '(the gateway named no owner)'}",
                       f"token:   {({True: 'accepted', False: 'REJECTED', None: 'not checked'})[p.get('authenticated')]}"]
                      + ([f"error:   {p['error']}"] if p.get("error") else []))
 

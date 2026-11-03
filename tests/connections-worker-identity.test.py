@@ -3,7 +3,8 @@
 
 - The row: a second agent on the core's own server is saved as the worker's row, never merged
   into the core's. It is never primary, keeps its own slug and vault key, and refuses an
-  unverified agent or one another row runs as. The record schema allows exactly that.
+  unverified agent, one another row runs as, or one an owner no core row serves holds. The record
+  schema allows exactly that.
 - Core-facing lookups never pick it: a room's connection, the unaddressed-message owner,
   set_primary/promote and move.
 - The lane: `lane_worker` names the worker. The bridge host addresses every task it queues to
@@ -89,10 +90,6 @@ class TheRow(Base):
         self.assertEqual(second["instance"], first["instance"])
         self.assertEqual(len(self.rows()), 2)
 
-    def test_the_first_row_ever_saved_is_never_primary_when_it_is_a_worker(self):
-        row, _ = self.add_worker()
-        self.assertFalse(row["primary"])
-
     def test_an_unverified_or_shared_agent_is_refused_and_nothing_is_kept(self):
         self.add_core()
         with self.assertRaises(C.WorkerIdentityUnverified):
@@ -107,7 +104,28 @@ class TheRow(Base):
             self.add_worker(worker="b" * 32)
         self.assertIn(f"worker {W}", str(e.exception))
 
+    def test_an_agent_another_owner_holds_is_refused_and_nothing_is_kept(self):
+        self.add_core()
+
+        def owned_by(owner):
+            return lambda url, token, address=None: {"agents": [{"id": WORKER_AGENT, "owner": owner}]}
+        for owner in ("@mallory:alpha-fixture.net", None):
+            with self.assertRaises(C.Refusal) as e:
+                self.add_worker(fetch=owned_by(owner))
+            self.assertEqual(e.exception.CODE, "worker_owner_mismatch", owner)
+            self.assertIn("@owner:alpha-fixture.net", str(e.exception))
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(sorted(self.vault.store), ["AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET"])
+        self.assertEqual(self.add_worker()[0]["owner_mxid"], "@owner:alpha-fixture.net")
+
+    def test_without_a_core_row_no_owner_vouches_for_a_worker(self):
+        with self.assertRaises(C.Refusal) as e:
+            self.add_worker()
+        self.assertEqual(e.exception.CODE, "worker_owner_mismatch")
+        self.assertFalse(C.record_path(self.ws).exists() and self.rows())
+
     def test_the_token_source_is_recorded(self):
+        self.add_core()
         row, _ = self.add_worker(source="agent_link")
         self.assertEqual(row["added_by"], "agent_link")
         with self.assertRaises(C.ConnectionsError):
@@ -384,6 +402,7 @@ class OwnerCommand(Base):
             rc, out, _ = self.run_cmd(*self.add_args(TOKEN_W))
         self.assertEqual(rc, 1)
         self.assertIn(f"agent:   {WORKER_AGENT}", out)
+        self.assertIn("owner:   @owner:alpha-fixture.net", out)
         self.assertIn("token:   accepted", out)
         self.assertNotIn("secret-reviewer", out)
         self.assertIn("not saved", out)
@@ -400,6 +419,7 @@ class OwnerCommand(Base):
         text = self.pi.preview_text({"server": "x.net", "verified": False, "authenticated": False, "error": "boom"})
         self.assertIn("x.net  (unverified)", text)
         self.assertIn("the gateway did not name one agent", text)
+        self.assertIn("the gateway named no owner", text)
         self.assertIn("token:   REJECTED", text)
         self.assertIn("error:   boom", text)
 
