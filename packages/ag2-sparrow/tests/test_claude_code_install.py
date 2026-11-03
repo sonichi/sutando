@@ -91,8 +91,8 @@ class ConnectInstall(ConnectBase):
         cfg = cli.read_config(cfg_path)
         self.assertEqual((cfg["CLAUDE"], cfg["PLUGIN_DIR"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["ROOT"]),
                          (str(self.claude), str(self.plugin), str(self.inbox), str(self.results), str(self.work)))
-        self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"], cfg["ALLOW_NON_OWNER"]), ("bypassPermissions", "1", ""),
-                         "a key file alone is strict; non-owner tasks are off")
+        self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"], cfg["ALLOW_NON_OWNER"], cfg["ALLOW_COLLABORATOR"]),
+                         ("bypassPermissions", "1", "", ""), "a key file alone is strict; non-owner and collaborator tasks are off")
         self.assertTrue(cli.SESSION_ID_RE.match(cfg["SESSION_ID"]), "install mints the session id")
         self.assertEqual(cfg["HITL_STORE"], str(cli.hitl_store_root()), "the bridge's claude-local root is persisted")
         self.assertTrue(self.inbox.is_dir() and self.results.is_dir())
@@ -1080,11 +1080,31 @@ class ConnectStrict(ConnectBase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.install("--hmac-strict", "--no-hmac-strict")
 
+    def test_allow_collaborator_is_persisted_off_by_default_independent_of_allow_non_owner_and_shown_by_verify(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "", "--allow-non-owner does not imply it")
+        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", self.main("verify")[1])
+        self.assertFalse(inbox.allow_collaborator())
+        self.assertEqual(self.install_with(runner, False, "--allow-collaborator")[0], 0)
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual((cfg["ALLOW_COLLABORATOR"], cfg["ALLOW_NON_OWNER"]), ("1", ""))
+        self.assertIn("INFO collaborator tasks: submitted into this session with the non-owner note (--allow-collaborator)",
+                      self.main("verify")[1])
+        self.assertTrue(inbox.allow_collaborator())
+        self.assertFalse(inbox.allow_non_owner())
+        self.assertTrue(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
+        self.assertFalse(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
+        path = cli.config_path()
+        path.write_text("".join(l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_COLLABORATOR=")))
+        self.assertFalse(inbox.allow_collaborator(), "a config written before the flag existed keeps refusing")
+        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", self.main("verify")[1])
+
     def test_allow_non_owner_is_persisted_off_by_default_and_shown_by_verify(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "")
-        self.assertIn("INFO non-owner tasks: attested collaborators submitted with the non-owner note; others refused", self.main("verify")[1])
+        self.assertIn("INFO non-owner tasks: refused (owner only)", self.main("verify")[1])
         self.assertFalse(inbox.allow_non_owner())
         self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")

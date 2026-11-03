@@ -265,8 +265,8 @@ class InboxCli(ConnectBase):
     def test_claim_admits_the_owner_and_answers_every_other_non_owner_and_a_tierless_task_with_the_refusal(self):
         rc, out = self.verb("claim", self.task("task-o"))
         self.assertEqual((rc, out["admission"], out["access_tier"], out["collaborator"]), (0, "owner", "owner", False))
-        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-gc": ("guest", "collaborator: true\n"),
-                   "task-n": (None, "")}
+        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-c": ("team", "collaborator: true\n"),
+                   "task-gc": ("guest", "collaborator: true\n"), "task-n": (None, "")}
         for t, (tier, extra) in refused.items():
             rc, out = self.verb("claim", self.task(t, tier, extra))
             self.assertEqual((rc, "not admitted" in out["refused"]), (1, True), (t, out))
@@ -276,15 +276,23 @@ class InboxCli(ConnectBase):
             self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
 
-    def test_claim_serves_an_attested_collaborator_without_allow_non_owner_as_the_shared_admission_does(self):
+    def test_a_collaborator_is_refused_by_default_and_under_allow_non_owner_alone_naming_allow_collaborator(self):
+        for i, over in enumerate(({}, {"ALLOW_NON_OWNER": "1"})):
+            self.configure(**over)
+            t = self.task("task-c%d" % i, "team", "collaborator: true\n")
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, "--allow-collaborator is off" in out.get("refused", "")), (1, True), (over, out))
+            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, over)
+
+    def test_allow_collaborator_claims_a_collaborator_with_its_admission_and_still_refuses_team_and_guest(self):
+        self.configure(ALLOW_COLLABORATOR="1")
         t = self.task("task-c", "team", "collaborator: true\n")
-        self.assertEqual(task_io.admission(task_io.parse_task(str(self.inbox / (t + ".txt")))[0], False), "collaborator")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, out.get("admission"), out.get("access_tier"), out.get("collaborator")),
                          (0, "collaborator", "team", True), out)
         self.assertFalse((self.results / (t + ".txt")).exists(), "submitted to the session, never refused")
-        for t, tier in (("task-t", "team"), ("task-g", "guest")):
-            rc, out = self.verb("claim", self.task(t, tier))
+        for t, tier, extra in (("task-t", "team", ""), ("task-g", "guest", ""), ("task-gc", "guest", "collaborator: true\n")):
+            rc, out = self.verb("claim", self.task(t, tier, extra))
             self.assertEqual((rc, (self.results / (t + ".txt")).read_text()), (1, task_io.NON_OWNER_REFUSED), t)
 
     def resolved(self, out):
@@ -327,7 +335,8 @@ class InboxCli(ConnectBase):
             ran.append(sc["name"])
             # The harness answers envelope from its options; the same choice is recorded in the config here.
             self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"},
-                              "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}))
+                              "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}),
+                           ALLOW_COLLABORATOR="1" if sc.get("allow_collaborator") else "")
             key = self.home / "task-hmac.key"
             if sc.get("key") == "present":
                 key.write_text("ab" * 32)
@@ -353,7 +362,7 @@ class InboxCli(ConnectBase):
 
     def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
         names = [sc["name"] for sc in contract_scenarios()]
-        self.assertEqual(len(names), 32)
+        self.assertEqual(len(names), 33)
         self.assertEqual(contract_set_problem(names), "")
         for i in (0, 17, len(names) - 1):
             self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)
@@ -906,8 +915,8 @@ class InboxCli(ConnectBase):
         self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
         self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 
-    def test_with_allow_non_owner_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
-        self.configure(ALLOW_NON_OWNER="1")
+    def test_with_both_flags_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
+        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1")
         for t, tier, extra, kind in (("task-t", "team", "", "non_owner"), ("task-g", "guest", "", "non_owner"),
                                      ("task-c", "team", "collaborator: true\n", "collaborator")):
             rc, out = self.verb("claim", self.task(t, tier, extra))

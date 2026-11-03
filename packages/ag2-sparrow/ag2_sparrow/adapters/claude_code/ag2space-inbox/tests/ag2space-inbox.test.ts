@@ -25,7 +25,7 @@ type Claim = { attempt: number; phase: string; token?: string; hash?: string; tu
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
                                strict?: boolean; lenient?: boolean; keyProblem?: string; policyFails?: number;
                                keySwap?: { from: string; to: string; signedWith: string };
-                               progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
+                               progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean; allowCollaborator?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
                                unstuckFails?: number; unstuckHardFails?: number; unstuckThrows?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
@@ -213,12 +213,13 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
         return out(1, { refused: `${task}: its staged answer is published now; only ABSENT may be submitted` })
       }
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
-      // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; a collaborator is served;
-      // other non-owners need the flag.
+      // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; a collaborator needs
+      // --allow-collaborator, any other non-owner --allow-non-owner.
       const text = files[`/in/${task}.txt`] ?? ''
       const tier = text.match(/^access_tier: (\S+)/m)?.[1]
       const collab = tier === 'team' && text.includes('\ncollaborator: true\n')
-      const admission = !tier ? '' : tier === 'owner' ? 'owner' : collab ? 'collaborator' : !opts.allowNonOwner ? '' : 'non_owner'
+      const admission = !tier ? '' : tier === 'owner' ? 'owner' : collab ? (opts.allowCollaborator ? 'collaborator' : '')
+        : opts.allowNonOwner ? 'non_owner' : ''
       if (!admission) {
         files[`/out/${task}.txt`] = 'This agent only answers its owner here.\n'
         return out(1, { refused: `${task} not admitted` })
@@ -364,7 +365,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
 })
 
 test('non-owner tiers carry the Hatch non-owner note and the collaborator flag', async ($, on) => {
-  const h = host(on, { allowNonOwner: true })
+  const h = host(on, { allowNonOwner: true, allowCollaborator: true })
   h.files['/in/task-g1.txt'] = TASK('task-g1', 'guest')
   await arm($, h)
   await h.clock.advance(1000)
@@ -379,21 +380,31 @@ test('non-owner tiers carry the Hatch non-owner note and the collaborator flag',
   expect(team).toContain('\n' + TASK('task-t2', 'team', 'collaborator: true\n'))
 })
 
-test('without --allow-non-owner a team or guest task is answered by the CLI and never submitted', async ($, on) => {
+test('with neither flag a team, guest or collaborator task is answered by the CLI and never submitted', async ($, on) => {
   const h = host(on)
   h.files['/in/task-t.txt'] = TASK('task-t', 'team')
   h.files['/in/task-g.txt'] = TASK('task-g', 'guest')
+  h.files['/in/task-c.txt'] = TASK('task-c', 'team', 'collaborator: true\n')
   h.files['/in/task-n.txt'] = TASK('task-n').replace('access_tier: owner\n', '')
   await arm($, h)
   await h.clock.advance(5000)
   expect(h.submitted.length).toBe(0)
   expect(verbs(h).filter(v => v === 'authorize').length).toBe(0)
-  for (const id of ['task-t', 'task-g', 'task-n']) expect(h.files[`/out/${id}.txt`]).toBe('This agent only answers its owner here.\n')
-  expect(verbs(h).filter(v => v === 'claim').length).toBe(3)
+  for (const id of ['task-t', 'task-g', 'task-c', 'task-n']) expect(h.files[`/out/${id}.txt`]).toBe('This agent only answers its owner here.\n')
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(4)
 })
 
-test('without --allow-non-owner an attested collaborator is submitted with the non-owner note', async ($, on) => {
-  const h = host(on)
+test('--allow-non-owner alone does not submit an attested collaborator', async ($, on) => {
+  const h = host(on, { allowNonOwner: true })
+  h.files['/in/task-c.txt'] = TASK('task-c', 'team', 'collaborator: true\n')
+  await arm($, h)
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.files['/out/task-c.txt']).toBe('This agent only answers its owner here.\n')
+})
+
+test('with --allow-collaborator alone an attested collaborator is submitted with the non-owner note', async ($, on) => {
+  const h = host(on, { allowCollaborator: true })
   h.files['/in/task-c.txt'] = TASK('task-c', 'team', 'collaborator: true\n')
   h.files['/in/task-t.txt'] = TASK('task-t', 'team')
   h.files['/in/task-g.txt'] = TASK('task-g', 'guest')
@@ -1763,6 +1774,7 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
     ran.push(sc.name)
     // The Python side records the same choice in the config and puts the key file in the same state.
     o.lenient = sc.hmac === 'lenient'
+    o.allowCollaborator = sc.allow_collaborator === true
     o.strict = sc.hmac === 'strict'
     o.keyProblem = sc.key === 'missing' ? '/k/task-hmac.key missing: strict mode submits nothing until it is back' : ''
     h.setKey(sc.key === 'present' ? 'ab'.repeat(32) : 'absent')
@@ -1801,7 +1813,7 @@ function scenarioSetProblem(ran: string[]): string {
 
 test('the contract set pin fails on a dropped or an extra scenario', async () => {
   const names = (CONTRACT as any[]).map(sc => sc.name)
-  expect(names.length).toBe(32)
+  expect(names.length).toBe(33)
   expect(scenarioSetProblem(names)).toBe('')
   for (const i of [0, 17, names.length - 1]) {
     expect(scenarioSetProblem(names.filter((_, j) => j !== i))).toContain(`missing ${JSON.stringify([names[i]])}`)

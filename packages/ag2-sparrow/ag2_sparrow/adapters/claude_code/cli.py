@@ -201,7 +201,8 @@ def install(args) -> int:
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
-              inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "", "AGENT_ID": agent_id, "BRIDGE": mode,
+              inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "",
+              inbox.ALLOW_COLLABORATOR: "1" if args.allow_collaborator else "", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
               "BRIDGE_STATE_DIR": str(state), "TMUX": tmux}
@@ -414,8 +415,10 @@ def verify(_args) -> int:
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
-                                      if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else
-                                      "attested collaborators submitted with the non-owner note; others refused"))
+                                      if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
+    print("INFO collaborator tasks: " + ("submitted into this session with the non-owner note (--allow-collaborator)"
+                                         if cfg.get(inbox.ALLOW_COLLABORATOR) == "1" else
+                                         "refused (--allow-collaborator off)"))
     root = cm.work_root(cfg)
     if cfg.get("BRIDGE_STATE_DIR"):
         want = card.store_root(bridge_state(cfg))
@@ -542,9 +545,14 @@ def session_options(p) -> None:
                     "--hmac-key-file)")
     hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
                     "unverifiable envelopes")
-    p.add_argument("--allow-non-owner", action="store_true", help="also submit team and guest tasks without "
-                   "collaborator access (an attested collaborator always is), with the non-owner note; off: they get "
-                   "the owner-only refusal and never reach the session")
+    p.add_argument("--allow-non-owner", action="store_true", help="submit team and guest tasks from senders "
+                   "without collaborator access (guests, and any collaborator claim the broker did not attest) with "
+                   "the non-owner note; off: they get the owner-only refusal and never reach the session. An "
+                   "attested collaborator is not covered by it: see --allow-collaborator")
+    p.add_argument("--allow-collaborator", action="store_true", help="submit attested collaborators' (Team) tasks "
+                   "into this session with the non-owner note. The session holds the owner's history, tools and "
+                   "credentials with permission prompts off; the note is the only guard. Off by default, so they "
+                   "are refused with the same plain line")
     p.add_argument("--permission-mode", default="bypassPermissions",
                    help="the session's --permission-mode; bypassPermissions (default) suits an unattended "
                         "session, a narrower mode makes a prompting tool stall the queue")
