@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -32,6 +32,9 @@
 //   arg6 (optional): path to hooks/native-pim-guard.py — registered under
 //                    PreToolUse[Bash]: denies commands that drive the native
 //                    macOS Calendar/Reminders/Contacts apps without consent.
+//   arg7 (optional): path to hooks/shell-trap-guard.py — registered under
+//                    PreToolUse[Bash] with --repo <checkout>: blocks or warns on
+//                    shell commands that misbehave on macOS/zsh.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -138,8 +141,26 @@ if (nativePimGuardHook.trim()) {
 	};
 }
 
+// Always-on: the hook narrows its own rules to the host, so a GNU host is not blocked.
+// It resolves the workspace for its hit log from the CONFIGURED checkout.
+const shellTrapGuardHook = process.argv[8] || '';
+let shellTrapGuardSettings = null;
+if (shellTrapGuardHook.trim()) {
+	const repoRoot = path.resolve(shellTrapGuardHook, '..', '..');
+	const command = `python3 ${shq(shellTrapGuardHook)} --repo ${shq(repoRoot)}`;
+	shellTrapGuardSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
+}
+
 process.stdout.write(
 	JSON.stringify(
-		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, gdocsWriteGuardSettings, nativePimGuardSettings),
+		mergeHookSettings(
+			guardSettings,
+			obsSettings,
+			skillTelemetrySettings,
+			gmailWriteGuardSettings,
+			gdocsWriteGuardSettings,
+			nativePimGuardSettings,
+			shellTrapGuardSettings,
+		),
 	),
 );
