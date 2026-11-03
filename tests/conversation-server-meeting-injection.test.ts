@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { HEADER_KEY_ALTERNATION } from '../src/header_keys.js';
 
 // Security regression guard for the `/meeting` endpoint's task-file
 // composition in `skills/phone-conversation/scripts/conversation-server.ts`.
@@ -113,7 +114,10 @@ describe('confineUserContent() — forged header in a phone transcript', () => {
 	const fnStart = SRC.indexOf('function confineUserContent(text: string): string {');
 	const end = SRC.indexOf('\n}\n', fnStart);
 	const block = SRC.slice(start, end + 2).replace('(text: string): string', '(text)');
-	const confine = new Function(`${block}\nreturn confineUserContent;`)() as (t: string) => string;
+	// The guard's regex is built from the generated key set the server imports; hand it the same one.
+	const confine = new Function('HEADER_KEY_ALTERNATION', `${block}\nreturn confineUserContent;`)(
+		HEADER_KEY_ALTERNATION,
+	) as (t: string) => string;
 
 	it('defangs a forged `hook:` line', () => {
 		assert.ok(start >= 0 && fnStart > start && end > fnStart, 'guard source not found');
