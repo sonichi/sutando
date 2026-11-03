@@ -26,6 +26,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import unittest
 import unittest.mock
@@ -341,6 +342,87 @@ class TheLane(unittest.TestCase):
                                   "requested_worker": h.get("requested_worker")})
         self.assertEqual((out["targets"], out["delivered"]), ([W], [W]))
         self.assertTrue((self.tmp / "deliveries" / W / f"{tid}.txt").exists())
+
+
+class LaneStart(Base):
+    """The lane's own start decision, through the real shim: an unreadable record never makes a
+    worker's lane a core lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rgb = _load_shim()
+
+    def setUp(self):
+        super().setUp()
+        self.add_core()
+        self.add_worker()
+        rgb = self.rgb
+        self.saved = {k: getattr(rgb, k) for k in ("WS", "GATEWAY_INSTANCE", "_log")}
+        self.logged = []
+        rgb.WS, rgb.GATEWAY_INSTANCE, rgb._log = self.ws, WORKER_INST, self.logged.append
+        self.addCleanup(lambda: [setattr(rgb, k, v) for k, v in self.saved.items()])
+
+    def start(self, **env):
+        with unittest.mock.patch.dict("os.environ", env):
+            if "SUTANDO_LANE_WORKER" not in env:
+                os.environ.pop("SUTANDO_LANE_WORKER", None)
+            return self.rgb._lane_worker()
+
+    @contextlib.contextmanager
+    def spoiled(self, how):
+        path = C.record_path(self.ws)
+        kept = path.read_text()
+        if how == "missing":
+            path.unlink()
+        elif how == "permission":
+            path.chmod(0)
+        else:
+            path.write_text({"corrupt": "{not json", "wrong-shape": '{"connections": 5}'}[how])
+        try:
+            yield
+        finally:
+            if path.exists():
+                path.chmod(0o600)
+            path.write_text(kept)
+
+    def test_the_launch_names_the_lanes_worker(self):
+        env = C.launch_env(C.plan_entry(WORKER_INST, {}, workspace=self.ws), {}, vault=self.vault)
+        self.assertEqual(env.get("SUTANDO_LANE_WORKER"), W)
+        env = C.launch_env(C.plan_entry("alpha-fixture-net", {}, workspace=self.ws), {}, vault=self.vault)
+        self.assertEqual(env.get("SUTANDO_LANE_WORKER"), "")
+
+    def test_an_unreadable_record_keeps_a_worker_lane_a_worker_and_says_so(self):
+        for how in ("corrupt", "wrong-shape", "permission", "missing"):
+            with self.subTest(how), self.spoiled(how):
+                self.logged.clear()
+                self.assertEqual(self.start(SUTANDO_LANE_WORKER=W), W)
+                self.assertTrue(any("record" in line for line in self.logged), self.logged)
+
+    def test_an_unreadable_record_without_the_launchers_word_refuses_to_start(self):
+        for how in ("corrupt", "wrong-shape", "permission"):
+            with self.subTest(how), self.spoiled(how), self.assertRaises(SystemExit):
+                self.start()
+        self.rgb.GATEWAY_INSTANCE = "alpha-fixture-net"
+        with self.spoiled("corrupt"):
+            self.assertEqual(self.start(SUTANDO_LANE_WORKER=""), "", "a lane launched as a core lane stays one")
+
+    def test_a_launch_and_a_row_that_disagree_refuse_to_start(self):
+        with self.assertRaises(SystemExit):
+            self.start(SUTANDO_LANE_WORKER="")
+        with self.assertRaises(SystemExit):
+            self.start(SUTANDO_LANE_WORKER="b" * 32)
+        self.assertEqual(self.start(SUTANDO_LANE_WORKER=W), W)
+        self.assertEqual(self.start(), W)
+        self.rgb.GATEWAY_INSTANCE = "alpha-fixture-net"
+        self.assertEqual(self.start(SUTANDO_LANE_WORKER=""), "")
+
+    def test_a_worker_row_another_owner_holds_refuses_to_start(self):
+        rec = self.record()
+        next(r for r in rec["connections"] if r.get("worker"))["owner_mxid"] = "@mallory:alpha-fixture.net"
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        with self.assertRaises(SystemExit):
+            self.start(SUTANDO_LANE_WORKER=W)
+        self.assertTrue(any("not the core's owner" in line for line in self.logged), self.logged)
 
 
 class OwnerCommand(Base):

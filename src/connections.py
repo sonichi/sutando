@@ -2120,6 +2120,42 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
 
 
+class LaneIdentityUnknown(ConnectionsError):
+    """A lane cannot tell whether it runs as a pool worker's own agent: it must not start."""
+
+
+def lane_worker_at_start(instance: str, environ: Optional[Mapping[str, str]] = None,
+                         workspace: Optional[Path] = None) -> "tuple[str, Optional[str]]":
+    """(the worker lane `instance` runs as, or "" for a core lane; a problem to log, or None). The
+    launcher's `LANE_WORKER_ENV` and the row must agree; the env alone decides on an unreadable
+    record, and with neither the lane is refused (`LaneIdentityUnknown`), never started as core."""
+    environ = os.environ if environ is None else environ
+    said = environ.get(LANE_WORKER_ENV)
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError) as e:
+        if said:
+            return said, f"its connection record is unreadable ({type(e).__name__}); running as the launch named"
+        if said is None:
+            raise LaneIdentityUnknown(f"connection record unreadable ({type(e).__name__}) and the launch names "
+                                      "no worker: this lane may be a worker's own and must not run as the core's")
+        return "", None
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    if row is None:
+        return said or "", ("its connection row is missing from the record; running as the launch named"
+                            if said else None)
+    recorded = str(row.get("worker") or "")
+    if said is not None and said != recorded:
+        raise LaneIdentityUnknown(f"the launch names worker {said or '<core>'} but the row names "
+                                  f"{recorded or '<core>'}")
+    if recorded:
+        owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
+        if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
+            raise LaneIdentityUnknown(f"worker {recorded}'s agent is held by {row.get('owner_mxid') or 'no owner'}, "
+                                      "not the core's owner")
+    return recorded, None
+
+
 def lane_worker(instance: str, workspace: Optional[Path] = None) -> str:
     """The pool worker whose own identity the lane `instance` runs as; "" for a core lane, or when unreadable."""
     if not instance:
@@ -2492,6 +2528,7 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"],
                      "agent_mxid": r.get("agent_mxid") or "",
+                     **({"worker": r["worker"]} if r.get("worker") else {}),
                      **({"not_before": r["not_before"]} if r.get("not_before") is not None else {})})
     for inst, var in env_token_vars(environ):
         if inst in seen_inst or var in seen_ref:
@@ -2577,12 +2614,15 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
         NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
+        LANE_WORKER_ENV: str(entry.get("worker") or ""),
     })
     return env
 
 
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
 NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+# The worker a lane runs as (a row's `worker`), empty for a core lane: the lane's start check.
+LANE_WORKER_ENV = "SUTANDO_LANE_WORKER"
 
 
 def backlog_reason(task: Mapping[str, object], not_before: object) -> Optional[str]:

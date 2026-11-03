@@ -487,9 +487,17 @@ LANE_SERVER = _ag2space_lane_server
 
 
 def _lane_worker() -> str:
-    """The pool worker whose own agent this lane runs as (its connection row's `worker`), or ""."""
-    from connections import lane_worker
-    return lane_worker(GATEWAY_INSTANCE, WS)  # noqa: F821
+    """The pool worker whose own agent this lane runs as, or "": exits rather than start a lane
+    that cannot tell, since a worker's lane run as the core's would post the core's messages."""
+    from connections import LaneIdentityUnknown, lane_worker_at_start
+    try:
+        worker, problem = lane_worker_at_start(GATEWAY_INSTANCE, os.environ, WS)  # noqa: F821
+    except LaneIdentityUnknown as e:
+        _log(f"FATAL: lane {GATEWAY_INSTANCE} refuses to start: {e}")  # noqa: F821
+        sys.exit(f"FATAL: lane {GATEWAY_INSTANCE} refuses to start: {e}")  # noqa: F821
+    if problem:
+        _log(f"ERROR: lane {GATEWAY_INSTANCE}: {problem} (worker {worker})")  # noqa: F821
+    return worker
 
 
 def _worker_lane_claims_nothing(path: Path) -> bool:
