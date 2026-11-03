@@ -178,6 +178,23 @@ class TestCli(Base):
                                                 "archive": 1, "keep": {"pending": 1}})
         self.assertEqual(self.live_names(), ["task-done.txt", "task-open.txt"])
 
+    def _main(self, *argv):
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pd.main(["--workspace", str(self.root), *argv])
+        return rc, json.loads(buf.getvalue())
+
+    def test_main_in_process_dry_run_and_run(self):
+        self.answered("task-done"); self.archived("task-done"); self.sentinel("task-done")
+        self.live("task-open"); self.sentinel("task-open")
+        rc, out = self._main("archive-finished", W, "--dry-run")
+        self.assertEqual((rc, out["archive"], out["keep"]), (0, 1, {"pending": 1}))
+        self.assertEqual(self.archived_names(), [])
+        rc, out = self._main("--recipient", W, "archive-finished")
+        self.assertEqual((rc, out["recipient"], out["archived"], out["dry_run"]), (0, W, 1, False))
+        self.assertEqual(self.archived_names(), ["task-done.txt"])
+
     def test_run_reports_what_it_moved(self):
         self.answered("task-done"); self.archived("task-done"); self.sentinel("task-done")
         r = subprocess.run([sys.executable, str(SCRIPTS / "pool_delivery.py"), "--workspace", str(self.root),
