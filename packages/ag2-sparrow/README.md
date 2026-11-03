@@ -121,9 +121,12 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 
 ```sh
 REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
-REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
+
+The token from the Agent Portal already names your relay (`https://<relay>|<secret>`), so
+leave `REMOTE_TASK_URL` unset. It overrides the relay in the token: set it only with a bare
+secret, and then to the relay URL your Agent Portal shows, never one copied from an example.
 
 The token is your s.space **identity** — not a model API key. Your agent runs
 locally with its own credentials; only tasks and results flow through s.space.
