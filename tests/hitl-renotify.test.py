@@ -1,6 +1,8 @@
 """Follow-up notices: a still-unresolved blocking requirement re-alerts as a NEW message
 on a 30m / 2h / 6h backoff, announces recovery, and keeps its schedule across a restart."""
 
+import ast
+import json
 import sys
 import tempfile
 import unittest
@@ -360,8 +362,40 @@ class RenotifyTests(unittest.TestCase):
                 self.assertEqual(renotify.seat_key(req), (req.runtime, schema.device_id(req)))
         hitl_dir = Path(__file__).resolve().parent.parent / "src" / "hitl"
         copies = [p.name for p in sorted(hitl_dir.glob("*.py"))
-                  if p.name != "schema.py" and '(req.device or {}).get("id")' in p.read_text(encoding="utf-8")]
+                  if p.name != "schema.py" and _derives_a_device_id(p.read_text(encoding="utf-8"))]
         self.assertEqual(copies, [], "derive a device id only through schema.device_id")
+
+    def test_the_driver_action_names_the_device_as_the_seat_does(self):
+        from hitl import replies, schema
+        for device in (None, {}, {"id": ""}, {"id": 7}, {"id": "dev-a", "socket": "/s"}):
+            with self.subTest(device=device):
+                req = blocking()
+                req.device = device
+                path = replies.write_driver_action(Path(self.tmp.name), req, req.actions[0])
+                self.assertEqual(json.loads(path.read_text())["session"], schema.device_id(req))
+
+    def test_the_guard_sees_a_device_id_spelled_across_two_lines(self):
+        split = 'device = req.device or {}\nbody = {"session": str(device.get("id") or "")}\n'
+        self.assertTrue(_derives_a_device_id(split))
+        self.assertTrue(_derives_a_device_id('x = str((req.device or {}).get("id") or "")\n'))
+        self.assertFalse(_derives_a_device_id('seat = str((req.device or {}).get("name") or "")\n'))
+
+
+def _derives_a_device_id(source: str) -> bool:
+    """Whether `source` reads `.get("id")` off a `.device` expression or a name bound from one."""
+    tree = ast.parse(source)
+
+    def from_device(node) -> bool:
+        return any(isinstance(n, ast.Attribute) and n.attr == "device" for n in ast.walk(node))
+    bound = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and from_device(n.value)
+             for t in n.targets if isinstance(t, ast.Name)}
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get"
+                and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == "id"):
+            recv = n.func.value
+            if from_device(recv) or (isinstance(recv, ast.Name) and recv.id in bound):
+                return True
+    return False
 
 
 if __name__ == "__main__":
