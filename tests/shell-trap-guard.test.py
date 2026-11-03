@@ -57,7 +57,6 @@ class Rules(unittest.TestCase):
         self.assertFires("cd /tmp && timeout 10 make", "timeout", stg.BLOCK)
         self.assertFires("out=$(timeout 3 ls)", "timeout", stg.BLOCK)
         self.assertFires("FOO=1 timeout 3 ls", "timeout", stg.BLOCK)
-        self.assertFires("/usr/bin/timeout 3 ls", "timeout", stg.BLOCK)
 
     def test_timeout_negatives(self):
         self.assertSilent("gtimeout 5 curl -s x")
@@ -67,6 +66,44 @@ class Rules(unittest.TestCase):
         self.assertSilent("cat <<'EOF' > f.py\ntimeout 5 x\nEOF")
         self.assertSilent("grep -n timeout file.py")
         self.assertSilent("ls  # timeout 5 x")
+
+    def test_timeout_guarded_by_a_probe_is_allowed(self):
+        self.assertSilent("command -v timeout >/dev/null && timeout 5 ls")
+        self.assertSilent("if command -v timeout >/dev/null; then timeout 5 ls; else ls; fi")
+        self.assertSilent("type timeout && timeout 5 ls")
+        self.assertSilent("which timeout >/dev/null 2>&1 && timeout 5 ls || ls")
+        self.assertFires("command -v gtimeout && timeout 5 ls", "timeout", stg.BLOCK)
+        self.assertFires("command timeout 5 ls", "timeout", stg.BLOCK)
+
+    def test_command_by_path_is_checked_against_that_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            bsd, gnu = Path(d, "bsd"), Path(d, "gnubin")
+            bsd.mkdir(), gnu.mkdir()
+            for tool in ("sed", "base64", "timeout"):
+                (gnu / tool).write_text("")
+            for tool in ("sed", "base64"):
+                (bsd / tool).write_text("")
+            (gnu / "link-sed").mkdir()
+            os.symlink(bsd / "sed", gnu / "link-sed" / "sed")
+            with mock.patch.object(stg, "BSD_DIR", str(bsd)):
+                self.assertSilent(f"{gnu}/timeout 5 ls")
+                self.assertSilent(f"{bsd}/timeout 5 ls")  # no BSD timeout exists
+                self.assertSilent(f"{gnu}/sed -i 's/a/b/' f")
+                self.assertSilent(f"{gnu}/base64 f")
+                self.assertSilent(f"{d}/missing/sed -i 's/a/b/' f")
+                self.assertFires(f"{bsd}/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
+                self.assertFires(f"{bsd}/base64 f", "base64_file", stg.BLOCK)
+                self.assertFires(f"{gnu}/link-sed/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
+                self.assertFires("sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)  # bare names: PATH gating
+
+    def test_gnubin_full_path_on_this_host(self):
+        self.assertSilent("/opt/homebrew/opt/coreutils/libexec/gnubin/timeout 5 ls")
+        self.assertSilent("/nonexistent/dir/sed -i 's/a/b/' f")
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.isfile("/usr/bin/sed"), "BSD sed")
+    def test_full_path_bsd_sed_is_blocked_on_macos(self):
+        self.assertFires("/usr/bin/sed -i 's/a/b/' f", "sed_inplace", stg.BLOCK)
+        self.assertSilent("/usr/bin/timeout 3 ls")
 
     def test_pgrep_positive(self):
         self.assertFires("pgrep -f voice-agent", "pgrep_self", stg.WARN)
@@ -192,6 +229,29 @@ class Hook(unittest.TestCase):
         cmd = "timeout 5 ls " + "x" * 3000
         _, log = self.run_hook(self.payload(cmd))
         self.assertEqual(json.loads(log.splitlines()[0])["command"], cmd[:2000])
+
+    def test_logged_command_redacts_secrets(self):
+        cmd = ('timeout 5 curl -H "Authorization: Bearer sk-live-abc123" --token tok999 '
+               "--password=pw777 x && GH_TOKEN=ghp_secret1 API_KEY='k3y' password=hunter2 ls")
+        p, log = self.run_hook(self.payload(cmd))
+        self.assertEqual(p.returncode, 2)
+        logged = json.loads(log.splitlines()[0])["command"]
+        for secret in ("sk-live-abc123", "tok999", "pw777", "ghp_secret1", "k3y", "hunter2"):
+            self.assertNotIn(secret, logged)
+        self.assertIn("timeout 5 curl", logged)
+        self.assertIn("[REDACTED]", logged)
+
+    def test_missing_or_broken_scanner_fails_open(self):
+        for scanner in (None, "raise ImportError('boom')\n", "def (:\n"):
+            with tempfile.TemporaryDirectory() as d:
+                hook = Path(d, "shell-trap-guard.py")
+                hook.write_text(HOOK.read_text())
+                if scanner is not None:
+                    Path(d, "_shell_scan.py").write_text(scanner)
+                env = dict(os.environ, SHELL_TRAP_GUARD_RULES=",".join(sorted(ALL)))
+                p = subprocess.run([sys.executable, str(hook)], input=self.payload("timeout 5 ls"),
+                                   capture_output=True, text=True, env=env, timeout=30)
+                self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""), scanner)
 
     def test_warn_json(self):
         p, log = self.run_hook(self.payload("pgrep -f foo"))

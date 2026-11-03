@@ -3,7 +3,8 @@
 fail, or quietly do the wrong thing, on a macOS/zsh host.
 
 Blocks (exit 2, the fix on stderr), each only where the host tool is the BSD one:
-  timeout      `timeout ...` when no `timeout` is on PATH (stock macOS has none)
+  timeout      `timeout ...` when no `timeout` is on PATH (stock macOS has none) and the
+               command does not probe for it (`command -v timeout && ...`)
   sed_inplace  GNU `sed -i` / `--in-place` without a suffix, with /usr/bin/sed on macOS
   base64_file  GNU `base64 <file>`, with /usr/bin/base64 on macOS
 Warns (exit 0, JSON ``additionalContext``; the call still runs):
@@ -12,11 +13,15 @@ Warns (exit 0, JSON ``additionalContext``; the call still runs):
   for_unquoted_var  `for x in $VAR` where VAR holds command output, when $SHELL is zsh
                     (zsh does not word-split it, so the loop runs once)
 
+A command named by path (`<dir>/timeout`) is checked against that path, not
+PATH: it is blocked only when it resolves to the BSD tool in /usr/bin.
+
 Tokenizes with the shared ``_shell_scan`` scanner, so quoted text, comments and
 heredoc bodies are data rather than commands.
 
 Each hit is appended as JSONL to ``<workspace>/state/guards/shell_trap_hits.jsonl``
-(``SHELL_TRAP_GUARD_LOG`` overrides the path). The workspace comes from
+(``SHELL_TRAP_GUARD_LOG`` overrides the path), with token, key, password and
+Authorization values redacted. The workspace comes from
 ``workspace_default.resolve_workspace`` under a CONFIGURED repo root: ``--repo <path>``
 in the registration, else ``$SUTANDO_REPO_ROOT``. With neither, nothing is logged
 and the guard still decides.
@@ -35,11 +40,23 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _shell_scan  # noqa: E402  (sibling module; path set above)
+try:
+    import _shell_scan  # noqa: E402  (sibling module; path set above)
+except Exception:
+    _shell_scan = None  # decide() then allows everything
 
 BLOCK, WARN = "blocked", "warned"
 ALL_RULES = ("timeout", "sed_inplace", "base64_file", "pgrep_self", "for_unquoted_var")
 LOG_CMD_CHARS = 2000
+BSD_DIR = "/usr/bin"
+PROBE_WORDS = {"command", "type", "which", "hash", "whence"}
+PROBE_SKIP = {"if", "elif", "!", "while", "until", "then", "do", "{", "&&", "||"}
+SECRET_RES = (
+    re.compile(r"(?i)(--(?:token|password|passwd|secret|api-?key|auth)(?:=|\s+))(\"[^\"]*\"|'[^']*'|\S+)"),
+    re.compile(r"(?i)(authorization:\s*)([^\"'\n]+)"),
+    re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._~+/=-]+)"),
+    re.compile(r"(?i)(\b\w*(?:token|key|secret|password|passwd)\w*=)(\"[^\"]*\"|'[^']*'|\S+)"),
+)
 
 PREFIX_WORDS = {"sudo", "command", "exec", "nohup", "time", "builtin", "then", "do", "else",
                 "elif", "if", "while", "until", "!", "{", "noglob", "nice"}
@@ -180,14 +197,41 @@ def _base(words):
     return os.path.basename(words[0]) if words else ""
 
 
+def _is_bsd(words, tool):
+    """words[0] runs `tool`: a bare name (PATH gating is host_rules'), or a path to the BSD one."""
+    if _base(words) != tool:
+        return False
+    if "/" not in words[0]:
+        return True
+    bsd = os.path.join(BSD_DIR, tool)
+    try:
+        return os.path.isfile(bsd) and os.path.realpath(words[0]) == os.path.realpath(bsd)
+    except (OSError, ValueError):
+        return False
+
+
+def probes_for(pipes, tool):
+    """True when a segment checks for `tool` (`command -v`, `type`, `which`, `hash`, `whence`)."""
+    for pipe in pipes:
+        for seg in pipe:
+            t = [w.text for w in seg]
+            while t and t[0] in PROBE_SKIP:
+                t = t[1:]
+            if not t or t[0] not in PROBE_WORDS or tool not in t[1:]:
+                continue
+            if t[0] != "command" or any(a in ("-v", "-V") for a in t[1:]):
+                return True
+    return False
+
+
 def check_timeout(words):
-    if _base(words) == "timeout" and len(words) > 1:
+    if _is_bsd(words, "timeout") and len(words) > 1:
         return MSG["timeout"]
     return None
 
 
 def check_sed(words):
-    if _base(words) != "sed":
+    if not _is_bsd(words, "sed"):
         return None
     for j, t in enumerate(words[1:], 1):
         if t.startswith("--in-place"):
@@ -200,7 +244,7 @@ def check_sed(words):
 
 
 def check_base64(words):
-    if _base(words) != "base64":
+    if not _is_bsd(words, "base64"):
         return None
     args, j, positional = words[1:], 0, False
     while j < len(args):
@@ -261,6 +305,8 @@ def analyze(cmd, rules=None):
     body = strip_heredocs(cmd)
     pipes = pipelines(body)
     hits, seen = [], set()
+    if "timeout" in rules and probes_for(pipes, "timeout"):
+        rules = rules - {"timeout"}
     for pipe in pipes:
         for seg in pipe:
             words = command_words(seg)
@@ -307,6 +353,12 @@ def log_path(argv):
     return os.path.join(str(ws), "state", "guards", "shell_trap_hits.jsonl")
 
 
+def redact(cmd):
+    for rx in SECRET_RES:
+        cmd = rx.sub(lambda m: m.group(1) + "[REDACTED]", cmd)
+    return cmd
+
+
 def log_hits(hits, cmd, argv):
     try:
         path = log_path(argv)
@@ -317,14 +369,14 @@ def log_hits(hits, cmd, argv):
         with open(path, "a") as f:
             for rule, action, _ in hits:
                 f.write(json.dumps({"ts": ts, "rule": rule, "action": action,
-                                    "command": cmd[:LOG_CMD_CHARS]}) + "\n")
+                                    "command": redact(cmd)[:LOG_CMD_CHARS]}) + "\n")
     except Exception:
         pass
 
 
 def decide(raw, argv=()):
     """(exit_code, stdout_text, stderr_text) for one hook invocation."""
-    if os.environ.get("SHELL_TRAP_GUARD_DISABLE") == "1":
+    if os.environ.get("SHELL_TRAP_GUARD_DISABLE") == "1" or _shell_scan is None:
         return 0, "", ""
     data = json.loads(raw)
     if data.get("tool_name", "Bash") != "Bash":

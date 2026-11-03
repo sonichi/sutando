@@ -318,8 +318,9 @@ host** before they run. Three are **blocked** (exit 2, the fix on stderr), each 
 where the host's tool is the BSD one, so a Linux host or a GNU tool first on `PATH` is
 not blocked:
 
-- `timeout ...` when no `timeout` is on `PATH` (stock macOS has none) — use the Bash
-  tool's `timeout` parameter or a Python `subprocess.run(..., timeout=N)`;
+- `timeout ...` when no `timeout` is on `PATH` (stock macOS has none) and the command
+  does not probe for it (`command -v` / `type` / `which` / `hash timeout`) — use the
+  Bash tool's `timeout` parameter or a Python `subprocess.run(..., timeout=N)`;
 - GNU `sed -i` / `--in-place` with no suffix argument, with `/usr/bin/sed` on macOS —
   use `sed -i '' ...`;
 - GNU `base64 <file>`, with `/usr/bin/base64` on macOS — use `base64 -i <file>` or
@@ -334,19 +335,27 @@ Two are **warned** (exit 0, JSON `additionalContext`; the call still runs):
 - `for x in $VAR` where `VAR` was assigned from `$(...)` or backticks, when `$SHELL` is
   zsh: zsh does not word-split it, so the loop runs once over the whole output.
 
+A command named by path (`/opt/homebrew/opt/coreutils/libexec/gnubin/timeout`) is
+judged by that path, not by the hook's `PATH`: it is blocked only when it resolves to
+the BSD tool in `/usr/bin` (so a path `timeout` is never blocked on macOS).
+
 The command is read with the shared `_shell_scan` scanner, so quoted text, comments
 and heredoc bodies are data, not commands.
 
 Each hit is appended to `<workspace>/state/guards/shell_trap_hits.jsonl`
 (`{ts, rule, action, command}`, command cut at 2000 characters so false positives can
-be audited); `SHELL_TRAP_GUARD_LOG` overrides the path. The workspace comes from
+be audited, with values after `--token`/`--password`, `Authorization:`, `Bearer ` and
+`*TOKEN=`/`*KEY=`/`password=` redacted); `SHELL_TRAP_GUARD_LOG` overrides the path. The workspace comes from
 `workspace_default.resolve_workspace` under the configured checkout (`--repo <path>`,
 else `$SUTANDO_REPO_ROOT`); with neither, nothing is logged and the guard still
 decides. `SHELL_TRAP_GUARD_RULES=pgrep_self,timeout` replaces the host-derived rule
 set; `SHELL_TRAP_GUARD_DISABLE=1` turns it off. Fail-OPEN on any internal error.
 
 **Known limits.** Five patterns only; a warning is advice and nothing records whether
-it was followed.
+it was followed. The hook sees only its own `PATH`, so a bare `timeout` that a
+`.zshrc`-only `PATH` or an earlier `brew install coreutils &&` would provide is still
+blocked; call it by path or probe for it first. `xargs sed -i` and `find -exec sed -i`
+are not caught.
 
 ### Registration
 
