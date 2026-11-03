@@ -89,7 +89,7 @@ def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[in
 
 
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
-    from .remote_gateway_bridge import _same_origin
+    from .remote_gateway_bridge import AGENT_ACCESS_MINT_PATH, _same_origin
     status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:
         detail = body.get("error") or "no detail"
@@ -98,6 +98,8 @@ def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
     # The relay secret goes only to the relay's own origin, as the bridge's own mint does.
     if not _same_origin(mint_url, relay_url):
         raise McpAuthError("mint_url is not on the relay's origin; the relay token is not sent there")
+    if urllib.parse.urlsplit(mint_url).path != AGENT_ACCESS_MINT_PATH:
+        raise McpAuthError(f"mint_url is not the relay's {AGENT_ACCESS_MINT_PATH}; the relay token is not sent there")
     return mint_url, _safe_url("mcp_url", body.get("mcp_url"))
 
 

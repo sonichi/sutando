@@ -239,7 +239,9 @@ It prints one `claude mcp add-json ag2-space '…'` line; run it. The server it 
 `{"Authorization": "Bearer <access token>"}`. Claude Code runs it at each connect and
 again after a 401, so an expired token is replaced; nothing is cached on disk. The
 relay token goes only to the relay's `/v1/mcp/discovery` and to the mint URL it names,
-which must be https; it never reaches the MCP server.
+which must be the relay's own `/api/v1/mcp/agent-access-tokens` (same scheme, host and port
+as the relay; https, or http only to loopback); any other mint URL is refused before the
+token is sent. It never reaches the MCP server.
 
 The helper reads the token the way `ag2-sparrow` does. When Sparrow read it from the
 `.env` named by `AG2_DEVICE_ENV`, the printed helper names that file. When it came from

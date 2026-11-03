@@ -152,6 +152,18 @@ class HeadersTest(unittest.TestCase):
             self.assertEqual([m for m, *_ in self.stub.seen], ["GET"], mint_url)
             self.assertNotIn(SECRET, err)
 
+    def test_a_mint_url_off_the_mint_path_is_refused_with_nothing_sent(self):
+        # Same origin is not enough: the token goes to the bridge's own mint path and nowhere else.
+        for path in ("/mint", "/api/v1/mcp/agent-access-tokens/../../admin", "/v1/other"):
+            self.stub.seen.clear()
+            self.stub.discovery = (200, {"mint_url": f"{self.stub.base}{path}",
+                                         "mcp_url": "https://mcp.example/mcp"})
+            rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
+            self.assertEqual((rc, out), (1, ""), path)
+            self.assertIn("/api/v1/mcp/agent-access-tokens", err)
+            self.assertEqual([m for m, *_ in self.stub.seen], ["GET"], path)
+            self.assertNotIn(SECRET, err)
+
     def test_unconfigured_discovery_fails_with_nothing_on_stdout(self):
         self.stub.discovery = (404, {"error": "mcp discovery not configured"})
         rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
@@ -181,7 +193,7 @@ class EdgeTest(unittest.TestCase):
         self.addCleanup(self.stub.close)
 
     def test_discovery_without_mcp_url_is_refused(self):
-        self.stub.discovery = (200, {"mint_url": f"{self.stub.base}/mint"})
+        self.stub.discovery = (200, {"mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens"})
         rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("without mcp_url", err)
