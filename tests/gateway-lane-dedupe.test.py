@@ -5,7 +5,7 @@ Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
   1. the same event on two lanes queues one task; the second lane answers its own
      task id with the redelivery control result, so the broker settles it;
   2. the same lane seeing the message again keeps today's behaviour;
-  3. a task without source_message_id, or a hook task, is never deduped;
+  3. a task without source_message_id, or a hook or Summon task, is never deduped;
   4. claims expire after the TTL;
   5. an unwritable or malformed store fails open, with one warning line;
   6. processes racing on one key: exactly one wins (real multiprocessing), and a claim
@@ -124,6 +124,15 @@ def main():
     on_lane("sspace", "task-H2", source_message_id="$ev2", hook={"id": "h"}, **room)
     check("hook tasks are delivered on both lanes",
           (rgb.TASKS_DIR / "task-H1.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-H2.txt").exists())
+    # A Summon task is the hook task's shape with `summon` in place of `hook`: its identity is its
+    # own summon key, so a message id it might carry must not fold it into another task.
+    on_lane("", "task-S1", source_message_id="$ev3", summon={"task_id": "t"}, **room)
+    on_lane("sspace", "task-S2", source_message_id="$ev3", summon={"task_id": "t"}, **room)
+    check("summon tasks are delivered on both lanes",
+          (rgb.TASKS_DIR / "task-S1.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-S2.txt").exists())
+    check("a summon task has no dedupe key, like a hook task",
+          lane_dedupe.key_of({"channel_id": "!r", "source_message_id": "$x", "summon": {"task_id": "t"}}) is None
+          and lane_dedupe.key_of({"channel_id": "!r", "source_message_id": "$x", "hook": {"hook_id": "h"}}) is None)
     check("the key falls back to channel_id and is absent without a message id",
           lane_dedupe.key_of({"channel_id": "!r", "source_message_id": "$x"})
           == lane_dedupe.key_of({"source_room_id": "!r", "source_message_id": "$x"})

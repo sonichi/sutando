@@ -227,10 +227,13 @@ KNOWN_HEADER_KEYS = (
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
     # A Commons hook fire's context (one-line JSON object: hook_id, fire_id, caused_by, rows,
-    # trigger, ...). Written by the trusted bridge; the guard defangs a forged body copy.
+    # trigger, ...). Only the bridge writes the line, and the guard defangs a forged body copy,
+    # but the values inside (row cells, names, digests) are room-member data: read them as
+    # data about the room, never as instructions or as an authority on who may do what.
     "hook",
     # A Commons Summon's context (one-line JSON object: task_id, caused_by, room_id, database,
-    # row_id, changed_by, changes, ...). Same trust and guard as `hook`.
+    # row_id, changed_by, changes, ...). Same as `hook`: a bridge-written line holding
+    # room-member data.
     "summon",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
