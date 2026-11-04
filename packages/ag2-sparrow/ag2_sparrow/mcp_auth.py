@@ -90,6 +90,7 @@ def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[in
 
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
     from .remote_gateway_bridge import AGENT_ACCESS_MINT_PATH, _same_origin
+    _safe_url("the relay URL", relay_url)  # the bearer goes to discovery first: same rule as mint_url
     status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:
         detail = body.get("error") or "no detail"
@@ -126,7 +127,7 @@ def headers(gateway: Gateway) -> dict:
     return {"Authorization": f"Bearer {mint(mint_url, bearer)}"}
 
 
-def _helper_command(env_file: str) -> str:
+def _helper_command(env_file: str, source_root: str = "") -> str:
     parts = []
     if env_file:
         parts.append(f"AG2_DEVICE_ENV={shlex.quote(env_file)}")
@@ -134,6 +135,12 @@ def _helper_command(env_file: str) -> str:
     if root.is_file():  # running from the zipapp
         parts.append(f"PYTHONPATH={shlex.quote(str(root))}")
         parts += [shlex.quote(sys.executable), "-m", "ag2_sparrow.mcp_auth", "headers"]
+        return " ".join(parts)
+    if source_root:
+        # A source checkout with no install: -I keeps the client's cwd and PYTHONPATH off sys.path.
+        code = (f"import sys; sys.path.insert(0, {source_root!r}); "
+                "from ag2_sparrow.mcp_auth import main; raise SystemExit(main(['headers']))")
+        parts += [shlex.quote(sys.executable), "-I", "-c", shlex.quote(code)]
         return " ".join(parts)
     # The console script, not `python -m`: -m puts the client's cwd first on sys.path.
     script = Path(sys.executable).with_name("ag2-sparrow-mcp")
@@ -144,10 +151,18 @@ def _helper_command(env_file: str) -> str:
     return " ".join(parts)
 
 
-def setup_lines(gateway: Gateway) -> list:
+def setup_entry(gateway: Gateway, source_root: str = "") -> dict:
+    """The Claude Code MCP entry: the discovered MCP URL, authorized by the `headers` helper.
+
+    `source_root` is a source checkout's packages/ag2-sparrow, for a client with no install."""
     url, bearer, env_file = _require(gateway)
     _mint_url, mcp_url = discover(url, bearer)
-    cfg = {"type": "http", "url": mcp_url, "headersHelper": _helper_command(env_file)}
+    return {"type": "http", "url": mcp_url, "headersHelper": _helper_command(env_file, source_root)}
+
+
+def setup_lines(gateway: Gateway) -> list:
+    _url, _bearer, env_file = _require(gateway)
+    cfg = setup_entry(gateway)
     lines = ["# Run in the agent's project: its Claude Code then acts in AG2 Space as this agent.",
              f"claude mcp add-json {SERVER_NAME} {shlex.quote(json.dumps(cfg))}"]
     if not env_file:
