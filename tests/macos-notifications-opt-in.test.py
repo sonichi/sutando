@@ -185,12 +185,14 @@ class ShellSender(unittest.TestCase):
 
 
 class AlwaysIsReservedForTheChannellessAlert(unittest.TestCase):
-    """The ungated entrypoint is a symlink to the gated helper; only the no-workspace alert names it."""
+    """The ungated entrypoint is a thin real file over the helper; only the no-workspace alert names it."""
 
-    def test_always_entrypoint_is_the_helper(self):
-        link = REPO / "src" / "macos-notify-always.sh"
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(link.resolve(), (REPO / "src" / "macos-notify.sh").resolve())
+    def test_always_entrypoint_is_a_real_file_that_calls_the_helper(self):
+        entry = REPO / "src" / "macos-notify-always.sh"
+        self.assertFalse(entry.is_symlink(), "packaging may drop symlinks")
+        text = entry.read_text()
+        self.assertIn("macos-notify.sh", text)
+        self.assertNotIn("osascript", text)
 
     def test_only_the_gateway_no_workspace_alert_uses_it(self):
         users = []
@@ -220,7 +222,6 @@ SHELL_SENDERS = (
 # Every file allowed to spell an osascript notification, and the gate it must carry.
 GATED_SENDERS = {
     "src/macos-notify.sh": "sutando-config.sh\" macos-notifications",
-    "src/macos-notify-always.sh": "sutando-config.sh\" macos-notifications",
     "src/sutando_platform.py": "resolve_macos_notifications()",
     "src/platform.ts": "resolveMacosNotifications()",
     "src/health-check.py": "resolve_macos_notifications()",
