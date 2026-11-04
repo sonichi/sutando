@@ -2,14 +2,15 @@
 
 The service manager (systemd --user, launchd) is the only supervisor; the work-root flock is occupancy
 and the holder record attribution, never readiness. `install` is a quiescent replacement under one
-per-shape operation lock: stop the job and prove it absent, prove the old root free, write the config
+per-job operation lock: stop the job and prove it absent, prove the old root free, write the config
 and the unit (tmp + replace), register and start, then require the root held by a fresh holder of this
 shape; anything less is one line and the files as written, so an identical install is the retry.
 `uninstall` stops, proves absent, proves the root free, removes the unit, reloads, and the config last.
 An unknown probe authorises nothing. The launcher holds the lock for its own life only, spawns the
 session as its direct child against `tasks` under the held root inode, signals only that child while
 it is unreaped, and leaves the rest of the process tree to the manager (systemd's control group,
-launchd's process group): nothing a descendant does can hold the root.
+launchd's process group): nothing a descendant does can hold the root. An agent installed on its own
+root is a job of its own (`Shape.agent`, its key); an earlier release's single job keeps its fixed name.
 
 Package level, parametrised by a Shape the adapter passes in: this module names no adapter and imports
 none, so each adapter owns its console script and the boundary rule holds. Stdlib only.
@@ -17,9 +18,11 @@ none, so each adapter owns its console script and the boundary rule holds. Stdli
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import fcntl
 import getpass
+import hashlib
 import json
 import os
 import platform
@@ -43,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import _dirs, diagnostics, gateway_credential_sources as _sources, gateway_instance, service_manager as _sm
+from . import agent_identity
 from . import setup_fetch, task_io
 from .bounded_file_read import read_regular
 from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock  # noqa: F401
@@ -70,6 +74,12 @@ DEBUG_SUFFIX = ".debug"
 # Set by the unit and the plist in the launcher's environment; `run` refuses without it, so a hand
 # start never takes the root inside the manager's teardown window. A guard, not a security boundary.
 MANAGED_VAR = "AG2_SPARROW_MANAGED"
+# The agent key of the job whose unit sets it, so `run` reads that agent's config; unset: the single-agent job.
+AGENT_VAR = "AG2_SPARROW_AGENT"
+AGENTS_DIR = "agents"   # under the config dir: one dir per agent key, holding each adapter's config
+AGENT_KEY_MAX = 24      # keeps claude-local's tmux socket, under the agent's config dir, within the path limit
+AGENT_KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,%d}" % (AGENT_KEY_MAX - 1))
+AGENT_ID_RE = re.compile(r"@[^\s:]+:\S+")
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,12 @@ class Shape:
     # tree (a tmux pane), proven from the shape's records; None when it cannot be proven.
     holder_launcher: object = None
     writer: str = ""        # the install that writes the unit, when it is not `command`'s own
+    agent: str = ""         # the agent key of a per-agent job; '' is the single-agent job of earlier installs
+
+    @property
+    def job(self) -> str:
+        """The job's own name: `name`, plus `.<agent key>` for a per-agent job."""
+        return f"{self.name}.{self.agent}" if self.agent else self.name
 
     @property
     def marker(self) -> str:
@@ -112,24 +128,33 @@ class Shape:
 
     @property
     def service_name(self) -> str:
-        return f"ag2-sparrow-{self.name}.service"
+        return f"ag2-sparrow-{self.job}.service"
 
     @property
     def agent_label(self) -> str:
-        return f"ai.ag2.sparrow.{self.name}"
+        return f"ai.ag2.sparrow.{self.job}"
 
 
 def _home() -> Path:
     return Path(os.path.expanduser("~"))
 
 
+def config_root() -> Path:
+    return _home() / ".config" / "ag2-sparrow"
+
+
+def config_dir(shape: Shape) -> Path:
+    """Where the job's config, operation lock and run files live: the agent's own dir for a per-agent job."""
+    return config_root() / AGENTS_DIR / shape.agent if shape.agent else config_root()
+
+
 def config_path(shape: Shape) -> Path:
-    return _home() / ".config" / "ag2-sparrow" / f"{shape.name}.conf"
+    return config_dir(shape) / f"{shape.name}.conf"
 
 
 def oplock_path(shape: Shape) -> Path:
-    """The per-shape operation mutex: a stable file, never unlinked."""
-    return _home() / ".config" / "ag2-sparrow" / f"{shape.name}.oplock"
+    """The per-job operation mutex: a stable file, never unlinked."""
+    return config_dir(shape) / f"{shape.name}.oplock"
 
 
 def service_path(shape: Shape) -> Path:
@@ -141,7 +166,7 @@ def plist_path(shape: Shape) -> Path:
 
 
 def log_path(shape: Shape) -> Path:
-    return _home() / "Library" / "Logs" / "ag2-sparrow" / f"{shape.name}.log"
+    return _home() / "Library" / "Logs" / "ag2-sparrow" / f"{shape.job}.log"
 
 
 def is_macos() -> bool:
@@ -158,6 +183,90 @@ def supervisor_marker(shape: Shape) -> str:
 
 def job_name(shape: Shape) -> str:
     return shape.agent_label if is_macos() else shape.service_name
+
+
+# ── one job per agent ────────────────────────────────────────────────────────
+
+def agent_key(agent_id: str) -> str:
+    """The agent's job key: its root segment when that is short enough, else a readable prefix and a digest
+    of the id. A valid launchd label part, systemd unit name part and path segment."""
+    segment = agent_identity.root_segment(agent_id)
+    if AGENT_KEY_RE.fullmatch(segment):
+        return segment
+    digest = hashlib.sha256(agent_id.strip().encode("utf-8")).hexdigest()[:10]
+    return f"{segment[:AGENT_KEY_MAX - 11].rstrip('._-') or 'agent'}-{digest}"
+
+
+def for_key(shape: Shape, key: str) -> Shape:
+    return dataclasses.replace(shape, agent=key)
+
+
+def recorded_agent(shape: Shape) -> str:
+    """The AGENT_ID the job's config records; '' for none, or for a config that cannot be read."""
+    try:
+        return read_config(config_path(shape)).get("AGENT_ID", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def job_for(shape: Shape, agent_id: str) -> Shape:
+    """The job serving `agent_id`: an earlier install's single-agent job while its config names this agent
+    (it keeps its job, and is verified and removed as it is), else the agent's own."""
+    single = for_key(shape, "")
+    return single if recorded_agent(single) == agent_id else for_key(shape, agent_key(agent_id))
+
+
+def installed_jobs(shape: Shape) -> list:
+    """Every job of this adapter on this host, the single-agent one first: its config or its unit is there."""
+    single, agents = for_key(shape, ""), config_root() / AGENTS_DIR
+    head, tail = supervisor_path(for_key(shape, "*")).name.split("*")
+    keys = set()
+    with contextlib.suppress(OSError):
+        keys.update(k for k in sorted(os.listdir(agents))[:256] if os.path.lexists(agents / k / f"{shape.name}.conf"))
+    with contextlib.suppress(OSError):
+        keys.update(n[len(head):-len(tail)] for n in sorted(os.listdir(supervisor_path(single).parent))[:1024]
+                    if n.startswith(head) and n.endswith(tail) and len(n) > len(head) + len(tail))
+    jobs = [single] if os.path.lexists(config_path(single)) or os.path.lexists(supervisor_path(single)) else []
+    return jobs + [for_key(shape, k) for k in sorted(keys) if AGENT_KEY_RE.fullmatch(k)]
+
+
+def job_label(shape: Shape) -> str:
+    return f"{recorded_agent(shape) or 'no agent recorded'} ({job_name(shape)})"
+
+
+def select_job(shape: Shape, agent_id: str = "") -> "tuple[Shape | None, str]":
+    """(the job a command acts on, ''): --agent's, else the only one installed (with none, the single-agent
+    job, which says it is not installed); several and no --agent is (None, the refusal naming each)."""
+    agent_id = (agent_id or "").strip()
+    if agent_id:
+        if not AGENT_ID_RE.fullmatch(agent_id):
+            return None, f"--agent {agent_id} is not a Matrix ID (@name:server)"
+        return job_for(shape, agent_id), ""
+    jobs = installed_jobs(shape)
+    if len(jobs) <= 1:
+        return (jobs or [for_key(shape, "")])[0], ""
+    return None, (f"{len(jobs)} agents are installed with {shape.command}: "
+                  + ", ".join(job_label(j) for j in jobs) + "; pass --agent <Matrix ID>")
+
+
+def job_from_env(shape: Shape, environ=None) -> "tuple[Shape | None, str]":
+    """The job `run` serves: the one whose unit set AGENT_VAR, else the single-agent job."""
+    key = (os.environ if environ is None else environ).get(AGENT_VAR, "")
+    if key and not AGENT_KEY_RE.fullmatch(key):
+        return None, f"{AGENT_VAR}={key!r} is not an agent key; run {shape.command} install again"
+    return for_key(shape, key), ""
+
+
+def list_jobs(shape: Shape) -> int:
+    """`list`: each installed agent, its job, the manager's word for it and its work root."""
+    jobs = installed_jobs(shape)
+    if not jobs:
+        print(f"no agent is installed with {shape.command}")
+    for job in jobs:
+        cfg, problem = owned_config(job)
+        print(f"{recorded_agent(job) or '-'}  {job_name(job)}  {manager_detail(job)}  "
+              f"{(cfg or {}).get('ROOT') or problem or 'no config'}")
+    return 0
 
 
 # ── the version pin ──────────────────────────────────────────────────────────
@@ -358,12 +467,18 @@ def _unit_env(key: str, value: str) -> str:
     return f'Environment="{key}={value}"\n'
 
 
+def job_env(shape: Shape, env=None) -> dict:
+    """The job's own variables: `env`, plus the agent key a per-agent job's `run` reads its config by
+    (not a unit another install writes, such as the agent's bridge, whose command reads no config)."""
+    return dict(env or {}, **({AGENT_VAR: shape.agent} if shape.agent and not shape.writer else {}))
+
+
 def render_service(shape: Shape, exec_start: str, env=None) -> str:
     """KillMode=control-group tears the whole cgroup down on stop; KillMode=process signals only the
     launcher and leaves a tmux-hosted session for the launcher's own stop path (then SIGKILL at
     TimeoutStopSec). `env` adds the job's own variables, one quoted line each."""
     args = "".join(f" {a}" for a in shape.service_args)
-    extra = "".join(_unit_env(k, v) for k, v in sorted((env or {}).items()))
+    extra = "".join(_unit_env(k, v) for k, v in sorted(job_env(shape, env).items()))
     return (f"{shape.marker}\n[Unit]\nDescription=ag2-sparrow {shape.name} ({shape.description})\n"
             "# A session that dies 5 times in 5 minutes (e.g. a bad login) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
@@ -380,7 +495,7 @@ def render_plist(shape: Shape, exec_start: str, path_env: str, log: str, env=Non
     body = {"Label": shape.agent_label, "ProgramArguments": [exec_start, *shape.run_args], "RunAtLoad": True,
             "KeepAlive": keep_alive, "ThrottleInterval": THROTTLE_S, "AbandonProcessGroup": False,
             "ExitTimeOut": shape.stop_timeout_s,
-            "EnvironmentVariables": dict(env or {}, PATH=path_env, **{MANAGED_VAR: "1"}),
+            "EnvironmentVariables": dict(job_env(shape, env), PATH=path_env, **{MANAGED_VAR: "1"}),
             "StandardOutPath": log, "StandardErrorPath": log}
     text = plistlib.dumps(body, sort_keys=True).decode("utf-8")
     head, rest = text.split("\n", 1)
@@ -1088,14 +1203,14 @@ def stop_started(shape: Shape, root: str) -> str:
         _PENDING[threading.get_ident()].remove(pending)
         line = _undo_start(pending)
         return "" if STOPPED in line else line
-    started = _STARTED.get(shape.name)
+    started = _STARTED.get(shape.job)
     if started is None:
         return (f"no job started by this connect was recorded, so {job_name(shape)} was left as it is: stop it by "
                 f"hand ({stop_command(shape)})")
     line = _undo_start(started)
     if STOPPED not in line:
         return line
-    _STARTED.pop(shape.name, None)
+    _STARTED.pop(shape.job, None)
     return ""
 
 
@@ -1303,7 +1418,7 @@ def abort_pending(root) -> None:
 
 def pending_start(shape: Shape) -> "dict | None":
     """The start this thread's operation made for `shape` and has not settled yet."""
-    return next((p for p in _PENDING.get(threading.get_ident(), []) if p["shape"].name == shape.name), None)
+    return next((p for p in _PENDING.get(threading.get_ident(), []) if p["shape"].job == shape.job), None)
 
 
 def settle(root, rc: int) -> int:
@@ -1337,7 +1452,7 @@ def await_started() -> int:
             failed = 1
             print(f"error: {why}{p['advice']}; {undone}", file=sys.stderr)
             continue
-        _STARTED[shape.name] = dict(p, undo=[])
+        _STARTED[shape.job] = dict(p, undo=[])
         linger(shape)
         holder = p["holder"]
         print(f"the managed launcher acquired the expected root: {root} "
@@ -1763,7 +1878,7 @@ def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
                 return _uninstall_locked(shape, before_free, token_file)
         except Busy as e:
             return _refuse(str(e))
-    return _refuse(f"{shape.name}'s configured root changed while uninstall waited for its lock; nothing was "
+    return _refuse(f"{shape.job}'s configured root changed while uninstall waited for its lock; nothing was "
                    f"removed; run {shape.command} uninstall again")
 
 
@@ -1784,7 +1899,7 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
     if manager == "unknown":
         return _refuse(f"{job_name(shape)}'s state is unknown; nothing was removed", recovery_lines(shape, root) if root else ())
     if unit is None and cfg is None and manager == "absent":
-        print(f"nothing to remove: {shape.name} is not installed")
+        print(f"nothing to remove: {shape.job} is not installed")
         print(kept_line(shape, relay))
         return 0
     kept = (f"{sup} and {conf} were" if unit is not None and cfg else f"{conf} was" if cfg else

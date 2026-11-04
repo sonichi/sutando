@@ -357,10 +357,11 @@ ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks f
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
-ag2-sparrow-claude-local verify
-ag2-sparrow-claude-local attach          # the live pane; detach with the tmux prefix + d
-ag2-sparrow-claude-local stop --confirm  # confirm an open stall card's Stop on this machine
-ag2-sparrow-claude-local uninstall
+ag2-sparrow-claude-local verify [--agent <@agent:server>]
+ag2-sparrow-claude-local attach [--agent <@agent:server>]   # the live pane; detach with the tmux prefix + d
+ag2-sparrow-claude-local stop --confirm [--agent <@agent:server>]  # confirm an open stall card's Stop here
+ag2-sparrow-claude-local uninstall [--agent <@agent:server>]
+ag2-sparrow-claude-local list            # each agent installed here, its job and its state
 ```
 
 The session loads the ag2space-inbox plugin this package ships;
@@ -420,6 +421,28 @@ Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
 one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
+
+**Several agents on one host.** Each agent installed on its own root (no
+`--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`
+(systemd: `ag2-sparrow-claude-local.<agent key>.service`), its bridge
+`…claude-local-bridge.<agent key>`, and its config, operation lock, tmux socket
+and launcher log under `~/.config/ag2-sparrow/agents/<agent key>/`. The unit
+sets `AG2_SPARROW_AGENT=<agent key>`, so `run` reads that agent's config. The
+agent key is the root segment when it is at most 24 characters, else a readable
+prefix and 10 hex of the id's sha256. `verify`, `uninstall`, `attach` and `stop`
+take `--agent <Matrix ID>`: with one agent installed it can be left out, with
+several the command refuses and lists them. `list` shows each installed agent,
+its job, the manager's state and its root. Installing, reinstalling (the
+restart) or uninstalling one agent never names another's job, and the per-agent
+operation lock is the agent lock, as before. An explicit root keeps the single
+fixed job.
+
+**From a single-agent install.** A job an earlier release installed keeps its
+fixed name (`ai.ag2.sparrow.claude-local`) for the agent its config names:
+`verify`, `install` (the restart) and `uninstall`, with or without `--agent`,
+act on it as before. Nothing is moved, and nothing is stopped by name. Other
+agents install beside it as jobs of their own. To give it a job of its own,
+`uninstall --agent <id>`, then `install` again.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the

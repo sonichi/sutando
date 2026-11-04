@@ -37,7 +37,7 @@ def bridge_shape(local: cm.Shape) -> cm.Shape:
     return cm.Shape(name=f"{local.name}-bridge", command="ag2-sparrow", writer=local.command,
                     description=f"the gateway bridge of the {local.name} agent", cli="ag2-sparrow",
                     min_version=(0, 0, 0), version_anchor="", version_note="", required_keys=(), config_keys=(),
-                    env_keep=(), kept="", run_args=(), service_args=())
+                    env_keep=(), kept="", run_args=(), service_args=(), agent=local.agent)
 
 
 def bridge_mode(cfg: dict) -> str:
@@ -187,50 +187,62 @@ def _unit_environ(text: str) -> dict:
             for m in re.finditer(r'^Environment="([A-Z_][A-Z0-9_]*)=(.*)"$', text, re.M)}
 
 
-def _named(name: str, command: str) -> cm.Shape:
+def _named(name: str, command: str, key: str = "") -> cm.Shape:
     return cm.Shape(name=name, command=command, description="", cli="", min_version=(0, 0, 0), version_anchor="",
-                    version_note="", required_keys=(), config_keys=(), env_keep=(), kept="")
+                    version_note="", required_keys=(), config_keys=(), env_keep=(), kept="", agent=key)
+
+
+def _config_paths() -> list:
+    """Each adapter's config on this host: the single-agent ones, then each agent's own."""
+    base = cm.config_root()
+    return sorted(base.glob("*.conf"))[:64] + sorted(base.glob(f"{cm.AGENTS_DIR}/*/*.conf"))[:256]
 
 
 def _other_bridges(local: cm.Shape, root, agent_id: str) -> dict:
-    """{adapter: (its command, its bridge mode, the agent it serves)} for each other adapter whose config or
-    bridge unit on this host names `root` or `agent_id` (root None: any agent)."""
+    """{job: (that job's Shape, its command, its bridge mode, the agent it serves)} for each other job on this
+    host whose config or bridge unit names `root` or `agent_id` (root None: any agent)."""
     def names(r, a):
         return root is None or r == root or bool(agent_id) and a == agent_id
-    found = {}
-    for path in sorted(cm.config_path(local).parent.glob("*.conf"))[:64]:
+    found, mine = {}, (local.name, local.agent)
+    for path in _config_paths():
+        job = _named(path.stem, "", path.parent.name if path.parent != cm.config_root() else "")
         text, _ = cm.file_text(path, "config")
         try:
             cfg = cm.read_config(path) if text else {}
         except (OSError, ValueError):
             cfg = {}
-        if path.stem != local.name and bridge_mode(cfg) != EXTERNAL and names(cfg.get("ROOT"), cfg.get("AGENT_ID")):
-            found[path.stem] = (_writer(text), bridge_mode(cfg), cfg.get("AGENT_ID") or cfg.get("ROOT"))
-    head, tail = cm.supervisor_path(bridge_shape(_named("*", ""))).name.split("*")
-    for path in sorted(cm.supervisor_path(bridge_shape(local)).parent.glob(f"{head}*{tail}"))[:64]:
-        name, (text, _) = path.name[len(head):-len(tail)], cm.file_text(path, "supervisor file")
+        if (job.name, job.agent) != mine and bridge_mode(cfg) != EXTERNAL and names(cfg.get("ROOT"), cfg.get("AGENT_ID")):
+            found[job.job] = (job, _writer(text), bridge_mode(cfg), cfg.get("AGENT_ID") or cfg.get("ROOT"))
+    head, tail = cm.supervisor_path(_named("*", "")).name.split("*")
+    for path in sorted(cm.supervisor_path(bridge_shape(local)).parent.glob(f"{head}*-bridge*{tail}"))[:256]:
+        base, _, key = path.name[len(head):-len(tail)].partition(".")
+        if not base.endswith("-bridge") or (key and not cm.AGENT_KEY_RE.fullmatch(key)):
+            continue
+        job = _named(base[:-len("-bridge")], "", key)
+        text, _ = cm.file_text(path, "supervisor file")
         env = _unit_environ(text or "")
         tasks = env.get("AGENT_CONNECT_TASK_DIR", "")
-        if name != local.name and tasks and names(os.path.dirname(tasks), env.get("AGENT_MXID")):
-            found.setdefault(name, (_writer(text), UNIT, env.get("AGENT_MXID") or tasks))
+        if (job.name, job.agent) != mine and tasks and names(os.path.dirname(tasks), env.get("AGENT_MXID")):
+            found.setdefault(job.job, (job, _writer(text), UNIT, env.get("AGENT_MXID") or tasks))
     return found
 
 
 def bridge_owner_problem(local: cm.Shape, root, agent_id: str = "") -> str:
-    """'' unless another adapter's bridge for this agent (root None: for any agent) is on this host or cannot
+    """'' unless another job's bridge for this agent (root None: for any agent) is on this host or cannot
     be shown gone: one agent is one bridge, whichever adapter runs it. A unit is gone once its file and job
     are; a host supervisor's declaration is the credential owner's to read, so only its uninstall clears it."""
-    for name, (command, mode, served) in sorted(_other_bridges(local, root, agent_id).items()):
-        other = bridge_shape(_named(name, command or f"ag2-sparrow-{name}"))
+    for _job, (job, command, mode, served) in sorted(_other_bridges(local, root, agent_id).items()):
+        other = bridge_shape(_named(job.name, command or f"ag2-sparrow-{job.name}", job.agent))
         where = cm.job_name(other) if mode == UNIT else f"declared for {mode}"
         gone = mode == UNIT and not os.path.lexists(cm.supervisor_path(other)) and cm.manager_state(other) == "absent"
         if not gone:
-            return (f"{served} already has a bridge, run by {name} ({where}); one agent is one bridge: run "
-                    f"{other.writer} uninstall first, then this command again")
+            which = f" --agent {served}" if job.agent and AGENT_ID_RE.fullmatch(served or "") else ""
+            return (f"{served} already has a bridge, run by {job.name} ({where}); one agent is one bridge: run "
+                    f"{other.writer} uninstall{which} first, then this command again")
     return ""
 
 
-AGENT_ID_RE = re.compile(r"@[^\s:]+:\S+")
+AGENT_ID_RE = cm.AGENT_ID_RE
 
 
 def connect_agent_problem(agent_id) -> str:
@@ -241,6 +253,14 @@ def connect_agent_problem(agent_id) -> str:
     if not AGENT_ID_RE.fullmatch(agent_id):
         return (f"--agent {agent_id} is not a Matrix ID (@name:server); copy the connect command from the "
                 "app again")
+    return ""
+
+
+def agent_arg_problem(given, agent_id: str) -> str:
+    """'' unless install's --agent names another agent than the one its token or root resolves to."""
+    given = (given or "").strip()
+    if given and given != agent_id:
+        return f"--agent {given} is not the agent this install serves ({agent_id or 'it names none'})"
     return ""
 
 
@@ -553,6 +573,7 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     The bearer never leaves the seat's token file."""
     agent_id = (agent_id or "").strip()
     problem = connect_agent_problem(agent_id)
+    local = local if problem else cm.job_for(local, agent_id)     # the agent's own job, or its earlier one
     problem = problem or (preflight() or cm.active_job_problem(local) or agent_owner_problem(local, agent_id)
                           or known_root_problem(local))
     code, why = cm.read_code(code_arg) if not problem else ("", "")

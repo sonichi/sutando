@@ -328,7 +328,7 @@ class UndoSeams:
                         with mock.patch.object(cm, "is_macos", return_value=mac):
                             rc, out, err = self.connect(self.backend(), fake)
                             self.assertEqual(rc, 0, out + err)
-                            self.assertIn(self.local.name, cm._STARTED, "the settled start is recorded")
+                            self.assertIn(self.local.job, cm._STARTED, "the settled start is recorded")
                             ours, before = fake.runner.session, len(fake.runner.calls)
                             if changed:
                                 fake.runner.start_session(by_manager=True)   # the manager's run is no longer ours
@@ -346,7 +346,7 @@ class UndoSeams:
                             self.assertIsNotNone(ours.wait(timeout=30), "its own run retired")
                             self.assertEqual(fake.runner.respawns, 0)
                             self.assertFalse(STOPS & verbs, "no step named the job to its manager")
-                            self.assertNotIn(self.local.name, cm._STARTED)
+                            self.assertNotIn(self.local.job, cm._STARTED)
                     finally:
                         self._done(fake)
                         with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \

@@ -2056,7 +2056,7 @@ class LauncherTmux(ConnectBase):
         order = []
         real_free, real_stray = cm._await_free, cli.stop_stray
         with mock.patch.object(cm, "_await_free", lambda root, *a, **k: order.append("free") or real_free(root, *a, **k)), \
-                mock.patch.object(cli, "stop_stray", lambda cfg: order.append("stray") or real_stray(cfg)), \
+                mock.patch.object(cli, "stop_stray", lambda cfg, *a: order.append("stray") or real_stray(cfg, *a)), \
                 mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, out + err)

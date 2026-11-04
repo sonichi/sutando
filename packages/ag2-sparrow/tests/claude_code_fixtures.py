@@ -378,8 +378,9 @@ class Runner:
     a `registered` job, ActiveState from the stand-in, UnitFileState from enable/disable; `print` likewise."""
 
     def __init__(self, table=None, default=0, root=None, adapter="claude-local", install="", registered=False,
-                 stop_delay=0.0):
+                 stop_delay=0.0, shape=None):
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
+        self.shape = shape or L
         self.session, self.adapter, self.install = None, adapter, install
         self.invocation, self.since = "", 0
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
@@ -468,7 +469,7 @@ class Runner:
                 return (0, "\tstate = spawn scheduled\n" + self.exit_words()[1], "")
             return (0, "\tstate = waiting\n" + self.exit_words()[1], "") if self.registered else NOT_LOADED
         if verb == "show":
-            loaded = cm.service_path(L).exists() or self.registered
+            loaded = cm.service_path(self.shape).exists() or self.registered
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
                      "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
                      "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
@@ -481,6 +482,8 @@ class Runner:
     def __call__(self, cmd, timeout=30):
         self.calls.append(list(cmd))
         verb = self.verb(cmd)
+        if self.foreign(cmd):
+            return self.absent(verb, cmd)
         self.respawn_if_due(cmd[0] == "launchctl")
         loaded = (37, "", "Bootstrap failed: 37: Operation already in progress\n")   # launchd, on a loaded job
         held = self.alive() or (self.keep_alive and self.loaded)
@@ -509,6 +512,21 @@ class Runner:
 
     def verbs(self, program):
         return [self.verb(c) for c in self.calls if c[0] == program]
+
+    def foreign(self, cmd):
+        """A command naming another job than this one: the manager here knows nothing of it."""
+        own = (self.shape.service_name, cm.launchd_service(self.shape), str(cm.supervisor_path(self.shape)))
+        return not any(a in own for a in cmd) and any("ag2-sparrow" in a or "ag2.sparrow" in a for a in cmd)
+
+    def absent(self, verb, cmd):
+        if verb == "print":
+            return subprocess.CompletedProcess(cmd, *NOT_LOADED)
+        words = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                 "MainPID": "0", "InvocationID": "", "ExecMainStartTimestampMonotonic": "0", "ExecMainCode": "0",
+                 "ExecMainStatus": "0"}
+        props = cmd[cmd.index("-p") + 1].split(",") if "-p" in cmd else []
+        shown = "".join((words[k] if "--value" in cmd else f"{k}={words[k]}") + "\n" for k in props)
+        return subprocess.CompletedProcess(cmd, 0, shown, "")
 
     def pid(self):
         return self.session.pid if self.alive() else None
@@ -592,12 +610,12 @@ class ConnectBase(unittest.TestCase):
         v.update(over)
         return v
 
-    def configure(self, **over):
+    def configure(self, shape=None, **over):
         """The config as install writes it, with no manager involved: what run, verify and uninstall read."""
         for d in (self.inbox, self.results):
             d.mkdir(parents=True, exist_ok=True)
-        cm._write(cli.config_path(), cli.render_config(self.values(**over)), 0o600)
-        return cli.config_path()
+        cm._write(cli.config_path(shape or L), cli.render_config(self.values(**over)), 0o600)
+        return cli.config_path(shape or L)
 
     def status(self, state=None, name="gateway-status.json", **over):
         """A bridge's gateway status, as the bridge writes it each poll, feeding this test's root by default."""
@@ -643,12 +661,13 @@ class BridgeFake:
     """The agent bridge's own manager state, so its unit never reaches the launcher's Runner: commands
     naming the bridge's service or label answer here, every other command goes to `runner`."""
 
-    def __init__(self, runner, table=None):
+    def __init__(self, runner, table=None, bridge=None):
         self.runner, self.table, self.calls = runner, dict(table or {}), []
         self.active = self.enabled = self.registered = False
+        self.bridge = bridge or cb.bridge_shape(runner.shape)
 
     def ours(self, cmd):
-        return any(cli.BRIDGE.service_name in a or cli.BRIDGE.agent_label in a for a in cmd)
+        return any(self.bridge.service_name in a or self.bridge.agent_label in a for a in cmd)
 
     def __call__(self, cmd, timeout=30):
         if not self.ours(cmd):
@@ -660,13 +679,13 @@ class BridgeFake:
             return None if got is None else subprocess.CompletedProcess(cmd, got, "", "exit %s" % got)
         out = ""
         if verb == "show":
-            loaded = cm.service_path(cli.BRIDGE).exists() or self.registered
+            loaded = cm.service_path(self.bridge).exists() or self.registered
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.active else "inactive",
                      "UnitFileState": "enabled" if self.enabled else "disabled"}
             out = "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(","))
         elif verb == "print":
             if not self.registered:
-                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % cli.BRIDGE.agent_label)
+                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % self.bridge.agent_label)
             return subprocess.CompletedProcess(cmd, 0, "\tstate = running\n" if self.active else "\tstate = waiting\n", "")
         elif verb in ("enable", "disable"):
             self.enabled = verb == "enable"
@@ -682,6 +701,9 @@ class BridgeFake:
 
 
 AGENT = "@probe.agent:ag2.space"
+# An agent-root install runs the agent's own job and bridge.
+LA = cm.for_key(L, cm.agent_key(AGENT))
+BA = cb.bridge_shape(LA)
 
 
 class AgentRootBase(ConnectBase):
@@ -695,7 +717,7 @@ class AgentRootBase(ConnectBase):
         self.addCleanup(self.scripts.stop)
 
     def bridged(self, table=None, root=None, **kw):
-        runner = Runner(table, 0, str(root or self.root), **kw)
+        runner = Runner(table, 0, str(root or self.root), **dict({"shape": LA}, **kw))
         self.runners.append(runner)
         return BridgeFake(runner)
 
@@ -705,7 +727,8 @@ class AgentRootBase(ConnectBase):
                              "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
     def cfg(self):
-        return cli.read_config(cli.config_path())
+        """The installed job's config: the agent's own, or an explicit root's single job."""
+        return cli.read_config(cli.config_path(cm.select_job(L)[0] or LA))
 
 
 BASE = "https://backend.example/api"
