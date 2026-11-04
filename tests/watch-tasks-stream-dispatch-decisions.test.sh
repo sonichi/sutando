@@ -6,6 +6,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 
+unset TMUX CLAUDE_CONFIG_DIR
 for v in $(compgen -e | grep '^SUTANDO_'); do unset "$v"; done
 TMP="$(mktemp -d)"
 WATCHER_PID=""
@@ -83,6 +84,46 @@ sleep $(( CATCHUP * 2 + 1 ))
 [ "$(grep -cF "TASK_FILE: task-stranded.txt" "$OUT")" = 1 ] && [ "$(grep -cF "TASK_FILE: task-declined.txt" "$OUT")" = 1 ]
 check $? "admitted tasks are never re-dispatched by later passes"
 ! grep -qF "dispatch task-handled.txt: re-dispatching" "$ERR"; check $? "...nor is a handled one"
+
+# A worker watches delivery entries, not their resolved payloads. Silent fswatch
+# makes each pass a catch-up-only path; neither a payload edit nor cksum failure
+# may turn an admitted delivery into a new task.
+kill -TERM "$WATCHER_PID" 2>/dev/null; wait "$WATCHER_PID" 2>/dev/null; WATCHER_PID=""
+for checksum in normal unavailable; do
+  WS="$TMP/worker-$checksum"; INBOX="$WS/deliveries/worker-test"
+  mkdir -p "$INBOX" "$WS/tasks" "$WS/results" "$WS/state"
+  OUT="$WS/out"; ERR="$WS/err"
+  payload="$WS/tasks/task-payload.txt"
+  printf 'id: task-payload\naccess_tier: owner\ntask: original\n' > "$payload"
+  printf 'delivery entry\n' > "$INBOX/task-delivery.txt"
+  cat > "$WS/resolve" <<EOF
+#!/bin/bash
+echo resolve >> "$WS/resolves"
+printf '%s\n' "$payload"
+EOF
+  chmod +x "$WS/resolve"
+  if [ "$checksum" = unavailable ]; then
+    printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/cksum"; chmod +x "$TMP/bin/cksum"
+  fi
+  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/tmp" SUTANDO_WORKSPACE_DIR="$WS" \
+  SUTANDO_RESULTS_DIR="$WS/results" SUTANDO_INSTANCE_ID=worker-test \
+  SUTANDO_INBOX_RESOLVER="$WS/resolve" SUTANDO_WATCHER_CATCHUP_SECONDS="$CATCHUP" \
+    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" --role standby --inbox "$INBOX" > "$OUT" 2> "$ERR" &
+  WATCHER_PID=$!
+  for _ in $(seq 1 100); do grep -qF "TASK_FILE: $payload" "$OUT" && break; sleep 0.1; done
+  [ "$(grep -cF "TASK_FILE: $payload" "$OUT")" = 1 ]; check $? "$checksum: resolved worker payload is admitted once"
+  resolves="$(wc -l < "$WS/resolves" | tr -d ' ')"
+  sleep $(( CATCHUP * 2 + 1 ))
+  [ "$(wc -l < "$WS/resolves" | tr -d ' ')" = "$resolves" ]; check $? "$checksum: pending delivery does not rerun its resolver"
+  printf 'payload edited while delivery is pending\n' >> "$payload"
+  sleep $(( CATCHUP * 2 + 1 ))
+  [ "$(grep -cF "TASK_FILE: $payload" "$OUT")" = 1 ]; check $? "$checksum: payload edit does not announce a second TASK_FILE"
+  ! grep -qF 're-dispatching:' "$ERR"; check $? "$checksum: no false stranded decision is logged"
+  if [ "$checksum" = unavailable ]; then
+    grep -qF 'no usable checksum' "$ERR"; check $? "checksum failure exercised the admission fallback"
+  fi
+  kill -TERM "$WATCHER_PID" 2>/dev/null; wait "$WATCHER_PID" 2>/dev/null; WATCHER_PID=""
+done
 
 echo
 echo "$pass passed, $fail failed"

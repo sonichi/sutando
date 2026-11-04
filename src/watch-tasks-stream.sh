@@ -393,10 +393,19 @@ ANSWERED_NAMES=""
 HELD_RETRY_AT=0
 DISPATCHED_IDS=""
 DECISION_IDENTITY=""
+ADMITTED_INBOX_NAMES=""
+DECISION_INBOX_NAME=""
+record_inbox_admission() {
+  [ -n "$DECISION_INBOX_NAME" ] || return 0
+  printf '%s' "$ADMITTED_INBOX_NAMES" | grep -qxF -- "$DECISION_INBOX_NAME" && return 0
+  ADMITTED_INBOX_NAMES="$ADMITTED_INBOX_NAMES$DECISION_INBOX_NAME
+"
+}
 # Called only where a task is actually admitted: announced to the core, or
 # handed to the handler with the claim held. A decision that admits nothing
 # records nothing.
 record_admission() {
+  record_inbox_admission
   [ -z "$DECISION_IDENTITY" ] || DISPATCHED_IDS="$DISPATCHED_IDS$DECISION_IDENTITY
 "
 }
@@ -956,7 +965,9 @@ dispatch_task() {
       esac
       ;;
   esac
+  DECISION_INBOX_NAME="$(basename "$1")"
   if [ -n "$identity" ] && [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
+    record_inbox_admission
     return 0
   fi
   # This decision is its own read: a fresh snapshot, parsed here, used here.
@@ -1201,7 +1212,7 @@ catchup_sweep() {
 # Still in the inbox a pass later, never admitted by this watcher, neither held nor answered: dropped on the
 # way for a reason nobody logged. Dispatched again each pass, so an unexplained drop heals within two passes.
 redispatch_stranded() {
-  local f fn identity
+  local f fn
   [ ! -f "$STATE_DIR/shutdown.sentinel" ] || return 0
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] || continue
@@ -1209,8 +1220,8 @@ redispatch_stranded() {
     printf '%s' "$HELD_NAMES" | grep -qxF -- "$fn" && continue
     # Answered once is answered for good: each costs a resolver run, and a long-lived inbox holds many.
     printf '%s' "$ANSWERED_NAMES" | grep -qxF -- "$fn" && continue
-    identity="$fn|$(task_file_identity "$f")"
-    [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity" && continue
+    # Catch-up heals only entries never admitted; payload changes belong to the event path.
+    printf '%s' "$ADMITTED_INBOX_NAMES" | grep -qxF -- "$fn" && continue
     if handler_result_is_answer "$fn"; then
       ANSWERED_NAMES="$ANSWERED_NAMES$fn
 "
