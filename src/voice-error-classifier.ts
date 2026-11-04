@@ -41,7 +41,7 @@ const PATTERNS: Array<{
 	userActionUrl: string;
 }> = [
 	{
-		// Checked first so no broader pattern below can claim Google's region refusal; every redial gets it again.
+		// Checked first so no broader pattern below can claim Google's region refusal.
 		rx: /user location is not supported/i,
 		category: 'location_unsupported',
 		retryable: false,
@@ -125,16 +125,20 @@ export function classifyTransportClose(
 	};
 }
 
+// Refusals Google decides from the network route each dial takes: shown as terminal, but every
+// dial asks again, so fixing the route (a VPN exit) brings voice back without a restart.
+const ROUTE_REFUSALS: ReadonlySet<FailureCategory> = new Set<FailureCategory>(['location_unsupported']);
+
 /**
- * The classifier bodhi's upstream recovery gets (`upstreamRecovery.classifyClose`): a non-retryable
- * close blocks dialing for the fatal backoff; anything else is left to the redial ladder.
+ * The classifier bodhi's upstream recovery gets (`upstreamRecovery.classifyClose`): a non-retryable close
+ * other than a route refusal blocks dialing for the fatal backoff; the rest is left to the redial ladder.
  */
 export function fatalCloseForRecovery(
 	code: number | undefined,
 	reason: string | undefined,
 ): { category: string; code?: number; reason: string } | null {
 	const c = classifyTransportClose(code, reason);
-	return c.retryable ? null : { category: c.category, code, reason: c.rawReason };
+	return c.retryable || ROUTE_REFUSALS.has(c.category) ? null : { category: c.category, code, reason: c.rawReason };
 }
 
 /**
@@ -208,6 +212,7 @@ export function protocolFailureFor(c: ClassifiedClose): ProtocolFailure | null {
 // arrives while the session sits in fatal backoff still sees
 // `upstream:'failed'` with the classified reason/category.
 let _lastTerminal: ProtocolFailure | null = null;
+let _lastTerminalCategory: FailureCategory | null = null;
 
 /**
  * Classify + persist in one step. Records only terminal classifications;
@@ -217,8 +222,21 @@ let _lastTerminal: ProtocolFailure | null = null;
  */
 export function recordTerminalClassification(c: ClassifiedClose): ProtocolFailure | null {
 	const failure = protocolFailureFor(c);
-	if (failure) _lastTerminal = failure;
+	if (failure) {
+		_lastTerminal = failure;
+		_lastTerminalCategory = c.category;
+	}
 	return failure;
+}
+
+/**
+ * Drop a persisted route refusal before a client attempt dials, so the client gets that dial's answer,
+ * not the stale one. Other terminal failures stay until ACTIVE. Returns whether one was dropped.
+ */
+export function clearRouteRefusalForAttempt(): boolean {
+	if (_lastTerminalCategory === null || !ROUTE_REFUSALS.has(_lastTerminalCategory)) return false;
+	clearTerminalClassification();
+	return true;
 }
 
 /** Last persisted terminal classification (null when none / cleared). */
@@ -232,6 +250,7 @@ export function lastTerminalClassification(): ProtocolFailure | null {
  */
 export function clearTerminalClassification(): void {
 	_lastTerminal = null;
+	_lastTerminalCategory = null;
 }
 
 // AppleScript `display notification` cannot be withdrawn or updated, so a banner

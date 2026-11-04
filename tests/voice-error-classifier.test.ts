@@ -14,6 +14,7 @@ import {
 	recordTerminalClassification,
 	lastTerminalClassification,
 	clearTerminalClassification,
+	clearRouteRefusalForAttempt,
 } from '../src/voice-error-classifier.ts';
 
 test('credits_depleted: paid-tier prepayment exhausted', () => {
@@ -107,8 +108,41 @@ test('location_unsupported: Google\'s region refusal names the region and the VP
 	assert.match(r.userMessage, /VPN or proxy, route generativelanguage\.googleapis\.com through a supported region/);
 	assert.doesNotMatch(r.userMessage, /config\/voice-agent\.json|model|API key|GEMINI_API_KEY/i);
 	assert.equal(r.userActionUrl, 'https://aistudio.google.com/docs/available-regions');
-	assert.deepEqual(fatalCloseForRecovery(1007, REGION_REFUSAL), { category: 'location_unsupported', code: 1007, reason: REGION_REFUSAL });
 	assert.equal(isModelUnavailableClose(1007, REGION_REFUSAL), false);
+});
+
+test('location_unsupported: shown as terminal, but recovery keeps dialing, so a fixed route brings voice back', () => {
+	assert.equal(classifyTransportClose(1007, REGION_REFUSAL).retryable, false);
+	assert.equal(fatalCloseForRecovery(1007, REGION_REFUSAL), null, 'no 5-minute fatal backoff for a region refusal');
+	// Every other terminal category still holds dialing for the fatal backoff.
+	for (const [code, reason, category] of [
+		[1011, 'Your prepayment credits are depleted.', 'credits_depleted'],
+		[1011, 'You exceeded your current quota, please check your plan and billing details.', 'quota_exceeded'],
+		[1007, 'API key not valid. Please pass a valid API key.', 'auth_invalid'],
+		[1011, 'Token has expired', 'token_expired'],
+		[1008, 'models/gemini-3.8-live is not found for API version v1beta', 'model_not_found'],
+	] as Array<[number, string, string]>) {
+		assert.equal(fatalCloseForRecovery(code, reason)?.category, category, reason);
+	}
+});
+
+test('clearRouteRefusalForAttempt drops only a persisted region refusal', () => {
+	clearTerminalClassification();
+	assert.equal(clearRouteRefusalForAttempt(), false, 'nothing persisted');
+
+	recordTerminalClassification(classifyTransportClose(1007, REGION_REFUSAL));
+	assert.equal(clearRouteRefusalForAttempt(), true);
+	assert.equal(lastTerminalClassification(), null);
+
+	const quota = recordTerminalClassification(classifyTransportClose(1011, 'You exceeded your current quota'));
+	assert.equal(clearRouteRefusalForAttempt(), false, 'a quota failure stays until ACTIVE');
+	assert.deepEqual(lastTerminalClassification(), quota);
+
+	// A region refusal replaced by a quota failure is no longer a route refusal.
+	recordTerminalClassification(classifyTransportClose(1007, REGION_REFUSAL));
+	recordTerminalClassification(classifyTransportClose(1011, 'You exceeded your current quota'));
+	assert.equal(clearRouteRefusalForAttempt(), false);
+	clearTerminalClassification();
 });
 
 test('model_not_found: a real model refusal still classifies after "not supported for" was narrowed', () => {
