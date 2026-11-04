@@ -264,13 +264,17 @@ class TestIngest(_Ws):
         self_resolved = "## SELF-RESOLVED 2026-07-31 — no answer needed\n\nMeasured myself; moot.\n\n"
         still_a_question = ("## #4358 — my diagnosis dispute RESOLVED in agreement; one gap remains\n\n"
                              "Default: ship as-is.\n\n")
-        self.file(resolved_no_brackets, self_resolved, still_a_question)
+        mixed_case_leading = "## Resolved by whom should X ship?\n\nStill open; nobody answered yet.\n\n"
+        self.file(resolved_no_brackets, self_resolved, still_a_question, mixed_case_leading)
         db = self.db()
         moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
         self.assertEqual(errors, [])
         titles = [r["title"] for r in db.open_entries()]
-        self.assertEqual(titles, ["#4358 — my diagnosis dispute RESOLVED in agreement; one gap remains"])
-        self.assertEqual(len(moved), 1)
+        self.assertEqual(titles, ["#4358 — my diagnosis dispute RESOLVED in agreement; one gap remains",
+                                   "Resolved by whom should X ship?"],
+                          "the all-caps hand-written marker closes a section; mixed-case leading "
+                          "'Resolved' is an ordinary open question and must still import (qingyun-wu)")
+        self.assertEqual(len(moved), 2, "both open questions became rows; the two closed sections never did")
         text = self.pq.read_text()
         self.assertIn("## RESOLVED 2026-09-08T09:04:41Z — owner said yes\n\n"
                       "Acted on it already", text, "untouched: never a row, nothing to mark moved")

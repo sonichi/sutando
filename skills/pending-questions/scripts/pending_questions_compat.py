@@ -57,9 +57,9 @@ _BULLET_RE = re.compile(r"^[ \t]*-[ \t]+\*\*\[(.+?)\][^\n]*$", re.MULTILINE)
 # A heading main's reader treated as organisation or as already settled, never a question.
 _ORG_HEADING = re.compile(r"^\s*(?:Q\d+\s*[—–-]\s*)?(?:Open|Pending|Resolved|Done|Answered|Archive)\s*$", re.I)
 _INLINE_RESOLVED = re.compile(r"^\s*(?:\d+[.)]\s*)?\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]", re.I)
-# main's other way of closing a section by hand: RESOLVED/SELF-RESOLVED leading the title with
-# no brackets. Anchored to the leading word so prose like "dispute RESOLVED in agreement" stays open.
-_TITLE_RESOLVED = re.compile(r"^\s*(?:\d+[.)]\s*)?(?:✅\s*)?(?:SELF-)?RESOLVED(?=[\s\]—–:,]|$)", re.I)
+# main's hand-written close: leading word, no brackets, case-sensitive (ALL CAPS
+# is the closing mark; "Resolved by whom...?" stays a question).
+_TITLE_RESOLVED = re.compile(r"^\s*(?:\d+[.)]\s*)?(?:✅\s*)?(?:SELF-)?RESOLVED(?=[\s\]—–:,]|$)")
 # Status words of an entry that still wants an answer; `moved` is one this ingest already copied.
 OPEN_WORDS = ("unanswered", "waiting", "open")
 MOVED = "moved"
