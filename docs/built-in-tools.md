@@ -2,6 +2,14 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+**Voice room tools** — the optional `ag2space-voice` skill reads, searches and writes
+s.space rooms through the registered MCP connection. A `no_credential` or
+`credential_refused` answer means the owner must reconnect through Connect in the app;
+say that instead of saying the room is unavailable or does not exist. This applies to
+name lookup with an empty room index as well as direct reads and writes. These credential
+failures happen before dispatch. Other write failures can still return `outcome_unknown`
+with an operation ID: do not claim nothing ran or retry automatically.
+
 **Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
 connector tools, first:
 - `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`
