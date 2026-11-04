@@ -15,6 +15,7 @@ cd "$REPO"
 . "$REPO/src/agent/restart-guard.sh"
 . "$REPO/src/agent/core-runtime-record.sh"
 . "$REPO/src/agent/core-window.sh"
+. "$REPO/src/agent/core-workspace-log.sh"
 
 # This entry point only launches the canonical core. A Codex pool worker uses
 # the pool's runtime launcher instead.
@@ -382,14 +383,12 @@ ensure_core_monitor() {
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  # Per workspace, as in the claude launcher: never the shared /tmp path.
-  mon_log="$ws/logs/core-input-watch.log"
   # Socket only (see the claude launcher): the desktop launcher's tmux-window
   # copy spells --out differently, and one watcher per socket is the invariant.
   if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" >/dev/null 2>&1; then
     return 0
   fi
-  mkdir -p "$ws/logs" 2>/dev/null || mon_log=/dev/null
+  mon_log="$(sutando_core_workspace_log "$ws" core-input-watch.log)"
   python3 "$REPO/src/core-input-watch.py" \
     --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
     >"$mon_log" 2>&1 &

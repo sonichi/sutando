@@ -33,6 +33,7 @@ cd "$REPO"
 . "$REPO/src/agent/restart-guard.sh"
 . "$REPO/src/agent/core-runtime-record.sh"
 . "$REPO/src/agent/core-window.sh"
+. "$REPO/src/agent/core-workspace-log.sh"
 # Named check before sourcing: an unexplained "No such file or directory" from
 # a bare `.` here reads as a broken launcher, not a fixture/checkout missing
 # this file's own sibling — a real trap for a scratch-repo test fixture.
@@ -449,10 +450,8 @@ ensure_core_monitor() {
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  # Per workspace: a scratch core on another socket must not truncate or mix into the production logs.
-  mon_log="$ws/logs/core-input-watch.log"
-  relay_log="$ws/logs/core-supervisor-relay.log"
-  mkdir -p "$ws/logs" 2>/dev/null || { mon_log=/dev/null; relay_log=/dev/null; }
+  mon_log="$(sutando_core_workspace_log "$ws" core-input-watch.log)"
+  relay_log="$(sutando_core_workspace_log "$ws" core-supervisor-relay.log)"
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
   if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \

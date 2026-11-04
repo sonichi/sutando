@@ -122,6 +122,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/agent/core-window.sh",
+            "src/agent/core-workspace-log.sh",
             "src/claude_config_dir.sh",
             "src/local_services.sh",
             "src/core_runtime_record.py",

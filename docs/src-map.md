@@ -326,6 +326,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`core-runtime-record.sh`** — Called only after the adapter confirms its named core is present.
 - **`core-window.sh`** — Core-window policy shared by the runtime launchers: a restart or heal replaces only the core's own window, so sibling windows in the session (gateway lanes, monitor) keep running.
+- **`core-workspace-log.sh`** — Core-monitor log policy shared by the runtime launchers: each workspace's own logs/, never a shared /tmp file, and a log that cannot be made is /dev/null rather than a refused start.
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
