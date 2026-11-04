@@ -33,7 +33,8 @@ from pathlib import Path
 
 from ... import (_dirs, agent_identity, bounded_file_read, delivery_destination, diagnostics,
                  gateway_credential_io,
-                 gateway_credentials, gateway_instance, outbox, result_ready, task_attempts,
+                 gateway_credentials, gateway_instance, outbox, result_labels, result_ready,
+                 task_attempts,
                  task_hold, workspace_lock)
 from ...persisted_number import bounded_number
 from ...delivery_core import WITHDRAWN
@@ -1526,7 +1527,8 @@ def _line_report(result_dir: Path, tid: str) -> str:
 
 
 def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path, item: str,
-                          result_file: Path, body: str) -> "tuple[bool, str]":
+                          result_file: Path, body: str,
+                          labels: "dict | None" = None) -> "tuple[bool, str]":
     """reply's commit under the send lock: claim the task and queue the answer, which withdraws
     its hold line at the outbox's dispatch-time recheck. A failed publication releases the claim
     and raises OSError, so a retry finds the task, and its line, as they were."""
@@ -1535,12 +1537,23 @@ def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path
         return False, "none"
     if outbox.item_status(root, item) is not None:
         return False, "none"
+    if result_file.exists():
+        return False, _line_report(result_dir, tid)
+    side = None
     try:
+        # Before the result: the drain that reads the result finds its labels with it.
+        side = result_labels.write(result_file, labels or {})
         committed = _publish_once(result_file, body)
     except BaseException:
         with contextlib.suppress(OSError):
             (_claims_dir(result_dir) / tid).unlink(missing_ok=True)
+        if side is not None:
+            with contextlib.suppress(OSError):
+                side.unlink(missing_ok=True)
         raise
+    if not committed and side is not None:
+        with contextlib.suppress(OSError):
+            side.unlink(missing_ok=True)
     # False: another result holds the name, so the task is answered either way.
     return committed, _line_report(result_dir, tid)
 
@@ -1575,6 +1588,18 @@ def no_reply(args) -> int:
     return _answer(args, _no_reply_body, silent=True)
 
 
+def _answer_labels(args, silent: bool) -> dict:
+    """The Activity title and outcome, each cut to fit with a warning; a no-reply's outcome
+    defaults to its reason."""
+    outcome = getattr(args, "outcome", None)
+    if silent and not result_labels.clean(outcome):
+        outcome = result_labels.fit(getattr(args, "reason", None), result_labels.OUTCOME_MAX)
+    labels, notes = result_labels.check(getattr(args, "title", None), outcome)
+    for note in notes:
+        print(f"warning: {note}", file=sys.stderr)
+    return labels
+
+
 def _answer(args, read_body, silent: bool) -> int:
     cfg = _installed_config()
     result_file = Path(args.result_file).expanduser()
@@ -1589,6 +1614,7 @@ def _answer(args, read_body, silent: bool) -> int:
     if body is None:
         print(f"error: {why}", file=sys.stderr)
         return 2
+    labels = _answer_labels(args, silent)
     item = _delivered_item(cfg, tid, instance, item)
     if item is None:
         return 2
@@ -1600,7 +1626,7 @@ def _answer(args, read_body, silent: bool) -> int:
     try:
         with delivery_destination.send_lock(result_dir):
             committed, where = _commit_answer_locked(result_dir, task_dir, tid, root, item,
-                                                     result_file, body)
+                                                     result_file, body, labels)
     except OSError as e:  # SendLockUnavailable included: every step taken was undone
         print(f"error: the answer was not committed ({diagnostics.describe(e)}); nothing "
               f"written and its hold line left as it was, run {'no-reply' if silent else 'reply'} "
@@ -1733,6 +1759,10 @@ def main(argv=None) -> int:
     r.add_argument("--answering", help=argparse.SUPPRESS)
     r.add_argument("--body", help="the reply text (default: read from stdin)")
     r.add_argument("--no-send", action="store_true", help="close the item without posting")
+    r.add_argument("--title", help=f"the Activity title: what the task is, imperative, one line, at most "
+                   f"{result_labels.TITLE_MAX} characters (longer is cut to fit, with a warning)")
+    r.add_argument("--outcome", help=f"the Activity outcome: what came of it, past tense, one "
+                   f"line, at most {result_labels.OUTCOME_ASK} characters, visible to the owner only")
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
@@ -1740,7 +1770,12 @@ def main(argv=None) -> int:
                        f"Sparrow settled it (exit {REPLY_POSTED} settled, {REPLY_NOT_POSTED} not "
                        f"settled, {REPLY_UNCONFIRMED} queued but not confirmed)")
     n.add_argument("result_file", help="the item's result_file from the wake payload")
-    n.add_argument("--reason", help="why nothing is posted, kept with the result (one line)")
+    n.add_argument("--reason", help="why nothing is posted, kept with the result (one line); with "
+                   "no --outcome, the reason becomes the Activity outcome, visible to the owner only")
+    n.add_argument("--title", help=f"the Activity title: what the task is, imperative, one line, at most "
+                   f"{result_labels.TITLE_MAX} characters (longer is cut to fit, with a warning)")
+    n.add_argument("--outcome", help=f"the Activity outcome, past tense, one line, at most "
+                   f"{result_labels.OUTCOME_ASK} characters, visible to the owner only (default: --reason)")
     n.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     n.set_defaults(func=no_reply)
