@@ -224,9 +224,8 @@ class RenotifyTests(unittest.TestCase):
         self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
 
     def test_a_newer_never_reminded_card_whose_resolve_edit_is_refused_fences_the_seat(self):
-        # keweichen's review on #6220: an older card had sent a reminder, a newer same-seat card
-        # none; both resolve, and only the newer one's edit is refused. The seat's recovery must
-        # wait for that edit, not announce "cleared" over a card still awaiting it.
+        # keweichen's review on #6220: older card reminded, newer same-seat card not, both resolved,
+        # only the newer edit refused. The seat's recovery waits for that edit.
         old = self._seat_cards("pro-dev", 1)[0]
         self.remind()
         new = self.mgr.create(seat_card("pro-dev", "pro-dev-g9", self.clock.t)).id
