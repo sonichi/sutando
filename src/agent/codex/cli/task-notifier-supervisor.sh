@@ -81,6 +81,18 @@ notifier_supports_nudge() {
   [ -r "$NOTIFIER" ] && grep -q '"--nudge"' "$NOTIFIER" 2>/dev/null
 }
 
+# Same grep probe for the one-shot stand-down clear; a notifier without it is never run with it.
+notifier_supports_clear_staged() {
+  [ -r "$NOTIFIER" ] && grep -q '"--clear-staged"' "$NOTIFIER" 2>/dev/null
+}
+
+# After a stand-down: the notifier decides whether a prompt it staged may leave the composer.
+clear_staged_after_stand_down() {
+  notifier_supports_clear_staged || return 0
+  "$PY" -c 'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], "--clear-staged"])' "$NOTIFIER" \
+    || echo "task-notifier-supervisor: the stand-down left the composer as it was (see the notifier log)" >&2
+}
+
 # nudge / alert / arm, from the pane verdict and the beat freshness. An
 # unresolvable beat path is passed as health=unknown, which decides "arm". A
 # notifier without --nudge can only ever arm, so short-circuit there: this also
@@ -281,6 +293,7 @@ while target_alive; do
   while target_alive; do
     run_notifier_once
     rc=$?
+    [ "$rc" -eq 2 ] && clear_staged_after_stand_down
     [ "$rc" -eq 0 ] || break   # 1: target gone (outer loop ends); 2: disarmed (back to standby)
   done
 done
