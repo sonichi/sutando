@@ -122,6 +122,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/agent/core-window.sh",
+            "src/agent/launch-path.sh",
             "src/claude_config_dir.sh",
             "src/local_services.sh",
             "src/core_runtime_record.py",
@@ -481,6 +482,52 @@ exit 0
             os.close(master)
             if slave >= 0:
                 os.close(slave)
+
+    def _launch_path_order(self, env_extra, restart_path=None):
+        """Run the codex launcher to its auth probe with codex and node each in an explicit dir
+        and a shared default; return (which codex ran, the PATH it saw, the dirs)."""
+        tmp = Path(self.tmp.name)
+        dirs = {
+            "bundled": tmp / "runtime" / "node" / "bin",
+            "override_node": tmp / "override-node",
+            "install": tmp / "npm-global",
+            "local": tmp / "home" / ".local" / "bin",
+        }
+        for d in dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+        for key in ("bundled", "override_node"):
+            (dirs[key] / "node").write_text("#!/bin/bash\nexit 0\n")
+            (dirs[key] / "node").chmod(0o755)
+        marker = tmp / "codex-ran"
+        for key in ("install", "local"):
+            exe = dirs[key] / "codex"
+            exe.write_text(f'#!/bin/bash\nprintf "%s\\n%s\\n" {key} "$PATH" > "{marker}"\nexit 1\n')
+            exe.chmod(0o755)
+        (self.bin / "codex").unlink()
+        env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
+        env.update({k: str(dirs[v]) for k, v in env_extra.items()})
+        if restart_path is not None:
+            got = restart_path(f"{self.bin}:/usr/bin:/bin")
+            env.update(got if isinstance(got, dict) else {"PATH": got})
+            result = self.run_launcher("--restart", env_extra=env)
+        else:
+            result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh", env_extra=env)
+        self.assertTrue(marker.exists(), result.stderr)
+        ran, path = marker.read_text().splitlines()[:2]
+        return ran, path.split(":"), {k: str(v) for k, v in dirs.items()}
+
+    def test_explicit_codex_dirs_beat_the_shared_launch_path_defaults(self):
+        ran, path, dirs = self._launch_path_order({"CODEX_NODE_BIN": "override_node"})
+        self.assertEqual(ran, "install", "~/.local/bin/codex shadowed CODEX_INSTALL_BIN")
+        self.assertLess(path.index(dirs["override_node"]), path.index(dirs["bundled"]))
+        self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
+        self.assertEqual(path[0], str(self.bin), "the incoming PATH must stay first")
+
+    def test_without_codex_node_bin_the_bundled_node_precedes_the_install_dir(self):
+        ran, path, dirs = self._launch_path_order({})
+        self.assertEqual(ran, "install")
+        self.assertLess(path.index(dirs["bundled"]), path.index(dirs["install"]))
+        self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
 
     def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
         # Since #4503 the launcher resolves nothing; only a genuine pin forwards.

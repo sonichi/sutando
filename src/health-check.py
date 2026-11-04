@@ -14456,30 +14456,13 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
 
 
 def _resolve_launch_env() -> dict:
-    """Environment for out-of-process core restarts (start-cli.sh --restart).
-
-    launchd's minimal PATH (``/usr/bin:/bin:/usr/sbin:/sbin``) cannot find the
-    tools start-cli.sh needs — homebrew ``tmux``, ``claude`` in ``~/.local/bin``,
-    or the Sutando.app-bundled ``node`` runtime — so the restart exits rc=127
-    (``node unavailable`` / ``exec: claude: not found``) and silently falls
-    through to the legacy fallback. Prepend all of them.
-
-    Extends the existing tmux-only PATH fix to node + claude. Incident
-    2026-07-10: the watchdog restart path was broken under launchd for ~70 min
-    (queue backlog) because every canonical restart hit rc=127. Same PATH-
-    narrowing class as _resolve_tmux_bin (2026-06-09), applied here.
-    """
+    """Env for out-of-process core probes and restarts: homebrew dirs prepended for tmux.
+    Node and ``claude`` dirs are the launchers' (src/agent/launch-path.sh), after any override."""
     env = dict(os.environ)
     extra = [
         "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
         "/usr/local/bin",                           # homebrew (Intel) / misc
-        str(Path.home() / ".local" / "bin"),        # `claude` install location
     ]
-    # Sutando.app-bundled node runtime: sibling of the repo inside the app bundle
-    # (Contents/Resources/{repo,runtime}). Absent in a plain dev checkout → skipped.
-    bundled_bin = REPO_DIR.parent / "runtime" / "bin"
-    if bundled_bin.is_dir():  # pragma: no cover — only present inside the app bundle
-        extra.append(str(bundled_bin))
     env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
     return env
 
@@ -14954,11 +14937,15 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     return best_socket or default
 
 
-def _resolve_tmux_bin(candidates: "tuple[str, ...]" = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")) -> str:
-    """Absolute tmux path when a known install location exists, else a bare
-    PATH lookup (run with _resolve_launch_env's healed PATH). Same
-    PATH-narrowing class as _resolve_launch_env: under launchd's minimal PATH,
-    homebrew tmux doesn't resolve. Candidates injectable for tests."""
+_TMUX_INSTALL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _resolve_tmux_bin(candidates: "Optional[tuple[str, ...]]" = None) -> str:
+    """Absolute tmux from homebrew or ~/.local/bin (neither is on launchd's PATH, and the
+    launch env does not add ~/.local/bin), else a bare PATH lookup. Candidates injectable."""
+    if candidates is None:
+        candidates = tuple(os.path.join(d, "tmux") for d in _TMUX_INSTALL_DIRS) + (
+            str(Path.home() / ".local" / "bin" / "tmux"),)
     for cand in candidates:
         if os.path.exists(cand):
             return cand

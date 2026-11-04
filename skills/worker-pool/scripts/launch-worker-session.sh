@@ -38,6 +38,9 @@ cd "$REPO"
 if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ]; then
   exec bash "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$@"
 fi
+# shellcheck source=../../../src/agent/launch-path.sh
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO"
 # shellcheck source=../../../src/agent/claude/cli/session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
