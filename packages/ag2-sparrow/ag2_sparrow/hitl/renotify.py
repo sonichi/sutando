@@ -106,16 +106,17 @@ def _current(req: HumanRequirement, projection: Dict) -> bool:
 
 
 def _pending_resolve(req: HumanRequirement, projection: Dict) -> bool:
-    """A resolved, notified, not-yet-recovered card whose own edit hasn't landed.
+    """A projected, not-yet-recovered card in a terminal state whose own edit
+    hasn't landed: resolved, cancelled or expired alike.
 
     Its seat's recovery must wait for it, not fire around it: a rejected send
     retries on the next drive, and skipping ahead here is what splits one
     seat's recovery into two messages. Whether the card itself owes a recovery
-    (`due`: a reminder went out, on a ledger this module keeps) is a different
-    question: any projected card fences its seat while its resolve edit is
-    refused, a never-reminded one and one on a pre-upgrade bare ledger too, or
-    the owner is told the seat cleared under a card still awaiting its edit."""
-    if req.status != STATUS_RESOLVED or not projection.get("event_id"):
+    (`due`: resolved, and a reminder went out on a ledger this module keeps) is
+    a different question: every projected card whose terminal edit is refused
+    fences its seat, a never-reminded one and one on a pre-upgrade bare ledger
+    too, or the owner is told the seat cleared under a card still visibly stale."""
+    if req.status not in TERMINAL_STATUSES or not projection.get("event_id"):
         return False
     if projection.get("revision", 0) >= req.revision:
         return False

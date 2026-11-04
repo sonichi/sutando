@@ -265,6 +265,33 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(len(messages), 1, [m["body"] for m in messages])
         self.assertTrue(self.mgr.store.projection(old).get("recovered"))
 
+    def _stale_terminal_edit_fences_the_seat(self, end):
+        # Older card reminded and resolved; a newer same-seat card ends another way, and only its
+        # terminal edit is refused: no "cleared" while that card is still visibly stale.
+        old = self._seat_cards("pro-dev", 1)[0]
+        self.remind()
+        new = self.mgr.create(seat_card("pro-dev", "pro-dev-g9", self.clock.t)).id
+        self.drive()
+        self.mgr.resolve(old)
+        end(new)
+        flaky = FlakySender(new)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery while the newer card's terminal edit is refused")
+        self.assertFalse(self.mgr.store.projection(old).get("recovered"))
+        self.clock.advance(MIN)
+        before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        messages = [p for p in flaky.sent[before:] if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(self.mgr.store.projection(old).get("recovered"))
+
+    def test_a_newer_cancelled_card_whose_edit_is_refused_fences_the_seat(self):
+        self._stale_terminal_edit_fences_the_seat(self.mgr.cancel)
+
+    def test_a_newer_expired_card_whose_edit_is_refused_fences_the_seat(self):
+        self._stale_terminal_edit_fences_the_seat(self.mgr.expire)
+
     def test_one_recovery_per_seat(self):
         seats = ("pro-dev", "pro-fast", "pro-comm")
         ids = [i for seat in seats for i in self._seat_cards(seat, 4)]
