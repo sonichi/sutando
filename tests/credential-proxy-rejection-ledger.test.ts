@@ -170,6 +170,15 @@ test('a capture cut short of the gzip trailer still yields the text it holds', (
 	assert.ok(out.length <= 2048, 'bounded to the snippet length');
 });
 
+test('br and deflate captures cut short also yield the text they hold', () => {
+	const big = Buffer.from(OVERLOADED + ' ' + randomBytes(6000).toString('hex'));
+	for (const [enc, packed] of [['br', brotliCompressSync(big)], ['deflate', deflateSync(big)], ['deflate', deflateRawSync(big)]] as const) {
+		const out = rejectionSnippet(packed.subarray(0, 2048), enc);
+		assert.ok(out.startsWith(OVERLOADED), `${enc}: decoded prefix kept, got ${JSON.stringify(out.slice(0, 80))}`);
+		assert.ok(out.length <= 2048, `${enc}: bounded to the snippet length`);
+	}
+});
+
 test('an unknown or undecodable encoding is named, never stored as raw bytes', () => {
 	assert.equal(rejectionSnippet(Buffer.from([1, 2, 3]), 'zstd'), '<3-byte body, content-encoding zstd>');
 	assert.equal(rejectionSnippet(Buffer.from('not gzip at all'), 'gzip'), '<15-byte body, content-encoding gzip, not decodable>');
