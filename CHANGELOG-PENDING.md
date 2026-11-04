@@ -39,7 +39,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Changed
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
-- macOS notifications are off by default. Sutando posts no macOS desktop notification (pending questions, bridge restarts, health checks, the agent shepherd, voice offline/online, context drop, screen recording) unless `sutando.config.local.json` sets `"notifications": {"macos": true}`. The same alerts still reach the owner's DM or the core's task queue. Windows and Linux notifications are unchanged.
+- macOS notifications are off by default. Sutando posts no macOS desktop notification (pending questions, bridge restarts, health checks, the agent shepherd, voice offline/online, context drop, screen recording) unless `sutando.config.local.json` sets `"notifications": {"macos": true}`. The same alerts still reach the owner's DM or the core's task queue. The one exception is the gateway bridge's no-workspace alert, which has no DM to fall back on and always shows its banner. Windows and Linux notifications are unchanged.
 
 ## Security
 

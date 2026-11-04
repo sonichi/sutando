@@ -114,7 +114,7 @@ fi
 # the bridge's own stand-down and ends the wrapper for good.
 if ! WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || [ -z "$WORKSPACE" ]; then
     echo "[gateway-bridge-wrapper] FATAL: workspace unresolvable via scripts/sutando-config.sh (check sutando.config.local.json) — not starting the bridge" >&2
-    bash "$REPO/src/macos-notify.sh" "Gateway bridge cannot resolve the workspace; it is not running." || true
+    bash "$REPO/src/macos-notify.sh" --always "Gateway bridge cannot resolve the workspace; it is not running." || true
     exit 0
 fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"

@@ -163,6 +163,28 @@ class ShellSender(unittest.TestCase):
         self._send(True, "hi")
         self.assertEqual(self.calls.read_text().splitlines()[-2:], ["hi", "Sutando"])
 
+    def test_always_posts_when_off(self):
+        r = self._send(False, "--always", "no workspace")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines()[-2:], ["no workspace", "Sutando"])
+
+
+class AlwaysIsReservedForTheChannellessAlert(unittest.TestCase):
+    """--always bypasses the opt-in, so only the alert with no DM to fall back on may use it."""
+
+    def test_only_the_gateway_no_workspace_alert_uses_always(self):
+        users = []
+        for dirpath, dirnames, files in os.walk(REPO):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for f in files:
+                p = Path(dirpath) / f
+                if p.suffix in SCANNED and p.name != "macos-notify.sh":
+                    for line in p.read_text(errors="replace").splitlines():
+                        if "macos-notify.sh" in line and "--always" in line:
+                            users.append((p.relative_to(REPO).as_posix(), line.strip()))
+        self.assertEqual([u[0] for u in users], ["src/launchd/gateway-bridge-wrapper.sh"], users)
+        self.assertIn("cannot resolve the workspace", users[0][1])
+
 
 # Shell senders that used to call osascript themselves; each now goes through the helper.
 SHELL_SENDERS = (
