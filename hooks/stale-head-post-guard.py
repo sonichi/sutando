@@ -17,7 +17,8 @@ when a claimed sha is not, unless the body also names the head's short sha.
 
 Allows: nothing to check, no repo named (it is never guessed), and a failed head
 fetch (with a one-line stderr warning). `SUTANDO_ALLOW_STALE_POST=1` in the command
-allows the post; `STALE_HEAD_POST_GUARD_DISABLE=1` turns the hook off;
+allows the post before any file is read; a body file that is not a regular file (a FIFO,
+a device) is never opened blocking or read. `STALE_HEAD_POST_GUARD_DISABLE=1` turns the hook off;
 `STALE_HEAD_POST_GUARD_GH` names the `gh` binary. Fail-OPEN on any internal error.
 
 Tokenizes with the shared ``_shell_scan`` scanner; heredoc bodies are read as the
@@ -26,6 +27,7 @@ stdin of a `-` argument, or as the content of a body file the command writes its
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -82,11 +84,19 @@ def _read(path, cwd):
     path = os.path.expanduser(path)
     if not os.path.isabs(path) and cwd:
         path = os.path.join(cwd, path)
+    # O_NONBLOCK + S_ISREG: a FIFO the same command feeds would otherwise block the hook.
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read(FILE_CAP)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, FILE_CAP).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def _source(value, cwd, docs, stdin_marker):
@@ -250,9 +260,11 @@ def decide(raw, fetch=None):
     cmd = (data.get("tool_input") or {}).get("command") or ""
     if not isinstance(cmd, str) or "gh" not in cmd or not cmd.strip():
         return 0, "", ""
+    if any(w.text == ESCAPE and not w.quoted for w in _shell_scan.words(heredocs(cmd)[0])):
+        return 0, "", ""
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else None
     todo = [p for p in posts(cmd, cwd) if p.repo and (p.commit_id or claims(p.body))]
-    if not todo or any(w.text == ESCAPE and not w.quoted for w in _shell_scan.words(heredocs(cmd)[0])):
+    if not todo:
         return 0, "", ""
     fetch = fetch or fetch_head
     heads, blocks, warns = {}, [], []

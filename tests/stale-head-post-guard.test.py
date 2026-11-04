@@ -117,6 +117,28 @@ class Decide(unittest.TestCase):
         self.assertBlocked("gh pr comment 7 --repo o/r --body-file - <<'EOF'\nat %s\nEOF" % OLD[:7])
         self.assertBlocked("gh pr comment 7 --repo o/r --body \"$(cat <<'EOF'\nat %s\nEOF\n)\"" % OLD[:7])
 
+    def test_ordinary_body_file_is_still_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "ok.md").write_text("Reviewed at %s\n" % HEAD[:7])
+            self.assertAllowed("gh pr comment 7 --repo o/r --body-file ok.md", cwd=d)
+            self.assertEqual(shg._read("ok.md", d), "Reviewed at %s\n" % HEAD[:7])
+
+    def test_fifo_body_file_is_not_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            fifo = os.path.join(d, "b.fifo")
+            os.mkfifo(fifo)
+            self.assertIsNone(shg._read(fifo, None))
+            self.assertAllowed("gh pr comment 7 --repo o/r --body-file %s" % fifo)
+
+    def test_escape_is_checked_before_any_file_is_read(self):
+        orig, seen = shg._read, []
+        shg._read = lambda *a: seen.append(a)
+        try:
+            self.assertAllowed("SUTANDO_ALLOW_STALE_POST=1 gh pr comment 7 -R o/r --body-file b.md")
+        finally:
+            shg._read = orig
+        self.assertEqual(seen, [])
+
     def test_body_naming_old_and_current_sha_is_allowed(self):
         body = "Re-reviewed at %s; the finding from %s is fixed." % (HEAD[:7], OLD[:7])
         self.assertAllowed("gh pr comment 7 --repo o/r --body '%s'" % body)
@@ -229,6 +251,17 @@ class Hook(unittest.TestCase):
         finally:
             shg.FETCH_TIMEOUT = orig
             os.environ.pop("STALE_HEAD_POST_GUARD_GH", None)
+
+    def test_fifo_fed_by_the_same_command_does_not_stall(self):
+        """The hook runs before the command, so a FIFO whose producer has not started must not block."""
+        self.fake_gh("echo %s" % HEAD)
+        fifo = self.tmp / "body.fifo"
+        os.mkfifo(fifo)
+        cmd = "(echo 'at %s' > %s &) ; gh pr comment 7 -R o/r --body-file %s" % (OLD[:7], fifo, fifo)
+        p = self.run_hook(payload(cmd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = self.run_hook(payload("SUTANDO_ALLOW_STALE_POST=1 " + cmd))
+        self.assertEqual((p.returncode, p.stderr), (0, ""))
 
     def test_disable(self):
         self.fake_gh("echo %s" % HEAD)
