@@ -59,4 +59,13 @@ out="$(HOME="$td/home" PATH="/usr/bin:/bin" /bin/bash -c '
 check "a worker under a core keeps both overrides ahead of the defaults" "$out" \
   "/usr/bin:/bin:$td/node override:$td/codex override:$td/home/.npm-global/bin:$td/home/.local/bin"
 
+mkdir -p "$td/app node"
+out="$(HOME="$td/home" PATH="/usr/bin" /bin/bash -c '
+  . "$1/src/agent/launch-path.sh"
+  sutando_prepend_default_dir "$3"
+  sutando_append_launch_path "$2" "$4"
+  printf %s "$PATH"' _ "$REPO" "$engine/sutando" "$td/app node" "$td/extra dir")"
+check "a dir startup prepends as a default goes behind the overrides, not away" \
+  "$out" "/usr/bin:$td/extra dir:$engine/runtime/bin:$td/home/.local/bin:$td/app node"
+
 exit "$fail"

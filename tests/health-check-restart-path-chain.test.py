@@ -5,6 +5,8 @@
   ~/.local/bin through health-check's env (it injects no default ahead of them).
 - A launchd-minimal restart through health-check's env still finds a `claude` that lives
   only in ~/.local/bin: the launcher adds that dir itself.
+- startup.sh's own bundled-node PATH step, then the dispatcher and codex core, still keeps
+  CODEX_NODE_BIN ahead of the bundled node.
 
 The launcher fixtures are the two launcher suites' own; this file only supplies the PATH
 health-check hands the launcher. Homebrew is stripped from it: a host's real tmux, claude or
@@ -12,13 +14,14 @@ codex there would shadow the fixture's stubs, and homebrew is not what is under 
 """
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
 import importlib.util
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -58,6 +61,30 @@ class CodexRestartChain(codex_suite.CodexCoreLauncherTests):
         self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
 
 
+def startup_node_step(inherited: str, repo: Path, bundled: Path) -> dict:
+    """PATH and launch marker after src/startup.sh's bundled-node step, run from its own text."""
+    lines = (REPO / "src" / "startup.sh").read_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith('_APP_NODE_DIR="$('))
+    end = next(i for i, l in enumerate(lines) if i > start and '"$_APP_NODE_DIR"' in l)
+    script = "\n".join([f'REPO="{repo}"'] + lines[start:end + 1]
+                       + ['printf "%s\\n%s\\n" "$PATH" "${_SUTANDO_LAUNCH_PATH_ADDED:-}"'])
+    env = isolated_child_env(PATH=inherited, SUTANDO_APP_NODE_DIR=str(bundled))
+    out = subprocess.run(["/bin/bash", "-c", script], env=env, capture_output=True, text=True, check=True)
+    path, marker = (out.stdout.splitlines() + ["", ""])[:2]
+    return {"PATH": path, "_SUTANDO_LAUNCH_PATH_ADDED": marker}
+
+
+class StartupChain(codex_suite.CodexCoreLauncherTests):
+    def test_startup_node_step_keeps_codex_node_bin_first(self):
+        bundled = Path(self.tmp.name) / "runtime" / "node" / "bin"
+        ran, path, dirs = self._launch_path_order(
+            {"CODEX_NODE_BIN": "override_node"},
+            restart_path=lambda inherited: startup_node_step(inherited, self.root, bundled))
+        self.assertEqual(ran, "install")
+        self.assertLess(path.index(dirs["override_node"]), path.index(dirs["bundled"]),
+                        "startup.sh's bundled-node step put the bundled node ahead of CODEX_NODE_BIN")
+
+
 class ClaudeRestartChain(unittest.TestCase):
     def test_launchd_minimal_restart_finds_a_local_bin_claude(self):
         rc, out = claude_suite._run(restart=True, session=True, core=True, force=True,
@@ -72,6 +99,7 @@ def load_tests(loader, tests, pattern):
     """Only this file's chain tests, not the inherited codex launcher suite."""
     suite = unittest.TestSuite()
     suite.addTest(CodexRestartChain("test_health_check_restart_keeps_the_explicit_overrides_first"))
+    suite.addTest(StartupChain("test_startup_node_step_keeps_codex_node_bin_first"))
     suite.addTest(ClaudeRestartChain("test_launchd_minimal_restart_finds_a_local_bin_claude"))
     return suite
 

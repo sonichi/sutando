@@ -507,7 +507,8 @@ exit 0
         env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
         env.update({k: str(dirs[v]) for k, v in env_extra.items()})
         if restart_path is not None:
-            env["PATH"] = restart_path(f"{self.bin}:/usr/bin:/bin")
+            got = restart_path(f"{self.bin}:/usr/bin:/bin")
+            env.update(got if isinstance(got, dict) else {"PATH": got})
             result = self.run_launcher("--restart", env_extra=env)
         else:
             result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh", env_extra=env)
