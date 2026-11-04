@@ -1,0 +1,15 @@
+{
+  "name": "standing-approvals",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "The owner's standing approvals for irreversible actions, as a revocable Room Commons database; manifest present to DECLARE config per this convention.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "STANDING_APPROVALS_ROOM": "",
+    "STANDING_APPROVALS_OWNER": ""
+  }
+}
