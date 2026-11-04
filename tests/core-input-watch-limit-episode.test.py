@@ -391,10 +391,14 @@ class PersistedSweepKeepsTheEpisode(unittest.TestCase):
         raise AssertionError(f"unexpected process operation: {argv}")
 
     def owe(self, task):
-        for f in self.inbox.glob("task-*.txt"):
+        tasks = self.ws / "tasks"
+        tasks.mkdir(exist_ok=True)
+        for f in list(self.inbox.glob("task-*.txt")) + list(tasks.glob("task-*.txt")):
             f.unlink()
         if task:
+            # Owed means routed and still live: the sentinel and the task file it names.
             (self.inbox / f"{task}.txt").write_text("pending")
+            (tasks / f"{task}.txt").write_text(f"id: {task}\ntask: x\n")
 
     def manager(self):
         return self.wc.manager_for(self.ws)  # fresh from disk, as a restarted producer loads it

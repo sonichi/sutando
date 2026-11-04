@@ -207,6 +207,8 @@ results = pd.results_dir(ws)
 results.mkdir(parents=True, exist_ok=True)
 check("the core's queue is not this worker's work", wo(ws, WID), False)
 (inbox / "task-a.txt").write_text("")
+check("a sentinel whose task is not in tasks/ is stale, not work", wo(ws, WID), False)
+(ws / "tasks" / "task-a.txt").write_text("task: hello\n")
 check("a sentinel handed to it with no reply yet is work", wo(ws, WID), True)
 (inbox / "task-a.txt").rename(inbox / "task-a.accepted")
 check("an accepted sentinel with no reply is work in flight", wo(ws, WID), True)
@@ -340,6 +342,7 @@ class Stub:
 
 
 (inbox / "task-b.txt").write_text("")
+(ws / "tasks" / "task-b.txt").write_text("task: hello\n")
 o = sup.observe(ws, 1000.0, runner=Stub(PANES["permission"][0]))[WID]
 check("observe reads the worker's pane and queue",
       (getattr(o, "pane", None), getattr(o, "work_outstanding", None)), (GATE, True))

@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.task_dispatch import find_ready_result  # noqa: E402
+from task_disposition import ANSWERED, ARCHIVED, MISSING, task_disposition  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
                          RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
                          require_recipient, workers_root)
@@ -506,61 +507,44 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
 
 
 def prune_spent(workspace: Path, recipient: str) -> dict:
-    """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
-    re-offer. First `archive_finished` moves every finished task's sentinels into
-    `archive/`, and `prune_archive` drops archived files older than
-    ARCHIVE_MAX_AGE_DAYS; both are fail-open (an OSError lands in `archive_error`
-    / `prune_error` and the pass goes on). The loop below then retires what is
-    left: a sentinel whose payload is gone (`stale-sentinel`), or a residual
-    finished one that nothing could hand back — the flag alone is not enough,
-    because the core re-queues a payload whose sentinel is gone and whose result
-    it cannot find. Safe beside a live watcher, which `sweep` is not.
+    """Retire `recipient`'s spent sentinels and nothing else: no release, no re-offer,
+    and nothing deleted. `archive_finished` moves every sentinel `sentinel_retirable`
+    allows into `archive/`, and `prune_archive` drops archived files older than
+    ARCHIVE_MAX_AGE_DAYS; both are fail-open (an OSError lands in `archive_error` /
+    `prune_error`). Every sentinel still in the inbox afterwards is `kept`, a move that
+    could not happen included. Safe beside a live watcher, which `sweep` is not.
     """
     ws = Path(workspace)
-    seen = set()
-    actions = {"archived": [], "pruned": [], "retired": [], "stale": [], "kept": []}
+    actions = {"archived": [], "pruned": [], "kept": []}
+    ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)})
     try:
-        archive_finished(ws, recipient, moved=actions["archived"])
+        archive_finished(ws, recipient, task_ids=ids, moved=actions["archived"])
     except OSError as e:
         actions["archive_error"] = f"{type(e).__name__}: {e}"
     try:
         actions["pruned"] = prune_archive(ws, recipient)
     except OSError as e:
         actions["prune_error"] = f"{type(e).__name__}: {e}"
-    for p in accepted(ws, recipient) + pending(ws, recipient):
-        task_id = parse_sentinel(p.name)[0]
-        if task_id in seen:
-            continue
-        seen.add(task_id)
-        state = residue(ws, recipient, task_id)
-        if state == "stale-sentinel":
-            p.unlink()
-            actions["stale"].append(task_id)
-        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
-            p.unlink()
-            actions["retired"].append(task_id)
-        else:
-            actions["kept"].append(task_id)
+    actions["kept"] = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)})
     return actions
 
 
 def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
-                     moved: Optional[list] = None) -> dict:
-    """Move every sentinel whose task is finished into `archive/`; open tasks keep theirs.
+                     task_ids=None, moved: Optional[list] = None) -> dict:
+    """Move every sentinel `sentinel_retirable` allows into `archive/`; open tasks keep theirs.
+    `task_ids` narrows the pass to those tasks (prune_spent, the boot sweep, the supervisor's
+    retire). Without it a missing task's sentinel stays: the inbox resolver still judges those.
 
-    Finished means answered or archived (`task_disposition`) with the payload gone from
-    `tasks/`: until the bridge archives a delivered task, its sentinel still tells the
-    bridge whose reply it is. The payload is re-checked under the folder lock the router
-    delivers under, so a task re-queued meanwhile keeps its hold. Moved here, never deleted;
-    `prune_spent` later deletes aged archived files through `prune_archive`.
-    Returns {"archived": [task ids], "kept": {disposition: count}, "sentinels": n}.
-    A caller's `moved` list gets each id as it moves, so a raise mid-loop keeps them.
+    The payload is re-checked under the folder lock the router delivers under, so a task
+    re-queued meanwhile keeps its hold. Moved, never deleted: a move that cannot happen
+    leaves the sentinel where it is; `prune_spent` later deletes aged archived files through
+    `prune_archive`. Returns {"archived": [task ids], "kept": {disposition: count},
+    "sentinels": n}. A caller's `moved` list gets each id as it moves, so a raise mid-loop
+    keeps them.
     """
     import task_disposition as tdisp
-    from task_archive import find_task_file
 
     ws = Path(workspace)
-    tasks = ws / "tasks"
     d = deliveries_dir(ws, recipient)
     try:
         names = os.listdir(d)
@@ -571,9 +555,12 @@ def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
         got = parse_sentinel(name)
         if got is not None and is_regular_file(d / name):
             by_id.setdefault(got[0], []).append(name)
+    if task_ids is not None:
+        wanted = set(task_ids)
+        by_id = {t: v for t, v in by_id.items() if t in wanted}
     disp = tdisp.task_dispositions(ws, by_id)
-    finished = sorted(t for t in by_id if disp.get(t) in tdisp.SETTLED
-                      and find_task_file(tasks, t) is None)
+    finished = sorted(t for t in by_id if t in disp and _retirable_given(ws, recipient, t, disp[t])
+                      and (task_ids is not None or disp[t] != tdisp.MISSING))
     kept: dict[str, int] = {}
     for t in set(by_id) - set(finished):
         state = disp.get(t, "unreadable-id")
@@ -590,7 +577,7 @@ def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
         afd = _open_archive(dfd)
         try:
             for t in finished:
-                if find_task_file(tasks, t) is not None:
+                if not sentinel_retirable(ws, recipient, t):  # the same rule, under the lock
                     kept["re-queued"] = kept.get("re-queued", 0) + 1
                     continue
                 for name in sentinel_names(t):
@@ -659,14 +646,28 @@ def _move_into_archive(dfd: int, afd: int, name: str) -> None:
     os.unlink(name, dir_fd=dfd)
 
 
-def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
-    """True when removing the sentinel cannot put the task back in the core's
-    queue: either the payload is gone, or a result the core can find remains."""
-    if not payload_path(ws, task_id).is_file():
-        return True
-    if find_ready_result(results_dir(ws), task_id) is not None:
-        return True
-    return archived_payload(ws, task_id).is_file()
+def sentinel_retirable(workspace, recipient: str, task_id: str) -> bool:
+    """May this sentinel leave the inbox? The one rule (`_retirable_given`) for one id; a
+    malformed id never leaves."""
+    try:
+        d = task_disposition(Path(workspace), task_id)
+    except ValueError:
+        return False
+    return _retirable_given(Path(workspace), recipient, task_id, d)
+
+
+def _retirable_given(ws: Path, recipient: str, task_id: str, disposition: str) -> bool:
+    """Its task is archived or gone, or answered with its payload out of tasks/ or this
+    recipient's done flag written: until then the bridge still reads whose reply it is."""
+    from task_archive import find_task_file
+    if disposition == ANSWERED:
+        return (find_task_file(ws / "tasks", task_id) is None
+                or _flagged_answer(ws, recipient, task_id, disposition))
+    return disposition in (ARCHIVED, MISSING)
+
+
+def _flagged_answer(ws: Path, recipient: str, task_id: str, disposition: str) -> bool:
+    return disposition == ANSWERED and is_done_flag(done_flag(ws, recipient, task_id))
 
 
 def sweep(workspace: Path, recipient: str) -> dict:
@@ -674,14 +675,18 @@ def sweep(workspace: Path, recipient: str) -> dict:
     so a reader that only streams never learns about it."""
     ws = Path(workspace)
     seen = set()
-    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": []}
+    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": [], "kept": []}
     for p in accepted(ws, recipient) + pending(ws, recipient):
         task_id = parse_sentinel(p.name)[0]
         if task_id in seen:
             continue
         seen.add(task_id)
         state = residue(ws, recipient, task_id)
-        if state == "pending":
+        if state in ("finished", "stale-sentinel") and not sentinel_retirable(ws, recipient, task_id):
+            # residue reads only the bare payload and the flag; a task still live in
+            # tasks/ (a lane's claim too) with no result would go back to the core's queue.
+            actions["kept"].append(task_id)
+        elif state == "pending":
             actions["ready"].append(task_id)
         elif state == "died-mid-work":
             release(p)
@@ -689,16 +694,22 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "completed":
             actions["completed"].append(task_id)
         elif state == "finished":
-            # Both result and flag exist, so the delivery is spent. Leaving the
-            # sentinel would hand finished work back as ready on the next boot.
-            p.unlink()
-            actions["retired"].append(task_id)
+            # The flag says done and the task is spent. Leaving the sentinel
+            # would hand finished work back as ready on the next boot.
+            actions["retired" if _archive_one(ws, recipient, task_id) else "kept"].append(task_id)
         elif state == "stale-sentinel":
-            p.unlink()
-            actions["stale"].append(task_id)
+            actions["stale" if _archive_one(ws, recipient, task_id) else "kept"].append(task_id)
         else:
             raise AssertionError(f"unmapped residue state {state!r} for {task_id}")
     return actions
+
+
+def _archive_one(ws: Path, recipient: str, task_id: str) -> bool:
+    """archive_finished for one task; an unusable archive/ moves nothing and the sentinel stays."""
+    try:
+        return task_id in archive_finished(ws, recipient, task_ids=[task_id])["archived"]
+    except OSError:
+        return False
 
 
 def read_payload(workspace: Path, task_id: str) -> str | None:

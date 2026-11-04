@@ -25,14 +25,18 @@ from task_archive import find_task_file  # noqa: E402
 
 PENDING, CLAIMED, ANSWERED, ARCHIVED, MISSING = "pending", "claimed", "answered", "archived", "missing"
 SETTLED = frozenset((ANSWERED, ARCHIVED))
+# A worker's delivery sentinel for a task in one of these owes no work.
+SPENT = frozenset((ANSWERED, ARCHIVED, MISSING))
 
 
-def task_disposition(workspace, task_id: str) -> str:
-    """The task's state, answered first: a ready result anywhere settles it whatever the task file says."""
+def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> str:
+    """The task's state, answered first: a ready result anywhere settles it whatever the task file says.
+    `unanswered=True` is a caller that already looked for a result in bulk; the lookup is skipped."""
     if not valid_archive_lookup_id(task_id):
         raise ValueError("not a task id")
     root = Path(workspace)
-    return _decide(root / "tasks", task_id, find_ready_result(root / "results", task_id) is not None)
+    answered = not unanswered and find_ready_result(root / "results", task_id) is not None
+    return _decide(root / "tasks", task_id, answered)
 
 
 def task_dispositions(workspace, task_ids) -> dict:
