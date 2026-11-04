@@ -518,7 +518,7 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
     actions = {"archived": [], "pruned": [], "kept": []}
     ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)})
     try:
-        actions["archived"] = archive_finished(ws, recipient, task_ids=ids)["archived"]
+        archive_finished(ws, recipient, task_ids=ids, moved=actions["archived"])
     except OSError as e:
         actions["archive_error"] = f"{type(e).__name__}: {e}"
     try:
@@ -530,15 +530,17 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
 
 
 def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
-                     task_ids=None) -> dict:
+                     task_ids=None, moved: Optional[list] = None) -> dict:
     """Move every sentinel `sentinel_retirable` allows into `archive/`; open tasks keep theirs.
     `task_ids` narrows the pass to those tasks (prune_spent, the boot sweep, the supervisor's
     retire). Without it a missing task's sentinel stays: the inbox resolver still judges those.
 
     The payload is re-checked under the folder lock the router delivers under, so a task
     re-queued meanwhile keeps its hold. Moved, never deleted: a move that cannot happen
-    leaves the sentinel where it is. Returns {"archived": [task ids], "kept": {disposition:
-    count}, "sentinels": n}.
+    leaves the sentinel where it is; `prune_spent` later deletes aged archived files through
+    `prune_archive`. Returns {"archived": [task ids], "kept": {disposition: count},
+    "sentinels": n}. A caller's `moved` list gets each id as it moves, so a raise mid-loop
+    keeps them.
     """
     import task_disposition as tdisp
 
@@ -565,9 +567,11 @@ def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
         if state in tdisp.SETTLED:
             state += "-payload-live"
         kept[state] = kept.get(state, 0) + 1
-    out = {"archived": [], "kept": kept, "sentinels": sum(len(v) for v in by_id.values())}
-    if dry_run or not finished:
-        out["archived"] = finished if dry_run else []
+    out = {"archived": [] if moved is None else moved, "kept": kept, "sentinels": sum(len(v) for v in by_id.values())}
+    if dry_run:
+        out["archived"] = finished
+        return out
+    if not finished:
         return out
     with arbitration(ws, recipient) as dfd:
         afd = _open_archive(dfd)

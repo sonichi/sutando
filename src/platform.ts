@@ -71,6 +71,11 @@ export function activateWindowsApp(app: string, scriptPath: string, signal?: Abo
 
 export function notify(message: string, title = 'Sutando'): void {
 	try {
+		// Spawned-agent tests set SUTANDO_TEST_MODE=1; a native banner there lands on the developer's desktop.
+		if (process.env.SUTANDO_TEST_MODE === '1') {
+			console.error(`[notify] SUTANDO_TEST_MODE=1, not shown: ${title}: ${message}`);
+			return;
+		}
 		if (isMacOS()) {
 			execFileSync('/usr/bin/osascript', [
 				'-e',

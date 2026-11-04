@@ -42,6 +42,19 @@ class PlatformBackends(unittest.TestCase):
                     expected,
                 )
 
+    def test_notify_test_mode_spawns_no_notifier(self):
+        for flags in (dict(mac=True), dict(windows=True), dict(linux=True)):
+            with self.subTest(**flags):
+                run = Mock(return_value=completed())
+                mac, win, linux = self.platform(**flags)
+                with mac, win, linux, patch.object(platform.subprocess, "run", run), \
+                        patch.dict(os.environ, {"SUTANDO_TEST_MODE": "1"}), \
+                        patch.object(platform.sys, "stderr") as stderr:
+                    platform.notify("Voice is offline", "Sutando")
+                run.assert_not_called()
+                self.assertIn("SUTANDO_TEST_MODE=1", str(stderr.write.call_args_list))
+
+    @patch.dict(os.environ, {"SUTANDO_TEST_MODE": "0"})
     def test_notify_backends_and_failures(self):
         run = Mock(return_value=completed())
         mac, win, linux = self.platform(mac=True)
