@@ -17,7 +17,7 @@
 
   "notifications": {
     "_comment": "macOS desktop notifications are off by default. Set macos to true to opt in.",
-    "macos": true
+    "macos": false
   },
 
   "vault": {

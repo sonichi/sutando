@@ -14,6 +14,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/`
 
+- **`_macos-post.sh`** — Ungated osascript poster. Only macos-notify.sh (after the opt-in check) and macos-notify-always.sh may call it.
 - **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`ack_claim.py`** — First-writer-wins claims on an acknowledgement key, shared by every sender of that ack.

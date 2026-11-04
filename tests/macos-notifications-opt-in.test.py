@@ -184,28 +184,47 @@ class ShellSender(unittest.TestCase):
         self.assertEqual(self.calls.read_text().splitlines()[-2:], ["no workspace", "Sutando"])
 
 
+def _code_lines(text):
+    return [ln for ln in text.splitlines() if not ln.lstrip().startswith(("#", "//"))]
+
+
 class AlwaysIsReservedForTheChannellessAlert(unittest.TestCase):
-    """The ungated entrypoint is a thin real file over the helper; only the no-workspace alert names it."""
+    """One ungated poster; the gated helper and the no-workspace entrypoint are its only callers."""
 
-    def test_always_entrypoint_is_a_real_file_that_calls_the_helper(self):
-        entry = REPO / "src" / "macos-notify-always.sh"
-        self.assertFalse(entry.is_symlink(), "packaging may drop symlinks")
-        text = entry.read_text()
-        self.assertIn("macos-notify.sh", text)
-        self.assertNotIn("osascript", text)
-
-    def test_only_the_gateway_no_workspace_alert_uses_it(self):
+    def _users(self, needle):
         users = []
         for dirpath, dirnames, files in os.walk(REPO):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for f in files:
                 p = Path(dirpath) / f
-                if p.suffix in SCANNED and not p.name.startswith("macos-notify"):
-                    for line in p.read_text(errors="replace").splitlines():
-                        if "macos-notify-always" in line:
+                if p.suffix in SCANNED and p.name != f"{needle}.sh":
+                    for line in _code_lines(p.read_text(errors="replace")):
+                        if needle in line:
                             users.append((p.relative_to(REPO).as_posix(), line.strip()))
+        return users
+
+    def test_entrypoints_are_real_files_over_the_poster(self):
+        for name in ("macos-notify.sh", "macos-notify-always.sh", POSTER.split("/")[-1]):
+            with self.subTest(name=name):
+                self.assertFalse((REPO / "src" / name).is_symlink(), "packaging may drop symlinks")
+        for name in ("macos-notify.sh", "macos-notify-always.sh"):
+            with self.subTest(name=name):
+                code = "\n".join(_code_lines((REPO / "src" / name).read_text()))
+                self.assertIn("_macos-post.sh", code)
+                self.assertNotIn("osascript", code)
+
+    def test_only_the_two_entrypoints_call_the_poster(self):
+        self.assertEqual(sorted({u[0] for u in self._users("_macos-post")}),
+                         ["src/macos-notify-always.sh", "src/macos-notify.sh"])
+
+    def test_only_the_gateway_no_workspace_alert_uses_always(self):
+        users = self._users("macos-notify-always")
         self.assertEqual([u[0] for u in users], ["src/launchd/gateway-bridge-wrapper.sh"], users)
         self.assertIn("cannot resolve the workspace", users[0][1])
+
+    def test_nothing_in_the_environment_skips_the_opt_in(self):
+        text = (REPO / "src" / "macos-notify.sh").read_text()
+        self.assertNotRegex(text, r"\$\{?SUTANDO_\w+", "the opt-in must not depend on an inherited variable")
 
 
 # Shell senders that used to call osascript themselves; each now goes through the helper.
@@ -230,6 +249,7 @@ GATED_SENDERS = {
     "skills/pending-questions/scripts/pending_questions_remind.py": "resolve_macos_notifications()",
     "skills/screen-record/scripts/record.py": "_macos_notifications_on()",
 }
+POSTER = "src/_macos-post.sh"
 SCANNED = {".py", ".sh", ".ts", ".js", ".mjs", ".cjs", ".swift"}
 SKIP_DIRS = {"node_modules", ".git", "tests", "dist", "build", "workspace", "cache"}
 
@@ -250,7 +270,7 @@ class EverySenderIsGated(unittest.TestCase):
                 if re.search(r"display notification|terminal-notifier", text):
                     found.add(p.relative_to(REPO).as_posix())
         self.assertGreaterEqual(len(found), 5, f"the scan narrowed: {sorted(found)}")
-        ungated = sorted(found - set(GATED_SENDERS) - {"src/voice-error-classifier.ts"})
+        ungated = sorted(found - set(GATED_SENDERS) - {POSTER, "src/voice-error-classifier.ts"})
         self.assertEqual(ungated, [], "a macOS notification sender that does not ask notifications.macos")
         for rel, gate in GATED_SENDERS.items():
             with self.subTest(rel=rel):
