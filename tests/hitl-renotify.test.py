@@ -224,8 +224,8 @@ class RenotifyTests(unittest.TestCase):
         self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
 
     def test_a_newer_never_reminded_card_whose_resolve_edit_is_refused_fences_the_seat(self):
-        # keweichen's review on #6220: older card reminded, newer same-seat card not, both resolved,
-        # only the newer edit refused. The seat's recovery waits for that edit.
+        # Older card reminded, newer same-seat card not, both resolved, only the newer edit
+        # refused: the seat's recovery waits for that edit.
         old = self._seat_cards("pro-dev", 1)[0]
         self.remind()
         new = self.mgr.create(seat_card("pro-dev", "pro-dev-g9", self.clock.t)).id
@@ -237,6 +237,26 @@ class RenotifyTests(unittest.TestCase):
         project(self.mgr, flaky, ROOM, clock=self.clock)
         self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
                          "no recovery while the newer card's resolve edit is refused")
+        self.assertFalse(self.mgr.store.projection(old).get("recovered"))
+        self.clock.advance(MIN)
+        before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        messages = [p for p in flaky.sent[before:] if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(self.mgr.store.projection(old).get("recovered"))
+
+    def test_a_newer_card_on_a_pre_upgrade_ledger_whose_resolve_edit_is_refused_fences_the_seat(self):
+        # Older current card reminded and resolved; newer same-seat card on a bare {revision,
+        # event_id} ledger with its resolve edit still pending: no "cleared" until that edit lands.
+        old = self._seat_cards("pro-dev", 1)[0]
+        self.remind()
+        self.mgr.resolve(old)
+        new = self._pre_upgrade(seat_card("pro-dev", "pro-dev-g9", self.clock.t), edited=False).id
+        self.assertNotIn("notified_at", self.mgr.store.projection(new))
+        flaky = FlakySender(new)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery while the legacy card's resolve edit is refused")
         self.assertFalse(self.mgr.store.projection(old).get("recovered"))
         self.clock.advance(MIN)
         before = len(flaky.sent)

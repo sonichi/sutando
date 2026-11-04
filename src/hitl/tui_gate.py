@@ -170,7 +170,7 @@ def option_action(i: int, label: str, yes: Optional[int], no: Optional[int]) -> 
     """One button per terminal option, label verbatim. `allow_always` and `spend` make the
     engine ask again first: a lasting permission, or money. They are classified BEFORE the
     generic yes/no, so a dialog whose first affirmative is "Yes, always allow …" or "Yes,
-    purchase …" never becomes a one-click `allow_once` (keweichen's review on #6220)."""
+    purchase …" never becomes a one-click `allow_once`."""
     if _ALWAYS.search(label):
         return Action(id=f"opt{i + 1}", kind="allow_always", label=label)
     if _SPEND.search(label):

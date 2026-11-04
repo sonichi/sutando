@@ -63,7 +63,7 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
     def test_a_first_affirmative_that_grants_for_good_or_spends_is_never_a_one_click_yes(self):
-        # keweichen's review on #6220: the generic yes/no branch ran first.
+        # The generic yes/no branch used to run first.
         always_first = (" Do you want to proceed?\n ❯ 1. Yes, always allow access to tmp/ from this project\n"
                         "   2. No\n Esc to cancel")
         spend_first = " Do you want to proceed?\n ❯ 1. Yes, purchase usage credits\n   2. No\n Esc to cancel"

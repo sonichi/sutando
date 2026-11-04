@@ -111,15 +111,15 @@ def _pending_resolve(req: HumanRequirement, projection: Dict) -> bool:
     Its seat's recovery must wait for it, not fire around it: a rejected send
     retries on the next drive, and skipping ahead here is what splits one
     seat's recovery into two messages. Whether the card itself owes a recovery
-    (`due`: only once a reminder went out) is a different question: a never-
-    reminded card still fences its seat while its resolve edit is refused, or
-    the owner is told the seat cleared under a card still awaiting its edit
-    (keweichen's review on #6220)."""
+    (`due`: a reminder went out, on a ledger this module keeps) is a different
+    question: any projected card fences its seat while its resolve edit is
+    refused, a never-reminded one and one on a pre-upgrade bare ledger too, or
+    the owner is told the seat cleared under a card still awaiting its edit."""
     if req.status != STATUS_RESOLVED or not projection.get("event_id"):
         return False
     if projection.get("revision", 0) >= req.revision:
         return False
-    return bool(projection.get("notified_at")) and not projection.get("recovered")
+    return not projection.get("recovered")
 
 
 def _tasks(members: Iterable[Tuple[HumanRequirement, Dict]]) -> int:

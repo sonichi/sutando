@@ -66,9 +66,9 @@ SPEND_FIRST = (" Your usage limit was reached. Do you want to proceed?\n"
 
 
 class TheFirstAffirmativeIsStillHeld(unittest.TestCase):
-    """keweichen's review on #6220: with no plain "Yes" before it, the first affirmative was the
-    generic yes (allow_once, one click, Enter typed). A lasting grant or a spend is one whatever
-    its position: the card asks again, and Confirm types its keys."""
+    """With no plain "Yes" before it, the first affirmative was the generic yes (allow_once, one
+    click, Enter typed). A lasting grant or a spend is one whatever its position: the card asks
+    again, and Confirm types its keys."""
 
     def _held_then_typed(self, prompt, kind, why):
         m = HitlManager(HitlStore(Path(tempfile.mkdtemp())))
