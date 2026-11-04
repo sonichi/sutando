@@ -87,7 +87,8 @@ exit 0
 
 def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False,
          slow_death_s: float = 0, gr_rid: str = "", lock_rid: str = "", grace_s: str = "2",
-         private_socket: bool = True, with_claude: bool = True, restart_path=None):
+         private_socket: bool = True, with_claude: bool = True, restart_path=None,
+         app_claude: bool = False):
     """Run start-cli.sh in the stub env with the given initial state.
 
     force  → invoke --force-restart instead of --restart.
@@ -107,11 +108,16 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         stubs = [("tmux", TMUX_STUB), ("pgrep", PGREP_STUB), ("ps", PS_STUB)]
         if with_claude:
             stubs.append(("claude", "#!/bin/bash\nexit 0\n"))
-        if restart_path is not None:
+        if restart_path is not None and not app_claude:
             local = td / ".local" / "bin"
             local.mkdir(parents=True)
             (local / "claude").write_text("#!/bin/bash\nexit 0\n")
             (local / "claude").chmod(0o755)
+        if app_claude:  # claude only in an env-named desktop root, as on a foreign checkout
+            app_bin = td / "app support" / "cli" / "claude" / "bin"
+            app_bin.mkdir(parents=True)
+            (app_bin / "claude").write_text("#!/bin/bash\nexit 0\n")
+            (app_bin / "claude").chmod(0o755)
         for name, body in stubs:
             p = bind / name
             p.write_text(body)
@@ -132,6 +138,8 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         # The post-kill wait is bounded by SUTANDO_RESTART_GRACE_S (90s in production);
         # 2s keeps the wedged cases fast while still exceeding a 1s slow death.
         env["SUTANDO_RESTART_GRACE_S"] = grace_s
+        if app_claude:
+            env["SUTANDO_APP_SUPPORT"] = str(td / "app support")
         if not private_socket:
             del env["SUTANDO_TMUX_SOCKET"]
         if restart_path is not None:

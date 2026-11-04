@@ -2,6 +2,8 @@
 # launch-path.sh finds <engine>/runtime/node/bin (and the older runtime/bin), appends only
 # present dirs not already on PATH, keeps the caller's order, and survives spaces in paths.
 set -u
+# The host desktop root would win over each fixture's own layout.
+unset SUTANDO_APP_SUPPORT
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 td="$(mktemp -d)"
@@ -77,5 +79,14 @@ out="$(HOME="$td/home" PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" /b
   printf %s "$PATH"' _ "$REPO" "$engine/sutando")"
 check "the desktop app's cli/claude and cli/codex dirs are appended, ahead of ~/.local/bin" \
   "$out" "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$engine/runtime/bin:$app/cli/claude/bin:$app/cli/codex/bin:$td/home/.local/bin"
+
+# A foreign checkout reaches the desktop CLIs through SUTANDO_APP_SUPPORT alone.
+mkdir -p "$td/foreign/sutando"
+out="$(HOME="$td/home" SUTANDO_APP_SUPPORT="$app" PATH="/usr/bin:/bin" /bin/bash -c '
+  . "$1/src/agent/launch-path.sh"
+  sutando_append_launch_path "$2"
+  printf %s "$PATH"' _ "$REPO" "$td/foreign/sutando")"
+check "a foreign checkout with SUTANDO_APP_SUPPORT gets that root's cli dirs" \
+  "$out" "/usr/bin:/bin:$app/cli/claude/bin:$app/cli/codex/bin:$td/home/.local/bin"
 
 exit "$fail"

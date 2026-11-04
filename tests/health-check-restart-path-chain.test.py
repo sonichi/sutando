@@ -4,7 +4,7 @@
 - An explicit CODEX_NODE_BIN / CODEX_INSTALL_BIN stays ahead of the bundled node and
   ~/.local/bin through health-check's env (it injects no default ahead of them).
 - A launchd-minimal restart through health-check's env still finds a `claude` that lives
-  only in ~/.local/bin: the launcher adds that dir itself.
+  only in ~/.local/bin, or only in an env-named desktop root's cli/claude/bin.
 - startup.sh's own bundled-node PATH step, then the dispatcher and codex core, still keeps
   CODEX_NODE_BIN ahead of the bundled node.
 
@@ -94,6 +94,15 @@ class ClaudeRestartChain(unittest.TestCase):
         self.assertIn("FAILED: core did not come up", claude_suite._run.last_attempts,
                       "the launch never reached the liveness poll")
 
+    def test_launchd_minimal_restart_of_a_foreign_checkout_finds_the_desktop_claude(self):
+        # The repo is not under <app support>/engine/: only SUTANDO_APP_SUPPORT names the root.
+        rc, out = claude_suite._run(restart=True, session=True, core=True, force=True,
+                                    with_claude=False, app_claude=True,
+                                    restart_path=lambda inherited: restart_path(inherited, REPO))
+        self.assertNotIn("claude not found", out, "the launcher did not find <app support>/cli/claude/bin")
+        self.assertIn("FAILED: core did not come up", claude_suite._run.last_attempts,
+                      "the launch never reached the liveness poll")
+
 
 def load_tests(loader, tests, pattern):
     """Only this file's chain tests, not the inherited codex launcher suite."""
@@ -101,6 +110,7 @@ def load_tests(loader, tests, pattern):
     suite.addTest(CodexRestartChain("test_health_check_restart_keeps_the_explicit_overrides_first"))
     suite.addTest(StartupChain("test_startup_node_step_keeps_codex_node_bin_first"))
     suite.addTest(ClaudeRestartChain("test_launchd_minimal_restart_finds_a_local_bin_claude"))
+    suite.addTest(ClaudeRestartChain("test_launchd_minimal_restart_of_a_foreign_checkout_finds_the_desktop_claude"))
     return suite
 
 

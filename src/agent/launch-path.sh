@@ -9,13 +9,28 @@ sutando_bundled_node_dir() {
   printf '%s\n' "$1/../runtime/node/bin"
 }
 
+# sutando_desktop_app_support <repo>: the desktop root: $SUTANDO_APP_SUPPORT, else the parent of
+# <repo>'s engine/ dir. Prints nothing outside a desktop install or when the dir is missing.
+sutando_desktop_app_support() {
+  local d="${SUTANDO_APP_SUPPORT:-}"
+  if [ -z "$d" ] && [ "$(basename "$(dirname "$1")")" = engine ]; then
+    d="$(dirname "$(dirname "$1")")"
+  fi
+  [ -n "$d" ] && [ -d "$d" ] && printf '%s\n' "$d"
+  return 0
+}
+
 # sutando_launch_path_dirs <repo>: default dirs, one per line, existing or not.
 # runtime/bin is the older bundle layout; <app support>/cli/*/bin is where the desktop app
 # ships `claude` and `codex` (the only copy on a desktop install); ~/.local/bin is the CLI install.
 sutando_launch_path_dirs() {
+  local app
   sutando_bundled_node_dir "$1"
-  printf '%s\n' "$1/../runtime/bin" "$1/../../cli/claude/bin" "$1/../../cli/codex/bin" \
-    "$HOME/.local/bin"
+  printf '%s\n' "$1/../runtime/bin"
+  app="$(sutando_desktop_app_support "$1")"
+  [ -n "$app" ] && printf '%s\n' "$app/engine/runtime/node/bin" "$app/cli/claude/bin" \
+    "$app/cli/codex/bin"
+  printf '%s\n' "$HOME/.local/bin"
 }
 
 # sutando_append_launch_path <repo> [override-dir...]: append each existing dir not already
