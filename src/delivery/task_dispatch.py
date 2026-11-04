@@ -203,6 +203,7 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
 
 
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
+WORKER_HOLD_SUFFIXES = _WORKER_HOLD_SUFFIXES  # the public spelling, for callers outside this module
 
 
 class WorkerHoldUnreadable(OSError):

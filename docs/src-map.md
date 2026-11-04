@@ -40,6 +40,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_auth_exit.py`** — Exit contract for a channel bridge whose provider rejected its credential.
 - **`channel_credentials.py`** — Credential variables a room client reads, taken from the AG2 Space channel env file.
 - **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
@@ -67,6 +68,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_gate_notice.py`** — Tell each task waiting behind a blocked core why it is on hold.
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
+- **`core_limit_hold.py`** — Hold the core's relaunch while its provider refuses it for a limit.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.
@@ -140,6 +142,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`local_time.ts`** — The owner's wall clock for the `local_time:` task header; mirrors local_task_protocol.local_time_value (ISO-8601 with offset, then the IANA zone).
 - **`loop_completion.py`** — Host-specific proof that a proactive-loop pass completed.
+- **`macos-notify.sh`** — Post one macOS notification, only when the owner opted in (notifications.macos).
 - **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-input-hold.ts`** — In meeting mode bodhi runs the session in transcription mode: the voice model must not speak.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
@@ -333,6 +336,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-runtime-record.sh`** — Called only after the adapter confirms its named core is present.
 - **`core-window.sh`** — Core-window policy shared by the runtime launchers: a restart or heal replaces only the core's own window, so sibling windows in the session (gateway lanes, monitor) keep running.
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`launch-path.sh`** — Launch-PATH policy shared by the runtime launchers and health-check's restart env: the engine-owned directories a core launch needs that a launchd job's PATH lacks.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.

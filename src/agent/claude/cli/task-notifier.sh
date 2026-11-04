@@ -143,7 +143,7 @@ alert_composer_block() {
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
-    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume.\" with title \"Sutando\"" &
+    bash "$REPO/src/macos-notify.sh" "Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume." &
     op=$!
     (
       trap 'kill "$s" 2>/dev/null || true; exit 0' TERM

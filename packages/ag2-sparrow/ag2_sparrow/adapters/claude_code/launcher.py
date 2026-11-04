@@ -620,7 +620,7 @@ class Launcher:
         before = cm.stop_handlers(self.state)    # over the inherited dispositions, before any lock
         try:
             with records.flocked(self.config_dir / LAUNCHER_LOCK, blocking=False):
-                return self._serve()
+                return cm.retired(self.state, self._serve(), retry=EXIT_RETRY)
         except BlockingIOError:
             self.log("another launcher of this install is alive; retrying later")
             return EXIT_RETRY

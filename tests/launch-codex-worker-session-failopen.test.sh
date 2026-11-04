@@ -12,6 +12,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 FAKE="$TMP/repo"
 mkdir -p "$FAKE/skills/worker-pool/scripts" "$FAKE/scripts" "$FAKE/src/agent/codex/cli" "$FAKE/skills/proactive-loop/scripts"
 cp "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$FAKE/skills/worker-pool/scripts/"
+cp "$REPO/src/agent/launch-path.sh" "$FAKE/src/agent/"
 printf '#!/bin/bash\necho ""\n' > "$FAKE/scripts/sutando-config.sh"
 printf 'require_python() { printf "%%s\\n" "$SUTANDO_PY"; }\nresolve_python() { printf "%%s\\n" "$SUTANDO_PY"; }\n' > "$FAKE/scripts/python-binary.sh"
 printf '#!/bin/bash\ntouch "$TEST_TMP/supervisor-ran"\n' > "$FAKE/skills/worker-pool/scripts/worker-watcher-supervisor.sh"

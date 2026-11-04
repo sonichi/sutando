@@ -248,8 +248,8 @@ def _checked(popen, op) -> int:
     state = cm.stop_state()
     before = cm.stop_handlers(state)
     try:
-        return _held(cfg, cm.work_root(cfg), popen, state, cm.debug_adapter(LOCAL) if op is not None else "",
-                     op.release if op is not None else None)
+        return cm.retired(state, _held(cfg, cm.work_root(cfg), popen, state,
+                                       cm.debug_adapter(LOCAL) if op is not None else "", op.release if op is not None else None))
     finally:
         cm.restore_handlers(state, before)
 
