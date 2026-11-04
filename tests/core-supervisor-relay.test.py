@@ -334,8 +334,9 @@ class TestComposeMessage(unittest.TestCase):
             self.assertNotIn("choice card", compose_message(sig, surface="ag2space"))
 
     def test_the_choice_card_is_named_only_where_a_card_with_buttons_exists(self):
-        """No card on discord/slack/telegram or macOS-only; a trust/bypass/limit dialog and an
-        unparseable prompt get the button-less card, so the notice names the terminal instead."""
+        """No card on discord/slack/telegram or macOS-only; a trust/bypass dialog and an unparseable
+        prompt get the button-less card, so the notice names the terminal instead. A usage-limit
+        menu now has a button per option, so the notice names the card."""
         base = {"state": "blocked-human", "detail": "awaiting user: selection", "kind": "selection"}
         for surface in ("discord", "slack", "telegram", ""):
             with _no_backend():
@@ -343,13 +344,16 @@ class TestComposeMessage(unittest.TestCase):
             self.assertNotIn("choice card", m, surface or "macos-only")
             self.assertIn("answer it where the core is running", m, surface or "macos-only")
         never = ("Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit",
-                 "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No",
-                 "You've hit your weekly limit\n❯ 1. Switch to Opus and continue\n  2. Stop")
+                 "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No")
         for prompt in never:
             with _no_backend():
                 m = compose_message({**base, "prompt": prompt}, surface="ag2space")
             self.assertNotIn("choice card", m, prompt.splitlines()[0])
             self.assertIn("answer it where the core is running", m)
+        with _no_backend():
+            m = compose_message({**base, "prompt": "You've hit your weekly limit\n❯ 1. Stop and wait for "
+                                 "limit to reset\n  2. Switch to usage credits"}, surface="ag2space")
+        self.assertIn("choice card", m, "a limit menu is answered from the card")
         with _no_backend():
             m = compose_message({**base, "prompt": "pick one"}, surface="ag2space")
         self.assertNotIn("choice card", m, "no numbered options: no buttons")
