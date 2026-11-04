@@ -124,7 +124,7 @@ archived sentinel is no hold. A worker watcher runs it before its startup sweep,
 `prune_spent` runs it first. `pool_delivery.py archive-finished <worker> --dry-run` prints the
 counts. A sentinel stays while the payload is in `tasks/`, even with a result: until the bridge
 archives the task, the sentinel still tells it whose reply it is delivering.
-`prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links.
+`prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links. The clock counts from delivery: the hard-link move keeps the sentinel's mtime, so the first `prune_spent` pass after this deploys archives the old backlog and prunes everything older than 14 days at once.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from

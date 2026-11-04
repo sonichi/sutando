@@ -161,6 +161,28 @@ class TestPruneSpentFailOpen(Base):
         self.assertEqual(os.listdir(elsewhere), [])
 
 
+class TestPartialArchiveIsReported(Base):
+    """A move that fails partway still reports the ids already moved."""
+
+    def test_failure_on_the_second_id_keeps_the_first(self):
+        for t in ("task-a", "task-b"):
+            self.answered(t); self.archived(t); self.sentinel(t)
+        real, calls = pd._move_into_archive, []
+
+        def flaky(dfd, afd, name):
+            calls.append(name)
+            if len(calls) == 2:
+                raise PermissionError("injected")
+            real(dfd, afd, name)
+
+        pd._move_into_archive = flaky
+        self.addCleanup(setattr, pd, "_move_into_archive", real)
+        acts = pd.prune_spent(self.root, W)
+        self.assertEqual(acts["archived"], ["task-a"])
+        self.assertIn("injected", acts["archive_error"])
+        self.assertEqual(self.archived_names(), ["task-a.txt"])
+
+
 class TestPruneArchive(Base):
     DAY = 86400
 
