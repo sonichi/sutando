@@ -138,7 +138,7 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # launch-path.sh owns where the bundled runtime lives; it only appends, so an
 # operator's (or a test harness's) codex or node earlier on PATH keeps winning.
 . "$REPO/src/agent/launch-path.sh"
-sutando_append_launch_path "$REPO" ${CODEX_NODE_BIN:+"$CODEX_NODE_BIN"} "$CODEX_INSTALL_BIN"
+sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting

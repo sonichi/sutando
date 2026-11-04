@@ -264,6 +264,20 @@ def case_force_restart_without_claude_says_why():
     return fails
 
 
+def case_heal_without_claude_exits_127():
+    """The heal path (session up, core gone) must refuse with 127 and name the missing
+    claude, not create a window whose pane dies at once."""
+    rc, out = _run(restart=False, session=True, core=False, with_claude=False)
+    fails = []
+    if rc != 127:
+        fails.append(f"heal with no claude on PATH should exit 127, got {rc}: out={out!r}")
+    if "healing core window" not in out:
+        fails.append(f"the heal branch was not reached: out={out!r}")
+    if "claude not found on PATH=" not in out:
+        fails.append(f"stderr does not name the missing claude: out={out!r}")
+    return fails
+
+
 def _live_log_lines() -> "tuple[int, int]":
     """Line counts of the two logs start-cli.sh appends to in the LIVE workspace."""
     ws = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
@@ -297,6 +311,7 @@ def main() -> int:
         ("slow-death waits", case_restart_waits_for_a_slow_death_instead_of_aborting),
         ("abort releases own lock", case_abort_releases_the_orchestrators_lock_only_for_its_own_rid),
         ("force-restart without claude says why", case_force_restart_without_claude_says_why),
+        ("heal without claude exits 127", case_heal_without_claude_exits_127),
         ("run-does-not-touch-the-live-workspace", case_run_does_not_touch_the_live_workspace),
     ]
     all_failures = []

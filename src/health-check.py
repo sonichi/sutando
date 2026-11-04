@@ -14467,25 +14467,19 @@ def _resolve_launch_env() -> dict:
         "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
         "/usr/local/bin",                           # homebrew (Intel) / misc
     ]
-    # Bundled node and `claude` dirs come from the launchers' shared policy.
-    for d in _engine_launch_path_dirs(REPO_DIR):
-        if d not in extra:
-            extra.append(d)
-    env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
+    parts = extra + env.get("PATH", "/usr/bin:/bin").split(":")
+    # Bundled node and `claude` dirs: appended, as the launchers do (launch-path.sh).
+    parts += [d for d in _engine_launch_path_dirs(REPO_DIR) if d not in parts]
+    env["PATH"] = ":".join(parts)
     return env
 
 
 def _engine_launch_path_dirs(repo: Path) -> "list[str]":
-    """Dirs src/agent/launch-path.sh names for `repo`; [] if it cannot be run."""
-    helper = Path(__file__).resolve().parent / "agent" / "launch-path.sh"
-    try:
-        out = subprocess.run(["/bin/bash", str(helper), str(repo)],
-                             capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if out.returncode != 0:
-        return []
-    return [os.path.normpath(line) for line in out.stdout.splitlines() if line.strip()]
+    """The default dirs of src/agent/launch-path.sh, in its order; no subprocess, so a
+    restart env costs nothing to build. tests/launch-path.test.sh pins the two together."""
+    engine = repo.parent
+    return [str(engine / "runtime" / "node" / "bin"), str(engine / "runtime" / "bin"),
+            str(Path.home() / ".local" / "bin")]
 
 
 def _core_limit_hold(now: float) -> "dict | None":

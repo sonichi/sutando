@@ -449,8 +449,8 @@ def case_o2_launch_env_finds_the_bundled_node() -> list[str]:
                 parts = hc._resolve_launch_env()["PATH"].split(":")
                 if str(want) not in parts:
                     fails.append(f"o2) {'/'.join(layout)} missing from PATH {parts}")
-                elif parts.index(str(want)) > parts.index("/usr/bin"):
-                    fails.append(f"o2) {'/'.join(layout)} must precede the minimal PATH")
+                elif parts.index(str(want)) < parts.index("/sbin"):
+                    fails.append(f"o2) {'/'.join(layout)} must follow the inherited PATH, as the launchers append it")
     finally:
         hc.REPO_DIR = saved_repo
         if saved_path is None:

@@ -19,15 +19,9 @@ done
 SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="$SUTANDO_TMUX_SESSION"
 
-for fallback in "$REPO/../bin" "$REPO/../runtime/node/bin" \
-                "$HOME/.npm-global/bin" "$HOME/.local/bin"; do
-  [ -d "$fallback" ] || continue
-  case ":$PATH:" in
-    *":$fallback:"*) ;;
-    *) PATH="$PATH:$fallback" ;;
-  esac
-done
-export PATH
+# shellcheck source=../../../src/agent/launch-path.sh
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO" "$REPO/../bin" "$(sutando_bundled_node_dir "$REPO")" "$HOME/.npm-global/bin"
 
 config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
 config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"

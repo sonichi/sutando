@@ -4,15 +4,20 @@
 
 # Sourced, defines the functions below; executed with <repo>, prints the directories.
 
-# sutando_launch_path_dirs <repo>: candidate dirs, one per line, existing or not.
-# The desktop app ships node at <engine>/runtime/node/bin; runtime/bin is the older layout.
-sutando_launch_path_dirs() {
-  local engine="$1/.."
-  printf '%s\n' "$engine/runtime/node/bin" "$engine/runtime/bin" "$HOME/.local/bin"
+# sutando_bundled_node_dir <repo>: where the desktop app ships node.
+sutando_bundled_node_dir() {
+  printf '%s\n' "$1/../runtime/node/bin"
 }
 
-# sutando_append_launch_path <repo> [extra-dir...]: append each existing dir not already
-# on PATH, standard dirs first. Appends, so a node or CLI the caller put on PATH keeps winning.
+# sutando_launch_path_dirs <repo>: default dirs, one per line, existing or not.
+# runtime/bin is the older bundle layout; ~/.local/bin is where `claude` installs.
+sutando_launch_path_dirs() {
+  sutando_bundled_node_dir "$1"
+  printf '%s\n' "$1/../runtime/bin" "$HOME/.local/bin"
+}
+
+# sutando_append_launch_path <repo> [override-dir...]: append each existing dir not already
+# on PATH: the caller's overrides first, then the defaults. The incoming PATH always wins.
 sutando_append_launch_path() {
   local repo="$1" d
   shift
@@ -23,7 +28,7 @@ sutando_append_launch_path() {
       *":$d:"*) ;;
       *) PATH="${PATH:+$PATH:}$d" ;;
     esac
-  done < <(sutando_launch_path_dirs "$repo"; [ "$#" -gt 0 ] && printf '%s\n' "$@")
+  done < <([ "$#" -gt 0 ] && printf '%s\n' "$@"; sutando_launch_path_dirs "$repo")
   export PATH
 }
 
