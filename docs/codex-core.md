@@ -78,6 +78,53 @@ The Codex implementation:
 - uses approval policy `never` and sandbox `danger-full-access`, matching the
   full local access required by the owner core;
 - enables web search and makes the user's home directory available;
+- raises Codex's 32 KiB `project_doc_max_bytes` default, which otherwise drops the
+  tail of the checkout's `AGENTS.md`;
+- on a desktop-hosted checkout (`<app-support>/engine/<checkout>`), links the
+  host's `engine/AGENTS.md` into `$CODEX_HOME/AGENTS.md`
+  (`src/codex_host_instructions.py`). Codex reads AGENTS.md only from its project
+  root down, so without the link a Codex core never sees the host's first-contact
+  and Getting started instructions that a Claude core reads from the parent
+  directory. The link is only ever made in the app-private Codex home the launcher
+  created: `CODEX_HOME` must be absolute, contain no `..`, and have no symlink or
+  non-directory component anywhere. Otherwise the helper refuses it as `invalid-home`,
+  creates nothing and the launcher warns; a symlinked `CODEX_HOME` is never followed.
+  One owner, `src/codex_home.py` (shell adapter `src/agent/codex/codex-home.sh`),
+  resolves the configured Codex home once, checks it with the helper's mutation-free
+  `--check`, and creates it only after an explicit `ok` or `no-host`. The startup auth
+  preflight, the core launcher, the worker launcher and `skills/install.sh` all call it
+  and create nothing themselves; project trust, the host link and the reset timer are
+  handed its one resolved home and skip when it is empty. A missing interpreter, a
+  failing or silent checker, or a desktop env name other than `CODEX_HOME` (the only one
+  Codex reads) refuses. A non-desktop checkout is unchanged: its home is created as
+  before and the effective home is the one Codex reads. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
+  is refused as `owner-home` from its path alone, before anything is created. The
+  spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
+  chain names, read textually whether or not the target exists; a chain of more than 32
+  links (Darwin's limit) refuses. The helper walks down from `/`
+  one real directory at a time (`O_DIRECTORY|O_NOFOLLOW`, relative to the parent's
+  descriptor). Before each step and before each directory it creates, it compares the
+  open directory's identity with the owner's `~/.codex`, or, while that does not exist
+  yet, with its nearest existing ancestor plus the case-folded missing names. A match,
+  or an identity it cannot read, refuses the link. That owner record is read again before
+  every directory it creates and right before the link, and any change observed by the
+  recheck refuses. The helper protects against pre-existing/stable aliases and owner-home
+  changes observed before each mutation. Concurrent replacement or retargeting of
+  `$HOME/.codex` (or an ancestor) by the user or another same-UID process while the helper
+  runs is unsupported. In that worst case the host AGENTS.md link can be created in the
+  app home at the instant another process makes that home reachable as `~/.codex`; the
+  helper still never removes or replaces an existing entry. Anything already at
+  `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
+  Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` only when it can
+  open it as a regular file whose whole content (read to EOF, no cap) is not blank:
+  content that is not valid UTF-8 counts, any non-whitespace character (a NUL included)
+  counts, and blank means only Unicode
+  White_Space characters, as Rust's `char::is_whitespace` (U+0009 to U+000D, U+0020,
+  U+0085, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000).
+  So an empty or whitespace-only file, a directory, FIFO, dangling or looping link, or an unreadable
+  file there does not count and the link is made. When a readable override
+  exists, the launcher links nothing, leaves it as it is and warns that the core reads
+  it instead of the host's file;
 - honors `SUTANDO_CORE_MODEL`, `SUTANDO_CORE_WORKING_DIR`, and the more specific
   `SUTANDO_CODEX_WORKING_DIR`;
 - runs a separate managed `sutando-core-watcher` tmux session that converts

@@ -56,6 +56,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
+- **`codex_home.py`** — Resolve, check and create the Codex core's home once, for every launcher that uses it.
+- **`codex_host_instructions.py`** — Give a Codex core the instructions its desktop host ships beside the checkout.
 - **`codex_project_trust.py`** — Record the Codex core's own checkout as a trusted project before launch.
 - **`connections.py`** — Connections: the install's directory of homeserver gateways, one row per bridge instance.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
@@ -358,6 +360,10 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
+
+## `src/agent/codex/`
+
+- **`codex-home.sh`** — Shell adapter for src/codex_home.py, the one owner of the Codex core's home: resolve it, check it, create it only when permitted.
 
 ## `src/agent/codex/cli/`
 

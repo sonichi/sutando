@@ -71,6 +71,7 @@ class EnsureTrusted(unittest.TestCase):
         self.assertEqual(self.cpt.ensure_trusted(self.home, self.repo, self.repo), "already-set")
 
     def test_subdirectory_trusts_the_repository_root(self):
+        self.home.mkdir()
         sub = self.repo / "src"
         sub.mkdir()
         self.assertEqual(self.cpt.ensure_trusted(self.home, sub, self.repo), "trusted")
@@ -109,15 +110,29 @@ class EnsureTrusted(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["config.toml"])
 
     def test_cli_prints_the_outcome(self):
+        self.home.mkdir()
         out = self.cli(self.home, self.repo, self.repo)
         self.assertEqual((out.returncode, out.stdout.strip()), (0, "trusted"))
         out = self.cli(self.home, self.repo, self.repo)
         self.assertEqual((out.returncode, out.stdout.strip()), (0, "already-set"))
 
     def test_main_reports_success(self):
+        self.home.mkdir()
         with patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(self.cpt.main([str(self.home), str(self.repo), str(self.repo)]), 0)
         self.assertEqual(out.getvalue().strip(), "trusted")
+
+    def test_a_missing_codex_home_is_never_created(self):
+        """The launcher resolves and creates the home; trust only writes into it."""
+        rc = self.cpt.main([str(self.home), str(self.repo), str(self.repo)])
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.lexists(self.home))
+
+    def test_an_empty_codex_home_is_refused(self):
+        cwd_config = Path("config.toml")
+        existed = cwd_config.exists()
+        self.assertEqual(self.cpt.main(["", str(self.repo), str(self.repo)]), 1)
+        self.assertEqual(cwd_config.exists(), existed)
 
     def test_an_inline_projects_table_is_refused_unchanged(self):
         """An inline table cannot gain a [projects."x"] section, so appending would break the file."""

@@ -23,10 +23,18 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
             for path in (home, workspace, bin_dir):
                 path.mkdir()
             for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
-                        "scripts/python-binary.sh"):
+                        "scripts/python-binary.sh", "src/agent/codex/codex-home.sh",
+                        "src/codex_home.py", "src/codex_host_instructions.py",
+                        "src/sutando_config.py"):
                 dest = root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / rel, dest)
+            (root / "src/__init__.py").touch()
+            # The worker's Codex home comes from the shared owner, which reads the real config.
+            (root / "sutando.config.json").write_text(json.dumps({
+                "workspace": {"path": str(workspace)},
+                "core_config_dirs": [{"id": "x", "type": "codex", "env_name": "CODEX_HOME",
+                                      "synced": False, "value": str(home / "codex")}]}))
             config = root / "scripts/sutando-config.sh"
             config.write_text(
                 '#!/bin/sh\n'

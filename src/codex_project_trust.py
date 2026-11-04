@@ -7,7 +7,8 @@ reported idle). `-c projects."<dir>".trust_level=...` does not answer it; only t
 saved entry in `$CODEX_HOME/config.toml` does, so this writes that entry.
 
 Only the launcher's own checkout is ever trusted, and an explicit choice already in
-the file (trusted or untrusted) is left as it is.
+the file (trusted or untrusted) is left as it is. The Codex home is the one the launcher
+resolved; it is never created here.
 """
 import argparse
 import json
@@ -58,7 +59,6 @@ def ensure_trusted(codex_home, working_dir, repo):
     # json.dumps quotes a TOML basic-string key the same way (backslashes, quotes).
     text += f'\n[projects.{json.dumps(str(root))}]\ntrust_level = "trusted"\n'
     tomllib.loads(text)  # never write a file Codex could not parse
-    config.parent.mkdir(parents=True, exist_ok=True)
     tmp = config.with_name(f"{config.name}.tmp.{os.getpid()}")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -77,12 +77,14 @@ def ensure_trusted(codex_home, working_dir, repo):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("codex_home", type=Path)
+    parser.add_argument("codex_home", help="the resolved Codex home; never created here")
     parser.add_argument("working_dir", type=Path)
     parser.add_argument("repo", type=Path)
     args = parser.parse_args(argv)
     try:
-        print(ensure_trusted(args.codex_home, args.working_dir, args.repo))
+        if not args.codex_home:
+            raise ValueError("no Codex home given")
+        print(ensure_trusted(Path(args.codex_home), args.working_dir, args.repo))
     except (OSError, ValueError) as exc:  # tomllib.TOMLDecodeError is a ValueError
         print(f"codex project trust: {exc}", file=sys.stderr)
         return 1
