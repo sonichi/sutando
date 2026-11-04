@@ -33,6 +33,10 @@ def is_linux() -> bool:
 def notify(message: str, title: str = "Sutando") -> None:
     """Fire a desktop notification. Best-effort — never raises."""
     try:
+        # Tests set SUTANDO_TEST_MODE=1; a native banner there lands on the developer's desktop.
+        if os.environ.get("SUTANDO_TEST_MODE") == "1":
+            print(f"[notify] SUTANDO_TEST_MODE=1, not shown: {title}: {message}", file=sys.stderr)
+            return
         if is_macos():
             safe = message.replace('"', '\\"')
             safe_title = title.replace('"', '\\"')
