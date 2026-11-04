@@ -175,52 +175,24 @@ class ShellSender(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.calls.read_text().splitlines()[-2:], ["--always", "Sutando"])
 
-    def test_always_entrypoint_posts_when_off(self):
-        env = _child_env(**macos_opt_in_env(self.tmp / "ws", on=False))
-        env["PATH"] = f"{self.bin}:{env['PATH']}"
-        r = subprocess.run(["bash", str(REPO / "src" / "macos-notify-always.sh"), "no workspace"],
-                           env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.calls.read_text().splitlines()[-2:], ["no workspace", "Sutando"])
-
 
 def _code_lines(text):
     return [ln for ln in text.splitlines() if not ln.lstrip().startswith(("#", "//"))]
 
 
-class AlwaysIsReservedForTheChannellessAlert(unittest.TestCase):
-    """One ungated poster; the gated helper and the no-workspace entrypoint are its only callers."""
+class NoSenderSkipsTheOptIn(unittest.TestCase):
+    """Every banner, the gateway's no-workspace alert included, goes through the one gated helper."""
 
-    def _users(self, needle):
-        users = []
-        for dirpath, dirnames, files in os.walk(REPO):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-            for f in files:
-                p = Path(dirpath) / f
-                if p.suffix in SCANNED and p.name != f"{needle}.sh":
-                    for line in _code_lines(p.read_text(errors="replace")):
-                        if needle in line:
-                            users.append((p.relative_to(REPO).as_posix(), line.strip()))
-        return users
-
-    def test_entrypoints_are_real_files_over_the_poster(self):
-        for name in ("macos-notify.sh", "macos-notify-always.sh", POSTER.split("/")[-1]):
+    def test_no_ungated_entrypoint_exists(self):
+        for name in ("macos-notify-always.sh", "_macos-post.sh"):
             with self.subTest(name=name):
-                self.assertFalse((REPO / "src" / name).is_symlink(), "packaging may drop symlinks")
-        for name in ("macos-notify.sh", "macos-notify-always.sh"):
-            with self.subTest(name=name):
-                code = "\n".join(_code_lines((REPO / "src" / name).read_text()))
-                self.assertIn("_macos-post.sh", code)
-                self.assertNotIn("osascript", code)
+                self.assertFalse((REPO / "src" / name).exists(), f"{name} would skip notifications.macos")
 
-    def test_only_the_two_entrypoints_call_the_poster(self):
-        self.assertEqual(sorted({u[0] for u in self._users("_macos-post")}),
-                         ["src/macos-notify-always.sh", "src/macos-notify.sh"])
-
-    def test_only_the_gateway_no_workspace_alert_uses_always(self):
-        users = self._users("macos-notify-always")
-        self.assertEqual([u[0] for u in users], ["src/launchd/gateway-bridge-wrapper.sh"], users)
-        self.assertIn("cannot resolve the workspace", users[0][1])
+    def test_gateway_no_workspace_alert_is_gated(self):
+        code = _code_lines((REPO / "src/launchd/gateway-bridge-wrapper.sh").read_text())
+        alert = [ln for ln in code if "cannot resolve the workspace" in ln and "notify" in ln]
+        self.assertEqual(len(alert), 1, alert)
+        self.assertIn("src/macos-notify.sh", alert[0])
 
     def test_nothing_in_the_environment_skips_the_opt_in(self):
         text = (REPO / "src" / "macos-notify.sh").read_text()
@@ -249,7 +221,6 @@ GATED_SENDERS = {
     "skills/pending-questions/scripts/pending_questions_remind.py": "resolve_macos_notifications()",
     "skills/screen-record/scripts/record.py": "_macos_notifications_on()",
 }
-POSTER = "src/_macos-post.sh"
 SCANNED = {".py", ".sh", ".ts", ".js", ".mjs", ".cjs", ".swift"}
 SKIP_DIRS = {"node_modules", ".git", "tests", "dist", "build", "workspace", "cache"}
 
@@ -270,7 +241,7 @@ class EverySenderIsGated(unittest.TestCase):
                 if re.search(r"display notification|terminal-notifier", text):
                     found.add(p.relative_to(REPO).as_posix())
         self.assertGreaterEqual(len(found), 5, f"the scan narrowed: {sorted(found)}")
-        ungated = sorted(found - set(GATED_SENDERS) - {POSTER, "src/voice-error-classifier.ts"})
+        ungated = sorted(found - set(GATED_SENDERS) - {"src/voice-error-classifier.ts"})
         self.assertEqual(ungated, [], "a macOS notification sender that does not ask notifications.macos")
         for rel, gate in GATED_SENDERS.items():
             with self.subTest(rel=rel):

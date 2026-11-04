@@ -14,7 +14,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/`
 
-- **`_macos-post.sh`** — Ungated osascript poster. Only macos-notify.sh (after the opt-in check) and macos-notify-always.sh may call it.
 - **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`ack_claim.py`** — First-writer-wins claims on an acknowledgement key, shared by every sender of that ack.
@@ -143,7 +142,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`local_time.ts`** — The owner's wall clock for the `local_time:` task header; mirrors local_task_protocol.local_time_value (ISO-8601 with offset, then the IANA zone).
 - **`loop_completion.py`** — Host-specific proof that a proactive-loop pass completed.
-- **`macos-notify-always.sh`** — Post one macOS notification even with notifications.macos off. Only for an alert with no DM to fall back on.
 - **`macos-notify.sh`** — Post one macOS notification, only when the owner opted in (notifications.macos).
 - **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-input-hold.ts`** — In meeting mode bodhi runs the session in transcription mode: the voice model must not speak.
