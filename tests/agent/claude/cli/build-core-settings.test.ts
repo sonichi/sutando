@@ -257,6 +257,34 @@ describe('build-core-settings.mjs', () => {
 		assert.deepEqual(shellParsedWords(blk.hooks[0].command), [hook, '--repo', '/x y']);
 	});
 
+	it('registers the stale-head post guard on Bash, after the shell-trap guard', () => {
+		const trap = '/x/hooks/shell-trap-guard.py';
+		const hook = '/x y/hooks/stale-head-post-guard.py';
+		const o = JSON.parse(
+			execFileSync(
+				'node',
+				[CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD, NATIVE_PIM_GUARD, trap, hook],
+				{ encoding: 'utf8' },
+			),
+		);
+		assert.deepEqual(
+			o.hooks.PreToolUse.map((b: any) => b.matcher),
+			['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'mcp__.*__composio_exec', 'Bash|Write|Edit|MultiEdit|NotebookEdit', 'Bash', 'Bash'],
+		);
+		const last = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+		assert.equal(last.hooks.length, 1);
+		assert.deepEqual(shellParsedWords(last.hooks[0].command), [hook]);
+	});
+
+	it('omitting the stale-head post guard path registers no hook for it', () => {
+		const o = JSON.parse(
+			execFileSync('node', [CORE_BUILDER, GUARD, '', '', '', '', '', '/x/hooks/shell-trap-guard.py', ''], {
+				encoding: 'utf8',
+			}),
+		);
+		assert.ok(!JSON.stringify(o).includes('stale-head-post-guard'));
+	});
+
 	it('omitting the native PIM guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);

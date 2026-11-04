@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>] [<abs-path-to-stale-head-post-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -35,6 +35,9 @@
 //   arg7 (optional): path to hooks/shell-trap-guard.py — registered under
 //                    PreToolUse[Bash] with --repo <checkout>: blocks or warns on
 //                    shell commands that misbehave on macOS/zsh.
+//   arg8 (optional): path to hooks/stale-head-post-guard.py — registered under
+//                    PreToolUse[Bash]: blocks a PR review or comment whose
+//                    commit_id or sha claim names a head the PR has moved past.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -151,6 +154,14 @@ if (shellTrapGuardHook.trim()) {
 	shellTrapGuardSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
 }
 
+// Always-on: the hook only reads GitHub when a post names a sha, and fails open.
+const staleHeadPostGuardHook = process.argv[9] || '';
+let staleHeadPostGuardSettings = null;
+if (staleHeadPostGuardHook.trim()) {
+	const command = `python3 ${shq(staleHeadPostGuardHook)}`;
+	staleHeadPostGuardSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
+}
+
 process.stdout.write(
 	JSON.stringify(
 		mergeHookSettings(
@@ -161,6 +172,7 @@ process.stdout.write(
 			gdocsWriteGuardSettings,
 			nativePimGuardSettings,
 			shellTrapGuardSettings,
+			staleHeadPostGuardSettings,
 		),
 	),
 );
