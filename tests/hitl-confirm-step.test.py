@@ -59,6 +59,47 @@ class TwoAlwaysOptionsAreTwoButtons(unittest.TestCase):
             self.assertEqual(G.keys_for(r, TWO_ALWAYS, "blocked-human"), keys, a.label)
 
 
+ALWAYS_FIRST = (" Bash command\n   ls tmp/\n Do you want to proceed?\n"
+                " ❯ 1. Yes, always allow access to tmp/ from this project\n   2. No\n Esc to cancel")
+SPEND_FIRST = (" Your usage limit was reached. Do you want to proceed?\n"
+               " ❯ 1. Yes, purchase usage credits\n   2. No\n Esc to cancel")
+
+
+class TheFirstAffirmativeIsStillHeld(unittest.TestCase):
+    """keweichen's review on #6220: with no plain "Yes" before it, the first affirmative was the
+    generic yes (allow_once, one click, Enter typed). A lasting grant or a spend is one whatever
+    its position: the card asks again, and Confirm types its keys."""
+
+    def _held_then_typed(self, prompt, kind, why):
+        m = HitlManager(HitlStore(Path(tempfile.mkdtemp())))
+        req = m.create(card(prompt, "permission"))
+        self.assertEqual([(a.id, a.kind) for a in req.actions][:2],
+                         [("opt1", kind), ("deny", "reject_once")])
+        self.assertTrue(req.to_wire()["engine_confirms"])
+        click(m, req, "opt1")
+        held = m.get(req.id)
+        self.assertEqual((held.status, held.chosen_action), ("pending", None), "held, nothing typed")
+        self.assertIn(why, held.message)
+        self.assertTrue(held.to_wire()["confirming"])
+        click(m, req, "confirm")
+        done = m.get(req.id)
+        self.assertEqual((done.status, done.chosen_action), ("in_progress", "opt1"))
+        self.assertEqual(G.keys_for(done, prompt, "blocked-human"), ["Enter"], "only after Confirm")
+
+    def test_a_first_option_that_grants_for_good_is_held(self):
+        self._held_then_typed(ALWAYS_FIRST, "allow_always", "is a lasting permission")
+
+    def test_a_first_option_that_spends_is_held(self):
+        self._held_then_typed(SPEND_FIRST, "spend", "spends money")
+
+    def test_a_plain_yes_first_is_still_one_click(self):
+        m = HitlManager(HitlStore(Path(tempfile.mkdtemp())))
+        req = m.create(card(TWO_ALWAYS, "permission"))
+        self.assertEqual((req.actions[0].id, req.actions[0].kind), ("allow", "allow_once"))
+        click(m, req, "allow")
+        self.assertEqual(m.get(req.id).status, "in_progress")
+
+
 class TheCardAsksAgainBeforeMoneyOrALastingGrant(unittest.TestCase):
     def setUp(self):
         self.m = HitlManager(HitlStore(Path(tempfile.mkdtemp())))

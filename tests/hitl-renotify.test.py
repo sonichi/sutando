@@ -223,6 +223,29 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(len(messages), 1, [m["body"] for m in messages])
         self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
 
+    def test_a_newer_never_reminded_card_whose_resolve_edit_is_refused_fences_the_seat(self):
+        # keweichen's review on #6220: an older card had sent a reminder, a newer same-seat card
+        # none; both resolve, and only the newer one's edit is refused. The seat's recovery must
+        # wait for that edit, not announce "cleared" over a card still awaiting it.
+        old = self._seat_cards("pro-dev", 1)[0]
+        self.remind()
+        new = self.mgr.create(seat_card("pro-dev", "pro-dev-g9", self.clock.t)).id
+        self.drive()
+        self.assertEqual(int(self.mgr.store.projection(new).get("reminders") or 0), 0)
+        for i in (old, new):
+            self.mgr.resolve(i)
+        flaky = FlakySender(new)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery while the newer card's resolve edit is refused")
+        self.assertFalse(self.mgr.store.projection(old).get("recovered"))
+        self.clock.advance(MIN)
+        before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        messages = [p for p in flaky.sent[before:] if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(self.mgr.store.projection(old).get("recovered"))
+
     def test_one_recovery_per_seat(self):
         seats = ("pro-dev", "pro-fast", "pro-comm")
         ids = [i for seat in seats for i in self._seat_cards(seat, 4)]

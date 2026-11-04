@@ -62,6 +62,18 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
+    def test_a_first_affirmative_that_grants_for_good_or_spends_is_never_a_one_click_yes(self):
+        # keweichen's review on #6220: the generic yes/no branch ran first.
+        always_first = (" Do you want to proceed?\n ❯ 1. Yes, always allow access to tmp/ from this project\n"
+                        "   2. No\n Esc to cancel")
+        spend_first = " Do you want to proceed?\n ❯ 1. Yes, purchase usage credits\n   2. No\n Esc to cancel"
+        for prompt, kind in ((always_first, "allow_always"), (spend_first, "spend")):
+            r = req("permission", prompt)
+            self.assertEqual([(a.id, a.kind) for a in r.actions][:2],
+                             [("opt1", kind), ("deny", "reject_once")], prompt)
+            self.assertTrue(r.to_wire()["engine_confirms"], prompt)
+            self.assertEqual(r.subject["option_for_action"], {"opt1": 0, "deny": 1}, prompt)
+
     def test_the_producer_leaves_the_host_to_the_wire(self):
         # One policy, in schema.wire_device: every producer (this gate, driver events,
         # the auth card) gets `host` there, so the gate itself must not add one.
