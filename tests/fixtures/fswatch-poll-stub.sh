@@ -4,7 +4,7 @@
 dirs=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    -l|--event) shift 2 ;;
+    -l|--event|-m|--monitor) shift 2 ;;
     -*) shift ;;
     *) dirs+=("$(cd "$1" 2>/dev/null && pwd -P || printf '%s' "$1")"); shift ;;
   esac
