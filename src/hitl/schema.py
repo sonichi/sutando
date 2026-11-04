@@ -19,7 +19,7 @@ WIRE_FIELD = "space.ag2.hitl"
 NOTICE_FIELD = "space.ag2.hitl_notice"
 # The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
 # (claims, tokens, leases, session keys) and never leaves the host.
-WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
+WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices", "row_link")
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.

@@ -30,6 +30,10 @@ python3 skills/pending-questions/scripts/pq.py clicks [--json]
 python3 skills/pending-questions/scripts/pq.py ack <ask-id> --token <token>
 ```
 
+**Write the question for a person.** The owner reads it on a card. Name the thing being decided
+in words, with a short reference a person uses ("cinny #3285"). Leave out commit hashes, URLs,
+machine and session names. The row link travels with the card on its own.
+
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
 it instead** with `ask` (or `scripts/ask-owner.py`; add `--unless-open` to file nothing when an
 open row already has that question — it reports `already open: [<id>]`). The terminal and a compaction summary reach no one.

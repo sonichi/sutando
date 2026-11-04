@@ -392,17 +392,14 @@ def card_room(dest: Destination) -> str:
 
 
 def card_message(question: str, context: Optional[str], default_action: Optional[str],
-                 reason: Optional[str], options, link: Optional[str] = None,
-                 intro: Optional[str] = None) -> str:
+                 reason: Optional[str], intro: Optional[str] = None) -> str:
+    """What a person reads above the buttons. The choices are the buttons themselves (their
+    consequences ride in subject.choices) and the row link rides in subject.row_link."""
     parts = [question.strip()]
     if context and context.strip():
         parts.append(context.strip())
     if reason and reason.strip() and (default_action or "").strip():
         parts.append(f"Why Approve: {reason.strip()}")
-    parts.append("\n".join(f"{label}: {what}" if what else label
-                           for label, what in card_choices(default_action, options)))
-    if link:
-        parts.append(f"Or set its Status on the row: {link}")
     if intro and intro.strip():
         parts.append(intro.strip())
     return "\n\n".join(parts)
@@ -413,12 +410,15 @@ def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                link: Optional[str] = None, intro: Optional[str] = None, room: str = ""):
     """The question's card, built but not stored, with its id already allocated."""
     from hitl.cards import choice_request, new_id  # noqa: PLC0415
+    subject = {"ask_id": ask_id, "choices": card_consequences(default_action, options)}
+    if link:
+        subject["row_link"] = link
+    # No title: the card is posted by the asking agent, and the client names its sender.
     return choice_request(
-        card_message(question, context, default_action, reason, options, link, intro),
-        card_actions(default_action, options), ask_id,
-        {"ask_id": ask_id, "choices": card_consequences(default_action, options)},
-        runtime=CARD_RUNTIME, title=f"Question from the {host} core",
-        device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host}, req_id=new_id(), room=room)
+        card_message(question, context, default_action, reason, intro),
+        card_actions(default_action, options), ask_id, subject,
+        runtime=CARD_RUNTIME, device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host},
+        req_id=new_id(), room=room)
 
 
 def write_proactive(results: Path, name: str, body: str) -> Path:

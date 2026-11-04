@@ -73,7 +73,9 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
         return None  # the edit goes first
     if req.status == STATUS_RESOLVED:
         # Only a card this module scheduled owes a recovery; a pre-upgrade ledger has no notified_at.
-        owed = projection.get("notified_at") and not projection.get("recovered")
+        # Unless a reminder went out, the card's own resolved line is the one status.
+        owed = (projection.get("notified_at") and not projection.get("recovered")
+                and int(projection.get("reminders") or 0) > 0)
         return RECOVERY if owed else None
     if req.status in TERMINAL_STATUSES or not reminds(req):
         return None
@@ -113,7 +115,8 @@ def _pending_resolve(req: HumanRequirement, projection: Dict) -> bool:
         return False
     if projection.get("revision", 0) >= req.revision:
         return False
-    return bool(projection.get("notified_at")) and not projection.get("recovered")
+    return (bool(projection.get("notified_at")) and not projection.get("recovered")
+            and int(projection.get("reminders") or 0) > 0)
 
 
 def _tasks(members: Iterable[Tuple[HumanRequirement, Dict]]) -> int:

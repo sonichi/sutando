@@ -19,7 +19,11 @@ SEMANTIC_GATES = frozenset({"permission", "selection", "press-enter", "login"})
 # The classifier names the gate nearest the bottom, so a trust or credit dialog rendered
 # as a numbered list arrives labelled `selection`; the TEXT still says what it is.
 _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|Yes, I accept|"
-                              r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
+                              r"Fable limit", re.I)
+# A usage-limit menu gets a button per option; a spending one is marked so the client confirms it.
+_LIMIT_MENU = re.compile(r"usage credits|limit to reset|hit your (?:session|usage|weekly) limit", re.I)
+_SPEND = re.compile(r"usage credits|extra usage|\bcredits\b|\bbuy\b|\bpurchase\b|\bupgrade\b", re.I)
+_ALWAYS = re.compile(r"don['’]?t ask again|do not ask again|always allow|allow always", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
 _FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝╌╍┄┅┈┉]*$")
 _EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
@@ -85,7 +89,7 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
 
 def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
     """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
-    where = f"open its terminal (tmux session {session})" if session else "open its terminal"
+    where = "open its terminal"
     if runtime == "codex":
         return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
                 "`codex login` to switch to another account.")
@@ -162,6 +166,20 @@ def _open_terminal() -> Action:
     return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
 
 
+def option_action(i: int, label: str, yes: Optional[int], no: Optional[int]) -> Action:
+    """One button per terminal option, label verbatim. `allow_always` and `spend` tell the
+    client to confirm first: a lasting permission, or money."""
+    if i == yes and no is not None:
+        return Action(id="allow", kind="allow_once", label=label)
+    if i == no and yes is not None:
+        return Action(id="deny", kind="reject_once", label=label)
+    if _ALWAYS.search(label):
+        return Action(id="allow_always", kind="allow_always", label=label)
+    if _SPEND.search(label):
+        return Action(id=f"opt{i + 1}", kind="spend", label=label)
+    return Action(id=f"opt{i + 1}", kind="select", label=label)
+
+
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
                     runtime: Optional[str] = None,
@@ -180,12 +198,14 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         "options": options,
         "caret": caret,
     }
-    kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
+    kind, title, message, actions = FALLBACK_KIND, "Agent needs your attention", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    if (episode == LIMIT_EPISODE or _NEVER_ONE_CLICK.search(prompt or "")
-            or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
-        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
+    limit_menu = bool(options) and (episode == LIMIT_EPISODE or bool(_LIMIT_MENU.search(prompt or "")))
+    if (_NEVER_ONE_CLICK.search(prompt or "") or (episode == LIMIT_EPISODE and not limit_menu)
+            or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"
+                and not (limit_menu and caret is not None))):
+        pass  # keeps the blocked card: never a one-click answer on a trust gate or a limit banner
     elif gate == "login" or state == "logged-out":
         kind = "auth"
         title, message, label = sign_in_copy(runtime)
@@ -200,15 +220,16 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         yes = next((i for i, o in enumerate(options) if _YES.match(o)), None)
         no = next((i for i, o in enumerate(options) if _NO.match(o)), None)
         message = question(prompt, detail)
-        if yes is not None and no is not None:
+        if limit_menu:
+            # Still the seat's one limit card (identity is runtime, kind, device), now with buttons.
+            kind, title = FALLBACK_KIND, "Usage limit reached"
+            message = f"It has hit its usage limit.\n\n{message}"
+        elif yes is not None and no is not None:
             kind, title = "permission", "Agent needs your confirmation"
-            option_for_action = {"deny": no, "allow": yes}
-            actions = [Action(id="deny", kind="reject_once", label="No"),
-                       Action(id="allow", kind="allow_once", label="Yes")]
         else:
             kind, title = "choice", "Agent needs a decision"
-            option_for_action = {f"opt{i + 1}": i for i in range(len(options))}
-            actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
+        actions = [option_action(i, o, yes, no) for i, o in enumerate(options)]
+        option_for_action = {a.id: i for i, a in enumerate(actions)}
 
     subject["option_for_action"] = option_for_action
     guard = guard_for(session, prompt, state)
@@ -229,7 +250,11 @@ def keys_for(req: HumanRequirement, current_prompt: Optional[str],
     """The keystrokes that realise `req.chosen_action` against the dialog on screen
     NOW, or None when the screen no longer shows the dialog the human clicked on."""
     subject = req.subject or {}
-    if guard_for(str(subject.get("session") or ""), current_prompt, current_state) != req.guard:
+    if limit_card(req):
+        # A limit card is keyed on its seat, so the dialog itself must still be the one asked.
+        if parse_options(current_prompt)[0] != list(subject.get("options") or []):
+            return None
+    elif guard_for(str(subject.get("session") or ""), current_prompt, current_state) != req.guard:
         return None
     action = req.chosen_action
     if action == "continue":

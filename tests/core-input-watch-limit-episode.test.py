@@ -44,11 +44,11 @@ from hitl.schema import STATUS_RESOLVED  # noqa: E402
 
 SESSION = "sutando-worker-1"
 SEAT = "worker comm"
-UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
-           "sutando-worker-1) and run /usage-credits to use extra credits, /login to switch to another "
+UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal "
+           "and run /usage-credits to use extra credits, /login to switch to another "
            "account, or /model to switch to a model with usage left.")
-CODEX_UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
-                 "sutando-worker-1) and run `codex login` to switch to another account.")
+CODEX_UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal "
+                 "and run `codex login` to switch to another account.")
 _FOOTER = ("────────\n❯ \n────────\n"
            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 
@@ -256,7 +256,7 @@ WID = "7c54b230a8d94ea9b86f52d70134ac68"
 POOL_SESSION = f"sutando-worker-{WID}"
 _MENU = ("  You've hit your session limit · resets 4pm\n"
          "  ❯ 1. Stop and wait for limit to reset\n  Enter to confirm · Esc to cancel\n")
-# "limit reached" escapes the one-click deny list, so this menu parses as a two-option choice.
+# A limit menu: one button per option, the paid one marked `spend` for the client to confirm.
 _WEEKLY_MENU = ("  Weekly limit reached · resets Oct 20, 9am\n\n"
                 "  ❯ 1. Stop and wait for limit to reset\n"
                 "    2. Switch to extra usage\n  Enter to confirm · Esc to cancel\n")
@@ -294,7 +294,8 @@ class PoolAndMonitorShareOneCard(_PoolSeat):
         self.assertEqual(pool_card.guard, tui_gate.limit_guard(name))
         self.assertIn("/usage-credits to use extra credits, /login to switch to another account",
                       pool_card.message)
-        self.assertIn(f"tmux session {name}", pool_card.message)
+        self.assertNotIn(name, pool_card.message, "the session rides in device.id, not the text")
+        self.assertEqual(pool_card.device["id"], name)
         watched = M.escalate(m, "blocked-human", "d", "session-limit", _MENU, name,
                              seat="worker comm", runtime="claude")
         self.assertEqual(watched.id, pool_card.id)
@@ -309,10 +310,44 @@ class PoolAndMonitorShareOneCard(_PoolSeat):
                 watched = M.escalate(self.m, "blocked-human", "d", "selection", _WEEKLY_MENU,
                                      POOL_SESSION, seat="worker comm", runtime="claude")
                 self.assertEqual(watched.kind, tui_gate.FALLBACK_KIND)
-                self.assertEqual([a.kind for a in watched.actions], ["open_terminal"])
+                # The monitor's card answers the menu; the pool's types nothing, so it only jumps.
+                kinds = ["open_terminal"] if pool_first else ["select", "spend", "open_terminal"]
+                self.assertEqual([a.kind for a in watched.actions], kinds)
                 pooled = first or self._pool_card(_WEEKLY_MENU)
                 self.assertEqual(watched.id, pooled.id)
                 self.assertEqual(len(self.m.active()), 1)
+
+
+# card-ugly3: the CLI greys the caret row; before #6059 that dropped option 1 from the card.
+_STYLED_LIMIT_MENU = (
+    "● Green the way CI actually runs it.\n"
+    "  ⎿  You've hit your weekly limit · resets Nov 2 at 11am (America/Los_Angeles)\n"
+    "✻ Churned for 30m 14s · done 5:39 PM · 1 monitor still running\n"
+    "────────────────────────────────────────\n"
+    " What do you want to do?\n"
+    " ❯ \x1b[38;5;246m1. Stop and wait for limit to reset\x1b[39m\n"
+    "   2. Wait here, then continue automatically at Nov 2 at 11am\n"
+    "   3. Switch to usage credits\n\n"
+    " Enter to confirm · Esc to cancel\n")
+
+
+class TheGreyCaretRowKeepsOptionOne(unittest.TestCase):
+    def test_all_three_options_reach_the_card_as_buttons(self):
+        import re
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", _STYLED_LIMIT_MENU)
+        state, detail, prompt, kind = M.compose_state(plain, "working", True, styled_pane=_STYLED_LIMIT_MENU)
+        self.assertEqual((state, kind), ("blocked-human", "selection"))
+        with tempfile.TemporaryDirectory() as d:
+            req = M.escalate(HitlManager(HitlStore(pathlib.Path(d))), state, detail, kind, prompt,
+                             SESSION, seat="Baxter", runtime="claude")
+        self.assertEqual([(a.label, a.kind) for a in req.actions], [
+            ("Stop and wait for limit to reset", "select"),
+            ("Wait here, then continue automatically at Nov 2 at 11am", "select"),
+            ("Switch to usage credits", "spend"),
+            ("Open terminal", "open_terminal")])
+        self.assertTrue(req.title.startswith("Baxter · "), req.title)
+        for leak in (SESSION, "tmux", "State:", "Gate:"):
+            self.assertNotIn(leak, req.title + req.message)
 
 
 class PoolSweepKeepsTheEpisode(_PoolSeat):
