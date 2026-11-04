@@ -135,19 +135,10 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # system node, so the app's bundled runtime must be reachable or every codex
 # invocation dies with "env: node: No such file or directory" (exit 127) —
 # which the auth probe below would otherwise misreport as "not authenticated".
-# The engine lives at <app-support>/engine; this script runs from
-# <app-support>/engine/sutando, so the runtime is one level up from $REPO.
-CODEX_NODE_BIN="${CODEX_NODE_BIN:-$(cd "$REPO/.." 2>/dev/null && pwd)/runtime/node/bin}"
-# APPEND, never prepend: an operator (or a test harness) who put a codex or
-# node earlier on PATH must keep winning; we only add a fallback.
-for _d in "$CODEX_NODE_BIN" "$CODEX_INSTALL_BIN"; do
-  [ -d "$_d" ] || continue
-  case ":$PATH:" in
-    *":$_d:"*) ;;
-    *) PATH="$PATH:$_d" ;;
-  esac
-done
-export PATH
+# launch-path.sh owns where the bundled runtime lives; it only appends, so an
+# operator's (or a test harness's) codex or node earlier on PATH keeps winning.
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO" ${CODEX_NODE_BIN:+"$CODEX_NODE_BIN"} "$CODEX_INSTALL_BIN"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting
@@ -214,7 +205,7 @@ if [ "$_codex_auth_rc" -eq 127 ]; then
   # 127 is "could not execute", not "not logged in" — almost always a missing
   # node on PATH. Saying "run codex login" here sends people the wrong way.
   echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
-  echo "  PATH lacked a usable node; looked in $CODEX_NODE_BIN" >&2
+  echo "  PATH lacked a usable node: PATH=$PATH" >&2
   exit 127
 fi
 if [ "$_codex_auth_rc" -ne 0 ]; then

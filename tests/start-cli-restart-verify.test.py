@@ -87,7 +87,7 @@ exit 0
 
 def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False,
          slow_death_s: float = 0, gr_rid: str = "", lock_rid: str = "", grace_s: str = "2",
-         private_socket: bool = True):
+         private_socket: bool = True, with_claude: bool = True):
     """Run start-cli.sh in the stub env with the given initial state.
 
     force  → invoke --force-restart instead of --restart.
@@ -104,8 +104,10 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         if core:
             core_mark.write_text("")
 
-        for name, body in (("tmux", TMUX_STUB), ("pgrep", PGREP_STUB),
-                           ("ps", PS_STUB), ("claude", "#!/bin/bash\nexit 0\n")):
+        stubs = [("tmux", TMUX_STUB), ("pgrep", PGREP_STUB), ("ps", PS_STUB)]
+        if with_claude:
+            stubs.append(("claude", "#!/bin/bash\nexit 0\n"))
+        for name, body in stubs:
             p = bind / name
             p.write_text(body)
             p.chmod(0o755)
@@ -145,6 +147,8 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         lock_left = (td / "workspace" / "state" / "locks" / "graceful-restart.lock").exists()
         _run.last_lock_left = lock_left
+        attempts = td / "workspace" / "logs" / "restart-attempts.log"
+        _run.last_attempts = attempts.read_text() if attempts.exists() else ""
         return r.returncode, (r.stdout + r.stderr)
 
 
@@ -246,6 +250,20 @@ def case_abort_releases_the_orchestrators_lock_only_for_its_own_rid():
     return fails
 
 
+def case_force_restart_without_claude_says_why():
+    """A launch whose `claude` does not resolve must say so, on stderr and in
+    restart-attempts.log, instead of the generic 'did not come up' line."""
+    rc, out = _run(restart=True, session=True, core=True, force=True, with_claude=False)
+    fails = []
+    if rc == 0:
+        fails.append(f"--force-restart with no claude on PATH exited 0: out={out!r}")
+    if "claude not found on PATH=" not in out:
+        fails.append(f"stderr does not name the missing claude: out={out!r}")
+    if "FAILED: claude not found on PATH=" not in _run.last_attempts:
+        fails.append(f"restart-attempts.log does not name the missing claude: {_run.last_attempts!r}")
+    return fails
+
+
 def _live_log_lines() -> "tuple[int, int]":
     """Line counts of the two logs start-cli.sh appends to in the LIVE workspace."""
     ws = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
@@ -278,6 +296,7 @@ def main() -> int:
         ("force-restart-wedged-escalates-to-sigkill", case_force_restart_wedged_escalates_to_sigkill),
         ("slow-death waits", case_restart_waits_for_a_slow_death_instead_of_aborting),
         ("abort releases own lock", case_abort_releases_the_orchestrators_lock_only_for_its_own_rid),
+        ("force-restart without claude says why", case_force_restart_without_claude_says_why),
         ("run-does-not-touch-the-live-workspace", case_run_does_not_touch_the_live_workspace),
     ]
     all_failures = []

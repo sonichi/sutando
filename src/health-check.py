@@ -14466,15 +14466,26 @@ def _resolve_launch_env() -> dict:
     extra = [
         "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
         "/usr/local/bin",                           # homebrew (Intel) / misc
-        str(Path.home() / ".local" / "bin"),        # `claude` install location
     ]
-    # Sutando.app-bundled node runtime: sibling of the repo inside the app bundle
-    # (Contents/Resources/{repo,runtime}). Absent in a plain dev checkout → skipped.
-    bundled_bin = REPO_DIR.parent / "runtime" / "bin"
-    if bundled_bin.is_dir():  # pragma: no cover — only present inside the app bundle
-        extra.append(str(bundled_bin))
+    # Bundled node and `claude` dirs come from the launchers' shared policy.
+    for d in _engine_launch_path_dirs(REPO_DIR):
+        if d not in extra:
+            extra.append(d)
     env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
     return env
+
+
+def _engine_launch_path_dirs(repo: Path) -> "list[str]":
+    """Dirs src/agent/launch-path.sh names for `repo`; [] if it cannot be run."""
+    helper = Path(__file__).resolve().parent / "agent" / "launch-path.sh"
+    try:
+        out = subprocess.run(["/bin/bash", str(helper), str(repo)],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [os.path.normpath(line) for line in out.stdout.splitlines() if line.strip()]
 
 
 def _core_limit_hold(now: float) -> "dict | None":

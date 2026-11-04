@@ -431,6 +431,35 @@ def case_o_launch_env_path() -> list[str]:
     return fails
 
 
+def case_o2_launch_env_finds_the_bundled_node() -> list[str]:
+    """The desktop app ships node at <engine>/runtime/node/bin, not <engine>/runtime/bin;
+    the restart env must carry it, and the older layout too."""
+    import os
+    fails = []
+    saved_path, saved_repo = os.environ.get("PATH"), hc.REPO_DIR
+    try:
+        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        for layout in (("runtime", "node", "bin"), ("runtime", "bin")):
+            with tempfile.TemporaryDirectory() as td:
+                engine = Path(td).resolve() / "engine"
+                (engine / "sutando").mkdir(parents=True)
+                want = engine.joinpath(*layout)
+                want.mkdir(parents=True)
+                hc.REPO_DIR = engine / "sutando"
+                parts = hc._resolve_launch_env()["PATH"].split(":")
+                if str(want) not in parts:
+                    fails.append(f"o2) {'/'.join(layout)} missing from PATH {parts}")
+                elif parts.index(str(want)) > parts.index("/usr/bin"):
+                    fails.append(f"o2) {'/'.join(layout)} must precede the minimal PATH")
+    finally:
+        hc.REPO_DIR = saved_repo
+        if saved_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved_path
+    return fails
+
+
 def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
     """A wedged->dead transition on the SAME oldest task must start a fresh confirm
     window for the dead condition, not inherit the wedge's already-elapsed one."""
@@ -843,6 +872,7 @@ def main() -> int:
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
         ("o", case_o_launch_env_path),
+        ("o2", case_o2_launch_env_finds_the_bundled_node),
         ("p", case_p_wedged_to_dead_transition_reobserves),
         ("q", case_q_preupgrade_state_dead_reobserves),
     ]

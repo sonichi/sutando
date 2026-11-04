@@ -391,6 +391,29 @@ install_claude_personal_hook() {
   bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
 }
 
+# PATH a core pane runs under: tmux gives it the session's, else the server's global
+# environment, never this shell's. Falls back to $PATH when no server answers.
+claude_pane_path() {
+  local line
+  line="$(tmux -S "$TMUX_SOCKET" show-environment -t "=$SESSION" PATH 2>/dev/null)" || line=""
+  case "$line" in PATH=*) printf '%s' "${line#PATH=}"; return 0 ;; esac
+  line="$(tmux -S "$TMUX_SOCKET" show-environment -g PATH 2>/dev/null)" || line=""
+  case "$line" in PATH=*) printf '%s' "${line#PATH=}"; return 0 ;; esac
+  printf '%s' "$PATH"
+}
+
+# Returns 1, with the reason in CLAUDE_LAUNCH_FAILURE and on stderr, when `claude` does
+# not resolve on the pane's PATH: tmux would accept the command and the pane would just die.
+claude_cli_resolves() {
+  local pane_path
+  CLAUDE_LAUNCH_FAILURE=""
+  pane_path="$(claude_pane_path)"
+  (PATH="$pane_path"; hash -r; command -v claude >/dev/null 2>&1) && return 0
+  CLAUDE_LAUNCH_FAILURE="claude not found on PATH=$pane_path"
+  echo "  ⚠ $CLAUDE_LAUNCH_FAILURE" >&2
+  return 1
+}
+
 # Creates a new tmux session running claude with the fully-assembled args, then
 # polls up to ~5s for it to actually come up (a `new-session` accepting the
 # command proves tmux liked it, not that the child process is alive). Reads
@@ -398,6 +421,7 @@ install_claude_personal_hook() {
 # SESSION_ARGS, BOOT_PROMPT. Returns 0 if the session came up live, 1 otherwise
 # (caller decides what that means — abort, retry, or a heal path).
 launch_claude_session() {
+  claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
