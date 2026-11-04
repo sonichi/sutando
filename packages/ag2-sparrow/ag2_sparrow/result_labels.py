@@ -58,11 +58,13 @@ def check(title=None, outcome=None) -> "tuple[dict, str]":
 
 
 def write(result_file: Path, labels: dict) -> "Path | None":
-    """Atomically publish `labels` beside `result_file`; None when there is nothing to write."""
+    """Atomically publish `labels` beside `result_file`. With none, remove any side file left
+    there, so a retried result never carries an earlier attempt's labels; then None."""
     labels = {k: clean(labels.get(k)) for k in LIMITS if clean(labels.get(k))}
-    if not labels:
-        return None
     target = side_path(result_file)
+    if not labels:
+        target.unlink(missing_ok=True)
+        return None
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
@@ -77,16 +79,15 @@ def write(result_file: Path, labels: dict) -> "Path | None":
     return target
 
 
-def archive(results_dir: Path, stem: str, archive_dir: Path, now: float) -> bool:
-    """Move `<stem>.meta.json` to `archive_dir/<stem>-<now>.meta.json`; True when it is gone,
-    absent included. Raises OSError when it could not be moved."""
+def archive(results_dir: Path, stem: str, archive_dir: Path, now: float) -> None:
+    """Move `<stem>.meta.json` to `archive_dir/<stem>-<now>.meta.json`; absent is done.
+    Raises OSError when it could not be moved."""
     side = Path(results_dir) / f"{stem}{SUFFIX}"
     Path(archive_dir).mkdir(parents=True, exist_ok=True)
     try:
         os.replace(side, Path(archive_dir) / f"{stem}-{int(now)}{SUFFIX}")
     except FileNotFoundError:
         pass
-    return True
 
 
 def read(path: Path) -> dict:

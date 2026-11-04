@@ -165,6 +165,13 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertNotIn('outcome', self.server.calls[0])
         self.assertFalse(self.side().exists())
 
+    def test_a_reply_without_labels_removes_a_side_file_left_by_an_earlier_attempt(self):
+        self.start()
+        self.side().write_text('{"title": "Stale", "outcome": "From a crashed attempt."}')
+        rc, out, err = self.reply('4\n')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c.get('title'), c.get('outcome')) for c in self.server.calls], [(None, None)])
+
     def test_no_reply_outcome_defaults_to_its_reason(self):
         self.start()
         rc, out, err = self.reply('', 'no-reply', '--reason', 'an acknowledgement')
