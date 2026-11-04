@@ -26,6 +26,11 @@ Exit code: 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys
