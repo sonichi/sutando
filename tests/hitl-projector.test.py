@@ -203,6 +203,16 @@ class ProjectorTests(unittest.TestCase):
 
 
 class FallbackWhereTests(unittest.TestCase):
+    def test_a_choice_card_without_the_card_still_names_its_replies_and_row(self):
+        from hitl.projector import fallback_body
+        req = make_req(kind="choice", title="", message="Merge cinny #3285?\n\nCI is green.",
+                       subject={"row_link": "https://row.test.invalid/1"},
+                       actions=[Action(id="approve", kind="confirmation", label="Approve"),
+                                Action(id="option-1", kind="confirmation", label="Hold")])
+        self.assertEqual(fallback_body(req), "Sutando needs a decision — Merge cinny #3285?\n"
+                                             "Reply with: Approve · Hold\n"
+                                             "Or set its Status on the row: https://row.test.invalid/1")
+
     def test_the_plain_text_is_one_line_without_machine_names(self):
         import hitl.schema as SCHEMA
         from hitl.projector import fallback_body

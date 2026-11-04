@@ -174,7 +174,7 @@ def option_action(i: int, label: str, yes: Optional[int], no: Optional[int]) -> 
     if i == no and yes is not None:
         return Action(id="deny", kind="reject_once", label=label)
     if _ALWAYS.search(label):
-        return Action(id="allow_always", kind="allow_always", label=label)
+        return Action(id=f"opt{i + 1}", kind="allow_always", label=label)
     if _SPEND.search(label):
         return Action(id=f"opt{i + 1}", kind="spend", label=label)
     return Action(id=f"opt{i + 1}", kind="select", label=label)
@@ -201,7 +201,8 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     kind, title, message, actions = FALLBACK_KIND, "Agent needs your attention", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    limit_menu = bool(options) and (episode == LIMIT_EPISODE or bool(_LIMIT_MENU.search(prompt or "")))
+    # The live dialog's own text, not the pane: a permission dialog under a stale limit line is not one.
+    limit_menu = bool(options) and bool(_LIMIT_MENU.search(dialog_identity(prompt) or ""))
     if (_NEVER_ONE_CLICK.search(prompt or "") or (episode == LIMIT_EPISODE and not limit_menu)
             or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"
                 and not (limit_menu and caret is not None))):

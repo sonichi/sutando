@@ -74,7 +74,7 @@ _KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has 
 
 
 def fallback_body(req: HumanRequirement) -> str:
-    """One line for clients that cannot render the card; a client that can shows the card only.
+    """A short notice for clients that cannot render the card; a client that can shows the card only.
     No machine name and no body text: those would print a second copy beside the card."""
     closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
@@ -83,7 +83,15 @@ def fallback_body(req: HumanRequirement) -> str:
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     first = next((ln.strip() for ln in (req.message or "").splitlines() if ln.strip()), "")
     headline = req.title or first
-    return f"{lead} — {headline}" if headline else lead
+    lines = [f"{lead} — {headline}" if headline else lead]
+    if req.kind in ("choice", "confirmation"):
+        # Without the card a reply by label is the only way to answer, so name the labels.
+        labels = [a.label for a in req.actions if a.kind != "open_terminal"]
+        if labels:
+            lines.append("Reply with: " + " · ".join(labels))
+        if (req.subject or {}).get("row_link"):
+            lines.append(f"Or set its Status on the row: {req.subject['row_link']}")
+    return "\n".join(lines)
 
 
 def _notices(manager: HitlManager, now: float) -> List[renotify.Notice]:

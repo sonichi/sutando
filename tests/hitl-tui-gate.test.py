@@ -58,7 +58,7 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual([a.kind for a in r.actions],
                          ["allow_once", "allow_always", "reject_once", "open_terminal"])
         self.assertEqual(r.message, "Dangerous rm operation on a possibly-empty path Do you want to proceed?")
-        self.assertEqual(r.subject["option_for_action"], {"allow": 0, "allow_always": 1, "deny": 2})
+        self.assertEqual(r.subject["option_for_action"], {"allow": 0, "opt2": 1, "deny": 2})
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
@@ -269,6 +269,13 @@ class TestAUsageLimitMenuIsAnsweredFromTheCard(unittest.TestCase):
         other = LIMIT_MENU.replace("Switch to usage credits", "Switch accounts")
         self.assertIsNone(G.keys_for(clicked(r, "opt3"), other, "blocked-human"))
         self.assertIsNone(G.keys_for(clicked(r, "opt1"), "  You've hit your usage limit", "blocked-human"))
+
+    def test_a_permission_dialog_under_a_stale_limit_line_is_a_permission_card(self):
+        prompt = ("  ⎿  You've hit your weekly limit · resets 3pm\n"
+                  "────────────────────────────────────────\n"
+                  "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No")
+        r = G.requirement_for("blocked-human", "selection", prompt, SESSION_ID, "d", FALLBACK)
+        self.assertEqual((r.kind, r.title), ("permission", "Agent needs your confirmation"))
 
     def test_a_limit_banner_without_a_menu_keeps_the_blocked_card(self):
         r = G.requirement_for("blocked-human", "session-limit", "  You've hit your weekly limit", SESSION_ID,

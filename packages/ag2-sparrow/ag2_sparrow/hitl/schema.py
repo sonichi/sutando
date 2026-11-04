@@ -20,6 +20,10 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 # The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
 # (claims, tokens, leases, session keys) and never leaves the host.
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices", "row_link")
+# A click on one of these asks again on the card before anything is typed: money, or a lasting grant.
+CONFIRM_KINDS = frozenset({"spend", "allow_always"})
+CONFIRM_ACTION_ID = "confirm"
+BACK_ACTION_ID = "back"
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -157,6 +161,27 @@ class HumanRequirement:
         self.revision += 1
         self.updated_at = time.time()
 
+    def ask_to_confirm(self, action: "Action") -> None:
+        """Hold a spending or lasting-grant click: the same card asks again, with only Confirm/Back."""
+        self.subject = {**(self.subject or {}), "confirming": {
+            "action": action.id, "message": self.message, "actions": [a.to_wire() for a in self.actions]}}
+        why = ("spends money" if action.kind == "spend"
+               else "is a lasting permission: you will not be asked again")
+        self.message = f"“{action.label}” {why}. Confirm?\n\n{self.message}"
+        self.actions = [Action(id=CONFIRM_ACTION_ID, kind="confirm", label="Confirm"),
+                        Action(id=BACK_ACTION_ID, kind="back", label="Back")]
+        self.revision += 1
+        self.updated_at = time.time()
+
+    def end_confirm(self) -> str:
+        """Restore the card the human was confirming from; returns the held action id."""
+        subject = dict(self.subject or {})
+        held = subject.pop("confirming")
+        self.subject = subject
+        self.message = held["message"]
+        self.actions = [Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in held["actions"]]
+        return held["action"]
+
     def wire_device(self) -> Optional[Dict[str, str]]:
         """The device as a reader sees it: the producer's dict plus `host` (this
         machine's label) when the producer left it out. Every card, one place.
@@ -197,6 +222,10 @@ class HumanRequirement:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:
             wire["turn_on_action"] = True
+        if any(a.kind in CONFIRM_KINDS for a in self.actions):
+            wire["engine_confirms"] = True  # the card asks again itself; a client need not
+        if (self.subject or {}).get("confirming"):
+            wire["confirming"] = True
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
         return wire_safe(wire)
