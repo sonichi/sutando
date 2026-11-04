@@ -18,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
+import { brotliDecompressSync, constants as zlibConstants, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
@@ -38,6 +39,31 @@ const QUOTA_FILE = statusPath('quota-state.json');
 // persisted in quota-state.json so health-check can page on a transient one.
 export const MAX_RECENT_REJECTIONS = 20;
 const REJECTION_SNIPPET_BYTES = 2048;
+// A decoded rejection body past this is not an error message; stop rather than inflate it.
+const REJECTION_DECODED_MAX_BYTES = 64 * 1024;
+
+/** The text of a captured rejection body, decoded per its Content-Encoding. The capture may stop
+ *  mid-stream, so decoding flushes what it has. A body that cannot be decoded is named, never shown raw. */
+export function rejectionSnippet(captured: Buffer, contentEncoding: unknown): string {
+	const enc = String(contentEncoding ?? '').trim().toLowerCase();
+	const zopts = { finishFlush: zlibConstants.Z_SYNC_FLUSH, maxOutputLength: REJECTION_DECODED_MAX_BYTES };
+	let text: Buffer;
+	try {
+		if (enc === '' || enc === 'identity') text = captured;
+		else if (enc === 'gzip' || enc === 'x-gzip') text = gunzipSync(captured, zopts);
+		else if (enc === 'br') {
+			text = brotliDecompressSync(captured, {
+				finishFlush: zlibConstants.BROTLI_OPERATION_FLUSH, maxOutputLength: REJECTION_DECODED_MAX_BYTES,
+			});
+		} else if (enc === 'deflate') {
+			// RFC 9110 deflate is zlib-wrapped; some servers send it raw.
+			try { text = inflateSync(captured, zopts); } catch { text = inflateRawSync(captured, zopts); }
+		} else return `<${captured.length}-byte body, content-encoding ${enc}>`;
+	} catch {
+		return `<${captured.length}-byte body, content-encoding ${enc}, not decodable>`;
+	}
+	return text.toString('utf8').slice(0, REJECTION_SNIPPET_BYTES);
+}
 
 // OAuth self-refresh. A namespaced CLAUDE_CONFIG_DIR uses a namespaced keychain
 // item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
@@ -679,7 +705,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 								if (seen < REJECTION_SNIPPET_BYTES) { rejChunks.push(c); seen += c.length; }
 							});
 							upRes.on('end', () => {
-								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
+								const snippet = redactForLog(rejectionSnippet(Buffer.concat(rejChunks), upRes.headers['content-encoding']));
 								const model = requestModel(body);
 								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
