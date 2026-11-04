@@ -122,8 +122,9 @@ from everywhere, or answered with its payload out of `tasks/` or this recipient'
 written. Until then the bridge still reads it for whose reply it is delivering.
 `pool_delivery.archive_finished` is the only mover: it moves such sentinels into the recipient's
 `archive/` under the folder lock and re-checks the rule there, so a task re-queued meanwhile keeps
-its hold. `task_ids=` narrows it to some tasks. `prune_spent`, the boot `sweep` and the
-supervisor's retire all go through it. A move that cannot happen (an unusable `archive/`) leaves
+its hold. `task_ids=` narrows it to some tasks; without it (the watcher's startup pass) a missing
+task's sentinel stays, because the inbox resolver still judges those. `prune_spent`, the boot
+`sweep` and the supervisor's retire name their ids and all go through it. A move that cannot happen (an unusable `archive/`) leaves
 the sentinel in the inbox. Every reader lists only the folder's top level, so an archived sentinel
 is no hold. `pool_delivery.py archive-finished <worker> --dry-run` prints the counts.
 `prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links.

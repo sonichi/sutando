@@ -516,8 +516,9 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
     """
     ws = Path(workspace)
     actions = {"archived": [], "pruned": [], "kept": []}
+    ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)})
     try:
-        actions["archived"] = archive_finished(ws, recipient)["archived"]
+        actions["archived"] = archive_finished(ws, recipient, task_ids=ids)["archived"]
     except OSError as e:
         actions["archive_error"] = f"{type(e).__name__}: {e}"
     try:
@@ -531,7 +532,8 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
 def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
                      task_ids=None) -> dict:
     """Move every sentinel `sentinel_retirable` allows into `archive/`; open tasks keep theirs.
-    `task_ids` narrows the pass to those tasks (the boot sweep and the supervisor's retire).
+    `task_ids` narrows the pass to those tasks (prune_spent, the boot sweep, the supervisor's
+    retire). Without it a missing task's sentinel stays: the inbox resolver still judges those.
 
     The payload is re-checked under the folder lock the router delivers under, so a task
     re-queued meanwhile keeps its hold. Moved, never deleted: a move that cannot happen
@@ -555,7 +557,8 @@ def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
         wanted = set(task_ids)
         by_id = {t: v for t, v in by_id.items() if t in wanted}
     disp = tdisp.task_dispositions(ws, by_id)
-    finished = sorted(t for t in by_id if t in disp and _retirable_given(ws, recipient, t, disp[t]))
+    finished = sorted(t for t in by_id if t in disp and _retirable_given(ws, recipient, t, disp[t])
+                      and (task_ids is not None or disp[t] != tdisp.MISSING))
     kept: dict[str, int] = {}
     for t in set(by_id) - set(finished):
         state = disp.get(t, "unreadable-id")

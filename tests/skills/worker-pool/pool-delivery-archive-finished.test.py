@@ -69,22 +69,21 @@ class TestArchiveFinished(Base):
         self.live("task-open"); self.sentinel("task-open")                       # pending
         self.live("task-held", "task-held.claimed-core-1.txt"); self.sentinel("task-held")
         self.live("task-sent"); self.answered("task-sent"); self.sentinel("task-sent")  # bridge not done
-        self.sentinel("task-gone")                                     # missing everywhere: spent too
+        self.sentinel("task-gone")                                               # missing everywhere
 
     def test_finished_sentinels_move_and_open_ones_stay(self):
         self.fixture()
         got = pd.archive_finished(self.root, W)
-        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped", "task-gone"])
-        self.assertEqual(self.archived_names(),
-                         ["task-acc.accepted", "task-done.txt", "task-dropped.txt", "task-gone.txt"])
-        self.assertEqual(self.live_names(), ["task-held.txt", "task-open.txt", "task-sent.txt"])
-        self.assertEqual(got["kept"], {"pending": 1, "claimed": 1, "answered-payload-live": 1})
+        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped"])
+        self.assertEqual(self.archived_names(), ["task-acc.accepted", "task-done.txt", "task-dropped.txt"])
+        self.assertEqual(self.live_names(), ["task-gone.txt", "task-held.txt", "task-open.txt", "task-sent.txt"])
+        self.assertEqual(got["kept"], {"pending": 1, "claimed": 1, "answered-payload-live": 1, "missing": 1})
 
     def test_dry_run_moves_nothing_and_counts_the_same(self):
         self.fixture()
         before = self.live_names()
         got = pd.archive_finished(self.root, W, dry_run=True)
-        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped", "task-gone"])
+        self.assertEqual(sorted(got["archived"]), ["task-acc", "task-done", "task-dropped"])
         self.assertEqual(self.live_names(), before)
         self.assertFalse(self.archive.exists())
 
@@ -92,7 +91,7 @@ class TestArchiveFinished(Base):
         self.fixture()
         pd.archive_finished(self.root, W)
         self.assertEqual(pd.archive_finished(self.root, W)["archived"], [])
-        self.assertEqual(len(self.archived_names()), 4)
+        self.assertEqual(len(self.archived_names()), 3)
 
     def test_an_archived_record_of_the_same_name_is_never_overwritten(self):
         self.answered("task-done"); self.archived("task-done")
@@ -138,6 +137,8 @@ class TestArchiveFinished(Base):
         self.assertEqual(got["archived"], ["task-done"])
         self.assertEqual(got["kept"], {"pending": 1})
         self.assertIn("task-gone.txt", self.live_names())
+        got = pd.archive_finished(self.root, W, task_ids=["task-gone"])
+        self.assertEqual(got["archived"], ["task-gone"], "named explicitly, a missing task's sentinel moves")
 
     def test_prune_spent_archives_finished_work_it_used_to_keep(self):
         self.answered("task-done"); self.archived("task-done"); self.sentinel("task-done")
