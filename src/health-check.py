@@ -4073,6 +4073,9 @@ ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
 def _default_local_notifier(msg: str) -> bool:
     """Owner surface that does not depend on any Sutando bridge. True only on a
     zero exit, so a missing osascript reads as undelivered rather than success."""
+    from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+    if not resolve_macos_notifications():
+        return False  # off unless the owner opted in: reported as undelivered
     safe = str(msg).replace('"', "").replace("\\", "")
     try:
         return subprocess.run(
@@ -13908,6 +13911,10 @@ def notify_for_failures(
     defaults to `osascript` driving `display notification`. Tests inject a
     fake to avoid spamming the developer's own notification center.
     """
+    if notify_cmd is None:
+        from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+        if not resolve_macos_notifications():
+            return
     failures = [c for c in checks
                 if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
                 and not _alerts_suppressed(c)]

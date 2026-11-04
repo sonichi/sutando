@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
+import sutando_config  # noqa: E402
 import sutando_platform as platform  # noqa: E402
 
 
@@ -55,7 +56,17 @@ class PlatformBackends(unittest.TestCase):
                 self.assertIn("SUTANDO_TEST_MODE=1", str(stderr.write.call_args_list))
 
     @patch.dict(os.environ, {"SUTANDO_TEST_MODE": "0"})
-    def test_notify_backends_and_failures(self):
+    def test_notify_macos_is_off_unless_opted_in(self):
+        run = Mock(return_value=completed())
+        mac, win, linux = self.platform(mac=True)
+        with mac, win, linux, patch.object(platform.subprocess, "run", run), \
+                patch.object(sutando_config, "resolve_macos_notifications", return_value=False):
+            platform.notify("Voice is offline", "Sutando")
+        run.assert_not_called()
+
+    @patch.dict(os.environ, {"SUTANDO_TEST_MODE": "0"})
+    @patch.object(sutando_config, "resolve_macos_notifications", return_value=True)
+    def test_notify_backends_and_failures(self, _opted_in):
         run = Mock(return_value=completed())
         mac, win, linux = self.platform(mac=True)
         with mac, win, linux, patch.object(platform.subprocess, "run", run):

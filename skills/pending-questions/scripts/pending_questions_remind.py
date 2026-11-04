@@ -25,6 +25,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 from workspace_default import resolve_workspace
+from sutando_config import resolve_macos_notifications
 from result_publish import publish_text
 from presenter_mode import presenter_mode_active
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently, card_live, send_card_pointers
@@ -134,7 +135,10 @@ BODY_MAX = 160
 
 
 def notify_macos(count, titles):
-    """Returns True only if osascript actually accepted the notification."""
+    """Returns True only if osascript actually accepted the notification; None when
+    notifications.macos is off, so nothing was attempted."""
+    if not resolve_macos_notifications():
+        return None
     # macOS truncates the body: the [:40] cap is the bound, since a title need
     # not contain a comma; blanks are dropped so the join cannot emit a bare `, ,`.
     names = [n for n in (t.split(",", 1)[0].strip()[:40] for t in titles[:3]) if n]
@@ -259,7 +263,7 @@ def notify_summary(count, macos_ok, voice_ok, stale):
     Pure so the claim itself is testable: the summary must not assert delivery
     that did not occur."""
     paths = [
-        "macos=ok" if macos_ok else "macos=FAILED",
+        "macos=off" if macos_ok is None else "macos=ok" if macos_ok else "macos=FAILED",
         "voice=ok" if voice_ok else "voice=skipped(not connected)",
     ]
     if stale:
@@ -272,7 +276,8 @@ def notify_summary(count, macos_ok, voice_ok, stale):
         warning = (
             "  WARNING: no consumer is draining results/proactive-*.txt on this host "
             f"(oldest undrained: {stale[0]}). The DM path is NOT reaching the owner; "
-            "only the macOS notification is real here."
+            + ("and macOS notifications are off, so nothing here is." if macos_ok is None
+               else "only the macOS notification is real here.")
         )
     return summary, warning
 

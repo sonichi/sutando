@@ -19,6 +19,7 @@
 import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { resolveMacosNotifications } from './sutando_config.js';
 
 export type SupportedPlatform = 'darwin' | 'win32' | 'linux';
 
@@ -77,6 +78,8 @@ export function notify(message: string, title = 'Sutando'): void {
 			return;
 		}
 		if (isMacOS()) {
+			// Off unless the owner opted in with notifications.macos.
+			if (!resolveMacosNotifications()) return;
 			execFileSync('/usr/bin/osascript', [
 				'-e',
 				`display notification "${message.replace(/"/g, '\\"')}" with title "${title.replace(/"/g, '\\"')}"`,
