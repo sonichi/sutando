@@ -98,7 +98,7 @@ publish_notice() {  # $1=file tag, $2=text
   printf '%s\n' "$2" \
     | "$PYTHON" "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-$CHANNEL-bridge-$1-$NOW.txt" \
     || echo "[$CHANNEL-bridge-wrapper] could not publish the $1 notice" >&2
-  osascript -e "display notification \"$2\" with title \"Sutando\"" >/dev/null 2>&1 || true
+  bash "$REPO/src/macos-notify.sh" "$2" || true
 }
 emit_restart_alert() {
   NOW="$(date +%s)"

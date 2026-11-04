@@ -15,6 +15,11 @@
     "path": "/absolute/path/to/your/workspace"
   },
 
+  "notifications": {
+    "_comment": "macOS desktop notifications are off by default. Set macos to true to opt in.",
+    "macos": true
+  },
+
   "vault": {
     "_comment": "Enable + point at your private remote git repo to sync notes/memory/archives off-host.",
     "enabled": true,

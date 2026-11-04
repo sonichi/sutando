@@ -659,14 +659,23 @@ def case_x_failed_sender_falls_back_to_a_local_owner_surface() -> list[str]:
     # 5. the shipped default reports False on a non-zero exit rather than assuming success
     if hc._default_local_notifier.__doc__ is None:
         fails.append("x) _default_local_notifier lost its contract docstring")
-    with mock.patch.object(hc.subprocess, "run",
-                           return_value=mock.MagicMock(returncode=1)):
+    import sutando_config
+    with mock.patch.object(sutando_config, "resolve_macos_notifications", return_value=True):
+        with mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.MagicMock(returncode=1)):
+            if hc._default_local_notifier("m") is not False:
+                fails.append("x) default notifier reported success on a non-zero exit")
+        with mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.MagicMock(returncode=0)):
+            if hc._default_local_notifier("m") is not True:
+                fails.append("x) default notifier reported failure on a zero exit")
+    # 6. notifications.macos off (the default): reported undelivered, osascript never run
+    with mock.patch.object(sutando_config, "resolve_macos_notifications", return_value=False), \
+            mock.patch.object(hc.subprocess, "run") as run:
         if hc._default_local_notifier("m") is not False:
-            fails.append("x) default notifier reported success on a non-zero exit")
-    with mock.patch.object(hc.subprocess, "run",
-                           return_value=mock.MagicMock(returncode=0)):
-        if hc._default_local_notifier("m") is not True:
-            fails.append("x) default notifier reported failure on a zero exit")
+            fails.append("x) default notifier claimed delivery with macOS notifications off")
+        if run.called:
+            fails.append("x) default notifier ran osascript with macOS notifications off")
     return fails
 
 

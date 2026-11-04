@@ -38,6 +38,9 @@ def notify(message: str, title: str = "Sutando") -> None:
             print(f"[notify] SUTANDO_TEST_MODE=1, not shown: {title}: {message}", file=sys.stderr)
             return
         if is_macos():
+            from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+            if not resolve_macos_notifications():  # off unless the owner opted in
+                return
             safe = message.replace('"', '\\"')
             safe_title = title.replace('"', '\\"')
             subprocess.run(

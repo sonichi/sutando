@@ -4,7 +4,11 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, it, mock } from 'node:test';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { notify } from '../src/platform.js';
+import { loadConfig, resetCacheForTests } from '../src/sutando_config.js';
 
 const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
 const savedTestMode = process.env.SUTANDO_TEST_MODE;
@@ -26,7 +30,16 @@ afterEach(() => {
 	Object.defineProperty(process, 'platform', platform);
 	if (savedTestMode === undefined) delete process.env.SUTANDO_TEST_MODE;
 	else process.env.SUTANDO_TEST_MODE = savedTestMode;
+	resetCacheForTests();
 });
+
+/** Prime the loader's cache with a config that opts in to macOS notifications. */
+function optInToMacosNotifications(): void {
+	const root = mkdtempSync(join(tmpdir(), 'notify-opt-in-'));
+	writeFileSync(join(root, 'sutando.config.json'),
+		JSON.stringify({ workspace: { path: join(root, 'ws') }, notifications: { macos: true } }));
+	loadConfig(root);
+}
 
 for (const os of ['darwin', 'win32', 'linux'] as const) {
 	it(`${os}: SUTANDO_TEST_MODE=1 spawns no notifier and logs the suppressed banner`, () => {
@@ -46,6 +59,7 @@ for (const value of [undefined, '0', 'true']) {
 		Object.defineProperty(process, 'platform', { value: 'darwin' });
 		if (value === undefined) delete process.env.SUTANDO_TEST_MODE;
 		else process.env.SUTANDO_TEST_MODE = value;
+		optInToMacosNotifications();
 		notify('Voice is back online');
 		assert.deepEqual(spawned, ['/usr/bin/osascript']);
 		assert.deepEqual(logged, []);

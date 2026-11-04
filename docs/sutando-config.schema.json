@@ -201,6 +201,18 @@
         }
       }
     },
+    "notifications": {
+      "type": "object",
+      "description": "Desktop notifications Sutando may post on this host. See docs/workspace-config.md.",
+      "additionalProperties": false,
+      "properties": {
+        "macos": {
+          "type": "boolean",
+          "default": false,
+          "description": "Post macOS desktop notifications (osascript banners from alerts, pending questions, bridge restarts, health checks, context drop, screen recording). Off by default; only JSON true opts in, and any other value or an unreadable config is off. Read by resolve_macos_notifications() in src/sutando_config.py (TS twin resolveMacosNotifications(); shell: scripts/sutando-config.sh macos-notifications, used by src/macos-notify.sh). Every macOS sender checks it."
+        }
+      }
+    },
     "bridges": {
       "type": "object",
       "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
