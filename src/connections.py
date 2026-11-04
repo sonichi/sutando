@@ -99,7 +99,10 @@ MAX_ROWS = 64
 
 PRIMARY_TOKEN_REF = "REMOTE_TASK_TOKEN"
 INSTANCE_TOKEN_PREFIX = "AG2_REMOTE_TOKEN_"
-ADDED_BY = ("login", "owner", "ui", "env")
+ADDED_BY = ("login", "owner", "ui", "env", "agent_link")
+# A pool worker's id, as the worker pool's roster spells it (pool_roster.WORKER_ID_RE). A row that
+# names one is that worker's own identity: never primary, never a core lane (`_core_rows`).
+WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 STATES = ("pending", "connected", "disconnected", "failed", "parked")
 SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
@@ -183,6 +186,16 @@ class DisabledCannotBePrimary(Refusal):
 
     def __init__(self, instance: str):
         super().__init__(f"{self.CODE}: {instance} is disconnected; reconnect it before making it primary")
+
+
+class WorkerCannotBePrimary(Refusal):
+    """A pool worker's own identity answers only what is addressed to it: it never owns the
+    proactive room or unaddressed messages."""
+
+    CODE = "worker_cannot_be_primary"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: {instance} is a pool worker's own identity, never the primary")
 
 
 class ParkedCannotBePrimary(Refusal):
@@ -380,6 +393,26 @@ class TokenUnverified(TokenMismatch):
     CODE = "token_unverified"
 
 
+class WorkerIdentityUnverified(Refusal):
+    """A worker's identity is saved only for an agent its gateway names: the row's agent is what
+    keeps it apart from the core's own row on the same server."""
+
+    CODE = "worker_identity_unverified"
+
+
+class WorkerOwnerMismatch(Refusal):
+    """A worker's agent must be held by an owner a core row already serves (`owner_mxid`): a token
+    for another person's agent would bring that person's messages in at owner tier."""
+
+    CODE = "worker_owner_mismatch"
+
+
+class WorkerIdentityShared(Refusal):
+    """The code is for an agent another row already runs as: a worker's identity is its own."""
+
+    CODE = "worker_identity_shared"
+
+
 class InvalidToken(ConnectionsError):
     pass
 
@@ -459,6 +492,13 @@ def host_of_url(url: str) -> str:
         return (urllib.parse.urlsplit(url or "").hostname or "").lower()
     except ValueError:
         return ""
+
+
+def worker_instance_for(server: str, worker: str) -> str:
+    """The slug of `worker`'s own identity on `server`: the server's slug and the worker id's head,
+    within the 32-character bound and distinct from the server's own slug."""
+    head = re.sub(r"[^a-z0-9]", "", worker.lower())[:8] or "worker"
+    return f"{instance_for(server)[:32 - len(head) - 1].rstrip('-')}-{head}"
 
 
 def token_ref_for(instance: str) -> str:
@@ -959,6 +999,11 @@ def _validate_row(row: object, index: int) -> dict:
     keys = row.get("launch_keys", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) and _ENV_VAR_RE.match(k) for k in keys):
         raise SchemaError(f"connections.json: row {index} launch_keys is not a list of AG2_REMOTE_TOKEN_<INST> names")
+    if "worker" in row:
+        if not isinstance(row["worker"], str) or not WORKER_RE.match(row["worker"]):
+            raise SchemaError(f"connections.json: row {index} worker is not a pool worker id")
+        if row["primary"] or not row["instance"]:
+            raise SchemaError(f"connections.json: row {index} is a worker's identity, so it is a named, non-primary row")
     return row
 
 
@@ -982,10 +1027,14 @@ def _validate(payload: object) -> dict:
     if len(rows) > MAX_ROWS:
         raise SchemaError(f"connections.json: more than {MAX_ROWS} rows")
     rows = [_validate_row(r, i) for i, r in enumerate(rows)]
-    for key in ("instance", "token_ref", "server"):
+    for key in ("instance", "token_ref"):
         values = [r[key] for r in rows]
         if len(set(values)) != len(values):
             raise SchemaError(f"connections.json: duplicate {key}")
+    # One core row per server; a worker's own identity may share its server, once per worker.
+    servers = [(r["server"], r.get("worker")) for r in rows]
+    if len(set(servers)) != len(servers):
+        raise SchemaError("connections.json: duplicate server")
     if sum(1 for r in rows if r["primary"]) > 1:
         raise SchemaError("connections.json: more than one primary row")
     removed = payload.get(REMOVED_KEY, [])
@@ -1190,8 +1239,12 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
                    vault=None, environ: Optional[Mapping[str, str]] = None, kill=None,
-                   skip_backlog: bool = False) -> "tuple[dict, bool]":
+                   skip_backlog: bool = False, worker: Optional[str] = None) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
+
+    With `worker`, the row is that pool worker's own identity (`add_worker_identity`): matched only
+    among that worker's rows, never primary, its slug `worker_instance_for`, and saved only for a
+    verified agent that no other row runs as (`WorkerIdentityUnverified`, `WorkerIdentityShared`).
 
     With `skip_backlog`, a row this call creates records `not_before` (now, epoch seconds): its
     bridge settles every task stamped earlier unqueued (`backlog_reason`). An existing row keeps its own.
@@ -1225,7 +1278,10 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
         raise ConnectionMismatch(server, expected_server if isinstance(expected_server, str) else "")
     if seen.get("authenticated") is False:
         raise TokenRejected()
-    inst = instance if instance is not None else instance_for(server)
+    if worker is not None and (not isinstance(worker, str) or not WORKER_RE.match(worker)):
+        raise ConnectionsError(f"worker {worker!r} is not a pool worker id")
+    inst = instance if instance is not None else (worker_instance_for(server, worker) if worker
+                                                  else instance_for(server))
     if not INSTANCE_RE.match(inst):
         raise ConnectionsError(f"instance {inst!r} is not a slug of [A-Za-z0-9_-]{{1,32}}")
     if inst in RESERVED_INSTANCES:
@@ -1239,9 +1295,11 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     try:
         with _transaction(workspace) as rec:
             rows = rec["rows"]
-            existing = _same_connection(rows, seen)
+            existing = _same_connection(rows, seen, worker)
             retired = None
-            if existing is not None and _readopts_legacy(existing, seen, token, vault, environ):
+            if existing is None and worker:
+                _check_worker_identity(rows, seen, worker)
+            if existing is not None and not worker and _readopts_legacy(existing, seen, token, vault, environ):
                 mine, theirs = existing.get("agent_mxid"), seen.get("agent_mxid")
                 if mine and theirs != mine:
                     raise TokenAgentMismatch("", f"the code is for agent {theirs}, not {mine}")
@@ -1264,10 +1322,12 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                 rec[LEGACY_PARKED_KEY] = True
                 rec[REMOVED_KEY] = sorted(set(rec[REMOVED_KEY]) | {retired["token_ref"]})
             row = _row(server=server, instance=inst, gateway_url=str(seen["gateway_url"]), token_ref=ref,
-                       primary=not any(r["primary"] for r in rows), added_by=added_by,
+                       primary=not worker and not any(r["primary"] for r in rows), added_by=added_by,
                        verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
                        identity=seen)
+            if worker:
+                row["worker"] = worker
             if skip_backlog:
                 row["not_before"] = int(time.time())
             rows.append(row)
@@ -1283,6 +1343,28 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     return dict(row), True
 
 
+def _check_worker_identity(rows: list, seen: Mapping[str, object], worker: str) -> None:
+    """Refuse a worker identity whose agent the gateway did not name, that another row runs as, or
+    that an owner no core row serves holds."""
+    agent = str(seen.get("agent_mxid") or "") if seen.get("verified") else ""
+    if not agent:
+        raise WorkerIdentityUnverified("the gateway did not confirm which agent this code is for"
+                                       + (f" ({seen['error']})" if seen.get("error") else ""))
+    taken = next((r for r in rows if r.get("agent_mxid") == agent), None)
+    if taken is not None:
+        whose = f"worker {taken['worker']}" if taken.get("worker") else "the core"
+        raise WorkerIdentityShared(f"agent {agent} is already {whose}'s ({taken['instance'] or '<legacy>'}); "
+                                   f"worker {worker} needs an agent of its own")
+    owner = str(seen.get("owner_mxid") or "")
+    owners = sorted({str(r["owner_mxid"]) for r in _core_rows(rows) if r.get("owner_mxid")})
+    if not owner or owner not in owners:
+        logging.getLogger(__name__).error("connections: worker %s refused: agent %s is held by %s, not the core's "
+                                          "owner (%s)", worker, agent, owner or "no named owner",
+                                          ", ".join(owners) or "none recorded")
+        raise WorkerOwnerMismatch(f"agent {agent} is held by {owner or 'no owner the gateway names'}, not the "
+                                  f"core's owner ({', '.join(owners) or 'no core row names one'})")
+
+
 def _readopts_legacy(row: Mapping[str, object], seen: Mapping[str, object], token: str, vault,
                      environ: Optional[Mapping[str, str]]) -> bool:
     """Whether a code matched to `row` re-adopts its server: the row is the legacy one, the preview
@@ -1294,12 +1376,19 @@ def _readopts_legacy(row: Mapping[str, object], seen: Mapping[str, object], toke
     return token.strip() not in (held, _vault_snapshot(vault, str(row["token_ref"])))
 
 
-def _same_connection(rows: list, seen: Mapping[str, object]) -> Optional[dict]:
-    """The row this preview belongs to. A row whose server the registry or an identity vouches
-    for matches on server; a provisional (gateway-sourced) row matches only on its own gateway
-    host, so it can never stand in for a real connection elsewhere."""
+def _core_rows(rows: list) -> list:
+    """The rows that are the install's own lanes: every row but a pool worker's own identity."""
+    return [r for r in rows if not r.get("worker")]
+
+
+def _same_connection(rows: list, seen: Mapping[str, object], worker: Optional[str] = None) -> Optional[dict]:
+    """The row this preview belongs to, among the core rows, or among `worker`'s own rows. A row
+    whose server the registry or an identity vouches for matches on server; a provisional
+    (gateway-sourced) row matches only on its own gateway host, so it can never stand in for a
+    real connection elsewhere."""
     server = str(seen.get("server") or "")
     host = str(seen.get("gateway_host") or "")
+    rows = [r for r in rows if r.get("worker") == (worker or None)]
     for r in rows:
         if r["server_source"] != "gateway" and r["server"] == server:
             return r
@@ -1442,7 +1531,8 @@ def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict]
     if _has_owner_dm(designated, workspace):
         return designated, None
     owner = designated.get("owner_mxid")
-    live = [r for r in rows if r is not designated and not r.get("disabled") and not r.get("parked")
+    # A worker's own identity never takes them: it answers only what is addressed to it.
+    live = [r for r in _core_rows(rows) if r is not designated and not r.get("disabled") and not r.get("parked")
             and (not owner or not r.get("owner_mxid") or r.get("owner_mxid") == owner)]
     live.sort(key=lambda r: (bool(r["instance"]), str(r["instance"])))
     taker = next((r for r in live if _has_owner_dm(r, workspace) and _lane_running(r, workspace)), None)
@@ -1548,7 +1638,8 @@ def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None
     resolution: fewer than two rows, no primary, or an unreadable record.
     NoConnectionForRoom when the domain has no row, or its row is disconnected."""
     try:
-        rows = _read(record_path(workspace))
+        # A room operation acts as the install's own agent, never as a worker's identity.
+        rows = _core_rows(_read(record_path(workspace)))
     except (SchemaError, OSError):
         return None
     if len(rows) < 2:
@@ -1678,6 +1769,8 @@ def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     environment until `reconnect`."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
+        if row.get("worker"):
+            raise WorkerCannotBePrimary(instance)
         if row.get("disabled"):
             raise DisabledCannotBePrimary(instance)
         if row.get("parked"):
@@ -1736,6 +1829,8 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
         return _promote_legacy(workspace, kill, park)
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
+        if row.get("worker"):
+            raise WorkerCannotBePrimary(instance)
         if row.get("disabled"):
             raise DisabledCannotBePrimary(instance)
         before = next((r["instance"] for r in rec["rows"] if r["primary"]), None)
@@ -2006,6 +2101,92 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
+
+
+# ── a pool worker's own identity ─────────────────────────────────────────────
+
+# One row naming the worker: a named, never-primary lane that queues every task to that worker and
+# posts nothing proactive. Its token, however it arrived (`source`), lives in the vault.
+
+WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
+
+
+def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    return next((dict(r) for r in rows if r.get("worker") == worker), None)
+
+
+class LaneIdentityUnknown(ConnectionsError):
+    """A lane cannot tell whether it runs as a pool worker's own agent: it must not start."""
+
+
+def lane_worker_at_start(instance: str, environ: Optional[Mapping[str, str]] = None,
+                         workspace: Optional[Path] = None) -> "tuple[str, Optional[str]]":
+    """(the worker lane `instance` runs as, or "" for a core lane; a problem to log, or None). The
+    launcher's `LANE_WORKER_ENV` and the row must agree; the env alone decides on an unreadable
+    record, and with neither the lane is refused (`LaneIdentityUnknown`), never started as core."""
+    environ = os.environ if environ is None else environ
+    said = environ.get(LANE_WORKER_ENV)
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError) as e:
+        if said:
+            return said, f"its connection record is unreadable ({type(e).__name__}); running as the launch named"
+        if said is None:
+            raise LaneIdentityUnknown(f"connection record unreadable ({type(e).__name__}) and the launch names "
+                                      "no worker: this lane may be a worker's own and must not run as the core's")
+        return "", None
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    if row is None:
+        return said or "", ("its connection row is missing from the record; running as the launch named"
+                            if said else None)
+    recorded = str(row.get("worker") or "")
+    if said is not None and said != recorded:
+        raise LaneIdentityUnknown(f"the launch names worker {said or '<core>'} but the row names "
+                                  f"{recorded or '<core>'}")
+    if recorded:
+        owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
+        if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
+            raise LaneIdentityUnknown(f"worker {recorded}'s agent is held by {row.get('owner_mxid') or 'no owner'}, "
+                                      "not the core's owner")
+    return recorded, None
+
+
+def lane_worker(instance: str, workspace: Optional[Path] = None) -> str:
+    """The pool worker whose own identity the lane `instance` runs as; "" for a core lane, or when unreadable."""
+    if not instance:
+        return ""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return ""
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    return str((row or {}).get("worker") or "")
+
+
+def add_worker_identity(worker: str, token: str, *, expected_server: str, source: str = "paste",
+                        **add_kw) -> "tuple[dict, bool]":
+    """Save `token` as `worker`'s own identity (`add_connection` with `worker`); `source` says how the
+    token arrived ("paste" or "agent_link"). Starts nothing: the caller starts the lane (`start_added`)."""
+    if source not in WORKER_TOKEN_SOURCES:
+        raise ConnectionsError(f"source must be one of {', '.join(WORKER_TOKEN_SOURCES)}")
+    return add_connection(token, added_by=WORKER_TOKEN_SOURCES[source], expected_server=expected_server,
+                          worker=worker, **add_kw)
+
+
+def retire_worker_identity(worker: str, *, workspace: Optional[Path] = None, vault=None,
+                           kill=None) -> Optional[dict]:
+    """Take `worker`'s own identity down for good: stop its lane, drop its row, its vault secret and its
+    launch record (`remove_connection`). None when it has none. The agent itself stays on its server
+    until the owner deletes it, or a re-issued token voids this one."""
+    row = worker_identity(worker, workspace)
+    if row is None:
+        return None
+    return remove_connection(str(row["instance"]), workspace=workspace, vault=vault, kill=kill)
 
 
 def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
@@ -2347,6 +2528,7 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"],
                      "agent_mxid": r.get("agent_mxid") or "",
+                     **({"worker": r["worker"]} if r.get("worker") else {}),
                      **({"not_before": r["not_before"]} if r.get("not_before") is not None else {})})
     for inst, var in env_token_vars(environ):
         if inst in seen_inst or var in seen_ref:
@@ -2432,12 +2614,15 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
         NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
+        LANE_WORKER_ENV: str(entry.get("worker") or ""),
     })
     return env
 
 
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
 NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+# The worker a lane runs as (a row's `worker`), empty for a core lane: the lane's start check.
+LANE_WORKER_ENV = "SUTANDO_LANE_WORKER"
 
 
 def backlog_reason(task: Mapping[str, object], not_before: object) -> Optional[str]:
@@ -3115,7 +3300,7 @@ def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str
     """The row `update_token` would write for `seen`, checked as `add_connection` checks a new row
     (same connection, same agent, unique server) and against the record schema; a refusal here
     precedes every external effect."""
-    if _same_connection([row], seen) is None:
+    if _same_connection([row], seen, row.get("worker")) is None:
         raise TokenServerMismatch(instance, f"the code is for server {seen['server']!r}, not {row['server']!r}")
     mine, theirs = row.get("agent_mxid"), seen.get("agent_mxid")
     if mine and not theirs:
@@ -3127,7 +3312,8 @@ def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str
     candidate["gateway_url"] = str(seen["gateway_url"])
     _rekey(candidate, seen)
     candidate["disabled"] = False
-    taken = [r["instance"] for r in rec["rows"] if r is not row and r["server"] == candidate["server"]]
+    taken = [r["instance"] for r in rec["rows"] if r is not row and r["server"] == candidate["server"]
+             and r.get("worker") == row.get("worker")]
     if taken:
         raise TokenServerMismatch(instance, f"the code's server {candidate['server']!r} is connection {taken[0]!r}")
     trial = [candidate if r is row else r for r in rec["rows"]]
@@ -3200,7 +3386,7 @@ def _move_source(rows: list, instance: Optional[str], space_of=None) -> dict:
     the legacy row, else the first row on such a server."""
     if instance is not None:
         return _find(rows, instance)
-    movable = [r for r in rows if successor_server(r["server"], space_of)]
+    movable = [r for r in _core_rows(rows) if successor_server(r["server"], space_of)]
     for pick in ([r for r in movable if r["primary"]], [r for r in movable if not r["instance"]], movable):
         if pick:
             return pick[0]
@@ -3389,7 +3575,7 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
         if seen.get("server") != target or server_of_mxid(new_agent) != target \
                 or _localpart(mine) != _localpart(new_agent) or (owner and theirs and _localpart(owner) != _localpart(theirs)):
             raise MoveRefused("agent_mismatch", f"{target} names {new_agent}, not {mine}")
-        taken = next((r for r in rows if r["server"] == target), None)
+        taken = next((r for r in _core_rows(rows) if r["server"] == target), None)
         if taken is not None and taken.get("agent_mxid") != new_agent:
             raise MoveRefused("successor_exists", f"connection {taken['instance']} is already on {target}")
     except MoveRefused as e:
