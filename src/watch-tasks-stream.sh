@@ -1301,26 +1301,43 @@ handle_event() {
 # must come back through fswatch. Its name matches no admission pattern.
 PRE_READY_EVENTS=""
 probe_n=0
-# 0: a probe came back through fswatch within SUTANDO_WATCHER_READY_TIMEOUT; 1: it did not.
+probe_round=0
+# 0: a probe of THIS round came back through fswatch within SUTANDO_WATCHER_READY_TIMEOUT; 1: it did not.
+# An earlier round's probe still in the FIFO proves nothing about the monitor now running.
 readiness_round_trip() {
-  local deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} )) path rc=1
-  : > "$TASKS_DIR/.ready-$$-$probe_n"
+  local deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} )) path rc=1 tag
+  probe_round=$((probe_round + 1))
+  tag=".ready-$$-r$probe_round"
+  : > "$TASKS_DIR/$tag-$probe_n"
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! IFS= read -r -t 1 path <&3; then
       kill -0 "$FSWATCH_PID" 2>/dev/null || break
       # A probe written before fswatch subscribed raises nothing: write a fresh one.
       probe_n=$((probe_n + 1))
-      : > "$TASKS_DIR/.ready-$$-$probe_n"
+      : > "$TASKS_DIR/$tag-$probe_n"
       continue
     fi
     case "$path" in
-      */.ready-$$-*|.ready-$$-*) rc=0; break ;;
+      */"$tag"-*|"$tag"-*) rc=0; break ;;
+      */.ready-$$-*|.ready-$$-*) ;;
       *) PRE_READY_EVENTS="$PRE_READY_EVENTS$path
 " ;;
     esac
   done
   rm -f "$TASKS_DIR"/.ready-$$-*
   return "$rc"
+}
+# Stops the fswatch the readiness probe gave up on: TERM, then KILL after 2 s, since a monitor
+# wedged on a stalled event service may never act on TERM and the start lock is still held.
+stop_stalled_fswatch() {
+  local _
+  kill -TERM "$FSWATCH_PID" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    { kill -0 "$FSWATCH_PID" 2>/dev/null && ! proc_is_zombie "$FSWATCH_PID"; } || break
+    sleep 0.1
+  done
+  kill -KILL "$FSWATCH_PID" 2>/dev/null
+  wait "$FSWATCH_PID" 2>/dev/null
 }
 if [ "$WATCHER_ROLE" = "session" ]; then
   ready=0
@@ -1329,8 +1346,7 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   # stats the inbox itself. A monitor the owner named is theirs, and is not second-guessed.
   if [ "$ready" -ne 1 ] && [ -z "$FSWATCH_MONITOR" ] && kill -0 "$FSWATCH_PID" 2>/dev/null; then
     echo "watch-tasks-stream: fswatch's default monitor reported nothing from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; relaunching fswatch with poll_monitor" >&2
-    kill -TERM "$FSWATCH_PID" 2>/dev/null
-    wait "$FSWATCH_PID" 2>/dev/null
+    stop_stalled_fswatch
     FSWATCH_MONITOR=poll_monitor
     launch_fswatch && readiness_round_trip && ready=1
   fi

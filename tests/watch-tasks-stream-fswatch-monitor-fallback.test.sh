@@ -1,12 +1,6 @@
 #!/bin/bash
-# A session watcher whose fswatch runs but whose default monitor reports nothing (fseventsd stopped
-# delivering, system-wide) relaunches fswatch with poll_monitor instead of failing readiness; a monitor
-# named in SUTANDO_FSWATCH_MONITOR is used from the first launch and is never replaced.
-#   a) default monitor silent: readiness passes on poll_monitor, the sentinel is stamped, a later task
-#      is announced through events (catch-up pushed out of reach), and a relaunch keeps poll_monitor
-#   b) SUTANDO_FSWATCH_MONITOR=kqueue_monitor: the first launch uses it, no fallback
-#   c) the named monitor is silent: exit 1 naming it, one launch only, no sentinel
-#   d) every monitor silent: exit 1 naming poll_monitor, no sentinel
+# A silent default fswatch monitor (fseventsd stopped delivering) falls back to poll_monitor once, a monitor
+# named in SUTANDO_FSWATCH_MONITOR is never replaced, and only the current round's probe proves readiness.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0; fail=0
@@ -17,8 +11,8 @@ TMP="$(mktemp -d)"
 WATCHER_PID=""
 trap 'if [ -n "$WATCHER_PID" ]; then kill -TERM "$WATCHER_PID" 2>/dev/null || true; wait "$WATCHER_PID" 2>/dev/null; fi; rm -rf "$TMP"' EXIT
 
-# Each launch logs its argv and pid. It reports events (via the shared polling stand-in) only under a
-# monitor listed in $TMP/<case>/working; otherwise it runs and reports nothing.
+# Each launch logs its argv and pid; it reports events only under a monitor listed in <case>/working.
+# <case>/default-mode makes the default monitor print the probes it saw when sent TERM (wedged: then ignore it).
 make_case() {
   local dir="$TMP/$1"; shift
   mkdir -p "$dir/ws/tasks" "$dir/ws/results" "$dir/ws/state" "$dir/bin" "$dir/tmp"
@@ -31,6 +25,19 @@ monitor=default
 prev=""
 for a in "\$@"; do [ "\$prev" = "-m" ] && monitor="\$a"; prev="\$a"; done
 grep -qxF "\$monitor" "$dir/working" && exec bash "$dir/poll-stub.sh" "\$@"
+mode="\$(cat "$dir/default-mode" 2>/dev/null)"
+if [ "\$monitor" = default ] && [ -n "\$mode" ]; then
+  seen=""
+  flush() { for f in \$seen; do printf '%s\n' "\$f"; done; }
+  if [ "\$mode" = wedged ]; then trap flush TERM; else trap 'flush; exit 0' TERM; fi
+  while :; do
+    for f in "$dir/ws/tasks"/.ready-*; do
+      [ -e "\$f" ] || continue
+      case " \$seen " in *" \$f "*) ;; *) seen="\$seen \$f" ;; esac
+    done
+    sleep 0.1
+  done
+fi
 exec tail -f /dev/null
 EOF
   chmod +x "$dir/bin/fswatch"
@@ -124,6 +131,29 @@ check $? "d) its message names the fallback that also failed"
 ! sentinel_stamped d
 check $? "d) no sentinel is written"
 
+# --- e) a default monitor wedged on TERM, which then flushes the old probe -------
+make_case e
+echo wedged > "$TMP/e/default-mode"
+start_watcher e
+wait_exit 150
+[ "$RC" = 1 ]
+check $? "e) the watcher exits 1 rather than hanging on a monitor that ignores TERM (rc $RC)"
+grep -qF "fswatch monitor: poll_monitor" "$TMP/e/err"
+check $? "e) the round-1 probe flushed on TERM did not mark poll_monitor ready"
+wedged="$(sed -n 1p "$TMP/e/launches")"; wedged="${wedged%% *}"
+! kill -0 "$wedged" 2>/dev/null
+check $? "e) the wedged fswatch ($wedged) was killed, not left running"
+! sentinel_stamped e
+check $? "e) no sentinel is written"
+
+# --- f) the default monitor flushes the old probe on TERM and exits -------------
+make_case f
+echo flush > "$TMP/f/default-mode"
+start_watcher f
+wait_exit 100
+[ "$RC" = 1 ] && ! sentinel_stamped f
+check $? "f) a probe from the round before is no proof: exit 1 and no sentinel (rc $RC)"
+
 echo
 echo "$pass passed, $fail failed"
-[ "$fail" = 0 ] || { for c in a b c d; do tail -3 "$TMP/$c/err" 2>/dev/null | sed "s/^/  err($c): /"; done; exit 1; }
+[ "$fail" = 0 ] || { for c in a b c d e f; do tail -3 "$TMP/$c/err" 2>/dev/null | sed "s/^/  err($c): /"; done; exit 1; }
