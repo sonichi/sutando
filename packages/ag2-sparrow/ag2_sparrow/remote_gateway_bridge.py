@@ -8326,7 +8326,11 @@ def _post_proactive() -> None:
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and not owns_unaddressed():
-            continue  # a secondary never owns unaddressed nudges
+            # A secondary never owns unaddressed nudges; with no owning lane running, this line is the only trace.
+            _log_backoff(("proactive-unaddressed-not-owned", f.name),
+                         f"proactive {f.name} left for the lane that owns unaddressed messages: it names no "
+                         f"room, and this lane ({GATEWAY_INSTANCE or 'unsuffixed'}) does not own them")
+            continue
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
