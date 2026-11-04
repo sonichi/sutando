@@ -14930,11 +14930,15 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     return best_socket or default
 
 
-def _resolve_tmux_bin(candidates: "tuple[str, ...]" = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")) -> str:
-    """Absolute tmux path when a known install location exists, else a bare
-    PATH lookup (run with _resolve_launch_env's healed PATH). Same
-    PATH-narrowing class as _resolve_launch_env: under launchd's minimal PATH,
-    homebrew tmux doesn't resolve. Candidates injectable for tests."""
+_TMUX_INSTALL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _resolve_tmux_bin(candidates: "Optional[tuple[str, ...]]" = None) -> str:
+    """Absolute tmux from homebrew or ~/.local/bin (neither is on launchd's PATH, and the
+    launch env does not add ~/.local/bin), else a bare PATH lookup. Candidates injectable."""
+    if candidates is None:
+        candidates = tuple(os.path.join(d, "tmux") for d in _TMUX_INSTALL_DIRS) + (
+            str(Path.home() / ".local" / "bin" / "tmux"),)
     for cand in candidates:
         if os.path.exists(cand):
             return cand

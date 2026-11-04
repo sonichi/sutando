@@ -433,6 +433,29 @@ def case_o_launch_env_path() -> list[str]:
     return fails
 
 
+def case_o3_tmux_probe_finds_a_local_bin_tmux() -> list[str]:
+    """health-check's own tmux probes still find a tmux that lives only in ~/.local/bin,
+    which the launch env no longer carries."""
+    import os
+    fails = []
+    saved = (os.environ.get("PATH"), os.environ.get("HOME"), getattr(hc, "_TMUX_INSTALL_DIRS", ()))
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / ".local" / "bin"
+        local.mkdir(parents=True)
+        (local / "tmux").write_text("#!/bin/sh\necho fake-local-tmux\n")
+        (local / "tmux").chmod(0o755)
+        try:
+            os.environ["PATH"], os.environ["HOME"] = "/usr/bin:/bin:/usr/sbin:/sbin", td
+            hc._TMUX_INSTALL_DIRS = ()
+            r = hc._run_tmux(str(Path(td) / "sock"), "list-sessions")
+            if r is None or "fake-local-tmux" not in (r.stdout or ""):
+                fails.append(f"o3) the ~/.local/bin tmux was not used: {r!r}")
+        finally:
+            os.environ["PATH"], os.environ["HOME"] = saved[0] or "", saved[1] or ""
+            hc._TMUX_INSTALL_DIRS = saved[2]
+    return fails
+
+
 def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
     """A wedged->dead transition on the SAME oldest task must start a fresh confirm
     window for the dead condition, not inherit the wedge's already-elapsed one."""
@@ -845,6 +868,7 @@ def main() -> int:
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
         ("o", case_o_launch_env_path),
+        ("o3", case_o3_tmux_probe_finds_a_local_bin_tmux),
         ("p", case_p_wedged_to_dead_transition_reobserves),
         ("q", case_q_preupgrade_state_dead_reobserves),
     ]

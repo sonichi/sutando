@@ -21,12 +21,18 @@ sutando_launch_path_dirs() {
 sutando_append_launch_path() {
   local repo="$1" d kept="" added=""
   shift
-  # Drop what an earlier call (the dispatcher) appended, so this caller's overrides go first.
+  # Drop only the defaults an earlier call (the dispatcher, a parent core) appended, so this
+  # caller's overrides land ahead of them; overrides are never recorded, so never dropped.
   while IFS= read -r -d: d; do
     case ":${_SUTANDO_LAUNCH_PATH_ADDED:-}:" in *":$d:"*) continue ;; esac
     kept="${kept:+$kept:}$d"
   done <<< "${PATH:+$PATH:}"
   PATH="$kept"
+  for d in "$@"; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    d="$(cd "$d" && pwd)"
+    case ":$PATH:" in *":$d:"*) ;; *) PATH="${PATH:+$PATH:}$d" ;; esac
+  done
   while IFS= read -r d; do
     [ -n "$d" ] && [ -d "$d" ] || continue
     d="$(cd "$d" && pwd)"
@@ -34,7 +40,7 @@ sutando_append_launch_path() {
       *":$d:"*) ;;
       *) PATH="${PATH:+$PATH:}$d"; added="${added:+$added:}$d" ;;
     esac
-  done < <([ "$#" -gt 0 ] && printf '%s\n' "$@"; sutando_launch_path_dirs "$repo")
+  done < <(sutando_launch_path_dirs "$repo")
   export PATH _SUTANDO_LAUNCH_PATH_ADDED="$added"
 }
 

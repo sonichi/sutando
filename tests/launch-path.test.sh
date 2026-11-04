@@ -46,4 +46,17 @@ out="$(HOME="$td/home" PATH="/usr/bin" /bin/bash -c '
 check "a second call puts its override ahead of the defaults the first call appended" \
   "$out" "/usr/bin:$td/extra dir:$engine/runtime/bin:$td/home/.local/bin"
 
+# A worker started from a core keeps the core's CODEX_NODE_BIN / CODEX_INSTALL_BIN dirs,
+# ahead of the defaults, though the core's call left its marker in the environment.
+mkdir -p "$td/home/.npm-global/bin" "$td/node override" "$td/codex override"
+out="$(HOME="$td/home" PATH="/usr/bin:/bin" /bin/bash -c '
+  . "$1/src/agent/launch-path.sh"
+  sutando_append_launch_path "$1" "$2" "$3"
+  SUTANDO_INSTANCE_ID=w1 SUTANDO_TMUX_SESSION=w1 SUTANDO_TASKS_DIR="$4" SUTANDO_WORKSPACE_DIR="$4" \
+  SUTANDO_RESULTS_DIR="$4" SUTANDO_INBOX_RESOLVER=x SUTANDO_POOL_DELIVERY_SCRIPT=x \
+    /bin/bash "$1/skills/worker-pool/scripts/launch-codex-worker-session.sh" --print-env' \
+  _ "$REPO" "$td/node override" "$td/codex override" "$td/ws" | sed -n 's/^PATH=//p')"
+check "a worker under a core keeps both overrides ahead of the defaults" "$out" \
+  "/usr/bin:/bin:$td/node override:$td/codex override:$td/home/.npm-global/bin:$td/home/.local/bin"
+
 exit "$fail"
