@@ -14449,37 +14449,15 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
 
 
 def _resolve_launch_env() -> dict:
-    """Environment for out-of-process core restarts (start-cli.sh --restart).
-
-    launchd's minimal PATH (``/usr/bin:/bin:/usr/sbin:/sbin``) cannot find the
-    tools start-cli.sh needs — homebrew ``tmux``, ``claude`` in ``~/.local/bin``,
-    or the Sutando.app-bundled ``node`` runtime — so the restart exits rc=127
-    (``node unavailable`` / ``exec: claude: not found``) and silently falls
-    through to the legacy fallback. Prepend all of them.
-
-    Extends the existing tmux-only PATH fix to node + claude. Incident
-    2026-07-10: the watchdog restart path was broken under launchd for ~70 min
-    (queue backlog) because every canonical restart hit rc=127. Same PATH-
-    narrowing class as _resolve_tmux_bin (2026-06-09), applied here.
-    """
+    """Env for out-of-process core probes and restarts: homebrew dirs prepended for tmux.
+    Node and ``claude`` dirs are the launchers' (src/agent/launch-path.sh), after any override."""
     env = dict(os.environ)
     extra = [
         "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
         "/usr/local/bin",                           # homebrew (Intel) / misc
     ]
-    parts = extra + env.get("PATH", "/usr/bin:/bin").split(":")
-    # Bundled node and `claude` dirs: appended, as the launchers do (launch-path.sh).
-    parts += [d for d in _engine_launch_path_dirs(REPO_DIR) if d not in parts]
-    env["PATH"] = ":".join(parts)
+    env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
     return env
-
-
-def _engine_launch_path_dirs(repo: Path) -> "list[str]":
-    """The default dirs of src/agent/launch-path.sh, in its order; no subprocess, so a
-    restart env costs nothing to build. tests/launch-path.test.sh pins the two together."""
-    engine = repo.parent
-    return [str(engine / "runtime" / "node" / "bin"), str(engine / "runtime" / "bin"),
-            str(Path.home() / ".local" / "bin")]
 
 
 def _core_limit_hold(now: float) -> "dict | None":

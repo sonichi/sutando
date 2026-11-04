@@ -409,54 +409,27 @@ def case_n_failed_dm_still_restarts_and_records() -> list[str]:
 
 
 def case_o_launch_env_path() -> list[str]:
-    """Regression for the 2026-07-10 launchd restart bug: under launchd's minimal"""
+    """Under launchd's minimal PATH the restart env prepends homebrew (tmux) and injects
+    no node/claude default dirs: those are the launchers' own, after any override."""
     import os
     fails = []
     saved = os.environ.get("PATH")
     try:
         os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"  # launchd minimal
-        env = hc._resolve_launch_env()
-        parts = env["PATH"].split(":")
-        for needed in ("/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local" / "bin")):
+        parts = hc._resolve_launch_env()["PATH"].split(":")
+        for needed in ("/opt/homebrew/bin", "/usr/local/bin"):
             if needed not in parts:
                 fails.append(f"o) resolved PATH missing {needed}")
-        if "/opt/homebrew/bin" in parts and "/usr/bin" in parts:
-            if parts.index("/opt/homebrew/bin") > parts.index("/usr/bin"):
-                fails.append("o) healed dirs must be PREPENDED (before the minimal PATH)")
+        if "/opt/homebrew/bin" in parts and parts.index("/opt/homebrew/bin") > parts.index("/usr/bin"):
+            fails.append("o) homebrew dirs must be PREPENDED (before the minimal PATH)")
+        injected = [p for p in parts if p.endswith(("/runtime/node/bin", "/runtime/bin", "/.local/bin"))]
+        if injected:
+            fails.append(f"o) default launch dirs injected ahead of the launcher's overrides: {injected}")
     finally:
         if saved is None:
             os.environ.pop("PATH", None)
         else:
             os.environ["PATH"] = saved
-    return fails
-
-
-def case_o2_launch_env_finds_the_bundled_node() -> list[str]:
-    """The desktop app ships node at <engine>/runtime/node/bin, not <engine>/runtime/bin;
-    the restart env must carry it, and the older layout too."""
-    import os
-    fails = []
-    saved_path, saved_repo = os.environ.get("PATH"), hc.REPO_DIR
-    try:
-        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
-        for layout in (("runtime", "node", "bin"), ("runtime", "bin")):
-            with tempfile.TemporaryDirectory() as td:
-                engine = Path(td).resolve() / "engine"
-                (engine / "sutando").mkdir(parents=True)
-                want = engine.joinpath(*layout)
-                want.mkdir(parents=True)
-                hc.REPO_DIR = engine / "sutando"
-                parts = hc._resolve_launch_env()["PATH"].split(":")
-                if str(want) not in parts:
-                    fails.append(f"o2) {'/'.join(layout)} missing from PATH {parts}")
-                elif parts.index(str(want)) < parts.index("/sbin"):
-                    fails.append(f"o2) {'/'.join(layout)} must follow the inherited PATH, as the launchers append it")
-    finally:
-        hc.REPO_DIR = saved_repo
-        if saved_path is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = saved_path
     return fails
 
 
@@ -872,7 +845,6 @@ def main() -> int:
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
         ("o", case_o_launch_env_path),
-        ("o2", case_o2_launch_env_finds_the_bundled_node),
         ("p", case_p_wedged_to_dead_transition_reobserves),
         ("q", case_q_preupgrade_state_dead_reobserves),
     ]

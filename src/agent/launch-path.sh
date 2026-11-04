@@ -19,17 +19,23 @@ sutando_launch_path_dirs() {
 # sutando_append_launch_path <repo> [override-dir...]: append each existing dir not already
 # on PATH: the caller's overrides first, then the defaults. The incoming PATH always wins.
 sutando_append_launch_path() {
-  local repo="$1" d
+  local repo="$1" d kept="" added=""
   shift
+  # Drop what an earlier call (the dispatcher) appended, so this caller's overrides go first.
+  while IFS= read -r -d: d; do
+    case ":${_SUTANDO_LAUNCH_PATH_ADDED:-}:" in *":$d:"*) continue ;; esac
+    kept="${kept:+$kept:}$d"
+  done <<< "${PATH:+$PATH:}"
+  PATH="$kept"
   while IFS= read -r d; do
     [ -n "$d" ] && [ -d "$d" ] || continue
     d="$(cd "$d" && pwd)"
     case ":$PATH:" in
       *":$d:"*) ;;
-      *) PATH="${PATH:+$PATH:}$d" ;;
+      *) PATH="${PATH:+$PATH:}$d"; added="${added:+$added:}$d" ;;
     esac
   done < <([ "$#" -gt 0 ] && printf '%s\n' "$@"; sutando_launch_path_dirs "$repo")
-  export PATH
+  export PATH _SUTANDO_LAUNCH_PATH_ADDED="$added"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

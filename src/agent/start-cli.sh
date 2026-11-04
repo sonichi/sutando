@@ -12,6 +12,9 @@ case "$0" in
 esac
 REPO="$(cd "$_self_dir/../.." && pwd)"
 unset _self_dir
+# The tmux guard below runs before either runtime launcher; it needs the same PATH they get.
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO"
 
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy

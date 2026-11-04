@@ -483,7 +483,20 @@ exit 0
             if slave >= 0:
                 os.close(slave)
 
-    def _launch_path_order(self, env_extra):
+    def _health_check_restart_path(self, path):
+        """PATH health-check hands the launcher for a restart. Homebrew is stripped: a host's
+        real tmux/codex there would shadow the fixture's stubs, and it is not under test."""
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("hc_chain", REAL_REPO / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        with mock.patch.dict(os.environ, {"PATH": path, "HOME": str(Path(self.tmp.name) / "home")}), \
+                mock.patch.object(hc, "REPO_DIR", self.root):
+            parts = hc._resolve_launch_env()["PATH"].split(":")
+        return ":".join(p for p in parts if p not in ("/opt/homebrew/bin", "/usr/local/bin"))
+
+    def _launch_path_order(self, env_extra, via_health_check=False):
         """Run the codex launcher to its auth probe with codex and node each in an explicit dir
         and a shared default; return (which codex ran, the PATH it saw, the dirs)."""
         tmp = Path(self.tmp.name)
@@ -506,7 +519,11 @@ exit 0
         (self.bin / "codex").unlink()
         env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
         env.update({k: str(dirs[v]) for k, v in env_extra.items()})
-        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh", env_extra=env)
+        if via_health_check:
+            env["PATH"] = self._health_check_restart_path(f"{self.bin}:/usr/bin:/bin")
+            result = self.run_launcher("--restart", env_extra=env)
+        else:
+            result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh", env_extra=env)
         self.assertTrue(marker.exists(), result.stderr)
         ran, path = marker.read_text().splitlines()[:2]
         return ran, path.split(":"), {k: str(v) for k, v in dirs.items()}
@@ -517,6 +534,15 @@ exit 0
         self.assertLess(path.index(dirs["override_node"]), path.index(dirs["bundled"]))
         self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
         self.assertEqual(path[0], str(self.bin), "the incoming PATH must stay first")
+
+    def test_health_check_restart_keeps_the_explicit_overrides_first(self):
+        """The whole chain: health-check's restart env -> dispatcher -> codex launcher."""
+        ran, path, dirs = self._launch_path_order({"CODEX_NODE_BIN": "override_node"},
+                                                  via_health_check=True)
+        self.assertEqual(ran, "install", "~/.local/bin/codex shadowed CODEX_INSTALL_BIN")
+        self.assertLess(path.index(dirs["override_node"]), path.index(dirs["bundled"]),
+                        "health-check's restart env put the bundled node ahead of CODEX_NODE_BIN")
+        self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
 
     def test_without_codex_node_bin_the_bundled_node_precedes_the_install_dir(self):
         ran, path, dirs = self._launch_path_order({})

@@ -87,7 +87,7 @@ exit 0
 
 def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False,
          slow_death_s: float = 0, gr_rid: str = "", lock_rid: str = "", grace_s: str = "2",
-         private_socket: bool = True, with_claude: bool = True):
+         private_socket: bool = True, with_claude: bool = True, via_health_check: bool = False):
     """Run start-cli.sh in the stub env with the given initial state.
 
     force  → invoke --force-restart instead of --restart.
@@ -107,6 +107,11 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         stubs = [("tmux", TMUX_STUB), ("pgrep", PGREP_STUB), ("ps", PS_STUB)]
         if with_claude:
             stubs.append(("claude", "#!/bin/bash\nexit 0\n"))
+        if via_health_check:
+            local = td / ".local" / "bin"
+            local.mkdir(parents=True)
+            (local / "claude").write_text("#!/bin/bash\nexit 0\n")
+            (local / "claude").chmod(0o755)
         for name, body in stubs:
             p = bind / name
             p.write_text(body)
@@ -129,6 +134,8 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         env["SUTANDO_RESTART_GRACE_S"] = grace_s
         if not private_socket:
             del env["SUTANDO_TMUX_SOCKET"]
+        if via_health_check:
+            env["PATH"] = _health_check_restart_path(env["PATH"], td)
         if wedged:
             env["WEDGED"] = "1"
         if slow_death_s:
@@ -264,6 +271,32 @@ def case_force_restart_without_claude_says_why():
     return fails
 
 
+def _health_check_restart_path(path: str, home: Path) -> str:
+    """PATH health-check hands the launcher for a restart. Homebrew is stripped: a host's
+    real tmux/claude there would shadow the stubs, and it is not under test."""
+    import importlib.util
+    from unittest import mock
+    spec = importlib.util.spec_from_file_location("hc_chain", REPO / "src" / "health-check.py")
+    hc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hc)
+    with mock.patch.dict(os.environ, {"PATH": path, "HOME": str(home)}):
+        parts = hc._resolve_launch_env()["PATH"].split(":")
+    return ":".join(p for p in parts if p not in ("/opt/homebrew/bin", "/usr/local/bin"))
+
+
+def case_health_check_restart_finds_local_bin_claude():
+    """(#6117) A launchd-minimal restart through health-check's env must still find a
+    `claude` that lives only in ~/.local/bin: the launcher adds it itself."""
+    rc, out = _run(restart=True, session=True, core=True, force=True, with_claude=False,
+                   via_health_check=True)
+    fails = []
+    if "claude not found" in out:
+        fails.append(f"the launcher did not find ~/.local/bin/claude: out={out!r}")
+    if "FAILED: core did not come up" not in _run.last_attempts:
+        fails.append(f"the launch never reached the liveness poll: {_run.last_attempts!r}")
+    return fails
+
+
 def case_heal_without_claude_exits_127():
     """The heal path (session up, core gone) must refuse with 127 and name the missing
     claude, not create a window whose pane dies at once."""
@@ -312,6 +345,7 @@ def main() -> int:
         ("abort releases own lock", case_abort_releases_the_orchestrators_lock_only_for_its_own_rid),
         ("force-restart without claude says why", case_force_restart_without_claude_says_why),
         ("heal without claude exits 127", case_heal_without_claude_exits_127),
+        ("health-check restart finds ~/.local/bin claude", case_health_check_restart_finds_local_bin_claude),
         ("run-does-not-touch-the-live-workspace", case_run_does_not_touch_the_live_workspace),
     ]
     all_failures = []
