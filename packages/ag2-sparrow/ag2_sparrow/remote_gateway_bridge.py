@@ -1613,7 +1613,7 @@ def _guarded_result_labels(tid: str) -> dict:
 def _archive_result_labels(stem: str) -> None:
     """Move `<stem>.meta.json` into the results archive; absent is done."""
     try:
-        result_labels.archive(RESULTS_DIR, stem, ARCHIVE_RESULTS_DIR, time.time())
+        result_labels.archive(RESULTS_DIR, stem, ARCHIVE_RESULTS_DIR)
     except OSError as exc:
         _log(f"result {stem}: its title and outcome file could not be archived "
              f"({diagnostics.describe(exc)}); the next sweep retries")

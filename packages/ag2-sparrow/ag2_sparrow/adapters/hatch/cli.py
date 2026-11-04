@@ -1588,12 +1588,16 @@ def no_reply(args) -> int:
     return _answer(args, _no_reply_body, silent=True)
 
 
-def _answer_labels(args, silent: bool) -> "tuple[dict, str]":
-    """The Activity title and outcome; a no-reply's outcome defaults to its reason."""
+def _answer_labels(args, silent: bool) -> dict:
+    """The Activity title and outcome, each cut to fit with a warning; a no-reply's outcome
+    defaults to its reason."""
     outcome = getattr(args, "outcome", None)
     if silent and not result_labels.clean(outcome):
         outcome = result_labels.fit(getattr(args, "reason", None), result_labels.OUTCOME_MAX)
-    return result_labels.check(getattr(args, "title", None), outcome)
+    labels, notes = result_labels.check(getattr(args, "title", None), outcome)
+    for note in notes:
+        print(f"warning: {note}", file=sys.stderr)
+    return labels
 
 
 def _answer(args, read_body, silent: bool) -> int:
@@ -1610,10 +1614,7 @@ def _answer(args, read_body, silent: bool) -> int:
     if body is None:
         print(f"error: {why}", file=sys.stderr)
         return 2
-    labels, why = _answer_labels(args, silent)
-    if why:
-        print(f"error: {why}", file=sys.stderr)
-        return 2
+    labels = _answer_labels(args, silent)
     item = _delivered_item(cfg, tid, instance, item)
     if item is None:
         return 2
@@ -1759,9 +1760,9 @@ def main(argv=None) -> int:
     r.add_argument("--body", help="the reply text (default: read from stdin)")
     r.add_argument("--no-send", action="store_true", help="close the item without posting")
     r.add_argument("--title", help=f"the Activity title: what the task is, imperative, one line, at most "
-                   f"{result_labels.TITLE_MAX} characters")
+                   f"{result_labels.TITLE_MAX} characters (longer is cut to fit, with a warning)")
     r.add_argument("--outcome", help=f"the Activity outcome: what came of it, past tense, one "
-                   f"line, at most {result_labels.OUTCOME_ASK} characters")
+                   f"line, at most {result_labels.OUTCOME_ASK} characters, visible to the owner only")
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
@@ -1769,11 +1770,12 @@ def main(argv=None) -> int:
                        f"Sparrow settled it (exit {REPLY_POSTED} settled, {REPLY_NOT_POSTED} not "
                        f"settled, {REPLY_UNCONFIRMED} queued but not confirmed)")
     n.add_argument("result_file", help="the item's result_file from the wake payload")
-    n.add_argument("--reason", help="why nothing is posted, kept with the result (one line)")
+    n.add_argument("--reason", help="why nothing is posted, kept with the result (one line); with "
+                   "no --outcome, the reason becomes the Activity outcome, visible to the owner only")
     n.add_argument("--title", help=f"the Activity title: what the task is, imperative, one line, at most "
-                   f"{result_labels.TITLE_MAX} characters")
+                   f"{result_labels.TITLE_MAX} characters (longer is cut to fit, with a warning)")
     n.add_argument("--outcome", help=f"the Activity outcome, past tense, one line, at most "
-                   f"{result_labels.OUTCOME_ASK} characters (default: --reason)")
+                   f"{result_labels.OUTCOME_ASK} characters, visible to the owner only (default: --reason)")
     n.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     n.set_defaults(func=no_reply)

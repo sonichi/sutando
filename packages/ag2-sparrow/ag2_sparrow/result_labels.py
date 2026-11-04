@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 
@@ -31,30 +32,48 @@ def side_path(result_file: Path) -> Path:
     return result_file.with_name(result_file.stem + SUFFIX)
 
 
+_ZWNJ, _ZWJ = "\u200c", "\u200d"
+
+
 def clean(value) -> str:
-    """One line: control and separator characters become spaces, runs of space collapse."""
+    """One line: control, invisible-format (bidi included) and line/paragraph separator characters
+    become spaces and runs of space collapse. ZWJ and ZWNJ stay: emoji sequences and scripts need them."""
     if not isinstance(value, str):
         return ""
-    chars = (" " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in value)
+    chars = (" " if c not in (_ZWNJ, _ZWJ) and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")
+             else c for c in value)
     return " ".join("".join(chars).split())
 
 
+def _joins_previous(c: str) -> bool:
+    """Whether `c` belongs to the grapheme before it: a combining mark, a joiner or a variation selector."""
+    return (unicodedata.category(c) in ("Mn", "Mc", "Me") or c in (_ZWNJ, _ZWJ)
+            or "\ufe00" <= c <= "\ufe0f" or "\U0001f3fb" <= c <= "\U0001f3ff")
+
+
 def fit(value, limit: int) -> str:
-    """`clean(value)`, cut to `limit` characters with a trailing ellipsis when longer."""
+    """`clean(value)` in at most `limit` code points (the server's count), cut with a trailing
+    ellipsis when longer. The cut never splits a base from its marks or a ZWJ sequence."""
     text = clean(value)
-    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+    if len(text) <= limit:
+        return text
+    cut = limit - 1
+    while cut > 0 and (_joins_previous(text[cut]) or text[cut - 1] == _ZWJ):
+        cut -= 1
+    return text[:cut].rstrip() + "…"
 
 
-def check(title=None, outcome=None) -> "tuple[dict, str]":
-    """(labels, "") with the empty ones left out, or ({}, why) when one is over its limit."""
-    labels = {}
+def check(title=None, outcome=None) -> "tuple[dict, list]":
+    """(labels, notes): each label cleaned and fitted to its limit, empty ones left out; a note
+    for each one that was cut."""
+    labels, notes = {}, []
     for key, value in (("title", title), ("outcome", outcome)):
-        text = clean(value)
-        if len(text) > LIMITS[key]:
-            return {}, f"--{key} over {LIMITS[key]} characters"
+        text = fit(value, LIMITS[key])
+        if text != clean(value):
+            notes.append(f"--{key} was over {LIMITS[key]} characters and was cut to fit")
         if text:
             labels[key] = text
-    return labels, ""
+    return labels, notes
 
 
 def write(result_file: Path, labels: dict) -> "Path | None":
@@ -79,13 +98,16 @@ def write(result_file: Path, labels: dict) -> "Path | None":
     return target
 
 
-def archive(results_dir: Path, stem: str, archive_dir: Path, now: float) -> None:
-    """Move `<stem>.meta.json` to `archive_dir/<stem>-<now>.meta.json`; absent is done.
-    Raises OSError when it could not be moved."""
+def archive(results_dir: Path, stem: str, archive_dir: Path) -> None:
+    """Move `<stem>.meta.json` to `archive_dir/<stem>-<ns>.meta.json`, a name no earlier archive
+    holds; absent is done. Raises OSError when it could not be moved."""
     side = Path(results_dir) / f"{stem}{SUFFIX}"
     Path(archive_dir).mkdir(parents=True, exist_ok=True)
+    ns = time.time_ns()
+    while (Path(archive_dir) / f"{stem}-{ns}{SUFFIX}").exists():
+        ns += 1
     try:
-        os.replace(side, Path(archive_dir) / f"{stem}-{int(now)}{SUFFIX}")
+        os.replace(side, Path(archive_dir) / f"{stem}-{ns}{SUFFIX}")
     except FileNotFoundError:
         pass
 

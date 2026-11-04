@@ -195,16 +195,22 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertEqual([(c.get('title'), c.get('outcome')) for c in self.server.calls],
                          [('Add two and two now', 'Answered [31m 4.')])
 
-    def test_an_over_long_label_is_refused_before_anything_is_written(self):
+    def test_an_over_long_label_is_cut_to_fit_with_a_warning(self):
         for flag, n in (('--title', 61), ('--outcome', 151)):
             with self.subTest(flag=flag):
                 self.start()
                 rc, out, err = self.reply('4\n', 'reply', flag, 'x' * n)
-                self.assertEqual(rc, 2, out + err)
-                self.assertIn(f'{flag} over {n - 1} characters', err)
-                self.assertFalse((self.results / f'{self.tid}.txt').exists())
-                self.assertFalse(self.side().exists())
-                self.assertEqual(self.server.calls, [])
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f'warning: {flag} was over {n - 1} characters and was cut to fit', err)
+                label = self.server.calls[0][flag[2:]]
+                self.assertEqual((len(label), label[-1]), (n - 1, '…'))
+
+    def test_bidi_controls_go_and_an_emoji_zwj_sequence_stays(self):
+        self.start()
+        coder = '\U0001f469\u200d\U0001f4bb'
+        rc, out, err = self.reply('4\n', 'reply', '--title', f'Ask {coder}\u202egnp.exe\u2066x')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.server.calls[0]['title'], f'Ask {coder} gnp.exe x')
 
     def test_a_long_reason_is_cut_to_the_outcome_limit(self):
         self.start()
@@ -345,6 +351,24 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         rc, out, err = self.reply('[channel: !other:ag2.space]\nhello\n')
         self.assertEqual(rc, 2, out + err)
         self.assertEqual(self.server.calls, [])
+
+
+class FitKeepsGraphemes(unittest.TestCase):
+    """The cut counts code points, as the server does, and never splits a grapheme it can see."""
+
+    def test_the_cut_steps_back_over_marks_and_zwj_sequences(self):
+        from ag2_sparrow import result_labels as rl
+        family = '\U0001f468\u200d\U0001f469\u200d\U0001f467'
+        for text in ('a' * 8 + family, 'a' * 8 + 'e\u0301\u0301\u0301\u0301',
+                     'a' * 8 + '\U0001f44d\U0001f3fd' + 'b' * 4):
+            with self.subTest(text=text):
+                out = rl.fit(text, 10)
+                self.assertLessEqual(len(out), 10)
+                self.assertEqual(out, 'a' * 8 + '…')
+
+    def test_a_short_value_is_unchanged(self):
+        from ag2_sparrow import result_labels as rl
+        self.assertEqual(rl.fit('Fix the bug', 60), 'Fix the bug')
 
 
 class SharedInstanceMapping(unittest.TestCase):
