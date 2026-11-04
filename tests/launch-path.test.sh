@@ -68,4 +68,14 @@ out="$(HOME="$td/home" PATH="/usr/bin" /bin/bash -c '
 check "a dir startup prepends as a default goes behind the overrides, not away" \
   "$out" "/usr/bin:$td/extra dir:$engine/runtime/bin:$td/home/.local/bin:$td/app node"
 
+# A desktop install ships claude only in <app support>/cli/claude/bin: a launchd PATH must reach it.
+mkdir -p "$td/App Support/cli/claude/bin" "$td/App Support/cli/codex/bin"
+app="$(cd "$td/App Support" && pwd)"
+out="$(HOME="$td/home" PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" /bin/bash -c '
+  . "$1/src/agent/launch-path.sh"
+  sutando_append_launch_path "$2"
+  printf %s "$PATH"' _ "$REPO" "$engine/sutando")"
+check "the desktop app's cli/claude and cli/codex dirs are appended, ahead of ~/.local/bin" \
+  "$out" "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$engine/runtime/bin:$app/cli/claude/bin:$app/cli/codex/bin:$td/home/.local/bin"
+
 exit "$fail"

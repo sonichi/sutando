@@ -10,10 +10,12 @@ sutando_bundled_node_dir() {
 }
 
 # sutando_launch_path_dirs <repo>: default dirs, one per line, existing or not.
-# runtime/bin is the older bundle layout; ~/.local/bin is where `claude` installs.
+# runtime/bin is the older bundle layout; <app support>/cli/*/bin is where the desktop app
+# ships `claude` and `codex` (the only copy on a desktop install); ~/.local/bin is the CLI install.
 sutando_launch_path_dirs() {
   sutando_bundled_node_dir "$1"
-  printf '%s\n' "$1/../runtime/bin" "$HOME/.local/bin"
+  printf '%s\n' "$1/../runtime/bin" "$1/../../cli/claude/bin" "$1/../../cli/codex/bin" \
+    "$HOME/.local/bin"
 }
 
 # sutando_append_launch_path <repo> [override-dir...]: append each existing dir not already
