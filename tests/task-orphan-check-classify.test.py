@@ -757,5 +757,88 @@ class TestWorkerHeld(ClassifyBase):
         self.assertEqual(self.one()["verdict"], "orphan")
 
 
+class TestLimitHeld(ClassifyBase):
+    """A task that arrived while the core was paused for a provider limit waits for the core:
+    the hold record names it, the classifier reads that record and never archives it."""
+
+    def _hold_then_resume(self, arrived: str) -> None:
+        sys.path.insert(0, str(REPO / "src"))
+        import core_limit_hold as clh
+        now = NOW - 7200
+        rec = {"available": False, "last_checked": iso(now - 30),
+               "headers": {"anthropic-ratelimit-unified-status": "rejected",
+                           "anthropic-ratelimit-unified-7d-status": "rejected",
+                           "anthropic-ratelimit-unified-7d-reset": str(int(now + 600))},
+               "recent_rejections": [{"ts": iso(now - 30), "status": 429, "model": "claude-opus-5-5",
+                                      "snippet": "rate_limit_error usage limit"}]}
+        (self.ws.root / "state").mkdir(exist_ok=True)
+        self.assertFalse(clh.decide(self.ws.root, now, quota=rec).launch)
+        self.ws.task(f"{arrived}.txt", chat_task_text(arrived, now + 60))
+        self.assertFalse(clh.decide(self.ws.root, now + 120, quota=rec).launch)
+        self.assertTrue(clh.decide(self.ws.root, now + 600 + clh.RESET_GRACE_S + 1, quota=rec).launch)
+
+    def test_task_that_arrived_during_a_hold_is_held_not_orphan(self):
+        self._hold_then_resume("task-held-1")
+        row = self.one()
+        self.assertEqual(row["verdict"], "held", row)
+
+    def test_a_result_still_wins_over_held(self):
+        self._hold_then_resume("task-held-2")
+        (self.ws.root / "results" / "task-held-2.txt").write_text("answered\n")
+        self.assertEqual(self.one()["verdict"], "done")
+
+    def test_unlisted_task_keeps_the_age_rule(self):
+        (self.ws.root / "state").mkdir()
+        (self.ws.root / "state" / "core-limit-hold.json").write_text(
+            json.dumps({"status": "released", "held_tasks": ["task-other"]}))
+        self.ws.task("task-old.txt", chat_task_text("task-old", NOW - 3600))
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+
+def local_time(epoch: float) -> str:
+    """The writers' `local_time:` shape: ISO with an offset, then the IANA zone."""
+    from datetime import datetime, timedelta, timezone
+    return datetime.fromtimestamp(epoch, tz=timezone(timedelta(hours=11))).isoformat() + " Australia/Sydney"
+
+
+class TestInboxAge(ClassifyBase):
+    """Age is time in THIS inbox: a message that waited at the broker while the app was down
+    arrives with an old sender `timestamp:` and must not be archived as an orphan on relaunch."""
+
+    def test_a_message_held_at_the_broker_while_the_app_was_down_is_fresh_on_relaunch(self):
+        self.ws.task("task-ag2space_dlocal~task-a8caf63b8e7c8a4791.txt",
+                     chat_task_text("task-ag2space_dlocal~task-a8caf63b8e7c8a4791", NOW - 10012,
+                                    source="ag2space", extra=f"local_time: {local_time(NOW - 12)}\n"))
+        row = self.one()
+        self.assertEqual(row["verdict"], "fresh")
+        self.assertEqual((row["age_s"], row["age_from"]), (12, "local_time"))
+
+    def test_a_task_that_waited_in_this_inbox_past_the_line_is_still_an_orphan(self):
+        self.ws.task("task-1.txt", chat_task_text("task-1", NOW - 10012,
+                                                  extra=f"local_time: {local_time(NOW - 9000)}\n"))
+        row = self.one()
+        self.assertEqual(row["verdict"], "orphan")
+        self.assertEqual(row["age_from"], "local_time")
+
+    def test_an_unparsable_local_time_falls_back_to_the_sender_timestamp(self):
+        self.ws.task("task-2.txt", chat_task_text("task-2", NOW - 10012, extra="local_time: soon\n"))
+        row = self.one()
+        self.assertEqual((row["verdict"], row["age_from"]), ("orphan", "timestamp"))
+
+    def test_a_local_time_line_in_a_legacy_body_is_not_the_age(self):
+        # A writer that never stamps local_time: a body line must not supply it (forged or quoted).
+        text = chat_task_text("task-3", NOW - 12) + "local_time: 2019-10-30T00:00:00+00:00 UTC\n"
+        self.ws.task("task-3.txt", text)
+        row = self.one()
+        self.assertEqual((row["verdict"], row["age_from"], row["age_s"]), ("fresh", "timestamp", 12),
+                         "a fresh legacy task is never archived on a body line's age")
+
+    def test_a_real_header_wins_over_a_body_copy(self):
+        text = (chat_task_text("task-4", NOW - 10012, extra=f"local_time: {local_time(NOW - 12)}\n")
+                + "local_time: 2019-10-30T00:00:00+00:00 UTC\n")
+        self.ws.task("task-4.txt", text)
+        self.assertEqual((self.one()["age_s"], self.one()["age_from"]), (12, "local_time"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

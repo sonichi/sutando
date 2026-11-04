@@ -35,6 +35,9 @@ esac
 REPO="$(cd "$_self_dir/../../.." && pwd)"
 unset _self_dir
 cd "$REPO"
+if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ]; then
+  exec bash "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$@"
+fi
 # shellcheck source=../../../src/agent/claude/cli/session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
@@ -48,6 +51,7 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
 # those are the canonical core's alone.
 SURFACE_ARGS=()
+add_skill_claude_plugins
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
@@ -68,6 +72,9 @@ ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SESSION")
 ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+ENV_ARGS+=(-e "SUTANDO_WORKER_ID=${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}")
+# Explicit empties: the core's ids are tmux server-global, so only -e clears them here.
+ENV_ARGS+=(-e SUTANDO_CORE_ID= -e SUTANDO_CORE_POOL_SIZE= -e SUTANDO_WORKER_SEAT=)
 [ -n "${SUTANDO_TASKS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 # A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
 # workspace from it: unforwarded, its results/ and state/ land under deliveries/.
@@ -76,6 +83,8 @@ ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
 # answers go. Derived in-session they become deliveries/results, which no
 # bridge drains.
 [ -n "${SUTANDO_INBOX_KIND:-}" ] && ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+# Always set, empty included: an omitted one inherits the tmux server's global env.
+ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 # Third half of that seam: without the resolver a worker reads the sentinel
 # itself, so an unforwarded one is the zero-byte read, not a missing option.
@@ -93,6 +102,9 @@ ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
 # the spawner's --cwd, which need not be the repo, so a relative path would
 # resolve against the wrong directory.
 ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
+# The worker's own watcher beats state/watchers/<id>.alive, so the pool can
+# observe it as a file rather than a process scan.
+ENV_ARGS+=(-e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py")
 # Canonical + executable, or EMPTY: a relative/`..` interpreter path resolves
 # against the worker's cwd, and only an explicit -e overrides a stale
 # server-global value.
@@ -124,6 +136,16 @@ if [ "${1:-}" = "--print-env" ]; then
   exit 0
 fi
 
+# The watcher sees SUTANDO_INSTANCE_ID in every worker session and therefore
+# requires the pool delivery writer. Fail before creating a session that could
+# receive tasks but cannot safely acknowledge them.
+if [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
+   [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
+   [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; then
+  echo "launch-worker-session.sh needs SUTANDO_POOL_DELIVERY_SCRIPT to name a readable file" >&2
+  exit 2
+fi
+
 # Same onboarding/hooks treatment a core launch gets: a worker is also
 # headless (no TTY, --dangerously-skip-permissions) and can hang on the exact
 # same unattended prompts (folder-trust, bypass-permissions, AskUserQuestion)
@@ -140,3 +162,7 @@ if ! launch_claude_session; then
   exit 1
 fi
 echo "Started worker session $SESSION detached."
+# The worker's inbox gets the same hosting-mode supervisor the core has; the
+# remedy timer re-ensures it, so a supervisor that dies is not gone for good.
+SUTANDO_PY="$WORKER_PY" bash "$REPO/skills/worker-pool/scripts/worker-watcher-supervisor.sh" \
+  || echo "  ⚠ the worker's watcher supervisor did not start; the remedy timer retries within 5 min" >&2

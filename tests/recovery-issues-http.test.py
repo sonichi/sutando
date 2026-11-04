@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """Exercise recovery entry points across processes with real local HTTP capture."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 from pathlib import Path
@@ -53,7 +59,7 @@ class LocalCapture(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, POSTHOG_HOST=f'http://127.0.0.1:{server.server_port}',
+            env = isolated_child_env(POSTHOG_HOST=f'http://127.0.0.1:{server.server_port}',
                        POSTHOG_API_KEY='local-test-only', DO_NOT_TRACK='0', SUTANDO_TELEMETRY='1',
                        SUTANDO_STATE_DIR=directory,
                        SUTANDO_TELEMETRY_ID_FILE=str(Path(directory)/'telemetry-id'),

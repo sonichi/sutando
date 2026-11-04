@@ -23,6 +23,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -65,18 +68,26 @@ class Harness:
         p.write_text(f"id: {name[:-4]}\naccess_tier: team\ntask: probe\n")
         return p
 
-    def start(self) -> None:
+    def start(self, **extra_env: str) -> None:
         env = dict(os.environ)
         env["PATH"] = f"{self.tmp/'bin'}:{env['PATH']}"
+        env.update(extra_env)
         env["TMPDIR"] = str(self.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
         for k in ("SUTANDO_TASK_EVENT_HANDLER", "SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR",
                   "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND"):
             env.pop(k, None)
-        self.proc = subprocess.Popen(
-            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
+        self.err = self.tmp / "watcher.err"
+        self.proc = popen_bound(
+            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+            stderr=self.err.open("w"), text=True)
+
+    def stderr_tail(self) -> str:
+        try:
+            return " | ".join(self.err.read_text(errors="replace").splitlines()[-6:])
+        except OSError:
+            return ""
 
     def deliver_file_event(self, path: Path) -> None:
         with self.feed.open("a") as fh:
@@ -148,15 +159,26 @@ def test_file_event_dispatches_once_and_bare_directory_event_never_repeats_it():
         h.cleanup()
 
 
-def test_eof_from_fswatch_ends_the_watcher():
+def test_eof_from_fswatch_relaunches_it_and_ends_the_watcher_only_past_the_budget():
     h = Harness()
+    tail = ["pgrep", "-f", f"tail -n \\+1 -f {h.feed}"]
+    tails = lambda: set(subprocess.run(tail, capture_output=True, text=True).stdout.split())
     try:
-        h.start()
-        time.sleep(1.0)
+        h.start(SUTANDO_FSWATCH_RESTART_MAX="1")
+        # The sentinel is stamped only once the watcher's own startup check of fswatch passed: a
+        # kill before that is a failed start (exit 1), not the EOF this test is about.
+        sentinel = h.ws / "state" / "watch-tasks-stream.pid"
+        started = lambda: sentinel.exists() and sentinel.read_text().strip() == str(h.proc.pid) and tails()
+        check("the watcher is up with its stubbed fswatch", wait_for(started, timeout=30.0), h.stderr_tail())
+        first = tails()
         # The stub tails the feed; killing it closes the FIFO's write end.
         subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
-        check("EOF on the event stream ends the watcher",
-              wait_for(lambda: h.proc.poll() is not None, timeout=10.0))
+        check("EOF on the event stream relaunches fswatch, the watcher stays",
+              wait_for(lambda: tails() - first and h.proc.poll() is None, timeout=30.0),
+              f"rc={h.proc.poll()} stderr: {h.stderr_tail()}")
+        subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
+        check("a second EOF past the relaunch budget ends the watcher, status 1",
+              wait_for(lambda: h.proc.poll() == 1, timeout=30.0), f"rc={h.proc.poll()} stderr: {h.stderr_tail()}")
     finally:
         h.cleanup()
 
@@ -165,7 +187,7 @@ if __name__ == "__main__":
     for fn in (
         test_bare_directory_event_dispatches_nothing_after_startup_sweep,
         test_file_event_dispatches_once_and_bare_directory_event_never_repeats_it,
-        test_eof_from_fswatch_ends_the_watcher,
+        test_eof_from_fswatch_relaunches_it_and_ends_the_watcher_only_past_the_budget,
     ):
         print(fn.__name__)
         fn()

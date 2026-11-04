@@ -36,13 +36,17 @@
  * honors the quarantine marker — quarantine is about revoking managed
  * credentials after logout, not about source choice.
  *
- * 'gemini-image' (the image-generation skill) walks the slots text THEN voice
- * in each tier: any Gemini key generates images, and a managed-key install
- * holds only the voice entry. It is not a voice surface, so a 'managed'
- * preference never blocks its env fallback; a 'byok' preference skips only the
- * managed VOICE slot (the owner chose their own key for voice, so that managed
- * entry is not theirs to spend), and quarantine hides every managed entry as
- * always. Twin: src/credential_resolver.py.
+ * 'gemini-image' (the image-generation skill) walks text THEN voice in the ENV
+ * tier: any real Gemini key generates images. In the MANAGED tier it reads the
+ * text slot only: the managed voice entry is a cloud-minted Gemini Live
+ * ephemeral token (`auth_tokens/...`), accepted by the Live API alone, so
+ * spending it on `generateContent` is rejected as an invalid API key. It is
+ * not a voice surface, so a 'managed' preference never blocks its env fallback,
+ * and quarantine hides every managed entry as always. A desktop supervisor also
+ * injects that token into every child as GEMINI_VOICE_API_KEY, so no capability
+ * but voice accepts an `auth_tokens/` value, or the managed voice key, from ANY
+ * tier; with nothing else left it resolves `{ key: '', source: 'none' }`.
+ * Twin: src/credential_resolver.py.
  *
  * With no managed file present (every pre-managed install), resolution is
  * byte-for-byte identical to the legacy env chain — this module changes where
@@ -90,11 +94,21 @@ export interface ResolvedCredential {
 }
 
 /** Per-capability lookup order within a tier (voice falls back to text). */
-const CAPABILITY_FALLBACKS: Record<Capability, string[]> = {
+// Per-capability lookup order per tier (voice falls back to text). The managed
+// voice entry is a Live-only ephemeral token: only the voice capability may spend it.
+const MANAGED_SLOTS: Record<Capability, string[]> = {
+	'gemini-voice': ['gemini-voice', 'gemini-text'],
+	'gemini-text': ['gemini-text'],
+	'gemini-image': ['gemini-text'],
+};
+const ENV_SLOTS: Record<Capability, string[]> = {
 	'gemini-voice': ['gemini-voice', 'gemini-text'],
 	'gemini-text': ['gemini-text'],
 	'gemini-image': ['gemini-text', 'gemini-voice'],
 };
+
+/** Cloud-minted Gemini Live ephemeral tokens carry this prefix; only the Live API accepts them. */
+const LIVE_TOKEN_PREFIX = 'auth_tokens/';
 
 /** Env-var names per capability slot, in existing-chain order. */
 const ENV_VARS: Record<string, string> = {
@@ -140,18 +154,19 @@ export function resolveCredential(
 	capability: Capability,
 	opts?: { managedPath?: string },
 ): ResolvedCredential {
-	const slots = CAPABILITY_FALLBACKS[capability];
 	const managed = readManaged(opts?.managedPath ?? managedCredentialsPath());
 	// S1: the preference governs the VOICE capability; quarantine hides
 	// managed entries from every capability in every mode.
 	const preference = capability === 'gemini-voice' ? managed.voicePreference : undefined;
+	const managedVoiceKey = managed.caps['gemini-voice']?.key;
+	// A Live token (or its injected env copy) is spendable by the voice capability alone.
+	const spendable = (key: string): boolean =>
+		capability === 'gemini-voice' || !(key.startsWith(LIVE_TOKEN_PREFIX) || key === managedVoiceKey);
 	if (preference !== 'byok' && !managed.quarantined) {
-		for (const slot of slots) {
-			// The managed voice entry is not the image capability's to spend under a byok voice preference.
-			if (capability === 'gemini-image' && slot === 'gemini-voice' && managed.voicePreference === 'byok') continue;
+		for (const slot of MANAGED_SLOTS[capability]) {
 			const entry = managed.caps[slot];
 			const key = entry?.key;
-			if (typeof key === 'string' && key) {
+			if (typeof key === 'string' && key && spendable(key)) {
 				// S3: managed entries may carry an opaque Rust-minted `generation`.
 				// Report it verbatim; legacy entries without one omit the field.
 				const generation = entry?.generation;
@@ -171,9 +186,9 @@ export function resolveCredential(
 		// logout-quarantine bypass the design closes). Fail actionably.
 		return { key: '', source: 'none' };
 	}
-	for (const slot of slots) {
+	for (const slot of ENV_SLOTS[capability]) {
 		const key = process.env[ENV_VARS[slot]];
-		if (key) {
+		if (key && spendable(key)) {
 			// S3/U4: for the voice capability the launcher injects
 			// SUTANDO_VOICE_CREDENTIAL_GENERATION beside a materialized BYOK
 			// key. Report it verbatim; manual/legacy .env keys (no injected

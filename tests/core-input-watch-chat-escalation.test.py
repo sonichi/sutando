@@ -11,6 +11,7 @@ right states, an episode key the Manager can dedup on, resolution when the
 core moves on, and never dying of its own escalation.
 """
 import importlib.util as u
+import json
 import os
 import pathlib
 import sys
@@ -178,6 +179,110 @@ class TestResolve(unittest.TestCase):
         M.resolve_escalations(m, "s")
         again = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
         self.assertNotEqual(first.id, again.id)
+
+
+_FOOTER = ("────────\n❯ \n────────\n"
+           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+_LOGIN_EXPIRED = "Login expired · Please run /login"
+_LOGIN_REFUSED = f"❯ /startup\n  ⎿  {_LOGIN_EXPIRED}\n✻ Worked for 0s\n"
+_REAL_TURN = ("❯ /startup\n● /startup complete: watcher streaming, 3 crons registered.\n"
+              "✻ Worked for 2m 14s · done 12:55 PM\n")
+
+
+class TestSignedOutCardNeedsProof(unittest.TestCase):
+    """User feedback 2026-09-29 (P1-41): a "session expired" card read "✓ Resolved — Sutando
+    has continued its work" while the worker still refused every turn in 0 s. Leaving the
+    blocked set is not recovery for a signed-out card; a turn that ran is."""
+
+    def _signed_out(self, m, session="s"):
+        state, detail, prompt, kind = M.compose_state(_LOGIN_REFUSED + _FOOTER, "idle", True)
+        self.assertEqual((state, kind), ("logged-out", "login"), "fixture no longer reads signed out")
+        return M.escalate(m, state, detail, kind, prompt, session)
+
+    def test_the_card_is_the_auth_card(self):
+        r = self._signed_out(_mgr())
+        self.assertEqual(r.kind, "auth")
+        self.assertIn("authenticate", [a.kind for a in r.actions])
+
+    def test_a_newer_typed_prompt_does_not_resolve_it(self):
+        # The pool typed at the seat again: the refusal is no longer the last turn, the seat
+        # is exactly as signed out. Old code resolved here.
+        m = _mgr()
+        r = self._signed_out(m)
+        pane = _LOGIN_REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        self.assertEqual(M.resolve_escalations(m, "s", pane), [])
+        self.assertEqual([x.id for x in m.active()], [r.id])
+
+    def test_an_empty_capture_does_not_resolve_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        for pane in (None, "", _FOOTER):
+            self.assertEqual(M.resolve_escalations(m, "s", pane), [], repr(pane))
+        self.assertEqual([x.id for x in m.active()], [r.id])
+
+    def test_a_turn_that_ran_resolves_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        self.assertEqual(M.resolve_escalations(m, "s", _LOGIN_REFUSED + _REAL_TURN + _FOOTER), [r.id])
+        self.assertEqual(m.get(r.id).status, STATUS_RESOLVED)
+
+    def test_login_successful_resolves_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        self.assertEqual(M.resolve_escalations(m, "s", _LOGIN_REFUSED + "  ⎿  Login successful\n" + _FOOTER),
+                         [r.id])
+
+    def test_other_cards_of_the_session_still_resolve_on_the_same_tick(self):
+        m = _mgr()
+        held = self._signed_out(m)
+        other = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        self.assertEqual(M.resolve_escalations(m, "s", _FOOTER), [other.id])
+        self.assertEqual([x.id for x in m.active()], [held.id])
+
+
+class TestSignedOutSeatAcrossTicks(unittest.TestCase):
+    """The monitor loop itself, one --once tick per pane, against a real store: the card
+    a refused login raises survives the re-armed seat's next prompt and closes only on a
+    turn that ran. The middle tick is the one the old code resolved."""
+
+    def _tick(self, out, pane, health="idle"):
+        from unittest.mock import patch
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": health}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--session", "sutando-worker-1",
+                "--out", out, "--once", "--stable", "1", "--login-confirm-s", "0", "--seat", "worker comm"]
+        with patch.object(M, "capture_styled", lambda s, sess: pane), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(sys, "argv", argv):
+            M.main()
+        with open(out) as f:
+            return json.load(f)
+
+    def test_the_card_holds_until_a_turn_ran(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "state", "core-supervisor.sutando-worker-1.json")
+            os.makedirs(os.path.dirname(out))
+            m = M._hitl_manager(out)
+            sig = self._tick(out, _LOGIN_REFUSED + _FOOTER)
+            self.assertEqual((sig["state"], sig["kind"]), ("logged-out", "login"))
+            [card] = m.active()
+            self.assertEqual(card.kind, "auth")
+            self.assertEqual(card.device["name"], "worker comm")
+            sig = self._tick(out, _LOGIN_REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1))
+            self.assertEqual(sig["state"], "logged-out")
+            self.assertEqual([r.id for r in m.active()], [card.id], "re-armed seat closed the card")
+            sig = self._tick(out, _LOGIN_REFUSED + _LOGIN_REFUSED + _FOOTER, health="working")
+            self.assertEqual([r.id for r in m.active()], [card.id], "a second refusal is the same episode")
+            sig = self._tick(out, _LOGIN_REFUSED + _REAL_TURN + _FOOTER)
+            self.assertEqual(sig["state"], "idle-ready")
+            self.assertEqual(m.active(), [])
+            self.assertEqual(m.get(card.id).status, STATUS_RESOLVED)
 
 
 class TestScope(unittest.TestCase):
@@ -405,6 +510,147 @@ class TestPartialSend(unittest.TestCase):
         for _ in range(3):
             M.drive_escalations(m, "s", moved, "blocked-human", lambda k: sent.append(k) or True)
         self.assertEqual(sent, ["Down", "Down"])
+
+
+class TestCodexSeatRuntime(unittest.TestCase):
+    """A Codex session's card, reminder and recovery carry runtime "codex" and one seat key,
+    the same key the runtime-event path gives that session."""
+
+    def test_codex_card_reminder_and_recovery_share_one_seat(self):
+        from hitl import events, renotify
+        from hitl.projector import project
+        from hitl.schema import NOTICE_FIELD
+        m, t, sent = _mgr(), [1_000_000.0], []
+        drive = lambda: project(m, lambda p: sent.append(p) or {"ok": True, "event_id": f"$e{len(sent)}"},
+                                "!room:example.org", clock=lambda: t[0])
+        req = M.escalate(m, "blocked-human", "d", None, "Something waits", "sutando-core", runtime="codex")
+        self.assertEqual(req.runtime, "codex")
+        ev = events._requirement_for({"session": "sutando-core", "runtime": "codex", "kind": "choice"})
+        self.assertEqual(renotify.seat_key(req), renotify.seat_key(ev))
+        drive()
+        t[0] += 31 * 60
+        drive()
+        m.resolve(req.id)
+        drive()
+        notices = [p["extra_content"][NOTICE_FIELD] for p in sent
+                   if p["op"] == "message" and NOTICE_FIELD in p.get("extra_content", {})]
+        self.assertEqual([n["notice"] for n in notices], ["reminder", "recovery"])
+        self.assertEqual({(n["runtime"], n["device"]) for n in notices}, {("codex", "sutando-core")})
+
+    def test_an_unstamped_session_stays_claude(self):
+        req = M.escalate(_mgr(), "blocked-human", "d", None, "Something waits", "s")
+        self.assertEqual(req.runtime, "claude")
+
+
+class _Done(Exception):
+    pass
+
+
+class TestSignedOutMustHold(unittest.TestCase):
+    """#5478: a fresh core read a transient refusal ~2 min after setup and carded "Your Claude
+    session has expired" while it was signed in; the card then waited for a completed turn.
+    A signed-out reading is carded only once it has held, and clears on the first frame
+    that shows the CLI signed in after it."""
+
+    def _run(self, frames, td, runtime="claude"):
+        """main() over (t, pane) frames against a real store; returns the store and the
+        state written after each frame."""
+        from unittest.mock import patch
+        out = os.path.join(td, "state", "core-supervisor.json")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+        i = {"n": 0}
+        states = []
+
+        def sleep(_s):
+            with open(out) as f:
+                states.append(json.load(f)["state"])
+            i["n"] += 1
+            if i["n"] >= len(frames):
+                raise _Done()
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--interval", "0"]
+        with patch.object(M, "capture_styled", lambda s, sess: frames[i["n"]][1]), \
+                patch.object(M.time, "time", lambda: 1000.0 + frames[i["n"]][0]), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "session_runtime", lambda *a: runtime), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
+                patch.object(M.time, "sleep", sleep), \
+                patch.object(sys, "argv", argv):
+            with self.assertRaises(_Done):
+                M.main()
+        return M._hitl_manager(out), states
+
+    def test_a_refusal_the_cli_recovers_from_is_never_carded(self):
+        refused = _LOGIN_REFUSED + _FOOTER
+        working = _LOGIN_REFUSED + "❯ hi\n● Starting up.\n✻ Perambulating… (12s)\n" + _FOOTER
+        frames = [(t, refused) for t in range(0, 45, 3)] + [(45, working), (48, working)]
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td)
+            self.assertNotIn("logged-out", states)
+            self.assertEqual(m.store.all(), [], "a card was raised for a recovered refusal")
+
+    def test_a_refusal_that_holds_is_carded_once(self):
+        frames = [(t, _LOGIN_REFUSED + _FOOTER) for t in range(0, 75, 3)]
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td)
+            self.assertEqual(states[-1], "logged-out")
+            self.assertEqual(states.index("logged-out"), 20, "carded before the 60 s confirm")
+            [card] = m.active()
+            self.assertEqual(card.kind, "auth")
+
+    def test_the_card_clears_on_the_first_frame_signed_in_after_the_refusal(self):
+        signed_in = _LOGIN_REFUSED + "❯ hi\n● Hello.\n✻ Perambulating… (4s)\n" + _FOOTER
+        frames = [(t, _LOGIN_REFUSED + _FOOTER) for t in range(0, 66, 3)] + [(66, signed_in), (69, signed_in)]
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td)
+            self.assertIn("logged-out", states)
+            self.assertEqual(m.active(), [], "the card waited for a completed turn")
+
+    _CODEX_TAIL = "\n» Ask Codex to do anything\n\n  GPT-6-Sol ultra · ~/agents/x  ⚠ 1 warning · f2 to view"
+    _CODEX_REFUSED = "› /startup\nAuthentication required\n" + _CODEX_TAIL
+    _CODEX_BACK = "› /startup\nAuthentication required\n› hi\n• Hello — starting up.\n" + _CODEX_TAIL
+
+    def test_a_codex_core_that_recovers_inside_the_window_is_never_carded(self):
+        frames = [(t, self._CODEX_REFUSED) for t in range(0, 45, 3)] + [(45, self._CODEX_BACK), (48, self._CODEX_BACK)]
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td, runtime="codex")
+            self.assertNotIn("logged-out", states)
+            self.assertEqual(m.store.all(), [])
+
+    def test_a_codex_card_resolves_on_its_first_signed_in_frame(self):
+        frames = ([(t, self._CODEX_REFUSED) for t in range(0, 66, 3)]
+                  + [(66, self._CODEX_BACK), (69, self._CODEX_BACK)])
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td, runtime="codex")
+            self.assertIn("logged-out", states)
+            self.assertNotEqual(m.store.all(), [], "control: the held refusal raised a card")
+            self.assertEqual(m.active(), [], "a Codex auth card never closed")
+
+    def test_compose_state_reads_a_codex_recovery(self):
+        self.assertEqual(M.compose_state(self._CODEX_BACK, "idle", True, runtime="codex")[0], "idle-ready")
+        self.assertEqual(M.compose_state(self._CODEX_REFUSED, "idle", True, runtime="codex")[0], "logged-out")
+
+
+class TestLoginConfirmStep(unittest.TestCase):
+    def test_a_signed_out_reading_settles_until_it_has_held(self):
+        self.assertEqual(M.login_confirm_step(None, "logged-out", "login", 100.0, 60), (True, 100.0))
+        self.assertEqual(M.login_confirm_step(100.0, "logged-out", "login", 159.0, 60), (True, 100.0))
+        self.assertEqual(M.login_confirm_step(100.0, "logged-out", None, 160.0, 60), (False, 100.0))
+        self.assertEqual(M.login_confirm_step(100.0, "blocked-human", "login", 170.0, 60), (False, 100.0))
+
+    def test_any_other_reading_resets_the_clock(self):
+        self.assertEqual(M.login_confirm_step(100.0, "running", None, 130.0, 60), (False, None))
+        self.assertEqual(M.login_confirm_step(None, "logged-out", "login", 131.0, 60), (True, 131.0))
+
+    def test_zero_turns_it_off(self):
+        self.assertEqual(M.login_confirm_step(None, "logged-out", "login", 100.0, 0), (False, 100.0))
 
 
 if __name__ == "__main__":

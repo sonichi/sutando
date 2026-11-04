@@ -1,13 +1,12 @@
 # Task watcher hosting modes: session watcher, standby, supervisor
 
 One inbox (`<workspace>/tasks/` for the core; `<workspace>/deliveries/<id>/` for a pool worker) is
-meant to have **exactly one announcer** in steady state. Two things can host that announcer, and for
-watchers that carry the tag the code keeps them mutually exclusive without relying on an agent
-instruction. The invariant is intended, not yet unconditional: an untagged watcher and a present but
-not yet ready tagged watcher are both invisible to the verdicts that enforce it, and a handoff can
-produce two notifications for one pending task; each exception is named under "Known issues and
-gaps" with the issue that closes it. This page is the design as it stands on `main` after #4477 and
-#4585; the behaviour is pinned by the tests named at the end.
+meant to have **exactly one announcer** in steady state. Two things can host that announcer, and the
+watcher itself refuses to double an inbox at its own startup (`inbox-holders`, below), so no
+launcher or instruction has to get the check right. The remaining exception is that a handoff can
+produce two notifications for one pending task; it is named under "Known issues and gaps" with the
+issue that closes it. This page is the design as it stands on `main` after #4477, #4585 and #4602;
+the behaviour is pinned by the tests named at the end.
 
 ## The two hosting modes
 
@@ -91,29 +90,88 @@ the same supervisor pid; the second handoff took 12 s.
 - **Two notifications per handoff, at most.** A core-bound task pending during a handoff can be
   announced by the standby's notifier and by the session watcher's sweep. Accepted as a known issue by
   the owner; the announce-once marker keyed to the core session (PR-B) is deferred.
-- **Untagged watchers.** A watcher started without `--role session` on an inbox reads `no` from
-  `role-present`, so the supervisor would arm a standby next to it, and a re-arm rule that reads only
-  `role-present` would start a second session watcher next to it. Likewise a tagged watcher that is
-  present but not yet ready reads `no` from both verdicts. The fix is a self-check in the watcher
-  itself (exit when any watcher already covers the inbox; replace only with `--force-restart`): #4602.
-- **Workers' watchers are unsupervised.** A pool worker's watcher is started by its session and nothing
-  outside re-arms it; the pool supervisor is to give each worker inbox the same contract: #4600.
+- **The watcher's own startup check (#4602).** Before it touches anything, `watch-tasks-stream.sh`
+  asks `watcher_identity.py inbox-holders --inbox <inbox>` for every watcher-shaped process naming its
+  inbox, tagged or not, ready or not. A start over a holder exits 0 as covered: one `WATCHER_HELD:`
+  line on stdout (inbox, holder pid, role, start time, whether anything reads its output, and the
+  `--force-restart` command that replaces it) so a Monitor-hosted caller sees it as an event, plus the
+  stderr line. The one exception is a session watcher over a supervisor's standby, which proceeds
+  (the supervisor stands the standby down once it proves ready); an untagged holder is nobody's
+  standby and counts as covered. An unobservable `ps` refuses to start. Only
+  `--force-restart` replaces the holder (TERM, then KILL, then its fswatch child), and only on the
+  owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
+  touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a
+  different directory than the operand. The supervisor's standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
+- **A session watcher dies with the core that owns it.** A SIGKILLed core runs no Stop hook, so its
+  watcher used to stay up, holding the inbox, until its next write failed. At start a `--role session`
+  watcher records its nearest `claude`/`codex` ancestor (pid + start time); the Monitor's shell wrapper
+  in between survives the kill, so the direct parent is not used. Every 3 s it checks that ancestor,
+  and once it is gone, a zombie, or a reused pid, the watcher TERMs itself through the normal cleanup
+  (claims settled, sentinel released, fswatch stopped), logging the exit to stderr and to
+  `<workspace>/logs/watch-tasks-stream.log` (stderr's only reader was that core). A revived core's
+  start then finds no holder.
+  With no such ancestor the watcher never self-exits. Standby watchers are not checked.
+- **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
+  starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker
+  session>-watcher`, parameterised with the worker's inbox, pane, identity and the pool beat), and
+  `pool_remedy.py` re-ensures it each tick for every worker whose session answers alive. An inbox
+  already held by a standby-kind watcher no supervisor started (a legacy untagged one) gets no
+  supervisor until that watcher is replaced: its standby would only yield to the holder, on a loop.
+  The stand-down is readiness-gated here as for the core: a worker's session watcher counts as the
+  holder from the moment it execs, but the standby stays armed until that watcher has proved it can
+  deliver, so the startup-scan window (#4588: a scan that grows with the inbox's backlog) is covered
+  by the standby rather than deaf. What the standby announces reaches the worker's pane only once the
+  notifier accepts a resolver-backed (absolute-path) announcement for a delivery inbox (#4635); until
+  then a supervised worker inbox is heard only by its own session watcher.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
   exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
   30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
   standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
   2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
   affected: #4524.
-- **Untagged is what pool workers run today** (`SUTANDO_WATCHER_CMD <inbox>`), which is why #4600 and
-  #4602 are the next two watcher changes. The rule going forward (owner, 2026-09-22): every start
-  carries an explicit `--role` (`session` or `standby`) and `--inbox`; the watcher refuses an untagged
-  start.
+- **An early exit, and `exit code 144`.** A notice that the session watcher exited before
+  its `timeout_ms` is the same instruction as the expiry notice: re-arm first, investigate second;
+  the inbox is unwatched until the supervisor's 45 s grace re-arms the standby. On macOS Claude Code
+  reports a background command that died of SIGTERM as `exit code 144` (128 + 16 reads as SIGURG, but
+  SIGURG's default is discard and the watcher ignores it). Before this fix the 144 was the `Monitor`'s
+  own wrapper shell, killed by the watcher's `kill -TERM 0` in `cleanup()`, so every exit reached the
+  session as "144, no stderr"; `cleanup()` now signals the process group only when the watcher leads
+  it. The watcher also relaunches a dead fswatch (backoff 1-16 s, `SUTANDO_FSWATCH_RESTART_MAX`) and
+  exits 1, saying so, only when fswatch will not stay up.
+- **A live fswatch that reports nothing** (a stalled fseventsd, 2026-10-17: pointers landed in every
+  seat inbox for hours and none was announced) is covered by the catch-up pass: every
+  `SUTANDO_WATCHER_CATCHUP_SECONDS` (30 s; empty, non-numeric or 0 reads as 30), whether or not events
+  arrived meanwhile, the watcher lists the inbox for entries whose ctime (so a pointer renamed into the
+  inbox with an old mtime counts) falls after the previous pass and before the last second,
+  and feeds each one through the same dispatch as an fswatch event. Each entry is examined by one pass,
+  so an inbox full of answered pointers costs the startup sweep once and the catch-up passes nothing.
+  Already-dispatched and already-answered entries are refused by the same dedupe the event path uses.
+  A dead fswatch is the relaunch budget's case, above, not this one.
+- **Watchers started before the tag was required** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose
+  worker boot skill predated the tagged form) keep running and read as `untagged` holders until
+  their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start
+  carries an explicit `--role` (`session` or `standby`) and `--inbox`, and the watcher enforces it.
+
+## Interrupted handlers and the next watcher (#4825)
+
+A watcher stopped while its task-event handler is in flight decides nothing at shutdown: it
+logs the claim it leaves and exits. Every watcher, before its startup sweep and again before
+each dispatch, retires claims whose owner is gone (`reconcile_dead_claims`: the pid must be
+alive, not a zombie, and carry the start time the claim recorded, read under `LC_ALL=C`; an
+unreadable `ps` keeps the claim and says so). The router's replay follows the delivery already
+committed for the task, under one per-task lock, and repairs a missing attribution; it refuses
+when two recipients hold the task or the record and the fact disagree. The transitions a kill
+can land in are exposed as `SUTANDO_WATCHER_TRANSITION_HOOK` (see the script header), which is
+how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts each one.
 
 ## Tests that pin this
 
 - `tests/watch-tasks-stream-role-session-kills-standby.test.sh`: the handoff contract with the real
   supervisor and notifier (arm after grace, stand down on readiness, re-arm after a kill).
-- `tests/watch-tasks-stream-readiness-window-honours-handler-config.test.py`: the readiness window,
-  buffered replay before the sweep, holds and admissions.
+- `tests/watch-tasks-stream-readiness-window-decision-instant.test.py`,
+  `tests/watch-tasks-stream-readiness-window-unreadable-config.test.py`,
+  `tests/watch-tasks-stream-readiness-window-held-task-recovery.test.py` (split from one combined
+  file in #4627, sharing `tests/fixtures/readiness_window_helpers.py`, so no single file sets the
+  CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.

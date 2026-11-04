@@ -580,6 +580,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ps.standardOutput = psPipe
         ps.standardError = FileHandle.nullDevice
         do { try ps.run() } catch { return nil }
+        // Drain BEFORE waiting: this listing exceeds the 64 KiB pipe buffer, so
+        // waiting first deadlocks ps on write against a main thread that never reads.
+        let out = psPipe.fileHandleForReading.readDataToEndOfFile()
         ps.waitUntilExit()
         // A failed ps must read as unknown -- an empty listing from a
         // non-zero exit is not a clean "no match" (the sysmond-unreachable
@@ -588,7 +591,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
             return nil
         }
-        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let listing = String(data: out, encoding: .utf8) ?? ""
         let selfPID = ProcessInfo.processInfo.processIdentifier
         let myInbox = canonicalInbox(ProcessInfo.processInfo.environment["SUTANDO_TASKS_DIR"] ?? workspace + "/tasks")
         // A tagged line answers by its inbox: this core's own is alive, another
@@ -739,8 +742,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Refresh `contextual-chips.json` from cheap mechanical sources. No LLM
-    /// round-trip — just shell-out to `gh pr list`, read top `## Title` line
-    /// of `pending-questions.md`, scan `results/` for unread items. Atomic
+    /// round-trip — just shell-out to `gh pr list` and scan `results/` for
+    /// unread items. Atomic
     /// write via tmp + replaceItem. Fires every 120s + once at startup. The
     /// web UI polls the file and pins matching chips at the top of the
     /// starter tab.
@@ -780,23 +783,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 2. Top pending question (read first `## Title` line of pending-questions.md).
-        // pending-questions.md is per-host (hosts/<host>/, #1717 F1) — probe there
-        // first so the chip reflects THIS host's questions, not a stale flat-root copy.
-        let pqPath = perHostPath("pending-questions.md")
-        if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
-            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
-            for line in pq.split(separator: "\n") {
-                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
-                    let title = String(line.dropFirst(3))
-                    let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
-                    chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
-                    break
-                }
-            }
-        }
-
-        // 3. Most recent unread result (results/task-*.txt newest mtime).
+        // 2. Most recent unread result (results/task-*.txt newest mtime).
         let resultsDir = workspace + "/results"
         if let entries = try? FileManager.default.contentsOfDirectory(atPath: resultsDir) {
             let taskResults = entries

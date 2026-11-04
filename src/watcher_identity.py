@@ -21,6 +21,7 @@ Stdlib only, so a gate that runs before the rest of src/ is importable can use i
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -360,6 +361,68 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
     return None if saw_undecidable else False
 
 
+class InboxHolders(NamedTuple):
+    """`observed` False: the process table itself could not be read, so `holders`
+    says nothing. `undecided` counts watcher-shaped lines that could be serving
+    this inbox but cannot be proven either way — a process that exits between the
+    snapshot and the argv read is the ordinary case, so this is never empty for
+    long on a busy host and must not be read as "a holder exists"."""
+    observed: bool
+    holders: List[tuple]
+    undecided: int
+
+
+def inbox_holders(inbox: str, exclude_pid=None, ps_output: Optional[str] = None,
+                  argv_vector: Optional[Callable] = None,
+                  run: Callable = subprocess.run) -> InboxHolders:
+    """Every watcher-shaped process PROVEN to serve `inbox`, tagged or not, ready
+    or not: `[(pid, role), ...]` with role `session`, `standby` or `untagged`.
+    Presence only: readiness is the supervisor's question.
+
+    Undecidable lines are counted, never merged into the answer: a caller that
+    starts a watcher must distinguish "something holds this inbox" from "something
+    could not be read", because refusing to start leaves the inbox with no
+    announcer at all, which is worse than the duplicate the check prevents."""
+    if ps_output is None:
+        try:
+            result = run(["ps", "-Ao", "pid,ppid,args"],
+                         capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return InboxHolders(False, [], 0)
+        if getattr(result, "returncode", None) != 0:
+            return InboxHolders(False, [], 0)
+        ps_output = result.stdout
+    want = canonical_inbox(inbox)
+    skip = {str(os.getpid()), str(exclude_pid) if exclude_pid else ""}
+    holders: List[tuple] = []
+    undecided = 0
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        # A forked child of the excluded caller (its own command substitution)
+        # carries the caller's argv and would read as a second watcher.
+        if len(parts) < 3 or parts[0] in skip or parts[1] in skip:
+            continue
+        pid, argv = parts[0], parts[2]
+        verdict = classify_argv(argv, as_pid(pid), argv_vector)
+        if verdict.watcher is False:
+            continue
+        if verdict.watcher is None:
+            flat = flat_inbox(argv)
+            if flat is None or canonical_inbox(flat) == want:
+                undecided += 1
+            continue
+        tagged = watcher_inbox(verdict.operands)
+        theirs = canonical_inbox(tagged if tagged else positional_inbox(verdict.operands))
+        if theirs is None:
+            undecided += 1
+            continue
+        if theirs != want:
+            continue
+        role = watcher_role(verdict.operands)
+        holders.append((int(pid), role if role in ("session", "standby") else "untagged"))
+    return InboxHolders(True, holders, undecided)
+
+
 def standby_present(inbox: str, ps_output: Optional[str] = None,
                     argv_vector: Optional[Callable] = None,
                     run: Callable = subprocess.run) -> Optional[bool]:
@@ -401,6 +464,88 @@ def standby_present(inbox: str, ps_output: Optional[str] = None,
     return None if saw_undecidable else False
 
 
+class OutputSink(NamedTuple):
+    """Where a watcher's announcements go, and whether anything reads them.
+
+    `read` is None when the question is not worth asking rather than when it
+    failed: see `output_sink`. `observed` False means `lsof` could not be
+    consulted, so nothing here is evidence."""
+    observed: bool
+    kind: str
+    target: str
+    read: Optional[bool]
+
+
+def _lsof(args: List[str], run: Callable) -> Optional[str]:
+    """`lsof` output, or None when it could not be consulted. Exit 1 is lsof's
+    "nothing matched", which is an answer; only a missing or broken lsof is not."""
+    lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+    try:
+        r = run([lsof, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode not in (0, 1):
+        return None
+    return r.stdout or ""
+
+
+def _fields(text: str):
+    """lsof -F records as dicts, one per open file, carrying the owning pid."""
+    pid, cur = None, {}
+    for line in text.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            if cur:
+                yield cur
+            pid, cur = val, {}
+        elif tag == "f":
+            if cur:
+                yield cur
+            cur = {"p": pid}
+        else:
+            cur[tag] = val
+    if cur:
+        yield cur
+
+
+def output_sink(pid, run: Callable = subprocess.run) -> OutputSink:
+    """What pid's stdout is, and whether another process is reading it.
+
+    This is how a stray watcher is told from a working one: a watcher holds its
+    inbox whether or not anything consumes what it announces, and the only
+    difference visible from outside is the reader.
+
+    Decided for a regular file (are there other openers with read access) and
+    for /dev/null (nothing can read it). Left at None for a pipe, fifo or
+    socket, which is not evasion: the watcher exits on its first failed write,
+    so those clear themselves at the next announcement. A tty means an operator
+    is attached, which counts as read."""
+    text = _lsof(["-p", str(pid), "-a", "-d", "1", "-F", "ftn"], run)
+    if text is None:
+        return OutputSink(False, "unknown", "", None)
+    rec = next((r for r in _fields(text) if "t" in r), None)
+    if rec is None:
+        return OutputSink(True, "unknown", "", None)
+    kind_raw, target = rec.get("t", ""), rec.get("n", "")
+    if kind_raw == "REG":
+        readers = _lsof(["-F", "pan", "--", target], run)
+        if readers is None:
+            return OutputSink(False, "file", target, None)
+        me = str(pid)
+        found = any(r.get("p") != me and "r" in (r.get("a") or "")
+                    for r in _fields(readers) if r.get("n") == target)
+        return OutputSink(True, "file", target, found)
+    if kind_raw == "CHR":
+        if target.endswith("/null"):
+            return OutputSink(True, "discarded", target, False)
+        return OutputSink(True, "tty", target, True)
+    if kind_raw in ("FIFO", "PIPE", "unix", "IPv4", "IPv6", "sock"):
+        return OutputSink(True, "stream", target, None)
+    return OutputSink(True, kind_raw or "unknown", target, None)
+
+
 def main(argv=None) -> int:
     """`watcher_identity.py <pid>` -> `watcher`, `not-watcher`, `dead` or
     `unknown` on stdout, with `why=` beneath. Exit 0 when decided, 2 when not,
@@ -413,6 +558,66 @@ def main(argv=None) -> int:
     `ps` snapshot itself failed -- `unknown` must never read as `no` to a
     caller deciding whether to start a duplicate watcher."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "output-sink":
+        if len(args) != 2 or as_pid(args[1]) is None:
+            print("usage: watcher_identity.py output-sink <pid>", file=sys.stderr)
+            return 64
+        sink = output_sink(args[1])
+        print(f"{sink.kind} {sink.target}".strip())
+        print("read=" + ("unknown" if sink.read is None else ("yes" if sink.read else "no")))
+        if not sink.observed:
+            print("why=lsof could not be consulted", file=sys.stderr)
+            return 2
+        return 0
+    if args and args[0] == "sentinel-names-pid":
+        rest = args[1:]
+        pid = as_pid(rest[0]) if rest else None
+        state_dir = None
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--ready" and i + 1 < len(rest):
+                state_dir = rest[i + 1]
+                i += 2
+            else:
+                i = len(rest) + 1
+        if pid is None or not state_dir:
+            print("usage: watcher_identity.py sentinel-names-pid <pid> --ready STATE_DIR", file=sys.stderr)
+            return 64
+        print("yes" if sentinel_names_pid(pid, state_dir) else "no")
+        return 0
+    if args and args[0] == "inbox-holders":
+        rest = args[1:]
+        inbox = None
+        exclude = None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--inbox" and i + 1 < len(rest):
+                inbox = rest[i + 1]
+                i += 2
+            elif rest[i].startswith("--inbox="):
+                inbox = rest[i].split("=", 1)[1] or None
+                i += 1
+            elif rest[i] == "--exclude" and i + 1 < len(rest):
+                exclude = as_pid(rest[i + 1])
+                i += 2
+            else:
+                print("usage: watcher_identity.py inbox-holders --inbox VALUE [--exclude PID]", file=sys.stderr)
+                return 64
+        if not inbox:
+            print("usage: watcher_identity.py inbox-holders --inbox VALUE [--exclude PID]", file=sys.stderr)
+            return 64
+        seen = inbox_holders(inbox, exclude_pid=exclude)
+        if not seen.observed:
+            print("unobserved")
+            print("why=ps snapshot unavailable", file=sys.stderr)
+            return 2
+        for pid, role in seen.holders:
+            print(f"{pid} {role}")
+        if not seen.holders:
+            print("none")
+        if seen.undecided:
+            print(f"undecided={seen.undecided}", file=sys.stderr)
+        return 0
     if args and args[0] == "standby-present":
         rest = args[1:]
         inbox = None

@@ -83,7 +83,8 @@ def sessions(workspace, probe=None) -> list:
             availability, detail = "absent", "no open incarnation" if not inc else "no socket recorded"
         entry = {
             "worker_id": worker_id,
-            "label": row.get("label") or worker_id,
+            "label": pool_roster.display_label(row, worker_id),
+            "routing_label": row.get("label") or worker_id,
             "state": row.get("state") or "unknown",
             "bound_rooms": rooms_bound_to(roster, worker_id),
             "session_name": name,
