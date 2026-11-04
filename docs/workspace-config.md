@@ -80,7 +80,7 @@ Sutando posts no macOS desktop notifications unless you opt in:
 { "notifications": { "macos": true } }
 ```
 
-Off by default. Only a JSON `true` turns them on; any other value, or a config that cannot be read, leaves them off. Every macOS sender asks the one reader: `resolve_macos_notifications()` in `src/sutando_config.py` (TypeScript: `resolveMacosNotifications()` in `src/sutando_config.ts`; shell: `bash scripts/sutando-config.sh macos-notifications`, used by `src/macos-notify.sh`). With it off, pending questions, bridge restarts, the agent shepherd and health alerts still reach you through your DM or the core's task queue; a banner that only acknowledged your own action (a context drop, a screen recording) is simply not shown. One alert ignores the setting: when the gateway bridge cannot resolve the workspace it has no DM to post to, so it always shows its banner (`macos-notify.sh --always`).
+Off by default. Only a JSON `true` turns them on; any other value, or a config that cannot be read, leaves them off. Every macOS sender asks the one reader: `resolve_macos_notifications()` in `src/sutando_config.py` (TypeScript: `resolveMacosNotifications()` in `src/sutando_config.ts`; shell: `bash scripts/sutando-config.sh macos-notifications`, used by `src/macos-notify.sh`). With it off, pending questions, bridge restarts, the agent shepherd and health alerts still reach you through your DM or the core's task queue; a banner that only acknowledged your own action (a context drop, a screen recording) is simply not shown. One alert ignores the setting: when the gateway bridge cannot resolve the workspace it has no DM to post to, so it always shows its banner (`macos-notify-always.sh`).
 
 ## Three common overrides
 

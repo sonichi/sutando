@@ -163,24 +163,44 @@ class ShellSender(unittest.TestCase):
         self._send(True, "hi")
         self.assertEqual(self.calls.read_text().splitlines()[-2:], ["hi", "Sutando"])
 
-    def test_always_posts_when_off(self):
-        r = self._send(False, "--always", "no workspace")
+    def test_message_cannot_skip_the_opt_in(self):
+        for msg in ("--always", "--", "-e"):
+            with self.subTest(msg=msg):
+                r = self._send(False, msg)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertFalse(self.calls.exists(), f"message {msg!r} got past the opt-in")
+
+    def test_on_a_flag_shaped_message_is_the_body(self):
+        r = self._send(True, "--always")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines()[-2:], ["--always", "Sutando"])
+
+    def test_always_entrypoint_posts_when_off(self):
+        env = _child_env(**macos_opt_in_env(self.tmp / "ws", on=False))
+        env["PATH"] = f"{self.bin}:{env['PATH']}"
+        r = subprocess.run(["bash", str(REPO / "src" / "macos-notify-always.sh"), "no workspace"],
+                           env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.calls.read_text().splitlines()[-2:], ["no workspace", "Sutando"])
 
 
 class AlwaysIsReservedForTheChannellessAlert(unittest.TestCase):
-    """--always bypasses the opt-in, so only the alert with no DM to fall back on may use it."""
+    """The ungated entrypoint is a symlink to the gated helper; only the no-workspace alert names it."""
 
-    def test_only_the_gateway_no_workspace_alert_uses_always(self):
+    def test_always_entrypoint_is_the_helper(self):
+        link = REPO / "src" / "macos-notify-always.sh"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), (REPO / "src" / "macos-notify.sh").resolve())
+
+    def test_only_the_gateway_no_workspace_alert_uses_it(self):
         users = []
         for dirpath, dirnames, files in os.walk(REPO):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for f in files:
                 p = Path(dirpath) / f
-                if p.suffix in SCANNED and p.name != "macos-notify.sh":
+                if p.suffix in SCANNED and not p.name.startswith("macos-notify"):
                     for line in p.read_text(errors="replace").splitlines():
-                        if "macos-notify.sh" in line and "--always" in line:
+                        if "macos-notify-always" in line:
                             users.append((p.relative_to(REPO).as_posix(), line.strip()))
         self.assertEqual([u[0] for u in users], ["src/launchd/gateway-bridge-wrapper.sh"], users)
         self.assertIn("cannot resolve the workspace", users[0][1])
@@ -200,6 +220,7 @@ SHELL_SENDERS = (
 # Every file allowed to spell an osascript notification, and the gate it must carry.
 GATED_SENDERS = {
     "src/macos-notify.sh": "sutando-config.sh\" macos-notifications",
+    "src/macos-notify-always.sh": "sutando-config.sh\" macos-notifications",
     "src/sutando_platform.py": "resolve_macos_notifications()",
     "src/platform.ts": "resolveMacosNotifications()",
     "src/health-check.py": "resolve_macos_notifications()",
