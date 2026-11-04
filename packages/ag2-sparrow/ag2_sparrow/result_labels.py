@@ -77,6 +77,18 @@ def write(result_file: Path, labels: dict) -> "Path | None":
     return target
 
 
+def archive(results_dir: Path, stem: str, archive_dir: Path, now: float) -> bool:
+    """Move `<stem>.meta.json` to `archive_dir/<stem>-<now>.meta.json`; True when it is gone,
+    absent included. Raises OSError when it could not be moved."""
+    side = Path(results_dir) / f"{stem}{SUFFIX}"
+    Path(archive_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(side, Path(archive_dir) / f"{stem}-{int(now)}{SUFFIX}")
+    except FileNotFoundError:
+        pass
+    return True
+
+
 def read(path: Path) -> dict:
     """The labels at a side file, each cleaned and fitted to its limit; {} when absent or unreadable."""
     try:
