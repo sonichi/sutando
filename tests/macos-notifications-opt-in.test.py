@@ -284,6 +284,11 @@ class PythonSendersDelegate(unittest.TestCase):
                 relay.main(["--signal", str(sig), "--no-seats"])
                 relay.main(["--signal", str(sig), "--no-seats", "--no-macos"])
         self.assertEqual(seen, [False, True, False])
+        src = os.path.realpath(REPO / "src")
+        bare = [x for x in sys.path if os.path.realpath(x or ".") != src]
+        with mock.patch.object(sys, "path", bare), self._gate(False):
+            self.assertIs(relay._macos_notifications_on(), False)
+        self.assertIn(src, [os.path.realpath(x) for x in bare], "the relay finds src/ from its own file")
 
     def test_screen_record(self):
         rec = _load("rec_gate", REPO / "skills/screen-record/scripts/record.py")
@@ -293,6 +298,18 @@ class PythonSendersDelegate(unittest.TestCase):
         with self._gate(True), mock.patch.object(rec.subprocess, "Popen") as popen:
             rec._notify("Screen recording started")
         self.assertEqual(popen.call_args.args[0][0], "osascript")
+        with mock.patch.dict(sys.modules, {"sutando_config": None}):
+            self.assertIs(rec._macos_notifications_on(), False, "no reader means off")
+
+    def test_screen_record_indicator_paths_stay_silent_when_off(self):
+        rec = _load("rec_gate2", REPO / "skills/screen-record/scripts/record.py")
+        with tempfile.TemporaryDirectory() as td:
+            rec.SCRIPT_DIR, rec.INDICATOR_PID_FILE = td, os.path.join(td, "rec.pid")
+            with self._gate(False), mock.patch.object(rec.subprocess, "Popen") as popen, \
+                    redirect_stderr(io.StringIO()):
+                rec._show_indicator()
+                rec._hide_indicator()
+        popen.assert_not_called()
 
 
 if __name__ == "__main__":
