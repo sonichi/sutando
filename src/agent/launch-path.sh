@@ -11,10 +11,13 @@ sutando_bundled_node_dir() {
 
 # sutando_desktop_app_support <repo>: the desktop root: $SUTANDO_APP_SUPPORT, else the parent of
 # <repo>'s engine/ dir. Prints nothing outside a desktop install or when the dir is missing.
+# Pure Bash: early boot calls this before PATH is known to hold dirname/basename.
 sutando_desktop_app_support() {
-  local d="${SUTANDO_APP_SUPPORT:-}"
-  if [ -z "$d" ] && [ "$(basename "$(dirname "$1")")" = engine ]; then
-    d="$(dirname "$(dirname "$1")")"
+  local d="${SUTANDO_APP_SUPPORT:-}" r="$1" parent
+  while [ "${#r}" -gt 1 ] && [ "${r%/}" != "$r" ]; do r="${r%/}"; done
+  if [ -z "$d" ] && [ "${r#*/}" != "$r" ]; then
+    parent="${r%/*}"
+    [ "${parent##*/}" = engine ] && d="${parent%/*}"
   fi
   [ -n "$d" ] && [ -d "$d" ] && printf '%s\n' "$d"
   return 0

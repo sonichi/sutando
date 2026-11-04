@@ -89,4 +89,17 @@ out="$(HOME="$td/home" SUTANDO_APP_SUPPORT="$app" PATH="/usr/bin:/bin" /bin/bash
 check "a foreign checkout with SUTANDO_APP_SUPPORT gets that root's cli dirs" \
   "$out" "/usr/bin:/bin:$app/cli/claude/bin:$app/cli/codex/bin:$td/home/.local/bin"
 
+# Early boot: SUTANDO_APP_SUPPORT unset and a PATH without dirname/basename still finds the root.
+mkdir -p "$td/nobin"
+out="$(HOME="$td/home" PATH="$td/nobin" /bin/bash -c '
+  . "$1/src/agent/launch-path.sh"
+  sutando_append_launch_path "$2" 2>&1
+  printf %s "$PATH"' _ "$REPO" "$engine/sutando")"
+check "the canonical fallback needs no external dirname/basename" \
+  "$out" "$td/nobin:$engine/runtime/bin:$app/cli/claude/bin:$app/cli/codex/bin:$td/home/.local/bin"
+out="$(PATH="$td/nobin" /bin/bash -c '. "$1/src/agent/launch-path.sh"
+  sutando_desktop_app_support "$2/"; sutando_desktop_app_support sutando
+  sutando_desktop_app_support "$2/x"' _ "$REPO" "$engine/sutando" 2>&1)"
+check "a trailing slash is ignored; a bare name or a non-engine parent gives nothing" "$out" "$app"
+
 exit "$fail"
