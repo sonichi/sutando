@@ -36,6 +36,8 @@ except ImportError:  # Windows can import spawn_worker even though it has no lau
 
 LABEL = "com.sutando.pool-remedy"
 DEFAULT_INTERVAL_S = 300
+# Kept in the job's environment: a worker the sweep relaunches must keep the launcher's Stop setting.
+STOP_INTERRUPT = "SUTANDO_STOP_INTERRUPT"
 _HERE = Path(__file__).resolve().parent
 
 
@@ -83,8 +85,14 @@ def remedy_script_path() -> str:
     return str(_HERE / "pool_remedy.py")
 
 
+def stop_interrupt_setting(environ=None) -> "str | None":
+    """The launcher's Stop setting: a non-empty value ("0" is the opt-out), else None (unset)."""
+    value = (os.environ if environ is None else environ).get(STOP_INTERRUPT)
+    return value if value else None
+
+
 def render(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S,
-           python: str | None = None) -> dict:
+           python: str | None = None, stop_interrupt: "str | None" = None) -> dict:
     """The job, as launchd reads it. Paths are recorded absolute at install time:
     launchd runs with no shell and no cwd worth trusting."""
     workspace, repo = Path(workspace).resolve(), Path(repo).resolve()
@@ -106,7 +114,7 @@ def render(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S,
         "RunAtLoad": True,
         "StandardOutPath": str(log),
         "StandardErrorPath": str(log),
-        "EnvironmentVariables": {"PATH": path},
+        "EnvironmentVariables": {"PATH": path, **({STOP_INTERRUPT: stop_interrupt} if stop_interrupt else {})},
         "ProcessType": "Background",
     }
 
@@ -159,6 +167,8 @@ def _status_for(label, dest, runner=None) -> dict:
         if job.get("Label") != label:
             raise ValueError(f"plist label {job.get('Label')!r} does not match {label!r}")
         out["interval_s"] = job.get("StartInterval")
+        env = job.get("EnvironmentVariables")
+        out["stop_interrupt"] = env.get(STOP_INTERRUPT) if isinstance(env, dict) else None
         out["log"] = job.get("StandardOutPath")
         args = job.get("ProgramArguments") or []
         if len(args) > 1:
@@ -183,11 +193,13 @@ def legacy_status(*, launch_agents: Path | None = None, runner=None) -> dict:
 def install(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S, python=None,
             launch_agents: Path | None = None, runner=None,
             sleep=time.sleep) -> dict:
-    job = render(workspace, repo, interval_s=interval_s, python=python)
+    prior = status(workspace, launch_agents=launch_agents, runner=runner)
+    # An installer without the setting keeps the one already saved, rather than clearing it.
+    stop = stop_interrupt_setting() or prior.get("stop_interrupt")
+    job = render(workspace, repo, interval_s=interval_s, python=python, stop_interrupt=stop)
     dest = plist_path(workspace, launch_agents)
     dest.parent.mkdir(parents=True, exist_ok=True)
     Path(job["StandardOutPath"]).parent.mkdir(parents=True, exist_ok=True)
-    prior = status(workspace, launch_agents=launch_agents, runner=runner)
     old_bytes = dest.read_bytes() if dest.exists() else None
     legacy = legacy_status(launch_agents=launch_agents, runner=runner)
     migrate = (legacy.get("installed") and not legacy.get("error")

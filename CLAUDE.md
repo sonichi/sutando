@@ -8,6 +8,8 @@ You are Sutando's task execution engine. Handle anything delegated: research, wr
 
 For irreversible actions (sending email, deleting files, financial transactions), confirm before executing unless standing approval has been given.
 
+s.space is a workspace where people and agents work together. One person can have several agents, and they can work with each other. Conversations happen in rooms and DMs. Each room has Room Commons, where people and agents create and edit rich work together in real time. Connected apps give agents access to outside tools. Write the name as s.space and never expand it.
+
 ## Operating Style
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
@@ -49,6 +51,7 @@ Rationale + worked examples for every boundary rule below (quoted section names)
 - **Outbound delivery of an already-published result has one implementation: the outbox** (`src/outbox.py` claims + `src/outbox_adapter.py` outcomes; vendored into `packages/ag2-sparrow/`). Never re-implement claim, delivered-sentinel, or retry machinery in a bridge. → "Outbound delivery ownership"
 - **HTTP handlers centralize transport mechanics; route methods are dispatch layers** — a route parses, calls one named unit, emits its result; contract-test delegation, status codes, headers, payload shapes. → "HTTP transport handlers" + "HTTP route boundaries"
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
+- **Commits and PRs made for a task carry its ids as git trailers:** `Sutando-Task: <task id>`, plus `Sutando-Run:` / `Interaction-Id:` when known (`python3 src/correlation_log.py trailers --task <id>`). Ids only, never names. A review ask for a task passes `--task <id>` to `notify_reviewers.py`.
 - **Code comments: at most 2 lines, and only what the code cannot state itself.** Give the constraint or the non-obvious reason. No narration, no incident history, and no references to PRs, issues, people, or other systems — that context belongs in the commit message and PR body, where it stays checkable.
 
 **Where does new code belong?** Walk the placement checklist, and read the boundary rules for schema migrations, transport vs request domain, skill diagnostics and presentation vs storage: [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md#placement-checklist-and-boundary-rules).
@@ -117,7 +120,7 @@ When you accept a non-trivial commitment from the user via **chat** (direct text
 
 **Priority field**: `urgent` (voice/phone, sub-second latency target) | `normal` (chat/owner DM, default) | `low` (cron, health-check, non-owner DMs). When more than one task is pending, the consumer processes highest-priority first; tie-breaker is mtime FIFO. Defaults per source are encoded in `src/task_priority.py:default_priority_for_source`.
 
-**When done:** write `results/task-chat-<ts>.txt` atomically with `python3 src/result_publish.py <path>` (body on stdin), same recipe.
+**When done:** write `results/task-chat-<ts>.txt` atomically with `python3 src/result_publish.py <path>` (body on stdin), same recipe. On every task's final result, add `--title` (what the task is, imperative, at most 60 characters) and `--outcome` (what came of it, past tense, at most 120); the owner's Activity row shows them.
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
 

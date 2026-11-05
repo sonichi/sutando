@@ -96,6 +96,20 @@ class TestConfig(unittest.TestCase):
                           "https://sutando.s.space", True, "config"))
         self.assertTrue(d.is_dotspace)
 
+    def test_app_origins_are_registry_fields_independent_of_relay(self):
+        expected = {"ag2.space": "https://chat.ag2.space", "s.space": "https://chat.s.space",
+                    "dev.ag2.space": "https://dev-chat.ag2.space", "dev.s.space": "https://dev-chat.s.space"}
+        self.assertEqual({d.server: d.app_origin for d in ds.registered_instances({})}, expected)
+        entry = {"server": "custom.example", "gateway_host": "relay.custom.example",
+                 "app_origin": "https://web.custom.example/client"}
+        self.assertEqual(ds.dotspace_for("custom.example", fetch=ds.NO_FETCH,
+                                        config={"instances": [entry]}).app_origin, "https://web.custom.example")
+        for value in (None, "not-a-url", "https://user:pass@web.custom.example"):
+            with self.subTest(value=value):
+                self.assertEqual(ds.dotspace_for("custom.example", fetch=ds.NO_FETCH,
+                    config={"instances": [{**entry, "app_origin": value}]}).app_origin, "")
+        self.assertEqual(ds.dotspace_for("unknown.example", fetch=ds.NO_FETCH, config={}).app_origin, "")
+
     def test_each_built_in_instance_names_its_mcp_url(self):
         got = {d.server: d.mcp_url for d in ds.registered_instances({})}
         self.assertEqual(got, {"ag2.space": "https://mcp.ag2.space/mcp", "dev.ag2.space": "https://dev-mcp.ag2.space/mcp",

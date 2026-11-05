@@ -1608,6 +1608,31 @@ class TestEnsureTmuxOnPath(unittest.TestCase):
             os.environ["PATH"] = orig_path
 
 
+    def test_prepends_the_shared_resolvers_dir(self):
+        from unittest.mock import patch
+        orig_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin"
+            with patch.object(_mod.shutil, "which", return_value=None), \
+                    patch.object(_mod.tmux_probe, "tmux_binary", return_value="/fake/dir/tmux"):
+                _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], "/fake/dir")
+        finally:
+            os.environ["PATH"] = orig_path
+
+    def test_bare_fallback_leaves_path_alone(self):
+        from unittest.mock import patch
+        orig_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin"
+            with patch.object(_mod.shutil, "which", return_value=None), \
+                    patch.object(_mod.tmux_probe, "tmux_binary", return_value="tmux"):
+                _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"], "/usr/bin")
+        finally:
+            os.environ["PATH"] = orig_path
+
+
 class TestMainOnce(unittest.TestCase):
     """End-to-end --once through the SHARED runtime-health derivation: with no
     live sutando-core, runtime_health.derive() → 'offline' → the supervisor
@@ -1954,6 +1979,15 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
         self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
                          ("blocked-human", "awaiting user: unknown"))
 
+    def test_a_turn_in_flight_above_the_composer_outruns_the_banner_with_work_owed(self):
+        mid_turn = ("● Writing the result file now.\n"
+                    "✳ Choreographing… (running Stop hooks… 2/3 · 2m 37s)\n"
+                    "  ✔ Update installed · Restart to update\n" + _RULE + "❯ \n" + _RULE
+                    + _STALE_BANNER + _SEAT_FOOTER)
+        for name, pane in (("stop hooks", mid_turn), ("thinking", _ALERT_WORKING)):
+            with self.subTest(spinner=name):
+                self.assertNotIn("blocked-human", self._seat([pane] * 3, owes=True))
+
     def test_owes_work_is_the_cores_queue_and_never_a_worker_seats(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
@@ -1994,6 +2028,44 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
             self.assertTrue(stale)
             st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
             self.assertEqual(st[0], "idle-ready")
+
+
+# An idle worker seat captured live: two turns that ran, then the CLI's two-row limit banner left
+# pinned under an empty composer (non-breaking space after the caret) while the seat kept working.
+_LIVE_IDLE_SEAT = (
+    "⏺ Clean start. Launching readiness probe.\n\n"
+    "⏺ Monitor(Poll watcher readiness probe until confirmed ready)\n"
+    "  ⎿  Monitor started · task task-a · timeout 120s\n\n  Ran 1 shell command\n\n"
+    "⏺ Watcher re-armed (clean start). Readiness probe launched; waiting on confirmation.\n\n"
+    "✻ Crunched for 3m 17s · done 6:46 PM · 1 monitor still running\n\n"
+    "⏺ Monitor \"Poll watcher readiness probe until confirmed ready\" stream ended\n\n"
+    "⏺ Watcher confirmed ready.\n\n  Ran 1 shell command\n\n"
+    "⏺ Logged. Standing by for the next task notification.\n\n"
+    "✻ Sautéed for 2m 29s · done 6:48 PM · 1 monitor still running\n"
+    + " " * 80 + "✔ Update installed · Restart to update\n"
+    + "─" * 70 + " seat-1 ─\n❯\u00a0\n" + "─" * 120 + "\n"
+    "  ⚠ Usage limit reached · continuing automatically at 1am · esc to cancel\n"
+    "  ⚠ /usage-credits to continue now\n"
+    "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage\n")
+
+
+class TestLiveIdleSeatUnderAPinnedBanner(unittest.TestCase):
+    """The worker seat watcher's own path on that capture: no page, and its limit card closes."""
+
+    def test_the_seat_watcher_does_not_page_and_its_limit_card_closes(self):
+        owes = _mod.owes_work("worker-seat", _Path("/nonexistent-ws"))
+        stale, _ = _mod.limit_step(_LIVE_IDLE_SEAT, None, "/nonexistent-ws", owes_work=owes)
+        self.assertTrue(stale)
+        st = compose_state(_LIVE_IDLE_SEAT, "idle", True, limit_stale=stale, styled_pane=_LIVE_IDLE_SEAT)
+        self.assertEqual(st[0], "idle-ready")
+        from delivery.pane_gate import limit_standing
+        self.assertFalse(limit_standing(_LIVE_IDLE_SEAT, "claude", stale))
+
+    def test_control_with_work_owed_one_frame_cannot_order_the_banner_and_it_holds(self):
+        stale, _ = _mod.limit_step(_LIVE_IDLE_SEAT, None, "/nonexistent-ws", owes_work=True)
+        self.assertFalse(stale)
+        st = compose_state(_LIVE_IDLE_SEAT, "idle", True, limit_stale=stale, styled_pane=_LIVE_IDLE_SEAT)
+        self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
 
 
 if __name__ == "__main__":

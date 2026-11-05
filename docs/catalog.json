@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-09-18"
+   "last_verified": "2026-11-02"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-10-28"
+   "last_verified": "2026-10-30"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -155,7 +155,7 @@
    ],
    "status": "draft",
    "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
-   "last_verified": "2026-09-28"
+   "last_verified": "2026-10-17"
   },
   "docs/health-snapshot.md": {
    "title": "Health snapshot: GET /health",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-10-26"
+   "last_verified": "2026-11-01"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -360,7 +360,7 @@
    ],
    "status": "canonical",
    "canonical_for": "test coverage policy",
-   "last_verified": null
+   "last_verified": "2026-11-02"
   },
   "docs/tutorial-delivery.md": {
    "title": "Tutorial delivery",
@@ -391,7 +391,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace configuration and resolver APIs",
-   "last_verified": "2026-10-19"
+   "last_verified": "2026-11-03"
   },
   "docs/workspace-contract.md": {
    "title": "Workspace contract",
@@ -503,7 +503,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-10-29"
+   "last_verified": "2026-11-03"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -576,6 +576,16 @@
    "status": "canonical",
    "canonical_for": "DotSpace resolution: which homeservers are AG2-operated, the well-known block and the core.dotspace config",
    "last_verified": "2026-10-28"
+  },
+  "docs/task-wedge-detection.md": {
+   "title": "Task wedge detection and coverage",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "task wedge classes, detection policy, origin status and measurement limits",
+   "last_verified": "2026-11-02"
   }
  }
 }

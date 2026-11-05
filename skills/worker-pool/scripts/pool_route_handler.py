@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # local_task_protocol lives in the core; repo root is parents[3] from here
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
+import activity_bus  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 import task_envelope as te  # noqa: E402
 
@@ -52,6 +53,10 @@ def read_task(task_file: str, workspace=None) -> dict:
     """
     text = Path(task_file).read_text(encoding="utf-8", errors="replace")
     task: dict = {"id": Path(task_file).stem}
+    # A stop from a trusted source must reach whoever holds the task it names; anything else is a task.
+    stop_of = activity_bus.trusted_cancel_target(text, task_file)
+    if stop_of:
+        task["stop_of"] = stop_of
     for line in text.splitlines():
         if line.startswith("task:"):
             break
@@ -98,6 +103,13 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         return MUST_HANDLE, [], None
     if committed is not None and committed != pr.CORE:
         return _to_worker(task, [committed], roster)
+    try:
+        holder = rt.stop_holder(workspace, task, roster=roster)
+    except rt.RouterRefused as e:      # whose the stopped task is cannot be told
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], None
+    if holder is not None:
+        return _to_worker(task, [holder], roster)
     if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.

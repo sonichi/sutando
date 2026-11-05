@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -281,6 +282,102 @@ class MainInProcess(unittest.TestCase):
         self.assertEqual(
             self._run(["--reviewers", "rui,mark", "--send",
                        "--widen-override", "reason"] + self.M), 0)
+
+
+class Interactions(unittest.TestCase):
+    """An ask carries a fresh interaction id, and one correlation record per PR it names."""
+
+    GOOD = MainInProcess.GOOD
+
+    def setUp(self):
+        self.mod = _load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Path(self.tmp.name) / "review-asks.jsonl"
+        self.sent = []
+
+    def _run(self, argv):
+        members = json.dumps({"ok": True, "members": [{"user_id": "@sutando-rui:x"}, {"user_id": "@mark-stand:x"}]})
+
+        def fake_run(cmd, *a, **k):
+            if len(cmd) > 4 and cmd[2] == "mention":
+                self.sent.append(cmd)
+            out = members if "members" in cmd else json.dumps({"ok": True, "event_id": "$ev"})
+            return type("R", (), {"stdout": out, "stderr": "", "returncode": 0})()
+        with patch.object(self.mod, "load_roster", return_value=self.GOOD), \
+             patch.object(self.mod, "ledger_path", return_value=self.led), \
+             patch.object(self.mod.subprocess, "run", side_effect=fake_run), \
+             patch("sys.argv", ["notify_reviewers.py"] + argv):
+            return self.mod.main()
+
+    def _records(self):
+        log = self.mod._correlation()
+        return log.read("interaction", path=self.led.with_name(log.LOG_NAME))
+
+    def test_each_reviewer_gets_its_own_id_cited_in_the_ask_and_recorded(self):
+        msg = "review https://github.com/o/r/pull/7 and https://github.com/o/r/pull/9"
+        self.assertEqual(self._run(["--reviewers", "rui,mark", "--send", "--task", "task-abc123",
+                                    "--message", msg]), 0)
+        ids = [re.search(r"Interaction-Id: (ix_[0-9a-f]{12})$", cmd[4]).group(1) for cmd in self.sent]
+        self.assertEqual(len(set(ids)), 2, "one id per reviewer")
+        recs = self._records()
+        self.assertEqual(len(recs), 4, "one record per (reviewer, PR)")
+        self.assertEqual({(r["interaction_id"], r["object"]) for r in recs},
+                         {(i, o) for i in ids for o in ("o/r#7", "o/r#9")})
+        r = recs[0]
+        self.assertEqual((r["task_id"], r["counterpart_kind"], r["counterpart_scope"], r["room_id"],
+                          r["room_kind"], r["channel"], r["event_id"]),
+                         ("task-abc123", "agent", "unknown", "!triage:x", "unknown", "room", "$ev"))
+        self.assertIn(r["counterpart"], ("@sutando-rui:x", "@mark-stand:x"))
+        self.assertNotIn("rui", {k for rec in recs for k in rec}, "ids only, no names as keys")
+        rows = [json.loads(x) for x in self.led.read_text().splitlines()]
+        self.assertEqual({row["interaction_id"] for row in rows}, set(ids), "the asks ledger carries it too")
+
+    def test_a_task_that_is_not_a_task_id_is_refused_before_anything_is_sent(self):
+        for bad in ("@chi:s.space", "!room:s.space", "Chi Wang"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self._run(["--reviewers", "rui,mark", "--send", "--task", bad,
+                                            "--message", "review https://github.com/o/r/pull/7"]), 7)
+            self.assertIn("is not a task id", err.getvalue())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self._records(), [])
+
+    def test_an_ask_without_a_task_says_so_and_records_no_task(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.dict(os.environ, {"SUTANDO_TASK_ID": "task-from-env"}):
+            self.assertEqual(self._run(["--reviewers", "rui,mark", "--send",
+                                        "--message", "review https://github.com/o/r/pull/7"]), 0)
+        self.assertIn("no --task", err.getvalue())
+        recs = self._records()
+        self.assertEqual(len(recs), 2)
+        self.assertTrue(all("task_id" not in r for r in recs), "the link is explicit; the env is not read")
+
+    def test_a_notice_carries_no_id_and_records_nothing(self):
+        self.assertEqual(self._run(["--reviewers", "rui,mark", "--send", "--kind", "notice",
+                                    "--message", "fyi https://github.com/o/r/pull/7"]), 0)
+        self.assertTrue(all("Interaction-Id" not in cmd[4] for cmd in self.sent))
+        self.assertEqual(self._records(), [])
+
+    def test_plan_mode_shows_the_id_and_records_nothing(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self._run(["--reviewers", "rui,mark", "--message",
+                                        "review https://github.com/o/r/pull/7"]), 0)
+        self.assertRegex(out.getvalue(), r"Interaction-Id: ix_[0-9a-f]{12}")
+        self.assertEqual(self._records(), [])
+
+    def test_without_the_engine_src_the_ask_goes_out_unchanged(self):
+        with patch.object(self.mod, "_correlation", return_value=None):
+            self.assertEqual(self._run(["--reviewers", "rui,mark", "--send",
+                                        "--message", "review https://github.com/o/r/pull/7"]), 0)
+            self.assertEqual(self.mod.record_interactions("https://github.com/o/r/pull/7",
+                                                          {"stand": "@s:x"}, "ix_0123456789ab", "", ""), 0)
+        self.assertTrue(all("Interaction-Id" not in cmd[4] for cmd in self.sent))
+
+    def test_the_import_falls_back_to_none(self):
+        with patch.dict(sys.modules, {"correlation_log": None}):
+            self.assertIsNone(self.mod._correlation())
 
 
 class FailurePaths(unittest.TestCase):
@@ -590,6 +687,7 @@ class AskWithoutPrUrlMustNameItsRepo(unittest.TestCase):
                                                 "returncode": 0})())[1]),
             "TimeoutExpired": Exception})
         m.record_asks = lambda *a, **k: 1
+        m.record_interactions = lambda *a, **k: 0
         m._stale_repeat_ask = lambda *a, **k: (False, "")
         buf = io.StringIO()
         argv = ["nr", "--reviewers", "a,b", "--kind", "ask",
@@ -736,6 +834,7 @@ class AliasProbeIsAnnounced(unittest.TestCase):
         m.send_to_stand = lambda *a, **k: type("R", (), {
             "returncode": 0, "stdout": "ok", "stderr": ""})()
         m.record_asks = lambda *a, **k: 1
+        m.record_interactions = lambda *a, **k: 0
         buf = io.StringIO()
         argv = ["nr", "--reviewers", "stand-only,b", "--kind", "ask",
                 "--message", "please review https://github.com/o/r/pull/1"]

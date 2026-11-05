@@ -190,6 +190,16 @@ def committed_recipient(workspace, task_id: str, _between_suffix_checks=None, _a
     return held[0] if held else None
 
 
+def stop_holder(workspace, task: dict, roster=FROM_DISK) -> "str | None":
+    """The worker holding the task a stop instruction names, which the instruction must reach; None
+    for any other task, or when the core holds the named one."""
+    target = task.get("stop_of")
+    if not target:
+        return None
+    holder = committed_recipient(workspace, target, roster=roster)
+    return holder if holder and holder != pr.CORE else None
+
+
 def deliver_one(workspace, recipient: str, task_id: str,
                 _between_sentinel_and_attribution=None, _arbitration_seams=None) -> str:
     """Create one sentinel. Returns 'delivered' | 'already' | 'no-payload'.
@@ -269,6 +279,8 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
         snapshot = pr.load_roster(workspace) if roster is FROM_DISK else roster
         committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams,
                                         roster=snapshot)
+        if committed is None:
+            committed = stop_holder(workspace, task, roster=snapshot)   # a stop follows its task
         if committed is not None:
             targets, unknown, r = [committed], [], (snapshot if isinstance(snapshot, dict) else {})
         else:

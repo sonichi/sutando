@@ -23,6 +23,7 @@ Stdlib only, so the ag2-sparrow package can vendor it byte-identical.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -51,6 +52,8 @@ TERMINAL_PHASES = frozenset({"responded", "suppressed", "consolidated", "complet
 TERMINAL_STATUSES = frozenset({"done", "no_action", "consolidated", "failed", "cancelled"})
 TERMINAL_INTENT_STATUSES = frozenset({"done", "no_action"})
 ASYNC_STATUSES = frozenset({"accepted", "running"})
+# The only outcome that proves an answer was not applied; any other non-success leaves it unknown.
+ANSWER_FAILED_STATUSES = frozenset({"failed"})
 SUSPENDED_PHASES = frozenset({"waiting_input", "input_ready"})
 
 _ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -255,8 +258,11 @@ def close_turn(state_dir: Path, turn_id: str) -> bool:
     if held is None:
         return False
     try:
-        fd = os.open(closed, os.O_WRONLY | os.O_CREAT, 0o400)
-        os.close(fd)
+        try:
+            os.close(os.open(closed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400))
+        except FileExistsError:
+            if not closed.exists():             # a dangling entry is no fence: keep the turn file
+                raise OSError(errno.EEXIST, f"{closed.name} is not a fence") from None
         try:
             _turn_path(state_dir, turn_id, ".json").unlink()
         except FileNotFoundError:
@@ -343,6 +349,97 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
     return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, sent)
 
 
+JOURNAL_SNAPSHOT_TRIES = 3
+
+
+def _journal_signature(path: Path):
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _journal_snapshot(path: Path) -> "list | None":
+    """(is the rotated file, text) for every read of the rotated and the live journal, once a read
+    held still; None when a file cannot be read or no read did. Earlier reads are kept: a rotation
+    may drop what one of them saw."""
+    rotated = path.with_name(path.name + ".1")
+    texts: list = []
+    for _ in range(JOURNAL_SNAPSHOT_TRIES):
+        try:
+            before = [_journal_signature(p) for p in (rotated, path)]
+            texts += [(p == rotated, p.read_text()) for p, sig in zip((rotated, path), before) if sig is not None]
+            if [_journal_signature(p) for p in (rotated, path)] == before:
+                return texts
+        except FileNotFoundError:
+            continue                            # rotated away between the look and the read
+        except OSError:
+            return None
+    return None
+
+
+CONFLICTING = "<conflicting question ids>"
+
+
+def answer_question_id(intent: dict):
+    """The question an answer intent names, top-level or in its arguments; None when it names none;
+    CONFLICTING when the two disagree (it may be either)."""
+    args = intent.get("arguments")
+    named = {q for q in (intent.get("question_id"), args.get("question_id") if type(args) is dict else None)
+             if type(q) is str and q}
+    if len(named) > 1:
+        return CONFLICTING
+    return next(iter(named), None)
+
+
+def answered_in_journal(state_dir: Path, task_id: str, question_id: str) -> "bool | None":
+    """Whether a turn of this task already answered this room question: a room.question.answer
+    intent the proxy tagged with this task and question whose outcome succeeded. None when that
+    cannot be told: a journal that cannot be read, a damaged line naming the task, an answer with
+    no outcome or one other than succeeded or failed, or one that names no question (it may be
+    this one's). An answer to another question does not count. False only says none is in the
+    journal as kept now, never that none was given: an answer may have rotated away."""
+    path = room_actions_path(state_dir)
+    snapshot = _journal_snapshot(path)
+    if snapshot is None:
+        return None
+    ops, unnamed, ok, failed = set(), set(), set(), set()
+    for _rotated, text in snapshot:
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                rec = None
+            if not isinstance(rec, dict):
+                if task_id in line:
+                    return None                 # even an append in progress may be this task's answer
+                continue
+            if rec.get("task_id") != task_id:
+                continue
+            op = rec.get("operation_id")
+            if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
+                if type(op) is not str:
+                    return None                 # an answer this reader cannot follow to its outcome
+                named = answer_question_id(rec)
+                if named is None or named is CONFLICTING:
+                    unnamed.add(op)
+                elif named == question_id:
+                    ops.add(op)
+            elif rec.get("record_type") == OUTCOME and type(op) is str:
+                status = rec.get("operation_status")
+                if status == "succeeded":
+                    ok.add(op)
+                elif type(status) is str and status in ANSWER_FAILED_STATUSES:
+                    failed.add(op)
+    if ops & ok:
+        return True
+    return None if (ops | unnamed) - failed else False
+
+
 def unmatched_intents(records: TurnRecords) -> list:
     """Intents whose server outcome is unknown and must be reconciled with core-api."""
     known = {o.get("operation_id") for o in records.outcomes
@@ -373,21 +470,32 @@ def _seq(rec: dict) -> int:
         return 0
 
 
+def _own(rec: dict, task_id: str | None) -> bool:
+    return task_id is None or rec.get("task_id") in (None, task_id)
+
+
 def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterable[dict] = (),
                   server_state: dict | None = None,
-                  server_operation_count: int | None = None) -> TurnVerdict:
+                  server_operation_count: int | None = None,
+                  task_id: str | None = None) -> TurnVerdict:
     """`reconciled`: core-api outcomes for unmatched intents. `server_state`: the task row.
-    `server_operation_count`: core-api operations for (task_id, turn_id); None is unknown."""
+    `server_operation_count`: core-api operations for (task_id, turn_id); None is unknown.
+    `task_id`: an outcome naming another task (an answer to its question) never rules this one."""
     by_op: dict = {}
     for o in sorted(records.outcomes, key=_seq):
-        by_op[o.get("operation_id")] = o
+        if _own(o, task_id):
+            by_op[o.get("operation_id")] = o
     intent_by_op = {i.get("operation_id"): i for i in records.intents}
-    for r in reconciled:
+    for r in (r for r in reconciled if _own(r, task_id)):
         op = r.get("operation_id")
         merged = {**intent_by_op.get(op, {}), **by_op.get(op, {}), **r}
         merged["record_type"] = OUTCOME
         by_op[op] = merged
-    outcomes = sorted(by_op.values(), key=_seq)
+    # The proxy tags an outcome with the caller's own task, but an answer's applied state is the
+    # asker's: a room.question.answer never rules this turn's terminal or suspended state.
+    outcomes = sorted((o for op, o in by_op.items()
+                       if (o.get("action") or intent_by_op.get(op, {}).get("action")) != "room.question.answer"),
+                      key=_seq)
     n = len(records.intents)
 
     if any(o.get("operation_status") == "succeeded" and _applied_terminal(o) for o in outcomes):
@@ -441,11 +549,13 @@ def body_sha256(body: str) -> str:
 
 def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = False,
                          reconciled: Iterable[dict] = (),
-                         server_state: dict | None = None) -> ResultDecision:
+                         server_state: dict | None = None,
+                         task_id: str | None = None) -> ResultDecision:
     """What to do with a result file the agent wrote on purpose (not inferred stdout):
     post it unless the task is already closed or the same text was sent as a room message, in this
     turn or an earlier one of the same task (a re-serve under a new generation)."""
-    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state)
+    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state,
+                            task_id=task_id)
     if verdict.outcome == TERMINAL_CONFIRMED or (server_state or {}).get("terminal") is True:
         return ResultDecision(SETTLE, {}, verdict.reason if verdict.outcome == TERMINAL_CONFIRMED
                               else "task already closed on server")
@@ -453,6 +563,15 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
         return ResultDecision(DEFER, {}, "a journal line is still being written")
     if verdict.outcome == DURABLY_SUSPENDED:
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
+    asks = {i.get("operation_id") for i in records.intents if i.get("action") == "room.question.ask"}
+    status = {o.get("operation_id"): o.get("operation_status") for o in (*records.outcomes, *reconciled)}
+    if any(status.get(op) not in (None, "dispatched_unknown", "succeeded", *ASYNC_STATUSES) for op in asks):
+        # The note says "I asked X", but no question exists: never post it as the reply.
+        return ResultDecision(POST, {"status": "failed", "no_send": True}, "the question could not be asked")
+    if any(status.get(op) in (None, "dispatched_unknown") for op in asks):
+        # Its outcome is unknown: never the final reply. A broker with no open question refuses it.
+        return ResultDecision(POST, {"status": "waiting_input", "no_send": True},
+                              "a question was asked and its outcome is unknown")
     if no_send:
         return ResultDecision(POST, {"status": "no_action_needed"}, "result marked no-send")
     if not records.readable:

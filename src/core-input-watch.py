@@ -66,11 +66,12 @@ from __future__ import annotations
 import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
-from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
 from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
+import tmux_probe  # noqa: E402
 
 import argparse
 import hashlib
@@ -97,10 +98,9 @@ def _ensure_tmux_on_path():
     runtime-health probes, which share this process env."""
     if shutil.which("tmux"):
         return
-    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
-        if os.path.exists(cand):
-            os.environ["PATH"] = os.path.dirname(cand) + os.pathsep + os.environ.get("PATH", "")
-            return
+    found = tmux_probe.tmux_binary()
+    if os.path.isabs(found):
+        os.environ["PATH"] = os.path.dirname(found) + os.pathsep + os.environ.get("PATH", "")
 
 
 # ---- Shared derivation core: runtime-health.py (#2092). -------------------- #
@@ -390,6 +390,8 @@ _BASE_TO_STATE = {
     # "unknown" = runtime-health saw a live session but a stale/absent core-status
     # ("running" that never advanced) → wedged. That IS the supervisor's `hung`.
     "unknown": ("hung", "core alive but stalled (status stale, no recognized prompt)"),
+    # Held by the launcher for a provider limit: visible, resumes by itself, never a restart.
+    "paused": ("blocked-known", "core paused for a provider limit; it resumes by itself"),
 }
 
 
@@ -425,6 +427,8 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         pane = strip_limit_banners(pane)
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
+    if base_health == "paused":
+        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
@@ -523,11 +527,6 @@ GATEWAY_STATUS_MAX_AGE_S = 90.0
 GATEWAY_OUTAGE_MAX_AGE_S = 90.0
 
 
-def _primary_sidecar_name(state_dir):
-    from connections import primary_sidecar_name
-    return primary_sidecar_name(state_dir)
-
-
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
@@ -551,7 +550,7 @@ def _gateway_status(state_dir):
         # Serving verdict is gateway_serving's; the freshness window and the
         # reconnect grace below are this reader's. Stale -> None, as before.
         v = read_gateway_verdict(
-            os.path.join(state_dir, _primary_sidecar_name(state_dir)),
+            gateway_status_path(state_dir),
             now=now,
             max_age=GATEWAY_STATUS_MAX_AGE_S,
         )
@@ -571,7 +570,7 @@ def _gateway_status(state_dir):
 def gateway_alive(app_data, state_dir=None):
     """Whether the relay gateway is up.
 
-    Prefer the bridge's OWN status sidecar (the primary connection's state/gateway-status sidecar), which
+    Prefer the bridge's OWN status sidecar (the active lane's, else the primary connection's), which
     remote_gateway_bridge rewrites on every poll outcome. It reports whether the
     connection is *serving*; the pgrep paths below only ever answered "is there a
     process whose argv looks right", which is a proxy for the wrong thing.
