@@ -564,7 +564,7 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
     the caller routes or sends, because those are async here."""
     try:
         return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-                                   channel_id, fresh_reask_id())
+                                   channel_id, fresh_reask_id(), state_dir=STATE_DIR)
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
         # A planner that raised proved nothing about the asker being answered.

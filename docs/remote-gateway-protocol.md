@@ -1073,7 +1073,9 @@ message ID omit the header. `source_message_id` remains unchanged.
 
 When shared dedup recovery accepts `[deduped: X]` (including an answer pending
 provider acceptance), `src/task_origins.py` merges the holder and folded task's
-origins into `state/task-origins/X.json`. Rejected folds do not contribute.
+origins into `state/task-origins/X.json`. The gateway, Slack, Telegram and
+Discord adapters pass their resolved state directory explicitly, so it need not
+be a sibling of the task directory. Rejected folds do not contribute.
 This sidecar leaves task files and their signed envelopes untouched. One writer
 locks per task, reads and merges, fsyncs a unique temporary file, then atomically
 replaces the record. Retries are idempotent; concurrent processes share the lock.

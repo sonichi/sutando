@@ -499,7 +499,7 @@ def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str | None, str]:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
-            fresh_reask_id())
+            fresh_reask_id(), state_dir=STATE_DIR)
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
             requeued = payload
