@@ -3262,7 +3262,8 @@ class StartupDialogAndRefusals(ConnectBase):
             self.assertEqual(rc, cm.EXIT_HELD, "the manager stops: launchd's 0, systemd's RestartPreventExitStatus")
             self.assertEqual(launcher.launchd_exit(rc), 0)
             self.assertIn("is not a fresh work dir for this adapter (it holds stray)", self.lines[0])
-            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install again")
+            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install "
+                                            f"--work {self.work} again")
             lc = self.launcher()
             with mock.patch.object(inbox, "prepare_root", return_value="refusing to start: cannot check /w: EIO"):
                 self.assertEqual(lc.tick(lc.record())[0], launcher.EXIT_RETRY)

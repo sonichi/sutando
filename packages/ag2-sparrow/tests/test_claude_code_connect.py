@@ -71,14 +71,16 @@ class ConnectVerify(ConnectBase):
         self.assertIn(f"INFO session: {self.work} free", out)
         self.assertNotEqual(rc, 0, "a configured bridge with no session job is a failed verify")
         self.assertIn(f"FAIL job: {cli.SERVICE_NAME} is unknown, so no session answers the tasks its configured bridge "
-                      f"passes on: run {cli.COMMAND} install again, or {cli.COMMAND} uninstall", out)
+                      f"passes on: run {cli.COMMAND} install --work {self.work} again, or {cli.COMMAND} uninstall "
+                      f"--work {self.work}", out)
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
         self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
         self.configure(BRIDGE_STATE_DIR="", HITL_STORE="/elsewhere/hitl/requirements-claude-local")
         out = self.main("verify")[1]
         self.assertNotIn("hitl", self.checks(out), "a config from before the key: no row derived from the store itself")
         self.assertIn(f"INFO hitl store: /elsewhere/hitl/requirements-claude-local (a config from before BRIDGE_STATE_DIR: "
-                      f"the bridge's state dir is read as its parent; run {cli.COMMAND} install to record it)", out)
+                      f"the bridge's state dir is read as its parent; run {cli.COMMAND} install --work {self.work} to "
+                      "record it)", out)
         self.configure()
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
         with mock.patch.object(shape_mod, "PLUGIN", self.home / "no-shipped-plugin"):
@@ -112,7 +114,7 @@ class ConnectVerify(ConnectBase):
         out = self.main("verify")[1]
         self.assertEqual(self.checks(out)["plugin"], "PASS", out)
         self.assertIn(f"PASS plugin: recorded plugin dir {old} missing; using the shipped plugin {cli.PLUGIN} "
-                      f"(re-run {cli.COMMAND} install to record it)", out)
+                      f"(re-run {cli.COMMAND} install --work {self.work} to record it)", out)
 
     def test_a_recorded_plugin_dir_that_holds_a_plugin_stays_the_override(self):
         self.configure()
@@ -854,7 +856,8 @@ class ConnectCode(UndoSeams, AgentRootBase):
 
     def test_a_failed_install_after_connect_names_the_seat_that_recovers_the_spent_code(self):
         seat = cli.bridge_home(self.root) / "channels" / "ag2space" / ".env"
-        rerun = (f"{cli.COMMAND} install --plugin-dir {self.plugin} --claude-config-dir {self.home / '.claude-sutando'} "
+        rerun = (f"{cli.COMMAND} install --agent {AGENT} --plugin-dir {self.plugin} --claude-config-dir "
+                 f"{self.home / '.claude-sutando'} "
                  f"--hmac-key-file {self.home / 'task-hmac.key'} --permission-mode plan --token-env-file {seat}")
         with mock.patch.object(cm, "console_script",
                                side_effect=lambda shape: "" if shape == BA else str(self.bin / shape.command)):
@@ -1927,7 +1930,8 @@ class ConnectAgentRoot(AgentRootBase):
                 out = self.main("verify")[1]
                 self.assertIn("FAIL bridge: ", out, over)
                 self.assertIn(why, out)
-            self.assertIn(f"see journalctl --user -u {BA.service_name}, or run {cli.COMMAND} install again", out)
+            self.assertIn(f"see journalctl --user -u {BA.service_name}, or run {cli.COMMAND} install --agent {AGENT} "
+                          "again", out)
             self.relay.chmod(0o644)
             self.assertEqual(ConnectVerify.checks(None, self.main("verify")[1])["relay"], "FAIL", "the agent's token file")
             cm.service_path(BA).unlink()

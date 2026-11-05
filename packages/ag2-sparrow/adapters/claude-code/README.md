@@ -426,8 +426,8 @@ one bridge). One agent is one bridge whichever adapter runs it: install refuses,
 **Several agents on one host.** Each agent installed on its own root (no
 `--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`
 (systemd: `ag2-sparrow-claude-local.<agent key>.service`), its bridge
-`…claude-local-bridge.<agent key>`, and its config, operation lock and run
-files under `~/.config/ag2-sparrow/agents/<agent key>/`; its operation lock is
+`…claude-local-bridge.<agent key>`, and its config and run files under
+`~/.config/ag2-sparrow/agents/<agent key>/`; its operation lock is
 `~/.config/ag2-sparrow/locks/<job>.oplock`, which no cleanup removes. The unit
 sets `AG2_SPARROW_AGENT=<agent key>`, so `run` reads that agent's config, and
 `AG2_SPARROW_ROOT=<root>`, which binds recovery to that job's own root. The agent

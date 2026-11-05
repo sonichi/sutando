@@ -116,6 +116,7 @@ class Shape:
     # tree (a tmux pane), proven from the shape's records; None when it cannot be proven.
     holder_launcher: object = None
     run_files: tuple = ()   # the files a job leaves in its config dir besides its config and operation lock
+    hand_verb: str = "debug-run"    # the verb that looks at a job's session by hand
     writer: str = ""        # the install that writes the unit, when it is not `command`'s own
     agent: str = ""         # the agent key of a per-agent job; '' is the single-agent job of earlier installs
 
@@ -279,21 +280,21 @@ def unit_environ(text: str) -> dict:
 
 
 def recovered_config(shape: Shape) -> dict:
-    """For a job whose config is gone or unreadable, what its own marked bridge unit, or its own declaration for
-    a host supervisor, records (its root, agent and state dir); {} when there is neither. Lets recovery find
-    the job again."""
+    """For a job whose config is gone or unreadable, what its own marked bridge unit, or the declaration beside the
+    root its own unit records, says (its root, agent and state dir), only when that agent is the one the root's
+    path names (agent_identity.owns_segment, the bridge runtime's own rule); {} otherwise."""
     bound = unit_root(shape)
     bridge = bridge_shape(shape)
     text, problem = owned_text(supervisor_path(bridge), supervisor_marker(bridge), "supervisor file")
     env = unit_environ(text) if text and not problem else {}
     tasks = env.get("AGENT_CONNECT_TASK_DIR", "")
     if not tasks or not os.path.isabs(tasks):
-        return _declared_config(shape, bound) if bound else {}
-    if bound and os.path.realpath(bound) != os.path.realpath(os.path.dirname(tasks)):
-        return {}     # the job's own unit names another root: nothing is proven
-    return {"ROOT": os.path.dirname(tasks), "AGENT_ID": env.get("AGENT_MXID", ""), "BRIDGE": "unit",
-            "TOKEN_ENV_FILE": env.get("AG2_DEVICE_ENV", ""), "TOKEN_VAULT_KEY": "",
-            "BRIDGE_STATE_DIR": env.get("AGENT_CONNECT_STATE_DIR", "")}
+        return _declared_config(shape, bound)[0] if bound else {}
+    root, agent = os.path.dirname(tasks), env.get("AGENT_MXID", "")
+    if (bound and os.path.realpath(bound) != os.path.realpath(root)) or _identity_problem(root, agent):
+        return {}
+    return {"ROOT": root, "AGENT_ID": agent, "BRIDGE": "unit", "TOKEN_ENV_FILE": env.get("AG2_DEVICE_ENV", ""),
+            "TOKEN_VAULT_KEY": "", "BRIDGE_STATE_DIR": env.get("AGENT_CONNECT_STATE_DIR", "")}
 
 
 def unit_root(shape: Shape) -> str:
@@ -306,28 +307,64 @@ def unit_root(shape: Shape) -> str:
 DECLARATION = "worker.json"     # a host supervisor's bridge declaration, in the dir beside an agent's root
 
 
-def _declared_config(shape: Shape, root: str) -> dict:
-    """recovered_config under a host supervisor: the declaration beside `root`, the root this job's own unit
-    records, when this install wrote it and it serves that root; else {}. Never a declaration found by search."""
-    got, _ = _sources.declared_bridge(Path(root + ".bridge") / DECLARATION, written_by=f"{shape.command} install")
-    tasks = got.get("tasks_dir", "")
-    if not (got.get("host") and tasks and os.path.realpath(tasks) == os.path.realpath(os.path.join(root, "tasks"))):
-        return {}
-    return {"ROOT": root, "AGENT_ID": got["agent_id"], "BRIDGE": got["host"], "TOKEN_ENV_FILE": "",
-            "TOKEN_VAULT_KEY": "", "BRIDGE_STATE_DIR": got["state_dir"]}
+def _identity_problem(root: str, agent: str) -> str:
+    """'' when `root` is directly under the agents dir and `agent` is exactly the agent its segment names."""
+    name = os.path.basename(os.path.normpath(root))
+    if os.path.realpath(os.path.dirname(os.path.normpath(root))) != os.path.realpath(_dirs.agents_dir()):
+        return f"its root {root} is not directly under the agents dir"
+    if not agent_identity.owns_segment(agent, name):
+        return f"it names {agent or 'no agent'}, not the agent the root {name} belongs to"
+    return ""
 
 
-def residue_line(shape: Shape) -> str:
-    """'' unless an agent's own job is gone but this install's declaration for that agent remains: no job here is
-    proven to own it, so it is left, and the line names the manual path."""
-    if not shape.agent:
-        return ""
-    decl = Path(_dirs.agents_dir()) / f"{shape.agent}.bridge" / DECLARATION
-    got, _ = _sources.declared_bridge(decl, written_by=f"{shape.command} install")
+def _declared_config(shape: Shape, root: str) -> "tuple[dict, str]":
+    """(the declaration beside `root`, as recovered_config returns it, '') when this install wrote it for exactly
+    that root's agent; ({}, '') when there is none; ({}, why) when one is there that cannot be proven this job's
+    (why names no path: the declaration's path stays with the credential owner's calls)."""
+    got, why = _sources.declared_bridge(Path(root + ".bridge") / DECLARATION, written_by=f"{shape.command} install")
+    if why:
+        return {}, "cannot be used: it is unreadable, or not this install's"
     if not got:
+        return {}, ""
+    tasks = got.get("tasks_dir", "")
+    problem = ("it serves another root" if not tasks or os.path.realpath(tasks) !=
+               os.path.realpath(os.path.join(root, "tasks")) else _identity_problem(root, got.get("agent_id", "")))
+    if problem or not got.get("host"):
+        return {}, f"is not proven this job's ({problem or 'no host'})"
+    return {"ROOT": root, "AGENT_ID": got["agent_id"], "BRIDGE": got["host"], "TOKEN_ENV_FILE": "",
+            "TOKEN_VAULT_KEY": "", "BRIDGE_STATE_DIR": got["state_dir"]}, ""
+
+
+def declaration_problem(shape: Shape) -> str:
+    """'' unless a bridge declaration this job may own is there and cannot be proven its own or read: beside the
+    root its unit records, beside an agent's own root, or (a fixed job whose unit predates the root record) any
+    this adapter wrote that no agent's own job here holds. The line names each, with its manual path."""
+    roots = [unit_root(shape)] if unit_root(shape) else []
+    if shape.agent:
+        roots.append(str(Path(_dirs.agents_dir()) / shape.agent))
+    elif not roots:
+        agents = Path(_dirs.agents_dir())
+        with contextlib.suppress(OSError):
+            for name in sorted(os.listdir(agents))[:256]:
+                keyed = for_key(shape, name[:-len(".bridge")])
+                if name.endswith(".bridge") and not (os.path.lexists(config_path(keyed)) or
+                                                     os.path.lexists(supervisor_path(keyed))):
+                    roots.append(str(agents / keyed.agent))
+    found = []
+    bridge = bridge_shape(shape)
+    text, _problem = owned_text(supervisor_path(bridge), supervisor_marker(bridge), "supervisor file")
+    if text and unit_environ(text).get("AGENT_CONNECT_TASK_DIR") and not recovered_config(shape):
+        found.append(f"the bridge unit {supervisor_path(bridge)} is not proven this job's (its agent and root do not "
+                     f"match); stop and remove it by hand ({stop_command(bridge)}; rm {supervisor_path(bridge)})")
+    for root in dict.fromkeys(roots):
+        got, why = _declared_config(shape, root)
+        why = why or ("is not bound to this job's unit" if got and not unit_root(shape) else "")
+        if why:
+            found.append(f"the bridge declaration at {Path(root + '.bridge') / DECLARATION} {why}; remove it by hand "
+                         f"(rm {Path(root + '.bridge') / DECLARATION})")
+    if not found:
         return ""
-    return (f"a bridge declaration for {got.get('agent_id') or 'this agent'} remains at {decl}; no job here is "
-            f"proven to own it, so it was left: once nothing serves that agent, remove it by hand (rm {decl})")
+    return "; ".join(found) + "; nothing was changed: remove one only once nothing serves its agent"
 
 
 def _recorded(shape: Shape, key: str) -> str:
@@ -440,6 +477,18 @@ def job_command(shape: Shape, verb: str, no_path: bool = False) -> str:
     return f"{shape.command} {verb}" + (f" {selector}" if selector else "")
 
 
+def install_selector_problem(job: Shape, key: str = "", single: bool = False) -> str:
+    """'' unless install's --key or --single names another job than the one its token and root make it: a
+    printed repair command never installs over a different job."""
+    if key and key != job.agent:
+        return (f"--key {key} names {job_name(for_key(job, key))}, but this install's token and root make it "
+                f"{job_name(job)}; pass that job's own token env file (--token-env-file); nothing was changed")
+    if single and job.agent:
+        return (f"--single names the fixed job, but this install's token and root make it {job_name(job)}; "
+                "nothing was changed")
+    return ""
+
+
 def uninstall_command(shape: Shape) -> str:
     return job_command(shape, "uninstall")
 
@@ -449,10 +498,13 @@ def config_problem(shape: Shape, problem: str) -> str:
     manual path for a declaration no job here is proven to own."""
     if not problem or os.path.lexists(config_path(shape)):
         return problem
-    if not (recovered_config(shape) or os.path.lexists(supervisor_path(shape))):
-        residue = residue_line(shape)
-        return f"{problem}; {residue}" if residue else problem
-    return f"{problem}; or remove this job: {uninstall_command(shape)}"
+    recovered = recovered_config(shape)
+    residue = "" if recovered else declaration_problem(shape)
+    if residue:
+        return f"{problem}; {residue}"
+    if recovered or os.path.lexists(supervisor_path(shape)):
+        return f"{problem}; or remove this job: {uninstall_command(shape)}"
+    return problem
 
 
 def job_label(shape: Shape) -> str:
@@ -507,7 +559,7 @@ def job_from_env(shape: Shape, environ=None) -> "tuple[Shape | None, str]":
     """The job `run` serves: the one whose unit set AGENT_VAR, else the single-agent job."""
     key = (os.environ if environ is None else environ).get(AGENT_VAR, "")
     if key and not AGENT_KEY_RE.fullmatch(key):
-        return None, f"{AGENT_VAR}={key!r} is not an agent key; run {shape.command} install again"
+        return None, f"{AGENT_VAR}={key!r} is not an agent key; reinstall that agent's job (list shows each job)"
     job = for_key(shape, key)
     return (None, key_problem(job)) if key_problem(job) else (job, "")
 
@@ -585,20 +637,20 @@ def load_config(shape: Shape) -> "tuple[dict, str]":
 def load_config_at(shape: Shape, path: Path) -> "tuple[dict, str]":
     """load_config for the config at `path`: what a pane's verb reads when its config dir is not the CLI's."""
     if path.is_symlink() and not path.exists():
-        return {}, f"{path} is a dangling symlink; remove it by hand (rm {shlex.quote(str(path))}), then run {shape.command} install"
+        return {}, f"{path} is a dangling symlink; remove it by hand (rm {shlex.quote(str(path))}), then run {job_command(shape, 'install')}"
     try:
         cfg = read_config(path)
     except IsADirectoryError:
         return {}, f"{path} is a directory, not a config; remove it yourself"
     except OSError as e:
-        return {}, f"{path} unreadable ({e.strerror or e}); run {shape.command} install"
+        return {}, f"{path} unreadable ({e.strerror or e}); run {job_command(shape, 'install')}"
     except ValueError as e:
-        return {}, f"{path} is not parsable ({e}); run {shape.command} install"
+        return {}, f"{path} is not parsable ({e}); run {job_command(shape, 'install')}"
     missing = [k for k in shape.required_keys + ("ROOT",) if not cfg.get(k)]
     if missing:
-        return {}, f"{path} lacks {', '.join(missing)}; run {shape.command} install"
+        return {}, f"{path} lacks {', '.join(missing)}; run {job_command(shape, 'install')}"
     if not os.path.isabs(cfg["ROOT"]):
-        return {}, f"{path} names a relative ROOT {cfg['ROOT']!r}; run {shape.command} install"
+        return {}, f"{path} names a relative ROOT {cfg['ROOT']!r}; run {job_command(shape, 'install')}"
     return cfg, ""
 
 
@@ -684,7 +736,7 @@ def owned_config(shape: Shape) -> "tuple[dict | None, str]":
     cfg, problem = load_config(shape)
     if problem:
         return None, f"{problem.split('; run ')[0]}; fix or remove it by hand (rm {shlex.quote(str(conf))}), then run " \
-                     f"{shape.command} install"
+                     f"{job_command(shape, 'install')}"
     return cfg, ""
 
 
@@ -1529,7 +1581,7 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
         return _refuse(problem)
     if old.get("ROOT") and old["ROOT"] != root:
         return _refuse(f"the work root is {old['ROOT']}, not {root}; run {uninstall_command(shape)}, then "
-                       f"{shape.command} install")
+                       f"{job_command(shape, 'install')}")
     problem = precheck(root) if precheck is not None else ""
     if problem:
         return _refuse(f"{problem}; nothing was applied")
@@ -1557,10 +1609,10 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     print(f"{'installed' if not old else 'changed' if old != dict(values, ROOT=root) else 'rewritten'}: {conf}")
     print(f"installed: {sup}")
     problem = _start_pending(shape, root, before, True, unit, None, holder,
-                             f"; run {uninstall_command(shape)}, then {shape.command} install")
+                             f"; run {uninstall_command(shape)}, then {job_command(shape, 'install')}")
     if problem:
         return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {uninstall_command(shape)}, "
-                       f"then {shape.command} install")
+                       f"then {job_command(shape, 'install')}")
     return 0
 
 
@@ -1580,7 +1632,7 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
         return _refuse(problem)
     if old.get("ROOT") and old["ROOT"] != root:
         return _refuse(f"the work root is {old['ROOT']}, not {root}; run {uninstall_command(shape)}, then "
-                       f"{shape.command} install")
+                       f"{job_command(shape, 'install')}")
     problem = precheck(root) if precheck is not None else ""
     if problem:
         return _refuse(f"{problem}; nothing was applied")
@@ -1604,13 +1656,13 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
         now, problem = file_text(path, "file")
         if problem or (now is not None and now != text):
             return _refuse(problem or f"{path} differs from what connect would write; connect changes no job's "
-                           f"definition: run {shape.command} install to change it; nothing was applied")
+                           f"definition: run {job_command(shape, 'install')} to change it; nothing was applied")
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         Path(values[key]).mkdir(parents=True, exist_ok=True)
     for path, text, mode in files:
         problem = _publish_noclobber(path, text, mode)
         if problem:
-            return _refuse(f"{problem}; connect changes no job's definition: run {shape.command} install to change "
+            return _refuse(f"{problem}; connect changes no job's definition: run {job_command(shape, 'install')} to change "
                            "it; nothing more was applied")
     problem = _start_pending(shape, root, lock_holder(root), False, unit, root_id, holder, "")
     if problem:
@@ -1860,8 +1912,10 @@ def managed_problem(shape: Shape, environ=None) -> str:
     base = os.environ if environ is None else environ
     if base.get(MANAGED_VAR) == "1":
         return ""
+    by_hand = " or ".join(job_command(j, shape.hand_verb) for j in installed_jobs(shape)) or \
+        job_command(shape, shape.hand_verb)
     return (f"{shape.command} run is the manager's entrypoint ({MANAGED_VAR}=1 in the unit's environment); "
-            f"for a session by hand run {shape.command} debug-run")
+            f"by hand, run {by_hand}")
 
 
 def stop_state() -> dict:
@@ -2091,12 +2145,12 @@ def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None, relay=No
     sup = supervisor_path(shape)
     text, problem = supervisor_text(sup)
     check(results, text is not None and marked(text, supervisor_marker(shape)), "supervisor",
-          problem or (f"{sup} missing; run {shape.command} install" if text is None else str(sup)))
+          problem or (f"{sup} missing; run {job_command(shape, 'install')}" if text is None else str(sup)))
     state = manager_state(shape)
     if cfg.get("BRIDGE"):
         check(results, state == "active", "job", f"{job_name(shape)} {state}" if state == "active" else
               f"{job_name(shape)} is {state}, so no session answers the tasks its configured bridge passes on: run "
-              f"{shape.command} install again, or {uninstall_command(shape)}")
+              f"{job_command(shape, 'install')} again, or {uninstall_command(shape)}")
     else:
         print(f"INFO job: {job_name(shape)} {state}")
     root = work_root(cfg)
@@ -2152,15 +2206,15 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None, cleanup=N
         return _refuse(problem)
     # With the config gone, its bridge unit still names the root and the bridge to unwire.
     known = cfg or recovered_config(shape) or None
+    residue = "" if known else declaration_problem(shape)
+    if residue:
+        return _refuse(f"{job_name(shape)}'s config is gone and {residue}")
     root = known["ROOT"] if known else ""
     relay = token_file(known) if token_file is not None and known else None
     manager = manager_state(shape)
     if manager == "unknown":
         return _refuse(f"{job_name(shape)}'s state is unknown; nothing was removed", recovery_lines(shape, root) if root else ())
     if unit is None and cfg is None and manager == "absent":
-        residue = residue_line(shape)
-        if residue:
-            return _refuse(f"nothing of {shape.job} is installed, but {residue}")
         print(f"nothing to remove: {shape.job} is not installed")
         print(kept_line(shape, relay))
         return 0

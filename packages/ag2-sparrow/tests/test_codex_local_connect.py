@@ -1829,7 +1829,8 @@ class ConnectCode(UndoSeams, Base):
         fake = self.fake()
         rc, out, err = self.connect(Backend(), fake, "--sandbox", "workspace-write", "--model", "gpt-test")
         self.assertEqual(rc, 1, out + err)
-        rerun = (f"{cli.COMMAND} install --codex-home {self.codex_home} --sandbox workspace-write --model gpt-test "
+        rerun = (f"{cli.COMMAND} install --key {LA.agent} --codex-home {self.codex_home} --sandbox workspace-write "
+                 "--model gpt-test "
                  f"--token-env-file {cb.seat_file(self.root)}")
         self.assertIn(f"the work root is {a}, not {self.root}", err)
         self.assertIn(f"the code is spent and its credential is in the seat {cb.seat_file(self.root)}; once the line "
@@ -1850,7 +1851,7 @@ class ConnectCode(UndoSeams, Base):
             rc, _out, err = self.connect(Backend())
         self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
         self.assertIn("the connector is installed but its bridge is not: ag2-sparrow was not found beside", err)
-        self.assertIn(f"; run {cli.COMMAND} install --codex-home {self.codex_home} --token-env-file "
+        self.assertIn(f"; run {cli.COMMAND} install --agent {AGENT} --codex-home {self.codex_home} --token-env-file "
                       f"{cb.seat_file(self.root)}\n", err)
 
     def test_a_bridge_wiring_failure_after_install_unwinds_this_attempt_and_restarts_nothing(self):

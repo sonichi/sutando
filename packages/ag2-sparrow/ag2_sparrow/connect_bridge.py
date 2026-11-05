@@ -245,7 +245,8 @@ def agent_arg_problem(given, agent_id: str) -> str:
     """'' unless install's --agent names another agent than the one its token or root resolves to."""
     given = (given or "").strip()
     if given and given != agent_id:
-        return f"--agent {given} is not the agent this install serves ({agent_id or 'it names none'})"
+        return (f"--agent {given} is not the agent this install serves ({agent_id or 'it names none'}); pass that "
+                "agent's own token env file (--token-env-file); nothing was changed")
     return ""
 
 
@@ -279,22 +280,28 @@ def session_flags(args) -> list:
     return out
 
 
-def rerun_install(command: str, token_file: str, flags=()) -> str:
-    """The install that repeats one given the agent's own seat (`token_file`) and these session flags,
-    else the bare one."""
-    return f"{command} install " + (shlex.join([*flags, "--token-env-file", token_file]) if token_file else "again")
+def rerun_install(local: cm.Shape, token_file: str, flags=()) -> str:
+    """The install of the job `local` that repeats one given the agent's own seat (`token_file`) and these session
+    flags, else that job's install again."""
+    return cm.job_command(local, "install") + (" " + shlex.join([*flags, "--token-env-file", token_file]) if token_file
+                                               else " again")
 
 
-def spent_code_line(command: str, seat_env: str, flags=()) -> str:
+def spent_code_line(local: cm.Shape, seat_env: str, flags=()) -> str:
     """After a connect whose install failed: the code is spent, but the seat it wrote recovers it."""
     return (f"the code is spent and its credential is in the seat {seat_env}; once the line above is fixed, run "
-            f"{rerun_install(command, seat_env, flags)} (no new code is needed)")
+            f"{rerun_install(local, seat_env, flags)} (no new code is needed)")
+
+
+def bridge_owner(bridge: cm.Shape, command: str) -> cm.Shape:
+    """The job whose install wrote `bridge`."""
+    return _named(bridge.name[:-len("-bridge")], command, bridge.agent)
 
 
 def bridge_fix(cfg: dict, command: str, bridge: cm.Shape) -> str:
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
     if mode == UNIT:
-        return f"see {cm.launcher_log(bridge)}, or run {command} install again"
+        return f"see {cm.launcher_log(bridge)}, or run {cm.job_command(bridge_owner(bridge, command), 'install')} again"
     if mode != EXTERNAL:
         where = (f"the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}" if cfg.get("TOKEN_VAULT_KEY") else
                  f"the token in the seat {cfg.get('TOKEN_ENV_FILE')} names")
@@ -407,7 +414,7 @@ def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wire
     if state != "absent":
         return (f"the bridge this attempt wired ({cm.job_name(bridge)}) is {state} and was left, since stopping it "
                 f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run "
-                f"{cm.uninstall_command(_named(bridge.name[:-len('-bridge')], command, bridge.agent))}")
+                f"{cm.uninstall_command(bridge_owner(bridge, command))}")
     try:
         artifact.unlink()
     except OSError as e:
@@ -509,7 +516,8 @@ def relay_rows(results: list, cfg: dict, command: str, bridge: cm.Shape) -> None
         sup = cm.supervisor_path(bridge)
         text, problem = cm.supervisor_text(sup)
         cm.check(results, text is not None and cm.marked(text, cm.supervisor_marker(bridge)), "bridge unit",
-                 problem or (f"{sup} missing; run {command} install" if text is None else
+                 problem or (f"{sup} missing; run {cm.job_command(bridge_owner(bridge, command), 'install')}"
+                             if text is None else
                              f"{sup} ({cm.job_name(bridge)} {cm.manager_state(bridge)})"))
     elif mode != EXTERNAL:
         where = (f"the vault key {cfg.get('TOKEN_VAULT_KEY')}, read by {mode} at start" if cfg.get("TOKEN_VAULT_KEY")
@@ -622,8 +630,7 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
         seat["lock"].release()
     rc = cm.settle(seat["root"], rc)
     if rc == 0:
-        verify = cm.job_command(seat["local"], "verify") if seat.get("local") else f"{command} verify"
-        print(f"next: {verify} (the bridge reports connected within a minute)")
+        print(f"next: {cm.job_command(seat['local'], 'verify')} (the bridge reports connected within a minute)")
     else:
-        print(f"error: {spent_code_line(command, seat['seat_env'], flags)}", file=sys.stderr)
+        print(f"error: {spent_code_line(seat['local'], seat['seat_env'], flags)}", file=sys.stderr)
     return rc

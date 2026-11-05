@@ -53,16 +53,17 @@ the bridge's connected status and its unit; `uninstall` stops and removes that u
 
 Several agents run side by side as claude-local's do: an agent installed with `--token-env-file` gets
 a job of its own, `ai.ag2.sparrow.codex-local.<agent key>` (systemd:
-`ag2-sparrow-codex-local.<agent key>.service`), with its bridge, config, operation lock and log under
-that key; `verify`, `uninstall` and `debug-run` take one selector, `--agent <Matrix ID>`, `--work <dir>`
+`ag2-sparrow-codex-local.<agent key>.service`), with its bridge, config and log under that key and its
+operation lock at `~/.config/ag2-sparrow/locks/<job>.oplock`, which no cleanup removes; `verify`,
+`uninstall` and `debug-run` take one selector, `--agent <Matrix ID>`, `--key <agent key>`, `--work <dir>`
 (an explicit-root job, by its recorded root) or `--single` (the fixed job), needed only when several are
-installed; `list` shows each one with its selector. A `--work` install, and a job an earlier release
+installed; `list` shows each one with its selector, and every command a line prints carries it. A `--work` install, and a job an earlier release
 installed for one agent, keep the fixed `ai.ag2.sparrow.codex-local` and are verified, reinstalled and
 removed as they are; one whose config was removed is found again by its marked bridge unit.
 
 `install` checks `codex --version` against the pin (0.160.1, the version the stdio shape was measured
 on; parsed from the line starting with `codex`; older is one line and exit 2, nothing written), then
-runs as a quiescent replacement under one per-shape operation lock: stop the job and prove it absent,
+runs as a quiescent replacement under its job's operation lock: stop the job and prove it absent,
 prove the old root free, write the 0600 marked config (`~/.config/ag2-sparrow/codex-local.conf`, with
 `ROOT` persisted once) and the marked unit (tmp + replace), register and start, and require the root
 held by a fresh launcher of this shape within 30 s; anything less is one line and the files as

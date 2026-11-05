@@ -87,7 +87,7 @@ def read_config(path: Path) -> dict:
 def load_config(shape: Shape = LOCAL) -> "tuple[dict, str]":
     cfg, problem = cm.load_config(shape)
     if not problem and not SESSION_ID_RE.match(cfg.get("SESSION_ID", "")):
-        return {}, f"{config_path(shape)} carries a malformed SESSION_ID; run {COMMAND} install"
+        return {}, f"{config_path(shape)} carries a malformed SESSION_ID; run {cm.job_command(shape, 'install')}"
     return cfg, problem
 
 
@@ -188,6 +188,7 @@ def install(args) -> int:
         return EXIT_UNUSABLE
     root, mode, agent_id = where["root"], where["mode"], where["agent_id"]
     local, problem = cm.agent_job(LOCAL, agent_id) if mode != EXTERNAL else (LOCAL, "")
+    problem = problem or cm.install_selector_problem(local, getattr(args, "key", None), getattr(args, "single", False))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -243,7 +244,8 @@ def install(args) -> int:
         problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, bridge, local,
                                        getattr(args, "root_identity", None))
         if problem:
-            print(f"error: the session is installed but its bridge is not: {problem}; run {COMMAND} install again",
+            print(f"error: the session is installed but its bridge is not: {problem}; run "
+                  f"{cm.job_command(local, 'install')} again",
                   file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
@@ -312,9 +314,8 @@ def child_env(cfg: dict, environ=None) -> dict:
 def run(args, popen=subprocess.Popen) -> int:
     """What the manager runs, and only it: refused without the marker the unit sets; `--launchd` is
     the entry shim that runs the launcher as a child and maps its outcome."""
-    problem = cm.managed_problem(LOCAL)
     local, why = cm.job_from_env(LOCAL)
-    problem = problem or why
+    problem = why or cm.managed_problem(LOCAL)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -375,7 +376,7 @@ def pane_dialog(rec: dict, local: Shape = LOCAL) -> "str | None":
     gen = rec.get("generation")
     if not gen:
         return None
-    tmux, problem = launcher.configured_tmux(load_config(local)[0])
+    tmux, problem = launcher.configured_tmux(load_config(local)[0], job=local)
     if problem:
         return None
     tm = launcher.Tmux(launcher.socket_path(config_dir(local)), tmux)
@@ -422,7 +423,7 @@ def verify(args) -> int:
     if not problem:
         problem = auth_problem(cfg)
         cm.check(results, not problem, "login", problem or "claude auth status: logged in")
-    tmux, problem = launcher.configured_tmux(cfg)
+    tmux, problem = launcher.configured_tmux(cfg, job=local)
     found, problem = (None, problem) if problem else launcher.tmux_check(tmux)
     cm.check(results, not problem, "tmux", problem or "tmux %s at %s" % (".".join(map(str, found or ())), tmux))
     problem = launcher.socket_problem(config_dir(local))
@@ -431,7 +432,7 @@ def verify(args) -> int:
     plugin, fell_back = resolve_plugin_dir(cfg["PLUGIN_DIR"])
     cm.check(results, (plugin / ".claude-plugin" / "plugin.json").is_file(), "plugin",
              f"recorded plugin dir {cfg['PLUGIN_DIR']} missing; using the shipped plugin {plugin} (re-run "
-             f"{COMMAND} install to record it)" if fell_back else str(plugin))
+             f"{cm.job_command(local, 'install')} to record it)" if fell_back else str(plugin))
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     key, mode = cfg.get("HMAC_KEY_FILE"), hmac_policy.mode(cfg)
@@ -457,7 +458,7 @@ def verify(args) -> int:
     else:
         # The store names the bridge's state dir itself here, so no row can check it against anything else.
         print(f"INFO hitl store: {cfg.get('HITL_STORE')} (a config from before BRIDGE_STATE_DIR: the bridge's state dir "
-              f"is read as its parent; run {COMMAND} install to record it)")
+              f"is read as its parent; run {cm.job_command(local, 'install')} to record it)")
     print(f"INFO agent: {cfg.get('AGENT_ID') or 'not recorded (an explicit root with no known agent id)'}")
     problem = bridge_problem(cfg, bridge=bridge)
     cm.check(results, not problem, "bridge", problem or f"a connected bridge feeds {root}/tasks and {root}/results")
@@ -543,7 +544,7 @@ def attach(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    tmux, problem = launcher.configured_tmux(cfg)
+    tmux, problem = launcher.configured_tmux(cfg, job=local)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -625,6 +626,8 @@ def main(argv=None) -> int:
     p.add_argument("--bridge-state-dir", help="with an explicit root: the AGENT_CONNECT_STATE_DIR of the bridge you "
                    "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
     p.add_argument("--agent", help="the agent's Matrix ID, checked against the one the token env file names")
+    p.add_argument("--key", help="the agent key of the job this install must be (checked, never chosen by it)")
+    p.add_argument("--single", action="store_true", help="checked: this install must be the fixed job")
     session_options(p)
     p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="check this machine, redeem the one-time code from s.space for the agent's "

@@ -155,6 +155,7 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     local, problem = cm.agent_job(LOCAL, where["agent_id"]) if mode != EXTERNAL else (LOCAL, "")
+    problem = problem or cm.install_selector_problem(local, getattr(args, "key", None), getattr(args, "single", False))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -177,7 +178,7 @@ def install(args) -> int:
                                        getattr(args, "root_identity", None))
         if problem:
             print(f"error: the connector is installed but its bridge is not: {problem}; run "
-                  f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
+                  f"{cb.rerun_install(local, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
     return cb.under_agent_lock(root, installed, local if mode != EXTERNAL else None, where["agent_id"])
@@ -225,9 +226,8 @@ def run(args, popen=subprocess.Popen) -> int:
     launchd stops instead of relaunching over the holder). `debug-run` is the hand start: its
     check-then-acquire runs under the shape's operation lock (install and uninstall take the same one)
     and its holder record carries the debug label, which install never accepts as its launcher."""
-    problem = "" if args.debug else cm.managed_problem(LOCAL)
     local, why = selected(args) if args.debug else cm.job_from_env(LOCAL)
-    problem = problem or why
+    problem = why or ("" if args.debug else cm.managed_problem(LOCAL))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -367,6 +367,8 @@ def main(argv=None) -> int:
     p.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file (a seat .env, or one with "
                    "REMOTE_TASK_TOKEN and AGENT_MXID); the root is the agent's own and install runs its bridge")
     p.add_argument("--agent", help="the agent's Matrix ID, checked against the one the token env file names")
+    p.add_argument("--key", help="the agent key of the job this install must be (checked, never chosen by it)")
+    p.add_argument("--single", action="store_true", help="checked: this install must be the fixed job")
     session_options(p)
     p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="experimental, off in this release: refused unless enabled")

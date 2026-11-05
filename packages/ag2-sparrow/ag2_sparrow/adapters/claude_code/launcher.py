@@ -172,16 +172,22 @@ def resolve_tmux(explicit: str = "", recorded: str = "", environ=None, run=subpr
     return "", first
 
 
-def configured_tmux(cfg: dict, environ=None) -> "tuple[str, str]":
+def job_of(config_dir) -> cm.Shape:
+    """The job whose config dir is `config_dir`: an agent's own under the agents dir, else the fixed one."""
+    d = Path(config_dir)
+    return cm.for_key(LOCAL, d.name) if d.parent.name == cm.AGENTS_DIR else LOCAL
+
+
+def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "tuple[str, str]":
     """(the tmux the config records, '') with no lookup; a config from before TMUX gets the first
-    candidate there is (never a bare name), or ('', why) to reinstall."""
+    candidate there is (never a bare name), or ('', why) to reinstall `job`."""
+    install = cm.job_command(job or LOCAL, "install")
     recorded = cfg.get("TMUX") or ""
     if recorded:
-        return (recorded, "") if os.path.isabs(recorded) else ("", "the config records a relative TMUX %r; run %s "
-                                                                    "install" % (recorded, LOCAL.command))
+        return (recorded, "") if os.path.isabs(recorded) else ("", "the config records a relative TMUX %r; run %s"
+                                                                    % (recorded, install))
     found = tmux_candidates("", environ)
-    return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s install"
-                                         % LOCAL.command)
+    return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
 class Tmux:
@@ -348,7 +354,8 @@ class Launcher:
         self.cfg, self.config_dir, self.root = cfg, Path(config_dir), cm.work_root(cfg)
         self.log = log or (lambda line: print("claude-local: %s" % line, file=sys.stderr, flush=True))
         self.run, self.sleep, self.clock, self.environ = run, sleep, clock, environ
-        found, self.tmux_missing = (tmux, "") if tmux else configured_tmux(cfg, environ)
+        self.job = job_of(config_dir)
+        found, self.tmux_missing = (tmux, "") if tmux else configured_tmux(cfg, environ, self.job)
         self.tm = Tmux(socket_path(config_dir), tmux=found, run=run)
         self.state = cm.stop_state()
         self.observation: dict = {}
@@ -378,9 +385,7 @@ class Launcher:
 
     def attach_command(self) -> str:
         """What the card shows: the adapter's own command naming this job, never a host path."""
-        d = self.config_dir
-        job = cm.for_key(LOCAL, d.name) if d.parent.name == cm.AGENTS_DIR else LOCAL
-        return cm.job_command(job, "attach", no_path=True)
+        return cm.job_command(self.job, "attach", no_path=True)
 
     # ── create / adopt ───────────────────────────────────────────────────────
 
@@ -629,7 +634,8 @@ class Launcher:
                 self.log("cannot create a session: %s" % problem)
                 if self.refused:
                     # A layout refusal holds until the owner fixes the root: terminal, so the manager stops.
-                    self.log("stopping: the work root needs attention, then run %s install again" % LOCAL.command)
+                    self.log("stopping: the work root needs attention, then run %s again"
+                             % cm.job_command(self.job, "install"))
                     return cm.EXIT_HELD, rec
                 return EXIT_RETRY, rec
             rec = self._with_record(lambda r: dict(r, deadline=None))

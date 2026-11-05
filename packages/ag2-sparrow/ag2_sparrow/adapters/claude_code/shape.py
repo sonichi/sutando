@@ -44,7 +44,7 @@ LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
               env_keep=("PATH", "HOME", "USER", "TERM", "ANTHROPIC_BASE_URL"), kept="the Claude login",
               kill_mode="process", stop_timeout_s=180, run_args=("run", "--launchd"), keep_alive_on_success=False,
               manager_timeout_s=240, holder_launcher=session_launcher,
-              run_files=(SUPERVISOR_LOCK, LAUNCHER_LOCK, records.PROGRESS_ALARM))
+              run_files=(SUPERVISOR_LOCK, LAUNCHER_LOCK, records.PROGRESS_ALARM), hand_verb="attach")
 # The agent's own gateway bridge, when install runs it.
 BRIDGE = bridge_shape(LOCAL)
 # The marker the plugin reads at session.start: with it, the watch arms itself, no model turn.

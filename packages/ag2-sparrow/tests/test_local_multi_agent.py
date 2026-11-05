@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import importlib
 import plistlib
 import shlex
@@ -689,8 +690,8 @@ class Round4(MultiBase):
                 self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", ALPHA)[0], 0)
 
 
-COMMAND_RE = re.compile(r"ag2-sparrow-(?:claude|codex)-local (?:verify|uninstall|attach|stop --confirm)"
-                        r"(?: --(?:agent|key|work) \S+| --single)?")
+COMMAND_RE = re.compile(r"ag2-sparrow-(?:claude|codex)-local (?:verify|uninstall|attach|stop --confirm|install|debug-run)"
+                        r"(?: --(?:agent|key|work) [^\s;,)]+| --single)?")
 SELECTOR_RE = re.compile(r"--(?:agent|key|work) [^\s;)]+|--single")
 
 
@@ -790,18 +791,16 @@ class Round5(MultiBase):
                 kept = (cm.supervisor_path(single).read_bytes(), self.launcher_pid(single), a_decl.read_bytes())
                 self.assertEqual((cm.recovered_config(single), cm.recorded_agent(single)), ({}, ""))
                 self.assertEqual(cm.recovered_config(a), {})
-                for args in (["uninstall", "--agent", ALPHA], ["verify", "--agent", ALPHA], ["verify"]):
+                for args in (["uninstall", "--agent", ALPHA], ["verify", "--agent", ALPHA], ["verify"],
+                             ["uninstall", "--single"]):
                     rc, out, err = self.run_cli(CL.name, *args)
                     self.assertNotEqual(rc, 0, out + err)
                     self.assertEqual((cm.supervisor_path(single).read_bytes(), self.launcher_pid(single),
                                       a_decl.read_bytes()), kept, args)
-                    if args[0] == "uninstall" or "--agent" in args:
-                        self.assertIn(f"remove it by hand (rm {a_decl})", out + err, args)
-                    else:
-                        self.assertIn("uninstall --single", out)
-                        self.assertNotIn(f"--agent {ALPHA}", out)
+                    self.assertIn(f"remove it by hand (rm {a_decl})", out + err, args)
+                    self.assertNotIn(f"--agent {ALPHA}", out, "nothing advertises a command on A's behalf")
+                a_decl.unlink()     # the manual path the refusal names; then the fixed job goes
                 self.assertEqual(self.run_cli(CL.name, "uninstall", "--single")[0], 0)
-                a_decl.unlink()
 
     def run_files(self, adapter, shape):
         SideBySide.run_files(self, adapter, shape)
@@ -846,11 +845,24 @@ class Round5(MultiBase):
             printed += [(c, j) for c in COMMAND_RE.findall(out + err)]
             for verb in ("verify", "uninstall"):
                 printed.append((f"{CLIS[adapter].COMMAND} {verb} {selector}", j))
-            if adapter == CL.name and cm.config_path(j).exists():
+        with mock.patch.dict(os.environ):     # `run` by hand: the advice names each job's hand verb
+            os.environ.pop(cm.MANAGED_VAR, None)
+            hand = " ".join(self.run_cli(adapter, "run")[1:])
+        for j in jobs:
+            line = cm.job_command(j, CLIS[adapter].LOCAL.hand_verb)
+            self.assertIn(line, hand)
+            printed.append((line, j))
+            if adapter == CL.name and cm.config_path(j).exists() and not cm.load_config(j)[1]:
                 card = claude_cli.launcher.Launcher(cm.read_config(cm.config_path(j)), cm.config_dir(j)).attach_command()
                 self.assertNotIn("--work", card, "the card's line leaves the host: no path")
                 printed.append((card, j))
         return jobs, printed
+
+    def snapshot(self, adapter):
+        """Every job's unit bytes, launcher pid and installed set: what a command that selects nothing may not move."""
+        return {j.job: (cm.supervisor_path(j).read_bytes() if cm.supervisor_path(j).exists() else None,
+                        self.launcher_pid(j) if j.job in self.host.launchers else None)
+                for j in cm.installed_jobs(job(adapter, ""))}
 
     def check_selects(self, adapter, text, mine):
         words = shlex.split(text)[1:]
@@ -894,8 +906,14 @@ class Round5(MultiBase):
             self.install_work(adapter)
             cm.config_path(job(adapter, "")).unlink()
 
+        def corrupt(adapter):
+            two(adapter)
+            conf = cm.config_path(job(adapter, BETA))
+            conf.write_text(conf.read_text() + "ROOT='unclosed\n")
+
         states = [(name, fn, adapter) for name, fn in (("one", one), ("two", two), ("two leftovers", two_leftovers),
-                                                       ("fixed leftover", fixed_leftover)) for adapter in CLIS]
+                                                       ("fixed leftover", fixed_leftover), ("beta's config corrupt", corrupt))
+                  for adapter in CLIS]
         states.append(("keyed and fixed, one agent", keyed_and_fixed, CL.name))
         for name, build, adapter in states:
             with self.subTest(state=name, adapter=adapter):
@@ -907,27 +925,183 @@ class Round5(MultiBase):
                 if name in ("two leftovers", "fixed leftover"):
                     for j in jobs:
                         self.assertIn(f"or remove this job: {cm.uninstall_command(j)}", self.verified[j])
+                if name == "beta's config corrupt":
+                    install = cm.job_command(job(adapter, BETA), "install")
+                    self.assertIn(install, self.verified[job(adapter, BETA)], "the repair line names beta's job")
+                    printed.append((install, job(adapter, BETA)))
                 uninstalls = {}
                 for text, mine in printed:
                     verb, selector = self.check_selects(adapter, text, mine)
                     if verb == ["uninstall"]:
                         uninstalls.setdefault(mine, text)
                         continue
+                    before = self.snapshot(adapter)
                     with mock.patch.object(os, "execv") as execv:
                         rc, out, err = self.run_cli(adapter, *verb, *selector)
                     self.assertNotIn("pass the selector", err, text)
-                    if verb == ["attach"]:
+                    if verb == ["attach"] and execv.called:
                         self.assertIn(str(claude_cli.launcher.socket_path(cm.config_dir(mine))), execv.call_args[0][1])
+                    elif verb == ["attach"]:     # a job left without its config: refused on that job's own config
+                        self.assertIn(str(cm.config_path(mine)), err, text)
                     elif verb == ["verify"]:
                         self.assertIn(str(cm.config_path(mine)), out, text)
+                    elif verb == ["install"]:
+                        after = self.snapshot(adapter)
+                        self.assertEqual({k: v for k, v in after.items() if k != mine.job},
+                                         {k: v for k, v in before.items() if k != mine.job}, f"{text} moved another job")
                 for mine, text in uninstalls.items():
                     others = [j for j in cm.installed_jobs(job(adapter, "")) if j != mine]
+                    before = self.snapshot(adapter)
                     rc, out, err = self.run_cli(adapter, *shlex.split(text)[1:])
-                    self.assertEqual(rc, 0, f"{text}: {out}{err}")
                     left = cm.installed_jobs(job(adapter, ""))
+                    if rc != 0:     # refused (a config it must not guess past): it moved nothing
+                        self.assertEqual(self.snapshot(adapter), before, f"{text}: {out}{err}")
+                        self.assertNotIn("pass the selector", err)
+                        cm.config_path(mine).unlink()
+                        rc, out, err = self.run_cli(adapter, *shlex.split(text)[1:])
+                        left = cm.installed_jobs(job(adapter, ""))
+                    self.assertEqual(rc, 0, f"{text}: {out}{err}")
                     self.assertNotIn(mine, left, text)
                     self.assertEqual(left, others, f"{text} removed only its own job")
                 self.relay.write_text(f"REMOTE_TASK_TOKEN={fx.TOKEN}\nAGENT_MXID={fx.AGENT}\n")
+
+
+PKG_SRC = Path(__file__).resolve().parents[1] / "ag2_sparrow"
+# A string that names one of the adapters' commands followed by a verb is a command someone can copy; every such
+# line must come from cm.job_command. These are the exceptions, each a provenance mark or an internal argv.
+EMITTER_RE = re.compile(r"(\{[^{}]*command[^{}]*\}|\{COMMAND\}|%s|(?:command|COMMAND)\s*\+\s*[\"']\s*|"
+                        r"ag2-sparrow-(?:claude|codex)-local) (?:install|uninstall|verify|attach|stop|debug-run|run|"
+                        r"connect|list|hold|inbox)\b")
+EMITTERS_ALLOWED = {
+    ("connect_common.py", 'return f"# Written by {self.writer or self.command} install;'): "the unit's provenance marker",
+    ("connect_common.py", 'return f"<!-- Written by {self.writer or self.command} install;'): "the plist's marker",
+    ("connect_common.py", 'written_by=f"{shape.command} install")'): "the declaration's provenance",
+    ("connect_common.py", 'return (f"{shape.command} run is the manager\'s entrypoint'): "names the refused verb",
+    ("connect_bridge.py", 'as {command} connect writes it"'): "names the seat's writer",
+    ("connect_bridge.py", 'path, written_by=f"{command} install", host=mode'): "the declaration's provenance",
+    ("connect_bridge.py", 'remove_bridge_declaration(path, written_by=f"{command} install")'): "the declaration's provenance",
+    ("adapters/claude_code/hold.py", '"""`ag2-sparrow-claude-local hold --generation'): "docstring",
+    ("adapters/claude_code/hold.py", 'return "%s hold --generation=%s --" % (command, nonce)'): "the pane's own argv",
+    ("adapters/claude_code/inbox.py", '"""`ag2-sparrow-claude-local inbox <verb>`'): "docstring",
+    ("adapters/claude_code/launcher.py", "START_COMMAND_RE = re.compile(r'^\"?ag2-sparrow-claude-local hold"): "argv check",
+}
+
+
+@expand
+class Round6(MultiBase):
+    sparrowd = Round5.sparrowd
+
+    def test_no_command_line_is_formatted_outside_the_one_formatter(self):
+        """Every command a line can print comes from cm.job_command (so it carries the job's selector): no other
+        string in the adapters or the shared modules formats one, beyond the provenance marks listed."""
+        files = [PKG_SRC / "connect_common.py", PKG_SRC / "connect_bridge.py", PKG_SRC / "adapters/codex/connect_cli.py",
+                 *sorted((PKG_SRC / "adapters/claude_code").glob("*.py"))]
+        found = set()
+        for path in files:
+            rel = str(path.relative_to(PKG_SRC))
+            for line in path.read_text().splitlines():
+                if EMITTER_RE.search(line) and not line.strip().startswith("#"):
+                    match = [k for k in EMITTERS_ALLOWED if k[0] == rel and k[1] in line]
+                    self.assertTrue(match, f"{rel}: a command formatted outside cm.job_command: {line.strip()}")
+                    found.update(match)
+        self.assertEqual(found, set(EMITTERS_ALLOWED), "every exception is still there (drop the stale ones)")
+
+    def tamper_bridge_agent(self, shape, agent):
+        """The job's own marked bridge unit, its agent changed: the marker stays, the identity no longer holds."""
+        unit = cm.supervisor_path(cb.bridge_shape(shape))
+        text = unit.read_text()
+        old = cm.unit_environ(text)["AGENT_MXID"]
+        unit.write_text(text.replace(old, agent))
+
+    def _misbound(self, adapter):
+        """A fixed job's bridge unit bound to B's root but naming agent A (as the bridge runtime would refuse):
+        nothing is recovered, `--agent A` never reaches the fixed job, and its own uninstall refuses with the
+        manual path instead of tearing down a bridge it cannot prove its own."""
+        single = job(adapter, "")
+        self.host.add(single, self.root_of(BETA))
+        with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+            self.installed(adapter, BETA)
+        self.tamper_bridge_agent(single, ALPHA)
+        cm.config_path(single).unlink()
+        kept = (cm.supervisor_path(single).read_bytes(), cm.supervisor_path(cb.bridge_shape(single)).read_bytes(),
+                self.launcher_pid(single))
+        self.assertEqual((cm.recovered_config(single), cm.recorded_agent(single)), ({}, ""))
+        rc, out, err = self.run_cli(adapter, "uninstall", "--agent", ALPHA)
+        self.assertEqual((cm.supervisor_path(single).read_bytes(), cm.supervisor_path(cb.bridge_shape(single)).read_bytes(),
+                          self.launcher_pid(single)), kept, "--agent A never reaches B's job")
+        rc, out, err = self.run_cli(adapter, "uninstall", "--single")
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"rm {cm.supervisor_path(cb.bridge_shape(single))}", err)
+        self.assertEqual((cm.supervisor_path(single).read_bytes(), cm.supervisor_path(cb.bridge_shape(single)).read_bytes(),
+                          self.launcher_pid(single)), kept, "and its own uninstall refuses before it moves anything")
+
+    test_a_bridge_unit_naming_another_agent_than_its_root_is_never_recovered = per_manager(_misbound)
+
+    def test_a_declaration_naming_another_agent_than_its_root_is_never_recovered(self):
+        """Under sparrowd, the fixed job's declaration beside its own root B, edited to name agent A: the same
+        identity rule as the bridge runtime refuses it, so nothing is recovered, `--agent A` never reaches B's job,
+        and B's uninstall refuses naming the declaration's manual path."""
+        argv = self.sparrowd()
+        single = job(CL.name, "")
+        decl = cb.bridge_home(self.root_of(BETA)) / cb.DECLARATION
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                self.host.add(single, self.root_of(BETA))
+                os.environ["AGENT_MXID"] = BETA
+                with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+                    self.assertEqual(self.run_cli(CL.name, *argv)[0], 0)
+                body = json.loads(decl.read_text())
+                body["env"]["AGENT_MXID"] = ALPHA
+                decl.write_text(json.dumps(body))
+                cm.config_path(single).unlink()
+                kept = (cm.supervisor_path(single).read_bytes(), decl.read_bytes(), self.launcher_pid(single))
+                self.assertEqual((cm.recovered_config(single), cm.recorded_agent(single)), ({}, ""))
+                self.run_cli(CL.name, "uninstall", "--agent", ALPHA)
+                rc, out, err = self.run_cli(CL.name, "uninstall", "--single")
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertIn(f"rm {decl}", err)
+                self.assertEqual((cm.supervisor_path(single).read_bytes(), decl.read_bytes(), self.launcher_pid(single)),
+                                 kept)
+                decl.unlink()
+                self.assertEqual(self.run_cli(CL.name, "uninstall", "--single")[0], 0)
+
+    def test_an_unreadable_or_unbound_declaration_fails_closed_and_names_its_manual_path(self):
+        """An agent's own job reduced to an unreadable declaration, and a legacy fixed job whose declaration its
+        unit cannot vouch for: uninstall refuses (non-zero), names the declaration and its `rm`, and moves nothing."""
+        argv = self.sparrowd()
+        a, single = job(CL.name, ALPHA), job(CL.name, "")
+        a_decl, b_decl = (cb.bridge_home(self.root_of(x)) / cb.DECLARATION for x in (ALPHA, BETA))
+        os.environ["AGENT_MXID"] = ALPHA
+        self.assertEqual(self.run_cli(CL.name, *argv)[0], 0)
+        gone = self.host.launchers[a.job]
+        gone.stop_session()
+        gone.enabled = gone.registered = gone.loaded = False
+        for path in (cm.config_path(a), cm.supervisor_path(a)):
+            path.unlink()
+        a_decl.chmod(0)
+        self.addCleanup(lambda: a_decl.exists() and a_decl.chmod(0o644))
+        rc, out, err = self.run_cli(CL.name, "uninstall", "--key", a.agent)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"the bridge declaration at {a_decl} cannot be used", err)
+        self.assertIn(f"rm {a_decl}", err)
+        self.assertTrue(os.path.lexists(a_decl))
+        a_decl.chmod(0o644)
+        a_decl.unlink()
+        self.host.add(single, self.root_of(BETA))
+        os.environ["AGENT_MXID"] = BETA
+        with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+            self.assertEqual(self.run_cli(CL.name, *argv)[0], 0)
+        without_root_var(cm.supervisor_path(single))
+        cm.config_path(single).unlink()
+        kept = (cm.supervisor_path(single).read_bytes(), b_decl.read_bytes(), self.launcher_pid(single))
+        rc, out, err = self.run_cli(CL.name, "uninstall", "--single")
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"rm {b_decl}", err)
+        self.assertEqual((cm.supervisor_path(single).read_bytes(), b_decl.read_bytes(), self.launcher_pid(single)), kept,
+                         "the legacy fixed job's unit is not removed while its declaration is left unnamed")
+        b_decl.unlink()
+        self.assertEqual(self.run_cli(CL.name, "uninstall", "--single")[0], 0)
 
 
 class Selection(MultiBase):
