@@ -225,6 +225,11 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             r = Path(td) / ".outbox-discord-proactive"
             r.mkdir(parents=True, exist_ok=True)
             (r / "ready").symlink_to(r / "gone-target")
+        elif c_state == "epoch-c":
+            from ag2_sparrow.delivery_core.migration import write_fence
+            r = Path(td) / ".outbox-discord-proactive"
+            r.mkdir(parents=True, exist_ok=True)
+            write_fence(r, "C")
         elif c_state == "epoch-dir":
             r = Path(td) / ".outbox-discord-proactive"
             (r / "protocol-epoch").mkdir(parents=True)
@@ -607,6 +612,31 @@ with tempfile.TemporaryDirectory() as td:
         after = {str(p.relative_to(backend_root)): p.read_bytes()
                  for p in backend_root.rglob("*") if p.is_file()}
         check(before == after, "refused claim preserves converted state and retry accounting")
+        from ag2_sparrow.delivery_core.contract import ClaimToken, DeliveryOutcome
+        blocked = fence._backend
+        stale = ClaimToken("queued", "old-worker", "old-incarnation")
+        check(blocked.release(stale) is False, "refusal cannot release a stale claim")
+        check(blocked.complete(stale, DeliveryOutcome.CONFIRMED) is False,
+              "refusal cannot confirm a stale claim")
+        check(blocked.park("queued", "operator") is None,
+              "refusal does not park queued work")
+        check(not blocked.is_terminal("queued") and blocked.attempts("queued") == 0,
+              "refusal is retryable deferral, not terminal or an attempted send")
+        check(blocked.resend_epoch("queued") == 0, "refusal does not invent a resend epoch")
+        cleanup = blocked.cleanup()
+        check(cleanup.pruned == 0 and blocked.reason in cleanup.detail,
+              "refusal cleanup deletes nothing and explains the deferral")
+        try:
+            blocked.force_release("queued")
+        except NotImplementedError:
+            check(not blocked.capabilities.supports_force_release,
+                  "force-release refusal agrees with the advertised capability")
+        else:
+            check(False, "force release must not bypass transition refusal")
+        after_lifecycle = {str(p.relative_to(backend_root)): p.read_bytes()
+                           for p in backend_root.rglob("*") if p.is_file()}
+        check(before == after_lifecycle and body.read_text() == "queued body",
+              "refusal lifecycle preserves queued payload, converted state and retry accounting")
     finally:
         db.RESULTS_DIR, db._PROACTIVE_FENCE = saved_results, saved_fence
         if saved_env is None:
@@ -625,6 +655,23 @@ for _name, _cls in (("DesignAClaimBackend", DesignAClaimBackend),
                     ("TransitionRefusalBackend", TransitionRefusalBackend)):
     _missing = sorted(a for a in _required if not hasattr(_cls, a))
     check(not _missing, f"{_name} must satisfy ClaimBackend; missing={_missing}")
+
+
+kind, out = _fence_with("a", c_state="epoch-c")
+check(kind == "TransitionRefusalBackend" and "epoch=C" in out,
+      "a completed C epoch alone fences rollback even with empty namespaces")
+
+_original_iterdir = Path.iterdir
+
+def _deny_ready_listing(path):
+    if path.name == "ready":
+        raise PermissionError("ready namespace cannot be read")
+    return _original_iterdir(path)
+
+with patch.object(Path, "iterdir", _deny_ready_listing):
+    kind, out = _fence_with("a", c_state="files")
+check(kind == "TransitionRefusalBackend" and "ready(unreadable)" in out,
+      "an unreadable C namespace refuses rollback instead of appearing empty")
 
 
 if fails:
