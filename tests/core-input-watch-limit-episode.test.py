@@ -415,6 +415,7 @@ class PersistedSweepKeepsTheEpisode(unittest.TestCase):
                           real_tick(ws, now, runner=self.runner, **kw)), \
                 patch.object(wc, "raise_card", side_effect=lambda ws, wid, which, **kw:
                              real_raise(ws, wid, which, runner=self.runner, routed=lambda *_: False)), \
+                patch.object(rem, "retry_limit", return_value={"outcome": "rearm-sent"}), \
                 patch.object(rem, "ensure_supervisors", return_value={}), \
                 patch.object(rem, "ensure_input_watches", return_value={}), \
                 patch.object(wc, "drive_escapes", return_value={}), \
@@ -442,9 +443,12 @@ class PersistedSweepKeepsTheEpisode(unittest.TestCase):
         for _ in range(6):
             self.sweep()
         self.watch()
+        self.sweep()
         [card] = self.manager().active()
         self.assertTrue(tui_gate.limit_card(card))
-        self.assertEqual(card.subject["source"], "tui" if seat_first else self.wc.SOURCE)
+        expected = (self.wc.SOURCE if not seat_first and
+                    self.sup.classify_pane_text(pane) != self.sup.ps.PANE_LIMIT else "tui")
+        self.assertEqual(card.subject["source"], expected)
         self.assertEqual(self.alerts(), 1)
         return card.id
 
