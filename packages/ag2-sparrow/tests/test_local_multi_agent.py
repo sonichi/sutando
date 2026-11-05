@@ -400,6 +400,9 @@ class SideBySide(MultiBase):
         cm.config_path(single).unlink()
         self.assertEqual((cm.recorded_agent(single), cm.recorded_root(single)), (ALPHA, str(self.root_of(ALPHA))))
         self.assertIn(f"{ALPHA}  {cm.job_name(single)}", self.run_cli(adapter, "list")[1])
+        verify = self.run_cli(adapter, "verify")[1]
+        self.assertIn(f"or remove this job: {CLIS[adapter].COMMAND} uninstall --agent {ALPHA}", verify,
+                      "verify names the uninstall that recovers it, with list's selector")
         self.installed(adapter, ALPHA)
         self.assertTrue(cm.config_path(single).exists(), "install rewrote the single job's config")
         self.assertFalse(cm.config_dir(a).exists(), "and made no job of the agent's own")
@@ -664,6 +667,8 @@ class Round4(MultiBase):
                 self.assertFalse(cm.supervisor_path(cb.bridge_shape(single)).exists(), "no bridge unit")
                 cm.config_path(single).unlink()
                 self.assertEqual((cm.recorded_agent(single), cm.recorded_root(single)), (ALPHA, str(self.root_of(ALPHA))))
+                self.assertIn(f"or remove this job: {claude_cli.COMMAND} uninstall --agent {ALPHA}",
+                              self.run_cli(CL.name, "verify")[1])
                 rc, out, err = self.run_cli(CL.name, *argv)
                 self.assertEqual(rc, 0, out + err)
                 self.assertTrue(cm.config_path(single).exists(), "install kept the fixed job")

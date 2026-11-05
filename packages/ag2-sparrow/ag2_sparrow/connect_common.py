@@ -394,6 +394,15 @@ def uninstall_command(shape: Shape) -> str:
     return f"{shape.command} uninstall" + (f" {selector}" if selector.startswith("--") else "")
 
 
+def config_problem(shape: Shape, problem: str) -> str:
+    """verify's config row: for a job left without its config, also the uninstall that removes it."""
+    if not problem or os.path.lexists(config_path(shape)):
+        return problem
+    if not (recovered_config(shape) or os.path.lexists(supervisor_path(shape))):
+        return problem
+    return f"{problem}; or remove this job: {uninstall_command(shape)}"
+
+
 def command_for(shape: Shape, cfg: dict, verb: str) -> str:
     """`<command> <verb>` naming this job, for a line shown outside this host: never a path, so --single
     for a single job that records no agent."""

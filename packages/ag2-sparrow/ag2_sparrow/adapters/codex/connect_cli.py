@@ -303,7 +303,7 @@ def verify(args) -> int:
     bridge = cb.bridge_shape(local)
     results: list = []
     cfg, problem = load_config(local)
-    cm.check(results, not problem, "config", problem or str(config_path(local)))
+    cm.check(results, not problem, "config", cm.config_problem(local, problem) or str(config_path(local)))
     if problem:
         return 1
     problem = version_problem(cfg["CODEX"])
