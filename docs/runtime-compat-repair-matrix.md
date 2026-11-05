@@ -135,6 +135,54 @@ The launcher does not restart onboarding after a fix:
 - Otherwise it prints the fix and the exact command to run again:
   `bash src/agent/start-cli.sh`.
 
+## When the desktop app is the consent surface
+
+The desktop app launches its core with `SUTANDO_RUNTIME_CONSENT_SURFACE=app` and
+asks the owner in an in-app repair card instead of a DM. Under that setting:
+
+- A launch never waits for a fix and never queues the DM, whatever `--wait` or
+  `--notify-owner` say. It exits 3 (unusable) or 4 (login) at once and the app
+  shows the card (`test_app_surface_never_waits_or_dms`,
+  `test_app_surface_logged_out_returns_4_at_once`; through the real Claude
+  launcher, `test_app_surface_launch_stops_at_once_without_a_dm`; the real Codex
+  launcher, `test_app_surface_broken_codex_stops_at_once_without_a_dm`).
+- Each binary gets 10 s for its `--version` and `--help` together, and a
+  discovery gets 60 s. A binary that times out is `broken`; one not reached in
+  time is `unknown` ("not probed in time") and counts as unusable, never as a
+  pass (`test_app_surface_probe_timeout_is_10s_per_binary`,
+  `test_discovery_deadline_reports_unprobed_candidates_as_unusable`,
+  `test_a_hanging_cli_is_unusable_within_the_cap_for_real`).
+- A repair starts no new download attempt 30 s after its first one and clips its
+  backoff to that budget. npm's own fetch retries are off, so the attempt
+  counter the card shows is the only retry loop
+  (`test_app_surface_blocked_download_gives_up_within_budget`,
+  `test_app_surface_turns_off_npm_own_fetch_retries`).
+
+What the app calls:
+
+| Command | What it gives the app |
+|---|---|
+| `doctor --runtime R --json` | per runtime: `schema` (1), `status`, `selected`, `selected_reason`, `candidates`, `interrupted_updates`, `plan`, `plan_hash` and `auth` (`{login, remedy, detail}`). Pinned by `test_doctor_json_schema_1_golden` |
+| `repair --runtime R --yes --json --consent-source app --consent-by <mxid> --plan-hash H` | one stdout line per phase (`{"type":"progress","phase":"checking-disk"\|"downloading"\|"verifying"\|"switching"\|"done"}`, downloading with `attempt` and `attempts`; `done` is a stdout line only, never written to a record or read as resumable; `RepairPhases`), then one `{"type":"result", ok, reason, detail, user_action, attempts, path, version}` line; prose stays on stderr. The consent (`{source, by, at, plan_hash, runtime}`) is written to the incident record before anything runs. `--consent-source app` requires `--plan-hash H`: missing it refuses (`plan-hash-required`, exit 2) and a plan that changed since `H` was shown also refuses (`plan-changed`, exit 2) — either way nothing installs. A workspace that cannot be resolved also refuses before installing (`workspace-unavailable`, exit 2), since consent could not be recorded. On success the incident closes (`resolved_by: app`), a DM already sent gets a "fixed from the app" follow-up, and a pending or later `install compatible <cli>` reply is answered "already fixed from the app" instead of repairing again (`RepairJson`, `AppConsent`) |
+| `notify-owner --runtime R --json` | the incident's one DM, for a card left unanswered: `{"queued": true, "reason": "queued"}` once, then `already-sent`; `usable` and no DM once the CLI works (`NotifyOwner`) |
+
+### Which binary a launch uses, and why
+
+The first usable candidate wins, as above. So the managed install is used only
+when every `PATH` binary before it fails `doctor` or is known-bad, or there is
+none; a user's binary that passes `doctor`, even an older or newer-untested one,
+is never overridden. Every `ensure` and `which` logs the choice as one line,
+also in `doctor --json` as `selected_reason`:
+
+```
+runtime-compat: chose <root>/bin/claude (managed) 2.1.0 because ~/.npm-global/bin/claude (PATH) is broken: --version exited 1
+runtime-compat: chose /opt/homebrew/bin/claude (PATH) 2.1.0; it passes doctor
+```
+
+(`test_managed_preferred_when_path_binary_is_broken`, `…_is_known_bad`,
+`…_is_absent`, `test_older_path_binary_that_passes_doctor_is_kept_over_a_newer_managed`,
+`test_newer_untested_path_binary_is_kept`, `test_every_launch_logs_the_chosen_binary_and_reason`.)
+
 ## Where the managed install lives
 
 `$SUTANDO_RUNTIMES_DIR`, else `$XDG_DATA_HOME/sutando/runtimes`, else
@@ -159,10 +207,11 @@ record for the owner DM is `<workspace>/state/runtime-compat-<cli>.json`.
 | `SUTANDO_RUNTIME_WAIT_S` | seconds to wait for a fix or a reply; default 600 |
 | `SUTANDO_RUNTIMES_DIR` | the managed install root |
 | `SUTANDO_RUNTIME_SYSTEM_DIRS` | `:`-separated folders searched instead of the Homebrew bin folders |
+| `SUTANDO_RUNTIME_CONSENT_SURFACE=app` | the desktop app is the consent surface: no wait, no DM, time-bounded checks and retries (above) |
 
 ## Not covered yet
 
-- The desktop installer's own flow (slice 2, in the desktop repo).
+- The desktop installer's own flow (slice 2, in the desktop repo); this engine side is ready for it.
 - A Claude token that has expired but is still on disk passes the static
   `auth_preflight` check, so this gate does not catch it; only the live probe
   (`auth_preflight.py --live`, one model call) does.
