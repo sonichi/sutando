@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
-"""Name Sutando helper processes that have used sustained CPU for a stretch.
-
-A helper is an interpreter (bash, sh, zsh, python, node) whose script operand is a file in this
-repo: the operand after the interpreter and its options, never an option's value or a data path.
-`ps` joins argv with spaces, so a script path that contains spaces (an install under
-"Application Support") is found by trying each cut that names an existing file. A relative
-operand is read against the repo, which is where the launchers start helpers.
-
-Each health-check run records every helper's cumulative CPU time, keyed by pid and exact start
-time. Once a recorded sample is at least WINDOW_S old, the CPU spent since then over the wall time
-since then is that helper's rate; above THRESHOLD it is reported. High sustained CPU can be a busy
-loop or legitimate work, so the report names the process and asks for a look, nothing more. The
-sample file is read, updated and written under one lock, and a sample this run did not see is kept
-for RETAIN_S, so an overlapping check that read an older process table cannot drop a newer one.
-"""
+"""Report sustained helper CPU use from locked samples keyed by process birth.
+High CPU alone does not establish a busy loop or justify termination."""
 from __future__ import annotations
 
 import json

@@ -1,26 +1,6 @@
 #!/usr/bin/env python3
-"""The one-supervisor-per-inbox slot: a holder_lock on the inbox directory, held for a supervisor's life.
-
-    notifier_slot.py hold --inbox DIR --parent PID [--wait SECONDS]
-    notifier_slot.py serve --inbox DIR -- COMMAND [ARGS...]
-
-Run by task-notifier-supervisor.sh in the background, this process takes the lock on the inbox's
-canonical directory, so two spellings of one inbox (a trailing slash, a symlink) share one slot. It
-waits up to --wait seconds for a predecessor that is still exiting. Its first stdout line is the
-verdict, then it stays silent:
-
-    held                     this supervisor owns the inbox
-    busy <pid> <start>       another holder's record names that live process
-    unknown <reason>         the slot could not be decided (unreadable lock, unsupported platform)
-
-While held it watches the parent (pid and start time): once the parent is gone, or on TERM/INT, it
-releases the lock and exits (TERM, INT and HUP alike). The flock decides; nothing here signals another process.
-
-`serve` binds exclusion to the notifier's own lifetime, not the helper's: it takes the inbox's serving
-flock without waiting and execs COMMAND as a new session leader that inherits the locked fd, so the lock
-lasts exactly as long as that process tree (its watcher too). Exit 3: another notifier still serves the
-inbox; exit 4: the serving lock could not be read. Either way nothing is started.
-"""
+"""Hold canonical inbox ownership for a supervisor or exec a serving notifier.
+Locks follow process lifetimes; holder records never authorize signalling another process."""
 from __future__ import annotations
 
 import argparse
