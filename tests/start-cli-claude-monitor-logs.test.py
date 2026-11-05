@@ -103,7 +103,7 @@ def launch(logs_blocked: bool = False):
     _exe(root / "src" / "tmux-probe-cli.py", "raise SystemExit(0)\n")
     _exe(binp / "pgrep", "#!/bin/bash\nexit 1\n")       # no core and no monitor run yet
     _exe(binp / "sleep", "#!/bin/bash\nexit 1\n")       # one relay pass, then the loop ends
-    _exe(binp / "claude", "#!/bin/bash\nexit 0\n")     # the launcher refuses a core with no claude on PATH
+    _exe(binp / "claude", "#!/bin/bash\nexit 0\n")
     _exe(binp / "codex", "#!/bin/bash\nexit 0\n")
     _exe(binp / "fswatch", "#!/bin/bash\nexit 0\n")
     for real in ("bash", "python3", "sed", "awk", "grep", "ps", "seq", "cat", "mkdir", "rm", "date",
