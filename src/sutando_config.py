@@ -67,6 +67,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
     "skills",
+    "notifications",
 }
 
 # Blocks every consumer reads with `.get()`. A scalar here is what the schema's
@@ -81,6 +82,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "health_check",
     "bridges",
     "skills",
+    "notifications",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -619,6 +621,25 @@ def resolve_skills_developer(repo_root: Optional[Path] = None) -> bool:
         return False
     if val is not None and not isinstance(val, bool):
         print(f"sutando config: skills.developer must be a JSON boolean, got {val!r}; "
+              f"treated as false", file=sys.stderr)
+        return False
+    return val is True
+
+
+def resolve_macos_notifications(repo_root: Optional[Path] = None) -> bool:
+    """``notifications.macos``: whether Sutando may post macOS desktop notifications.
+
+    Off by default. Only a real JSON ``true`` opts in; any other value, or a config
+    that cannot be read, is off, so no sender can fire a banner the owner did not ask for.
+    """
+    try:
+        val = (load_config(repo_root).get("notifications") or {}).get("macos")
+    except Exception as exc:  # noqa: BLE001 — a notification gate must never raise
+        print(f"sutando config: cannot read notifications.macos ({exc}); treated as false",
+              file=sys.stderr)
+        return False
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: notifications.macos must be a JSON boolean, got {val!r}; "
               f"treated as false", file=sys.stderr)
         return False
     return val is True

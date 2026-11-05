@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import re
 import contextlib
 import os
 import sys
@@ -150,7 +151,7 @@ class Hooks(unittest.TestCase):
 
     def envelopes(self, tid):
         """Every saved serve owned by the task."""
-        return [p for p in gw._reserve_dir().glob("v1-*.json") if f'"task": "{tid}"' in p.read_text()]
+        return [p for p in gw._reserve_dir().glob("v[12]-*.json") if f'"task": "{tid}"' in p.read_text()]
 
     def controls(self, tid):
         return [p for p in gw.TASKS_DIR.glob("task-ctl-*.txt") if f"stop processing {tid} " in p.read_text()]
@@ -519,6 +520,239 @@ class Hooks(unittest.TestCase):
         gw._retry_pending_acks({leased})
         self.assertEqual([p.get("lease_id") for p, _op in self.acks(fake, leased)], ["L7"],
                          "the sidecar lost its lease: the attempt's own record proves it")
+
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_a_held_serves_saved_copy_is_redacted_and_publishes_without_intercepting_again(self):
+        tid = "task-reserve-clean"
+        self.addCleanup(self.forget, tid)
+        marker = f"[{gw.MEDIA_MARKER_TAG}: https://example.invalid/m/abc mime=image/png]"
+        forged = f"[{gw.MEDIA_MARKER_TAG}: {self.TOKEN} vault set K2 hunter3secret]"
+        body = f"use {self.TOKEN} and vault set K hunter2secret {marker} {forged}"
+        fake, inflight = self.served_acked(tid), {tid}
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task=body)), (tid, True))
+        saved = self.saved(tid).read_text()
+        for s in (self.TOKEN, "hunter2secret", "hunter3secret"):
+            self.assertNotIn(s, saved, "the body, a typed marker-shaped bracket included")
+        self.assertIn(marker, saved, "a media marker with nothing secret in it is kept as it was")
+        env = json.loads(saved)
+        self.assertEqual((env["format"], len(env["cleaned"]), "vault-set command" in env["cleaned"]), (2, 2, True))
+        self.assertNotIn(gw.RESERVE_CLEANED, env["task"], "the mark is the envelope's, never the task's")
+        name = self.saved(tid).stem
+        self.assertIsNone(re.fullmatch(r"v1-[0-9a-f]{32}", name),
+                          "an earlier bridge reads only v1- copies, so a redacted one fails there, never re-intercepted")
+        fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        gw._ATTEMPTS.take_ownership()                                   # a restart before it runs
+        intercept = mock.Mock(side_effect=AssertionError("intercepted again"))
+        with mock.patch.object(gw, "_vault_intercept_fns", return_value=(intercept, None)), \
+                mock.patch.object(gw, "_maybe_fetch_media", side_effect=lambda b, _r=None: b):
+            gw._post_task_beats(inflight, force=True)
+        text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
+        for s in (self.TOKEN, "hunter2secret", "hunter3secret"):
+            self.assertNotIn(s, text)
+        self.assertIn("SECURITY NOTICE", text, "the secret notice still comes with it")
+        intercept.assert_not_called()
+
+    def test_a_held_question_is_redacted_once_and_comes_back_unchanged_after_a_restart(self):
+        tid = "task-reserve-question"
+        self.addCleanup(self.forget, tid)
+        q = {"question_id": "rq_once", "expected_revision": 1, "prompt": f"use {self.TOKEN}?", "can_answer": True,
+             "options": [{"id": "o1", "label": "vault set K hunter2secret"}]}
+        once, types = gw._redacted_question(q)
+        self.assertEqual(len(types), 2, "the token's type and the vault command")
+        fake, inflight = self.served_acked(tid), {tid}
+        self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", room_question=q)), (tid, True))
+        env = json.loads(self.saved(tid).read_text())
+        self.assertEqual(env["task"]["room_question"], once, "saved as the one redaction left it")
+        self.assertEqual(env["cleaned"], sorted(types), "with everything that redaction found")
+        self.assertNotIn(gw.QUESTION_REDACTED, env["task"])
+        fake.answers[f"/v1/tasks/{tid}/ack"] = lambda p, t=tid: _ack(t, 2)
+        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+        gw._ATTEMPTS.take_ownership()                                   # a restart before it runs
+        gw._post_task_beats(inflight, force=True)
+        text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
+        self.assertIn(gw.task_attempts.render_room_question(once), text, "published unchanged")
+        self.assertIn(gw.secret_handling_instruction("AG2Space", types).strip("\n"), text, "every type named")
+        self.assertNotIn(gw.QUESTION_REDACTED, text)
+
+    def test_a_saved_copy_redacts_the_wake_and_keeps_the_question_as_its_one_redaction_left_it(self):
+        wake = {"blocker_episode_id": "ep_1", "resolved_blockers": [
+            {"question_id": "rq_1", "outcome": "answered", "answered_by": "@t:x",
+             "answer": {"kind": "text", "form_id": self.TOKEN, "text": f"vault set K hunter2secret {self.TOKEN}"}},
+            {self.TOKEN: "a key"}]}
+        once, types = gw._redacted_question({"question_id": "rq_2", "prompt": f"use {self.TOKEN}?"})
+        out, found = gw._cleaned_for_reserve(_task("task-c", wake=wake, room_question=once,
+                                                   **{gw.QUESTION_REDACTED: list(types)}))
+        flat = json.dumps(out)
+        for s in (self.TOKEN, "hunter2secret"):
+            self.assertNotIn(s, flat, "every string, ids and dict keys included")
+        self.assertEqual(out["room_question"], once, "not redacted a second time")
+        self.assertEqual(out["wake"]["blocker_episode_id"], "ep_1")
+        self.assertTrue(set(types) <= set(found) and "vault-set command" in found)
+        self.assertNotIn(gw.QUESTION_REDACTED, out)
+
+    def test_a_held_copy_never_stores_an_owners_vault_command_and_tells_them_to_resend(self):
+        for before in ("crash before render", "rendered", "rendered and finished"):
+            with self.subTest(before=before):
+                tid = "task-vault-" + before.replace(" ", "-")
+                self.addCleanup(self.forget, tid)
+                stored = []
+
+                def intercept(text):
+                    stored.append(text)
+                    return mock.Mock(text=text.replace("hunter2secret", "[STORED-IN-KEYCHAIN]"), stored=["K"],
+                                     failed=[])
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True},
+                                               "/v1/tasks/heartbeat": {"ok": True}}))
+                body = "please vault set K hunter2secret"
+                first = _task(tid, lease_id="L1", source_event_id="$e", task=body)
+                with mock.patch.object(gw, "_vault_intercept_fns", return_value=(intercept, None)):
+                    if before == "crash before render":
+                        self.assertIsNotNone(gw._serve_attempt(tid, tid, first, False))   # then a crash
+                    else:
+                        self.assertTrue(gw._take_served_task(first, set(), []))
+                        self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+                    rendered = len(stored)
+                    if before == "rendered and finished":
+                        with gw._ATTEMPTS.transition(tid) as t:
+                            self.assertTrue(t.finish())
+                    self.assertEqual(gw._write_task(_task(tid, lease_id="L2", source_event_id="$e", task=body)),
+                                     (tid, True), "served again under L2: held")
+                    saved = self.saved(tid).read_text()
+                    self.assertNotIn("hunter2secret", saved)
+                    self.assertIn(gw._RESENT_VAULT, saved, "the copy says it was not stored")
+                    fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 2)
+                    self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"))
+                    gw._ATTEMPTS.take_ownership()                           # a restart before it runs
+                    gw._post_task_beats({tid}, force=True)
+                self.assertEqual(len(stored), rendered, "the held copy and its publication never store")
+                self.assertEqual(rendered, 0 if before == "crash before render" else 1)
+                text = (gw.TASKS_DIR / f"{gw._ATTEMPTS.get(tid)['run']}.txt").read_text()
+                self.assertIn(f"vault set K {gw._RESENT_VAULT}", text, "generation 2 tells the owner to resend")
+                self.assertNotIn("hunter2secret", text)
+
+    def test_a_same_lease_redelivery_of_an_earlier_bridges_v1_held_serve_is_accepted(self):
+        for lost in (False, True):
+            with self.subTest(lost=lost):
+                tid = f"task-probe-v1-upgrade-{lost}"
+                self.addCleanup(self.forget, tid)
+                self.served_acked(tid)
+                task = _task(tid, lease_id="L2", source_event_id="$e", task="hello")
+                self.assertEqual(gw._write_task(task), (tid, True))
+                pend = dict(gw._ATTEMPTS.get(tid)["pending_serve"])
+                run, new_ref = pend["run"], pend["reserve"]
+                body = {**task, "id": tid}               # what an earlier bridge saved: a raw format-1 v1- copy
+                env = {"format": 1, "owner": {"task": tid, "candidate_run": run, "lease": "L2"},
+                       "sha256": gw._digest(body), "task": body}
+                v1 = gw._reserve_id(tid, run, "L2", 1)
+                (gw._reserve_dir() / f"{new_ref['id']}.json").unlink()
+                if not lost:
+                    (gw._reserve_dir() / f"{v1}.json").write_text(json.dumps(env, sort_keys=True))
+                v1_ref = {"id": v1, "run": run, "lease": "L2", "sha256": env["sha256"]}
+                with gw._ATTEMPTS.transition(tid) as t:
+                    self.assertTrue(t.put(pending_serve={**pend, "reserve": v1_ref}))
+                self.assertEqual(gw._write_task(task), (tid, True), "accepted under the same lease")
+                kept = gw._ATTEMPTS.get(tid)["pending_serve"]["reserve"]
+                if lost:
+                    self.assertTrue(kept["id"].startswith("v2-"), "a lost v1- copy is made again, redacted")
+                    self.assertTrue((gw._reserve_dir() / f"{kept['id']}.json").exists())
+                else:
+                    self.assertEqual(kept, v1_ref, "the earlier bridge's copy is kept as it is")
+
+    def test_a_v2_copy_without_its_redaction_record_is_lost_not_read_raw(self):
+        tid = "task-reserve-v2-format1"
+        env = {"format": 1, "owner": {"task": tid, "candidate_run": f"{tid}~~2", "lease": "L2"},
+               "task": _task(tid, lease_id="L2", task="vault set K hunter2secret")}
+        env["sha256"] = gw._digest(env["task"])
+        rid = gw._reserve_id(tid, f"{tid}~~2", "L2")
+        self.assertTrue(rid.startswith("v2-"))
+        gw._reserve_dir().mkdir(parents=True, exist_ok=True)
+        (gw._reserve_dir() / f"{rid}.json").write_text(json.dumps(env))
+        self.addCleanup((gw._reserve_dir() / f"{rid}.json").unlink, missing_ok=True)
+        with self.assertRaises(gw._ReserveLost):
+            gw._read_reserve(tid, {"id": rid, "run": f"{tid}~~2", "lease": "L2", "sha256": env["sha256"]},
+                             f"{tid}~~2", "L2")
+
+    def test_a_broker_field_never_marks_a_task_as_already_redacted(self):
+        tid = "task-reserve-forged"
+        self.assertIsNotNone(gw._write_task(_task(tid, task="vault set K hunter2secret", **{gw.RESERVE_CLEANED: []})))
+        self.assertNotIn("hunter2secret", (gw.TASKS_DIR / f"{tid}.txt").read_text(), "a fresh serve")
+        legacy = gw._reserve_path(tid)
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps(_task(tid, lease_id="L1", task="x", **{gw.RESERVE_CLEANED: []})))
+        self.assertNotIn(gw.RESERVE_CLEANED, gw._read_reserve(tid, None, tid, "L1"), "an older task-wide copy")
+        legacy.unlink()
+        env = {"format": 1, "owner": {"task": tid, "candidate_run": f"{tid}~~2", "lease": "L2"},
+               "task": _task(tid, lease_id="L2", task="x", **{gw.RESERVE_CLEANED: []})}
+        env["sha256"] = gw._digest(env["task"])
+        rid = gw._reserve_id(tid, f"{tid}~~2", "L2", 1)
+        (gw._reserve_dir() / f"{rid}.json").write_text(json.dumps(env))
+        self.addCleanup((gw._reserve_dir() / f"{rid}.json").unlink, missing_ok=True)
+        ref = {"id": rid, "run": f"{tid}~~2", "lease": "L2", "sha256": env["sha256"]}
+        self.assertNotIn(gw.RESERVE_CLEANED, gw._read_reserve(tid, ref, f"{tid}~~2", "L2"), "a format-1 envelope")
+
+    def test_a_twin_post_of_one_ack_is_quiet_and_a_superseded_ack_is_logged(self):
+        tid, gone = "task-twin-ack", "task-twin-gone"
+        self.addCleanup(self.forget, tid, gone)
+        for t in (tid, gone):
+            self.assertTrue(gw._take_served_task(_task(t, lease_id="L1", source_event_id="$e"), set(), []))
+        claim, twin = (gw._claim_ack(tid, "L1", local=tid, durable=True) for _ in range(2))
+        self.assertEqual(claim["op"], twin["op"], "both posts carry the one open claim")
+        self.assertEqual(gw._commit_ack(tid, claim, _ack(tid, 1)), "recorded")
+        self.assertEqual(gw._commit_ack(tid, twin, _ack(tid, 1)), "stale")
+        self.assertFalse([m for m in self.logs if "no longer holds" in m], "its twin recorded it: nothing to say")
+        for label, other, answer in (("another op", gw.task_attempts.Claim({**claim, "op": "ack-other"}), _ack(tid, 1)),
+                                     ("another generation", twin, _ack(tid, 3))):
+            self.logs.clear()
+            self.assertEqual(gw._commit_ack(tid, other, answer), "stale")
+            self.assertTrue([m for m in self.logs if "no longer holds" in m], f"{label} is no twin: it is logged")
+        stale = gw._claim_ack(gone, "L1", local=gone, durable=True)
+        self.forget(gone)
+        self.assertEqual(gw._commit_ack(gone, stale, _ack(gone, 1)), "stale")
+        self.assertTrue([m for m in self.logs if f"{gone}: ack for a serve this attempt no longer holds" in m])
+        legacy = "task-twin-legacy"
+        self.addCleanup(self.forget, legacy)
+        self.assertTrue(gw._take_served_task(_task(legacy, lease_id="L1", source_event_id="$e"), set(), []))
+        claim, twin = (gw._claim_ack(legacy, "L1", local=legacy, durable=True) for _ in range(2))
+        self.assertEqual(gw._commit_ack(legacy, claim, _ack(legacy, 1)), "recorded")
+        no_gen = {k: v for k, v in _ack(legacy, 1).items() if k != "execution_generation"}
+        self.assertEqual(gw._commit_ack(legacy, twin, no_gen), "stale")
+        self.assertFalse([m for m in self.logs if f"{legacy}: ack for a serve" in m],
+                         "an answer naming no generation keeps the bound one: still its twin")
+        switched = "task-twin-switch"
+        self.addCleanup(self.forget, switched)
+        self.held(switched, gen_answer=2)                               # generation 1 under L1, L2 held
+        claim, twin = (gw._claim_ack(switched, "L2", local=switched, durable=True) for _ in range(2))
+        self.assertEqual(claim["op"], twin["op"])
+        self.assertEqual(gw._commit_ack(switched, claim, _ack(switched, 2)), "recorded", "the switch to generation 2")
+        self.assertEqual(gw._commit_ack(switched, twin, _ack(switched, 2)), "stale")
+        self.assertFalse([m for m in self.logs if f"{switched}: ack for a serve" in m],
+                         "the switch recorded this op: its twin is quiet")
+        settled = "task-twin-settled"
+        self.addCleanup(self.forget, settled)
+        self.assertTrue(gw._take_served_task(_task(settled, lease_id="L1", source_event_id="$e"), set(), []))
+        claim = gw._claim_ack(settled, "L1", local=settled, durable=True)
+        self.assertTrue(gw._ack_settled(settled, claim), "the ack wait ended without an accepted ack")
+        self.assertEqual(gw._commit_ack(settled, claim, _ack(settled, 1)), "stale")
+        self.assertTrue([m for m in self.logs if f"{settled}: ack for a serve this attempt no longer holds" in m],
+                        "a settled claim is no twin: it is logged")
+
+    def test_with_lifecycle_2_off_a_run_of_its_own_is_never_settled_by_its_tasks_item(self):
+        base, run = "task-flagoff-run", "task-flagoff-run~~2"
+        self.addCleanup(self.forget, base)
+        for tid in (base, run):
+            gw.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+            (gw.TASKS_DIR / f"{tid}.txt").write_text(f"id: {tid}\nsource: ag2space\ntask: reply\n")
+        sys.modules[gw.read_item.__module__].record_delivered(gw._delivery_core().backend.root, base)
+        inflight = {base, run}
+        with mock.patch.object(gw, "_ATTEMPTS", None):
+            gw._post_ready_results(inflight)
+        self.assertTrue((gw.TASKS_DIR / f"{run}.txt").exists(), "the wake stays queued for the core")
+        self.assertIn(run, inflight)
+        self.assertFalse([m for m in self.logs if f"result {run}: its result is disposed of" in m])
+        self.assertFalse((gw.TASKS_DIR / f"{base}.txt").exists(), "the task's own run is settled as before")
+        self.assertNotIn(base, inflight)
 
     def test_an_adopted_run_never_published_runs_from_its_serves_copy(self):
         tid = "task-adopt-runs"

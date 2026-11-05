@@ -141,10 +141,10 @@ _QUESTION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _HOLDER_ID_RE = re.compile(r"[A-Za-z0-9._~:-]{1,160}")
 QUESTION_DATA_MAX = 2000
 
-# 4 adds saved-serve references (`pending_serve.reserve`, `owed_reserve`): a format-3 reader refuses the
-# ledger rather than serve their debts from a legacy task-wide file. A format-3 ledger is read and upgraded.
-FORMAT = 4
-_READS = (3, FORMAT)
+# 5: held copies are redacted (v2-), so a format-4 bridge, which would save a raw copy, refuses the ledger
+# and holds every task. Formats 3 and 4 are read and upgraded.
+FORMAT = 5
+_READS = (3, 4, FORMAT)
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
@@ -834,7 +834,8 @@ class Transition:
                   "missing_since": None, "hold_reported": None,
                   "wake_episode": episode if type(episode) is str else None,
                   "cancel_requested_generation": None, "cancel_requested_attempt": None,
-                  "owed_publish": pending["run"], "owed_reserve": pending.get("reserve"), "finished": None}
+                  "owed_publish": pending["run"], "owed_reserve": pending.get("reserve"), "finished": None,
+                  "ack_op": c["op"]}
         if self.owner.turn_context and open_turn:
             fields.update(self._open_turn(gen, {**rec, **context}, agent_mxid))
         qid = rec.get("answer_offered")
@@ -951,7 +952,8 @@ class Transition:
         if not self.holds_claim(c):
             self.release_claim(c)
             return "stale"
-        extra = extra or {}
+        # Which operation recorded the ack: another post of the same claim can tell it was its twin.
+        extra = {**(extra or {}), "ack_op": c["op"]}
         gen = response.get("execution_generation") if isinstance(response, dict) else None
         if type(gen) is not int or gen < 1:
             return self.rec if self.commit_claim(c, awaiting_ack=False, **extra) else None

@@ -220,7 +220,7 @@ class Base(unittest.TestCase):
         self.bin = self.home / "bin"
         self.bin.mkdir()
         executable(self.bin / "flock", "#!/bin/sh\nexit 0\n")
-        executable(self.bin / "timeout", '#!/bin/sh\nshift\nexec "$@"\n')
+        executable(self.bin / "timeout", '#!/bin/sh\n[ "$1" = -k ] && shift 2\nshift\nexec "$@"\n')
         # Stands in for the console script pip installs; only PATH finds it here.
         self.reply_stub = self.bin / hatch_cli.REPLY_COMMAND
         executable(self.reply_stub, "#!/bin/sh\nexit 0\n")
@@ -271,6 +271,9 @@ class Base(unittest.TestCase):
 class HookScript(Base):
     def setUp(self):
         super().setUp()
+        self.hook_setup()
+
+    def hook_setup(self):
         (self.home / "runtime.sh").write_text(RUNTIME)
         self.config = self.home / "config"
         self.sparrow_state = self.home / "sparrow_state"
@@ -867,6 +870,110 @@ class HookScript(Base):
         self.assertEqual(second["snippet"], broken)
         self.run_script()
         self.assertNotIn("reply_context", self.payload()["worker_note"])
+
+
+TIMEOUT_CALL = re.compile(r"\btimeout(?: -k (\d+))? (\d+) ")
+# Seconds the hook keeps outside its bounded steps for jq, the state write and the wake.
+UNBOUNDED_MARGIN_S = 6
+
+
+class HookTimeBudget(Base):
+    """The bounded steps fit the scheduler's script timeout, a child that ignores SIGTERM
+    still dies, and no child keeps the hook's lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.hook_setup()
+
+    hook_setup = HookScript.hook_setup
+    sparrow_status = HookScript.sparrow_status
+    run_script = HookScript.run_script
+    events_list = HookScript.events_list
+
+    def test_worst_case_of_the_bounded_steps_fits_the_script_timeout(self):
+        calls = TIMEOUT_CALL.findall(SCRIPT.read_text())
+        self.assertEqual(len(calls), 3, calls)
+        self.assertTrue(all(k for k, _ in calls), f"every timeout needs -k: {calls}")
+        worst = sum(int(k) + int(t) for k, t in calls)
+        limit = json.loads((HATCH / "hook-definition.json").read_text())["script_timeout_secs"]
+        self.assertLessEqual(worst + UNBOUNDED_MARGIN_S, limit, calls)
+
+    def real_tools(self):
+        for stub in ("timeout", "flock"):
+            (self.bin / stub).unlink()
+        missing = [t for t in ("timeout", "flock") if shutil.which(t, path=os.environ["PATH"]) is None]
+        if missing:
+            self.skipTest(f"needs {', '.join(missing)} on PATH")
+
+    def fake_python(self, body):
+        fake = self.bin / "fakepy"
+        executable(fake, "#!/bin/bash\n" + body)
+        self.config.write_text(self.config.read_text().replace(
+            f"SPARROW_PYTHON={sys.executable}", f"SPARROW_PYTHON={fake}"))
+
+    def lock_is_free(self):
+        import fcntl
+        with open(self.home / "hooks" / "state" / "ag2-sparrow-hatch.lock", "w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            return True
+
+    def kill_on_cleanup(self, pid_file):
+        def reap():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        self.addCleanup(reap)
+
+    def test_a_child_that_ignores_sigterm_is_killed_and_the_lock_released(self):
+        self.real_tools()
+        pid_file = self.home / "child.pid"
+        self.kill_on_cleanup(pid_file)
+        self.fake_python(f"trap '' TERM\necho $$ >{pid_file}\nwhile :; do sleep 1; done\n")
+        step = max(int(k or 0) + int(t) for k, t in TIMEOUT_CALL.findall(SCRIPT.read_text()))
+        env = py_env(self.home)
+        env.update({"PATH": f"{self.bin}:{os.environ['PATH']}",
+                    "HATCH_HOOK_RUNTIME": str(self.home / "runtime.sh"),
+                    "SPARROW_HATCH_CONFIG": str(self.config), "STATE_FILE": str(self.state),
+                    "EVENTS": str(self.events), "WAKE_OUT": str(self.wake_out)})
+        start = time.monotonic()
+        proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc.wait(timeout=step + 10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            self.fail(f"the hook outlived its {step}s step bound: the child survived SIGTERM")
+        self.assertLess(time.monotonic() - start, step + 5)
+        self.assertIn("SILENT", self.events_list())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+        self.assertTrue(self.lock_is_free())
+
+    def test_a_child_that_outlives_the_hook_does_not_hold_its_lock(self):
+        self.real_tools()
+        pid_file = self.home / "escaped.pid"
+        self.kill_on_cleanup(pid_file)
+        escape = (
+            "import os, sys, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    fd = os.open(os.devnull, os.O_RDWR)\n"
+            "    for n in (0, 1, 2): os.dup2(fd, n)\n"
+            f"    open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    os._exit(0)\n")
+        self.fake_python(
+            f'if [ "$2" = ag2_sparrow.adapters.hatch.task_fields ]; then\n'
+            f"  {sys.executable} -c {shlex.quote(escape)}\n"
+            f"  while [ ! -s {pid_file} ]; do sleep 0.05; done\n"
+            f"fi\nexec {sys.executable} \"$@\"\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.kill(int(pid_file.read_text()), 0)
+        self.assertTrue(self.lock_is_free(), "a child the hook started still holds fd 9")
 
 
 class TaskFields(Base):
@@ -3435,6 +3542,16 @@ class StartSparrow(Base):
             self.assertTrue(line.endswith(" listener=up restarted=0"), line)
         self.assertIsNone(old.poll(), "a drain whose lock declares the protocol is never replaced")
 
+    def test_the_drains_lane_record_states_lifecycle_2_only_when_it_runs_it(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        for lifecycle in (2, None):
+            with self.subTest(lifecycle=lifecycle), mock.patch.object(gb, "_STATE", self.state), \
+                    mock.patch.object(gb, "_log"), mock.patch.object(gb, "_reenroll_identity", return_value=AGENT), \
+                    mock.patch.object(gb, "_LANE_LIFECYCLE", lifecycle), mock.patch.dict(gb._LANE_OWNED, clear=True):
+                gb._lane_identity()
+                self.assertEqual(agent_identity.published_lane_record(self.state, "").get("lifecycle"), lifecycle,
+                                 "republished as soon as it differs")
+
     def test_keepawake_judges_a_declaring_lock_by_its_protocol_and_its_process(self):
         want = keepalive.health_command(str(self.reply_stub))
         for proto, start, restarted in ((delivery_destination.SEND_LOCK_PROTOCOL - 1, "own", 1),
@@ -4948,7 +5065,7 @@ class DocumentedCommands(unittest.TestCase):
         shipped = runtime_text.builtin()
         self.assertEqual(shipped["worker_note"], note("REMAINING_WORK_NOTE"))
         # task_io owns the non-owner policy: the hook reads it and the built-in text is it.
-        self.assertIn('NON_OWNER_NOTE="$(timeout 10 "$PY" -m ag2_sparrow.task_io --non-owner-note',
+        self.assertIn('NON_OWNER_NOTE="$(timeout -k 1 4 "$PY" -m ag2_sparrow.task_io --non-owner-note',
                       script)
         self.assertEqual(shipped["tier_notes"], [task_io.non_owner_note()])
         raw = json.loads((HATCH / "builtin-runtime-text.json").read_text())
@@ -5051,6 +5168,59 @@ class Reply(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("nothing posted", r.stdout)
         self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+
+    def no_reply(self, *args):
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["no-reply", *args], self.env())
+
+    def test_no_reply_settles_only_once_sparrow_recorded_it(self):
+        sent = []
+        self.sparrow(lambda body: (sent.append(body), outbox.record_delivered(self.outbox, self.TID),
+                                   self.result_file.unlink()))
+        r = self.no_reply(str(self.result_file), "--reason", " thanks,\n just an ack ",
+                          "--wait", "10")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"settled: {self.TID}.txt, nothing posted", r.stdout)
+        self.assertEqual(sent, ["[no-send] thanks, just an ack\n"])
+
+    def test_no_reply_unconfirmed_is_not_reported_as_settled(self):
+        r = self.no_reply(str(self.result_file), "--wait", "0.3")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("do not report it as settled", r.stderr)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+        self.assertEqual(stat.S_IMODE(self.result_file.stat().st_mode), 0o600)
+
+    def test_no_reply_parked_is_not_settled(self):
+        self.sparrow(lambda _body: outbox.park_item(self.outbox, self.TID, "gateway refused"))
+        r = self.no_reply(str(self.result_file), "--wait", "10")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NOT settled", r.stderr)
+
+    def test_no_reply_after_a_reply_writes_nothing(self):
+        self.assertEqual(self.reply(str(self.result_file), "--body", "hi", "--wait", "0").returncode, 3)
+        r = self.no_reply(str(self.result_file), "--wait", "0")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.result_file.read_text(), "hi")
+
+    def test_an_unreadable_attempt_ledger_writes_nothing_only_when_the_drain_keeps_one(self):
+        from ag2_sparrow import agent_identity, delivery_destination
+        state = self.home / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "relay-task-ledger.json").write_text("{not json")
+        for lifecycle, rc in ((2, 2), (None, 3)):
+            with self.subTest(lifecycle=lifecycle):
+                self.result_file.unlink(missing_ok=True)
+                shutil.rmtree(self.results / ".hatch-reply-claims", ignore_errors=True)
+                agent_identity.publish_lane(state, "", "@agent:ag2.space",
+                                            send_lock=delivery_destination.SEND_LOCK_PROTOCOL, lifecycle=lifecycle)
+                r = self.no_reply(str(self.result_file), "--wait", "0")
+                self.assertEqual(r.returncode, rc, r.stderr)
+                self.assertEqual(self.result_file.exists(), rc == 3, "written only when its item is known")
+
+    def test_no_reply_refuses_an_overlong_reason(self):
+        r = self.no_reply(str(self.result_file), "--reason", "x" * 201)
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse(self.result_file.exists())
 
     def test_refuses_every_delivery_marker(self):
         for body in ("[REPLIED]\n", "[no-send]", "   \n",
@@ -5245,6 +5415,14 @@ class Hold(Base):
                 {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time(),
                  **({"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if self.send_lock else {})}))
         return env
+
+    def test_hold_never_reads_the_attempt_ledger(self):
+        self.add_task(self.TID, "$ev1")
+        ledger = self.home / "state" / "relay-task-ledger.json"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("{not json")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
 
     def armed_mark(self):
         """A notice record whose generation a hold armed, as a hold that stood leaves it."""

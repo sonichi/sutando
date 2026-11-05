@@ -12,6 +12,9 @@ case "$0" in
 esac
 REPO="$(cd "$_self_dir/../.." && pwd)"
 unset _self_dir
+# The tmux guard below runs before either runtime launcher; it needs the same PATH they get.
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO"
 
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy
@@ -102,11 +105,7 @@ export SUTANDO_CORE_RUNTIME="$runtime"
 # On a desktop install the core lives on the app's private socket, under its bundled tmux. A
 # terminal launch that names neither took the /tmp default and started a second core beside
 # the app's on a Homebrew tmux, both reading one inbox (2026-10-23, a core-suggested command).
-desktop_app_support="${SUTANDO_APP_SUPPORT:-}"
-if [ -z "$desktop_app_support" ] && [ "$(basename "$(dirname "$REPO")")" = engine ]; then
-  desktop_app_support="$(dirname "$(dirname "$REPO")")"
-fi
-[ -n "$desktop_app_support" ] && [ -d "$desktop_app_support" ] || desktop_app_support=""
+desktop_app_support="$(sutando_desktop_app_support "$REPO")"
 desktop_socket="${desktop_app_support:+$desktop_app_support/run/tmux.sock}"
 if [ -n "$desktop_app_support" ]; then
   if [ -z "${SUTANDO_TMUX_SOCKET:-}" ]; then

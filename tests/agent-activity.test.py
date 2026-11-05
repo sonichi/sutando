@@ -587,6 +587,18 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.working_line("Bash", {"description": "First sentence. Second one"}), "First sentence.")
         self.assertEqual(len(hook.working_line("Bash", {"description": "x" * 300})), 100)
 
+    def test_working_line_names_the_file_for_edits_and_writes(self):
+        # These tools carry no description, so until now they produced no step line at all.
+        self.assertEqual(hook.working_line("Edit", {"file_path": "/Users/me/dev/repo/src/foo.py"}), "Editing src/foo.py")
+        self.assertEqual(hook.working_line("Write", {"file_path": "notes.md"}), "Writing notes.md")
+        self.assertEqual(hook.working_line("NotebookEdit", {"notebook_path": "/a/b/c.ipynb"}), "Editing b/c.ipynb")
+        self.assertEqual(hook.working_line("MultiEdit", {"file_path": "x/y/z"}), "Editing y/z")
+        self.assertEqual(hook.working_line("Edit", {"file_path": "/p/q.py", "description": "Fix the typo"}), "Fix the typo")
+        self.assertIsNone(hook.working_line("Edit", {}))
+        self.assertIsNone(hook.working_line("Edit", {"file_path": "   "}))
+        self.assertIsNone(hook.working_line("Read", {"file_path": "/p/q.py"}))
+        self.assertEqual(len(hook.working_line("Write", {"file_path": "a/" + "b" * 300})), 100)
+
     def test_a_processing_append_binds_the_task_to_this_session_and_writes_no_working_row(self):
         out = hook.handle(self.pre("S1", "Bash", {"command": "python3 activity.py append 'picked up' --kind processing --task-id task-1", "description": "Tag the task"}), self.p, self.run)
         self.assertEqual((out, self.runs), ([], []))
