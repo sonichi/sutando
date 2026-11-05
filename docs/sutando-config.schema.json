@@ -47,7 +47,9 @@
                   "gateway_host": {"type": "string", "description": "The sparrow gateway / relay host, e.g. chat.ag2.space."},
                   "cloud_origin": {"type": "string", "description": "This instance's Sutando Cloud origin, e.g. https://sutando.ag2.space; empty when it has none."},
                   "link_via": {"type": "string", "description": "matrix.to ?via= server; defaults to server."},
-                  "prefer_ipv4": {"type": "boolean", "default": true}
+                  "prefer_ipv4": {"type": "boolean", "default": true},
+                  "mcp_url": {"type": "string", "description": "This instance's hosted MCP endpoint, e.g. https://mcp.s.space/mcp."},
+                  "allow_local": {"type": "boolean", "default": false, "description": "A self-hosted homeserver on this machine or the owner's own network. For this entry's gateway_host (its server when it names no gateway_host; a gateway_host with a port covers that port only), a connect code may name a single-label host such as localhost and must resolve to a loopback, private (RFC 1918, IPv6 ULA) or shared (100.64/10) address, never link-local or public; plain http only when the gateway host itself names loopback (localhost, *.localhost, a 127/8 or ::1 literal), https otherwise. A configured instances list replaces the built-in one, so restate the built-ins beside this entry. Only this entry turns that on; nothing a token or a server says can."}
                 }
               }
             }
@@ -196,6 +198,18 @@
           "type": "boolean",
           "default": false,
           "description": "Link developer-only skills (manifest `audience`: `developer`, or an unknown value) into the core's skills dirs. Only JSON true opts in; any other value is false. Read by resolve_skills_developer() in src/sutando_config.py, through src/skill_audience.py, the decision every installer calls."
+        }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "description": "Desktop notifications Sutando may post on this host. See docs/workspace-config.md.",
+      "additionalProperties": false,
+      "properties": {
+        "macos": {
+          "type": "boolean",
+          "default": false,
+          "description": "Post macOS desktop notifications (osascript banners from alerts, pending questions, bridge restarts, health checks, context drop, screen recording). Off by default; only JSON true opts in, and any other value or an unreadable config is off. Read by resolve_macos_notifications() in src/sutando_config.py (TS twin resolveMacosNotifications(); shell: scripts/sutando-config.sh macos-notifications, used by src/macos-notify.sh). Every macOS sender checks it."
         }
       }
     },

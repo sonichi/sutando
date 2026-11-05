@@ -34,7 +34,7 @@ LAUNCHER = "src/agent/claude/cli/start-cli.sh"
 NEEDED = (
     "src/agent/claude/cli/start-cli.sh", "src/agent/claude/cli/session-launch.sh",
     "src/agent/restart-guard.sh", "src/agent/core-runtime-record.sh", "src/agent/core-window.sh",
-    "src/agent/core-workspace-log.sh",
+    "src/agent/core-workspace-log.sh", "src/agent/launch-path.sh",
     "src/core_runtime_record.py", "src/result_publish.py", "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh", "src/local_services.sh", "src/shutdown.py", "src/workspace_default.py",
     "src/sutando_config.py", "src/util_paths.py", "src/watch-tasks-stream.sh",
@@ -103,6 +103,7 @@ def launch(logs_blocked: bool = False):
     _exe(root / "src" / "tmux-probe-cli.py", "raise SystemExit(0)\n")
     _exe(binp / "pgrep", "#!/bin/bash\nexit 1\n")       # no core and no monitor run yet
     _exe(binp / "sleep", "#!/bin/bash\nexit 1\n")       # one relay pass, then the loop ends
+    _exe(binp / "claude", "#!/bin/bash\nexit 0\n")     # the launcher refuses a core with no claude on PATH
     _exe(binp / "codex", "#!/bin/bash\nexit 0\n")
     _exe(binp / "fswatch", "#!/bin/bash\nexit 0\n")
     for real in ("bash", "python3", "sed", "awk", "grep", "ps", "seq", "cat", "mkdir", "rm", "date",

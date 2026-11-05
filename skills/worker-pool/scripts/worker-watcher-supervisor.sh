@@ -62,6 +62,8 @@ for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
      && [ "$v" = SUTANDO_TASK_EVENT_HANDLER ]; then continue; fi
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
 done
+# Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 CMD=(tmux -S "$SOCK" new-session -d -s "$SUP_SESSION" "${ENV_ARGS[@]}" bash "$SUPERVISOR")
 
 if [ "${1:-}" = "--print-command" ]; then
@@ -69,8 +71,15 @@ if [ "${1:-}" = "--print-command" ]; then
   exit 0
 fi
 if tmux -S "$SOCK" has-session -t "=$SUP_SESSION" 2>/dev/null; then
-  echo "worker-watcher-supervisor: $SUP_SESSION already running"
-  exit 0
+  # The stop handler reads the switch in this watcher's environment: a change replaces it.
+  # Only an exact session value counts: one the session never set may come from the server's global env.
+  have="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STOP_INTERRUPT 2>/dev/null)"
+  if [ "$have" = "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" ]; then
+    echo "worker-watcher-supervisor: $SUP_SESSION already running"
+    exit 0
+  fi
+  tmux -S "$SOCK" kill-session -t "=$SUP_SESSION" 2>/dev/null || true
+  echo "worker-watcher-supervisor: $SUP_SESSION restarted: the Stop interrupt switch changed"
 fi
 if ! tmux -S "$SOCK" has-session -t "=$WORKER_SESSION" 2>/dev/null; then
   echo "worker-watcher-supervisor: worker session $WORKER_SESSION is not running; nothing to supervise" >&2

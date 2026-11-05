@@ -100,6 +100,8 @@ class CardIsAcknowledgedOnlyOnceItExists(unittest.TestCase):
     def check_retry(self, pane, decision):
         ws = pool()
         (pd.deliveries_dir(ws, WID) / "task-owed.txt").write_bytes(b"")
+        (ws / "tasks").mkdir(exist_ok=True)
+        (ws / "tasks" / "task-owed.txt").write_text("task: hello\n")
         captures = {"card": 0}
 
         def runner(argv, **kw):

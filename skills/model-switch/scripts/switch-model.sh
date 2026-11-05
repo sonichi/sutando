@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
+# switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
 # Sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
 set -u
-MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""
+MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""
 while [ $# -gt 0 ]; do case "$1" in
-  --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
+  --dry-run) DRY=1;; --offline) OFFLINE=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
   --picker-dismiss-after) DISMISS_AFTER="${2:?}"; shift;;
   --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
@@ -51,6 +51,42 @@ if [ $RRC -ne 0 ] || [ -z "$RUNTIME" ]; then echo "switch-model: refused — cor
 case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecognized core runtime '$RUNTIME'; nothing changed" >&2; exit 4;; esac
 if [ "$RUNTIME" = "codex" ]; then
   echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
+fi
+# --offline: the core is down, so no CLI can take /model; write its settings for the next launch.
+# Refused while any core process for this session runs, which then owns its settings.
+if [ -n "$OFFLINE" ]; then
+  if pgrep -f "claude --name $SESSION( |$)" > /dev/null 2>&1; then
+    echo "switch-model: refused --offline — a core is running for '$SESSION'; switch it live instead. Nothing changed." >&2; exit 9
+  fi
+  OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
+import json, os, sys, time, tempfile
+cfg, model, state_dir = sys.argv[1:4]
+try:
+    data = json.load(open(cfg))
+    if not isinstance(data, dict): raise ValueError("settings is not an object")
+except FileNotFoundError:
+    data = {}
+except (OSError, ValueError) as e:
+    print(f"FAILED settings unreadable: {e}"); sys.exit(1)
+prev = data.get("model")
+def put(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".model-switch.staged.")
+    with os.fdopen(fd, "w") as f: json.dump(obj, f, indent=2); f.write("\n")
+    os.replace(tmp, path)
+try:
+    put(cfg, dict(data, model=model))
+    put(os.path.join(state_dir, "model-switch.json"), {"model": model, "previous": prev, "previous_source": "settings.json" if prev else "none",
+        "accepted": False, "applied": "settings (core down)", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "by": "skills/model-switch/scripts/switch-model.sh --offline", "settings_read": cfg})
+except OSError as e:
+    print(f"FAILED {e}"); sys.exit(1)
+print(f"OK {prev or '-'}")
+PYEOF
+)"
+  case "$OUT" in OK*) ;; *) echo "switch-model: --offline could not write ($CFG): ${OUT#FAILED }" >&2; exit 1;; esac
+  echo "switched: model=$MODEL (was ${OUT#OK }); the core is down, so it takes effect at its next launch; record: $STATE_DIR/model-switch.json"
+  exit 0
 fi
 # Preflight the live pane before any write through the ONE sender
 # (scripts/tmux-send-line.sh): its --dry-run inspects the prompt under the

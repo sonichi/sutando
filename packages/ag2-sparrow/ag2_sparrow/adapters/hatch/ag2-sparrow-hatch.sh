@@ -52,10 +52,12 @@ fi
 
 # task_fields validates AGENT_MXID, so the hook and `install` accept the same MXIDs.
 # HELD_AWARE: this hook explains held: true (HELD_NOTE), so held tasks may be listed to it.
+# Each step's timeout plus its -k grace sums under script_timeout_secs; 9>&- keeps the lock
+# out of a child that outlives the hook.
 rc=0
-items="$(HATCH_HOOK_HELD_AWARE=1 timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
+items="$(HATCH_HOOK_HELD_AWARE=1 timeout -k 1 12 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
   --task-dir "$TASK_DIR" --result-dir "$RESULT_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" \
-  2>/dev/null)" || rc=$?
+  2>/dev/null 9>&-)" || rc=$?
 if [[ "$rc" -eq 3 ]]; then
   log "ag2-sparrow-hatch not configured" '{"hint":"run: ag2-sparrow-hatch install --mxid @your-agent:ag2.space"}'
   silent "AGENT_MXID not configured; run ag2-sparrow-hatch install" '{}'
@@ -65,7 +67,7 @@ fi
 
 # Tier rules come from Sparrow's shared policy, not from message text: a worker may rightly
 # treat an instruction block inside the message as untrusted prose.
-NON_OWNER_NOTE="$(timeout 10 "$PY" -m ag2_sparrow.task_io --non-owner-note 2>/dev/null)" || NON_OWNER_NOTE=''
+NON_OWNER_NOTE="$(timeout -k 1 4 "$PY" -m ag2_sparrow.task_io --non-owner-note 2>/dev/null 9>&-)" || NON_OWNER_NOTE=''
 if [[ -z "$NON_OWNER_NOTE" ]]; then
   log "ag2-sparrow-hatch read failed" '{"stage":"non_owner_note"}'; silent "non-owner note unreadable; retry next poll" '{}'
 fi
@@ -152,8 +154,8 @@ elif [[ "$n" -eq 0 ]]; then
   payload="$(jq -cn --arg note "$HEARTBEAT_NOTE" '{heartbeat: true, matches: [], total: 0, worker_note: $note}')"
   # A dead Sparrow writes no task files, so the heartbeat is where it gets noticed.
   sparrow_rc=0
-  sparrow_detail="$(timeout 10 "$PY" -m ag2_sparrow.adapters.hatch.cli sparrow \
-    --state-dir "$SPARROW_STATE_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" 2>/dev/null)" \
+  sparrow_detail="$(timeout -k 1 4 "$PY" -m ag2_sparrow.adapters.hatch.cli sparrow \
+    --state-dir "$SPARROW_STATE_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" 2>/dev/null 9>&-)" \
     || sparrow_rc=$?
   case "$sparrow_rc" in
     0) ;;

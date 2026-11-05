@@ -136,19 +136,10 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # system node, so the app's bundled runtime must be reachable or every codex
 # invocation dies with "env: node: No such file or directory" (exit 127) —
 # which the auth probe below would otherwise misreport as "not authenticated".
-# The engine lives at <app-support>/engine; this script runs from
-# <app-support>/engine/sutando, so the runtime is one level up from $REPO.
-CODEX_NODE_BIN="${CODEX_NODE_BIN:-$(cd "$REPO/.." 2>/dev/null && pwd)/runtime/node/bin}"
-# APPEND, never prepend: an operator (or a test harness) who put a codex or
-# node earlier on PATH must keep winning; we only add a fallback.
-for _d in "$CODEX_NODE_BIN" "$CODEX_INSTALL_BIN"; do
-  [ -d "$_d" ] || continue
-  case ":$PATH:" in
-    *":$_d:"*) ;;
-    *) PATH="$PATH:$_d" ;;
-  esac
-done
-export PATH
+# launch-path.sh owns where the bundled runtime lives; it only appends, so an
+# operator's (or a test harness's) codex or node earlier on PATH keeps winning.
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting
@@ -215,7 +206,7 @@ if [ "$_codex_auth_rc" -eq 127 ]; then
   # 127 is "could not execute", not "not logged in" — almost always a missing
   # node on PATH. Saying "run codex login" here sends people the wrong way.
   echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
-  echo "  PATH lacked a usable node; looked in $CODEX_NODE_BIN" >&2
+  echo "  PATH lacked a usable node: PATH=$PATH" >&2
   exit 127
 fi
 if [ "$_codex_auth_rc" -ne 0 ]; then
@@ -279,7 +270,6 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
-
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {
@@ -318,7 +308,7 @@ ensure_task_notifier() {
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -333,6 +323,9 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
+  # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
@@ -502,6 +495,12 @@ ensure_codex_auto_reset_timer() {
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
 resolve_heartbeat_python
+prepare_codex_bootstrap() {
+  local prompt
+  [ -n "$_HB_PY" ] || { echo "start-cli: no runnable Python for managed Codex bootstrap" >&2; return 1; }
+  prompt="$("$_HB_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || return 1
+  CODEX_ARGS+=("$prompt")
+}
 if [ "$RECONCILE_SCHEDULES" = 1 ]; then
   ensure_durable_schedules
   ensure_codex_scheduler
@@ -636,6 +635,7 @@ if ! tmux_available; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
+  prepare_codex_bootstrap || exit 1
   ensure_codex_project_trust
   stash_shutdown_sentinel
   clear_shutdown_sentinel
@@ -689,6 +689,7 @@ heal_core_window() {
     return 3
   fi
   echo "  ⚠ $SESSION exists but its Codex core is gone — healing core window (sibling windows preserved)" >&2
+  prepare_codex_bootstrap || return 1
   for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
@@ -726,6 +727,7 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
+  prepare_codex_bootstrap || return 1
   ensure_codex_project_trust
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1

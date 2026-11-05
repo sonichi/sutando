@@ -50,6 +50,7 @@ SEGMENT_MAX = 64
 DIGEST_HEX = 12
 _PLAIN = re.compile(r"@([a-z0-9][a-z0-9.-]*):([a-z0-9][a-z0-9.-]*)")
 _UNSAFE = re.compile(r"[^a-z0-9._-]")
+_MXID = re.compile(r"@[a-z0-9._=/+-]+:[a-z0-9.-]+(?::\d{1,5})?")
 
 
 # Parsing has one owner, so the identity tiers cannot disagree with the credential tiers.
@@ -248,18 +249,20 @@ def _well_formed(rec: dict, instance: str) -> "tuple[dict, float] | None":
     return {**rec, "agent_id": agent.strip()}, ts
 
 
-def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None) -> dict:
+def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None,
+                 lifecycle: "int | None" = None) -> dict:
     """Record, under the lane lock, the identity the live drain of `instance` resolved, so a reader
     that must not open the credential env sees that drain's lane; returns the record written.
     It holds the id, instance, pid, the process's start time (which binds it to that process, not
     to a reused pid), a timestamp and, when given, the proactive `send_lock` protocol the drain
-    honours. On a failed write the record is emptied in the same locked step, so it reads invalid,
-    and OSError is raised either way."""
+    honours, and the task `lifecycle` it runs when not the default. On a failed write the record is
+    emptied in the same locked step, so it reads invalid, and OSError is raised either way."""
     if valid_pid(os.getpid()) is None:
         raise OSError(f"pid {os.getpid()} is outside the pid domain readers accept")
     record = {"agent_id": (agent_id or "").strip(), "instance": instance or "",
               "pid": os.getpid(), "start": own_start(), "ts": time.time(),
-              **({"send_lock": send_lock} if send_lock is not None else {})}
+              **({"send_lock": send_lock} if send_lock is not None else {}),
+              **({"lifecycle": lifecycle} if lifecycle is not None else {})}
     dfd = _auth_dir(state_dir, create=True)
     try:
         with _lane_locked(dfd, instance):
@@ -344,10 +347,16 @@ def published_lane_record(state_dir, instance: str, now: "float | None" = None) 
     return rec if state == LANE_FRESH else None
 
 
-def resolve(state_dir, channel_value, environ=None, strict=None) -> str:
+def resolve(state_dir, channel_value, environ=None, strict=None, instance: str = "", whoami=None,
+            credential: str = "", server: str = "") -> str:
     """The agent id by the bridge's chain; `channel_value(key)` reads the channel .env tier. '' = unknown.
     A pinned environment answers from its own `AGENT_MXID` alone. `strict` (default: the environment is a
-    seat's) stops at the channel tier: the host's binding is the host's agent, never a seat's."""
+    seat's) stops at the channel tier: the host's binding is the host's agent, never a seat's.
+
+    A secondary lane (`instance` set) is its own agent on its own homeserver: after the env and channel
+    tiers it reads its own lane record, else asks its own relay (`whoami()`, the server's answer for
+    this lane's credential) and records that (see `lane_agent`). It never falls back to the host's
+    binding, which is the primary lane's agent; '' tells the caller the lane's identity is unknown."""
     env = os.environ if environ is None else environ
     if strict is None:
         strict = _sources.is_seat(env)
@@ -361,7 +370,61 @@ def resolve(state_dir, channel_value, environ=None, strict=None) -> str:
         v = (channel_value(key) or "").strip()
         if v:
             return v
+    if instance:
+        return lane_agent(state_dir, instance, whoami, credential=credential, server=server)
     return "" if strict else enrolled(state_dir)
+
+
+def _lane_agent_name(instance: str) -> str:
+    return f"lane-agent{_instance_suffix(instance)}.json"
+
+
+def _on_server(agent_id: str, server: str) -> bool:
+    return not server or agent_id.split(":", 1)[-1].lower() == server.strip().lower()
+
+
+def lane_agent(state_dir, instance: str, whoami=None, *, credential: str = "", server: str = "") -> str:
+    """A secondary lane's own agent id: its record, else its relay's answer (then recorded). '' when
+    neither knows; never the host's binding. The record holds only for the credential it was made
+    with (`credential`, a digest the caller derives from the lane's gateway and token), so a lane
+    re-linked to another agent asks again; an id on another server than `server` (the lane's row)
+    is refused from either source. Read and written without following a symlink."""
+    if state_dir is None or not instance:
+        return ""
+    name = _lane_agent_name(instance)
+    if LANE_SUPPORTED:
+        try:
+            dfd = _auth_dir(state_dir, create=False)
+            rec = None
+            if dfd is not None:
+                try:
+                    rec, _why = _read_at(dfd, name)
+                finally:
+                    _close(dfd)
+        except OSError:
+            rec = None
+        v = (rec or {}).get("agent_id")
+        if isinstance(v, str) and _MXID.fullmatch(v.strip().lower()) and _on_server(v.strip(), server) \
+                and (rec or {}).get("credential", "") == credential:
+            return v.strip()
+    try:
+        v = (whoami() if whoami is not None else "") or ""
+    except Exception:  # noqa: BLE001 - an unreachable relay is unknown, not the host's agent
+        v = ""
+    v = v.strip() if isinstance(v, str) else ""
+    if not _MXID.fullmatch(v.lower()) or not _on_server(v, server):
+        return ""
+    if LANE_SUPPORTED:
+        try:
+            dfd = _auth_dir(state_dir, create=True)
+            try:
+                _write_at(dfd, name, {"agent_id": v, "instance": instance, "credential": credential,
+                                      "source": "relay-whoami"})
+            finally:
+                _close(dfd)
+        except OSError:
+            pass  # answered all the same; recorded next time
+    return v
 
 
 def host_enrolled(state_dir, environ=None) -> str:
