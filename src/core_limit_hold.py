@@ -19,6 +19,9 @@ never held, so it is revived as before.
     core_limit_hold.py status             the hold record, if any
     core_limit_hold.py clear              lift the hold now (the next revive launches)
 
+A hold also records a digest of the account it was observed under; a launch under a different
+account is not held by it, so signing in to an account with quota resumes at once.
+
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
 Tasks that arrive during a hold are listed in its record (`held_tasks`), so the orphan check
@@ -27,6 +30,7 @@ on the next boot leaves them for the core; each hold incident sends its own noti
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -330,6 +334,28 @@ def _same_family(limited_model: Optional[str], launch_model: Optional[str]) -> b
     return not (mine and theirs and mine != theirs)
 
 
+def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
+    """A non-reversible digest of the account the CLI is signed in to, else None.
+    Only non-secret identity fields of `.claude.json` are read; tokens never are."""
+    if not config_dir:
+        return None
+    try:
+        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(acct, dict):
+        return None
+    ident = [str(acct.get(k) or "") for k in ("accountUuid", "organizationUuid", "emailAddress")]
+    if not any(ident):
+        return None
+    return hashlib.sha256("\0".join(ident).encode("utf-8")).hexdigest()[:16]
+
+
+def _same_account(held_account: Optional[str], launch_account: Optional[str]) -> bool:
+    """A hold binds only the account it was seen under; an unknown side keeps it binding."""
+    return not (held_account and launch_account and held_account != launch_account)
+
+
 def _relevant(limit: Optional[Limit], launch_model: Optional[str]) -> bool:
     return limit is not None and _same_family(limit.model, launch_model)
 
@@ -400,7 +426,8 @@ class Decision:
 
 
 def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
-           projects_dir: Optional[Path] = None, launch_model: Optional[str] = None) -> Decision:
+           projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
+           launch_account: Optional[str] = None) -> Decision:
     """Launch, or hold and say why. The one writer of the hold record."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
@@ -410,7 +437,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         if admitted is not hold:
             hold = admitted
             _write_hold(workspace, hold)
-    if active_hold(workspace, now) and _same_family(hold.get("model"), launch_model):
+    if active_hold(workspace, now) and _same_family(hold.get("model"), launch_model) \
+            and _same_account(hold.get("account"), launch_account):
         if _ensure_notice(workspace, hold):
             _write_hold(workspace, hold)
         return Decision(False, hold, status_line(hold))
@@ -433,6 +461,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "status": "held", "kind": limit.kind, "model": limit.model, "source": limit.source,
             "reset_at": limit.reset_at, "evidence_at": limit.at, "set_at": now,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
+            "account": launch_account,
         }
         new["reason"] = status_line(new)
         # An incident runs until the core is let out; a hold after a release is a new one.
@@ -638,8 +667,10 @@ def main(argv=None) -> int:
         print("hold lifted" if hold and hold.get("status") == "cleared" else "no hold in force")
         return 0
     handle_owner_actions(workspace, switch_cmd=args.switch_entry or None)
-    model = qa.seat_model(qa.SeatEnv(True, None, os.environ.get("CLAUDE_CONFIG_DIR")), workspace)
-    decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model)
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), workspace)
+    decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model,
+                      launch_account=account_fingerprint(config_dir))
     if decision.launch:
         return 0
     print(decision.line)

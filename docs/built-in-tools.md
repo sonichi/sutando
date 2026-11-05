@@ -435,5 +435,6 @@ model (above) is the way to keep going before then. A core that died on a limit 
 until the reset (or a backoff of 5 to 60 minutes when none is given), and the owner gets one DM
 saying so. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
 launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as is; the next revive
-then starts the core. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+then starts the core. A hold binds only the Claude account it was seen under: after signing in to
+another account, the next restart launches the core at once. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
 `... clear` lifts it.
