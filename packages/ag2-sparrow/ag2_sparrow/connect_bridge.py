@@ -382,6 +382,7 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
     agent's fence (`fence`, cm.fence_name), so no other operation on the agent runs before that settle ends.
     An install that failed after it first touched a session or bridge (cm.mark_mutated) then runs `orphan()`: no
     bridge of the agent is left running without its session; a refusal before that point leaves everything as it was."""
+    cm.begin_operation()    # first: a refusal at the fence or the lock must not read the last invocation's mark
     try:
         with cm.agent_fence(fence):
             try:
@@ -390,7 +391,6 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
                     if problem:
                         print(f"error: {problem}; nothing was changed", file=sys.stderr)
                         return cm.EXIT_UNUSABLE
-                    cm.begin_operation()
                     try:
                         rc = fn()
                     except BaseException:

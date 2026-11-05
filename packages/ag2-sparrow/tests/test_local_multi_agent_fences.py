@@ -313,6 +313,36 @@ class Round9(MultiBase):
                 self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", ALPHA)[0], 0)
     test_a_refusal_before_any_change_keeps_a_foreground_session_and_its_bridge = per_manager(_foreground_kept)
 
+    def _busy_reads_no_stale_mark(self, adapter):
+        """The mark is per invocation from its very start: after one install that changed things, the next install
+        on the same thread refused at the agent lock (Busy) owes nothing, so the bridge left running is not stopped."""
+        a = job(adapter, ALPHA)
+        bridge = self.host.bridges[a.job]
+        self.installed(adapter, ALPHA)
+        with mock.patch.object(sm, "_run", side_effect=self.host), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cm.stop_supervisor(a), "")
+        self.assertTrue(bridge.active)
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with cm.agent_lock(str(self.root_of(ALPHA))):
+                held.set()
+                release.wait(30)
+        t = threading.Thread(target=holder, daemon=True)
+        t.start()
+        held.wait(30)
+        try:
+            with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0):
+                rc, out, err = self.install(adapter, ALPHA)
+        finally:
+            release.set()
+            t.join(30)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("another operation on this agent is in progress", err)
+        self.assertNotIn("since its session is not running", err)
+        self.assertTrue(bridge.active, "a Busy refusal changed nothing, so it owes nothing")
+    test_a_busy_refusal_reads_no_mark_from_the_previous_install = per_manager(_busy_reads_no_stale_mark)
+
     def install_argv(self, adapter):
         if adapter == CL.name:
             return ["install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
