@@ -6,6 +6,7 @@ Run: python3 tests/sparrow-result-labels.test.py
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -72,6 +73,20 @@ class Writer(Dir):
                                                         'result_sha256': self.rl.digest('4\n')})
         self.assertEqual(side.stat().st_mode & 0o777, 0o600)
         self.assertEqual([p.name for p in self.root.iterdir()], ['task-1.meta.json'])
+
+    def test_write_needs_no_fchmod(self):
+        with patch.object(self.rl.os, 'fchmod', side_effect=AttributeError('no fchmod'), create=True):
+            side = self.rl.write(self.result, {'title': 'T'}, 'x')
+        self.assertEqual(side.stat().st_mode & 0o777, 0o600)
+
+    def test_the_digest_is_of_the_bytes_a_text_mode_writer_publishes(self):
+        body = 'caf\u00e9\nline two\n'
+        with open(self.result, 'w', encoding='utf-8') as fh:
+            fh.write(body)
+        self.assertEqual(self.rl.digest(body), hashlib.sha256(self.result.read_bytes()).hexdigest())
+        with patch.object(self.rl.os, 'linesep', '\r\n'):
+            self.assertEqual(self.rl.digest(body),
+                             hashlib.sha256('caf\u00e9\r\nline two\r\n'.encode()).hexdigest())
 
     def test_write_with_no_labels_writes_and_removes_nothing(self):
         self.rl.write(self.result, {'title': 'Other'}, 'other')

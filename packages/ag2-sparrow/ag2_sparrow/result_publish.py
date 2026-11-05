@@ -218,7 +218,11 @@ def main(argv: list[str]) -> int:
     labels, notes = result_labels_for(text, title, outcome)
     for note in notes:
         print(f"result_publish: warning: {note}", file=sys.stderr)
-    labels_mod.write(Path(path), labels, text)
+    try:
+        labels_mod.write(Path(path), labels, text)
+    except Exception as exc:  # noqa: BLE001 — labels are optional; the result never waits on them
+        print(f"result_publish: warning: published without --title/--outcome: {exc}",
+              file=sys.stderr)
     publish_text(path, text)
     return 0
 

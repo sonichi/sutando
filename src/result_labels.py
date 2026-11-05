@@ -83,8 +83,9 @@ def check(title=None, outcome=None) -> "tuple[dict, list]":
 
 
 def digest(body: str) -> str:
-    """The SHA-256 of `body` as published: the bytes a reader of the result file hashes."""
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+    """The SHA-256 of `body` as a text-mode UTF-8 writer publishes it, newlines translated to the
+    platform's line ending: the bytes a reader of the result file hashes."""
+    return hashlib.sha256(body.replace("\n", os.linesep).encode("utf-8")).hexdigest()
 
 
 def write(result_file: Path, labels: dict, body: str) -> "Path | None":
@@ -98,7 +99,7 @@ def write(result_file: Path, labels: dict, body: str) -> "Path | None":
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
     try:
-        os.fchmod(fd, 0o600)
+        # mkstemp already made it 0600 where modes apply; os.fchmod is missing on older Windows.
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(labels, fh, ensure_ascii=False)
             fh.flush()
