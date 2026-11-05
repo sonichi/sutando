@@ -206,10 +206,18 @@ def main(argv: list[str]) -> int:
               "proactive result routed to the owner's channel), start it with [no-send], "
               "or pass --allow-undeliverable", file=sys.stderr)
         return 2
+    try:
+        labels_mod = _labels_module()
+    except ImportError:
+        # Labels are optional: a copy without its label writer still publishes the result.
+        if title is not None or outcome is not None:
+            print("result_publish: warning: no result_labels module; published without "
+                  "--title/--outcome", file=sys.stderr)
+        publish_text(path, text)
+        return 0
     labels, notes = result_labels_for(text, title, outcome)
     for note in notes:
         print(f"result_publish: warning: {note}", file=sys.stderr)
-    labels_mod = _labels_module()
     labels_mod.write(Path(path), labels)
     try:
         publish_text(path, text)

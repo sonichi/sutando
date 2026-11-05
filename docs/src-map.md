@@ -200,6 +200,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
 - **`result_channel_key.py`** — Alias of `delivery.channel_key` (phase-1a restructure); one transition window.
+- **`result_labels.py`** — A result's Activity labels: the `<name>.meta.json` side file beside `<name>.txt` in results/.
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every delivery consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the `src/dm-result.py` REST fallback).
 - **`result_publish.py`** — One publisher for every `results/` body: staged beside the target, fsynced, renamed whole.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.

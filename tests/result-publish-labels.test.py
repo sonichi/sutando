@@ -110,6 +110,15 @@ class Publish(unittest.TestCase):
                 self.assertEqual(self.run_cli('Done.', *flags)[0], 2)
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_without_the_label_writer_the_result_still_publishes(self):
+        with patch.object(rp, '_labels_module', side_effect=ImportError('gone')):
+            self.assertEqual(self.run_cli('Done.'), (0, ''))
+            code, err = self.run_cli('Again.', '--title', 'Add two')
+        self.assertEqual(code, 0)
+        self.assertIn('published without --title/--outcome', err)
+        self.assertEqual(self.result.read_text(), 'Again.')
+        self.assertFalse(self.side.exists())
+
     def test_allow_undeliverable_still_takes_labels(self):
         code, _ = self.run_cli('Done.', '--allow-undeliverable', '--outcome', 'Logged it')
         self.assertEqual((code, self.side_doc()), (0, {'outcome': 'Logged it'}))
