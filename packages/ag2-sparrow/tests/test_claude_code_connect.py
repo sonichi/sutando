@@ -426,7 +426,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         seed_seat(cli.bridge_home(self.root), "other-bearer-PPPP6666")
         return {p: p.read_bytes() for p in sorted(self.seat().iterdir())}
 
-    def test_a_root_another_adapter_holds_is_refused_before_the_seat_is_written(self):
+    def test_a_root_another_adapter_holds_is_refused_before_the_code_is_read(self):
         before = self.seated_by_another_adapter()
         holder = hold(self.root, "codex-local")
         try:
@@ -437,8 +437,31 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual({p: p.read_bytes() for p in sorted(self.seat().iterdir())}, before, "byte-identical")
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertIn(f"{self.root} is held by launcher pid {holder.pid}; stop what holds it", err)
+        self.assertIn("the code was not used", err)
+        self.assertEqual(backend.calls, [], "--agent names the root: it is checked before the code is spent")
+        self.assertFalse(cli.config_path(LA).exists())
+        self.assertFalse(cm.service_path(BA).exists())
+
+    def test_a_root_taken_after_the_preflight_is_refused_before_the_seat_is_written(self):
+        before = self.seated_by_another_adapter()
+        holders, real = [], cm.redeem_code
+
+        def redeemed_then_taken(*a, **kw):
+            out = real(*a, **kw)
+            holders.append(hold(self.root, "codex-local"))
+            return out
+        try:
+            backend = Backend()
+            with mock.patch.object(cm, "redeem_code", side_effect=redeemed_then_taken):
+                rc, _out, err = self.connect(backend)
+        finally:
+            for h in holders:
+                unhold(h)
+        self.assertEqual({p: p.read_bytes() for p in sorted(self.seat().iterdir())}, before, "byte-identical")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"{self.root} is held by launcher pid {holders[0].pid}; stop what holds it", err)
         self.assertIn("the code is spent and nothing was written", err)
-        self.assertEqual(len(backend.calls), 1, "the root is known only from the redemption's agent id")
+        self.assertEqual(len(backend.calls), 1, "the race after the preflight is still caught after the redemption")
         self.assertFalse(cli.config_path(LA).exists())
         self.assertFalse(cm.service_path(BA).exists())
 
@@ -839,15 +862,16 @@ class ConnectCode(UndoSeams, AgentRootBase):
 
     def test_a_holder_that_takes_the_root_after_the_clean_check_keeps_the_seat(self):
         self.root.mkdir(parents=True)
-        late, real = [], cm._free_root_problem
+        late, real, redeem, redeemed = [], cm._free_root_problem, cm.redeem_code, []
 
-        def checked_then_taken(root):
+        def checked_then_taken(root):     # the clean check after the redemption, then the root taken
             got = real(root)
-            if not late:
+            if redeemed and not late:
                 late.append(hold(self.root, "codex-local"))
             return got
         try:
-            with mock.patch.object(cm, "_free_root_problem", side_effect=checked_then_taken):
+            with mock.patch.object(cm, "_free_root_problem", side_effect=checked_then_taken), \
+                    mock.patch.object(cm, "redeem_code", side_effect=lambda *a, **kw: redeemed.append(1) or redeem(*a, **kw)):
                 self.assert_refused_untouched(None, f"{self.root} was taken by another process first")
         finally:
             for p in late:

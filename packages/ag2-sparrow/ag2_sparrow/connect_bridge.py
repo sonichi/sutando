@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -292,11 +293,15 @@ def agent_arg_problem(given, agent_id: str) -> str:
     return ""
 
 
+def named_root(agent_id: str) -> str:
+    """The agent's own root under the agents dir, as its Matrix ID names it."""
+    return cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")[0]
+
+
 def agent_owner_problem(local: cm.Shape, agent_id: str) -> str:
     """bridge_owner_problem before a code is spent, for the agent connect names and its own root: another
     agent's bridge on this host does not refuse."""
-    root, _ = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")
-    return bridge_owner_problem(local, root, agent_id)
+    return bridge_owner_problem(local, named_root(agent_id), agent_id)
 
 
 def agent_root(agent_id: str) -> "tuple[str, str]":
@@ -399,6 +404,9 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
             except cm.Busy as e:
                 print(f"error: {e}", file=sys.stderr)
                 rc = 1
+            if orphan is not None and cm.agent_lock_held(root):     # an outer connect settles: it reconciles then
+                _FINAL[threading.get_ident()] = (root, orphan)
+                return cm.settle(root, rc)
             rc = cm.settle(root, rc)
             line = _reconciled(root, orphan) if rc != 0 and orphan is not None and cm.mutated() else ""
             if line:
@@ -407,6 +415,9 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
     except cm.Busy as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+
+_FINAL: dict = {}
 
 
 def fenced(agent_id, fn) -> int:
@@ -439,10 +450,9 @@ def orphan_bridge(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape) ->
     mode, root = bridge_mode(cfg), cm.work_root(cfg)
     if mode == EXTERNAL or cm.manager_state(local) == "active":
         return ""
-    held = cm.lock_held(root)
-    if held != "free":
-        return f"the agent's bridge was kept: {root} is {cm.holder_line(root)}" if held == "held" else \
-            f"the agent's bridge was kept: who holds {root} cannot be read"
+    served = cm.serving_session(local, root)
+    if served:
+        return f"the agent's bridge was kept: {served}"
     if mode != UNIT:
         line = _withdraw(cfg, command)
         return f"{line}: its session is not running" if line else ""
@@ -556,12 +566,18 @@ def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
     state = cm.manager_state(bridge)
     if state == "unknown":
         return f"{cm.job_name(bridge)}'s state is unknown"
+    was_running = state == "active"
     if text is not None or state != "absent":
         problem = cm.stop_supervisor(bridge)
         if problem:
             return problem
     cm._write(sup, unit, 0o644)
     print(f"installed: {sup}")
+
+    def restore() -> str:
+        problem = cm.start_supervisor(bridge)
+        return (f"{cm.job_name(bridge)}, which this attempt stopped, could not be started again ({problem})" if problem
+                else f"{cm.job_name(bridge)}, which this attempt stopped, was started again")
 
     def start() -> str:
         problem = cm.start_supervisor(bridge)
@@ -575,6 +591,8 @@ def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
         return start()
     pending.setdefault("then", []).append(start)
     pending.setdefault("failed", []).append(lambda: _unstarted(cfg, command, bridge, sup, wired))
+    if was_running:
+        pending.setdefault("kept", []).append(restore)
     print(f"{cm.job_name(bridge)} starts once the session holds {root}")
     return ""
 
@@ -680,19 +698,22 @@ def host_problem(command: str) -> str:
     return ""
 
 
-def known_root_problem(local: cm.Shape) -> str:
+def known_root_problem(local: cm.Shape, agent_id: str = "") -> str:
     """What would refuse after the redemption, asked before it: the config and unit connect may not
-    change, and the root, its agent lock and its seat. The root is known now only as `local`'s recorded
-    ROOT (the only one connect's install accepts); with none, any agent operation in progress refuses."""
+    change; for `local`'s recorded ROOT and the root `agent_id` names, the agent lock and who holds the
+    root; the recorded ROOT's seat; with no recorded ROOT, any agent operation in progress refuses too."""
     cfg, problem = cm.owned_config(local)
     problem = problem or cm.owned_text(cm.supervisor_path(local), cm.supervisor_marker(local), "supervisor file")[1]
     if problem:
         return problem
-    root = (cfg or {}).get("ROOT", "")
-    busy = cm.agent_lock_busy(root) if root else cm.agent_operation_in_progress()
+    recorded = (cfg or {}).get("ROOT", "")
+    roots = [r for r in dict.fromkeys((recorded, named_root(agent_id) if agent_id else "")) if r]
+    busy = next((b for b in map(cm.agent_lock_busy, roots) if b), "") or \
+        ("" if recorded else cm.agent_operation_in_progress())
     if busy:
         return f"another operation on an agent is in progress (lock {busy}); wait for it, then try again"
-    return (cm._free_root_problem(root) or cm.seat_problem(bridge_home(root))) if root else ""
+    problem = next((p for p in map(cm._free_root_problem, roots) if p), "")
+    return problem or (cm.seat_problem(bridge_home(recorded)) if recorded else "")
 
 
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
@@ -710,7 +731,7 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
         job, problem = cm.agent_job(local, agent_id)
         local = job or local
     problem = problem or (preflight() or cm.active_job_problem(local) or agent_owner_problem(local, agent_id)
-                          or known_root_problem(local))
+                          or known_root_problem(local, agent_id))
     code, why = cm.read_code(code_arg) if not problem else ("", "")
     problem = problem or why or cm.code_problem(base, code)
     if problem:
@@ -759,8 +780,10 @@ def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict,
 
 
 def finish_connect(seat: dict, install, command: str, flags) -> int:
-    """install() still under the agent lock connect took for the seat, then that lock released, and
+    """install() still under the agent lock connect took for the seat, then that lock released, the start it
+    left settled, and on a failure install's bridge reconciliation (orphan_bridge, deferred to here), then
     connect's closing line: what to verify, or how the spent code's seat is installed again."""
+    _FINAL.pop(threading.get_ident(), None)
     try:
         rc = install()
     except BaseException:
@@ -769,6 +792,10 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
     finally:
         seat["lock"].release()
     rc = cm.settle(seat["root"], rc)
+    root, orphan = _FINAL.pop(threading.get_ident(), (None, None))
+    line = _reconciled(root, orphan) if rc != 0 and orphan is not None and cm.mutated() else ""
+    if line:
+        print(line, file=sys.stderr)
     if rc == 0:
         print(f"next: {cm.job_command(seat['local'], 'verify')} (the bridge reports connected within a minute)")
     else:

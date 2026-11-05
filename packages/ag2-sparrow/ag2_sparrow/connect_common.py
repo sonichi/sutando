@@ -1886,9 +1886,7 @@ def await_started() -> int:
                 with agent_lock(root):
                     rec = _fresh_holder(shape, root, p["before"], wait_s=0)
                     why = _holder_problem(shape, root, rec, p)
-                    undone = _undo_start(p) if why else ""
-                    # A session that never held its root gets no bridge: what waited on it is withdrawn.
-                    undone += "".join(f"; {line}" for line in (f() for f in p.get("failed", ())) if why and line)
+                    undone = (_undo_start(p) + _unwaited(p)) if why else ""
             except Busy:
                 undone = _left_unlocked(p)
         if why:
@@ -1896,12 +1894,33 @@ def await_started() -> int:
             print(f"error: {why}{p['advice']}; {undone}", file=sys.stderr)
             continue
         failed = max(failed, _then(shape, root, p.get("then", ())))
-        _STARTED[shape.job] = dict(p, undo=[], then=[], failed=[])
+        _STARTED[shape.job] = dict(p, undo=[], then=[], failed=[], kept=[])
         linger(shape)
         holder = p["holder"]
         print(f"the managed launcher acquired the expected root: {root} "
               f"({holder(root, rec) if holder is not None else 'launcher pid %s' % rec['pid']})")
     return failed
+
+
+def serving_session(shape: Shape, root: str) -> str:
+    """'' when no session serves `root` (`shape`'s job is not active and no live holder, managed or foreground,
+    holds it); else which does. A holder that cannot be read counts as one."""
+    if manager_state(shape) == "active":
+        return f"{job_name(shape)} is running"
+    held = lock_held(root)
+    if held == "free":
+        return ""
+    return f"{root} is {holder_line(root)}" if held == "held" else f"who holds {root} cannot be read"
+
+
+def _unwaited(p: dict) -> str:
+    """Under the agent lock, after a pending start failed: what waited on its session (the bridge) is withdrawn
+    only while no session serves the root; else it is kept and what this attempt stopped is restored."""
+    if not (p.get("failed") or p.get("kept")):
+        return ""
+    served = serving_session(p["shape"], p["root"])
+    lines = [line for line in (f() for f in p.get("kept" if served else "failed", ())) if line]
+    return "".join(f"; {line}" for line in ([f"the agent's bridge was kept: {served}"] if served else []) + lines)
 
 
 def _then(shape: Shape, root: str, steps) -> int:

@@ -1410,7 +1410,7 @@ class ConnectCode(UndoSeams, Base):
         seed_seat(cb.bridge_home(self.root), "other-bearer-PPPP6666")
         return {p: p.read_bytes() for p in sorted(self.seat().iterdir())}
 
-    def test_a_root_another_adapter_holds_is_refused_before_the_seat_is_written(self):
+    def test_a_root_another_adapter_holds_is_refused_before_the_code_is_read(self):
         before = self.seated_by_another_adapter()
         holder = hold(self.root, "claude-local")
         try:
@@ -1421,8 +1421,31 @@ class ConnectCode(UndoSeams, Base):
         self.assertEqual({p: p.read_bytes() for p in sorted(self.seat().iterdir())}, before, "byte-identical")
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertIn(f"{self.root} is held by launcher pid {holder.pid}; stop what holds it", err)
+        self.assertIn("the code was not used", err)
+        self.assertEqual(backend.calls, [], "--agent names the root: it is checked before the code is spent")
+        self.assertFalse(cli.config_path(LA).exists())
+        self.assertFalse(cm.service_path(B).exists())
+
+    def test_a_root_taken_after_the_preflight_is_refused_before_the_seat_is_written(self):
+        before = self.seated_by_another_adapter()
+        holders, real = [], cm.redeem_code
+
+        def redeemed_then_taken(*a, **kw):
+            out = real(*a, **kw)
+            holders.append(hold(self.root, "claude-local"))
+            return out
+        try:
+            backend = Backend()
+            with mock.patch.object(cm, "redeem_code", side_effect=redeemed_then_taken):
+                rc, _out, err = self.connect(backend)
+        finally:
+            for h in holders:
+                unhold(h)
+        self.assertEqual({p: p.read_bytes() for p in sorted(self.seat().iterdir())}, before, "byte-identical")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"{self.root} is held by launcher pid {holders[0].pid}; stop what holds it", err)
         self.assertIn("the code is spent and nothing was written", err)
-        self.assertEqual(len(backend.calls), 1, "the root is known only from the redemption's agent id")
+        self.assertEqual(len(backend.calls), 1, "the race after the preflight is still caught after the redemption")
         self.assertFalse(cli.config_path(LA).exists())
         self.assertFalse(cm.service_path(B).exists())
 
@@ -1467,7 +1490,7 @@ class ConnectCode(UndoSeams, Base):
         self.root.mkdir(parents=True)
         holder = hold(self.root, "claude-local")
         try:   # the job at the other root is not this agent's: its own root, held, refuses the seat
-            self.assert_refused_untouched(fake, f"{self.root} is held by")
+            self.assert_refused_untouched(fake, f"{self.root} is held by", unspent=True)
         finally:
             unhold(holder)
 
@@ -1504,7 +1527,7 @@ class ConnectCode(UndoSeams, Base):
         self.root.mkdir(parents=True)
         holder = hold(self.root, cli.SHAPE)
         try:   # the job at the other root is not this agent's: its own root, held, refuses the seat
-            self.assert_refused_untouched(fake, f"{self.root} is held by")
+            self.assert_refused_untouched(fake, f"{self.root} is held by", unspent=True)
         finally:
             unhold(holder)
 
@@ -1814,15 +1837,16 @@ class ConnectCode(UndoSeams, Base):
 
     def test_a_holder_that_takes_the_root_after_the_clean_check_keeps_the_seat(self):
         self.root.mkdir(parents=True)
-        late, real = [], cm._free_root_problem
+        late, real, redeem, redeemed = [], cm._free_root_problem, cm.redeem_code, []
 
-        def checked_then_taken(root):
+        def checked_then_taken(root):     # the clean check after the redemption, then the root taken
             got = real(root)
-            if not late:
+            if redeemed and not late:
                 late.append(hold(self.root, "claude-local"))
             return got
         try:
-            with mock.patch.object(cm, "_free_root_problem", side_effect=checked_then_taken):
+            with mock.patch.object(cm, "_free_root_problem", side_effect=checked_then_taken), \
+                    mock.patch.object(cm, "redeem_code", side_effect=lambda *a, **kw: redeemed.append(1) or redeem(*a, **kw)):
                 self.assert_refused_untouched(None, f"{self.root} was taken by another process first")
         finally:
             for p in late:
@@ -1884,6 +1908,48 @@ class ConnectCode(UndoSeams, Base):
         self.assertNotIn("next:", out)
         self.assertIn(f"; this attempt was undone: {cm.job_name(LA)}, the job its install started, was stopped", err)
         self.assertIsNone(fake.runner.pid(), "the job this attempt started is not left running")
+
+    def lost_reconnect(self, mac, host, foreground):
+        """Connected once; the managed launcher stops while its bridge remains; reconnect's manager accepts the
+        new start, but its launcher never takes the root, and (`foreground`) a foreground session takes it first."""
+        holders, real = [], cm._start_pending
+
+        def lost(shape, *a, **kw):
+            problem = real(shape, *a, **kw)
+            if shape.job == LA.job and not problem:
+                fake.runner.session.kill()
+                fake.runner.session.wait(timeout=30)
+                if foreground:
+                    holders.append(hold(self.root, cli.SHAPE))
+            return problem
+        hosted = mock.patch.object(_dirs, "bridge_host", return_value=host) if host else contextlib.nullcontext()
+        try:
+            with hosted, platform_as(mac):
+                fake = self.running_job()
+                fake.runner.stop_session()
+                decl, unit = cb.bridge_home(self.root) / cb.DECLARATION, cm.supervisor_path(B)
+                before = decl.read_bytes() if host else unit.read_bytes()
+                self.assertTrue(host or fake.active, "the bridge remains")
+                with mock.patch.object(cm, "_start_pending", side_effect=lost):
+                    rc, out, err = self.connect(Backend(), fake)
+                self.assertNotEqual(rc, 0, out + err)
+                if foreground:
+                    self.assertIsNone(holders[0].poll(), "the foreground session still holds the root")
+                    if host:
+                        self.assertEqual(_bytes(decl), before, "the declaration is kept as it was")
+                    else:
+                        self.assertEqual(_bytes(unit), before, "the unit is kept")
+                        self.assertTrue(fake.active, "the bridge this attempt stopped runs again")
+                    kept = f"the agent's bridge was kept: {self.root} is held by launcher pid {holders[0].pid}"
+                    self.assertIn(f"; {kept}", err, "the failed start's cleanup kept it")
+                    self.assertIn(f"\n{kept}\n", err, "and so did connect's final reconciliation")
+                else:
+                    self.assertNotIn("the agent's bridge was kept", err)
+                    self.assertFalse(decl.exists() if host else unit.exists(), "no session: the bridge is withdrawn")
+                    self.assertFalse(fake.active)
+        finally:
+            for h in holders:
+                unhold(h)
 
     def test_a_job_started_after_the_seat_write_is_left_running_and_connect_refuses(self):
         fake = self.running_job()
@@ -2529,6 +2595,24 @@ class ConnectCode(UndoSeams, Base):
         self.assertFalse(cm.service_path(B).exists())
         self.assertIn(f"kept: {self.seat() / '.env'}", out)
         self.assertTrue((self.seat() / "token").exists(), "the credential is kept")
+
+
+def _bytes(path):
+    return path.read_bytes() if path.exists() else None
+
+
+def _lost_reconnect_test(mac, host, foreground):
+    def test(self):
+        self.lost_reconnect(mac, host, foreground)
+    return test
+
+
+for _mac in (False, True):
+    for _host in ("", "sparrowd"):
+        for _fg in (True, False):
+            setattr(ConnectCode, "test_a_reconnect_whose_launcher_never_takes_the_root_%s_%s_%s" % (
+                "keeps_the_foreground_sessions_bridge" if _fg else "cleans_up_with_no_session",
+                "launchd" if _mac else "systemd", _host or "unit"), _lost_reconnect_test(_mac, _host, _fg))
 
 
 class InstallTokenEnvFile(Base):
