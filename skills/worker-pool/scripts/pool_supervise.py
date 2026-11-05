@@ -37,6 +37,7 @@ ps = _sibling("pool_supervision")
 pb = _sibling("pool_beat")
 pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
+pl = _sibling("pool_limit")
 prr = _sibling("pool_routing_receipt")
 pd = _sibling("pool_delivery")
 
@@ -211,24 +212,29 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
 
 
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
-                 runner=subprocess.run) -> tuple[str | None, str | None]:
-    """(pane kind, frame id) of this worker's pane; (None, None) when unread."""
+                 runner=subprocess.run, now=None) -> tuple[str | None, str | None, float | None]:
+    """(pane kind, frame id, limit reset time); all None when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
-        return None, None
+        return None, None, None
     try:
         # -e as the notifier captures: both read the same bytes, so a dim placeholder is one verdict.
         done = runner(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-t", f"={name}:0"],
                       capture_output=True, text=True, timeout=8)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None, None
+        return None, None, None
     text = done.stdout if done.returncode == 0 else None
     if not text or not text.strip():
-        return None, None
+        return None, None, None
     kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
     if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
         pane_gate.save_frame(workspace, name, kind, text)
-    return kind, frame_id(text)
+    return kind, frame_id(text), (pl.reset_at(plain_text(text), time.time() if now is None else now)
+                                  if kind == ps.PANE_LIMIT else None)
+
+
+def plain_text(text: str) -> str:
+    return pane_gate.SGR_STRIP.sub("", text)
 
 
 def frame_id(text: str) -> str:
@@ -278,9 +284,9 @@ def observe(workspace, now: float, *, worker_ids=None,
         held = None
         if session_alive is True and watcher_beat != pb.LIVE:
             held = session_watcher_holds(workspace, wid, runner=runner)
-        pane, pane_id = (observe_pane(workspace, wid, row.get("runtime") or "claude",
-                                      runner=runner)
-                         if session_alive is True else (None, None))
+        pane, pane_id, reset = (observe_pane(workspace, wid, row.get("runtime") or "claude",
+                                      runner=runner, now=now)
+                         if session_alive is True else (None, None, None))
         socket = _open_tmux(workspace, wid)[0] if session_alive is True else None
         if socket and socket not in blocks:
             blocks[socket] = delivery_block(socket)
@@ -293,6 +299,7 @@ def observe(workspace, now: float, *, worker_ids=None,
             work_outstanding=work_outstanding(workspace, wid),
             pane=pane,
             pane_id=pane_id,
+            limit_reset_at=reset,
             delivery_block=blocks.get(socket) if socket else None,
         )
     return obs
@@ -394,6 +401,9 @@ def load_state(workspace) -> ps.SupervisionState:
                 wedge_escalated=bool(ev.get("wedge_escalated")),
                 wedge_kind=ev.get("wedge_kind"),
                 last_pane_id=ev.get("last_pane_id"),
+                limit_next_at=ev.get("limit_next_at"),
+                limit_attempts=int(ev.get("limit_attempts") or 0),
+                limit_exhausted=bool(ev.get("limit_exhausted")),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -418,7 +428,10 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "wedge_consecutive": e.wedge_consecutive,
                         "wedge_escalated": e.wedge_escalated,
                         "wedge_kind": e.wedge_kind,
-                        "last_pane_id": e.last_pane_id}
+                        "last_pane_id": e.last_pane_id,
+                        "limit_next_at": e.limit_next_at,
+                        "limit_attempts": e.limit_attempts,
+                        "limit_exhausted": e.limit_exhausted}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -468,6 +481,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
                             if e.wedge_consecutive and e.wedge_kind},
+            "limit_waits": {w: {"next_at": e.limit_next_at, "attempts": e.limit_attempts,
+                                  "exhausted": e.limit_exhausted}
+                            for w, e in new_state.workers.items() if e.limit_next_at is not None},
             "routing": routing_status(workspace),
             "sentinels_retired": retired,
             "sentinel_retire_errors": retire_errors,

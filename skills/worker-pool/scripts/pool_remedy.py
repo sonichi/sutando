@@ -400,6 +400,24 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
+def retry_limit(workspace, worker_id):
+    """Request a fresh turn through ordinary routed delivery, never by typing keys."""
+    if (sup.is_paused(workspace, worker_id)
+            or worker_id not in sup.supervised_workers(workspace)
+            or sup.work_outstanding(workspace, worker_id) is not True):
+        return {"worker_id": worker_id, "outcome": "no-work-or-paused"}
+    ask = _sibling("pool_ask")
+    try:
+        delivery = ask.ask(workspace, worker_id,
+            "The usage-limit recovery probe is due. Re-arm your session-role task watcher "
+            "using the normal worker bootstrap, then process your outstanding deliveries. "
+            "Do not run core startup or core schedules. If still usage-limited, leave the "
+            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.")
+    except (OSError, ValueError) as exc:
+        return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
+    return {"worker_id": worker_id, "outcome": "rearm-queued", "task_id": delivery["task_id"]}
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
@@ -425,6 +443,8 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
                 continue
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
+        elif decision == ps.RETRY_LIMIT:
+            rearms[worker_id] = retry_limit(workspace, worker_id)
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)

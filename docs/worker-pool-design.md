@@ -719,3 +719,22 @@ Each of these is out of scope for v1, and none is an oversight.
 5. Identity persistence versus context restoration — resuming is not remembering.
 6. How a steering message reaches the in-flight task it steers.
 7. Per-worker schedule durability, and suppression on pause.
+
+### Usage-limit recovery requests
+
+A live pane classified as `limit` with outstanding deliveries uses a separate
+persisted wait, instead of the watcher-loss or human-card ladder. A printed reset
+time (including its named timezone) sets the first due time; unreadable or absent
+reset text uses a 15-minute probe interval. A due tick requests one fresh turn
+through `pool_ask` and the normal recipient routing path, asking the worker to
+re-arm its session watcher and process its existing inbox. It never sends pane
+keys or restarts the worker from the recovery action.
+
+Still-limited observations back off for 15, 30, 60 and 120 minutes, with at most
+four delivery requests before escalation. The attempt count survives supervisor
+restarts and unknown observations; a positively idle/working pane starts a new
+episode. Paused workers and workers without outstanding work receive no request.
+
+This action queues a request, not proof of a completed model turn. A standalone
+Claude notifier still uses the guarded pane sender when no session Monitor is
+alive; routing does not supply an independent transport around that notifier.

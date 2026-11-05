@@ -9,8 +9,8 @@ sleep, in microseconds.
 The rungs come from docs/worker-pool-design.md and the owner's settlement:
 detection at the design's 90 s stale line, silent recovery, and only if recovery
 has not brought the worker back by 3 minutes does the owner get asked. A live
-session that is wedged (a gate, a limit, abnormal text or a frozen turn while the
-worker owes work) is never restarted: it only ever reaches the owner as a card.
+session is never restarted for a live-pane wedge. Limits with owed work request
+bounded fresh turns through delivery; other wedges reach the owner as cards.
 """
 from __future__ import annotations
 
@@ -34,6 +34,10 @@ UNDELIVERED_AFTER_S = 900.0
 
 # Beat readings, as pool_beat classifies them.
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
+
+RETRY_LIMIT = "retry_limit"
+LIMIT_PROBE_S = 900.0
+LIMIT_MAX_ATTEMPTS = 4
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
@@ -79,6 +83,7 @@ class Observation:
     pane_id: str | None = None
     # Why typed delivery cannot reach this seat, when the caller can tell ("pane-key-fence").
     delivery_block: str | None = None
+    limit_reset_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +104,9 @@ class WorkerEvidence:
     # The kind this tick's wedge reads as; `wedge_escalated` is about this kind only.
     wedge_kind: str | None = None
     last_pane_id: str | None = None
+    limit_next_at: float | None = None
+    limit_attempts: int = 0
+    limit_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -325,6 +333,33 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             continue
 
         ev = workers.get(worker_id, WorkerEvidence())
+
+        if obs.session_alive is True and obs.pane == PANE_LIMIT:
+            ev = _cleared_wedge(ev)
+            if obs.work_outstanding is not True:
+                workers[worker_id] = ev
+                decisions[worker_id] = NOTHING
+                continue
+            due = ev.limit_next_at
+            if due is None:
+                due = obs.limit_reset_at if obs.limit_reset_at is not None else now + LIMIT_PROBE_S
+            elif obs.limit_reset_at is not None:
+                due = max(due, obs.limit_reset_at)
+            ev = replace(ev, limit_next_at=due)
+            decision = NOTHING
+            if now >= due and not ev.limit_exhausted:
+                if ev.limit_attempts >= LIMIT_MAX_ATTEMPTS:
+                    decision = ESCALATE
+                    ev = replace(ev, limit_exhausted=True)
+                else:
+                    decision = RETRY_LIMIT
+                    ev = replace(ev, limit_attempts=ev.limit_attempts + 1,
+                                 limit_next_at=now + LIMIT_PROBE_S * 2 ** ev.limit_attempts)
+            workers[worker_id] = ev
+            decisions[worker_id] = decision
+            continue
+        if obs.session_alive is True and obs.pane in (PANE_IDLE, PANE_WORKING):
+            ev = replace(ev, limit_next_at=None, limit_attempts=0, limit_exhausted=False)
 
         # A session that answers contradicts "the session is gone", so it clears a
         # death as surely as a beat does; an UNANSWERED probe does not, and holds.
