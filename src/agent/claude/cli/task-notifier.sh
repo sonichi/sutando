@@ -1014,9 +1014,10 @@ while :; do
   if notifier_proc_live "$watcher_pid"; then
     log_notifier "standby watcher (pid $watcher_pid) closed its events pipe but is still running; stopping it and this notifier"
     STANDBY_END_WHY="standby watcher closed its events pipe"
+    STANDBY_END_TRIES=1
   else
     STANDBY_END_WHY="standby watcher exited"
+    STANDBY_END_TRIES=10
   fi
-  STANDBY_END_TRIES=10
   break   # the events stream ended -- stop the notifier
 done < "$event_dir/events"
