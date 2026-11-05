@@ -123,6 +123,8 @@ class LimitRecovery(unittest.TestCase):
         self.assertEqual(sup.pl.reset_at("resets Dec 31 at 11pm (UTC)", new_year),
                          datetime(2026, 12, 31, 23, tzinfo=timezone.utc).timestamp())
         self.assertEqual(sup.pl.reset_at("resets Nov 5 at 11am (UTC)", NOW), NOW - 3600)
+        autumn = datetime(2028, 9, 1, tzinfo=timezone.utc).timestamp()
+        self.assertIsNone(sup.pl.reset_at("resets Feb 29 at 2pm (UTC)", autumn))
 
     def test_unchanged_relative_banner_keeps_its_first_deadline_across_midnight(self):
         text = "  ⎿  You've hit your weekly limit · resets tomorrow 2pm (UTC)\n❯ \n"

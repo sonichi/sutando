@@ -756,7 +756,7 @@ def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
     gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
     if gate:
         return gate in LIMIT_GATES
-    return limit_banner(capture) is not None or (abn is not None and abn.kind == "provider-limit")
+    return abn is not None and abn.kind == "provider-limit"
 
 
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
