@@ -17,6 +17,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "task-progress" / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 import notify  # noqa: E402
@@ -55,6 +60,12 @@ class NotifyWorkerStampTests(unittest.TestCase):
         p = self._payload({"SUTANDO_CORE_ID": "3", "SUTANDO_WORKER_ID": ""})
         self.assertEqual(p["extra_content"], {"space.ag2.worker": {"id": "worker-3"}})
 
+    def test_extra_content_merges_with_the_stamp(self):
+        tag = {"space.ag2.agent_alert": {"agent": "core@mac"}}
+        p = self._payload({"SUTANDO_WORKER_ID": "core-7"}, extra=tag)
+        self.assertEqual(p["extra_content"],
+                         {**tag, "space.ag2.worker": {"id": "core-7"}})
+
     def test_no_worker_env_sends_no_stamp(self):
         p = self._payload({})
         self.assertNotIn("extra_content", p)
@@ -78,6 +89,16 @@ class NotifyThreadRootTests(unittest.TestCase):
             rc = notify.main()
         return rc, sent
 
+    def test_extra_content_flag_reaches_the_payload(self):
+        rc, sent = self._send(["--extra-content", '{"space.ag2.agent_alert": {"agent": "a"}}'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["extra_content"], {"space.ag2.agent_alert": {"agent": "a"}})
+
+    def test_extra_content_must_be_a_json_object(self):
+        for bad in ("[1]", "not json"):
+            rc, sent = self._send(["--extra-content", bad])
+            self.assertEqual((rc, sent), (1, []), bad)
+
     def test_thread_root_flag_threads_the_message(self):
         rc, sent = self._send(["--thread-root", "$root123"])
         self.assertEqual(rc, 0)
@@ -97,6 +118,18 @@ class NotifyThreadRootTests(unittest.TestCase):
     def test_malformed_thread_root_is_refused_without_posting(self):
         for bad in ("root123", "   ", "$"):
             rc, sent = self._send(["--thread-root", bad])
+            self.assertEqual(rc, 1, repr(bad))
+            self.assertEqual(sent, [], repr(bad))
+
+    def test_reply_to_flag_cites_without_threading(self):
+        rc, sent = self._send(["--reply-to", "$ask123"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
+                                 "reply_to": "$ask123"}])
+
+    def test_malformed_reply_to_is_refused_without_posting(self):
+        for bad in ("ask123", "   ", "$"):
+            rc, sent = self._send(["--reply-to", bad])
             self.assertEqual(rc, 1, repr(bad))
             self.assertEqual(sent, [], repr(bad))
 
@@ -193,22 +226,39 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
-    def test_no_thread_root_threads_under_source_message_id_not_reply_to_event(self):
-        # reply_to_event is the post the sender quoted (often someone else's);
-        # the asking message is source_message_id.
+    def test_no_thread_root_cites_source_message_id_as_reply_to_not_thread_root(self):
+        # No real thread_root header: cites the asking message (never
+        # reply_to_event, the post the sender quoted) without nesting a thread.
         f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "source_message_id: $ask\nreply_to_event: $other\ntask: x\n")
         rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
-        self.assertEqual(sent[0]["thread_root"], "$ask")
+        self.assertNotIn("thread_root", sent[0])
+        self.assertEqual(sent[0]["reply_to"], "$ask")
 
-    def test_thread_root_wins_over_source_message_id(self):
+    def test_thread_root_and_source_message_id_both_sent(self):
+        # The two fields are independent, not mutually exclusive (relations.py).
         f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "source_message_id: $ask\nreply_to_event: $other\ntask: x\n"
                        "thread_root: $root\n")
         rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
         self.assertEqual(sent[0]["thread_root"], "$root")
+        self.assertEqual(sent[0]["reply_to"], "$ask")
+
+    def test_explicit_reply_to_overrides_what_the_task_file_carries(self):
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "source_message_id: $ask\ntask: x\n")
+        rc, sent, _ = self._send(["--task-file", f, "--reply-to", "$explicit"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["reply_to"], "$explicit")
+
+    def test_empty_explicit_reply_to_opts_out_of_the_file_citation(self):
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "source_message_id: $ask\ntask: x\n")
+        rc, sent, _ = self._send(["--task-file", f, "--reply-to", ""])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
     def test_missing_task_file_falls_back_to_explicit_flags_without_crashing(self):
         missing = os.path.join(tempfile.gettempdir(), "notify-does-not-exist-xyz.txt")

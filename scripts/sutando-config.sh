@@ -9,6 +9,7 @@
 # Usage:
 #   bash scripts/sutando-config.sh workspace     # print resolved workspace path
 #   bash scripts/sutando-config.sh vault-enabled # print "true" or "false"
+#   bash scripts/sutando-config.sh macos-notifications # print "true" or "false" (notifications.macos)
 #   bash scripts/sutando-config.sh vault-url     # print vault remote_url (may be empty)
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
 #   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
@@ -116,6 +117,15 @@ import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
 print('true' if resolve_vault().get('enabled') else 'false', end='')
+"
+    ;;
+
+  macos-notifications)
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_macos_notifications
+print('true' if resolve_macos_notifications() else 'false', end='')
 "
     ;;
 
@@ -262,6 +272,29 @@ print(resolve_core_runtime(), end='')
 "
     ;;
 
+  desktop-runtime-select)
+    # Persist an explicit --runtime switch as the desktop's coreRuntime. Prints
+    # updated|unchanged|no-desktop (--check: would-update, writing nothing); nonzero when unwritable.
+    case "${2:-}" in
+      claude|codex) ;;
+      *) echo "sutando-config: desktop-runtime-select needs claude or codex" >&2; exit 2 ;;
+    esac
+    case "${3:-}" in
+      '') _check=False ;;
+      --check) _check=True ;;
+      *) echo "sutando-config: desktop-runtime-select takes only --check after the runtime" >&2; exit 2 ;;
+    esac
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import persist_desktop_runtime_selection
+try:
+    print(persist_desktop_runtime_selection('$2', check=$_check), end='')
+except (OSError, ValueError) as exc:
+    sys.exit(f'sutando-config: desktop runtime selection not written: {exc}')
+"
+    ;;
+
   core-config-dir-value)
     # v0.9 — print the resolved value (absolute path) of the matching
     # core_config_dirs entry. Selector semantics identical to
@@ -276,6 +309,25 @@ if entry is None:
     sys.exit(0)
 print(entry['value'], end='')
 "
+    ;;
+
+  codex-home-path)
+    # The core_config_dirs codex value the Codex launcher exports, else $CODEX_HOME, else
+    # Codex's own default. Extra args join as sub-path components, as in claude-home-path.
+    _cxh_base="$(py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import find_core_config_dir
+entry = find_core_config_dir(type_='codex')
+print(entry['value'] if entry else '', end='')
+")"
+    [ -n "$_cxh_base" ] || _cxh_base="${CODEX_HOME:-$HOME/.codex}"
+    _cxh_base="${_cxh_base/#\~/$HOME}"
+    shift
+    for _p in "$@"; do
+      _cxh_base="$_cxh_base/$_p"
+    done
+    printf '%s' "$_cxh_base"
     ;;
 
   core-config-dirs)
@@ -801,7 +853,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|skill-roots [workspace]|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|macos-notifications|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|skill-roots [workspace]|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

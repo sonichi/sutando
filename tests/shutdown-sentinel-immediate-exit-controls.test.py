@@ -36,8 +36,14 @@ NEEDED = (
     "src/agent/claude/cli/session-launch.sh",
     "src/agent/codex/cli/start-cli.sh",
     "src/agent/restart-guard.sh",
+    "src/agent/core-runtime-record.sh",
+    "src/agent/core-window.sh",
+    "src/agent/launch-path.sh",
+    "src/core_runtime_record.py",
+    "src/result_publish.py",
     "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
+    "src/local_services.sh",
     "src/shutdown.py",
     "src/workspace_default.py",
     "src/sutando_config.py",
@@ -154,6 +160,8 @@ def run_branch(label: str, launcher_rel: str, env_extra: dict, *, tty: bool = Fa
         _exe(binp / "tmux", TMUX_STUB)
         _exe(binp / "pgrep", PGREP_STUB)
         _exe(binp / "codex", CODEX_STUB)
+        # The claude launcher refuses before tmux when `claude` does not resolve.
+        _exe(binp / "claude", CODEX_STUB)
         _exe(binp / "fswatch", "#!/bin/bash\nexit 0\n")
         # mktemp is load-bearing: without it claude_config_dir.sh fails and the
         # launcher exits before reaching tmux, making the assert vacuous.

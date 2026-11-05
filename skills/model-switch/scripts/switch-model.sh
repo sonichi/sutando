@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
+# switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
 # Sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
 set -u
-MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""
+MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""
 while [ $# -gt 0 ]; do case "$1" in
-  --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
+  --dry-run) DRY=1;; --offline) OFFLINE=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
   --picker-dismiss-after) DISMISS_AFTER="${2:?}"; shift;;
   --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
 esac; shift; done
 [ -n "$MODEL" ] || { echo "usage: switch-model.sh <model> [--dry-run]" >&2; exit 2; }
-# Aliases the CLI's /model accepts, or a full id with an optional context tag.
-if ! printf '%s' "$MODEL" | grep -Eq '^(default|opus|sonnet|haiku|fable|claude-[a-z0-9.-]+(\[1m\])?)$'; then
+# Aliases the CLI's /model accepts, or a full id; a family alias or id may carry a context tag.
+if ! printf '%s' "$MODEL" | grep -Eq '^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$'; then
   echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
 fi
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -51,6 +51,42 @@ if [ $RRC -ne 0 ] || [ -z "$RUNTIME" ]; then echo "switch-model: refused — cor
 case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecognized core runtime '$RUNTIME'; nothing changed" >&2; exit 4;; esac
 if [ "$RUNTIME" = "codex" ]; then
   echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
+fi
+# --offline: the core is down, so no CLI can take /model; write its settings for the next launch.
+# Refused while any core process for this session runs, which then owns its settings.
+if [ -n "$OFFLINE" ]; then
+  if pgrep -f "claude --name $SESSION( |$)" > /dev/null 2>&1; then
+    echo "switch-model: refused --offline — a core is running for '$SESSION'; switch it live instead. Nothing changed." >&2; exit 9
+  fi
+  OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
+import json, os, sys, time, tempfile
+cfg, model, state_dir = sys.argv[1:4]
+try:
+    data = json.load(open(cfg))
+    if not isinstance(data, dict): raise ValueError("settings is not an object")
+except FileNotFoundError:
+    data = {}
+except (OSError, ValueError) as e:
+    print(f"FAILED settings unreadable: {e}"); sys.exit(1)
+prev = data.get("model")
+def put(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".model-switch.staged.")
+    with os.fdopen(fd, "w") as f: json.dump(obj, f, indent=2); f.write("\n")
+    os.replace(tmp, path)
+try:
+    put(cfg, dict(data, model=model))
+    put(os.path.join(state_dir, "model-switch.json"), {"model": model, "previous": prev, "previous_source": "settings.json" if prev else "none",
+        "accepted": False, "applied": "settings (core down)", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "by": "skills/model-switch/scripts/switch-model.sh --offline", "settings_read": cfg})
+except OSError as e:
+    print(f"FAILED {e}"); sys.exit(1)
+print(f"OK {prev or '-'}")
+PYEOF
+)"
+  case "$OUT" in OK*) ;; *) echo "switch-model: --offline could not write ($CFG): ${OUT#FAILED }" >&2; exit 1;; esac
+  echo "switched: model=$MODEL (was ${OUT#OK }); the core is down, so it takes effect at its next launch; record: $STATE_DIR/model-switch.json"
+  exit 0
 fi
 # Preflight the live pane before any write through the ONE sender
 # (scripts/tmux-send-line.sh): its --dry-run inspects the prompt under the
@@ -92,18 +128,36 @@ case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core
 GATE="$REPO/src/self_opened_gate.py"
 "$PY" "$GATE" record --state-dir "$STATE_DIR" --session "$SESSION" --opener model-switch \
   --dismiss-after "${DISMISS_AFTER:-0}" --claim-window "$((ACCEPT_TIMEOUT * 2 + 30))" || echo "switch-model: could not write the picker attribution; a picker left behind will wait for a human" >&2
-bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null || { "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7; }
+bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; SEND_RC=$?
+if [ "$SEND_RC" = 125 ]; then
+  "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+  echo "switch-model: send may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 7
+elif [ "$SEND_RC" != 0 ]; then
+  "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
+fi
 CONFIRMED=false
 VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
 case "$VERDICT" in
   ACCEPTED) "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; CONFIRMED=true
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
+      case "$ANSWER_RC" in
+        0|11) CONFIRMED=true;;
+        125) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+             echo "switch-model: the confirming Enter may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 8;;
+        *) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+           echo "switch-model: the confirming Enter was not sent (rc=$ANSWER_RC); picker attribution retained, nothing recorded" >&2; exit 8;;
+      esac
       [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
     else
-      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null; CANCEL_RC=$?
+      if [ "$CANCEL_RC" != 0 ]; then
+        "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+        echo "switch-model: dialog cancel failed (rc=$CANCEL_RC); picker attribution retained, nothing recorded" >&2
+        exit 8
+      fi
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
       echo "switch-model: the core asked to confirm the switch (warm conversation cache); not confirmed — pass --confirm on an owner instruction. Dialog cancelled, nothing recorded" >&2; exit 6
     fi;;

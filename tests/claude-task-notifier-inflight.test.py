@@ -15,6 +15,9 @@ import subprocess
 import time
 import unittest
 from pathlib import Path
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "claude_task_notifier_harness", Path(__file__).resolve().parent / "claude-task-notifier.test.py")
@@ -334,14 +337,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
     def test_dropped_task_file_is_picked_up_by_the_real_watcher(self):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.assertTrue(
@@ -381,7 +383,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
         self.pane_file.write_text("API Error: 529 Overloaded\n" + IDLE_FOOTER + "\n")
         self.write_task("task-busy.txt")
         err = open(self.root / "notifier.stderr", "w")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env({"SUTANDO_NOTIFIER_CORE_READY_TIMEOUT": "1",
                            "SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
@@ -389,7 +391,6 @@ class MainLoopWiringTest(FakeTmuxHarness):
             stdout=subprocess.DEVNULL,
             stderr=err,
             text=True,
-            start_new_session=True,
         )
         try:
             deadline = time.time() + 6
@@ -433,14 +434,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         # had none of the notifier's own log_notifier lines to diagnose from (#4703).
         errf_path = self.root / "notifier.stderr"
         errf = open(errf_path, "w")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env({"SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=errf,
             text=True,
-            start_new_session=True,
         )
         def with_stderr(msg):
             return msg + "\nnotifier stderr:\n" + errf_path.read_text(errors="replace")
@@ -502,14 +502,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
                                text=True, env={**os.environ, "LC_ALL": "C"}).stdout.strip()
         (claims_dir / "task-claimed.txt").write_text(
             f"{holder.pid}\nlive-watcher\n{task}\nmust-handle\n{start}\n")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.assertTrue(
@@ -553,14 +552,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         held.mkdir(parents=True, exist_ok=True)
         self.write_task("task-held.txt")
         (held / "task-held.claimed").write_text("")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.assertTrue(

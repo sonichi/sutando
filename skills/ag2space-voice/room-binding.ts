@@ -4,6 +4,8 @@
 import { writeFileSync, readFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from '../../src/workspace_default.js';
 import type { VoiceSessionOrigin } from '../../src/task-bridge.js';
 import { MATRIX_ROOM_ID_RE, parseSessionContextFrame, type VoiceSessionRoom } from './session-context.js';
@@ -214,6 +216,29 @@ export function sessionRoomNotice(change: SessionRoomChange, room: VoiceSessionR
 	}
 	return null;
 }
+
+/** current_room: the room the session is docked in when asked, read from the binding, never from what the model was told. */
+export function createCurrentRoomTool(current: () => VoiceSessionRoom | null): ToolDefinition {
+	return {
+		name: 'current_room',
+		description:
+			'The AG2 Space room this voice session is docked in right now: the room the user has open, when you are in it. ' +
+			'Call it whenever the user asks which room you are in or whether you are in this room. ' +
+			'Returns {docked:true, room} or {docked:false}: not docked means you are in the owner\'s DM, not in any room.',
+		parameters: z.object({}),
+		execution: 'inline',
+		async execute() {
+			const room = current();
+			return room ? { docked: true, room: room.name || room.id } : { docked: false, room: null };
+		},
+	};
+}
+
+/** The prompt rule that goes with current_room; present only when the tool is declared. */
+export const CURRENT_ROOM_PROMPT_RULE = '- WHERE YOU ARE: which room you are in now, or whether you are in this room, is answered by current_room, every time — never from memory, an earlier notice, recent context or an earlier answer: the user moves between rooms, so an earlier answer is never the answer now. Not docked → say plainly you are in their DM, not in a room.';
+
+/** What the relay agent's turn check is told: where the session is docked is the voice model's own question. */
+export const CURRENT_ROOM_TURN_CHECK_RULE = '- none: which room the assistant is in now, or whether it is in this room, is answered by the assistant itself with current_room. It is never work.';
 
 /** The voice-context line for the docked room; none in the DM. */
 export function roomContextLines(room: VoiceSessionRoom | null): string[] {

@@ -43,6 +43,13 @@ an approved release PR.
    python3 skills/release/scripts/docs_audit.py
    ```
 
+   A `WARN` about `skills/tutorial/feature-list.json` names the tour steps
+   whose watched paths changed since the last plain `vX.Y.Z` tag while the
+   tour's `revision` did not. Whoever cuts the release updates those steps and
+   bumps `revision`. If the tour is unaffected, set the file's top-level
+   `"reviewed_at"` to that tag instead. That records the review durably and
+   silences the warning until the next tag.
+
 6. Perform a docs-impact pass. For every user-visible or contract change,
    identify the canonical document in `docs/catalog.json`. Update that document,
    its `last_verified` date, README navigation when appropriate, migration or

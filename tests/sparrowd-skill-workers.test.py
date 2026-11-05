@@ -19,6 +19,11 @@ import shutil
 import sys
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 FAILS = []
 
@@ -142,7 +147,7 @@ def outside_the_engine(mod):
 
 def guarded_scan(mod):
     """An unreadable root is skipped, a leftover folder claims no name, and a worker whose
-    manifest is not enabled is not started (the voice loader's gate)."""
+    manifest is not enabled still starts (workers own their runtime opt-in)."""
     import tempfile
     print("── guards ──")
     saved_repo, saved_py = mod.REPO, os.environ.get("WS_FIXTURE_PYTHON")
@@ -162,7 +167,7 @@ def guarded_scan(mod):
             (skill / "manifest.json").write_text(json.dumps(body), encoding="utf-8")
         (ws / "skills" / "leftover" / "__pycache__").mkdir(parents=True)
         put(ext / "skills", "leftover", "leftover-worker")
-        put(ext / "skills", "off-skill", "off-worker", enabled=False)
+        put(engine / "skills", "off-skill", "off-worker", enabled=False)
         put(ext / "skills", "unset-skill", "unset-worker", enabled=None)
         put(locked / "skills", "hidden", "hidden-worker")
         mod.REPO = engine
@@ -184,9 +189,9 @@ def guarded_scan(mod):
             finally:
                 mod._skill_manifests = real
             names = {s.name for s in specs}
-            check("a worker whose manifest says enabled: false is not started", "off-worker" not in names)
-            check("...nor one whose manifest has no enabled", "unset-worker" not in names)
-            check("...and the reason says so", any("not enabled" in r for r in skipped), str(skipped))
+            check("a shipped enabled:false declarer is still supervised", "off-worker" in names)
+            check("a declarer without enabled is still supervised", "unset-worker" in names)
+            check("enabled does not exclude supervised workers", not any("not enabled" in r for r in skipped), str(skipped))
             check("an enabled worker is still started", "leftover-worker" in names, str(skipped))
         finally:
             (locked / "skills").chmod(0o755)

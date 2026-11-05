@@ -10,6 +10,12 @@ reconciles before it reminds — the injected adapter is read through its pass; 
 resolves the declared adapter path and requires containment, as runtime discovery does, so a
 symlink escaping the skill is a lint error. No real room: the fake capability and in-process
 store of the room-db suite."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib
 import importlib.util
 import json
@@ -33,7 +39,7 @@ skill_roots = importlib.import_module("skill_roots")
 pqo = importlib.import_module("pending_questions_outbox")
 ADAPTER = Path(adapter.__file__)
 SKILL = REPO / "skills" / "pending-questions"
-ENV = {k: v for k, v in os.environ.items()
+ENV = {k: v for k, v in isolated_child_env().items()
        if k not in ("SUTANDO_INSTANCE_ID", "SUTANDO_WORKSPACE_DIR", "SUTANDO_TASKS_DIR", "PENDING_QUESTIONS_ROOM")}
 
 

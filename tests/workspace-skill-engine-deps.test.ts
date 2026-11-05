@@ -28,7 +28,7 @@ function loadedToolNames(workspace: string): { names: string[]; log: string } {
 	const driver = join(workspace, '..', 'driver.mjs');
 	writeFileSync(driver,
 		`const m = await import(process.env.INLINE_TOOLS_URL);\n` +
-		`console.log('__TOOLS__' + JSON.stringify([...m.envDependentToolNames]));\n`);
+		`console.log('__TOOLS__' + JSON.stringify([...m.envDependentToolNames]));\nprocess.exit(0);\n`);
 	const env: NodeJS.ProcessEnv = {
 		...process.env,
 		SUTANDO_TEST_MODE: '1',
@@ -36,7 +36,7 @@ function loadedToolNames(workspace: string): { names: string[]; log: string } {
 		INLINE_TOOLS_URL: pathToFileURL(join(REPO_ROOT, 'src', 'inline-tools.ts')).href,
 	};
 	for (const k of ['SUTANDO_EXTERNAL_PLUGIN_DIRS', 'SUTANDO_MEMORY_DIR', 'SUTANDO_PRIVATE_DIR', 'SUTANDO_WORKSPACE_DIR']) delete env[k];
-	const out = execFileSync(process.execPath, [TSX_CLI!, driver], { cwd: REPO_ROOT, encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] });
+	const out = execFileSync(process.execPath, [TSX_CLI!, driver], { cwd: REPO_ROOT, encoding: 'utf8', env, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
 	const line = out.split('\n').find(l => l.startsWith('__TOOLS__'));
 	assert.ok(line, `driver printed no tool list:\n${out}`);
 	return { names: JSON.parse(line.slice('__TOOLS__'.length)), log: out };

@@ -135,7 +135,8 @@ describe('the spoken block', () => {
 		assert.match(dist, /["']speech\.user_started["']/, 'the speech edge the agent stamps from is gone');
 		const agent = readFileSync(new URL('../src/voice-agent.ts', import.meta.url), 'utf-8');
 		assert.match(agent, /pendingInput: speechHost\.transcriptManager\?\.inputBuffer/);
-		assert.match(agent, /subscribe\('speech\.user_started', \(\) => \{ lastUserSpeechAt = Date\.now\(\);/);
+		// The handler takes the event now (its source tells the speech gate whether the microphone saw it); the stamp stays.
+		assert.match(agent, /subscribe\('speech\.user_started', \([^)]*\) => \{ lastUserSpeechAt = Date\.now\(\);/);
 	});
 
 	it('an identical call during the spoken-turn wait is a duplicate, not a second task file', async () => {

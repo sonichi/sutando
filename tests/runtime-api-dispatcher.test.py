@@ -9,6 +9,12 @@ are security contracts (governed-capability gating, fingerprint binding, one-tim
 approval consumption, idempotency, crash recovery), and a response object alone
 does not prove the row transitioned correctly.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import json
 import os
@@ -16,6 +22,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
@@ -162,6 +169,87 @@ check("cancel transitions to cancelled", c["status"] == "cancelled", str(c))
 check("cancellation is durable", store.get(rid)["status"] == "cancelled")
 check("public shape includes resolvedBy once set", "resolvedBy" in c, str(c))
 
+print("── cancellation reconciles only its human requirement ──")
+for kind, params in (("approval", {"action": "synthetic.approval"}),
+                     ("elicitation", {"question": "Choose?", "type": "confirmation"}),
+                     ("human_action", {"action": "Synthetic act"})):
+    d, store, ha, tmp = fresh()
+    rid = run(d.handle(f"{kind}.request", params))["requestId"]
+    aid = d._ha_of[rid]
+    other = run(d.handle("approval.request", {"action": "unrelated"}))["requestId"]
+    other_before = ha.manager.get(d._ha_of[other])
+    with mock.patch.object(ha, "cancel", wraps=ha.cancel) as cancel:
+        c = run(d.handle("request.cancel", {"requestId": rid}))
+    check(f"{kind}: dispatcher delegates the matching id", cancel.call_args_list == [mock.call(aid)])
+    check(f"{kind}: both records cancelled",
+          c["status"] == store.get(rid)["status"] == ha.manager.get(aid).status == "cancelled")
+    cancelled_row, cancelled_mirror = store.get(rid), ha.manager.get(aid)
+    d._cancel({"requestId": rid})
+    restarted = RuntimeDispatcher(store, HumanActionAdapter(str(tmp / "ha")), "after-restart", {})
+    restarted.recover()
+    check(f"{kind}: recovery does not relink cancelled requests", rid not in restarted._ha_of)
+    restarted._cancel({"requestId": rid})
+    check(f"{kind}: retries preserve records and revision",
+          store.get(rid) == cancelled_row and ha.manager.get(aid) == cancelled_mirror)
+    check(f"{kind}: unrelated requirement untouched", ha.manager.get(other_before.id) == other_before)
+    ha.resolve(other_before.id, {"1": [1]}, "synthetic-owner")
+    d._settle(other)
+    check(f"{kind}: unrelated request still resolves", store.get(other)["status"] == "approved")
+
+d, store, ha, tmp = fresh()
+rid = run(d.handle("approval.request", {"action": "retry"}))["requestId"]
+aid = d._ha_of[rid]
+with mock.patch("hitl.manager.os.replace", side_effect=OSError("synthetic write failure")):
+    try:
+        d._cancel({"requestId": rid})
+        check("cancel propagates mirror write failures", False)
+    except OSError as exc:
+        check("cancel propagates mirror write failures", str(exc) == "synthetic write failure")
+check("failure leaves a cancelled row and pending mirror",
+      store.get(rid)["status"] == "cancelled" and ha.manager.get(aid).status == "pending")
+restarted = RuntimeDispatcher(store, HumanActionAdapter(str(tmp / "ha")), "after-restart", {})
+restarted.recover()
+check("recovery alone does not clean up historical mismatches", ha.manager.get(aid).status == "pending")
+restarted._cancel({"requestId": rid})
+check("explicit retry repairs without the in-memory mapping", ha.manager.get(aid).status == "cancelled")
+
+for outcome in ("approved", "denied", "resolved", "completed", "declined", "expired", "failed"):
+    d, store, ha, _ = fresh()
+    rid = run(d.handle("approval.request", {"action": "terminal-control"}))["requestId"]
+    aid = d._ha_of[rid]
+    store.transition(rid, outcome, result={"answer": "keep"}, resolved_by="synthetic-owner")
+    before = store.get(rid)
+    with mock.patch.object(ha, "cancel", wraps=ha.cancel) as cancel:
+        c = d._cancel({"requestId": rid})
+    check(f"{outcome}: cancellation preserves terminal row and never touches mirror",
+          c["status"] == outcome and store.get(rid) == before and not cancel.called
+          and ha.manager.get(aid).status == "pending")
+
+d, store, ha, _ = fresh()
+rid = run(d.handle("approval.request", {"action": "race"}))["requestId"]
+transition = store.transition
+
+
+def resolve_before_cancellation(request_id, status, **kw):
+    transition(request_id, "approved", result={"answer": "keep"}, resolved_by="synthetic-owner")
+    return transition(request_id, status, **kw)
+
+
+with mock.patch.object(store, "transition", side_effect=resolve_before_cancellation), \
+        mock.patch.object(ha, "cancel", wraps=ha.cancel) as cancel:
+    c = d._cancel({"requestId": rid})
+check("cancel re-reads the durable winner before touching the mirror",
+      c["status"] == "approved" and c["result"] == {"answer": "keep"} and not cancel.called)
+
+for kind in ("capability", "approval"):
+    d, store, ha, _ = fresh()
+    rid = store.create(kind, f"{kind}.request", "synthetic", {})["requestId"]
+    with mock.patch.object(ha, "cancel", wraps=ha.cancel) as cancel:
+        c = d._cancel({"requestId": rid})
+    check(f"{kind}: missing mirror is not created",
+          c["status"] == "cancelled" and not ha.manager.store.all())
+    check(f"{kind}: only human requests delegate cancellation", cancel.called == (kind == "approval"))
+
 d, store, ha, _ = fresh()
 rid = run(d.handle("approval.request", {"action": "x.y"}))["requestId"]
 t0 = time.monotonic()
@@ -294,6 +382,55 @@ d.recover()
 check("recovery relinks a pending approval to its card", a_rid in d._ha_of, str(d._ha_of))
 check("recovery relinks a pending elicitation to its card", e_rid in d._ha_of, str(d._ha_of))
 check("recovered approval is still pending", store.get(a_rid)["status"] == "pending")
+
+print("── expired mirror reconciliation and retry ──")
+d, store, ha, tmp = fresh()
+expired_ids = []
+for kind, params in (("approval", {"action": "local"}),
+                     ("elicitation", {"question": "q", "type": "confirmation"}),
+                     ("human_action", {"action": "local"})):
+    rid = run(d.handle(kind + ".request", {**params, "expiresInS": 0.05}))["requestId"]
+    expired_ids.append(rid)
+    ha.manager.record_projection(d._ha_of[rid], 1, "$" + rid)
+time.sleep(0.1)
+d._settle(expired_ids[0])
+check("settle expires the mirror when its read expires the runtime row",
+      ha.manager.get(ha_action_id(expired_ids[0])).status == "expired")
+for rid in expired_ids:
+    store.get(rid)
+runtime_before = [store.get(rid) for rid in expired_ids]
+retry_id = ha_action_id(expired_ids[1])
+real_save = ha.manager.store.save
+failures = []
+
+
+def fail_once(req, *args, **kwargs):
+    if req.id == retry_id and req.status == "expired" and not failures:
+        failures.append(req.id)
+        raise OSError("synthetic transient mirror write failure")
+    return real_save(req, *args, **kwargs)
+
+
+d._ha_of.clear()
+with mock.patch.object(ha.manager.store, "save", side_effect=fail_once):
+    d.recover()
+    check("recovery isolates a transient mirror-write failure",
+          failures == [retry_id] and ha.manager.get(retry_id).status == "pending")
+    check("one failed expiry does not block another mirror",
+          ha.manager.get(ha_action_id(expired_ids[2])).status == "expired")
+    run(one_and_a_bit())
+check("periodic reconciliation retries an already-expired runtime row",
+      ha.manager.get(retry_id).status == "expired")
+snapshots = [ha.manager.get(ha_action_id(rid)) for rid in expired_ids]
+d.recover()
+run(one_and_a_bit())
+check("repeated success adds no revisions or runtime transitions",
+      snapshots == [ha.manager.get(ha_action_id(rid)) for rid in expired_ids]
+      and runtime_before == [store.get(rid) for rid in expired_ids])
+check("expiry preserves original projection receipts",
+      all(ha.manager.store.projection(ha_action_id(rid)) ==
+          {"revision": 1, "event_id": "$" + rid} for rid in expired_ids))
+check("expired mirrors leave active()", not ha.manager.active())
 
 print("── approval.respond (device-plane; needs a daemon-resolved grant) ──")
 d0, store0, ha0, _ = fresh(actor="ungranted")

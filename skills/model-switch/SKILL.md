@@ -7,7 +7,8 @@ user-invocable: true
 # model-switch
 
 `scripts/switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S]` — `<model>` is one of the
-CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id with an optional `[1m]` tag;
+CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id, either with an optional `[1m]`
+tag (`default` takes none);
 anything else is refused before any write (exit 2).
 
 Order, under one lock per brain (`<workspace>/state/.model-switch.lock`, held across preflight, send,
@@ -28,6 +29,12 @@ persist every `/model` pick, so the file can lag the live session), else null.
 (measured 2026-09-04: the key changed hours into a session with no repo writer). Measured the same
 day on a live core: the send alone exited 0 while the CLI sat at the confirm dialog and the model had
 not changed — which is why the send is treated as initiation and the record follows acceptance.
+
+**`--offline` (core down).** With no core process for the session there is no CLI to take `/model`,
+so `--offline` writes `model` into the runtime's `settings.json` (other keys kept) and records
+`model-switch.json` with `accepted: false`; the core starts on it at its next launch. It is refused
+(exit 9) while any `claude --name <session>` runs, and never overwrites a settings file it cannot
+read (exit 1). The launcher's provider-limit hold uses it for the owner's "switch to <model>" reply.
 
 **A picker left on screen.** Right before the send the script writes an attribution record through
 `src/self_opened_gate.py` (`<workspace>/state/self-opened-gate.<session>.json`) and clears it once the

@@ -39,7 +39,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import pending_questions_ledger as ledger
-from pending_questions_md import DIVIDER_RE, active_region, mask_markup
+from pending_questions_md import DIVIDER_RE, active_region, archive_boundary_damage, mask_markup
 from pending_questions_outbox import mark_store_used
 from pending_questions_store import Question, StoreError, question_body, row_body, row_id, safe_body
 
@@ -57,6 +57,9 @@ _BULLET_RE = re.compile(r"^[ \t]*-[ \t]+\*\*\[(.+?)\][^\n]*$", re.MULTILINE)
 # A heading main's reader treated as organisation or as already settled, never a question.
 _ORG_HEADING = re.compile(r"^\s*(?:Q\d+\s*[—–-]\s*)?(?:Open|Pending|Resolved|Done|Answered|Archive)\s*$", re.I)
 _INLINE_RESOLVED = re.compile(r"^\s*(?:\d+[.)]\s*)?\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]", re.I)
+# main's hand-written close: leading word, no brackets, case-sensitive (ALL CAPS
+# is the closing mark; "Resolved by whom...?" stays a question).
+_TITLE_RESOLVED = re.compile(r"^\s*(?:\d+[.)]\s*)?(?:✅\s*)?(?:SELF-)?RESOLVED(?=[\s\]—–:,]|$)")
 # Status words of an entry that still wants an answer; `moved` is one this ingest already copied.
 OPEN_WORDS = ("unanswered", "waiting", "open")
 MOVED = "moved"
@@ -132,7 +135,7 @@ def legacy_entries(text: str) -> list:
             continue
         head, _, body = sec[3:].partition("\n")
         title = _HEADING_TS_RE.sub("", head.strip())
-        if not title or _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
+        if not title or _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title) or _TITLE_RESOLVED.match(title):
             continue
         word = st.group(0)[len("**Status:**"):].strip().lower() if st else ""
         sent = _SENT_RE.search(sec)
@@ -147,8 +150,13 @@ def legacy_entries(text: str) -> list:
     for s, e in _bullets(text):
         line = text[s:e]
         m, st = _BULLET_RE.match(line), _STATUS_ANY_RE.search(line)
+        label = m.group(1).strip()
+        # `_BULLET_RE` already strips the brackets, so only the unbracketed form
+        # of the closing marker (`_TITLE_RESOLVED`) can ever match here.
+        if _TITLE_RESOLVED.match(label):
+            continue
         word = st.group(0)[len("**Status:**"):].strip().lower() if st else ""
-        out.append({"ask_id": digest_key(line), "title": m.group(1).strip(), "body": line.strip(), "span": (s, e),
+        out.append({"ask_id": digest_key(line), "title": label, "body": line.strip(), "span": (s, e),
                     "kind": "bullet", "open": not word or word.startswith(OPEN_WORDS),
                     "moved": word.startswith(MOVED), "sent": legacy_sent_line(), "question": None})
     return out
@@ -186,6 +194,10 @@ def ingest_legacy_file_entries(workspace, host: Optional[str], store) -> tuple:
         return moved, errors
     except OSError as e:
         return moved, [f"legacy file: {e}"]
+    damaged = archive_boundary_damage(text)
+    if damaged:
+        lines = ", ".join(str(line) for line, _ in damaged)
+        return moved, [f"legacy ingest: ambiguous archive boundary at line(s) {lines}; no entries imported"]
     todo = [e for e in legacy_entries(text) if e["open"] and not e["moved"]]
     if not todo:
         return moved, errors
