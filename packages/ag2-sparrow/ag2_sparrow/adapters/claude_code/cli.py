@@ -137,7 +137,8 @@ def resolve_root(args) -> "tuple[dict, str]":
     mode = _dirs.bridge_host() or UNIT
     token_file = str(Path(args.token_env_file).expanduser().resolve()) if args.token_env_file else \
         (host_env if mode == UNIT else "")
-    agent_id = install_identity(token_file, token_file == host_env)
+    agent_id = install_identity(token_file, token_file == host_env) or \
+        ((getattr(args, "agent", None) or "") if mode != UNIT and not token_file else "")
     if not agent_id:
         where = f"in {token_file} or the environment" if token_file else "in the environment"
         return {}, (f"the agent id is unknown, so its root cannot be named: bind the agent first, or set AGENT_MXID "
@@ -164,7 +165,17 @@ def resolve_tmux(args, shape: Shape = LOCAL) -> "tuple[str, str]":
     return launcher.resolve_tmux(getattr(args, "tmux", None) or "", recorded)
 
 
+# What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
+RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v if v and resolve_plugin_dir(v)[1] is False else ""),
+            ("CLAUDE_CONFIG_DIR", "claude_config_dir", str),
+            ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
+            ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
+            (inbox.ALLOW_NON_OWNER, "allow_non_owner", lambda v: v == "1"),
+            (inbox.ALLOW_COLLABORATOR, "allow_collaborator", lambda v: v == "1"))
+
+
 def install(args) -> int:
+    cb.recorded_install_args(args, LOCAL, RECORDED)
     claude = shutil.which(args.claude) or args.claude
     problem = version_problem(claude)
     if problem:
@@ -225,6 +236,9 @@ def install(args) -> int:
         --new-session only once the old generation is proven gone (the job stopped, the root free
         and the recorded server dead), else kept, and the command says so."""
         kept = (old or {}).get("SESSION_ID") or ""
+        if kept and not SESSION_ID_RE.match(kept):
+            print(f"the recorded session id {kept!r} is malformed (the launcher refuses it): minting a new one")
+            kept = ""
         if kept and args.new_session:
             rec = records.load_supervisor(root)
             gen = rec.get("generation")
@@ -668,6 +682,7 @@ def main(argv=None) -> int:
                    "selector that names it").set_defaults(func=list_cmd)
     inbox.add_parser(sub)
     args = ap.parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)
 
 

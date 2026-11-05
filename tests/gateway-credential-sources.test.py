@@ -2390,7 +2390,8 @@ class Guard(unittest.TestCase):
         tree = ast.parse(text)
         parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         uses = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "_sources"]
-        self.assertEqual(sorted(n.attr for n in uses), ["remove_bridge_declaration", "seat_bridge_environ",
+        self.assertEqual(sorted(n.attr for n in uses), ["remove_bridge_declaration", "remove_bridge_declaration",
+                                                        "seat_bridge_environ",
                                                         "write_bridge_declaration"],
                          "the owner checks, writes and removes the declaration and reads a seat; the adapter only "
                          "names its path")

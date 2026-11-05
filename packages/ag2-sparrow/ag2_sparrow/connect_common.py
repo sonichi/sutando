@@ -628,6 +628,21 @@ def read_config(path: Path) -> dict:
     return cfg
 
 
+def read_config_lenient(path: Path) -> dict:
+    """read_config line by line, a line that does not parse skipped; {} when the file cannot be read."""
+    cfg = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for line in lines:
+        if "=" in line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            with contextlib.suppress(ValueError):
+                cfg[k] = "".join(shlex.split(v)) if v else ""
+    return cfg
+
+
 def load_config(shape: Shape) -> "tuple[dict, str]":
     """(config, '') or ({}, why): a missing, dangling, directory, unreadable, unparsable or key-less
     config is one line, never a traceback. The one loader every command reads through."""
@@ -1557,6 +1572,8 @@ def _managed_here(shape: Shape, root: str) -> str:
     """'' only when the active job's recorded root is `root` and the lock's record is live and names
     this shape and install; an unreadable config, another root, a stale record or another holder refuse."""
     cfg, problem = owned_config(shape)
+    if problem:
+        cfg, problem = _repairable(shape, root, problem)
     managed = (cfg or ({} if problem else recovered_config(shape))).get("ROOT", "")
     rec = lock_holder(root)
     ours = rec.get("live") is True and rec.get("adapter") == shape.name and rec.get("install_id") == install_id()
@@ -1573,6 +1590,10 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
     old, problem = owned_config(shape)
+    if problem:
+        old, problem = _repairable(shape, root, problem)
+        if not problem:
+            print(f"repairing: {config_path(shape)}, which no longer loads")
     if problem:
         return _refuse(problem)
     old = old or {}
@@ -1614,6 +1635,19 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
         return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {uninstall_command(shape)}, "
                        f"then {job_command(shape, 'install')}")
     return 0
+
+
+def _repairable(shape: Shape, root: str, problem: str) -> "tuple[dict | None, str]":
+    """install's own marked config that no longer loads, read line by line, when the root it and the job's unit
+    record is `root` (at least one records it): install rewrites it whole. Else (None, `problem`)."""
+    text, why = owned_text(config_path(shape), shape.marker, "config")
+    if why or text is None:
+        return None, problem
+    cfg = read_config_lenient(config_path(shape))
+    recorded = {r for r in (cfg.get("ROOT", ""), unit_root(shape)) if r}
+    if recorded != {root}:
+        return None, problem
+    return dict(cfg, ROOT=root), ""
 
 
 def _connect_install_locked(shape: Shape, values: dict, root: str, revise, precheck, holder, root_id) -> int:
@@ -1740,7 +1774,8 @@ def settle(root, rc: int) -> int:
 
 
 def await_started() -> int:
-    """0 once every pending start has a fresh launcher of its own on its root, else 1. The wait runs
+    """0 once every pending start has a fresh launcher of its own on its root and what waited on it ran, else
+    1 (EXIT_UNUSABLE when only what waited failed: _then). The wait runs
     without the agent lock; a failure is decided and undone only under it (so no launcher can be between
     admission and the root); when the lock stays busy nothing is stopped and what is left is reported."""
     failed = 0
@@ -1755,18 +1790,37 @@ def await_started() -> int:
                     rec = _fresh_holder(shape, root, p["before"], wait_s=0)
                     why = _holder_problem(shape, root, rec, p)
                     undone = _undo_start(p) if why else ""
+                    # A session that never held its root gets no bridge: what waited on it is withdrawn.
+                    undone += "".join(f"; {line}" for line in (f() for f in p.get("failed", ())) if why and line)
             except Busy:
                 undone = _left_unlocked(p)
         if why:
             failed = 1
             print(f"error: {why}{p['advice']}; {undone}", file=sys.stderr)
             continue
-        _STARTED[shape.job] = dict(p, undo=[])
+        failed = max(failed, _then(shape, root, p.get("then", ())))
+        _STARTED[shape.job] = dict(p, undo=[], then=[], failed=[])
         linger(shape)
         holder = p["holder"]
         print(f"the managed launcher acquired the expected root: {root} "
               f"({holder(root, rec) if holder is not None else 'launcher pid %s' % rec['pid']})")
     return failed
+
+
+def _then(shape: Shape, root: str, steps) -> int:
+    """What waited for the session to hold its root (its bridge's start), under the agent lock: 0, or
+    EXIT_UNUSABLE said (the session is installed, its bridge is not)."""
+    for step in steps:
+        try:
+            with agent_lock(root):
+                problem = step()
+        except Busy as e:
+            problem = str(e)
+        if problem:
+            print(f"error: {job_name(shape)} holds {root}, but its bridge is not installed: {problem}; run "
+                  f"{job_command(shape, 'install')} again", file=sys.stderr)
+            return EXIT_UNUSABLE
+    return 0
 
 
 def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:

@@ -1952,7 +1952,7 @@ class ConnectCode(UndoSeams, Base):
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
 
-    def test_a_root_replaced_while_the_bridge_is_wired_leaves_the_running_bridge_and_unwinds_the_rest(self):
+    def test_a_root_replaced_while_the_bridge_is_wired_never_starts_it_and_unwinds_the_rest(self):
         fake, real = self.fake(), cb.wire_bridge
 
         def wired_then_replaced(*a, **kw):
@@ -1964,13 +1964,12 @@ class ConnectCode(UndoSeams, Base):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"the bridge this attempt wired ({cm.job_name(B)}) is active and was left, since stopping it would "
-                      f"name whatever runs as it now: stop it by hand ({cm.stop_command(B)})", err)
+        self.assertIn(f"the bridge unit this attempt wrote ({cm.service_path(B)}) was removed", err)
         self.assertIn(f"{cm.job_name(LA)}, which held the directory that was there, was stopped; nothing at {self.root} was "
                       "touched", err)
-        self.assertTrue(cm.service_path(B).exists(), "a running bridge is left: its manager stops it only by name")
-        self.assertTrue(fake.active, "and it still runs")
-        self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
+        self.assertFalse(cm.service_path(B).exists(), "the bridge waited for the session, so it never started")
+        self.assertFalse(fake.active)
+        self.assertFalse({"stop", "bootout", "restart", "start"} & bridge_verbs(fake), "nothing named the bridge to its manager")
         self.assertIsNone(fake.runner.pid(), "this attempt's job is stopped")
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")

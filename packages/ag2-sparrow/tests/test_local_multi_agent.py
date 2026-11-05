@@ -109,9 +109,14 @@ class MultiBase(fx.AgentRootBase):
 
     def run_cli(self, adapter: str, *argv):
         out, err = io.StringIO(), io.StringIO()
+        seen = {n: len(b.calls) for n, b in self.host.bridges.items()}
         with mock.patch.object(sm, "_run", side_effect=self.host), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
             rc = CLIS[adapter].main(list(argv))
+        if argv and argv[0] == "install" and rc != 0:     # a failed install leaves no bridge it started or stopped running
+            for n, b in self.host.bridges.items():
+                moved = [c for c in b.calls[seen[n]:] if bx.verb_of(c) in (*bx.START, "stop", "bootout")]
+                self.assertFalse(b.active and moved, f"{n} runs after a failed install: {out.getvalue()}{err.getvalue()}")
         return rc, out.getvalue(), err.getvalue()
 
     def install(self, adapter: str, agent: str, *extra):
@@ -328,7 +333,8 @@ class SideBySide(MultiBase):
 
     def _unreadable(self, adapter):
         """A single-agent job whose config cannot be read is still its agent's (its bridge unit names it): this
-        adapter's install goes to that job and refuses on its config; the other adapter's is refused by its bridge."""
+        adapter's install goes to that job and repairs its config on that job's own root; the other adapter's is
+        refused by its bridge."""
         with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
             self.installed(adapter, ALPHA)
         conf = cm.config_path(job(adapter, ""))
@@ -336,10 +342,14 @@ class SideBySide(MultiBase):
         for name in (adapter, CX.name if adapter == CL.name else CL.name):
             with self.subTest(name=name):
                 rc, out, err = self.install(name, ALPHA)
-                self.assertNotEqual(rc, 0, out + err)
-                self.assertIn("fix or remove it by hand" if name == adapter else
-                              f"already has a bridge, run by {adapter} ({cm.job_name(cb.bridge_shape(job(adapter, '')))})",
-                              err)
+                if name == adapter:
+                    self.assertEqual(rc, 0, out + err)
+                    self.assertIn(f"repairing: {conf}, which no longer loads", out)
+                    self.assertEqual(cm.load_config(job(adapter, ""))[1], "")
+                else:
+                    self.assertNotEqual(rc, 0, out + err)
+                    self.assertIn(f"already has a bridge, run by {adapter} "
+                                  f"({cm.job_name(cb.bridge_shape(job(adapter, '')))})", err)
                 self.assertFalse(cm.config_path(job(name, ALPHA)).exists())
                 self.assertFalse(self.host.launchers[job(name, ALPHA).job].calls, "its job is never asked to start")
 
@@ -864,6 +874,14 @@ class Round5(MultiBase):
                         self.launcher_pid(j) if j.job in self.host.launchers else None)
                 for j in cm.installed_jobs(job(adapter, ""))}
 
+    def kept(self, adapter, agent):
+        """What a repair keeps from the job's install: its token file and the flags it was installed with."""
+        keys = ("TOKEN_ENV_FILE", claude_cli.inbox.ALLOW_COLLABORATOR, claude_cli.inbox.ALLOW_NON_OWNER) \
+            if adapter == CL.name else \
+            ("TOKEN_ENV_FILE", "SANDBOX", "ALLOW_NON_OWNER")
+        cfg = cm.read_config_lenient(cm.config_path(job(adapter, agent)))
+        return {k: cfg.get(k) for k in keys}
+
     def check_selects(self, adapter, text, mine):
         words = shlex.split(text)[1:]
         verb, selector = (words[:2], words[2:]) if words[0] == "stop" else (words[:1], words[1:])
@@ -911,10 +929,24 @@ class Round5(MultiBase):
             conf = cm.config_path(job(adapter, BETA))
             conf.write_text(conf.read_text() + "ROOT='unclosed\n")
 
+        def malformed(adapter):     # the launcher refuses this session id; install's repair mints a new one
+            self.installed(adapter, ALPHA)
+            self.installed(adapter, BETA, "--allow-collaborator")
+            conf = cm.config_path(job(adapter, BETA))
+            conf.write_text(re.sub(r"(?m)^SESSION_ID=.*$", "SESSION_ID=not-a-uuid", conf.read_text()))
+
+        def lacking(adapter):
+            self.installed(adapter, ALPHA)
+            self.installed(adapter, BETA, "--sandbox", "workspace-write", "--allow-non-owner")
+            conf = cm.config_path(job(adapter, BETA))
+            conf.write_text(re.sub(r"(?m)^CODEX=.*\n", "", conf.read_text()))
+
         states = [(name, fn, adapter) for name, fn in (("one", one), ("two", two), ("two leftovers", two_leftovers),
                                                        ("fixed leftover", fixed_leftover), ("beta's config corrupt", corrupt))
                   for adapter in CLIS]
         states.append(("keyed and fixed, one agent", keyed_and_fixed, CL.name))
+        states.append(("beta's session id malformed", malformed, CL.name))
+        states.append(("beta's config lacks a key", lacking, CX.name))
         for name, build, adapter in states:
             with self.subTest(state=name, adapter=adapter):
                 build(adapter)
@@ -925,10 +957,12 @@ class Round5(MultiBase):
                 if name in ("two leftovers", "fixed leftover"):
                     for j in jobs:
                         self.assertIn(f"or remove this job: {cm.uninstall_command(j)}", self.verified[j])
-                if name == "beta's config corrupt":
+                repairing = name.startswith("beta's")
+                if repairing:
                     install = cm.job_command(job(adapter, BETA), "install")
                     self.assertIn(install, self.verified[job(adapter, BETA)], "the repair line names beta's job")
                     printed.append((install, job(adapter, BETA)))
+                    kept = self.kept(adapter, BETA)
                 uninstalls = {}
                 for text, mine in printed:
                     verb, selector = self.check_selects(adapter, text, mine)
@@ -947,6 +981,12 @@ class Round5(MultiBase):
                         self.assertIn(str(cm.config_path(mine)), out, text)
                     elif verb == ["install"]:
                         after = self.snapshot(adapter)
+                        if repairing and mine == job(adapter, BETA):       # the repair, run verbatim, repairs: beta verifies its config, flags kept
+                            self.assertEqual(rc, 0, f"{text}: {out}{err}")
+                            self.assertEqual(self.kept(adapter, BETA), kept, text)
+                            self.assertTrue(self.host.bridges[mine.job].active, text)
+                            verified = "".join(self.run_cli(adapter, "verify", *selector)[1:])
+                            self.assertIn("PASS config", verified, text)
                         self.assertEqual({k: v for k, v in after.items() if k != mine.job},
                                          {k: v for k, v in before.items() if k != mine.job}, f"{text} moved another job")
                 for mine, text in uninstalls.items():
@@ -978,7 +1018,9 @@ EMITTERS_ALLOWED = {
     ("connect_common.py", 'written_by=f"{shape.command} install")'): "the declaration's provenance",
     ("connect_common.py", 'return (f"{shape.command} run is the manager\'s entrypoint'): "names the refused verb",
     ("connect_bridge.py", 'as {command} connect writes it"'): "names the seat's writer",
-    ("connect_bridge.py", 'path, written_by=f"{command} install", host=mode'): "the declaration's provenance",
+    ("connect_bridge.py", 'bridge_home(root) / DECLARATION, written_by=f"{command} install", host=mode'): "the "
+    "declaration's provenance",
+    ("connect_bridge.py", '                  written_by=f"{command} install")'): "the declaration's provenance (_withdraw)",
     ("connect_bridge.py", 'remove_bridge_declaration(path, written_by=f"{command} install")'): "the declaration's provenance",
     ("adapters/claude_code/hold.py", '"""`ag2-sparrow-claude-local hold --generation'): "docstring",
     ("adapters/claude_code/hold.py", 'return "%s hold --generation=%s --" % (command, nonce)'): "the pane's own argv",
@@ -1123,6 +1165,137 @@ class Round6(MultiBase):
                          "the legacy fixed job's unit is not removed while its declaration is left unnamed")
         b_decl.unlink()
         self.assertEqual(self.run_cli(CL.name, "uninstall", "--single")[0], 0)
+
+
+@expand
+class Round7(MultiBase):
+    def stalled(self, shape):
+        """The manager accepts the job's start, but no launcher comes to take its root."""
+        runner = self.host.launchers[shape.job]
+        runner.stop_session()
+        runner.root = None
+        return runner
+
+    def _no_bridge_without_a_session(self, adapter):
+        """A session that never holds its root gets no bridge: a fresh install never starts one and leaves no unit;
+        a reinstall leaves the bridge it stopped stopped, its unit removed; the printed repair, run verbatim, wires it."""
+        a = job(adapter, ALPHA)
+        bridge, unit = self.host.bridges[a.job], cm.supervisor_path(cb.bridge_shape(a))
+        runner = self.stalled(a)
+        rc, out, err = self.install(adapter, ALPHA)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("did not acquire", err)
+        self.assertFalse(bridge.started(), "a fresh install never starts the bridge")
+        self.assertFalse(unit.exists(), err)
+        runner.root = str(self.root_of(ALPHA))
+        self.installed(adapter, ALPHA)
+        self.assertTrue(bridge.active)
+        self.stalled(a)
+        rc, out, err = self.install(adapter, ALPHA)
+        self.assertEqual(rc, 1, out + err)
+        self.assertFalse(bridge.active, "the reinstall leaves the bridge it stopped stopped")
+        self.assertFalse(unit.exists(), err)
+        repair = cm.job_command(a, "install")
+        self.assertIn(repair, err)
+        runner.root = str(self.root_of(ALPHA))
+        rc, out, err = self.run_cli(adapter, *shlex.split(repair)[1:])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(bridge.active and unit.exists(), out)
+    test_a_session_that_never_holds_its_root_gets_no_bridge = per_manager(_no_bridge_without_a_session)
+
+    def _no_declaration_without_a_session(self, adapter):
+        """Under sparrowd, likewise: a fresh install declares no bridge; a reinstall withdraws the declaration, so
+        the supervisor stops that bridge on its next scan; the repair, run verbatim, declares it again."""
+        argv = Round5.sparrowd(self) if adapter == CL.name else \
+            ["install", "--codex", str(self.codex), "--codex-home", str(self.codex_home)]
+        Round5.sparrowd(self)
+        root = self.root_of(ALPHA)
+        self.assertEqual(cb._sources.write_seat_credentials(     # the seat connect writes: sparrowd's only token
+            cb.bridge_home(root), agent_id=ALPHA, instance="c" * 32, tier="owner",
+            relay_url="https://relay.backend.example/relay", bearer="bearer-SEAT0001"), "")
+        argv += ["--token-env-file", cb.seat_file(root)]
+        a = job(adapter, ALPHA)
+        decl = cb.bridge_home(self.root_of(ALPHA)) / cb.DECLARATION
+        runner = self.stalled(a)
+        rc, out, err = self.run_cli(adapter, *argv)
+        self.assertEqual(rc, 1, out + err)
+        self.assertFalse(decl.exists(), out + err)
+        runner.root = str(self.root_of(ALPHA))
+        self.assertEqual(self.run_cli(adapter, *argv)[0], 0)
+        self.assertTrue(decl.exists())
+        self.stalled(a)
+        rc, out, err = self.run_cli(adapter, *argv)
+        self.assertEqual(rc, 1, out + err)
+        self.assertFalse(decl.exists(), out + err)
+        self.assertIn("was withdrawn", err)
+        runner.root = str(self.root_of(ALPHA))
+        rc, out, err = self.run_cli(adapter, *shlex.split(cm.job_command(a, "install"))[1:])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(decl.exists())
+    test_under_sparrowd_a_session_that_never_holds_its_root_declares_no_bridge = \
+        per_manager(_no_declaration_without_a_session)
+
+    def test_under_sparrowd_the_printed_repair_names_the_agent_by_its_selector_alone(self):
+        """Under sparrowd, a job installed with no token file of its own: verify's repair line is `install --agent`,
+        which, run verbatim with no AGENT_MXID in sight, takes the agent from the selector and keeps its flags."""
+        argv = Round5.sparrowd(self)
+        b = job(CL.name, BETA)
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                with mock.patch.dict(os.environ, {"AGENT_MXID": BETA}):
+                    rc, out, err = self.run_cli(CL.name, *argv, "--allow-collaborator")
+                self.assertEqual(rc, 0, out + err)
+                conf = cm.config_path(b)
+                conf.write_text(re.sub(r"(?m)^SESSION_ID=.*$", "SESSION_ID=not-a-uuid", conf.read_text()))
+                repair = cm.job_command(b, "install")
+                self.assertIn(repair, "".join(self.run_cli(CL.name, "verify", "--agent", BETA)[1:]))
+                rc, out, err = self.run_cli(CL.name, *shlex.split(repair)[1:])
+                self.assertEqual(rc, 0, out + err)
+                after = cm.read_config(conf)
+                self.assertRegex(after["SESSION_ID"], claude_cli.SESSION_ID_RE)
+                self.assertEqual(after[claude_cli.inbox.ALLOW_COLLABORATOR], "1")
+                self.assertTrue((cb.bridge_home(self.root_of(BETA)) / cb.DECLARATION).exists())
+                self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", BETA)[0], 0)
+
+    def test_an_option_the_repair_line_gives_wins_over_the_recorded_one(self):
+        """`install <selector>` takes each recorded option the command did not give: one given (even at its default,
+        as `--opt=value`, or by argparse's unique prefix) wins; one not given keeps the recorded value."""
+        b = job(CX.name, BETA)
+        self.installed(CX.name, BETA, "--sandbox", "workspace-write", "--allow-non-owner")
+        for given in (["--sandbox", "read-only"], ["--sandbox=read-only"], ["--sand", "read-only"]):
+            with self.subTest(given=given):
+                rc, out, err = self.run_cli(CX.name, "install", "--agent", BETA, *given)
+                self.assertEqual(rc, 0, out + err)
+                cfg = cm.read_config(cm.config_path(b))
+                self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"]), ("read-only", "1"))
+                self.assertEqual(cfg["TOKEN_ENV_FILE"], str(self.tokens[BETA]))
+                self.installed(CX.name, BETA, "--sandbox", "workspace-write", "--allow-non-owner")
+
+    def test_a_reinstall_mints_a_new_session_id_for_a_malformed_one(self):
+        """A kept session id the launcher refuses is replaced, not kept: the reinstall mints a valid one, keeps the
+        flags it was installed with, and its session and bridge run; the other agent's job is not moved."""
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                a, b = job(CL.name, ALPHA), job(CL.name, BETA)
+                self.installed(CL.name, ALPHA)
+                self.installed(CL.name, BETA, "--allow-collaborator")
+                conf, others = cm.config_path(b), self.files(a)
+                before = cm.read_config(conf)
+                conf.write_text(re.sub(r"(?m)^SESSION_ID=.*$", "SESSION_ID=not-a-uuid", conf.read_text()))
+                rc, out, err = self.run_cli(CL.name, "install", "--agent", BETA)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn("malformed", out)
+                after = cm.read_config(conf)
+                self.assertRegex(after["SESSION_ID"], claude_cli.SESSION_ID_RE)
+                self.assertNotEqual(after["SESSION_ID"], before["SESSION_ID"])
+                self.assertEqual({k: v for k, v in after.items() if k != "SESSION_ID"},
+                                 {k: v for k, v in before.items() if k != "SESSION_ID"})
+                self.assertTrue(self.launcher_pid(b) and self.host.bridges[b.job].active)
+                self.assertEqual(self.files(a), others)
+                for agent in (ALPHA, BETA):
+                    self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", agent)[0], 0)
 
 
 class Selection(MultiBase):

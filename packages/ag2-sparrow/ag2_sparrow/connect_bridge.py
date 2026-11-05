@@ -241,6 +241,37 @@ def connect_agent_problem(agent_id) -> str:
     return ""
 
 
+def recorded_install_args(args, local: cm.Shape, fields) -> None:
+    """`install <selector>` with no token env file of its own: the job the selector names lends its recorded token
+    file and options (`fields`: (config key, option, value from the recorded one)), each only where the command
+    did not give that option, so a printed repair line reinstalls that job as it was installed."""
+    if getattr(args, "token_env_file", None) or getattr(args, "inbox", None):
+        return
+    work, key, single = getattr(args, "work", None) or "", getattr(args, "key", None), getattr(args, "single", False)
+    if not (getattr(args, "agent", None) or key or single or work):
+        return
+    job, _ = cm.select_job(local, getattr(args, "agent", None), work, single, key)
+    if job is None:
+        return
+    cfg = cm.read_config_lenient(cm.config_path(job)) or cm.recovered_config(job)
+    if not work and cfg.get("TOKEN_ENV_FILE"):
+        args.token_env_file = cfg["TOKEN_ENV_FILE"]
+    opts = getattr(getattr(args, "parser", None), "_option_string_actions", {})
+    given = {_dest_of(opts, a.split("=", 1)[0]) for a in getattr(args, "argv", ()) if a.startswith("--")}
+    for cfg_key, dest, value in fields:
+        recorded = value(cfg.get(cfg_key) or "")
+        if recorded and dest not in given:
+            setattr(args, dest, recorded)
+
+
+def _dest_of(opts: dict, given: str) -> str:
+    """The option `given` names as argparse reads it: exactly, or by its unique prefix."""
+    if given in opts:
+        return opts[given].dest
+    found = {opts[o].dest for o in opts if o.startswith(given)}
+    return found.pop() if len(found) == 1 else ""
+
+
 def agent_arg_problem(given, agent_id: str) -> str:
     """'' unless install's --agent names another agent than the one its token or root resolves to."""
     given = (given or "").strip()
@@ -404,14 +435,14 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
 
 
 def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wired: bytes) -> str:
-    """The undo of this attempt's wiring, under the start's undo. Its manager stops a bridge job only by
-    name, which could stop a start this attempt did not make, so a registered or running bridge is left and
-    said; only an unregistered unit that still holds the bytes this attempt wrote is removed."""
+    """The undo of this attempt's wiring, which never started it. Its manager stops a bridge job only by name,
+    which could stop a start this attempt did not make, so a running (or unreadable) bridge is left and said;
+    a unit that is not running and still holds the bytes this attempt wrote is removed."""
     if _bytes(artifact) != wired:
         return (f"{cm.job_name(bridge)} is no longer the unit this attempt wrote, so it was left: stop it by hand "
                 f"({cm.stop_command(bridge)})")
     state = cm.manager_state(bridge)
-    if state != "absent":
+    if state in ("active", "unknown"):
         return (f"the bridge this attempt wired ({cm.job_name(bridge)}) is {state} and was left, since stopping it "
                 f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run "
                 f"{cm.uninstall_command(bridge_owner(bridge, command))}")
@@ -436,22 +467,16 @@ def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
     if problem:
         return problem
     bridge_state(cfg).mkdir(parents=True, exist_ok=True)
+    # Inside an install, the bridge starts only once its session holds the root (cm.await_started).
+    pending = cm.pending_start(bridge_owner(bridge, command))
     if mode != UNIT:
-        path = bridge_home(root) / DECLARATION
-        name = worker_name(Path(root).name)
-        problem = _sources.write_bridge_declaration(
-            path, written_by=f"{command} install", host=mode, name=name, module=BRIDGE_MODULE,
-            env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
-        if problem:
-            return problem
-        if not cfg["TOKEN_VAULT_KEY"]:
-            print(f"declared: {path} ({mode} runs it as worker {name} on its next scan, with the seat "
-                  f"{cfg['TOKEN_ENV_FILE']} and the token file it names)")
-            return ""
-        print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
-              f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
-        print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
-              f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
+        def declare() -> str:
+            return _declare(cfg, command, env)
+        if pending is None:
+            return declare()
+        pending.setdefault("then", []).append(declare)
+        pending.setdefault("failed", []).append(lambda: _withdraw(cfg, command))
+        print(f"the bridge is declared for {mode} once the session holds {root}")
         return ""
     sup = cm.supervisor_path(bridge)
     text, problem = cm.owned_text(sup, cm.supervisor_marker(bridge), "supervisor file")
@@ -469,11 +494,58 @@ def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
             return problem
     cm._write(sup, unit, 0o644)
     print(f"installed: {sup}")
-    problem = cm.start_supervisor(bridge)
+
+    def start() -> str:
+        problem = cm.start_supervisor(bridge)
+        if problem:
+            left = _unstarted(cfg, command, bridge, sup, wired) if pending is not None else ""
+            return f"{problem}; {left}" if left else problem
+        print(f"started: {cm.job_name(bridge)}, feeding {root}/tasks as {cfg['AGENT_ID']}")
+        return ""
+    wired = unit.encode("utf-8")
+    if pending is None:
+        return start()
+    pending.setdefault("then", []).append(start)
+    pending.setdefault("failed", []).append(lambda: _unstarted(cfg, command, bridge, sup, wired))
+    print(f"{cm.job_name(bridge)} starts once the session holds {root}")
+    return ""
+
+
+def _unstarted(cfg: dict, command: str, bridge: cm.Shape, sup: Path, wired: bytes) -> str:
+    """The bridge unit an install wrote and never started (its session never held the root, or the start was
+    refused), removed as _unwire_ours does; '' when it no longer holds those bytes (an undo already took it)."""
+    return _unwire_ours(cfg, command, bridge, sup, wired) if _bytes(sup) == wired else ""
+
+
+def _declare(cfg: dict, command: str, env: dict) -> str:
+    """The declaration a host supervisor runs the agent's bridge from; '' or why not."""
+    root, mode = cm.work_root(cfg), bridge_mode(cfg)
+    name = worker_name(Path(root).name)
+    problem = _sources.write_bridge_declaration(
+        bridge_home(root) / DECLARATION, written_by=f"{command} install", host=mode, name=name,
+        module=BRIDGE_MODULE, env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
     if problem:
         return problem
-    print(f"started: {cm.job_name(bridge)}, feeding {root}/tasks as {cfg['AGENT_ID']}")
+    if not cfg["TOKEN_VAULT_KEY"]:
+        print(f"declared: {bridge_home(root) / DECLARATION} ({mode} runs it as worker {name} on its next scan, with "
+              f"the seat {cfg['TOKEN_ENV_FILE']} and the token file it names)")
+        return ""
+    print(f"declared: {bridge_home(root) / DECLARATION} ({mode} runs it as worker {name} on its next scan; the token "
+          f"is read from the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
+    print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
+          f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
     return ""
+
+
+def _withdraw(cfg: dict, command: str) -> str:
+    """After a session that never held its root: the agent's declaration this install owns, removed, so its
+    supervisor stops the bridge on its next scan; the line saying so, or why it was left."""
+    root = cm.work_root(cfg)
+    removed, problem = _sources.remove_bridge_declaration(bridge_home(root) / DECLARATION,
+                                                          written_by=f"{command} install")
+    if problem:
+        return f"the bridge declaration beside {root} was left ({problem})"
+    return f"the bridge declaration beside {root} was withdrawn" if removed else ""
 
 
 def unwire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:

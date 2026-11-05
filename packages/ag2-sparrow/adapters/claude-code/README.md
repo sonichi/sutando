@@ -454,6 +454,13 @@ host, never carries a path. An explicit-root job
 records the host's agent; when that agent also has its own job, `--agent` refuses
 as ambiguous and names each job's `--work <root>`. Installing,
 reinstalling (the restart) or uninstalling one agent never names another's job.
+`install <selector>` with no token
+file is the repair `verify` prints: it reuses the job's recorded token file and
+install flags, rewrites a marked config that no longer loads when the root it and
+the unit record is the same, and mints a new session id for a malformed one. An
+install's bridge starts (or its declaration is written) only once the session
+holds its root; when it never does, the bridge is left stopped, its unit removed
+or its declaration withdrawn.
 An explicit root keeps the single fixed job.
 
 **From a single-agent install.** A job an earlier release installed keeps its

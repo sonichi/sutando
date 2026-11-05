@@ -1143,8 +1143,7 @@ class ConnectOwnership(ConnectBase):
         self.assertTrue(cfg.is_dir())
         cfg.rmdir()
         good = self.configure().read_text()
-        for bad in (good + "PERMISSION_MODE='unclosed\n", good.replace("INBOX_DIR=", "INBOX_WAS="),
-                    good.replace(f"ROOT={self.work}", "ROOT=relative/work")):
+        for bad in (good.replace(f"ROOT={self.work}", "ROOT=relative/work"),):
             cfg.write_text(bad)
             scratch = self.home / "cwd"
             scratch.mkdir(exist_ok=True)
@@ -1164,6 +1163,31 @@ class ConnectOwnership(ConnectBase):
             self.assertFalse(cli.service_path().exists())
             rc, _, err = self.main("uninstall")
             self.assertEqual((rc, cfg.read_text()), (1, bad), "uninstall keeps it too: " + err)
+
+    def test_a_marked_config_that_no_longer_loads_on_its_own_root_is_repaired_by_install(self):
+        """A marked config whose root is still the one install resolves (an unparsable line, a key gone) is
+        rewritten whole by install, the repair verify names; run, verify and uninstall still refuse it."""
+        cfg = cli.config_path()
+        good, runner = self.configure().read_text(), self.runner()
+        for bad in (good + "PERMISSION_MODE='unclosed\n", good.replace("INBOX_DIR=", "INBOX_WAS=")):
+            cfg.write_text(bad)
+            self.assertEqual(self.main("run")[0], 2, bad)
+            self.assertEqual(self.main("verify")[0], 1, bad)
+            rc, out, err = self.install_with(runner)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn(f"repairing: {cfg}, which no longer loads", out)
+            self.assertEqual(cm.load_config(L)[1], "", "the rewritten config loads")
+            self.assertEqual(cm.read_config(cfg)["ROOT"], str(self.work))
+        cfg.write_text(good.replace(f"ROOT={self.work}", "ROOT='unclosed"))     # the unit still records the root
+        rc, out, err = self.install_with(runner)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(cm.read_config(cfg)["ROOT"], str(self.work))
+        elsewhere = good.replace(f"ROOT={self.work}", f"ROOT={self.home / 'elsewhere'}") + "PERMISSION_MODE='unclosed\n"
+        cfg.write_text(elsewhere)       # the config and the unit disagree on the root: no repair
+        rc, out, err = self.install_with(runner)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("remove it by hand", err)
+        self.assertEqual(cfg.read_text(), elsewhere, "preserved")
 
     def test_a_malformed_owned_config_fails_closed_with_an_old_root_orphan(self):
         """The persisted root is the only anchor; a config that cannot name it stops install and uninstall

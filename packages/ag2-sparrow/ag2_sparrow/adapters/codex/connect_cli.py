@@ -139,7 +139,13 @@ def resolve_root(args) -> "tuple[dict, str]":
     return {"root": root, "mode": mode, "agent_id": agent_id, "token_file": token_file}, problem
 
 
+# What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
+RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
+            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str))
+
+
 def install(args) -> int:
+    cb.recorded_install_args(args, LOCAL, RECORDED)
     codex = shutil.which(args.codex) or args.codex
     problem = version_problem(codex)
     if problem:
@@ -399,6 +405,7 @@ def main(argv=None) -> int:
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
                    "selector that names it").set_defaults(func=list_cmd)
     args = ap.parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)
 
 
