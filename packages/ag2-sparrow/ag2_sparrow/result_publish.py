@@ -11,8 +11,8 @@ only what to say and where. The staged name starts with a dot and ends in
 `.tmp`, so no drain's `*.txt` glob can match it, and it is unique per call so
 two publishers of one name never rename each other's bytes. Shell writers use
 the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
-`--title`/`--outcome` publish the result's Activity labels first (`result_labels`);
-without them any earlier side file is removed, and a `[no-send]` reason is the outcome.
+`--title`/`--outcome` publish the result's Activity labels first, bound to this body
+(`result_labels`); a `[no-send]` reason is the outcome when none is given.
 
 The CLI refuses a `source: cron` task's result that names no destination and
 carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
@@ -218,13 +218,8 @@ def main(argv: list[str]) -> int:
     labels, notes = result_labels_for(text, title, outcome)
     for note in notes:
         print(f"result_publish: warning: {note}", file=sys.stderr)
-    labels_mod.write(Path(path), labels)
-    try:
-        publish_text(path, text)
-    except BaseException:
-        # A label left without its result would name the next attempt's reply.
-        labels_mod.side_path(Path(path)).unlink(missing_ok=True)
-        raise
+    labels_mod.write(Path(path), labels, text)
+    publish_text(path, text)
     return 0
 
 

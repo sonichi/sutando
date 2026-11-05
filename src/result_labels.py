@@ -5,10 +5,15 @@ TITLE_MAX characters), the outcome what came of it (past tense, asked at most OU
 accepted up to OUTCOME_MAX). Both are one line with no control characters. The writer publishes
 the side file before the result, so the bridge that reads the result finds its labels; a bridge
 without this module ignores them.
+
+Labels belong to one result body: the side file carries the SHA-256 of the bytes it was written for,
+and a reader given another body's digest gets none. So two publishers of one name can lose labels
+but never swap them, and no writer deletes a side file: one that matches no body is inert.
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import tempfile
@@ -21,6 +26,7 @@ OUTCOME_MAX = 150
 # What agents are asked for; OUTCOME_MAX is the hard limit, with headroom above it.
 OUTCOME_ASK = 120
 SUFFIX = ".meta.json"
+DIGEST_KEY = "result_sha256"
 LIMITS = {"title": TITLE_MAX, "outcome": OUTCOME_MAX}
 # Far above two bounded labels: a larger file is not one this writer made.
 _READ_MAX = 4096
@@ -76,14 +82,20 @@ def check(title=None, outcome=None) -> "tuple[dict, list]":
     return labels, notes
 
 
-def write(result_file: Path, labels: dict) -> "Path | None":
-    """Atomically publish `labels` beside `result_file`. With none, remove any side file left
-    there, so a retried result never carries an earlier attempt's labels; then None."""
+def digest(body: str) -> str:
+    """The SHA-256 of `body` as published: the bytes a reader of the result file hashes."""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def write(result_file: Path, labels: dict, body: str) -> "Path | None":
+    """Atomically publish `labels` beside `result_file`, bound to `body`; None when there are none.
+    The results directory is made if missing, as publishing the result would."""
     labels = {k: clean(labels.get(k)) for k in LIMITS if clean(labels.get(k))}
-    target = side_path(result_file)
     if not labels:
-        target.unlink(missing_ok=True)
         return None
+    labels[DIGEST_KEY] = digest(body)
+    target = side_path(result_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
@@ -112,8 +124,9 @@ def archive(results_dir: Path, stem: str, archive_dir: Path) -> None:
         pass
 
 
-def read(path: Path) -> dict:
-    """The labels at a side file, each cleaned and fitted to its limit; {} when absent or unreadable."""
+def read(path: Path, result_digest: "str | None") -> dict:
+    """The labels at a side file for the result whose bytes hash to `result_digest`, each cleaned
+    and fitted to its limit; {} when absent, unreadable, or written for another body."""
     try:
         with open(path, "rb") as fh:
             raw = fh.read(_READ_MAX + 1)
@@ -125,6 +138,6 @@ def read(path: Path) -> dict:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return {}
-    if not isinstance(doc, dict):
+    if not isinstance(doc, dict) or not result_digest or doc.get(DIGEST_KEY) != result_digest:
         return {}
     return {k: fit(doc.get(k), limit) for k, limit in LIMITS.items() if clean(doc.get(k))}

@@ -6,6 +6,8 @@ Run: python3 tests/sparrow-result-labels.test.py
 from __future__ import annotations
 
 import contextlib
+import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -36,70 +38,92 @@ class Dir(unittest.TestCase):
 
 
 class Writer(Dir):
+    rl = rl
+
     def test_side_path_sits_beside_the_result(self):
-        self.assertEqual(rl.side_path(self.result), self.root / 'task-1.meta.json')
-        self.assertEqual(rl.side_path(str(self.result)), self.root / 'task-1.meta.json')
+        self.assertEqual(self.rl.side_path(self.result), self.root / 'task-1.meta.json')
+        self.assertEqual(self.rl.side_path(str(self.result)), self.root / 'task-1.meta.json')
 
     def test_clean_makes_one_line_and_keeps_joiners(self):
-        self.assertEqual(rl.clean(None), '')
-        self.assertEqual(rl.clean(42), '')
-        self.assertEqual(rl.clean(' a\x07\nb\tc d‮e​f '), 'a b c d e f')
-        self.assertEqual(rl.clean(f'x {CODER} र्‌क'), f'x {CODER} र्‌क')
+        self.assertEqual(self.rl.clean(None), '')
+        self.assertEqual(self.rl.clean(42), '')
+        self.assertEqual(self.rl.clean(' a\x07\nb\tc d‮e​f '), 'a b c d e f')
+        self.assertEqual(self.rl.clean(f'x {CODER} र्‌क'), f'x {CODER} र्‌क')
 
     def test_fit_cuts_on_a_grapheme_boundary(self):
-        self.assertEqual(rl.fit('short', 10), 'short')
-        self.assertEqual(rl.fit('abcdefghijk', 5), 'abcd…')
-        self.assertEqual(rl.fit('abc' + CODER + 'zzzz', 5), 'abc…')
-        self.assertEqual(rl.fit('abc' + 'é́' + 'zz', 5), 'abc…')
-        self.assertEqual(rl.fit('abc   defgh', 5), 'abc…')
+        self.assertEqual(self.rl.fit('short', 10), 'short')
+        self.assertEqual(self.rl.fit('abcdefghijk', 5), 'abcd…')
+        self.assertEqual(self.rl.fit('abc' + CODER + 'zzzz', 5), 'abc…')
+        self.assertEqual(self.rl.fit('abc' + 'é́' + 'zz', 5), 'abc…')
+        self.assertEqual(self.rl.fit('abc   defgh', 5), 'abc…')
 
     def test_check_fits_and_notes_each_cut(self):
-        labels, notes = rl.check('t' * 61, 'o' * 151)
+        labels, notes = self.rl.check('t' * 61, 'o' * 151)
         self.assertEqual((len(labels['title']), len(labels['outcome'])), (60, 150))
         self.assertEqual(notes, ['--title was over 60 characters and was cut to fit',
                                  '--outcome was over 150 characters and was cut to fit'])
-        self.assertEqual(rl.check('Fix it', None), ({'title': 'Fix it'}, []))
-        self.assertEqual(rl.check('', '  '), ({}, []))
+        self.assertEqual(self.rl.check('Fix it', None), ({'title': 'Fix it'}, []))
+        self.assertEqual(self.rl.check('', '  '), ({}, []))
 
     def test_write_publishes_atomically_and_privately(self):
-        side = rl.write(self.result, {'title': 'Fix\nit', 'outcome': 'Fixed.', 'other': 'x'})
+        side = self.rl.write(self.result, {'title': 'Fix\nit', 'outcome': 'Fixed.', 'other': 'x'}, '4\n')
         self.assertEqual(side, self.root / 'task-1.meta.json')
-        self.assertEqual(json.loads(side.read_text()), {'title': 'Fix it', 'outcome': 'Fixed.'})
+        self.assertEqual(json.loads(side.read_text()), {'title': 'Fix it', 'outcome': 'Fixed.',
+                                                        'result_sha256': self.rl.digest('4\n')})
         self.assertEqual(side.stat().st_mode & 0o777, 0o600)
         self.assertEqual([p.name for p in self.root.iterdir()], ['task-1.meta.json'])
 
-    def test_write_with_no_labels_removes_a_stale_side_file(self):
-        rl.write(self.result, {'title': 'Old'})
-        self.assertIsNone(rl.write(self.result, {'title': ' ', 'outcome': None}))
-        self.assertFalse(rl.side_path(self.result).exists())
-        self.assertIsNone(rl.write(self.result, {}))
+    def test_write_with_no_labels_writes_and_removes_nothing(self):
+        self.rl.write(self.result, {'title': 'Other'}, 'other')
+        self.assertIsNone(self.rl.write(self.result, {'title': ' ', 'outcome': None}, 'x'))
+        self.assertEqual(self.rl.read(self.rl.side_path(self.result), self.rl.digest('other')), {'title': 'Other'})
+
+    def test_write_makes_a_missing_results_directory(self):
+        result = self.root / 'not' / 'yet' / 'task-1.txt'
+        self.assertEqual(self.rl.write(result, {'title': 'T'}, 'x'), self.rl.side_path(result))
 
     def test_a_failed_write_leaves_no_temp_file(self):
-        with patch.object(rl.os, 'replace', side_effect=OSError('disk')):
+        with patch.object(self.rl.os, 'replace', side_effect=OSError('disk')):
             with self.assertRaises(OSError):
-                rl.write(self.result, {'title': 'T'})
+                self.rl.write(self.result, {'title': 'T'}, 'x')
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_read_returns_only_what_this_writer_could_make(self):
-        side = rl.side_path(self.result)
-        self.assertEqual(rl.read(side), {})
-        for raw in (b'x' * (rl._READ_MAX + 1), b'\xff\xfe', b'{not json', b'["a"]'):
+        side, d = self.rl.side_path(self.result), self.rl.digest('x')
+        self.assertEqual(self.rl.read(side, d), {})
+        for raw in (b'x' * (self.rl._READ_MAX + 1), b'\xff\xfe', b'{not json', b'["a"]'):
             side.write_bytes(raw)
-            self.assertEqual(rl.read(side), {}, raw[:10])
-        side.write_text(json.dumps({'title': 't' * 80 + '\n', 'outcome': '', 'x': 'y'}))
-        self.assertEqual(rl.read(side), {'title': 't' * 59 + '…'})
+            self.assertEqual(self.rl.read(side, d), {}, raw[:10])
+        side.write_text(json.dumps({'title': 't' * 80 + '\n', 'outcome': '', 'x': 'y', 'result_sha256': d}))
+        self.assertEqual(self.rl.read(side, d), {'title': 't' * 59 + '…'})
+
+    def test_labels_are_read_only_for_the_body_they_were_written_for(self):
+        side = self.rl.write(self.result, {'title': 'A'}, 'body A')
+        self.assertEqual(self.rl.read(side, self.rl.digest('body A')), {'title': 'A'})
+        for other in (self.rl.digest('body B'), None, ''):
+            self.assertEqual(self.rl.read(side, other), {}, other)
+        side.write_text(json.dumps({'title': 'A'}))
+        self.assertEqual(self.rl.read(side, self.rl.digest('body A')), {})
 
     def test_archive_moves_under_a_unique_name(self):
         archive = self.root / 'archive'
-        rl.archive(self.root, 'task-1', archive)
+        self.rl.archive(self.root, 'task-1', archive)
         self.assertFalse(archive.exists() and any(archive.iterdir()))
         for n in range(2):
-            rl.write(self.result, {'title': f'T{n}'})
-            with patch.object(rl.time, 'time_ns', return_value=7):
-                rl.archive(self.root, 'task-1', archive)
+            self.rl.write(self.result, {'title': f'T{n}'}, 'x')
+            with patch.object(self.rl.time, 'time_ns', return_value=7):
+                self.rl.archive(self.root, 'task-1', archive)
         self.assertEqual(sorted(p.name for p in archive.iterdir()),
                          ['task-1-7.meta.json', 'task-1-8.meta.json'])
-        self.assertFalse(rl.side_path(self.result).exists())
+        self.assertFalse(self.rl.side_path(self.result).exists())
+
+
+class WriterSrc(Writer):
+    """The same writer at its source, which the desktop core's publisher imports."""
+    _spec = importlib.util.spec_from_file_location('src_result_labels', REPO / 'src' / 'result_labels.py')
+    rl = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(rl)
+
 
 
 class HatchLabels(Dir):
@@ -149,7 +173,7 @@ class HatchLabels(Dir):
         seen = []
 
         def publish(result_file, body):
-            seen.append(rl.read(rl.side_path(result_file)))
+            seen.append(rl.read(rl.side_path(result_file), rl.digest(body)))
             result_file.write_text(body)
             return True
         self.assertEqual(self.commit({'title': 'Add'}, publish), (True, 'none'))
@@ -160,20 +184,20 @@ class HatchLabels(Dir):
         self.assertEqual(self.commit({'title': 'Add'}), (False, 'none'))
         self.assertFalse(rl.side_path(self.result).exists())
 
-    def test_an_unpublished_answer_takes_its_side_file_back(self):
+    def test_an_unpublished_answer_leaves_labels_that_match_no_other_body(self):
         self.assertEqual(self.commit({'title': 'Add'}, lambda *_: False), (False, 'none'))
-        self.assertFalse(rl.side_path(self.result).exists())
+        side = rl.side_path(self.result)
+        self.assertEqual(rl.read(side, rl.digest('another answer')), {})
 
         def boom(*_):
             raise OSError('disk')
         with self.assertRaises(OSError):
             self.commit({'title': 'Add'}, boom)
-        self.assertFalse(rl.side_path(self.result).exists())
 
-    def test_an_answer_without_labels_removes_a_stale_side_file(self):
-        rl.write(self.result, {'title': 'Stale'})
+    def test_an_answer_without_labels_never_inherits_a_stale_side_file(self):
+        rl.write(self.result, {'title': 'Stale'}, 'an earlier answer')
         self.assertEqual(self.commit({}, lambda f, b: bool(f.write_text(b))), (True, 'none'))
-        self.assertFalse(rl.side_path(self.result).exists())
+        self.assertEqual(rl.read(rl.side_path(self.result), rl.digest('4\n')), {})
 
 
 class BridgeLabels(Dir):
@@ -190,22 +214,31 @@ class BridgeLabels(Dir):
     def task(self, tier):
         (self.tasks / 'task-1.txt').write_text(f'id: task-1\nsource: ag2space\naccess_tier: {tier}\ntask: x\n')
 
+    def gen(self, body='4'):
+        return types.SimpleNamespace(digest=rl.digest(body))
+
     def test_no_side_file_adds_nothing(self):
+        self.assertEqual(gw._guarded_result_labels('task-1', self.gen()), {})
+
+    def test_labels_for_another_body_or_no_known_body_are_left_out(self):
+        rl.write(self.result, {'title': 'Add two'}, '4')
+        self.task('owner')
+        self.assertEqual(gw._guarded_result_labels('task-1', self.gen('5')), {})
         self.assertEqual(gw._guarded_result_labels('task-1'), {})
 
     def test_owner_labels_pass_and_non_owner_leaks_are_left_out(self):
-        rl.write(self.result, {'title': 'Add two', 'outcome': 'Sent ghp_' + 'a' * 36})
+        rl.write(self.result, {'title': 'Add two', 'outcome': 'Sent ghp_' + 'a' * 36}, '4')
         self.task('owner')
-        self.assertEqual(gw._guarded_result_labels('task-1'),
+        self.assertEqual(gw._guarded_result_labels('task-1', self.gen()),
                          {'title': 'Add two', 'outcome': 'Sent ghp_' + 'a' * 36})
         self.task('team')
-        self.assertEqual(gw._guarded_result_labels('task-1'), {'title': 'Add two'})
+        self.assertEqual(gw._guarded_result_labels('task-1', self.gen()), {'title': 'Add two'})
         self.assertTrue(any('its outcome is left out' in line for line in self.log))
 
     def test_with_no_guard_the_labels_are_left_out(self):
-        rl.write(self.result, {'title': 'Add two'})
+        rl.write(self.result, {'title': 'Add two'}, '4')
         with patch.object(gw, '_team_guard_fns', side_effect=ImportError('gone')):
-            self.assertEqual(gw._guarded_result_labels('task-1'), {})
+            self.assertEqual(gw._guarded_result_labels('task-1', self.gen()), {})
         self.assertTrue(any('result guard is unavailable' in line for line in self.log))
 
     def test_an_archive_failure_is_logged_for_the_next_sweep(self):
