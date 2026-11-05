@@ -100,9 +100,9 @@ tell the owner and where.
 `reply_to`, `operation_id`) to pass verbatim to `room.action.execute` / `room.message.send`. It is
 `null` for a private card and when no wait was made. For `mode: dm` it also prints `fallback`
 (`body`, `reply_to`, `operation_id`): plain text that gets the owner connected without the card
-(step 3a), and `card_problem`, non-null when the card would not pass the client's check. `find`, `status` and `card` read the
-connections and the catalog through a 30-second cache; `claim`, `verify-account`, the switch
-baseline and the waiter always read the cloud.
+(step 3a), and `card_problem`, non-null when the card would not pass the client's check. `find`,
+`status` and `card` read the connections and the catalog through a 30-second cache; `claim`,
+`verify-account`, the switch baseline and the waiter always read the cloud.
 
 `--switch` (step 3c) records which connections of the apps are active right now; the wait is ready
 only once each app has an active connection that wasn't, so the old account never answers. A switch
@@ -252,13 +252,14 @@ For a task whose room is the owner's DM (see "Which kind of room"). From a share
    SUTANDO_READBACK
    ```
 
+   Pass the whole `room.context.read` output; `--event-id` is required and must match exactly.
    Exit 0 (`ok`, or `wait_closed`): nothing more. Exit 1 (`unverifiable`, `missing`, `malformed`,
    `bad_*`, `wrong_owner`, `not_found`): post its `fallback` object verbatim with ONE
    `room.message.send`; it names Settings → Integrations, and its `operation_id` makes a second post
    a no-op. While the read-back carries no event content, the verdict is `unverifiable` and the
    fallback goes out: one extra line beats a missing card. When `card` itself prints a non-null
    `card_problem`, its `message` already is that text; post it and skip this check.
-4. Go to step 4.
+4. Continue with Step 4 (the result).
 
 ## Step 3b: a private card, in a room with other people
 

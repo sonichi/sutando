@@ -1904,8 +1904,21 @@ class TestStampedAccountCredential(unittest.TestCase):
         self.assertIsNone(cloud.refused)
 
 
-READBACK_TODAY = {"body": "Google Calendar isn't connected yet.", "event_id": "$card", "sender": "@agent:ag2.space",
-                  "reactions": [], "ts": 1789000000000}
+# One room.context.read entry as the tool returns it today: metadata only, no event content keys.
+CARD_ENTRY = {"sender": "@agent:ag2.space", "body": "Google Calendar isn't connected yet.", "event_id": "$card",
+              "ts": 1789000000000, "reactions": [], "msgtype": "m.text", "mxc": None, "mimetype": None,
+              "reply_to_event": "$evt1", "reply_to_sender": OWNER, "thread_root": None, "mentions": [],
+              "in_reply_to": None, "transcript": None, "transcript_role": None}
+
+
+def context_read(*entries):
+    """The whole room.context.read tool output around these entries, newest first."""
+    return {"status": "ok", "action": "room.context.read", "correlation_id": "c-1",
+            "result": {"messages": [*entries, {**CARD_ENTRY, "event_id": "$older", "body": "hi"}], "cursor": "s1"},
+            "next_action": None}
+
+
+READBACK_TODAY = context_read(CARD_ENTRY)
 
 
 class TestCardSelfCheck(Base):
@@ -1916,13 +1929,10 @@ class TestCardSelfCheck(Base):
         self.assertEqual(code, connectors.EXIT_OK)
         return out
 
-    def check(self, wait_id, readback, event_id=None):
+    def check(self, wait_id, readback, event_id="$card"):
         path = self.ws / "readback.json"
         path.write_text(readback if isinstance(readback, str) else json.dumps(readback))
-        argv = ["card-check", wait_id, "--content-file", str(path)]
-        if event_id:
-            argv += ["--event-id", event_id]
-        return run(self.ws, argv)
+        return run(self.ws, ["card-check", wait_id, "--event-id", event_id, "--content-file", str(path)])
 
     def test_card_prints_a_text_fallback_that_needs_no_card(self):
         out = self.armed()
@@ -1970,29 +1980,46 @@ class TestCardSelfCheck(Base):
 
     def test_a_readback_carrying_the_card_needs_no_fallback(self):
         out = self.armed()
-        entry = {**READBACK_TODAY, "content": {"body": "x", **out["message"]["extra_content"]}}
-        code, res = self.check(out["wait_id"], {"messages": [{"event_id": "$other"}, entry]}, "$card")
-        self.assertEqual((code, res["verdict"], res["fallback"]), (connectors.EXIT_OK, "ok", None))
+        card = out["message"]["extra_content"]
+        shapes = {
+            "whole output, keys on the entry": context_read({**CARD_ENTRY, **card}),
+            "whole output, under content": context_read({**CARD_ENTRY, "content": {"msgtype": "m.text", **card}}),
+            "result only": context_read({**CARD_ENTRY, **card})["result"],
+            "one entry": {**CARD_ENTRY, **card},
+        }
+        for name, readback in shapes.items():
+            with self.subTest(name):
+                code, res = self.check(out["wait_id"], readback)
+                self.assertEqual((code, res["verdict"], res["fallback"]), (connectors.EXIT_OK, "ok", None))
 
     def test_todays_readback_cannot_confirm_the_card_so_the_text_goes_out(self):
         out = self.armed()
-        code, res = self.check(out["wait_id"], READBACK_TODAY)
-        self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, "unverifiable"))
-        self.assertEqual(res["fallback"], out["fallback"], "the same message, the same operation id")
+        for name, readback in {"whole output": READBACK_TODAY, "result": READBACK_TODAY["result"]}.items():
+            with self.subTest(name):
+                code, res = self.check(out["wait_id"], readback)
+                self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, "unverifiable"))
+                self.assertEqual(res["fallback"], out["fallback"], "the same message, the same operation id")
 
     def test_a_readback_without_the_card_or_with_a_broken_one_gets_the_fallback(self):
         out = self.armed()
+        card = out["message"]["extra_content"]["space.ag2.connector"]
         cases = {
-            "missing": {**READBACK_TODAY, "content": {"body": "x", "msgtype": "m.text"}},
-            "wrong_owner": {**READBACK_TODAY, "space.ag2.connector": {
-                "version": 1, "for": "@other:ag2.space", "toolkits": [{"slug": "googlecalendar"}]}},
-            "not_found": {"messages": [{**READBACK_TODAY, "event_id": "$other"}]},
+            "missing": context_read({**CARD_ENTRY, "content": {"body": "x", "msgtype": "m.text"}}),
+            "wrong_owner": context_read({**CARD_ENTRY, "space.ag2.connector": {**card, "for": "@other:ag2.space"}}),
+            "bad_msgtype": context_read({**CARD_ENTRY, "msgtype": "m.image", "space.ag2.connector": card}),
+            "not_found": context_read({**CARD_ENTRY, "event_id": "$other"}),
+            "not_found without an id": {k: v for k, v in CARD_ENTRY.items() if k != "event_id"},
         }
         for want, readback in cases.items():
             with self.subTest(want):
-                code, res = self.check(out["wait_id"], readback, "$card")
-                self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, want))
+                code, res = self.check(out["wait_id"], readback)
+                self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, want.split(" ")[0]))
                 self.assertEqual(res["fallback"]["operation_id"], "task-abc:connect-text")
+
+    def test_a_private_wait_has_no_dm_card_to_check(self):
+        out = self.armed(private=True, lines=("Calendar isn't connected yet.",))
+        code, res = self.check(out["wait_id"], READBACK_TODAY)
+        self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
 
     def test_a_switch_fallback_says_switch(self):
         cloud = FakeCloud(self.ws, connections=[{"id": "c1", "toolkit": "googlecalendar", "status": "active"}])
@@ -2013,11 +2040,13 @@ class TestCardSelfCheck(Base):
         self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
         code, res = self.check("nope", READBACK_TODAY)
         self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+        code, res = self.check(out["wait_id"], READBACK_TODAY, event_id=" ")
+        self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
 
     def test_the_readback_can_come_on_stdin(self):
         out = self.armed()
         with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(READBACK_TODAY))):
-            code, res = run(self.ws, ["card-check", out["wait_id"], "--content-file", "-"])
+            code, res = run(self.ws, ["card-check", out["wait_id"], "--event-id", "$card", "--content-file", "-"])
         self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, "unverifiable"))
 
 

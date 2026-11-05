@@ -18,7 +18,7 @@ resume their request once the apps are connected.
                                     connected: catalog check, one connections read, one account
                                     read, then the wait; prints "mode" (dm | private) and, for dm,
                                     the exact room.message.send payload ("message") to post
-  card-check <wait-id> --content-file PATH|- [--event-id E]
+  card-check <wait-id> --event-id E --content-file PATH|-
                                     after posting a DM card, check the read-back event carries a
                                     card the client draws; exit 1 prints "fallback", the plain text
                                     to post when it does not or cannot be confirmed
@@ -1380,9 +1380,8 @@ def card_message(wait: dict, owner: str, task: str, intro: str, switch: bool) ->
 
 
 CONNECTOR_KEY = "space.ag2.connector"
-# Read-back entry keys that carry no event content: an entry with nothing else cannot show the card.
-READBACK_META = frozenset(("body", "event_id", "sender", "reactions", "ts", "origin_server_ts", "msgtype",
-                           "mxc", "mimetype", "reply_to", "thread_root", "formatted_body", "format"))
+# The client draws a Connect card only on these message types.
+CARD_MSGTYPES = ("m.text", "m.notice")
 
 
 def connector_problem(content: Any, owner: str | None = None) -> str | None:
@@ -1482,25 +1481,19 @@ def cmd_card(
     return EXIT_OK
 
 
-def _readback_entry(data: Any, event_id: str | None) -> dict | None:
-    """The posted event out of what the agent read back: one entry, or a list of them."""
+def _readback_entry(data: Any, event_id: str) -> dict | None:
+    """The posted event out of the read-back: the whole tool output, its `result`, or a list."""
+    if isinstance(data, dict) and isinstance(data.get("result"), (dict, list)):
+        data = data["result"]
     if isinstance(data, dict):
-        for key in ("messages", "events", "items", "results", "chunk"):
-            if isinstance(data.get(key), list):
-                data = data[key]
-                break
-        else:
-            return data if event_id is None or data.get("event_id") in (None, event_id) else None
+        data = data.get("messages") if isinstance(data.get("messages"), list) else [data]
     if not isinstance(data, list):
         return None
-    entries = [e for e in data if isinstance(e, dict)]
-    if event_id is None:
-        return entries[0] if len(entries) == 1 else None
-    return next((e for e in entries if e.get("event_id") == event_id), None)
+    return next((e for e in data if isinstance(e, dict) and e.get("event_id") == event_id), None)
 
 
 def readback_verdict(entry: dict | None, owner: str) -> str:
-    """ok | missing | malformed reasons | unverifiable (the read-back carries no event content)."""
+    """ok | missing | bad_msgtype | malformed reasons | not_found | unverifiable (no content keys)."""
     if entry is None:
         return "not_found"
     content: dict = {}
@@ -1508,15 +1501,18 @@ def readback_verdict(entry: dict | None, owner: str) -> str:
         if isinstance(entry.get(key), dict):
             content.update(entry[key])
     content.update({k: v for k, v in entry.items() if k.startswith("space.ag2.")})
-    if not content and not set(entry) - READBACK_META:
+    if not any(k in entry for k in ("content", "extra_content")) and not content:
         return "unverifiable"
+    msgtype = content.get("msgtype", entry.get("msgtype"))
+    if msgtype is not None and msgtype not in CARD_MSGTYPES:
+        return "bad_msgtype"
     return connector_problem(content, owner) or "ok"
 
 
 def cmd_card_check(ws: Path, cloud: Cloud | None, args: argparse.Namespace, **_: Any) -> int:
     """After posting a DM card: did the event carry a card the client draws? Exit 1 prints the text to post."""
     wait_id = _require(args.wait_id, WAIT_ID_RE, "wait id")
-    event_id = (args.event_id or "").strip() or None
+    event_id = _require(args.event_id, TOKEN_RE, "--event-id")
     try:
         raw = sys.stdin.read() if args.content_file == "-" else Path(args.content_file).read_text()
         data = json.loads(raw)
@@ -1530,6 +1526,8 @@ def cmd_card_check(ws: Path, cloud: Cloud | None, args: argparse.Namespace, **_:
         # Claimed or gone: the request is answered (or told why not), so a fallback would only confuse.
         emit({"wait_id": wait_id, "verdict": "wait_closed", "fallback": None})
         return EXIT_OK
+    if marker.get("private"):
+        raise Setup("invalid_arguments", f"{wait_id} is a private card: there is no DM card to check.")
     verdict = readback_verdict(_readback_entry(data, event_id), marker["owner"])
     fallback = None if verdict == "ok" else fallback_message(marker, marker["task"], bool(marker.get("switch")))
     emit({"wait_id": wait_id, "event_id": event_id, "verdict": verdict, "fallback": fallback})
@@ -1698,9 +1696,9 @@ def parser() -> argparse.ArgumentParser:
     k.add_argument("--switch", action="store_true", help="a Switch account card instead of a Connect card")
     cc = sub.add_parser("card-check", help="after posting a DM card: verify the posted event carries it")
     cc.add_argument("wait_id")
-    cc.add_argument("--event-id", help="the posted event; picks it out of a read-back list")
+    cc.add_argument("--event-id", required=True, help="the event id room.message.send returned")
     cc.add_argument("--content-file", required=True,
-                    help="the read-back JSON (one entry or a list of them); - reads stdin")
+                    help="the room.context.read output (whole, its result, or one entry); - reads stdin")
     n = sub.add_parser("note")
     n.add_argument("wait_id")
     n.add_argument("text", nargs="+")
