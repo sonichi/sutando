@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 40 of them, including outbox.py and its
+canonical for those modules — currently 41 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -33,6 +33,8 @@ from pathlib import Path
 MAP = {
     "src/task_archive.py": "task_archive.py",
     "src/local_task_protocol.py": "local_task_protocol.py",
+    # AgentTrigger event vocabulary + playbook ids; the bridge sanitizes trigger headers through it
+    "src/agent_triggers.py": "agent_triggers.py",
     "src/result_markers.py": "result_markers.py",
     "src/delivery/readiness.py": "result_ready.py",
     # the one results/ publisher: the bridge stages and renames through it

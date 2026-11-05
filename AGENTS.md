@@ -247,7 +247,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
-- A task with `event_type: room.joined` (you were just added to an s.space room) → follow `skills/room-onboard/SKILL.md`
+- **Playbook dispatch.** A task with an `event_type` or `playbook` header (a platform event, e.g. `room.joined`) runs a playbook: `python3 src/agent_triggers.py resolve --event-type '<event_type>' --playbook '<playbook>'` prints the `skills/<playbook>/SKILL.md` to follow (the task's playbook, else the event's default); `none` means handle it as an ordinary message, as a task without these headers always is.
 - Dates in a task are the owner's: "today", "yesterday", "this week" mean calendar days in the zone of the task's `local_time:` header (e.g. `America/Los_Angeles`), never UTC. Turn them into that zone's day boundaries before a query (`gh search … --merged-at`, log greps), and say the zone-local date in the reply. A UTC day drops the owner's evening (Pacific evenings are the next UTC day). When the task also names a calendar date that disagrees with its relative day, the relative day wins (the voice model's date can be a day off). Take a weekday from the date itself (`date -j -f %F 2026-10-19 +%A`), never from memory.
 
 ### Where replies go

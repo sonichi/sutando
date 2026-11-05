@@ -324,7 +324,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
+from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
@@ -2701,6 +2701,10 @@ def _context_header(name: str, value) -> "str | None":
 
 # Remote values outside the shared vocabulary degrade to "message" rather than passing through.
 _INTERACTION_TYPES = local_task_protocol.INTERACTION_TYPES
+# A value its sanitizer refuses is dropped: an unknown event or a non-token id never reaches the core.
+_TRIGGER_SANITIZERS = {"event_type": agent_triggers.event_type_value,
+                       "agent_trigger_id": agent_triggers.trigger_id_value,
+                       "playbook": agent_triggers.playbook_value}
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
@@ -6190,14 +6194,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if it not in _INTERACTION_TYPES:
                 it = "message"
             lines.append(f"interaction_type: {it}")
-        elif f == "event_type":
-            et = local_task_protocol.event_type_value(task.get(f))
-            if et:
-                lines.append(f"event_type: {et}")
-        elif f in ("agent_trigger_id", "playbook"):
-            tok = local_task_protocol.trigger_token_value(task.get(f))
-            if tok:
-                lines.append(f"{f}: {tok}")
+        elif f in _TRIGGER_SANITIZERS:
+            val = _TRIGGER_SANITIZERS[f](task.get(f))
+            if val:
+                lines.append(f"{f}: {val}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.

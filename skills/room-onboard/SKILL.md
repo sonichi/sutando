@@ -5,6 +5,9 @@ description: "Playbook for a task with `event_type: room.joined` (an s.space Age
 
 # room-onboard
 
+The first playbook of the AgentTrigger dispatch (`src/agent_triggers.py`): a task with
+`event_type: room.joined` (and `playbook: room-onboard`, or none) resolves here.
+
 A join task carries `channel_id` (the room), `room_name`, `user_id` (the inviter), `access_tier`
 (the inviter's tier), `room_members`, `room_member_count`, `channel_kind` and, from a current relay,
 `agent_trigger_id` (`join|<agent>|<room>`). It has no `source_message_id`: your result posts as a

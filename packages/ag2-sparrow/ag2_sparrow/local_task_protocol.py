@@ -90,25 +90,6 @@ INTERACTION_TYPES = frozenset({
     "tool_initiated", "system_event", "self_reflective",
 })
 
-# AgentTrigger event vocabulary: which platform event caused a task. The
-# remote-gateway bridge passes a known value through and drops anything else.
-EVENT_TYPES = frozenset({"room.mention", "room.joined"})
-
-# agent_trigger_id / playbook: one opaque token, e.g. "join|@a:hs|!room:hs".
-_TRIGGER_TOKEN_RE = re.compile(r"[A-Za-z0-9._:@!|=+/-]{1,256}")
-
-
-def event_type_value(value) -> "str | None":
-    """The value when it is a known event type, else None (dropped, not defaulted)."""
-    return value if isinstance(value, str) and value in EVENT_TYPES else None
-
-
-def trigger_token_value(value) -> "str | None":
-    """A bounded one-token header value, or None when it is anything else."""
-    if not isinstance(value, str) or not _TRIGGER_TOKEN_RE.fullmatch(value):
-        return None
-    return value
-
 # Content-modality vocabulary (interaction-model 4D, step 1.5). The modalities
 # a task's payload spans — orthogonal to interaction_type (which names the
 # *mode*, not the media). A text-only DM is {"text"}; a photo with a caption is
@@ -256,8 +237,8 @@ KNOWN_HEADER_KEYS = (
     # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
     # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
     "parent_task", "parent_generation",
-    # AgentTrigger context: the platform event behind the task, its idempotency id and
-    # the playbook it names. Bridge-written above task:, so the guard defangs body copies.
+    # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
+    # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
