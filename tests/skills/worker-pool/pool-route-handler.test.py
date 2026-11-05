@@ -354,6 +354,18 @@ class TestIdsNoSentinelCanCarry(Base):
             with self.subTest(tid=tid):
                 self.assertIs(pd.carries(tid), ok)
 
+    def test_a_stop_no_sentinel_can_carry_is_held_to_the_same_rule_as_any_task_bound_for_a_worker(self):
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        name = "ask-stop-1"
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(f"id: {name}\nsource: relay-control\naccess_tier: owner\npriority: urgent\n"
+                     "task: CANCEL_INSTRUCTION: stop processing task-1 if still in flight (stop).\n")
+        self.assertEqual(h.read_task(str(p)).get("stop_of"), "task-1", "the branch under test")
+        self.assertEqual(self.both_modes(str(p)), (h.DECLINE, h.DECLINE), "the owner's falls to the core")
+        self.assertTrue(self.nothing_delivered(name))
+
     def test_control_the_same_task_with_a_task_id_is_delivered(self):
         self.roster()
         t = self.task_file("task-dd249c1dd88b8ef9a5f4c8ad", channel_id="!room:x")
