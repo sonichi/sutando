@@ -292,7 +292,8 @@ def _supervise(child, state: dict) -> int:
 
 def selected(args) -> "tuple[Shape | None, str]":
     """The job --agent, --work or --single names, else the only one installed."""
-    return cm.select_job(LOCAL, getattr(args, "agent", None), getattr(args, "work", None), getattr(args, "single", False))
+    return cm.select_job(LOCAL, getattr(args, "agent", None), getattr(args, "work", None), getattr(args, "single", False),
+                         getattr(args, "key", None))
 
 
 def verify(args) -> int:

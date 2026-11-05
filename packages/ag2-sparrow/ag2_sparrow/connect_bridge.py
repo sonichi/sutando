@@ -591,7 +591,7 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     if problem:
         lock.release()
         return None, problem
-    return dict(seat, lock=lock), ""
+    return dict(seat, lock=lock, local=local), ""
 
 
 def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict, str]":
@@ -622,7 +622,8 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
         seat["lock"].release()
     rc = cm.settle(seat["root"], rc)
     if rc == 0:
-        print(f"next: {command} verify (the bridge reports connected within a minute)")
+        verify = cm.job_command(seat["local"], "verify") if seat.get("local") else f"{command} verify"
+        print(f"next: {verify} (the bridge reports connected within a minute)")
     else:
         print(f"error: {spent_code_line(command, seat['seat_env'], flags)}", file=sys.stderr)
     return rc

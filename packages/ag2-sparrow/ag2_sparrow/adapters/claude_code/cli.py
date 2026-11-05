@@ -382,7 +382,7 @@ def pane_dialog(rec: dict, local: Shape = LOCAL) -> "str | None":
     return trust.dialog(tm.capture(gen["pane_id"])) if tm.has_session() is True else None
 
 
-def projection_lines(cfg: dict) -> list:
+def projection_lines(cfg: dict, local: Shape = LOCAL) -> list:
     """Pending projection cases: a claude-local card nobody has projected yet, with why."""
     out = []
     store_root = Path(cfg.get("HITL_STORE") or "")
@@ -394,14 +394,14 @@ def projection_lines(cfg: dict) -> list:
             why = "no primary gateway" if not (store_root.parent.parent / "owner-routing.json").exists() \
                 else "gateway predates claude-local"
             out.append(f"INFO pending projection: {req.id} ({why}); on this machine: "
-                       f"{cm.command_for(LOCAL, cfg, 'stop --confirm')}")
+                       f"{cm.job_command(local, 'stop --confirm')}")
     return out
 
 
 def selected(args) -> "Shape | None":
     """The job --agent names, else the only one installed; None (said) when several are and none is named."""
     local, problem = cm.select_job(LOCAL, getattr(args, "agent", None), getattr(args, "work", None),
-                                   getattr(args, "single", False))
+                                   getattr(args, "single", False), getattr(args, "key", None))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
     return local
@@ -485,7 +485,7 @@ def verify(args) -> int:
     waiting = pane_dialog(rec, local)
     if waiting:
         cm.check(results, False, "session", f"the pane waits at Claude Code's {waiting} dialog, so no task is "
-                 f"answered; run {cm.command_for(LOCAL, cfg, 'attach')} and answer it")
+                 f"answered; run {cm.job_command(local, 'attach')} and answer it")
     if rec.get("stall"):
         print(f"INFO {'needs attention' if rec['stall'].get('reason', '').startswith('abnormal') else 'suspected hang'}: "
               f"{rec['stall'].get('reason')} (card {(rec.get('hitl') or {}).get('id') or 'not raised'})")
@@ -495,9 +495,9 @@ def verify(args) -> int:
               f"fenced stop is withheld until the session is recreated")
     if rec.get("fence_uncertain"):
         print(f"INFO the pane-key guard on {sock} is uncertain: creation is fenced until recovered")
-    for line in projection_lines(cfg):
+    for line in projection_lines(cfg, local):
         print(line)
-    print(f"INFO attach: {cm.command_for(LOCAL, cfg, 'attach')}")
+    print(f"INFO attach: {cm.job_command(local, 'attach')}")
     return 0 if all(results) else 1
 
 

@@ -378,7 +378,9 @@ class Launcher:
 
     def attach_command(self) -> str:
         """What the card shows: the adapter's own command naming this job, never a host path."""
-        return cm.command_for(LOCAL, self.cfg, "attach")
+        d = self.config_dir
+        job = cm.for_key(LOCAL, d.name) if d.parent.name == cm.AGENTS_DIR else LOCAL
+        return cm.job_command(job, "attach", no_path=True)
 
     # ── create / adopt ───────────────────────────────────────────────────────
 

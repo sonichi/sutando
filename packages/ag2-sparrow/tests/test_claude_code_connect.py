@@ -63,7 +63,7 @@ class ConnectVerify(ConnectBase):
                       "the shared tri-state, naming the lock's holder")
         self.assertNotIn("launcher pid", out)
         self.assertIn("INFO session id: %s" % cli.read_config(cli.config_path())["SESSION_ID"], out)
-        self.assertIn(f"INFO attach: {cli.COMMAND} attach --single", out)
+        self.assertIn(f"INFO attach: {cli.COMMAND} attach --work {self.work}", out)
         self.assertIn("PASS hitl store: %s (the bridge's, beside its default store under %s)"
                       % (cli.hitl_store_root(), _dirs.state_dir()), out)
         runner.stop_session()

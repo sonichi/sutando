@@ -2592,7 +2592,7 @@ class LocalCommands(ConnectBase):
         routing.unlink(missing_ok=True)
         line = cli.projection_lines(cli.load_config()[0])
         self.assertEqual(line, ["INFO pending projection: %s (no primary gateway); on this machine: %s stop --confirm "
-                                "--single" % (req.id, cli.COMMAND)])
+                                "--work %s" % (req.id, cli.COMMAND, self.work)])
         routing.write_text("{}")
         self.addCleanup(routing.unlink, missing_ok=True)
         self.assertIn("(gateway predates claude-local)", cli.projection_lines(cli.load_config()[0])[0])
@@ -3310,7 +3310,7 @@ class StartupDialogAndRefusals(ConnectBase):
         self.assertEqual(rc, 1)
         self.assertIn(f"INFO folder trust: {self.inbox} recorded", out)
         self.assertIn(f"FAIL session: the pane waits at Claude Code's folder-trust dialog, so no task is answered; run "
-                      f"{cli.COMMAND} attach --single and answer it", out)
+                      f"{cli.COMMAND} attach --work {self.work} and answer it", out)
         for present, pane in ((True, READY_PANE), (False, TRUST_PANE), (None, TRUST_PANE)):
             with mock.patch.object(launcher.Tmux, "has_session", return_value=present), \
                     mock.patch.object(launcher.Tmux, "capture", return_value=pane):
