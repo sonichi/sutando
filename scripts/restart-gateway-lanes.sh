@@ -25,6 +25,16 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 
+# The credential store startup.sh uses. Left unset, the lanes read ~/.claude's channel
+# env instead of the one the connect flow wrote, and a configured lane is not started.
+source "$REPO/src/claude_config_dir.sh"
+_ccd_rc=0
+_ccd="$(resolve_claude_config_dir "$REPO" restart-gateway-lanes)" || _ccd_rc=$?
+case "$_ccd_rc" in
+  0|2) export CLAUDE_CONFIG_DIR="$_ccd" ;;
+  *) exit 1 ;;
+esac
+
 WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
 LOGS_DIR="$WORKSPACE/logs"
 mkdir -p "$LOGS_DIR"
