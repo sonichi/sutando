@@ -82,7 +82,8 @@ def _main(argv) -> int:
     r = sub.add_parser("resolve", help="print the SKILL.md a trigger task follows, or none")
     r.add_argument("--event-type", default="")
     r.add_argument("--playbook", default="")
-    r.add_argument("--skills-root", default=str(Path(__file__).resolve().parent.parent / "skills"))
+    repo = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — the code skills/
+    r.add_argument("--skills-root", default=str(repo / "skills"))
     args = ap.parse_args(argv)
     path = resolve_playbook(args.event_type, args.playbook, Path(args.skills_root))
     print(path if path is not None else "none")
