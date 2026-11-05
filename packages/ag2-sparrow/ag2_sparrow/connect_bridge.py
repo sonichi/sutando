@@ -217,13 +217,13 @@ def bridge_owner_problem(local: cm.Shape, root, agent_id: str = "") -> str:
     be shown gone: one agent is one bridge, whichever adapter runs it. A unit is gone once its file and job
     are; a host supervisor's declaration is the credential owner's to read, so only its uninstall clears it."""
     for _job, (job, command, mode, served) in sorted(_other_bridges(local, root, agent_id).items()):
-        other = bridge_shape(_named(job.name, command or f"ag2-sparrow-{job.name}", job.agent))
+        owner = _named(job.name, command or f"ag2-sparrow-{job.name}", job.agent)
+        other = bridge_shape(owner)
         where = cm.job_name(other) if mode == UNIT else f"declared for {mode}"
         gone = mode == UNIT and not os.path.lexists(cm.supervisor_path(other)) and cm.manager_state(other) == "absent"
         if not gone:
-            which = f" --agent {served}" if job.agent and AGENT_ID_RE.fullmatch(served or "") else ""
             return (f"{served} already has a bridge, run by {job.name} ({where}); one agent is one bridge: run "
-                    f"{other.writer} uninstall{which} first, then this command again")
+                    f"{cm.uninstall_command(owner)} first, then this command again")
     return ""
 
 
@@ -386,7 +386,7 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
         return problem
     after = _bytes(artifact)
     note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
-        f"the bridge declaration is left for {command} uninstall to remove; "
+        f"the bridge declaration is left for {cm.uninstall_command(local)} to remove; "
     if before is None and after is not None:
         note = f"{_unwire_ours(cfg, command, bridge, artifact, after)}; "
     stopped = cm.stop_started(local, root)
@@ -406,8 +406,8 @@ def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wire
     state = cm.manager_state(bridge)
     if state != "absent":
         return (f"the bridge this attempt wired ({cm.job_name(bridge)}) is {state} and was left, since stopping it "
-                f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run {command} "
-                "uninstall")
+                f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run "
+                f"{cm.uninstall_command(_named(bridge.name[:-len('-bridge')], command, bridge.agent))}")
     try:
         artifact.unlink()
     except OSError as e:

@@ -16,6 +16,7 @@ import io
 import os
 import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -310,7 +311,7 @@ class SideBySide(MultiBase):
                 rc, out, err = self.install(other, ALPHA)
                 self.assertNotEqual(rc, 0, out + err)
                 self.assertIn(f"already has a bridge, run by {adapter}", err)
-                which = "" if single else f" --agent {ALPHA}"
+                which = f" --agent {ALPHA}"     # the single job too: --agent selects it while it records the agent
                 self.assertIn(f"run {CLIS[adapter].COMMAND} uninstall{which} first", err)
                 self.assertFalse(self.host.bridges[job(other, ALPHA).job].started())
                 self.assertFalse(cm.config_path(job(other, ALPHA)).exists())
@@ -514,6 +515,169 @@ def dash_key(agent_id: str) -> str:
     if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,23}", segment):     # round 1's 24-character bound
         return segment
     return f"{segment[:13].rstrip('._-')}-{cm.hashlib.sha256(agent_id.encode()).hexdigest()[:10]}"
+
+
+PRINTED = re.compile(r"ag2-sparrow-(?:claude|codex)-local uninstall(?: --(?:agent|work) \S+| --single)?")
+
+
+class Round4(MultiBase):
+    def printed(self, text: str) -> "tuple[str, list]":
+        """The first uninstall command `text` prints: (its adapter, its argv), as an operator would copy it."""
+        found = PRINTED.search(text)
+        self.assertIsNotNone(found, text)
+        words = found.group(0).rstrip(",;)").split()
+        return ("claude-local" if "claude" in words[0] else "codex-local"), words[1:]
+
+    def run_printed(self, text: str, selector: str):
+        adapter, argv = self.printed(text)
+        self.assertEqual(" ".join(argv[1:]), selector, f"the printed command names its job: {text}")
+        rc, out, err = self.run_cli(adapter, *argv)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("pass the selector", err)
+
+    def test_every_printed_uninstall_command_names_its_job_and_runs_verbatim(self):
+        """With two jobs installed, the commands the cross-adapter refusal, uninstall's manual recovery and a
+        failed install print each carry the job's selector, and each succeeds when run as printed."""
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                a = job(CL.name, ALPHA)
+                for agent in (ALPHA, BETA):
+                    self.installed(CL.name, agent)
+                rc, out, err = self.install(CX.name, ALPHA)
+                self.assertNotEqual(rc, 0)
+                self.run_printed(err, f"--agent {ALPHA}")
+                self.installed(CL.name, ALPHA)
+                runner = self.host.launchers[a.job]
+                runner.table.update({("systemctl", "show"): None, ("launchctl", "print"): None})
+                rc, out, err = self.run_cli(CL.name, "uninstall", "--agent", ALPHA)
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn("3. re-run ", err)
+                runner.table.clear()
+                self.run_printed(err.split("3. re-run ", 1)[1], f"--agent {ALPHA}")
+                runner.root = None      # the manager starts the job, but no launcher takes the root
+                rc, out, err = self.install(CL.name, ALPHA)
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn("did not acquire", err)
+                self.run_printed(err, f"--agent {ALPHA}")
+                runner.root = str(self.root_of(ALPHA))
+                self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", BETA)[0], 0)
+                self.assertEqual(cm.installed_jobs(CL), [])
+                self.assertFalse((cm.config_root() / cm.AGENTS_DIR).exists(), "the empty agents dir goes too")
+                self.assertFalse((cm.config_root() / cm.RUN_DIR).exists(), "and the empty run dir")
+
+    def test_an_explicit_root_job_and_the_agents_own_job_are_never_aliased(self):
+        """A claude-local explicit-root job records the host's agent: beside that agent's own job, --agent
+        refuses as ambiguous and names both --work selectors, each of which selects its own job."""
+        single, a = job(CL.name, ""), job(CL.name, ALPHA)
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                self.host.add(single, self.work)
+                self.installed(CL.name, ALPHA)
+                self.relay.write_text(f"REMOTE_TASK_TOKEN={fx.TOKEN}\nAGENT_MXID={ALPHA}\n")
+                rc, out, err = self.run_cli(CL.name, "install", "--plugin-dir", str(self.plugin), "--claude-config-dir",
+                                            str(self.home / ".claude-sutando"), "--hmac-key-file",
+                                            str(self.home / "task-hmac.key"), "--work", str(self.work))
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(cm.recorded_agent(single), ALPHA)
+                for argv in (["verify", "--agent", ALPHA], ["attach", "--agent", ALPHA], ["uninstall", "--agent", ALPHA]):
+                    with mock.patch.object(os, "execv") as execv:
+                        rc, out, err = self.run_cli(CL.name, *argv)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertFalse(execv.called)
+                    self.assertIn(f"two jobs serve {ALPHA}", err)
+                    self.assertIn(f"--work {self.work}", err)
+                    self.assertIn(f"--work {self.root_of(ALPHA)}", err)
+                rc, out, err = self.run_cli(CL.name, "verify")
+                self.assertIn(f"({cm.job_name(single)}; --work {self.work})", err)
+                self.assertIn(f"({cm.job_name(a)}; --work {self.root_of(ALPHA)})", err)
+                for root, mine in ((self.work, single), (self.root_of(ALPHA), a)):
+                    self.assertIn(f"PASS config: {cm.config_path(mine)}", self.run_cli(CL.name, "verify", "--work", str(root))[1])
+                for root in (self.work, self.root_of(ALPHA)):
+                    self.assertEqual(self.run_cli(CL.name, "uninstall", "--work", str(root))[0], 0)
+                self.assertEqual(cm.installed_jobs(CL), [])
+
+    def test_a_waiter_on_the_operation_lock_and_a_reinstall_are_never_two_owners(self):
+        """uninstall removes the agent's operation lock while it holds it: a waiter blocked on it meanwhile takes
+        the lock file that is there afterwards, so a reinstall waits for that waiter instead of running beside it."""
+        for adapter in CLIS:
+            with self.subTest(adapter=adapter):
+                a = job(adapter, ALPHA)
+                self.installed(adapter, ALPHA)
+                path, real_open, real_remove = str(cm.oplock_path(a)), os.open, cm.remove_config_dir
+                opened, held, done, threads = threading.Event(), threading.Event(), threading.Event(), []
+
+                def waiter():
+                    lock = cm.operation_lock(a)
+                    lock.__enter__()
+                    held.set()
+                    done.wait(30)
+                    lock.release()
+
+                def watching(p, *args, **kw):
+                    fd = real_open(p, *args, **kw)
+                    if str(p) == path and threading.current_thread() is not threading.main_thread():
+                        opened.set()
+                    return fd
+
+                def removing(shape):
+                    threads.append(threading.Thread(target=waiter))
+                    threads[-1].start()
+                    self.assertTrue(opened.wait(10), "the waiter opened the lock uninstall holds")
+                    return real_remove(shape)
+                with mock.patch.object(os, "open", side_effect=watching), \
+                        mock.patch.object(cm, "remove_config_dir", side_effect=removing), \
+                        mock.patch.object(cm, "OP_WAIT_S", 30):
+                    rc, out, err = self.run_cli(adapter, "uninstall", "--agent", ALPHA)
+                self.assertEqual(rc, 0, out + err)
+                self.assertTrue(held.wait(10), "the waiter gets the lock")
+                self.assertTrue(os.path.exists(path), "on the file that is there now")
+                with mock.patch.object(cm, "OP_WAIT_S", 0.3):
+                    rc, out, err = self.install(adapter, ALPHA)
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn("operation is in progress", err)
+                self.assertFalse(cm.config_path(a).exists(), "the reinstall did not run beside the waiter")
+                done.set()
+                threads[0].join(10)
+                self.installed(adapter, ALPHA)
+                self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", ALPHA)[0], 0)
+
+    def test_a_fixed_job_under_sparrowd_is_recovered_by_its_declaration(self):
+        """Under a host supervisor the fixed job's bridge is a declaration, not a unit: with the config removed,
+        its declaration still names the agent and root, install keeps the job, uninstall removes the declaration,
+        and the next install is the agent's own job."""
+        saved = fx._dirs._injected
+        self.addCleanup(setattr, fx._dirs, "_injected", saved)
+        fx._dirs.set_dirs(state_dir=self.home / "ws-state", agents_dir=self.agents, bridge_host="sparrowd")
+        os.environ["AGENT_MXID"] = ALPHA
+        single, a = job(CL.name, ""), job(CL.name, ALPHA)
+        decl = cb.bridge_home(self.root_of(ALPHA)) / cb.DECLARATION
+        argv = ["install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
+                "--hmac-key-file", str(self.home / "task-hmac.key")]
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+                    self.assertEqual(self.run_cli(CL.name, *argv)[0], 0)
+                self.assertTrue(decl.exists())
+                self.assertFalse(cm.supervisor_path(cb.bridge_shape(single)).exists(), "no bridge unit")
+                cm.config_path(single).unlink()
+                self.assertEqual((cm.recorded_agent(single), cm.recorded_root(single)), (ALPHA, str(self.root_of(ALPHA))))
+                rc, out, err = self.run_cli(CL.name, *argv)
+                self.assertEqual(rc, 0, out + err)
+                self.assertTrue(cm.config_path(single).exists(), "install kept the fixed job")
+                self.assertFalse(cm.config_dir(a).exists())
+                cm.config_path(single).unlink()
+                rc, out, err = self.run_cli(CL.name, "uninstall", "--agent", ALPHA)
+                self.assertEqual(rc, 0, out + err)
+                self.assertFalse(decl.exists(), "uninstall removed the fixed job's declaration")
+                self.assertIn(f"removed: {decl}", out)
+                self.assertFalse(cm.supervisor_path(single).exists())
+                rc, out, err = self.run_cli(CL.name, *argv)
+                self.assertEqual(rc, 0, out + err)
+                self.assertTrue(cm.config_path(a).exists() and decl.exists(), "the next install is the agent's own")
+                self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", ALPHA)[0], 0)
 
 
 class Selection(MultiBase):

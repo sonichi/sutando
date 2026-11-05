@@ -445,7 +445,10 @@ fixed job, even a unit left without its config). With one job installed it can
 be left out; with several the command refuses and lists each job with its
 selector. `list` shows each job, its agent, the manager's state, its root and
 its selector. Commands verify prints, and the stall card's attach line, name
-the job (`--agent`, or `--single` for a job that records none). Installing,
+the job (`--agent`, or `--single` for a job that records none), as does every
+`uninstall` a refusal or a recovery line tells you to run. An explicit-root job
+records the host's agent; when that agent also has its own job, `--agent` refuses
+as ambiguous and names each job's `--work <root>`. Installing,
 reinstalling (the restart) or uninstalling one agent never names another's job.
 An explicit root keeps the single fixed job.
 
@@ -456,9 +459,10 @@ act on it as before. Nothing is moved, and nothing is stopped by name. Other
 agents install beside it as jobs of their own. To give it a job of its own,
 `uninstall --agent <id>`, then `install` again. A job whose config is gone or
 unreadable (say, removed by hand as its refusal says) is found again by its own
-marked bridge unit, which records its agent and root: `install` keeps that job
+marked bridge unit, or under a host supervisor by its own bridge declaration
+(`<root>.bridge/worker.json`), which records its agent and root: `install` keeps that job
 and writes the config again, and `uninstall --agent <id>` stops it, unwires its
-bridge and removes its units.
+bridge (the unit, or the declaration) and removes its units.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the

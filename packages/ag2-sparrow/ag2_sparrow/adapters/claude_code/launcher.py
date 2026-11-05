@@ -80,7 +80,10 @@ def remove_run_dir(config_dir) -> str:
         if e.name.startswith(guard + ".") and e.is_dir(follow_symlinks=False):
             return sorted(os.listdir(e.path)) in ([], ["mutex"])
         return False
-    return cm.remove_if_only(path, ours)
+    line = cm.remove_if_only(path, ours)
+    if line.startswith("removed: "):
+        cm.remove_empty_parent(path)
+    return line
 
 
 def socket_problem(config_dir) -> str:

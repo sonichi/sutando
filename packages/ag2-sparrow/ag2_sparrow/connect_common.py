@@ -182,10 +182,20 @@ def remove_if_only(path, accept, whose: str = "this job's") -> str:
     return f"removed: {path}"
 
 
+def remove_empty_parent(path) -> None:
+    """The dir holding `path`, once it is empty (the last agent's dir gone); a dir with anything in it stays."""
+    with contextlib.suppress(OSError):
+        os.rmdir(Path(path).parent)
+
+
 def remove_config_dir(shape: Shape) -> str:
-    """After an agent's own job is uninstalled: its config dir, once it holds only this job's run files."""
+    """After an agent's own job is uninstalled: its config dir, once it holds only this job's run files, then
+    the agents dir once it is empty. The operation lock is removed held: operation_lock re-checks its inode."""
     owned = {f"{shape.name}.oplock", *shape.run_files}
-    return remove_if_only(config_dir(shape), lambda e: e.name in owned and e.is_file(follow_symlinks=False))
+    line = remove_if_only(config_dir(shape), lambda e: e.name in owned and e.is_file(follow_symlinks=False))
+    if line.startswith("removed: "):
+        remove_empty_parent(config_dir(shape))
+    return line
 
 
 def config_path(shape: Shape) -> Path:
@@ -263,17 +273,46 @@ def unit_environ(text: str) -> dict:
 
 
 def recovered_config(shape: Shape) -> dict:
-    """For a job whose config is gone or unreadable, what its own marked bridge unit records (its root, agent,
-    token file and state dir); {} when there is no such unit. Lets recovery find the job again."""
+    """For a job whose config is gone or unreadable, what its own marked bridge unit, or its own declaration for
+    a host supervisor, records (its root, agent and state dir); {} when there is neither. Lets recovery find
+    the job again."""
     bridge = bridge_shape(shape)
     text, problem = owned_text(supervisor_path(bridge), supervisor_marker(bridge), "supervisor file")
     env = unit_environ(text) if text and not problem else {}
     tasks = env.get("AGENT_CONNECT_TASK_DIR", "")
     if not tasks or not os.path.isabs(tasks):
-        return {}
+        return _declared_config(shape)
     return {"ROOT": os.path.dirname(tasks), "AGENT_ID": env.get("AGENT_MXID", ""), "BRIDGE": "unit",
             "TOKEN_ENV_FILE": env.get("AG2_DEVICE_ENV", ""), "TOKEN_VAULT_KEY": "",
             "BRIDGE_STATE_DIR": env.get("AGENT_CONNECT_STATE_DIR", "")}
+
+
+DECLARATION = "worker.json"     # a host supervisor's bridge declaration, in the dir beside an agent's root
+
+
+def _declared_config(shape: Shape) -> dict:
+    """recovered_config under a host supervisor: the one agent root whose declaration this job's install wrote
+    (an agent's own job: its root; the single job: one no agent's own job of this adapter claims)."""
+    agents = Path(_dirs.agents_dir())
+    if shape.agent:
+        names = [shape.agent + ".bridge"]
+    else:
+        try:
+            names = sorted(n for n in os.listdir(agents) if n.endswith(".bridge"))[:256]
+        except OSError:
+            names = []
+    found = []
+    for name in names:
+        key = name[:-len(".bridge")]
+        keyed = for_key(shape, key)
+        if not shape.agent and (os.path.lexists(config_path(keyed)) or os.path.lexists(supervisor_path(keyed))):
+            continue
+        got, _ = _sources.declared_bridge(agents / name / DECLARATION, written_by=f"{shape.command} install")
+        tasks = got.get("tasks_dir", "")
+        if got.get("host") and tasks and os.path.realpath(tasks) == os.path.realpath(agents / key / "tasks"):
+            found.append({"ROOT": os.path.dirname(tasks), "AGENT_ID": got["agent_id"], "BRIDGE": got["host"],
+                          "TOKEN_ENV_FILE": "", "TOKEN_VAULT_KEY": "", "BRIDGE_STATE_DIR": got["state_dir"]})
+    return found[0] if len(found) == 1 else {}
 
 
 def _recorded(shape: Shape, key: str) -> str:
@@ -298,6 +337,13 @@ def job_for(shape: Shape, agent_id: str) -> Shape:
 def agent_job(shape: Shape, agent_id: str) -> "tuple[Shape | None, str]":
     """job_for, refused when that job's config records another agent: never act on a job that is not its own."""
     job = job_for(shape, agent_id)
+    single, own = for_key(shape, ""), for_key(shape, agent_key(agent_id))
+    if job == single and (os.path.lexists(config_path(own)) or os.path.lexists(supervisor_path(own))):
+        root = recorded_root(single)
+        return None, (f"two jobs serve {agent_id}: {job_name(single)} (select it with "
+                      f"{f'--work {shlex.quote(root)}' if root else '--single'}) and its own {job_name(own)} (select it "
+                      f"with --work {shlex.quote(recorded_root(own) or str(Path(_dirs.agents_dir()) / own.agent))}); "
+                      "pass one of those, or uninstall one")
     other = recorded_agent(job)
     if other and other != agent_id:
         return None, (f"{config_path(job)} records {other}, not {agent_id}: the job {job_name(job)} is not this "
@@ -335,11 +381,17 @@ def recorded_root(shape: Shape) -> str:
 def job_selector(shape: Shape) -> str:
     """The flag that selects this job: its agent, else (the single job) its work root, else --single."""
     agent, root = recorded_agent(shape), recorded_root(shape)
-    if agent:
+    if agent and agent_job(for_key(shape, ""), agent)[0] == shape:
         return f"--agent {agent}"
     if root:
         return f"--work {shlex.quote(root)}"
     return "--single" if not shape.agent else f"none: fix or remove {config_path(shape)} by hand"
+
+
+def uninstall_command(shape: Shape) -> str:
+    """`<command> uninstall` with the selector that names this job, for a line telling the operator to run it."""
+    selector = job_selector(shape)
+    return f"{shape.command} uninstall" + (f" {selector}" if selector.startswith("--") else "")
 
 
 def command_for(shape: Shape, cfg: dict, verb: str) -> str:
@@ -834,27 +886,43 @@ class Busy(Exception):
 
 
 class operation_lock:
-    """One cheap per-shape mutex across install, uninstall and debug-run's check-then-acquire: a flock
-    on a stable file, waited for briefly, then Busy with one line. `release()` is idempotent."""
+    """One cheap per-job mutex across install, uninstall and debug-run's check-then-acquire: a flock on its
+    file, waited for briefly, then Busy with one line. uninstall may remove an agent's file while holding it,
+    so a flock counts only while the path still names the locked inode. `release()` is idempotent."""
 
     def __init__(self, shape: Shape):
         self.shape, self.fd = shape, -1
 
     def __enter__(self):
         path = oplock_path(self.shape)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
         deadline = time.monotonic() + OP_WAIT_S
         while True:
+            if self.fd < 0:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    self.fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+                except FileNotFoundError:   # its dir removed between the two calls: open it again
+                    continue
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
+                if self._names_held_inode(path):
+                    return self
+                self.release()      # the file was removed while we waited: the lock is the one there now
+                continue
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     self.release()
                     raise Busy(f"another {self.shape.command} operation is in progress (lock {path}); wait for it, "
                                "then try again")
                 time.sleep(0.1)
+
+    def _names_held_inode(self, path: Path) -> bool:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return False
+        held = os.fstat(self.fd)
+        return (st.st_dev, st.st_ino) == (held.st_dev, held.st_ino)
 
     def release(self) -> None:
         if self.fd >= 0:
@@ -916,7 +984,7 @@ def recovery_lines(shape: Shape, root: str) -> list:
            f"no live launcher is recorded; find the holder with: lsof {shlex.quote(lock or '<lock file>')}")
     return [f"Manual recovery: 1. stop the job by hand: {stop_command(shape)}",
             f"2. stop what holds the work root {root}: {who}",
-            f"3. re-run {shape.command} uninstall"]
+            f"3. re-run {uninstall_command(shape)}"]
 
 
 def _refuse(line: str, more=()) -> int:
@@ -1412,7 +1480,7 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     if problem:
         return _refuse(problem)
     if old.get("ROOT") and old["ROOT"] != root:
-        return _refuse(f"the work root is {old['ROOT']}, not {root}; run {shape.command} uninstall, then "
+        return _refuse(f"the work root is {old['ROOT']}, not {root}; run {uninstall_command(shape)}, then "
                        f"{shape.command} install")
     problem = precheck(root) if precheck is not None else ""
     if problem:
@@ -1441,9 +1509,9 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     print(f"{'installed' if not old else 'changed' if old != dict(values, ROOT=root) else 'rewritten'}: {conf}")
     print(f"installed: {sup}")
     problem = _start_pending(shape, root, before, True, unit, None, holder,
-                             f"; run {shape.command} uninstall, then {shape.command} install")
+                             f"; run {uninstall_command(shape)}, then {shape.command} install")
     if problem:
-        return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {shape.command} uninstall, "
+        return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {uninstall_command(shape)}, "
                        f"then {shape.command} install")
     return 0
 
@@ -1463,7 +1531,7 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
     if problem:
         return _refuse(problem)
     if old.get("ROOT") and old["ROOT"] != root:
-        return _refuse(f"the work root is {old['ROOT']}, not {root}; run {shape.command} uninstall, then "
+        return _refuse(f"the work root is {old['ROOT']}, not {root}; run {uninstall_command(shape)}, then "
                        f"{shape.command} install")
     problem = precheck(root) if precheck is not None else ""
     if problem:
@@ -1667,8 +1735,8 @@ def _undo_start(p: dict) -> str:
     problem = _retire_run(shape, p["ident"])
     if problem:
         return (f"{notes}{job_name(shape)} could not be stopped ({problem}): {by_hand}, or remove it with "
-                f"{shape.command} uninstall")
-    left = f"it stays installed and starts again at your next login: {shape.command} uninstall removes it"
+                f"{uninstall_command(shape)}")
+    left = f"it stays installed and starts again at your next login: {uninstall_command(shape)} removes it"
     print(f"stopped: {job_name(shape)} (the job this operation started, pid {p['ident']['pid']}); {left}")
     return f"{notes}{job_name(shape)}, {STOPPED}; {left}"
 
@@ -1980,7 +2048,7 @@ def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None, relay=No
     if cfg.get("BRIDGE"):
         check(results, state == "active", "job", f"{job_name(shape)} {state}" if state == "active" else
               f"{job_name(shape)} is {state}, so no session answers the tasks its configured bridge passes on: run "
-              f"{shape.command} install again, or {shape.command} uninstall")
+              f"{shape.command} install again, or {uninstall_command(shape)}")
     else:
         print(f"INFO job: {job_name(shape)} {state}")
     root = work_root(cfg)
@@ -2015,12 +2083,12 @@ def uninstall(shape: Shape, before_free=None, token_file=None, cleanup=None) -> 
                 busy = "" if root else agent_operation_in_progress()
                 if busy:
                     return _refuse(f"no config names the root {job_name(shape)} serves, and an operation on an agent "
-                                   f"holds {busy}; nothing was removed; run {shape.command} uninstall once it ends")
+                                   f"holds {busy}; nothing was removed; run {uninstall_command(shape)} once it ends")
                 return _uninstall_locked(shape, before_free, token_file, cleanup)
         except Busy as e:
             return _refuse(str(e))
     return _refuse(f"{shape.job}'s configured root changed while uninstall waited for its lock; nothing was "
-                   f"removed; run {shape.command} uninstall again")
+                   f"removed; run {uninstall_command(shape)} again")
 
 
 def _uninstall_locked(shape: Shape, before_free=None, token_file=None, cleanup=None) -> int:
@@ -2067,10 +2135,11 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None, cleanup=N
     if not is_macos():
         r = _sm._systemctl(("--user", "daemon-reload"))
         if not _ok(r):
-            return _refuse(f"systemctl --user daemon-reload failed ({_why(r)}); {kept}; run uninstall again", recovery)
+            return _refuse(f"systemctl --user daemon-reload failed ({_why(r)}); {kept}; run {uninstall_command(shape)} "
+                           "again", recovery)
         if unit_load_state(shape) != "not-found":
             return _refuse(f"{shape.service_name} is still known to systemd (LoadState {unit_load_state(shape)}); {kept}; "
-                           "run uninstall again", recovery)
+                           f"run {uninstall_command(shape)} again", recovery)
     if cfg is not None:
         conf.unlink()
         print(f"removed: {conf}")

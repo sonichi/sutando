@@ -1608,7 +1608,7 @@ READS = {"open", "read_text", "read_bytes", "readlines"}
 # The bridge declaration's file: a path built from these is opaque outside the owner. It may be
 # formatted into a message or handed to one of DECLARATION_OWNER_CALLS, and nothing else.
 DECLARATION_MARKERS = {"DECLARATION", "worker.json"}
-DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration"}
+DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration", "declared_bridge"}
 OWNER_MODULE = "gateway_credential_sources"
 # The owner's entry points: reachable only as `<alias>.<name>(...)` on the module's one import of it.
 OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | READER_ONLY)

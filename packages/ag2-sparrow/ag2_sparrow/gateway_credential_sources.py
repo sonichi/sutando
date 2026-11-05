@@ -61,9 +61,9 @@ def _bridge_declaration_text(*, written_by: str, host: str, name: str, module: s
     return json.dumps(record, indent=1, sort_keys=False) + "\n"
 
 
-def _declaration_owned(path: str, written_by: str) -> "tuple[bool, str]":
-    """(present, '') when nothing is at `path` or it is a declaration `written_by` wrote, else (False, why).
-    A file over MAX_DECLARATION_BYTES is not one: refused and left untouched, never read past the cap."""
+def _declaration_owned(path: str, written_by: str, record: "dict | None" = None) -> "tuple[bool, str]":
+    """(present, '') when nothing is at `path` or it is a declaration `written_by` wrote, else (False, why);
+    `record` gets an owned declaration's fields. A file over MAX_DECLARATION_BYTES is refused unread."""
     if os.path.isdir(path):
         return False, f"{path} is a directory, not a declaration; remove it yourself"
     if os.path.islink(path) and not os.path.exists(path):
@@ -80,12 +80,27 @@ def _declaration_owned(path: str, written_by: str) -> "tuple[bool, str]":
         return False, (f"{path} is over the {MAX_DECLARATION_BYTES}-byte cap for a declaration; "
                        f"remove it by hand (rm {shlex.quote(path)}) if it is yours to remove")
     try:
-        ours = json.loads(data.decode("utf-8", errors="replace")).get("written_by") == written_by
+        loaded = json.loads(data.decode("utf-8", errors="replace"))
+        ours = loaded.get("written_by") == written_by
     except (ValueError, AttributeError):
         ours = False
     if not ours:
         return False, f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
+    if record is not None:
+        record.update(loaded)
     return True, ""
+
+
+def declared_bridge(path, *, written_by: str) -> "tuple[dict, str]":
+    """For an install whose config is gone: the inbox, agent, state dir and host its declaration at `path`
+    names, ({}, '') for none, ({}, why) for one `written_by` did not write. Never its vault key or token name."""
+    record: dict = {}
+    present, problem = _declaration_owned(os.fspath(path), written_by, record)
+    env = record.get("env") if isinstance(record.get("env"), dict) else {}
+    if not present:
+        return {}, problem
+    return {"tasks_dir": str(env.get("AGENT_CONNECT_TASK_DIR") or ""), "agent_id": str(env.get("AGENT_MXID") or ""),
+            "state_dir": str(env.get("AGENT_CONNECT_STATE_DIR") or ""), "host": str(record.get("host") or "")}, ""
 
 
 def remove_bridge_declaration(path, *, written_by: str) -> "tuple[bool, str]":
