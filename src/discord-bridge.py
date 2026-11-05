@@ -5515,7 +5515,7 @@ def _proactive_fence():
         except OSError:
             entries = [items]  # unreadable A-side state: fail closed
         if resolve_claim_backend() == "c":
-            from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+            from ag2_sparrow.delivery_core import DesignCClaimBackend
             from ag2_sparrow.delivery_core.migration import c_selection_allowed
             # The fence, not just config, decides: C must not drain a root the
             # migration owner still says A owns, and must defer on bad state.

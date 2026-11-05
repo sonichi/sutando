@@ -7,6 +7,10 @@ Two halves, because they are separate claims: sutando_config decides the NAME
 drove the resolver would pass while the bridge ignored it.
 """
 # ruff: noqa: E402 — imports follow the sys.path inserts below
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
