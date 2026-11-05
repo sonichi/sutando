@@ -1,6 +1,10 @@
 """Usage-limit reset parsing and bounded recovery decisions, without a live pane."""
 import os
 import sys
+import subprocess
+import shutil
+import time
+import shlex
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -80,7 +84,7 @@ class LimitRecovery(unittest.TestCase):
         _, action = self.tick(state, paused, NOW + 900)
         self.assertEqual(action, ps.NOTHING)
 
-    def test_rearm_uses_real_routed_delivery_without_a_pane_send(self):
+    def test_rearm_routes_then_uses_guarded_line_sender(self):
         import pool_remedy as remedy
         import pool_ask
         with tempfile.TemporaryDirectory() as directory:
@@ -90,17 +94,73 @@ class LimitRecovery(unittest.TestCase):
                 session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
             sup.pr.register_worker(ws, wid, "fixture-worker")
             pool_ask.ask(ws, wid, "Outstanding fixture work")
-            def refuse_process(*args, **kwargs):
-                raise AssertionError("recovery must not send keys or spawn a process")
-            result = remedy.apply(ws, REPO, {wid: remedy.ps.RETRY_LIMIT}, runner=refuse_process,
-                                  spawn=refuse_process)
+            calls = []
+            def runner(argv, **kwargs):
+                calls.append(argv)
+                if argv[0] == "tmux":
+                    return subprocess.CompletedProcess(argv, 0, "You've hit your weekly limit\n❯ \n", "")
+                self.assertEqual(argv[:2], ["bash", str(REPO / "scripts/tmux-send-line.sh")])
+                self.assertIn("--refuse-if-pending", argv)
+                self.assertIn("--socket", argv)
+                return subprocess.CompletedProcess(argv, 0, "sent", "")
+            with patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
+                result = remedy.apply(ws, REPO, {wid: remedy.ps.RETRY_LIMIT}, runner=runner)
             delivered = result["rearms"][wid]
-            self.assertEqual(delivered["outcome"], "rearm-queued")
+            self.assertEqual(delivered["outcome"], "rearm-sent")
+            self.assertEqual(len(calls), 2)
             self.assertTrue(sup.pd.find(ws, wid, delivered["task_id"]))
             payload = sup.pd.read_payload(ws, delivered["task_id"])
             self.assertIn("Re-arm your session-role task watcher", payload)
+            for frame in ("You've hit your weekly limit\n❯ owner draft\n", "❯ \n", ""):
+                def changed(argv, **kwargs):
+                    self.assertEqual(argv[0], "tmux", "changed panes must never send")
+                    return subprocess.CompletedProcess(argv, 0, frame, "")
+                with patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
+                    refused = remedy.retry_limit(ws, REPO, wid, runner=changed)
+                self.assertEqual(refused["outcome"], "pane-changed-or-pending")
             sup.set_paused(ws, wid, True)
-            self.assertEqual(remedy.retry_limit(ws, wid)["outcome"], "no-work-or-paused")
+            self.assertEqual(remedy.retry_limit(ws, REPO, wid)["outcome"], "no-work-or-paused")
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux required")
+    def test_real_guarded_sender_wakes_an_isolated_limit_pane(self):
+        import pool_remedy as remedy
+        import pool_ask
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            socket = str(ws / "tmux.sock")
+            received = ws / "received.txt"
+            script = ws / "fixture.py"
+            script.write_text("from pathlib import Path\n"
+                              "print(\"You've hit your weekly limit\")\n"
+                              f"Path({str(received)!r}).write_text(input('❯ '))\n"
+                              "import time; time.sleep(30)\n")
+            cmd = ["tmux", "-S", socket]
+            subprocess.run(cmd + ["-f", "/dev/null", "new-session", "-d", "-s", "fixture",
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"], check=True)
+            try:
+                for _ in range(100):
+                    frame = subprocess.run(cmd + ["capture-pane", "-p", "-t", "fixture"],
+                                           capture_output=True, text=True).stdout
+                    if "❯" in frame:
+                        break
+                    time.sleep(0.05)
+                self.assertIn("❯", frame)
+                wid = sup.wi.new_worker_id()
+                sup.wi.create_worker(ws, runtime="claude", cwd=str(ws), host="fixture",
+                    session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
+                sup.pr.register_worker(ws, wid, "fixture-worker")
+                pool_ask.ask(ws, wid, "Outstanding fixture work")
+                with patch.object(remedy.sup, "_open_tmux", return_value=(socket, "fixture")):
+                    result = remedy.retry_limit(ws, REPO, wid)
+                self.assertEqual(result["outcome"], "rearm-sent", result)
+                for _ in range(100):
+                    if received.exists():
+                        break
+                    time.sleep(0.05)
+                self.assertIn(result["task_id"], received.read_text())
+                self.assertTrue(sup.pd.find(ws, wid, result["task_id"]))
+            finally:
+                subprocess.run(cmd + ["kill-server"], capture_output=True)
 
 
 if __name__ == "__main__":

@@ -727,14 +727,18 @@ persisted wait, instead of the watcher-loss or human-card ladder. A printed rese
 time (including its named timezone) sets the first due time; unreadable or absent
 reset text uses a 15-minute probe interval. A due tick requests one fresh turn
 through `pool_ask` and the normal recipient routing path, asking the worker to
-re-arm its session watcher and process its existing inbox. It never sends pane
-keys or restarts the worker from the recovery action.
+re-arm its session watcher and process its existing inbox. For Claude, a fresh limit capture and empty composer permit a wake-up line
+through the existing guarded line sender, pointing at that routed payload.
+The sender rechecks pending input under its lock; refusals consume an attempt
+and retain the queued task. The worker is never restarted for this action.
 
 Still-limited observations back off for 15, 30, 60 and 120 minutes, with at most
 four delivery requests before escalation. The attempt count survives supervisor
 restarts and unknown observations; a positively idle/working pane starts a new
 episode. Paused workers and workers without outstanding work receive no request.
 
-This action queues a request, not proof of a completed model turn. A standalone
-Claude notifier still uses the guarded pane sender when no session Monitor is
-alive; routing does not supply an independent transport around that notifier.
+The standalone notifier deliberately holds limit refusals. The bounded recovery
+action supplies the wake-up through the guarded sender instead of waiting for
+that notifier. A successful send proves submission, not that the provider accepted
+the turn; continued limit observations use the same backoff. Non-Claude workers
+are currently refused by the recovery action.
