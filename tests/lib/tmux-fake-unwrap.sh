@@ -12,7 +12,11 @@ if [ "${1:-}" = -S ] && [ "${3:-}" = if-shell ]; then
   eval "set -- $_tfu_mode"
   "$0" -S "$_tfu_sock" "$@"
   eval "set -- $_tfu_cmd"
-  eval "_tfu_cmd=\${$#}"
+  if [ "${5:-}" != '#{pane_in_mode}' ]; then
+    _tfu_cmd="$6"
+  else
+    eval "_tfu_cmd=\${$#}"
+  fi
   eval "set -- $_tfu_cmd"
   _tfu_out=""
   for _tfu_k in "$@"; do

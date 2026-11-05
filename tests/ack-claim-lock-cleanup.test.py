@@ -5,7 +5,7 @@
   b) a lock whose record still exists, or that is younger than retention, stays
   c) a lock another publisher holds survives
   d) a publisher that has opened the lock but not yet acquired it: cleanup waits for it, never
-     unlinks the inode under it, and removes the lock only after the publisher is done
+     unlinks the inode under it, and a later sweep removes the lock after the publisher is done
      CONTROL (d): without the directory lock, cleanup unlinks during that window and the
      publisher's inode check has to reopen
   e) the directory lock itself is never removed
@@ -81,7 +81,46 @@ def interleave(ws: Path, lock: Path):
     go.set()
     pub.join(10)
     cleaner.join(10)
+    assert not pub.is_alive() and not cleaner.is_alive(), "publisher or cleaner did not finish"
     return during, done, calls
+
+
+def directory_unlock_handoff():
+    ws = ws_()
+    lock = released_lock(ws)
+    directory_inode = (ack_claim.claims_dir(ws) / ack_claim.DIR_LOCK).stat().st_ino
+    released, resume = threading.Event(), threading.Event()
+    real_flock = fcntl.flock
+    errors = []
+
+    def paused_unlock(fh, operation):
+        real_flock(fh, operation)
+        if (threading.current_thread().name == "handoff-publisher"
+                and operation == fcntl.LOCK_UN
+                and os.fstat(fh.fileno()).st_ino == directory_inode):
+            released.set()
+            if not resume.wait(10):
+                raise AssertionError("publisher was not resumed")
+
+    def publish():
+        try:
+            ack_claim.update(ws, KEY, "status-ack", via="late")
+        except BaseException as exc:
+            errors.append(exc)
+
+    fcntl.flock = paused_unlock
+    publisher = threading.Thread(target=publish, name="handoff-publisher")
+    try:
+        publisher.start()
+        assert released.wait(10), "publisher never released the directory lock"
+        removed = ack_claim.prune_orphan_locks(ws, lock.stat().st_mtime + 2 * RET, RET)
+        check(removed == [f"lock:{lock.stem}"] and not lock.exists(),
+              f"f) directory unlock hands cleanup an already-unlocked key ({removed})")
+    finally:
+        resume.set()
+        publisher.join(10)
+        fcntl.flock = real_flock
+    check(not publisher.is_alive() and not errors, f"f) publisher completed ({errors})")
 
 
 def main() -> int:
@@ -112,10 +151,13 @@ def main() -> int:
 
     ws = ws_()
     lock = released_lock(ws)
+    now = os.stat(lock).st_mtime + 2 * RET
     (waited, intact), done, calls = interleave(ws, lock)
     check(not waited and intact, "d) cleanup waits while a publisher is between open and acquire; the inode stays")
-    check(done == [[f"lock:{lock.stem}"]] and not lock.exists() and len(calls) == 1,
-          f"d) once the publisher is done, cleanup removes the lock ({done}, {len(calls)} open(s))")
+    removed = ack_claim.prune_orphan_locks(ws, now, RET)
+    check(done in ([[]], [[f"lock:{lock.stem}"]]) and done[0] + removed == [f"lock:{lock.stem}"]
+          and not lock.exists() and len(calls) == 1,
+          f"d) a post-publisher sweep removes any lock skipped while held ({done}, {removed}, {len(calls)} open(s))")
 
     ws = ws_()
     lock = released_lock(ws)
@@ -129,6 +171,7 @@ def main() -> int:
           f"CONTROL (d): without the directory lock cleanup unlinks mid-open and the publisher reopens ({len(calls)})")
 
     check((ack_claim.claims_dir(ws) / ack_claim.DIR_LOCK).exists(), "e) the directory lock is never removed")
+    directory_unlock_handoff()
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
 

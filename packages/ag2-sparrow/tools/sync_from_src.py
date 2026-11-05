@@ -37,6 +37,8 @@ MAP = {
     "src/delivery/readiness.py": "result_ready.py",
     # the one results/ publisher: the bridge stages and renames through it
     "src/result_publish.py": "result_publish.py",
+    # a result's Activity labels side file; the hatch and result_publish write it, the bridge reads it
+    "src/result_labels.py": "result_labels.py",
     # terminal disposal of a result file (claim / verify / quarantine / recover);
     # the gateway delegates, tests/gateway-disposal-delegation.test.py pins it
     "src/delivery/disposal.py": "result_disposal.py",
@@ -73,6 +75,8 @@ MAP = {
     # task ordering (urgent > normal > low, FIFO within a tier) for every inbox consumer
     "src/task_priority.py": "task_priority.py",
     "src/agent_turn.py": "agent_turn.py",
+    # the one reader of a number from untrusted JSON
+    "src/safe_number.py": "safe_number.py",
     # one adapter's task execution lifecycle: work-dir lock, classifier, claims, publication
     "src/task_lifecycle.py": "task_lifecycle.py",
     # worker-pool completion-record contract: the pool skill writes through it
