@@ -848,8 +848,48 @@ class HelperCpu(unittest.TestCase):
         blocked.write_text("")
         r = hcg.check(self.repo, blocked / "state" / "samples.json", runner=lambda *a, **k: Out())
         self.assertEqual((r["status"], r["detail"].split(":")[0]), ("warn", "not checked"))
-        with unittest.mock.patch.object(hcg.os, "replace", side_effect=OSError("ro")):
-            self.assertEqual(hcg.evaluate(self.rows(1), self.repo, self.state, now=1), [], "a write failure is quiet")
+
+    def test_sample_write_failures_are_unknown_and_leave_no_temporary_file(self):
+        original_write = Path.write_text
+
+        def partial_write(path, *args, **kwargs):
+            original_write(path, "partial")
+            raise OSError("disk full")
+
+        for operation in ("write", "replace"):
+            with self.subTest(operation=operation):
+                self.state.unlink(missing_ok=True)
+                patch = (unittest.mock.patch.object(Path, "write_text", partial_write)
+                         if operation == "write" else
+                         unittest.mock.patch.object(hcg.os, "replace", side_effect=OSError("read only")))
+                with patch:
+                    for now, cpu in ((1000, "0:01"), (2000, "10:01")):
+                        out = subprocess.CompletedProcess([], 0,
+                            stdout=f"42 {START} {cpu} bash {self.repo}/src/x.sh\n")
+                        result = hcg.check(self.repo, self.state, runner=lambda *a, **k: out, now=now)
+                        self.assertEqual(result["status"], "warn", result)
+                        self.assertIn("not checked: samples unwritable", result["detail"])
+                        self.assertFalse(self.state.exists())
+                        self.assertEqual(list(self.state.parent.glob(".*.tmp")), [])
+                for now, cpu, status in ((1000, "0:01", "ok"), (2000, "10:01", "warn")):
+                    out = subprocess.CompletedProcess([], 0,
+                        stdout=f"42 {START} {cpu} bash {self.repo}/src/x.sh\n")
+                    result = hcg.check(self.repo, self.state, runner=lambda *a, **k: out, now=now)
+                    self.assertEqual(result["status"], status, result)
+                self.assertIn("pid 42 src/x.sh at 60%", result["detail"])
+
+    def test_failed_replacement_preserves_the_previous_sample(self):
+        hcg.evaluate(self.rows(1), self.repo, self.state, now=1000)
+        previous = self.state.read_bytes()
+        out = subprocess.CompletedProcess([], 0,
+            stdout=f"42 {START} 10:01 bash {self.repo}/src/x.sh\n")
+        with unittest.mock.patch.object(hcg.os, "replace", side_effect=OSError("read only")):
+            result = hcg.check(self.repo, self.state, runner=lambda *a, **k: out, now=2000)
+        self.assertIn("not checked: samples unwritable", result["detail"])
+        self.assertEqual(self.state.read_bytes(), previous)
+        self.assertEqual(list(self.state.parent.glob(".*.tmp")), [])
+        result = hcg.check(self.repo, self.state, runner=lambda *a, **k: out, now=2000)
+        self.assertIn("pid 42 src/x.sh at 60%", result["detail"])
 
     def test_health_check_runs_the_probe(self):
         import importlib.util

@@ -158,12 +158,12 @@ def evaluate(rows: "list[dict]", repo: Path, state_path: Path, now: "float | Non
             if key not in kept and isinstance(old, dict) and isinstance(old.get("at"), (int, float)) \
                     and now - old["at"] < RETAIN_S:
                 kept[key] = old
+        tmp = state_path.with_name(f".{state_path.name}.{os.getpid()}.tmp")
         try:
-            tmp = state_path.with_name(f".{state_path.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(kept), encoding="utf-8")
             os.replace(tmp, state_path)
-        except OSError:
-            pass
+        finally:
+            tmp.unlink(missing_ok=True)
     return hot
 
 
