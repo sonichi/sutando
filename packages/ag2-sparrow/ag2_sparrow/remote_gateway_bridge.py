@@ -1583,10 +1583,11 @@ def _guard_tier(tid: str, resolve, filter_enabled):
     return tfile, tier, scan_sensitive_data
 
 
-def _guarded_result_labels(tid: str) -> dict:
-    """The task's Activity title and outcome from its side file, each kept only when the result
-    guard passes it unchanged for the task's tier; {} when the guard cannot be loaded."""
-    labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}")
+def _guarded_result_labels(tid: str, generation=None) -> dict:
+    """The task's Activity title and outcome from its side file, when written for the bytes of
+    `generation`; each kept only when the result guard passes it unchanged for the task's tier."""
+    labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}",
+                                getattr(generation, "digest", None))
     if not labels:
         return {}
     try:
@@ -9361,7 +9362,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["consolidated_into"] = consolidated_into
     doc.update(_result_contract(dm_only))
     # Activity labels ride the doc that carries dm_only; a broker without them ignores the keys.
-    doc.update(_guarded_result_labels(tid))
+    doc.update(_guarded_result_labels(tid, generation))
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
         doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK

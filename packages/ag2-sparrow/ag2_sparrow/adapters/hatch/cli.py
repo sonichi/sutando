@@ -1539,21 +1539,14 @@ def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path
         return False, "none"
     if result_file.exists():
         return False, _line_report(result_dir, tid)
-    side = None
     try:
         # Before the result: the drain that reads the result finds its labels with it.
-        side = result_labels.write(result_file, labels or {})
+        result_labels.write(result_file, labels or {}, body)
         committed = _publish_once(result_file, body)
     except BaseException:
         with contextlib.suppress(OSError):
             (_claims_dir(result_dir) / tid).unlink(missing_ok=True)
-        if side is not None:
-            with contextlib.suppress(OSError):
-                side.unlink(missing_ok=True)
         raise
-    if not committed and side is not None:
-        with contextlib.suppress(OSError):
-            side.unlink(missing_ok=True)
     # False: another result holds the name, so the task is answered either way.
     return committed, _line_report(result_dir, tid)
 
