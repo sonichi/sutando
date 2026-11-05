@@ -229,7 +229,7 @@ class HumanCardMigration(unittest.TestCase):
                             or "inbox-holders" in a for a in self.calls))
 
     def test_limit_wait_replaces_the_old_human_card_ladder(self):
-        self.panes[self.wid] = LIMIT
+        self.panes[self.wid] = LIMIT.replace(" · resets 12:10pm", "")
         self.sweep()
         self.assertEqual(self.active(), [])
         evidence = sup.load_state(self.ws).workers[self.wid]
