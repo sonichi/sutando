@@ -43,7 +43,7 @@ from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holde
 from ag2_sparrow import gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # the shared seam suite, also under runpy
-from connect_undo_seams import UndoSeams, bridge_verbs  # noqa: E402
+from connect_undo_seams import MANAGERS, UndoSeams, bridge_verbs  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
 # The wrapper survives an interpreter path with a space: exec of the quoted path on the body beside it.
@@ -1163,7 +1163,7 @@ class ConnectCode(UndoSeams, Base):
 
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
         fake = fake or self.fake()
-        argv = ["connect", "--experimental-connect", "--base", base, "--agent", AGENT, *code_args, "--codex-home",
+        argv = ["connect", "--base", base, "--agent", AGENT, *code_args, "--codex-home",
                 str(self.codex_home), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
@@ -1178,36 +1178,43 @@ class ConnectCode(UndoSeams, Base):
     def seat(self):
         return cb.bridge_home(self.root) / "channels" / "ag2space"
 
-    def test_connect_is_off_without_the_experimental_flag_and_touches_nothing(self):
-        backend, fake, stdin = Backend(), self.fake(), io.StringIO(CODE + "\n")
-        out, err = io.StringIO(), io.StringIO()
-        spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
-                 ((cm, "_post_json"), (cm, "redeem_code"), (cm, "operation_lock"), (cm, "agent_lock"),
-                  (cb, "redeem_into_seat"), (cli, "connect_preflight"))}
-        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
-                mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
-                contextlib.ExitStack() as stack, \
-                mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            called = {name: stack.enter_context(spy) for name, spy in spies.items()}
-            rc = cli.main(["connect", "--base", BASE, "--code", "-", "--codex-home", str(self.codex_home)])
-        self.assertEqual({name: spy.call_count for name, spy in called.items()}, dict.fromkeys(spies, 0),
-                         "no backend call, no lock, no preflight")
-        self.assertEqual(rc, cli.EXIT_UNUSABLE)
-        self.assertEqual(err.getvalue(), "error: Codex connect is not enabled in this release; use install --work / "
-                                         "verify\n")
-        self.assertEqual(out.getvalue(), "")
-        self.assertEqual(backend.calls, [], "no code is redeemed")
-        self.assertEqual(stdin.read(), CODE + "\n", "the code is not even read")
-        self.assertEqual(fake.runner.calls, [], "no manager is asked anything")
-        self.assertFalse(self.root.exists(), "no root")
-        self.assertFalse(cb.bridge_home(self.root).exists(), "no seat")
-        self.assertFalse(cm.agent_lock_path(self.root).parent.exists(), "no agent lock")
-        self.assertFalse(cli.config_path(LA).exists(), "no config")
-        self.assertFalse(cm.supervisor_path(cli.LOCAL).exists(), "no unit")
-        self.assertFalse(cm.supervisor_path(cb.bridge_shape(cli.LOCAL)).exists(), "no bridge unit")
-        with contextlib.redirect_stderr(io.StringIO()) as bare:
-            self.assertEqual(cli.main(["connect"]), cli.EXIT_UNUSABLE, "the refusal comes before any argument check")
-        self.assertIn("not enabled in this release", bare.getvalue())
+    def connected_on(self, mac, *extra):
+        """connect on `mac`'s manager, then its own cleanup: (rc, out, err, backend calls, the unit's suffix)."""
+        fake, backend = self.seam_fake(), Backend()
+        try:
+            with mock.patch.object(cm, "is_macos", return_value=mac):
+                rc, out, err = self.connect(backend, fake, *extra)
+                suffix = cm.supervisor_path(self.local).suffix
+        finally:
+            self._done(fake)
+            with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                cm.uninstall(self.local)
+        return rc, out, err, backend.calls, suffix
+
+    def test_connect_runs_without_any_flag_on_both_managers(self):
+        for name, mac in MANAGERS:
+            with self.subTest(name):
+                rc, out, err, calls, suffix = self.connected_on(mac)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(calls, [(BASE + "/connect/poll", {"device_code": CODE}, "POST")], "redeemed once")
+                self.assertIn(f"connected: {AGENT}", out)
+                self.assertIn("the managed launcher acquired the expected root", out)
+                self.assertEqual(suffix, ".plist" if mac else ".service")
+                self.assertNotIn("not enabled", err)
+                self.assertNotIn("experimental-connect", out + err)
+
+    def test_the_old_experimental_flag_is_a_deprecated_no_op_that_warns_once(self):
+        for name, mac in MANAGERS:
+            with self.subTest(name):
+                rc, out, err, calls, suffix = self.connected_on(mac, "--experimental-connect")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(err.count("warning: --experimental-connect is deprecated and does nothing"), 1, err)
+                self.assertEqual(err.count("experimental-connect"), 1, "warned once, and never carried into a hint")
+                self.assertEqual(calls, [(BASE + "/connect/poll", {"device_code": CODE}, "POST")], "redeemed once")
+                self.assertIn(f"connected: {AGENT}", out)
+                self.assertEqual(suffix, ".plist" if mac else ".service")
+                self.assertNotIn("experimental-connect", out)
 
     def assert_code_unspent(self, backend, rc, err):
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
@@ -1853,6 +1860,15 @@ class ConnectCode(UndoSeams, Base):
         self.assertIn("the connector is installed but its bridge is not: ag2-sparrow was not found beside", err)
         self.assertIn(f"; run {cli.COMMAND} install --agent {AGENT} --codex-home {self.codex_home} --token-env-file "
                       f"{cb.seat_file(self.root)}\n", err)
+
+    def test_the_install_a_failed_connect_names_never_carries_the_deprecated_flag(self):
+        with mock.patch.object(cm, "console_script",
+                               side_effect=lambda shape: "" if shape == B else str(self.bin / shape.command)):
+            rc, _out, err = self.connect(Backend(), None, "--experimental-connect")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
+        self.assertIn(f"; run {cli.COMMAND} install --agent {AGENT} --codex-home {self.codex_home} --token-env-file "
+                      f"{cb.seat_file(self.root)}\n", err)
+        self.assertEqual(err.count("experimental-connect"), 1, "only the deprecation warning names it")
 
     def test_a_bridge_wiring_failure_after_install_unwinds_this_attempt_and_restarts_nothing(self):
         fake = self.running_job()

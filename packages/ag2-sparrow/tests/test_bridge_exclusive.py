@@ -177,7 +177,7 @@ class Exclusive(fx.AgentRootBase):
                     "--claude-config-dir", str(self.home / ".claude-sutando"),
                     "--hmac-key-file", str(self.home / "task-hmac.key")]
         else:
-            argv = ["connect", "--experimental-connect", "--base", fx.BASE, *named, "--code", "-", "--codex",
+            argv = ["connect", "--base", fx.BASE, *named, "--code", "-", "--codex",
                     str(self.codex), "--codex-home", str(self.codex_home)]
         return self.run_cli(name, argv, jobs, mac, stdin=stdin, backend=backend)
 
@@ -237,10 +237,10 @@ class Exclusive(fx.AgentRootBase):
         self.assertEqual(stdin.tell(), 0, "nor read")
         self.assertIn("the code was not used", err)
 
-    def test_codex_experimental_connect_is_refused_before_the_code_is_spent_systemd(self):
+    def test_codex_connect_is_refused_before_the_code_is_spent_systemd(self):
         self.connect_switch(CL.name, CX.name, mac=False)
 
-    def test_codex_experimental_connect_is_refused_before_the_code_is_spent_launchd(self):
+    def test_codex_connect_is_refused_before_the_code_is_spent_launchd(self):
         self.connect_switch(CL.name, CX.name, mac=True)
 
     def test_claude_connect_is_refused_before_the_code_is_spent_systemd(self):

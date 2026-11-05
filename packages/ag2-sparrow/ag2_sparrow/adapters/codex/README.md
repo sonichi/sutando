@@ -27,14 +27,13 @@ ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same op
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
 ag2-sparrow-codex-local list
+ag2-sparrow-codex-local connect --base <url> --agent <@agent:server> [--code -] [the same options]
 ```
 
-**Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
-enabled in this release; use install --work / verify") before it reads or redeems a code or touches any
-root, seat, unit or lock. Use `install --work` and `verify`. What follows is the experimental path.
-On a host with no core, `connect --experimental-connect --base <url> --agent <the agent's Matrix ID>` is the
-agent's whole setup, with
-claude-local's `connect` behaviour, from the same package code (`connect_bridge`): it checks the
+**Connect with a code.** On a host with no core, `connect --base <url> --agent <the agent's Matrix ID>` is
+the agent's whole setup. `--agent` is required: without it `connect` refuses before it reads the code.
+The former `--experimental-connect` flag is still accepted, does nothing and prints one deprecation
+warning; drop it from scripts. `connect` has claude-local's `connect` behaviour, from the same package code (`connect_bridge`): it checks the
 machine before the code is spent (no host supervisor, no `AGENT_CONNECT_TASK_DIR`, the Codex pin, and
 `codex login status` under `--codex-home`), reads the code from a prompt or `--code -` (a code on the
 command line works with a warning), requires https for `--base` and the relay URL (plain http only on

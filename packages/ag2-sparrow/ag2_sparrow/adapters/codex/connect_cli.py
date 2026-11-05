@@ -13,7 +13,7 @@ on SIGTERM; a root another session holds is exit 75, which the manager does not 
 `verify` checks each part; `uninstall` removes only what install wrote. With `--token-env-file` and no
 `--work`, the root is the agent's own and install also wires its bridge (connect_bridge's, as claude-local's).
 `connect --base --agent --code` checks the machine, redeems AG2 Space's one-time code into the agent's seat, then
-runs install with that seat; it is off in this release and refuses unless `--experimental-connect` is given. The relay token stays in its env or seat file and the Codex login in
+runs install with that seat (`--experimental-connect` is a deprecated no-op). The relay token stays in its env or seat file and the Codex login in
 CODEX_HOME: neither is copied. Stdlib only.
 """
 from __future__ import annotations
@@ -205,16 +205,14 @@ def connect_preflight(args) -> str:
     return version_problem(codex) or login_problem(login)
 
 
-CONNECT_OFF = "Codex connect is not enabled in this release; use install --work / verify"
+EXPERIMENTAL_FLAG_DEPRECATED = "--experimental-connect is deprecated and does nothing: connect is on; drop the flag"
 
 
 def connect(args) -> int:
     """Preflight, redeem the code into the agent's seat beside its root (connect_bridge's), then install
-    exactly as `install` does with the seat's .env as the token env file. Off unless --experimental-connect:
-    refused before anything is read, redeemed or written."""
-    if not args.experimental_connect:
-        print(f"error: {CONNECT_OFF}", file=sys.stderr)
-        return EXIT_UNUSABLE
+    exactly as `install` does with the seat's .env as the token env file."""
+    if args.experimental_connect:
+        print(f"warning: {EXPERIMENTAL_FLAG_DEPRECATED}", file=sys.stderr)
     if not args.base:
         args.parser.error("the following arguments are required: --base")
     return cb.fenced(args.agent, lambda: _connect(args))
@@ -386,7 +384,8 @@ def main(argv=None) -> int:
     p.add_argument("--single", action="store_true", help="checked: this install must be the fixed job")
     session_options(p)
     p.set_defaults(func=install, parser=p)
-    c = sub.add_parser("connect", help="experimental, off in this release: refused unless enabled")
+    c = sub.add_parser("connect", help="redeem a one-time code from s.space into the agent's seat, then install "
+                       "with it (--agent required)")
     c.add_argument("--experimental-connect", action="store_true", default=False, help=argparse.SUPPRESS)
     c.add_argument("--base", help="the s.space backend URL the code was issued by")
     c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
