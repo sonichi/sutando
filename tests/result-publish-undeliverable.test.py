@@ -146,6 +146,17 @@ class RefuseUndeliverable(unittest.TestCase):
         self.assertEqual((month / f"{tid}.txt").read_text(encoding="utf-8"), "[no-send] first run\n")
         self.assertEqual((month / suffixed).read_text(encoding="utf-8"), "[no-send] second run\n")
 
+    def test_retirements_within_one_second_keep_distinct_records(self):
+        tid = "task-cron-hourly-burst"
+        self._task(tid, CRON_TASK)
+        bodies = [f"[no-send] run {n}\n" for n in range(4)]
+        for body in bodies:
+            proc, _ = self._publish(tid, body)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        archived = sorted(self._archived(tid), key=lambda p: (len(p.name), p.name))
+        self.assertEqual(len(archived), 4, [p.name for p in archived])
+        self.assertEqual([p.read_text(encoding="utf-8") for p in archived], bodies)
+
     def test_non_cron_skip_marker_publishes_live(self):
         self._task("task-chat-skip", "id: task-chat-skip\nsource: chat\ntask: do it\n")
         proc, target = self._publish("task-chat-skip", "[no-send] nothing to say\n")

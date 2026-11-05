@@ -161,9 +161,12 @@ def retired_path(path: str | Path, text: str) -> Path | None:
     protocol = _helpers()[0]
     target = Path(path).resolve()
     dest = protocol.archive_month_dir(target.parent, datetime.now().isoformat()) / target.name
-    # Never overwrite a record: an occupied slot takes the epoch-suffixed re-archive name readers know.
-    if dest.exists():
-        dest = dest.with_name(f"{dest.stem}-{int(time.time())}.txt")
+    # Never overwrite a record: an occupied slot takes the epoch-suffixed re-archive name readers
+    # know, and the stamp is bumped past any neighbour taken within the same second.
+    stem, stamp = dest.stem, int(time.time())
+    while dest.exists():
+        dest = dest.with_name(f"{stem}-{stamp}.txt")
+        stamp += 1
     return dest
 
 
