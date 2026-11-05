@@ -107,15 +107,13 @@ class Handler(unittest.TestCase):
             self.assertEqual(h.offer(reaction(1)), [])
         self.assertIn("left for the next drain", said[0])
 
-    def test_loaded_outside_the_package_it_uses_the_engine_copy(self):
-        import importlib.util
-        sys.path.insert(0, str(REPO / "src"))
-        spec = importlib.util.spec_from_file_location(
-            "outcome_reactions_flat", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outcome_reactions.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        mod.OutcomeReactionHandler(self.log, log=lambda *a: None).offer(reaction(1))
-        self.assertEqual(len(self._signals()), 1)
+    def test_control_characters_are_refused_and_settled(self):
+        for n, key in enumerate(("\x1b[31m\x00", "👍\x7f", "a\x01b"), start=1):
+            with self.subTest(key=repr(key)):
+                self.assertEqual(self.h.offer(reaction(n, key=key)), [f"$r{n}:s.space"])
+        self.assertEqual(self._signals(), [])
+        self.h.offer(reaction(4, key="❤️"))
+        self.assertEqual([s["value"] for s in self._signals()], ["❤️"])
 
     def test_buckets_are_for_display(self):
         self.assertEqual((bucket("✅"), bucket("👎"), bucket("🤔")), ("positive", "negative", "neutral"))

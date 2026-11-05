@@ -85,7 +85,7 @@ PATTERNS["ref"] = PATTERNS["event_id"]
 # The delivering event's own id, as the broker numbers it: what makes a replay recognisable.
 PATTERNS["source_event_id"] = re.compile(r"^[A-Za-z0-9$_:.+/=~-]{1,255}$")
 # A reaction key as Matrix carries it: an emoji or a short token, one line, no spaces.
-PATTERNS["value"] = re.compile(r"^\S{1,16}$")
+PATTERNS["value"] = re.compile(r"^[^\s\x00-\x1f\x7f]{1,16}$")
 HANDOFF_RE = re.compile(r"^ho_[0-9a-f]{12}$")
 PATTERNS["handoff_id"] = HANDOFF_RE
 PATTERNS["parent_generation"] = re.compile(r"^\d{1,9}$")

@@ -1,4 +1,4 @@
-"""Reactions on the agent's own messages, recorded as outcome signals and never turned into tasks.
+"""Agreed-envelope reactions on the agent's own messages become outcome signals, never tasks.
 
 The broker delivers a reaction on a message this agent sent with the message it targets and who
 reacted (the reactor's id, and whether that is the agent's owner or a room member), plus the task
@@ -12,7 +12,8 @@ whose result that message was, when the message was one:
 writes one `outcome_signal` to the correlation log: the owner's reaction is `direct` evidence, a
 member's `correlated`. The event is consumed and no task is made, so a reaction never causes a
 reply. Approval-card reactions are answered by the human-action handler ahead of this one in the
-chain; any other event falls through untouched. The label a task closed with is never changed here.
+chain; events outside this envelope fall through untouched and may become ambient tasks.
+The label a task closed with is never changed here.
 """
 from __future__ import annotations
 
@@ -64,10 +65,7 @@ class OutcomeReactionHandler:
             fields = self._fields(event)
             if fields is None:
                 return [eid] if eid else []
-            try:
-                from . import correlation_log as cl
-            except ImportError:  # run from src/, not the package
-                import correlation_log as cl
+            from . import correlation_log as cl
             if fields["task_id"] and not cl.is_task_id(fields["task_id"]):
                 fields["task_id"] = None  # recorded untasked rather than lost
             if fields["room_id"] and not cl.PATTERNS["room_id"].match(fields["room_id"]):
