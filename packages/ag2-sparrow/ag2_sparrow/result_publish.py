@@ -11,6 +11,8 @@ only what to say and where. The staged name starts with a dot and ends in
 `.tmp`, so no drain's `*.txt` glob can match it, and it is unique per call so
 two publishers of one name never rename each other's bytes. Shell writers use
 the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
+`--title`/`--outcome` publish the result's Activity labels first, bound to this body
+(`result_labels`); a `[no-send]` reason is the outcome when none is given.
 
 The CLI refuses a `source: cron` task's result that names no destination and
 carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
@@ -28,7 +30,7 @@ import sys
 from pathlib import Path
 
 __all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "undeliverable_reason", "retired_path", "main"]
+           "undeliverable_reason", "retired_path", "result_labels_for", "main"]
 
 STAGED_SUFFIX = ".tmp"
 
@@ -170,30 +172,103 @@ def retired_path(path: str | Path, text: str) -> Path | None:
     return dest
 
 
+def _labels_module():
+    try:
+        from . import result_labels
+    except ImportError:
+        import result_labels
+    return result_labels
+
+
+def _no_send_reason(text: str) -> str:
+    """What follows a leading `[no-send]`; empty for any other body."""
+    try:
+        _, markers, _, _ = _helpers()
+    except ImportError:
+        return ""
+    if not any(a.kind == "skip" and a.value == "no-send" for a in markers.parse_markers(text).actions):
+        return ""
+    at = text.casefold().find("[no-send]")
+    return text[at + len("[no-send]"):] if at >= 0 else ""
+
+
+def result_labels_for(text: str, title=None, outcome=None) -> "tuple[dict, list]":
+    """(labels, notes) for a body: each flag fitted to its limit, with a note when cut; a
+    `[no-send]` body with no --outcome takes its reason as the outcome."""
+    labels_mod = _labels_module()
+    labels, notes = labels_mod.check(title, outcome)
+    if "outcome" not in labels and not labels_mod.clean(outcome):
+        reason = labels_mod.fit(_no_send_reason(text), labels_mod.OUTCOME_MAX)
+        if reason:
+            labels["outcome"] = reason
+    return labels, notes
+
+
+_USAGE = ("usage: result_publish.py [--allow-undeliverable] [--title TEXT] [--outcome TEXT] <path>"
+          "   (body on stdin)")
+
+
+def _parse(args: list[str]):
+    """(path, allow, title, outcome), or None for a malformed command line."""
+    allow, flags, paths = False, {}, []
+    it = iter(args)
+    for a in it:
+        if a == "--allow-undeliverable":
+            allow = True
+        elif a in ("--title", "--outcome"):
+            value = next(it, None)
+            if value is None or a in flags:
+                return None
+            flags[a] = value
+        elif a.startswith("-"):
+            return None
+        else:
+            paths.append(a)
+    if len(paths) != 1:
+        return None
+    return paths[0], allow, flags.get("--title"), flags.get("--outcome")
+
+
 def main(argv: list[str]) -> int:
-    args = argv[1:]
-    allow = "--allow-undeliverable" in args
-    args = [a for a in args if a != "--allow-undeliverable"]
-    if len(args) != 1 or args[0].startswith("-"):
-        print("usage: result_publish.py [--allow-undeliverable] <path>   (body on stdin)",
-              file=sys.stderr)
+    parsed = _parse(argv[1:])
+    if parsed is None:
+        print(_USAGE, file=sys.stderr)
         return 2
+    path, allow, title, outcome = parsed
     text = sys.stdin.read()
-    reason = None if allow else undeliverable_reason(args[0], text)
+    reason = None if allow else undeliverable_reason(path, text)
     if reason:
         print(f"result_publish: refused, {reason}: nothing would deliver this body; send it "
               "as a channel-bound result (a task with a destination header, or a "
               "proactive result routed to the owner's channel), start it with [no-send], "
               "or pass --allow-undeliverable", file=sys.stderr)
         return 2
-    dest = None if allow else retired_path(args[0], text)
-    if dest is None:
-        publish_text(args[0], text)
+    dest = None if allow else retired_path(path, text)
+    if dest is not None:
+        # Nothing delivers a retired body, so it carries no Activity labels.
+        publish_text(dest, text)
+        print(f"result_publish: published {Path(path).name} to {dest.parent} instead of results/: "
+              "a cron task with no channel_id or chat_id has no bridge, so nothing would retire "
+              "this skipped body from the live directory")
         return 0
-    publish_text(dest, text)
-    print(f"result_publish: published {Path(args[0]).name} to {dest.parent} instead of results/: "
-          "a cron task with no channel_id or chat_id has no bridge, so nothing would retire "
-          "this skipped body from the live directory")
+    try:
+        labels_mod = _labels_module()
+    except ImportError:
+        # Labels are optional: a copy without its label writer still publishes the result.
+        if title is not None or outcome is not None:
+            print("result_publish: warning: no result_labels module; published without "
+                  "--title/--outcome", file=sys.stderr)
+        publish_text(path, text)
+        return 0
+    labels, notes = result_labels_for(text, title, outcome)
+    for note in notes:
+        print(f"result_publish: warning: {note}", file=sys.stderr)
+    try:
+        labels_mod.write(Path(path), labels, text)
+    except Exception as exc:  # noqa: BLE001 — labels are optional; the result never waits on them
+        print(f"result_publish: warning: published without --title/--outcome: {exc}",
+              file=sys.stderr)
+    publish_text(path, text)
     return 0
 
 
