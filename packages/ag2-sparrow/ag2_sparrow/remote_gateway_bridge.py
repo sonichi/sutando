@@ -8870,7 +8870,7 @@ def _recover_outbox_claims() -> None:
             retired = core.recover().retired
         except Exception as e:  # noqa: BLE001 - recovery serves the operator, never delivery
             disposal.report_once(f"outbox-recovery:{lane}", _log,
-                                 f"outbox {lane}: claim recovery failed ({diagnostics.describe(e)}); delivery continues")
+                                 f"outbox {lane}: could not recover claims ({diagnostics.describe(e)}); delivery continues")
             continue
         if retired:
             _log(f"outbox {core.backend.root.name}: retired {len(retired)} claim(s) a crash left on "

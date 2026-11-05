@@ -167,7 +167,7 @@ class OutboxClaimRecovery(unittest.TestCase):
         self.sweep()
         self.assertFalse(self.held(before, "task-dead-terminal"), "the lane before the failure")
         self.assertFalse(self.held(after, "task-proactive"), "the lane after the failure is still swept")
-        self.assertTrue(any("withheld" in m and "claim recovery failed" in m for m in self.logs),
+        self.assertTrue(any("withheld" in m and "could not recover claims" in m for m in self.logs),
                         self.logs)
 
 
