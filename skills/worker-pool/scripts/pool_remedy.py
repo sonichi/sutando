@@ -436,7 +436,8 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
     prompt = f"Read {pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
     try:
         sent = sup.pane_gate.deliver(prompt, session, runtime, socket_path=str(socket),
-            refuse_if_pending=True, runner=run, script=Path(repo) / "scripts/tmux-send-line.sh")
+            refuse_if_pending=True, require_limit=True, runner=run,
+            script=Path(repo) / "scripts/tmux-send-line.sh")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"worker_id": worker_id, "outcome": "wake-failed", "task_id": task_id, "why": str(exc)}
     return {"worker_id": worker_id, "outcome": "rearm-sent" if sent.code == 0 else "wake-refused",

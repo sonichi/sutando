@@ -212,8 +212,8 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
 
 
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
-                 runner=subprocess.run, now=None) -> tuple[str | None, str | None, float | None]:
-    """(pane kind, frame id, limit reset time); all None when unread."""
+                 runner=subprocess.run, now=None) -> tuple[str | None, str | None, "pl.Reset | None"]:
+    """(pane kind, frame id, limit reset); all None when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
         return None, None, None
@@ -229,7 +229,7 @@ def observe_pane(workspace, worker_id, runtime: str = "claude", *,
     kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
     if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
         pane_gate.save_frame(workspace, name, kind, text)
-    return kind, frame_id(text), (pl.reset_at(plain_text(text), time.time() if now is None else now)
+    return kind, frame_id(text), (pl.reset(plain_text(text), time.time() if now is None else now)
                                   if kind == ps.PANE_LIMIT else None)
 
 
@@ -299,7 +299,8 @@ def observe(workspace, now: float, *, worker_ids=None,
             work_outstanding=work_outstanding(workspace, wid),
             pane=pane,
             pane_id=pane_id,
-            limit_reset_at=reset,
+            limit_reset_at=reset.at if reset else None,
+            limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
         )
     return obs
@@ -404,6 +405,8 @@ def load_state(workspace) -> ps.SupervisionState:
                 limit_next_at=ev.get("limit_next_at"),
                 limit_attempts=int(ev.get("limit_attempts") or 0),
                 limit_exhausted=bool(ev.get("limit_exhausted")),
+                limit_banner=ev.get("limit_banner"),
+                limit_reset_at=ev.get("limit_reset_at"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -431,7 +434,9 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "last_pane_id": e.last_pane_id,
                         "limit_next_at": e.limit_next_at,
                         "limit_attempts": e.limit_attempts,
-                        "limit_exhausted": e.limit_exhausted}
+                        "limit_exhausted": e.limit_exhausted,
+                        "limit_banner": e.limit_banner,
+                        "limit_reset_at": e.limit_reset_at}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")

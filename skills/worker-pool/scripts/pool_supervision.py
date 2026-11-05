@@ -84,6 +84,8 @@ class Observation:
     # Why typed delivery cannot reach this seat, when the caller can tell ("pane-key-fence").
     delivery_block: str | None = None
     limit_reset_at: float | None = None
+    # The banner's own reset words: an unchanged banner keeps the deadline it first parsed to.
+    limit_banner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,8 @@ class WorkerEvidence:
     limit_next_at: float | None = None
     limit_attempts: int = 0
     limit_exhausted: bool = False
+    limit_banner: str | None = None
+    limit_reset_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -340,11 +344,16 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
                 workers[worker_id] = ev
                 decisions[worker_id] = NOTHING
                 continue
+            reset = obs.limit_reset_at
+            if obs.limit_banner is not None and obs.limit_banner == ev.limit_banner:
+                reset = ev.limit_reset_at
+            else:
+                ev = replace(ev, limit_banner=obs.limit_banner, limit_reset_at=reset)
             due = ev.limit_next_at
             if due is None:
-                due = obs.limit_reset_at if obs.limit_reset_at is not None else now + LIMIT_PROBE_S
-            elif obs.limit_reset_at is not None:
-                due = max(due, obs.limit_reset_at)
+                due = reset if reset is not None else now + LIMIT_PROBE_S
+            elif reset is not None:
+                due = max(due, reset)
             ev = replace(ev, limit_next_at=due)
             decision = NOTHING
             if now >= due and not ev.limit_exhausted:
@@ -358,8 +367,10 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             workers[worker_id] = ev
             decisions[worker_id] = decision
             continue
-        if obs.session_alive is True and obs.pane in (PANE_IDLE, PANE_WORKING):
-            ev = replace(ev, limit_next_at=None, limit_attempts=0, limit_exhausted=False)
+        # A refused probe can show a spinner first; only a finished turn ends the episode.
+        if obs.session_alive is True and obs.pane == PANE_IDLE:
+            ev = replace(ev, limit_next_at=None, limit_attempts=0, limit_exhausted=False,
+                         limit_banner=None, limit_reset_at=None)
 
         # A session that answers contradicts "the session is gone", so it clears a
         # death as surely as a beat does; an UNANSWERED probe does not, and holds.

@@ -1,14 +1,35 @@
 """Reset times printed by a provider-limit pane; unrecognized text is unknown."""
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 import re
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+# A yearless date further than this from now names the neighbouring year.
+_HALF_YEAR = timedelta(days=182)
 
-def reset_at(text, now):
+
+class Reset(NamedTuple):
+    at: float | None
+    banner: str
+
+
+def reset(text, now):
+    """The banner's reset words and their time (None when unparsed); None without a banner."""
     matches = list(re.finditer(r"(?:resets?|continuing automatically)\s+(?:at\s+)?([^\n]+)", text, re.I))
     if not matches:
         return None
-    value = matches[-1].group(1).split("·")[0].strip()
+    banner = matches[-1].group(1).split("·")[0].strip()
+    return Reset(_parse(banner, now), banner)
+
+
+def reset_at(text, now):
+    found = reset(text, now)
+    return found.at if found else None
+
+
+def _parse(value, now):
     zone = re.search(r"\(([^)]+)\)", value)
     try:
         tz = ZoneInfo(zone[1]) if zone else datetime.fromtimestamp(now).astimezone().tzinfo
@@ -28,6 +49,13 @@ def reset_at(text, now):
             continue
         if "%Y" not in pattern:
             parsed = parsed.replace(year=today.year)
+        if "%b" in pattern and "%Y" not in pattern:
+            local = today.replace(tzinfo=None)
+            step = 1 if parsed < local - _HALF_YEAR else -1 if parsed > local + _HALF_YEAR else 0
+            try:
+                parsed = parsed.replace(year=parsed.year + step)
+            except ValueError:
+                return None
         if "%b" not in pattern and "%Y" not in pattern:
             parsed = parsed.replace(month=today.month, day=today.day)
         if tomorrow:
