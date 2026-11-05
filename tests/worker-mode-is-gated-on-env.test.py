@@ -77,6 +77,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
         td = Path(td)
         root = td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
         shutil.copy2(
@@ -174,6 +175,7 @@ def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:
     import signal
     root = td / "repo"
     shutil.copytree(REPO / "src", root / "src", symlinks=True)
+    shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
     shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     ws = td / "ws"; ws.mkdir()
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
@@ -206,6 +208,7 @@ def _state_root(extra_env: dict, td: Path):
     root = td / "repo"
     if not root.exists():
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     ws = td / "ws"; ws.mkdir(exist_ok=True)
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
@@ -248,6 +251,7 @@ def _core_env(extra_env: dict, td: Path) -> list[str]:
     root = td / "repo"
     if not root.exists():
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     ws = td / "ws"; ws.mkdir(exist_ok=True)
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
@@ -269,6 +273,7 @@ def _worker_env(extra_env: dict, td: Path) -> list[str]:
     root = td / "repo"
     if not root.exists():
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy2(

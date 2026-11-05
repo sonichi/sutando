@@ -32,6 +32,7 @@ class Harness:
         self.td = Path(tempfile.mkdtemp())
         root = self.td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         # Only the worker's own launcher, not the whole skill: this harness
         # tests the launch mechanics, not worker-pool's own behavior.
