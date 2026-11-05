@@ -41,6 +41,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 from local_record import new_name, write_text_whole
+from sutando_config import resolve_macos_notifications
 from pending_questions_outbox import Outbox, one_line_title
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename, should_claim_proactive
 from result_markers import neutralize_markers
@@ -427,7 +428,10 @@ def write_proactive(results: Path, name: str, body: str) -> Path:
 
 
 def notify_macos(text: str) -> tuple:
-    """(ok, fix). A refused or failed osascript names the fix; it never claims ok."""
+    """(ok, fix). A refused or failed osascript names the fix; it never claims ok.
+    (None, None) when notifications.macos is off: nothing was attempted."""
+    if not resolve_macos_notifications():
+        return None, None
     esc = text.replace("\\", "\\\\").replace('"', '\\"')[:200]
     try:
         r = subprocess.run(["osascript", "-e",

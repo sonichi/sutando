@@ -61,8 +61,10 @@ class LauncherJob(fx.Runner):
                  "ActiveState": "active" if self.alive() else "inactive",
                  "SubState": "running" if self.alive() else "dead",
                  "UnitFileState": "enabled" if self.enabled else "disabled",
-                 "MainPID": str(self.session.pid) if self.alive() else "0"}
-        return (0, "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(",")), "")
+                 "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
+                 "ExecMainStartTimestampMonotonic": str(self.since), **self.exit_words()[0]}
+        shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in cmd[cmd.index("-p") + 1].split(","))
+        return (0, "".join(w + "\n" for w in shown), "")
 
 
 class BridgeJob:

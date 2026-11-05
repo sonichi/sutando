@@ -345,8 +345,8 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None" = None, agent_id: s
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
     """wire_bridge under the agent lock, held to connect's root (`root_id`, None outside connect): refused
     unless the root path names that directory before wiring and after. On a mismatch, or a wiring that
-    fails under connect, this attempt is undone: the bridge artifact it created (none was there before)
-    and the job its install started (cm.stop_started); nothing at the new `root` is touched."""
+    fails under connect, this attempt is undone: the bridge artifact it created (none was there before), as
+    _unwire_ours allows, and the job its install started (cm.stop_started); nothing at the new `root` is touched."""
     root = cm.work_root(cfg)
     try:
         with cm.agent_lock(root):
@@ -375,22 +375,39 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
     problem = bridge_owner_problem(local, root, cfg.get("AGENT_ID", "")) or wire_bridge(cfg, command, bridge)
     replaced = root_id is not None and cm.dir_identity(root) != root_id
     if root_id is None or not (problem or replaced):
-        pending = cm.pending_start(local) if root_id is not None else None
-        if not problem and pending is not None and before is None and _bytes(artifact) is not None:
-            pending["undo"].append(lambda: unwire_bridge(cfg, command, bridge))
+        pending, wired = cm.pending_start(local), _bytes(artifact)
+        if not problem and pending is not None and before is None and wired is not None:
+            pending["undo"].append(lambda: _unwire_ours(cfg, command, bridge, artifact, wired))
         return problem
     after = _bytes(artifact)
     note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
         f"the bridge declaration is left for {command} uninstall to remove; "
     if before is None and after is not None:
-        unwired = unwire_bridge(cfg, command, bridge)
-        note = (f"{cm.job_name(bridge)} could not be removed ({unwired}); " if unwired else
-                f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed; ")
+        note = f"{_unwire_ours(cfg, command, bridge, artifact, after)}; "
     stopped = cm.stop_started(local, root)
     if replaced:
         return _replaced(root, local, stopped, note)
     return (f"{problem}; this attempt was undone: {note}"
             + (stopped or f"{cm.job_name(local)}, the job its install started, was stopped"))
+
+
+def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wired: bytes) -> str:
+    """The undo of this attempt's wiring, under the start's undo. Its manager stops a bridge job only by
+    name, which could stop a start this attempt did not make, so a registered or running bridge is left and
+    said; only an unregistered unit that still holds the bytes this attempt wrote is removed."""
+    if _bytes(artifact) != wired:
+        return (f"{cm.job_name(bridge)} is no longer the unit this attempt wrote, so it was left: stop it by hand "
+                f"({cm.stop_command(bridge)})")
+    state = cm.manager_state(bridge)
+    if state != "absent":
+        return (f"the bridge this attempt wired ({cm.job_name(bridge)}) is {state} and was left, since stopping it "
+                f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run {command} "
+                "uninstall")
+    try:
+        artifact.unlink()
+    except OSError as e:
+        return f"{artifact} could not be removed ({e.strerror or e})"
+    return f"the bridge unit this attempt wrote ({artifact}) was removed"
 
 
 def _replaced(root: str, local: cm.Shape, stopped: str, bridge_note: str) -> str:

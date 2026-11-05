@@ -574,7 +574,8 @@ def render_skill_prelude(
         _step += 1
         # No notify step here: the broker's delivery status already shows
         # pickup and working, so no notify message is sent.
-    _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+    _skill.append(f"{_step}. Process and write the result to results/{tid}.txt; to end it with "
+                  "no reply, write `[no-send]` as the result. Every task ends with a result.")
     return _skill
 
 
