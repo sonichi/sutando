@@ -2653,6 +2653,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # the agent's safe parser must see which hook or row change it serves.
                 "hook",
                 "summon",
+                # AgentTrigger context, above "task" so the strict parser reads it: the event
+                # behind this task, its idempotency id and the playbook it names.
+                "event_type", "agent_trigger_id", "playbook",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2696,12 +2699,8 @@ def _context_header(name: str, value) -> "str | None":
         return None
     return line
 
-# Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
-# values outside this set degrade to "message" rather than passing through.
-_INTERACTION_TYPES = frozenset({
-    "message", "realtime_audio", "realtime_video",
-    "tool_initiated", "system_event", "self_reflective",
-})
+# Remote values outside the shared vocabulary degrade to "message" rather than passing through.
+_INTERACTION_TYPES = local_task_protocol.INTERACTION_TYPES
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
@@ -6191,6 +6190,14 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if it not in _INTERACTION_TYPES:
                 it = "message"
             lines.append(f"interaction_type: {it}")
+        elif f == "event_type":
+            et = local_task_protocol.event_type_value(task.get(f))
+            if et:
+                lines.append(f"event_type: {et}")
+        elif f in ("agent_trigger_id", "playbook"):
+            tok = local_task_protocol.trigger_token_value(task.get(f))
+            if tok:
+                lines.append(f"{f}: {tok}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.

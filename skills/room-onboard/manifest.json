@@ -1,0 +1,11 @@
+{
+  "name": "room-onboard",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Playbook for the s.space room.joined AgentTrigger: read the room the agent was just added to, post one top-level greeting (who it is, who invited it, the room's purpose, 2-3 offers), and send the owner one DM line. Idempotent by agent_trigger_id; skips the owner's own DM.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
