@@ -259,6 +259,20 @@ class RefuseUndeliverable(unittest.TestCase):
                     with self.subTest(mod=mod.__name__, target=target.name, body=body):
                         self.assertEqual(mod.retired_path(target, body), expected)
 
+    def test_in_process_retired_path_steps_past_an_occupied_stamp(self):
+        self._task("task-cron-a", CRON_TASK)
+        res = self.ws / "results"
+        month = local_task_protocol.archive_month_dir(res.resolve(), datetime.now().isoformat())
+        month.mkdir(parents=True)
+        for name in ("task-cron-a.txt", "task-cron-a-1700000000.txt", "task-cron-a-1700000001.txt"):
+            (month / name).write_text("[no-send] taken\n", encoding="utf-8")
+        with mock.patch.dict("os.environ", self._env()), \
+                mock.patch("time.time", return_value=1700000000.6):
+            for mod in MODULES:
+                with self.subTest(mod=mod.__name__):
+                    self.assertEqual(mod.retired_path(res / "task-cron-a.txt", "[no-send] x\n"),
+                                     month / "task-cron-a-1700000002.txt")
+
     def test_helper_import_failure_publishes(self):
         self._task("task-cron-c", CRON_TASK)
         target = self.ws / "results" / "task-cron-c.txt"
