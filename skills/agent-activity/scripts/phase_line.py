@@ -531,7 +531,7 @@ def gemini(project: str, model: str, system: str, user: str, timeout: float = TI
                f"models/{model}:generateContent")
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 80, "responseMimeType": "application/json",
+                "generationConfig": {"maxOutputTokens": 80, "responseMimeType": "application/json",
                                      "responseSchema": SCHEMA, "thinkingConfig": {"thinkingLevel": "minimal"}}}
         def post(token: str) -> dict:
             req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
@@ -805,9 +805,10 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
     summary is the phase word or the fixed waiting line ("Queued · next"), never a step's text; with
     `share_line` it is the detail line as `shareable_line` lets it leave. The publisher adds the task's source
     message itself. None when `status_for` says nothing."""
+    import wedge_detector
     st = status_for(workspace, task_id, **kw)
     if st is None:
-        return None
+        return wedge_detector.status_for(workspace, task_id, None, now=kw.get("now"))
     waiting = st.get("waiting")
     out = {"phase": st["phase"], "summary": st["phase"], "since": st["since"]}
     if waiting:
@@ -816,7 +817,22 @@ def published_status(workspace, task_id: str, *, share_line: bool = False, **kw)
             out["summary"] = st["line"]
     if share_line:
         out["summary"] = shareable_line(workspace, task_id, st)
-    return out
+    try:
+        silence_s = float(setting("WEDGE_SILENCE_SECONDS", "180"))
+        if not math.isfinite(silence_s) or silence_s < 1:
+            silence_s = 180.0
+    except (TypeError, ValueError):
+        silence_s = 180.0
+    try:
+        tool_max_s = float(setting("WEDGE_TOOL_MAX_SECONDS", "900"))
+        if not math.isfinite(tool_max_s) or tool_max_s < 1:
+            tool_max_s = 900.0
+    except (TypeError, ValueError):
+        tool_max_s = 900.0
+    import turns
+    return wedge_detector.status_for(workspace, task_id, out, now=kw.get("now"), silence_s=silence_s,
+                                     active_tool=turns.has_open_tool(Path(workspace), task_id,
+                                                                     now=kw.get("now"), max_age_s=tool_max_s))
 
 
 # The only lines the opt-in share carries: fixed text naming nothing. Free text never leaves, since a

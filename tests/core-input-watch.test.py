@@ -1608,6 +1608,31 @@ class TestEnsureTmuxOnPath(unittest.TestCase):
             os.environ["PATH"] = orig_path
 
 
+    def test_prepends_the_shared_resolvers_dir(self):
+        from unittest.mock import patch
+        orig_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin"
+            with patch.object(_mod.shutil, "which", return_value=None), \
+                    patch.object(_mod.tmux_probe, "tmux_binary", return_value="/fake/dir/tmux"):
+                _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], "/fake/dir")
+        finally:
+            os.environ["PATH"] = orig_path
+
+    def test_bare_fallback_leaves_path_alone(self):
+        from unittest.mock import patch
+        orig_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin"
+            with patch.object(_mod.shutil, "which", return_value=None), \
+                    patch.object(_mod.tmux_probe, "tmux_binary", return_value="tmux"):
+                _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"], "/usr/bin")
+        finally:
+            os.environ["PATH"] = orig_path
+
+
 class TestMainOnce(unittest.TestCase):
     """End-to-end --once through the SHARED runtime-health derivation: with no
     live sutando-core, runtime_health.derive() → 'offline' → the supervisor

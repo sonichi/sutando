@@ -33,6 +33,8 @@ cd "$REPO"
 . "$REPO/src/agent/restart-guard.sh"
 . "$REPO/src/agent/core-runtime-record.sh"
 . "$REPO/src/agent/core-window.sh"
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO"
 # Named check before sourcing: an unexplained "No such file or directory" from
 # a bare `.` here reads as a broken launcher, not a fixture/checkout missing
 # this file's own sibling — a real trap for a scratch-repo test fixture.
@@ -555,6 +557,21 @@ if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   fi
 fi
 
+# Every launch below (heal, fresh boot, restart) passes this gate. A core refused for a
+# provider limit is held until the reset or a backoff; any other death launches as before.
+if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
+  _hold_rc=0
+  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
+  if [ "$_hold_rc" = 75 ]; then
+    echo "  ⏸ $SESSION not launched — ${_hold_line:-core paused: provider limit}" >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
+    # No core window will exist, so a notifier left running would type into a sibling.
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    release_orchestrator_lock
+    exit 75
+  fi
+fi
+
 if claude_named_tmux_session_exists; then
   # Session alive but the core claude is gone. The old behavior here was
   # kill-session — but the desktop runtime keeps SIBLING windows in this
@@ -567,6 +584,10 @@ if claude_named_tmux_session_exists; then
   # restart-core (kill core window → rerun this script) truly window-scoped.
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_claude_tmux_defaults
+  if ! claude_cli_resolves; then
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    exit 127
+  fi
   CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
@@ -681,8 +702,8 @@ apply_claude_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   if ! launch_claude_session; then
-    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
-    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
+    echo "  ⚠ $SESSION ${CLAUDE_LAUNCH_FAILURE:+not launched: $CLAUDE_LAUNCH_FAILURE}${CLAUDE_LAUNCH_FAILURE:-did not come up within ~5s of launch} — start FAILED." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: ${CLAUDE_LAUNCH_FAILURE:-core did not come up within ~5s}"
     exit 1
   fi
   record_confirmed_core_runtime claude "$PY"
@@ -697,8 +718,8 @@ else
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
   # the same false-success class as the --restart kill race above.
   if ! launch_claude_session; then
-    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
-    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
+    echo "  ⚠ $SESSION ${CLAUDE_LAUNCH_FAILURE:+not launched: $CLAUDE_LAUNCH_FAILURE}${CLAUDE_LAUNCH_FAILURE:-did not come up within ~5s of launch} — start FAILED." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: ${CLAUDE_LAUNCH_FAILURE:-core did not come up within ~5s}"
     exit 1
   fi
   # Verified live above, so this is the first point at which clearing the

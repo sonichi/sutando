@@ -124,8 +124,7 @@ nudge_and_wait() {
 # owner's lane). The caller still arms afterwards -- see the alert branch.
 health_alert() {
   echo "task-notifier-supervisor: pane idle-ready but the session beat is stale/absent for $NUDGE_TARGET; needs a restart (arming the standby meanwhile)" >&2
-  command -v osascript >/dev/null 2>&1 \
-    && osascript -e 'display notification "A Sutando session looks idle but its heartbeat is stale. It may need a restart." with title "Sutando"' >/dev/null 2>&1 || true
+  bash "$REPO/src/macos-notify.sh" "A Sutando session looks idle but its heartbeat is stale. It may need a restart." || true
 }
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
 # A notifier dying within RESTART_HEALTHY_S of its start is restarted after a doubling delay, up to the cap.

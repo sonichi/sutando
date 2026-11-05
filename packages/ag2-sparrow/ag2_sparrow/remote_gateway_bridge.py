@@ -34,7 +34,8 @@ original pull/result protocol.
 Config (env / .env):
   REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
                         (combined "https://<gateway>|<secret>" or a bare secret)
-  REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
+  REMOTE_TASK_URL        gateway base URL; set it only with a bare secret, since it
+                        overrides the gateway named in a combined token
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
   REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
@@ -330,6 +331,7 @@ from .bounded_file_read import read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
                                 proactive_item_id)
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
@@ -386,6 +388,8 @@ _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# A title/outcome side file with no result this long after it was written is an orphan.
+RESULT_LABELS_ORPHAN_S = 600.0
 # tids THIS process redelivered. Not a file: the collaborator path has full
 # workspace write, so any sidecar it can create is provenance it can forge.
 _REDELIVERED: "set[str]" = set()
@@ -1569,6 +1573,73 @@ def _team_task_media_root(tid: str, tier) -> "str | None":
     return None
 
 
+def _guard_tier(tid: str, resolve, filter_enabled):
+    """(task file, access tier, scan_sensitive_data) the result guard judges a task's output by."""
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    # Absence is not owner provenance: a month-archived Team task is exactly the
+    # case that would otherwise fall open.
+    tier = resolve(tfile) if tfile is not None else "guest"
+    scan_sensitive_data = filter_enabled(tfile, tier) if tfile is not None else True
+    return tfile, tier, scan_sensitive_data
+
+
+def _guarded_result_labels(tid: str) -> dict:
+    """The task's Activity title and outcome from its side file, each kept only when the result
+    guard passes it unchanged for the task's tier; {} when the guard cannot be loaded."""
+    labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}")
+    if not labels:
+        return {}
+    try:
+        classify, _materialize, resolve, filter_enabled, *_ = _team_guard_fns()
+        from .chat_secret_filter import filter_chat_secrets
+    except Exception as exc:  # noqa: BLE001 — labels are optional; the result is not held for them
+        _log(f"result {tid}: its title and outcome are left out: the result guard is "
+             f"unavailable ({diagnostics.describe(exc)})")
+        return {}
+    _tfile, tier, scan_sensitive_data = _guard_tier(tid, resolve, filter_enabled)
+    kept = {}
+    for key, text in labels.items():
+        # A label is never a delivery control, so no suppression marker exempts it from the scan.
+        verdict = classify(text, tier, None, secret_filter=filter_chat_secrets,
+                           scan_sensitive_data=scan_sensitive_data, honor_suppressions=False)
+        if verdict.kind == team_result_guard.VERDICT_DELIVER and verdict.body == text:
+            kept[key] = text
+        else:
+            _log(f"result {tid}: its {key} is left out: the result guard withheld it "
+                 f"({verdict.reason or 'rewritten'})")
+    return kept
+
+
+def _archive_result_labels(stem: str) -> None:
+    """Move `<stem>.meta.json` into the results archive; absent is done."""
+    try:
+        result_labels.archive(RESULTS_DIR, stem, ARCHIVE_RESULTS_DIR)
+    except OSError as exc:
+        _log(f"result {stem}: its title and outcome file could not be archived "
+             f"({diagnostics.describe(exc)}); the next sweep retries")
+
+
+def _sweep_orphan_result_labels(now: float) -> None:
+    """Archive a side file whose result is gone. A young one may be ahead of its result, which
+    the writer publishes after it, so it is left until RESULT_LABELS_ORPHAN_S has passed."""
+    try:
+        sides = list(RESULTS_DIR.glob(f"*{result_labels.SUFFIX}"))
+    except OSError:
+        return
+    for side in sides:
+        stem = side.name[:-len(result_labels.SUFFIX)]
+        if (stem.startswith(".") or os.path.lexists(RESULTS_DIR / f"{stem}.txt")
+                or os.path.lexists(disposal.pin_path(RESULTS_DIR, stem))
+                or any(RESULTS_DIR.glob(f"{glob.escape(stem)}.sending*"))):
+            continue
+        try:
+            if now - side.lstat().st_mtime < RESULT_LABELS_ORPHAN_S:
+                continue
+        except OSError:
+            continue
+        _archive_result_labels(stem)
+
+
 def _guarded_result_body(tid: str, body: str):
     """Scan a non-owner result BEFORE any marker is interpreted.
 
@@ -1590,11 +1661,7 @@ def _guarded_result_body(tid: str, body: str):
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {diagnostics.describe(exc)}"
-    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
-    # Absence is not owner provenance: a month-archived Team task is exactly the
-    # case that would otherwise fall open.
-    tier = resolve(tfile) if tfile is not None else "guest"
-    scan_sensitive_data = filter_enabled(tfile, tier) if tfile is not None else True
+    tfile, tier, scan_sensitive_data = _guard_tier(tid, resolve, filter_enabled)
     context = {}
     if tfile is not None:
         try:
@@ -2068,6 +2135,9 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
+# or "". None (standalone default) leaves each task's field as the gateway sent it.
+TASK_ADDRESSEE: Callable[[], str] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.
 LANE_SERVER: Callable[[], str] | None = None
@@ -2578,6 +2648,10 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The broker's word that the message mentioned the owner, not this agent.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "owner_mentioned",
+                # Commons hook-fire / Summon contexts, each one JSON line. Above "task":
+                # the agent's safe parser must see which hook or row change it serves.
+                "hook",
+                "summon",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2600,6 +2674,26 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
 _PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
+
+# A structured context is written only when it names what it is the context of.
+_CONTEXT_HEADER_KEYS = {
+    "hook": ("hook_id", "fire_id", "caused_by"),
+    "summon": ("task_id", "caused_by", "room_id", "database", "row_id"),
+}
+# Over this the header is dropped whole: a truncated JSON line would not parse.
+_CONTEXT_HEADER_MAX_BYTES = 16 * 1024
+
+
+def _context_header(name: str, value) -> "str | None":
+    """`name: {compact json}` for a well-formed context object, else None."""
+    if not isinstance(value, dict) or not all(
+            isinstance(value.get(k), str) and value[k] for k in _CONTEXT_HEADER_KEYS[name]):
+        return None
+    line = f"{name}: {json.dumps(value, separators=(',', ':'), default=str)}"
+    if len(line.encode("utf-8")) > _CONTEXT_HEADER_MAX_BYTES:
+        _log(f"[{name}] context header over {_CONTEXT_HEADER_MAX_BYTES} bytes; omitted")
+        return None
+    return line
 
 # Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
 # values outside this set degrade to "message" rather than passing through.
@@ -3994,9 +4088,11 @@ def _build_agent_profile(workers: "dict") -> "dict":
     AVAILABLE: the broker REPLACES the profile document, so this function must
     never be reached with a map it could not read."""
     name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
-    return {"display": {"name": name},
-            "host": {"host_id": _profile_host_id(), "kind": "local"},
-            "workers": workers}
+    host = {"host_id": _profile_host_id(), "kind": "local"}
+    # Display-only hint; any value but "desktop" is dropped so the broker never sees junk.
+    if (os.environ.get("SUTANDO_PLACEMENT") or "").strip().lower() == "desktop":
+        host["placement"] = "desktop"
+    return {"display": {"name": name}, "host": host, "workers": workers}
 
 
 def _maybe_push_agent_profile(record) -> bool:
@@ -6002,6 +6098,12 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if TASK_ADDRESSEE is not None:
+        # The lane's own recipient, whatever the gateway's copy says: an addressee this lane did
+        # not name never reaches the router through it.
+        task["requested_worker"] = TASK_ADDRESSEE() or task.get("requested_worker")
+        if not task["requested_worker"]:
+            task.pop("requested_worker")
     if run is None:
         task.pop(RESERVE_CLEANED, None)         # only a saved serve's own copy carries it
     task.pop(QUESTION_REDACTED, None)
@@ -6146,6 +6248,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                     lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
                 else:
                     lines.append(f"picker_args: {'' if pa is None else _one_line(pa)}")
+        elif f in _CONTEXT_HEADER_KEYS:
+            _ctx = _context_header(f, task.get(f))
+            if _ctx:
+                lines.append(_ctx)
         elif f == "platform_card":
             # Signed platform-metadata pointer: re-serialize only the expected
             # subkeys as one compact JSON line (dict repr or extra keys never
@@ -7584,6 +7690,7 @@ def _archive_result(path: Path, tid: str, generation) -> bool:
         disposal.report_once(f"archive:{tid}", _log,
                              f"result {tid}: sent, but could not be archived ({done.cause})")
         return False
+    _archive_result_labels(tid)
     if not _archive_task_file(tid):
         _task_left_executable(tid)
         return False
@@ -9253,6 +9360,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         # that task and posts nothing for it, so no marker and no `no_send` ride along.
         doc["consolidated_into"] = consolidated_into
     doc.update(_result_contract(dm_only))
+    # Activity labels ride the doc that carries dm_only; a broker without them ignores the keys.
+    doc.update(_guarded_result_labels(tid))
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
         doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
@@ -10050,6 +10159,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         return
     _last_orphan_sweep = now
     _recover_disposing_claims()
+    _sweep_orphan_result_labels(now)
     try:
         candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
     except OSError:
