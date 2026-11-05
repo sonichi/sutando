@@ -9,8 +9,9 @@ This module is the one owner of that vocabulary:
 - event_type_value / trigger_id_value / playbook_value sanitize the wire values
   (None = drop the header); the remote-gateway bridge writes only what they pass.
 - resolve_playbook picks the skill a task runs: the task's own playbook when it is
-  a valid id with skills/<id>/SKILL.md, else the event's registry default, else
-  None (handle the task as an ordinary message).
+  an allowed playbook (a registry value, or a skill whose manifest.json sets
+  `"playbook": true`) with skills/<id>/SKILL.md, else the event's registry default,
+  else None (handle the task as an ordinary message). Any other skill is refused.
 
 Stdlib only, vendored verbatim into ag2-sparrow by tools/sync_from_src.py.
 
@@ -21,6 +22,7 @@ prints the SKILL.md path to follow, or `none`.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -32,6 +34,8 @@ EVENT_PLAYBOOKS = {
     "room.joined": "room-onboard",
 }
 EVENT_TYPES = frozenset(EVENT_PLAYBOOKS)
+# A playbook header may name only these, or a skill that opts in with `"playbook": true`.
+REGISTRY_PLAYBOOKS = frozenset(EVENT_PLAYBOOKS.values())
 
 # A playbook id names a directory directly under skills/: no separators, no dots.
 PLAYBOOK_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
@@ -60,8 +64,21 @@ def default_playbook(event_type) -> Optional[str]:
     return EVENT_PLAYBOOKS[known] if known else None
 
 
-def _skill_file(skills_root: Path, playbook: Optional[str]) -> Optional[Path]:
+def is_playbook(skills_root: Path, playbook) -> bool:
+    """True for a registry playbook or a skill whose manifest.json sets `"playbook": true`."""
     if not playbook_value(playbook):
+        return False
+    if playbook in REGISTRY_PLAYBOOKS:
+        return True
+    try:
+        manifest = json.loads((skills_root / playbook / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(manifest, dict) and manifest.get("playbook") is True
+
+
+def _skill_file(skills_root: Path, playbook: Optional[str]) -> Optional[Path]:
+    if not is_playbook(skills_root, playbook):
         return None
     path = skills_root / playbook / "SKILL.md"
     return path if path.is_file() else None

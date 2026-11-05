@@ -121,8 +121,9 @@ dropped, not passed. Its optional `"agent_trigger_id"` (the event's idempotency
 id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
 most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
 matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
-trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` when it
-exists, else the registry default for the event (`room.joined` →
+trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
+allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
+`"playbook": true`), else the registry default for the event (`room.joined` →
 `room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
 as a message. A `room.joined` task names the room in `channel_id`/`source_room_id`,
 the inviter in `user_id` (its `access_tier` is the inviter's) and has no
