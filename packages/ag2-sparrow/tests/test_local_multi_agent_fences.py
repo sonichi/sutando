@@ -343,6 +343,72 @@ class Round9(MultiBase):
         self.assertTrue(bridge.active, "a Busy refusal changed nothing, so it owes nothing")
     test_a_busy_refusal_reads_no_mark_from_the_previous_install = per_manager(_busy_reads_no_stale_mark)
 
+    def seated(self, root):
+        """Under sparrowd: the seat connect writes beside the root, the only token a declared bridge runs with."""
+        lm.Round5.sparrowd(self)
+        self.assertEqual(cb._sources.write_seat_credentials(
+            cb.bridge_home(root), agent_id=ALPHA, instance="c" * 32, tier="owner",
+            relay_url="https://relay.backend.example/relay", bearer="bearer-SEAT0001"), "")
+
+    def _holder_in_the_window(self, adapter):
+        """A queued foreground holder acquires the root while the failed install is between its mutation and its
+        cleanup (after the agent lock is released, before the reconciliation): the cleanup, under the agent lock,
+        re-reads who holds the root and preserves that live holder's bridge or declaration. The no-holder control:
+        the same failure with no holder still cleans up, while the agent lock (a launcher's admission) is held."""
+        a = job(adapter, ALPHA)
+        root, bridge = self.root_of(ALPHA), self.host.bridges[a.job]
+        decl = cb.bridge_home(root) / cb.DECLARATION
+        for sparrowd in (False, True):
+            with self.subTest(sparrowd=sparrowd):
+                if sparrowd:
+                    self.seated(root)
+
+                def full():
+                    if not sparrowd:
+                        return self.install(adapter, ALPHA)
+                    return self.run_cli(adapter, *self.install_argv(adapter), "--token-env-file", cb.seat_file(root))
+
+                def serving():
+                    return decl.exists() if sparrowd else bridge.active
+                self.assertEqual(full()[0], 0)
+                real_settle, holders = cm.settle, []
+
+                def settled_then_held(*a, **kw):
+                    rc = real_settle(*a, **kw)
+                    if not holders and not cm.agent_lock_held(str(root)):     # the outer settle: the lock is released
+                        holders.append(fx.hold(str(root), adapter))     # queued, it takes the root before the cleanup
+                    return rc
+                with mock.patch.object(cm, "_await_free", return_value="still held (test)"), \
+                        mock.patch.object(cm, "settle", side_effect=settled_then_held):
+                    rc, out, err = full()
+                self.addCleanup(lambda h=holders[0]: h.poll() is None and fx.unhold(h))
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertIn("the agent's bridge was kept", err)
+                self.assertIsNone(holders[0].poll(), "the foreground session holds the root")
+                self.assertTrue(serving(), "the bridge serving it is kept")
+                fx.unhold(holders[0])
+                self.assertEqual(full()[0], 0)
+                admitted = []
+                teardown = (cb, "_withdraw") if sparrowd else (cm, "stop_supervisor")
+                real_teardown = getattr(*teardown)
+
+                def probed(*a, **kw):
+                    if sparrowd or a[0] == cb.bridge_shape(a_job):
+                        fd, why = cm.launch_admission(str(root), wait_s=0)
+                        cm.end_admission(fd)
+                        admitted.append(fd is not None)
+                    return real_teardown(*a, **kw)
+                a_job = a
+                with mock.patch.object(cm, "_await_free", return_value="still held (test)"), \
+                        mock.patch.object(*teardown, side_effect=probed):
+                    rc, out, err = full()
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertFalse(serving(), "with no session at all, the bridge is torn down")
+                self.assertEqual(admitted, [False], "no launcher is admitted while it is torn down")
+                self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", ALPHA)[0], 0)
+    test_a_queued_foreground_holder_between_mutation_and_cleanup_keeps_its_bridge_and_no_holder_still_cleans_up = \
+        per_manager(_holder_in_the_window)
+
     def install_argv(self, adapter):
         if adapter == CL.name:
             return ["install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),

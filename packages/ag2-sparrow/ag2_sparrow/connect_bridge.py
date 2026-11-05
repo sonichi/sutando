@@ -400,7 +400,7 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
                 print(f"error: {e}", file=sys.stderr)
                 rc = 1
             rc = cm.settle(root, rc)
-            line = orphan() if rc != 0 and orphan is not None and cm.mutated() else ""
+            line = _reconciled(root, orphan) if rc != 0 and orphan is not None and cm.mutated() else ""
             if line:
                 print(line, file=sys.stderr)
             return rc
@@ -422,12 +422,27 @@ def fenced(agent_id, fn) -> int:
         return 1
 
 
+def _reconciled(root: str, orphan) -> str:
+    """orphan() under the agent lock a launcher's admission takes, so no session can take the root between its
+    check of who holds the root and its teardown; while the lock is busy nothing is torn down, and said."""
+    try:
+        with cm.agent_lock(root):
+            return orphan()
+    except cm.Busy as e:
+        return f"the agent's bridge was left as it is ({e})"
+
+
 def orphan_bridge(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape) -> str:
-    """After a failed install, under the agent's fence: when `local`'s session job is not running, its bridge is
-    stopped, or its declaration withdrawn, so no bridge runs without its session; the line saying so, or ''."""
-    mode = bridge_mode(cfg)
+    """After a failed install, under the agent's fence and lock (_reconciled): when no session serves the root (its
+    managed job is not running and no live holder, managed or foreground, holds it), its bridge is stopped or its
+    declaration withdrawn, so no bridge runs without a session; the line saying so, or ''."""
+    mode, root = bridge_mode(cfg), cm.work_root(cfg)
     if mode == EXTERNAL or cm.manager_state(local) == "active":
         return ""
+    held = cm.lock_held(root)
+    if held != "free":
+        return f"the agent's bridge was kept: {root} is {cm.holder_line(root)}" if held == "held" else \
+            f"the agent's bridge was kept: who holds {root} cannot be read"
     if mode != UNIT:
         line = _withdraw(cfg, command)
         return f"{line}: its session is not running" if line else ""
