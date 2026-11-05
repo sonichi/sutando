@@ -48,6 +48,7 @@ CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+UNDELIVERED = getattr(ps, "CARD_UNDELIVERED", "card_undelivered")
 LOGGED_OUT = getattr(ps, "PANE_LOGGED_OUT", "logged-out")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
     ("PANE_GATE", "gate"), ("PANE_LIMIT", "limit"), ("PANE_ABNORMAL", "abnormal"),
@@ -71,7 +72,7 @@ def run(seq, period=300.0, ack=True):
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN):
+        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED):
             st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
@@ -113,7 +114,8 @@ got, _ = run([obs(GATE, work=False)] * 5)
 check("an idle worker parked on a limit owes nothing: not wedged", got, [N] * 5)
 
 got, _ = run([obs(IDLE)] * 5)
-check("at its prompt with work queued is the watcher rung's case, not a wedge", got, [N] * 5)
+check("at its prompt with work queued and a live watcher: carded once UNDELIVERED_AFTER_S passes",
+      got, [N, N, N, UNDELIVERED, N])
 
 got, _ = run([obs(ABN), obs(ABN), obs(IDLE, work=False), obs(ABN), obs(ABN)])
 check("one clean tick clears the wedge clock", got, [N, N, N, N, N])
@@ -205,6 +207,8 @@ results = pd.results_dir(ws)
 results.mkdir(parents=True, exist_ok=True)
 check("the core's queue is not this worker's work", wo(ws, WID), False)
 (inbox / "task-a.txt").write_text("")
+check("a sentinel whose task is not in tasks/ is stale, not work", wo(ws, WID), False)
+(ws / "tasks" / "task-a.txt").write_text("task: hello\n")
 check("a sentinel handed to it with no reply yet is work", wo(ws, WID), True)
 (inbox / "task-a.txt").rename(inbox / "task-a.accepted")
 check("an accepted sentinel with no reply is work in flight", wo(ws, WID), True)
@@ -338,6 +342,7 @@ class Stub:
 
 
 (inbox / "task-b.txt").write_text("")
+(ws / "tasks" / "task-b.txt").write_text("task: hello\n")
 o = sup.observe(ws, 1000.0, runner=Stub(PANES["permission"][0]))[WID]
 check("observe reads the worker's pane and queue",
       (getattr(o, "pane", None), getattr(o, "work_outstanding", None)), (GATE, True))

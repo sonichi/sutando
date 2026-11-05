@@ -122,6 +122,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/agent/core-window.sh",
+            "src/agent/launch-path.sh",
             "src/claude_config_dir.sh",
             "src/local_services.sh",
             "src/core_runtime_record.py",
@@ -378,7 +379,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler=""):
+    def _notifier_version(self, handler="", stop=""):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -394,7 +395,9 @@ exit 0
         handler_cksum = subprocess.run(
             ["cksum"], input=handler.encode(), capture_output=True,
             check=True, text=False).stdout.decode().split()[0]
-        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}"
+        stop_cksum = subprocess.run(["cksum"], input=stop.encode(), capture_output=True,
+                                    check=True, text=False).stdout.decode().split()[0]
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -504,6 +507,52 @@ exit 0
             os.close(master)
             if slave >= 0:
                 os.close(slave)
+
+    def _launch_path_order(self, env_extra, restart_path=None):
+        """Run the codex launcher to its auth probe with codex and node each in an explicit dir
+        and a shared default; return (which codex ran, the PATH it saw, the dirs)."""
+        tmp = Path(self.tmp.name)
+        dirs = {
+            "bundled": tmp / "runtime" / "node" / "bin",
+            "override_node": tmp / "override-node",
+            "install": tmp / "npm-global",
+            "local": tmp / "home" / ".local" / "bin",
+        }
+        for d in dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+        for key in ("bundled", "override_node"):
+            (dirs[key] / "node").write_text("#!/bin/bash\nexit 0\n")
+            (dirs[key] / "node").chmod(0o755)
+        marker = tmp / "codex-ran"
+        for key in ("install", "local"):
+            exe = dirs[key] / "codex"
+            exe.write_text(f'#!/bin/bash\nprintf "%s\\n%s\\n" {key} "$PATH" > "{marker}"\nexit 1\n')
+            exe.chmod(0o755)
+        (self.bin / "codex").unlink()
+        env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
+        env.update({k: str(dirs[v]) for k, v in env_extra.items()})
+        if restart_path is not None:
+            got = restart_path(f"{self.bin}:/usr/bin:/bin")
+            env.update(got if isinstance(got, dict) else {"PATH": got})
+            result = self.run_launcher("--restart", env_extra=env)
+        else:
+            result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh", env_extra=env)
+        self.assertTrue(marker.exists(), result.stderr)
+        ran, path = marker.read_text().splitlines()[:2]
+        return ran, path.split(":"), {k: str(v) for k, v in dirs.items()}
+
+    def test_explicit_codex_dirs_beat_the_shared_launch_path_defaults(self):
+        ran, path, dirs = self._launch_path_order({"CODEX_NODE_BIN": "override_node"})
+        self.assertEqual(ran, "install", "~/.local/bin/codex shadowed CODEX_INSTALL_BIN")
+        self.assertLess(path.index(dirs["override_node"]), path.index(dirs["bundled"]))
+        self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
+        self.assertEqual(path[0], str(self.bin), "the incoming PATH must stay first")
+
+    def test_without_codex_node_bin_the_bundled_node_precedes_the_install_dir(self):
+        ran, path, dirs = self._launch_path_order({})
+        self.assertEqual(ran, "install")
+        self.assertLess(path.index(dirs["bundled"]), path.index(dirs["install"]))
+        self.assertLess(path.index(dirs["install"]), path.index(dirs["local"]))
 
     def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
         # Since #4503 the launcher resolves nothing; only a genuine pin forwards.
@@ -1038,6 +1087,18 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._tmux_calls()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_turning_the_stop_interrupt_on_or_off_replaces_the_watcher(self):
+        for running, wanted in (("", "1"), ("1", ""), ("1", "1")):
+            with self.subTest(running=running, wanted=wanted):
+                self.log.unlink(missing_ok=True)
+                result = self.run_launcher(env_extra={
+                    "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+                    "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(stop=running),
+                    "SUTANDO_STOP_INTERRUPT": wanted})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                replaced = "kill-session -t =sutando-core-watcher" in self._tmux_calls()
+                self.assertEqual(replaced, running != wanted, "activation and rollback both take effect")
 
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
@@ -2223,7 +2284,7 @@ exit 0
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
 
-    def _run_managed_notifier_against_pane(self, pane_printf):
+    def _run_managed_notifier_against_pane(self, pane_printf, extra_env=None):
         """One managed task with core-status idle; the tmux stub shows `pane_printf` (a printf
         format, escapes kept as capture-pane -e would) and completes the task on C-m."""
         workspace = self.root / "workspace"
@@ -2263,6 +2324,10 @@ exit 0
             SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="1",
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
         )
+        # Never the live workspace or seat a host's own environment names.
+        env.pop("SUTANDO_INSTANCE_ID", None)
+        env["SUTANDO_WORKSPACE_DIR"] = str(workspace)
+        env.update(extra_env or {})
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=10)
         return result, self._tmux_calls(), results / "task-owner.txt"
@@ -2287,6 +2352,38 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("send-keys", calls)
         self.assertFalse(done.exists())
+
+    def _worker_seat_env(self):
+        writer = Path(self.tmp.name) / "accepting-writer.py"
+        writer.write_text("import sys\nsys.exit(0)\n")
+        return {"SUTANDO_INSTANCE_ID": "worker-3", "SUTANDO_POOL_DELIVERY_SCRIPT": str(writer)}
+
+    def test_a_held_notifier_keeps_the_frame_and_surfaces_the_third_round_once(self):
+        picker = ("  Select Model and Effort\\n› 4. gpt-5.5 (current)  Proven previous-generation model\\n"
+                  "  Press enter to confirm or esc to go back\\n")
+        workspace = self.root / "workspace"
+        # The idle wait and its stall accounting run on worker seats; the core uses the pickup gate.
+        errs = [self._run_managed_notifier_against_pane(picker, self._worker_seat_env())[0].stderr
+                for _ in range(4)]
+        surfaced = [e for e in errs if "has not become idle for 3 rounds" in e]
+        self.assertEqual(len(surfaced), 1, errs)
+        self.assertIn("has not become idle for 3 rounds", errs[2])
+        rec = json.loads((workspace / "state/notifier-stalls/sutando-core.json").read_text())
+        self.assertEqual(rec["rounds"], 4)
+        frames = sorted((workspace / "state/pane-frames/sutando-core").glob("*-not-idle.txt"))
+        self.assertTrue(frames, "the frame that held the notifier was not kept")
+        self.assertIn("Select Model and Effort", frames[-1].read_text())
+
+    def test_an_idle_pane_clears_the_stall_record(self):
+        workspace = self.root / "workspace"
+        stall = workspace / "state/notifier-stalls/sutando-core.json"
+        stall.parent.mkdir(parents=True, exist_ok=True)
+        stall.write_text('{"seat": "sutando-core", "rounds": 3, "since": 1, "last": 1}')
+        result, _calls, done = self._run_managed_notifier_against_pane(
+            "\\033[1m›\\033[0m \\033[2mAsk Codex to do anything\\033[0m\\n", self._worker_seat_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(done.exists(), result.stderr)
+        self.assertFalse(stall.exists(), "an idle pane must clear the stall the supervisor reports")
 
     def test_managed_notifier_holds_while_a_real_picker_is_open(self):
         result, calls, done = self._run_managed_notifier_against_pane(

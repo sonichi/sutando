@@ -40,6 +40,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -49,6 +51,7 @@ sys.path.insert(0, str(_SRC))
 from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
                        core_target, frame_abnormal, frame_working, needs_login_line, normalize,
                        state_id)
+from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl directly)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from worker_auth_state import signed_in_since  # noqa: E402
@@ -184,6 +187,16 @@ AWAIT_HINT = re.compile(
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
 _SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
 _TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+
+
+def turn_status(lines: List[str]) -> Optional[List[str]]:
+    """The last turn row and the lines below it (its status line and footer) while that row is a
+    live spinner; None when the last turn row is a completion line or there is none."""
+    for i in range(len(lines) - 1, -1, -1):
+        row = _SGR.sub("", lines[i])
+        if _TURN_ROW.search(row):
+            return lines[i:] if _SPINNER_ROW.search(row) else None
+    return None
 
 
 def live_tail(lines: List[str]) -> List[str]:
@@ -462,7 +475,8 @@ def gate_evidence(tail: str, styled_tail: Optional[str] = None,
         signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
         if adapter.idle_ready.search(row) and not signatures:
             continue
-        if i == composer_i and line and line.placeholder and not line.text.strip():
+        # A dialog's caret row styles its option number grey, which reads as a ghost composer.
+        if i == composer_i and line and line.placeholder and not line.text.strip() and not signatures:
             continue
         # A marker alone cannot distinguish a live instruction from completed output.
         if (completed and i < composer_i and not signatures
@@ -596,7 +610,7 @@ def progress_id(capture: str) -> str:
 def _limit_row(ln: str) -> bool:
     plain = _SGR.sub("", ln)
     abn = frame_abnormal(plain)
-    return bool(LIMIT_WAIT.search(plain)) or (
+    return limit_line(plain) or (
         abn is not None and all(n in PROVIDER_LIMIT_PATTERNS for n in abn.names))
 
 
@@ -623,6 +637,45 @@ def limit_baseline(capture: str) -> LimitBaseline:
                          frozenset(key for key, _ in _turns(capture)))
 
 
+# A spinner's clock: its first `·` field that is only a duration ("2m 37s"), never a
+# suffix such as "thought for 4s".
+_CLOCK = re.compile(r"\d+[hms](?:\s+\d+[hms])*")
+_UNIT_S = {"h": 3600, "m": 60, "s": 1}
+
+
+def spinner_elapsed(row: str) -> Optional[int]:
+    """Seconds on a spinner row's own clock, else None."""
+    inner = row.partition("(")[2].rpartition(")")[0]
+    for field in inner.split("\u00b7"):
+        if _CLOCK.fullmatch(field.strip()):
+            return sum(int(t[:-1]) * _UNIT_S[t[-1]] for t in field.split())
+    return None
+#: A delivery the limit refuses ends within seconds; a turn running longer was served.
+FLIGHT_MIN_S = 10
+# A turn waiting rather than working: a limit, a retry or a cancellable wait on its rows.
+_WAIT_TEXT = re.compile(r"\bretry(?:ing)?\b|\brate[ -]?limit|\boverloaded\b|\battempt \d+"
+                        r"|esc to cancel|\b429\b", re.I)
+
+
+def _waiting_row(plain: str) -> bool:
+    return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
+
+
+def turn_in_flight(capture: Optional[str]) -> bool:
+    """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
+    and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
+    so a limit banner under the composer is from before it."""
+    lines = (capture or "").splitlines()
+    above = [_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]]
+    for i in range(len(above) - 1, -1, -1):
+        if _TURN_ROW.search(above[i]):
+            if not _SPINNER_ROW.search(above[i]) or any(_waiting_row(r) for r in above[i:]):
+                return False
+            ran = spinner_elapsed(above[i])
+            return ran is not None and ran >= FLIGHT_MIN_S
+    return False
+
+
 def strip_limit_banners(capture: str) -> str:
     """`capture` without the limit banner under its composer, for a caller that has judged
     it stale. Rows inside turns (a refusal) are evidence and stay."""
@@ -633,16 +686,19 @@ def strip_limit_banners(capture: str) -> str:
 
 def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, baseline=None) -> bool:
     """A quota-only banner is a line from before the reset, scrollback, not a hold, when
-    the seat shows it is not held: the newest turn finished since `baseline` (limit_baseline
-    of the first capture showing the banner) ran, or a FRESH proxy record says accepted for a
-    seat ROUTED through that proxy. A newest turn that was refused holds whatever the record
-    says. Anything else keeps the hold -- another abnormal family, no newer turn, an
-    unrouted or unobserved seat, or a record absent, stale or rejected. A retry never
-    reaches here: classify_pane returns on it before any gate."""
+    the seat shows it is not held: a turn is in flight above the composer, the newest turn
+    finished since `baseline` (limit_baseline of the first capture showing the banner) ran,
+    or a FRESH proxy record says accepted for a seat ROUTED through that proxy. A newest
+    turn that was refused holds whatever the record says. Anything else keeps the hold --
+    another abnormal family, no newer turn, an unrouted or unobserved seat, or a record
+    absent, stale or rejected. A retry never reaches here: classify_pane returns on it
+    before any gate."""
     if abn is None or abn.kind != "provider-limit":
         return False
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
         return False
+    if turn_in_flight(capture):
+        return True
     if capture is not None and baseline is not None:
         new = [ran for key, ran in _turns(capture) if key not in baseline.seen]
         if new:
@@ -693,9 +749,11 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
     gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
+    if gate in LIMIT_GATES and turn_in_flight(capture):
+        return Verdict("busy", "working")
     if gate:
         return Verdict("busy", gate)
-    if abn and not limit_is_stale(abn, workspace, socket, session, probe):
+    if abn and not limit_is_stale(abn, workspace, socket, session, probe, capture=capture):
         return Verdict("abnormal", ",".join(abn.names))
     if frame_working(tail):
         return Verdict("busy", "working")
@@ -755,6 +813,110 @@ def _read_stdin() -> str:
     return sys.stdin.read()
 
 
+# A pane judged abnormal or not idle is kept for diagnosis: the live area a TUI
+# redraws (a retry banner, a dialog) is gone from scrollback once it clears.
+FRAMES_REL = Path("state") / "pane-frames"
+FRAMES_KEEP = 5
+_SEAT_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def save_frame(workspace, seat: str, kind: str, text: str, now: Optional[float] = None,
+               keep: int = FRAMES_KEEP) -> Optional[Path]:
+    """Write `text` to state/pane-frames/<seat>/<UTC stamp>-<kind>.txt and keep the newest
+    `keep` per seat. Best effort: None when nothing was written; filesystem errors are swallowed."""
+    if not text or not text.strip():
+        return None
+    seat_dir = _SEAT_NAME.sub("_", seat or "")
+    if seat_dir in ("", ".", ".."):
+        seat_dir = "unknown"
+    try:
+        d = Path(workspace) / FRAMES_REL / seat_dir
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+        base = f"{stamp}-{_SEAT_NAME.sub('_', kind) or 'frame'}"
+        path, n = d / f"{base}.txt", 1
+        while path.exists():  # a second frame in the same second sits beside the first
+            path, n = d / f"{base}.{n}.txt", n + 1
+        _write_atomic(path, text)
+        frames = sorted(f for f in d.glob("*.txt") if f.is_file() and not f.is_symlink())
+        for old in frames[:-keep] if keep > 0 else frames:
+            old.unlink(missing_ok=True)
+        return path
+    except OSError:
+        return None
+
+
+# A notifier that times out waiting for idle restarts as a new process, so its rounds
+# are counted on disk; the third surfaces once, and an idle pane clears the record.
+STALLS_REL = Path("state") / "notifier-stalls"
+STALL_ROUNDS = 3
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _stall_lock(path: Path):
+    """One writer per seat: the count is read, bumped and replaced (or cleared) under it."""
+    return locked_file(path.with_name(f".{path.name}.lock"))
+
+
+def _stall_path(workspace, seat: str) -> Path:
+    name = _SEAT_NAME.sub("_", seat or "")
+    return Path(workspace) / STALLS_REL / f"{name if name not in ('', '.', '..') else 'unknown'}.json"
+
+
+def note_idle_timeout(workspace, seat: str, now: Optional[float] = None) -> int:
+    """Count one more idle-wait timeout for `seat`; returns the rounds so far (0 if unwritable)."""
+    path = _stall_path(workspace, seat)
+    now = time.time() if now is None else now
+    try:
+        with _stall_lock(path):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                rec = rec if isinstance(rec, dict) else {}
+            except (OSError, ValueError):
+                rec = {}
+            rec = {"seat": seat, "since": rec.get("since", now), "last": now,
+                   "rounds": int(rec.get("rounds", 0) or 0) + 1}
+            _write_atomic(path, json.dumps(rec))
+    except OSError:
+        return 0
+    return rec["rounds"]
+
+
+def clear_idle_timeouts(workspace, seat: str) -> bool:
+    path = _stall_path(workspace, seat)
+    if not path.exists():
+        return False
+    try:
+        with _stall_lock(path):
+            path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def idle_stalls(workspace) -> dict:
+    """{seat: record} for every seat whose notifier has timed out STALL_ROUNDS times or more."""
+    out = {}
+    for f in sorted((Path(workspace) / STALLS_REL).glob("*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and int(rec.get("rounds", 0) or 0) >= STALL_ROUNDS:
+            out[str(rec.get("seat") or f.stem)] = rec
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="pane_gate")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -785,6 +947,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
     hp.add_argument("--session", default=None, help="the seat the record must vouch for")
     hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    sf = sub.add_parser("save-frame")
+    sf.add_argument("--workspace", required=True)
+    sf.add_argument("--seat", required=True)
+    sf.add_argument("--kind", required=True)
+    for name in ("idle-timeout", "idle-ok"):
+        it = sub.add_parser(name)
+        it.add_argument("--workspace", required=True)
+        it.add_argument("--seat", required=True)
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -798,6 +968,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Emitting the SAFE set keeps a caller's membership test fail-closed: anything
         # absent -- a new state, a typo, an empty read -- refuses without being listed.
         print(" ".join(s for s in STATES if not state_is_unsafe(s)))
+        return 0
+    if a.cmd == "save-frame":
+        path = save_frame(a.workspace, a.seat, a.kind, _read_stdin())
+        print(path or "", end="\n" if path else "")
+        return 0 if path else 1
+    if a.cmd == "idle-timeout":
+        # "surface N" exactly once, on the round that reaches STALL_ROUNDS; later rounds stay quiet.
+        rounds = note_idle_timeout(a.workspace, a.seat)
+        print(f"surface {rounds}" if rounds == STALL_ROUNDS else str(rounds))
+        return 0
+    if a.cmd == "idle-ok":
+        clear_idle_timeouts(a.workspace, a.seat)
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":

@@ -21,7 +21,7 @@ SEMANTIC_GATES = frozenset({"permission", "selection", "press-enter", "login"})
 _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|Yes, I accept|"
                               r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
-_FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
+_FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝╌╍┄┅┈┉]*$")
 _EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
 _FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
@@ -92,6 +92,19 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) 
     return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
             "/usage-credits to use extra credits, /login to switch to another account, "
             "or /model to switch to a model with usage left.")
+
+
+def sign_in_copy(runtime: Optional[str] = None) -> Tuple[str, str, str]:
+    """(title, message, button label) for a signed-out seat, in its own runtime's words."""
+    if runtime in (None, "claude"):
+        return ("Claude needs you to sign in again",
+                "Your Claude session has expired. Sign in again to continue.", "Sign in to Claude")
+    if runtime == "codex":
+        return ("Codex needs you to sign in again",
+                "Your Codex session has expired. Run `codex login` in its terminal to continue.",
+                "Sign in to Codex")
+    return ("Agent needs you to sign in again",
+            "The agent's sign-in has expired. Sign in again to continue.", "Sign in")
 
 
 def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:
@@ -174,15 +187,16 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
-        kind, title = "auth", "Claude needs you to sign in again"
-        message = "Your Claude session has expired. Sign in again to continue."
-        actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
+        kind = "auth"
+        title, message, label = sign_in_copy(runtime)
+        actions = [Action(id="authenticate", kind="authenticate", label=label)]
     elif gate == "press-enter":
         kind, title = "confirmation", "Agent needs your confirmation"
         message = question(prompt, detail)
         actions = [Action(id="continue", kind="continue", label="Continue")]
-    elif options:
+    elif options and caret is not None:
         # Kind follows the OPTIONS: classify() names a Yes/No dialog `selection`.
+        # No caret means keys_for can never answer it, so a button would only go stale.
         yes = next((i for i, o in enumerate(options) if _YES.match(o)), None)
         no = next((i for i, o in enumerate(options) if _NO.match(o)), None)
         message = question(prompt, detail)

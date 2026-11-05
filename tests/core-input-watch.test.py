@@ -752,11 +752,36 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         self.assertEqual(st, "idle-ready")
 
     def test_the_watcher_carries_the_previous_capture_between_polls(self):
+        self.assertEqual(self._watch([_TURN_A, _TURN_B], [0.0, 3.0]), ["running", "running"])
+
+    def test_the_watcher_reads_hung_once_the_turn_has_stood_still_past_the_bound(self):
+        frozen = _mod.FROZEN_TURN_S
+        states = self._watch([_TURN_A, _TURN_A_TICKED, _TURN_A_TICKED], [0.0, frozen - 1, frozen + 1])
+        self.assertEqual(states, ["running", "running", "hung"])
+
+    def test_a_wall_clock_jump_forward_does_not_freeze_a_quiet_turn(self):
+        # Three real seconds, but the wall clock jumped forward 600s: still in flight.
+        states = self._watch([_TURN_A, _TURN_A_TICKED], [0.0, 3.0], wall=[1000.0, 1603.0])
+        self.assertEqual(states, ["running", "running"])
+
+    def test_a_wall_clock_jump_back_does_not_hide_a_frozen_turn(self):
+        # Past the bound in real time, with the wall clock set back 600s: frozen.
+        still = _mod.FROZEN_TURN_S + 1
+        states = self._watch([_TURN_A, _TURN_A_TICKED], [0.0, still], wall=[1000.0, 1000.0 + still - 600])
+        self.assertEqual(states, ["running", "hung"])
+
+    def _watch(self, frames, clock, wall=None):
         import sys
         import tempfile
         from unittest.mock import patch
         out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
-        panes, states = iter([_TURN_A, _TURN_B]), []
+        panes, states, times = iter(frames), [], iter(clock)
+        walls = iter(wall if wall is not None else clock)
+        now, wall_now = [0.0], [0.0]
+
+        def _capture(_s, _sess):
+            now[0], wall_now[0] = next(times), next(walls)
+            return next(panes)
 
         class _RH:
             TMUX_SOCKET = SESSION = None
@@ -770,18 +795,20 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         def _sleep(_s):
             with open(out) as f:
                 states.append(json.load(f)["state"])
-            if len(states) == 2:
+            if len(states) == len(frames):
                 raise _Stop
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
-        with patch.object(_mod, "capture_styled", lambda s, sess: next(panes)), \
+        with patch.object(_mod, "capture_styled", _capture), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "session_runtime", lambda *a: None), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod.time, "monotonic", lambda: now[0]), \
+                patch.object(_mod.time, "time", lambda: wall_now[0]), \
                 patch.object(_mod.time, "sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
             main()
-        self.assertEqual(states, ["hung", "running"])
+        return states
 
 
 class TestRefusedTurn(unittest.TestCase):
@@ -1219,6 +1246,45 @@ _CODEX_WORKING = f"• Working (3m 02s • esc to interrupt)\n\n› \n\n{_CODEX_
 _CODEX_PICKER = f"  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven model\n\n{_CODEX_FOOTER}"
 
 
+# A Codex core mid-turn, three seconds apart: the model is thinking, so only the clock moved.
+_CODEX_THINKING_A = f"• Ran gh pr list --state open\n  └ #4944 feat(health): …\n\n• Working (1m 12s • esc to interrupt)\n\n› \n\n{_CODEX_FOOTER}"
+_CODEX_THINKING_B = _CODEX_THINKING_A.replace("1m 12s", "1m 15s")
+
+
+class TestAQuietTurnIsNotHung(unittest.TestCase):
+    """A core that writes no fresh core-status (a Codex core, or any long turn) read hung on the
+    first poll its turn printed nothing new, and /health showed it red while it worked (#6063)."""
+
+    def test_a_codex_turn_quiet_for_one_poll_reads_running(self):
+        st, detail, prompt, _k = compose_state(_CODEX_THINKING_B, "unknown", True,
+                                               prev_pane=_CODEX_THINKING_A, runtime="codex", still_s=3.0)
+        self.assertEqual((st, detail, prompt), ("running", "actively processing", None))
+
+    def test_a_turn_still_past_the_bound_reads_hung(self):
+        for runtime, pane, prev in (("codex", _CODEX_THINKING_B, _CODEX_THINKING_A),
+                                    (None, _TURN_A_TICKED, _TURN_A)):
+            with self.subTest(runtime=runtime):
+                st, *_ = compose_state(pane, "unknown", True, prev_pane=prev, runtime=runtime,
+                                       still_s=_mod.FROZEN_TURN_S)
+                self.assertEqual(st, "hung")
+
+    def test_a_still_pane_with_no_turn_in_flight_is_not_vouched_for(self):
+        st, *_ = compose_state(f"Running step 3...\n{_CODEX_FOOTER}", "unknown", True,
+                               runtime="codex", still_s=3.0)
+        self.assertEqual(st, "hung")
+
+    def test_still_step_counts_from_the_last_change_ignoring_the_clock(self):
+        pair, age = _mod.still_step(_CODEX_THINKING_A, None, 100.0)
+        self.assertEqual(age, 0.0)
+        pair, age = _mod.still_step(_CODEX_THINKING_B, pair, 103.0)
+        self.assertEqual(age, 3.0)
+        pair, age = _mod.still_step(_CODEX_THINKING_B.replace("1m 15s", "6m 0s"), pair, 400.0)
+        self.assertEqual(age, 300.0)
+        _pair, age = _mod.still_step(_CODEX_THINKING_B + "\n• Ran npm test", pair, 401.0)
+        self.assertEqual(age, 0.0)
+        self.assertEqual(_mod.still_step(None, pair, 402.0), (None, None))
+
+
 class TestCodexIdleIsNotHung(unittest.TestCase):
     """After a switch to Codex an idle core writes core-status rarely, exactly as
     Claude's does, so the stale-status `hung` must yield to Codex's own idle footer."""
@@ -1465,6 +1531,50 @@ class TestSendKeys(unittest.TestCase):
             self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
+class TestStyledPermissionCaretRow(unittest.TestCase):
+    """Claude Code 2.1 styles the selected option's number grey (SGR 38;5;246): the caret
+    row must stay dialog evidence, or the card loses its Yes button and every click goes stale."""
+
+    # The bottom of a real capture-pane -e frame of a Bash permission dialog.
+    STYLED = (
+        " Bash command\n"
+        "\x1b[38;5;246m Run the specified bash command\x1b[39m\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " sh -c 'for f in ./x; do rm \"$f\"; done'\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " This command requires approval\n"
+        "\n"
+        " Do you want to proceed?\n"
+        " \x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. \x1b[38;5;153mYes\x1b[39m\n"
+        "   \x1b[38;5;246m2. \x1b[39mYes, and don’t ask again for: sh -c 'for f in ./x; do rm \"$f\"; done'\n"
+        "   \x1b[38;5;246m3. \x1b[39mNo\n"
+        "\n"
+        " \x1b[38;5;246mEsc to cancel · Tab to amend\x1b[39m\n")
+
+    def _card(self):
+        from hitl import tui_gate
+        plain = _mod._ANSI_SGR.sub("", self.STYLED)
+        state, detail, prompt, kind = compose_state(plain, "idle", True, styled_pane=self.STYLED)
+        self.assertEqual(state, "blocked-human")
+        self.assertIn("❯ 1. Yes", prompt)
+        return tui_gate, prompt, state, tui_gate.requirement_for(
+            state, kind, prompt, "s", detail, "fallback")
+
+    def test_the_card_offers_yes_and_no(self):
+        _, _, _, req = self._card()
+        self.assertEqual(req.kind, "permission")
+        self.assertEqual([a.label for a in req.actions], ["No", "Yes", "Open terminal"])
+        self.assertNotIn("╌", req.message)
+        self.assertIn("This command requires approval Do you want to proceed?", req.message)
+
+    def test_yes_is_typed_into_the_dialog_on_screen(self):
+        tui_gate, prompt, state, req = self._card()
+        req.chosen_action = "allow"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Enter"])
+        req.chosen_action = "deny"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Down", "Down", "Enter"])
+
+
 class TestEnsureTmuxOnPath(unittest.TestCase):
     """Mini-verified 2026-07-14: a detached spawn without Homebrew on PATH made bare
     `tmux` fail → healthy core mis-read as crashed. The monitor must self-heal PATH."""
@@ -1495,6 +1605,31 @@ class TestEnsureTmuxOnPath(unittest.TestCase):
             self.assertEqual(os.environ["PATH"], "/usr/bin")  # untouched
         finally:
             _mod.shutil.which = orig_which
+            os.environ["PATH"] = orig_path
+
+
+    def test_prepends_the_shared_resolvers_dir(self):
+        from unittest.mock import patch
+        orig_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin"
+            with patch.object(_mod.shutil, "which", return_value=None), \
+                    patch.object(_mod.tmux_probe, "tmux_binary", return_value="/fake/dir/tmux"):
+                _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], "/fake/dir")
+        finally:
+            os.environ["PATH"] = orig_path
+
+    def test_bare_fallback_leaves_path_alone(self):
+        from unittest.mock import patch
+        orig_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin"
+            with patch.object(_mod.shutil, "which", return_value=None), \
+                    patch.object(_mod.tmux_probe, "tmux_binary", return_value="tmux"):
+                _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"], "/usr/bin")
+        finally:
             os.environ["PATH"] = orig_path
 
 
@@ -1844,6 +1979,15 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
         self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
                          ("blocked-human", "awaiting user: unknown"))
 
+    def test_a_turn_in_flight_above_the_composer_outruns_the_banner_with_work_owed(self):
+        mid_turn = ("● Writing the result file now.\n"
+                    "✳ Choreographing… (running Stop hooks… 2/3 · 2m 37s)\n"
+                    "  ✔ Update installed · Restart to update\n" + _RULE + "❯ \n" + _RULE
+                    + _STALE_BANNER + _SEAT_FOOTER)
+        for name, pane in (("stop hooks", mid_turn), ("thinking", _ALERT_WORKING)):
+            with self.subTest(spinner=name):
+                self.assertNotIn("blocked-human", self._seat([pane] * 3, owes=True))
+
     def test_owes_work_is_the_cores_queue_and_never_a_worker_seats(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
@@ -1884,6 +2028,44 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
             self.assertTrue(stale)
             st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
             self.assertEqual(st[0], "idle-ready")
+
+
+# An idle worker seat captured live: two turns that ran, then the CLI's two-row limit banner left
+# pinned under an empty composer (non-breaking space after the caret) while the seat kept working.
+_LIVE_IDLE_SEAT = (
+    "⏺ Clean start. Launching readiness probe.\n\n"
+    "⏺ Monitor(Poll watcher readiness probe until confirmed ready)\n"
+    "  ⎿  Monitor started · task task-a · timeout 120s\n\n  Ran 1 shell command\n\n"
+    "⏺ Watcher re-armed (clean start). Readiness probe launched; waiting on confirmation.\n\n"
+    "✻ Crunched for 3m 17s · done 6:46 PM · 1 monitor still running\n\n"
+    "⏺ Monitor \"Poll watcher readiness probe until confirmed ready\" stream ended\n\n"
+    "⏺ Watcher confirmed ready.\n\n  Ran 1 shell command\n\n"
+    "⏺ Logged. Standing by for the next task notification.\n\n"
+    "✻ Sautéed for 2m 29s · done 6:48 PM · 1 monitor still running\n"
+    + " " * 80 + "✔ Update installed · Restart to update\n"
+    + "─" * 70 + " seat-1 ─\n❯\u00a0\n" + "─" * 120 + "\n"
+    "  ⚠ Usage limit reached · continuing automatically at 1am · esc to cancel\n"
+    "  ⚠ /usage-credits to continue now\n"
+    "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage\n")
+
+
+class TestLiveIdleSeatUnderAPinnedBanner(unittest.TestCase):
+    """The worker seat watcher's own path on that capture: no page, and its limit card closes."""
+
+    def test_the_seat_watcher_does_not_page_and_its_limit_card_closes(self):
+        owes = _mod.owes_work("worker-seat", _Path("/nonexistent-ws"))
+        stale, _ = _mod.limit_step(_LIVE_IDLE_SEAT, None, "/nonexistent-ws", owes_work=owes)
+        self.assertTrue(stale)
+        st = compose_state(_LIVE_IDLE_SEAT, "idle", True, limit_stale=stale, styled_pane=_LIVE_IDLE_SEAT)
+        self.assertEqual(st[0], "idle-ready")
+        from delivery.pane_gate import limit_standing
+        self.assertFalse(limit_standing(_LIVE_IDLE_SEAT, "claude", stale))
+
+    def test_control_with_work_owed_one_frame_cannot_order_the_banner_and_it_holds(self):
+        stale, _ = _mod.limit_step(_LIVE_IDLE_SEAT, None, "/nonexistent-ws", owes_work=True)
+        self.assertFalse(stale)
+        st = compose_state(_LIVE_IDLE_SEAT, "idle", True, limit_stale=stale, styled_pane=_LIVE_IDLE_SEAT)
+        self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
 
 
 if __name__ == "__main__":

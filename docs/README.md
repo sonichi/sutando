@@ -117,3 +117,5 @@ python3 skills/release/scripts/docs_audit.py
 - [GitHub verification receipts](github-verification.md) — bounded PR evidence and governed foreground publication.
 
 - [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.
+
+- [Task wedge detection](task-wedge-detection.md): detector coverage, recovery, origin-message status and latency evidence.

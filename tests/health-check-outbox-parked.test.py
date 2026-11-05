@@ -99,6 +99,43 @@ class OutboxParkedProbe(unittest.TestCase):
         self.assertIn("task-abc", r["detail"])
         self.assertIn("requeue", r["detail"])
 
+    def _reply(self, item_id, status, payload="", root_name=".outbox-slack-results"):
+        """A record the way the outbox writes it (addressable by id), not a hand-made file."""
+        import outbox
+        root = self.ws / "results" / root_name
+        outbox._write_item(root, item_id, {"item_id": item_id, "status": status, "attempts": 5,
+                                           "reason": "max-attempts", "payload": payload})
+        return root
+
+    def test_a_parked_reply_whose_body_is_gone_says_re_send_not_requeue(self):
+        self._reply("task-gone", "PARKED")
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("1 cannot be requeued, their body is gone", r["detail"])
+        self.assertIn("re-send manually: task-gone", r["detail"])
+        self.assertNotIn("Recover with", r["detail"], "requeue would refuse it, so do not advise it")
+
+    def test_a_queued_reply_with_nothing_to_send_is_surfaced(self):
+        # What an earlier requeue of a body-less reply left behind: QUEUED, waiting forever.
+        root = self._reply("task-stranded", "QUEUED")
+        self._reply("task-sending", "QUEUED")
+        (self.ws / "results" / "task-sending.txt").write_text("a reply on its way")
+        import outbox
+        self._reply("task-claimed", "QUEUED")
+        self.assertTrue(outbox.acquire_delivery_claim(root, "task-claimed", "slack-results"))
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("1 QUEUED with nothing to send", r["detail"])
+        self.assertIn("task-stranded", r["detail"])
+        for live in ("task-sending", "task-claimed"):
+            self.assertNotIn(live, r["detail"], "a body on disk or a live claim is not stranded")
+
+    def test_control_a_gateway_record_keeps_the_requeue_advice(self):
+        self._reply("task-gw", "PARKED", payload='{"id": "task-gw"}', root_name=".outbox")
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertIn("1 never delivered — nothing retries them: task-gw", r["detail"])
+        self.assertIn("Recover with", r["detail"])
+
     def test_an_unknown_outcome_park_warns_against_a_blind_requeue(self):
         self._items(".outbox-withheld-review").joinpath("wr_1.c.json").write_text(json.dumps(
             {"item_id": "wr_1.c", "status": "PARKED", "reason": "outcome-unknown"}), encoding="utf-8")

@@ -89,6 +89,33 @@ class RealTmux(unittest.TestCase):
         self.assertEqual(self.in_mode(), "1")
         self.assertNotIn("MODE-NEGATIVE", self.tmux("capture-pane", "-p", "-t", pane).stdout)
 
+    def test_fenced_keys_land_only_while_the_predicate_holds_and_leave_copy_mode_first(self):
+        self.tmux("set-option", "-p", "-t", "=core:0", "@turn", "P1")
+        self.tmux("copy-mode", "-t", "=core:0")
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P2}", "-l", "--", "wrong turn")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, tmux_pane_keys.WITHHELD, r.stderr)
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P1}", "-l", "--", "right turn")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.in_mode(), "0")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "right turn" not in self.tmux("capture-pane", "-p", "-t", "=core:0").stdout:
+            time.sleep(0.1)
+        text = self.tmux("capture-pane", "-p", "-t", "=core:0").stdout
+        self.assertIn("right turn", text)
+        self.assertNotIn("wrong turn", text)
+        r = subprocess.run(argv[:argv.index("--")], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, "fenced keys need keys")
+
+    def test_a_false_fence_leaves_the_pane_exactly_as_it_was(self):
+        self.tmux("set-option", "-p", "-t", "=core:0", "@turn", "P1")
+        self.tmux("copy-mode", "-t", "=core:0")
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P2}", "Escape")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, tmux_pane_keys.WITHHELD, r.stderr)
+        self.assertEqual(self.in_mode(), "1", "a stale request never touches the pane, its mode included")
+
     def test_without_the_helper_the_same_send_blocks(self):
         # The control: plain send-keys into copy mode waits on "(jump to forward)".
         self.tmux("copy-mode", "-t", "=core:0")

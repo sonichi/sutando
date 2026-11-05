@@ -121,9 +121,12 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 
 ```sh
 REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
-REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
+
+The token from the Agent Portal already names your relay (`https://<relay>|<secret>`), so
+leave `REMOTE_TASK_URL` unset. It overrides the relay in the token: set it only with a bare
+secret, and then to the relay URL your Agent Portal shows, never one copied from an example.
 
 The token is your s.space **identity** — not a model API key. Your agent runs
 locally with its own credentials; only tasks and results flow through s.space.
@@ -219,6 +222,37 @@ command prints stands. The row does not change the presence status Sparrow
 reports. The Hatch adapter's
 `ag2-sparrow-hatch keepalive health` is one such command.
 
+## Acting in AG2 Space: the MCP server (`ag2-sparrow-mcp`)
+
+Sparrow carries messages. To do more in AG2 Space as the agent, such as Room Commons
+writes (pages, databases, comments) through `room.action.execute`, the agent's MCP client
+connects to the AG2 Space MCP server as the agent itself. No link code is involved: the
+relay token Sparrow already holds is the credential. Core exchanges it for a 15-minute
+MCP access token for this agent (the exchange the desktop app makes for its own agent),
+and every Action runs under the agent's own room membership and grants.
+
+For Claude Code, run this once with Sparrow's environment, in the agent's project:
+
+```sh
+ag2-sparrow-mcp setup
+```
+
+It prints one `claude mcp add-json ag2-space '…'` line; run it. The server it adds is
+`type: http` with a `headersHelper` of `ag2-sparrow-mcp headers`, which prints
+`{"Authorization": "Bearer <access token>"}`. Claude Code runs it at each connect and
+again after a 401, so an expired token is replaced; nothing is cached on disk. The
+relay token goes only to the relay's `/v1/mcp/discovery` and to the mint URL it names,
+which must be the relay's own `/api/v1/mcp/agent-access-tokens` (same scheme, host and port
+as the relay; https, or http only to loopback); any other mint URL is refused before the
+token is sent. It never reaches the MCP server.
+
+The helper reads the token the way `ag2-sparrow` does. When Sparrow read it from the
+`.env` named by `AG2_DEVICE_ENV`, the printed helper names that file. When it came from
+the environment, Claude Code needs `REMOTE_TASK_TOKEN` in its environment too.
+
+Check it with `ag2.whoami`: it answers `Authenticated as @<agent> (agent)`. Agents
+whose kind is `sutando` or `acp` can make the exchange; others get a 401 naming the reason.
+
 ## Meta Hatch agents (`ag2-sparrow[hatch]`)
 
 A Meta Hatch agent (for example Muse) can let Sparrow do the receiving and keep
@@ -253,7 +287,11 @@ and 1 when Sparrow refused or withheld it or the task already has a result; exit
 `[REPLIED]`, `[channel:]`, `[thread]` or `[file:]`, which a reply may not use).
 Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
 in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
-with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
+with `ag2-sparrow-hatch reply --no-send <result_file>`. An agent that answers
+outside the wake (no worker_note) ends it with `ag2-sparrow-hatch no-reply
+<result_file> [--reason TEXT]`, which writes `[no-send]` the same way and waits
+like `reply`: exit 0 once Sparrow has settled the task with the gateway, 1 when
+it was not, 3 when it is queued but not confirmed. Work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
 main session. An item that waits for the owner's go is parked with
 `ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
@@ -814,7 +852,7 @@ task delivery — a channel failure never affects the task loop.
 |---|---|
 | `SPARROW_EVENTS` | `1` enables the event channel + consumer (default off) |
 | `SPARROW_OBSERVE_REACT` | `1` enables the built-in 👀 observed-receipt (default off). Off by default because the receipt is scoped by room id alone — no owner/DM scope, allowlist, or mention test — so it must not react in shared rooms without an explicit choice |
-| `SPARROW_HA_OWNER` | owner mxid; enables human-action decision routing — the owner's typed/reacted answers to pending question cards resolve them |
+| `SPARROW_HA_OWNER` | owner mxid; enables human-action decision routing — the owner's typed/reacted answers to pending question cards resolve them. HITL card clicks use it when set, else the owner the gateway registry (`/v1/agents`) names for this agent |
 | `SPARROW_HA_ROOM` | room id where question cards are posted (with `SPARROW_HA_OWNER`) |
 | `SPARROW_HA_A2UI` | `1` attaches interactive A2UI blocks to cards (default off; requires a client that renders them) |
 

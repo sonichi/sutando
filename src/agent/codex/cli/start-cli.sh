@@ -135,19 +135,10 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # system node, so the app's bundled runtime must be reachable or every codex
 # invocation dies with "env: node: No such file or directory" (exit 127) —
 # which the auth probe below would otherwise misreport as "not authenticated".
-# The engine lives at <app-support>/engine; this script runs from
-# <app-support>/engine/sutando, so the runtime is one level up from $REPO.
-CODEX_NODE_BIN="${CODEX_NODE_BIN:-$(cd "$REPO/.." 2>/dev/null && pwd)/runtime/node/bin}"
-# APPEND, never prepend: an operator (or a test harness) who put a codex or
-# node earlier on PATH must keep winning; we only add a fallback.
-for _d in "$CODEX_NODE_BIN" "$CODEX_INSTALL_BIN"; do
-  [ -d "$_d" ] || continue
-  case ":$PATH:" in
-    *":$_d:"*) ;;
-    *) PATH="$PATH:$_d" ;;
-  esac
-done
-export PATH
+# launch-path.sh owns where the bundled runtime lives; it only appends, so an
+# operator's (or a test harness's) codex or node earlier on PATH keeps winning.
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting
@@ -214,7 +205,7 @@ if [ "$_codex_auth_rc" -eq 127 ]; then
   # 127 is "could not execute", not "not logged in" — almost always a missing
   # node on PATH. Saying "run codex login" here sends people the wrong way.
   echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
-  echo "  PATH lacked a usable node; looked in $CODEX_NODE_BIN" >&2
+  echo "  PATH lacked a usable node: PATH=$PATH" >&2
   exit 127
 fi
 if [ "$_codex_auth_rc" -ne 0 ]; then
@@ -316,7 +307,7 @@ ensure_task_notifier() {
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -331,6 +322,9 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
+  # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")

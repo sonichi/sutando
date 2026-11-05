@@ -5,10 +5,11 @@
       -> the page's HTML
   getting_started.py plan --room ROOM                   -> {"action": "create"|"update", "kind": ...}
   getting_started.py publish [--room ROOM] [--name NAME|auto] [--owner MXID] [--core ...] [--summon]
-      [--room-commons PATH] [--list PATH|URL] [--media PATH] [--if-newer]
+      [--room-commons PATH] [--list PATH|URL] [--media PATH] [--no-upload] [--if-newer]
       -> {"ok": true, "action": "created"|"updated"|"unchanged", "kind": "html-<id>", "summoned": bool,
           "name": the name used, "revision": the feature list's, "list": "file" or the --list source,
-          "media": the asset names the page points at room media for}
+          "media": the asset names the page points at room media for,
+          "upload": {"uploaded": [...], "skipped": [...], "fallback": [...], "reason": str|null}}
   getting_started.py publish --all-rooms --if-newer [options as above, but no --room or --audience]
       -> {"ok": every room's run succeeded, "action": "refreshed", "rooms": {room: {"code": exit code,
           ...that room's result}}}: one --if-newer run per room the marker has an entry for, in the
@@ -19,18 +20,23 @@
           an unexpected error included, leaves the others refreshed.
 
 The page (tour_page.py) is a short interactive AG2 Space tour rendered from the skill's feature
-list (feature-list.json: nine steps for every core, plus the Claude Code history import step when
-the core is Claude Code; `--core auto` asks the engine's config resolver, unknown omits it).
+list (feature-list.json: ten steps for every core; a step naming a `runtime` shows only on that
+core, `--core auto` asks the engine's config resolver, unknown omits such steps).
 `--list` renders from another list instead, a file or an https URL (the backend's served list,
 once it exists); a list that cannot be read or does not validate is reported on stderr and the
 skill's own file is used. Nothing is fetched unless --list names a URL. `--name auto` uses this
 agent's Matrix profile displayname, else a name made from its mxid's localpart, else "Sutando";
 it never fails.
 
-Each screenshot in the list is an asset reference. `--media PATH` (a JSON object {asset name:
-"mxc://..."}, the room media an upload of that capture returned) makes the page point at the
-room's media for those assets; the map is recorded in the room's entry and reused on later runs
-there, and an asset with no mapping is inlined from its fallback file, as every one is today.
+Each screenshot in the list is an asset reference. Before writing the page, `publish` uploads each
+screenshot's full-resolution `hd_file` to the room's media (room.media.upload, unposted, with an
+operation id derived from the room and the file's sha256, so a retry replays rather than re-adds)
+and points the page at the returned mxc; the room's entry records {asset: {mxc, sha256}} and a
+later run uploads again only a file whose hash changed. An encrypted room (its media would sit in
+plaintext), a room whose encryption cannot be read, a deployment without room media, or a failed
+upload leaves that asset inlined from its small fallback file; `--no-upload` uploads nothing.
+`--media PATH` (a JSON object {asset name: "mxc://..."}) maps assets to media explicitly and wins
+over an upload; it too is recorded and reused there.
 
 The page records the list's revision in its ownership tag. `publish` rewrites a page whose text
 differs from what it would write (a new name, core, list or prompts), unless someone edited the page
@@ -99,7 +105,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
-    AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
+    AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for, FeatureList, LIST_PATH, clean_media, load_list, newer, parse_list, read_marker,
     role_labels, LIST_MAX_BYTES, read_regular, page_digest_ok, page_shape_ok, strip_digest,
 )
@@ -496,12 +502,44 @@ def _locked(path: Path):
         yield
 
 
+@contextlib.contextmanager
+def _on_path(directory: Path):
+    sys.path.insert(0, str(directory))
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(str(directory))
+
+
 class Commons:
     """The room-commons CLI, one call per subprocess."""
 
     def __init__(self, script: Path, room: str, env: Optional[Dict[str, str]] = None, actions=None):
         self.script, self.room, self.env = script, room, env
-        self._actions, self._door = actions, None
+        self._actions, self._door, self._media = actions, None, None
+
+    def media(self):
+        """room-commons' own room_media.Media on this room's Actions client; PublishError when the
+        installed room-commons has no room_media.py."""
+        if self._media is None:
+            path = self.script.parent / "room_media.py"
+            if not path.is_file():
+                raise PublishError("this room-commons has no room media support (room_media.py)")
+            with _on_path(self.script.parent):
+                spec = importlib.util.spec_from_file_location("_tutorial_room_media", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            if self._door is None:
+                self._door = (self._actions or (lambda: connect_actions(self.script, self.env)))()
+            self._media = mod.Media(actions=self._door)
+        return self._media
+
+    def media_call(self, how: str, *args):
+        """One room_media call with room-commons' scripts importable (it imports lazily)."""
+        client = self.media()
+        with _on_path(self.script.parent):
+            return getattr(client, how)(*args)
 
     def create_page(self, title: str, body: str, operation_id: str) -> str:
         """`room.commons.pages.create` with a first body. The same operation_id again returns the
@@ -717,7 +755,7 @@ def _stand_aside(marker: Path, rooms: Dict[str, dict], room: str, journal: dict,
     else:
         _record(marker, rooms, room, {"kind": journal["kind"], "state": "complete", "hash": now, "foreign": True,
                                       "revision": (read_marker(journal.get("target", "")) or (None, None))[1],
-                                      **note})
+                                      **({"media": journal["media"]} if journal.get("media") else {}), **note})
 
 
 def _undo(commons: Commons, kind: str, step: tuple) -> str:
@@ -862,7 +900,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             agent: Optional[str] = None, prompts: object = None, roles: object = None,
             features: Optional[FeatureList] = None, if_newer: bool = False,
             media: object = None, dm_room: Optional[str] = None, had_entry: bool = False,
-            aliases: Iterable[str] = ()) -> dict:
+            aliases: Iterable[str] = (), upload: bool = True) -> dict:
     """`audience` None means the room's recorded one; a refresh skips a page it can't place, and
     never creates one: only an explicit publish does. `had_entry`: the room had one before recovery."""
     features = features or tour_page.FEATURES
@@ -889,11 +927,21 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         if if_newer and not role_labels(roles):
             roles = rooms.get(commons.room, {}).get("roles")
         prompts = clean_prompts(prompts, slots)
-        recorded = rooms.get(commons.room, {}).get("media")
-        media = clean_media({**(recorded if isinstance(recorded, dict) else {}),
-                             **(media if isinstance(media, dict) else {})}, features)
-        page = render_page(name, core, audience, agent, prompts, roles, features, media)
-        entry = _entry(None, page, features, prompts, roles, media, audience)
+        # A refresh of a room whose record is current writes nothing, so it uploads nothing either.
+        current = (if_newer and known.get("state") == "complete" and bool(known.get("revision"))
+                   and not newer(features.revision, known["revision"]))
+        no_upload = "--no-upload" if not upload else "record current" if current else None
+        recorded, explicit = known.get("media"), media
+
+        def render(skip: Optional[str]) -> tuple:
+            """(record, upload report, media shown, page); uploads only when `skip` is None."""
+            record, report = upload_media(commons, features, recorded, explicit, skip)
+            shown = clean_media(record, features)
+            return record, report, shown, render_page(name, core, audience, agent, prompts, roles, features, shown)
+
+        # Until a page is about to be written it is rendered from the media already recorded or
+        # given: a run that skips, keeps the page or stops on its size uploads nothing.
+        record, uploads, media, page = render(no_upload or "no page write")
         pages = commons.listed_pages()
         step = plan(rooms, commons.room, pages)
         if if_newer and step["action"] == "resume":
@@ -913,7 +961,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                     ours = upgrade = live == strip_digest(page) or (page_shape_ok(live) and len(candidates(pages)) == 1)
                 _record(marker, rooms, commons.room,
                         {"kind": found, "state": "complete", "hash": content_hash(live), "revision": tag[1] if tag else None,
-                         **({} if ours else {"foreign": True})})
+                         **({} if ours else {"foreign": True}), **({"media": record} if record else {})})
                 step, adopted = {"action": "update", "kind": found, "pending": False}, True
             else:
                 step = {"action": "create", "kind": None, "pending": False}
@@ -921,6 +969,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             return skipped("page deleted" if known or had_entry else "no page")
         kind = step["kind"]
         if step["action"] in ("create", "resume"):
+            record, uploads, media, page = render(no_upload)
+            entry = _entry(None, page, features, prompts, roles, record, audience)
             op = step.get("operation_id") or f"tutorial-{uuid.uuid4().hex}"
             first, earlier = chunks(page, piece_limit(commons.env))[0], rooms.get(commons.room, {}).get("before")
             journal = _journal(entry, first, page, None, name, core, audience, agent, mode="fill")
@@ -936,9 +986,9 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                     journal = _journal(entry, live, page, None, name, core, audience, agent, env=commons.env)
                 else:
                     _record(marker, rooms, commons.room, {"kind": kind, "state": "complete", "hash": content_hash(live),
-                                                          "foreign": True})
+                                                          "foreign": True, **({"media": record} if record else {})})
                     return {"ok": True, "action": "kept", "edited": True, "kind": kind, "summoned": False,
-                            "revision": features.revision, "media": sorted(media)}
+                            "revision": features.revision, "media": sorted(media), "upload": uploads}
             _record(marker, rooms, commons.room, {**journal, "kind": kind, "state": "pending", "operation_id": op})
             try:
                 outcome = _advance(commons, marker, rooms, commons.room)
@@ -953,11 +1003,15 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             page_revision = was[1] if was else None
             known = rooms.get(commons.room, {})
             written = None if known.get("foreign") or step["pending"] else known.get("hash")
+            mine = bool(written) and content_hash(current) == written
+            gated = if_newer and not upgrade and not newer(features.revision, page_revision)
+            if mine and not gated and not unplaced and rewritable(current, "", commons.env):
+                record, uploads, media, page = render(no_upload)  # a rewrite may follow: upload now
             if current == page:
                 action = "unchanged"
-            elif not written or content_hash(current) != written:
+            elif not mine:
                 action = "kept"  # a page this script cannot vouch for, or edited since: theirs stays
-            elif if_newer and not upgrade and not newer(features.revision, page_revision):
+            elif gated:
                 action = "unchanged"
             elif unplaced:
                 return skipped("audience unknown")
@@ -966,16 +1020,16 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             else:
                 # Every call of the rewrite checks the page it expects and is read back; a run cut
                 # short finishes or stands aside from the call the journal recorded.
+                entry = _entry(kind, page, features, prompts, roles, record, audience)
                 _record(marker, rooms, commons.room,
-                        _journal({**entry, "kind": kind}, current, page, known, name, core, audience, agent,
-                                 env=commons.env))
+                        _journal(entry, current, page, known, name, core, audience, agent, env=commons.env))
                 action = "updated" if _advance(commons, marker, rooms, commons.room) == "finished" else "kept"
         # A page equal to this run's render records its inputs (a revision-only bump catches up);
         # a gated unchanged or kept run records nothing: inputs that were not applied stay out.
         if action in ("created", "updated") or action == "unchanged" and current == page:
-            _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, media, audience))
+            _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, record, audience))
     result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
-              "media": sorted(media)}
+              "media": sorted(media), "upload": uploads}
     if adopted:
         result["adopted"] = True
     if action == "kept":
@@ -992,6 +1046,71 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         except PublishError as exc:
             result["summon_error"] = str(exc)
     return result
+
+
+def media_op_id(room: str, asset: str, digest: str) -> str:
+    """The upload's operation id: the same room, asset and bytes always replay the first upload."""
+    return "tutorial-media-" + hashlib.sha256(f"{room}\n{asset}\n{digest}".encode("utf-8")).hexdigest()[:40]
+
+
+def upload_media(commons: Commons, features: FeatureList, recorded: object, explicit: object,
+                 skip: Optional[str] = None) -> tuple:
+    """(record, report): the room's media map to render and record, {asset: "mxc://..." from --media
+    | {"mxc", "sha256"} from an upload}, after uploading each hd_file the record does not already
+    hold at its current hash. An asset that cannot go up (encrypted room, no media support, a
+    failed call) is left out, so the page inlines its fallback; the report says which and why.
+    `skip` names why nothing is uploaded this run (--no-upload)."""
+    names = set(tour_page.asset_names(features))
+    explicit = {k: v for k, v in (explicit if isinstance(explicit, dict) else {}).items()
+                if k in names and tour_page.media_uri(v)}
+    recorded = recorded if isinstance(recorded, dict) else {}
+    record = {k: v for k, v in recorded.items() if k in names and isinstance(v, str) and tour_page.media_uri(v)}
+    report = {"uploaded": [], "skipped": [], "fallback": [], "reason": None}
+    pending = []
+    for asset, filename in tour_page.hd_files(features).items():
+        if asset in explicit or asset in record:
+            report["skipped"].append(asset)  # mapped by hand: never replaced by an upload
+            continue
+        try:
+            data = read_regular(tour_page.ASSETS / filename, tour_page.HD_MAX_BYTES, "screenshot")
+        except ValueError as exc:
+            report["fallback"].append(asset)
+            report["reason"] = str(exc)
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        held = recorded.get(asset)
+        if isinstance(held, dict) and held.get("sha256") == digest and tour_page.media_uri(held):
+            record[asset] = {"mxc": held["mxc"], "sha256": digest}
+            report["skipped"].append(asset)
+        else:
+            pending.append((asset, filename, data, digest))
+    if pending:
+        reason = skip
+        if reason is None:
+            try:
+                commons.media_call("require_plain_room", commons.room)
+            except Exception as exc:  # noqa: BLE001 - encrypted, unreadable, or no media: inline them all
+                reason = redact(str(exc), commons.env)
+        for asset, filename, data, digest in pending:
+            if reason is not None:
+                report["fallback"].append(asset)
+                continue
+            try:
+                mxc = commons.media_call("upload", commons.room, data, filename, "image/png",
+                                         media_op_id(commons.room, asset, digest))
+            except Exception as exc:  # noqa: BLE001 - this asset only: the others still go up
+                report["fallback"].append(asset)
+                report["reason"] = f"{asset}: {redact(str(exc), commons.env)}"[:400]
+                continue
+            if not tour_page.media_uri(mxc):
+                report["fallback"].append(asset)
+                report["reason"] = f"{asset}: room.media.upload returned no well-formed mxc"
+                continue
+            record[asset] = {"mxc": mxc, "sha256": digest}
+            report["uploaded"].append(asset)
+        report["reason"] = reason or report["reason"]
+    record.update(explicit)
+    return record, report
 
 
 def detect_core() -> str:
@@ -1016,7 +1135,8 @@ def _personal_args(parser: argparse.ArgumentParser) -> None:
                         "e.g. \"Founder, Product Manager.\" (labels, or slugs)")
     parser.add_argument("--media", type=Path, metavar="PATH",
                         help="JSON object {asset name: \"mxc://...\"}: the room media to point those "
-                             "screenshots at; an asset not mapped is inlined from its fallback file")
+                             "screenshots at, over any upload; an asset not mapped is inlined from its "
+                             "fallback file")
     parser.add_argument("--list", dest="feature_list", metavar="PATH|URL",
                         help=f"render from this feature list (a JSON file, or an https URL) instead of "
                              f"{LIST_PATH.name}; one that cannot be read or does not validate is reported "
@@ -1073,7 +1193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "\"your agent\"")
     _personal_args(r)
     r.add_argument("--core", choices=CORES + ("auto",), default="unknown",
-                   help="the Sutando core; claude adds the Claude Code import section")
+                   help="the Sutando core; a step naming a runtime shows only on that core")
     p = sub.add_parser("plan", help="what publish would do in this room, from the marker alone")
     p.add_argument("--room", required=True)
     u = sub.add_parser("publish", help="create the page in this room, or refresh the one already there")
@@ -1084,13 +1204,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     u.add_argument("--agent-mxid", help="with --name auto: this agent's mxid")
     u.add_argument("--owner", help="the owner's mxid; summoned to the page when it is created")
     u.add_argument("--core", choices=CORES + ("auto",), default="auto",
-                   help="the Sutando core (default auto: what the engine resolves); claude adds the "
-                        "Claude Code import section, unknown leaves it out")
+                   help="the Sutando core (default auto: what the engine resolves); a step naming a "
+                        "runtime shows only on that core, unknown leaves such steps out")
     u.add_argument("--audience", choices=AUDIENCES, default=None,
                    help="dm: the owner's DM; room: any other room, where the page says \"your agent\" "
                         "(default: the audience recorded for the room, else dm)")
     _personal_args(u)
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
+    u.add_argument("--no-upload", action="store_true",
+                   help="upload no screenshot to the room's media: an asset the room has no recorded "
+                        "media for is inlined from its fallback file")
     u.add_argument("--if-newer", action="store_true",
                    help="rewrite a complete page only when the feature list's revision is newer than the "
                         "page's (a pass after an engine update); the prompts it was built with are kept")
@@ -1175,7 +1298,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             result = publish(commons, marker, name, args.owner, args.summon,
                              detect_core() if args.core == "auto" else args.core, args.audience,
                              agent, prompts, args.roles, features, args.if_newer, media, inputs.get("room"),
-                             had_entry, aliases=aliases)
+                             had_entry, aliases=aliases, upload=not args.no_upload)
         except (PublishError, ValueError) as exc:
             print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
             return 4

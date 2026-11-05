@@ -84,6 +84,7 @@ import {
 	recordTerminalClassification,
 	lastTerminalClassification,
 	clearTerminalClassification,
+	clearRouteRefusalForAttempt,
 	formatVoiceOfflineNotification,
 	formatVoiceRecoveryNotification,
 	type ClassifiedClose,
@@ -1766,6 +1767,10 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
 			}
 			writeVoiceState(true);
+			// This attach's dial (or the one in flight) asks Google again; a stale region refusal must not answer first.
+			if (/^(UPSTREAM_LOST|CONNECTING|RECONNECTING)$/.test(String(session.sessionManager.state)) && clearRouteRefusalForAttempt()) {
+				console.log(`${ts()} [VoiceFailure] client attached: region refusal cleared, its dial asks again`);
+			}
 			origConnect();
 			// Step 12: immediate `agent.state` frame on every accepted real
 			// connection (after origConnect so `clientAttached` reads true),

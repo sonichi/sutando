@@ -317,6 +317,28 @@ class TestStampedAccountIsNeverSwapped(unittest.TestCase):
         self.assertEqual(self.me_calls, ["sutk_unknown"], "one token is checked once")
         self.assertEqual(cloud_auth.read_cloud_auth(self.ws, user_id=lambda b, t: None).refused, "account_unverified")
 
+    def test_an_unreachable_credential_beside_another_users_reads_as_unverified(self):
+        # The unchecked one may be the stamped user's, so "sign in again" would be the wrong remedy.
+        self.stamp("u-A")
+        self.file("sutk_B")
+        self.metering("sutk_unreachable")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused), ((None, None), "account_unverified"))
+        self.assertIn("try again", cloud_auth.refusal_message(auth))
+
+    def test_a_dead_credential_beside_another_users_still_reads_as_changed(self):
+        self.stamp("u-A")
+        self.file("sutk_B")
+        self.metering("sutk_dead")
+
+        def me(base, token):
+            if token == "sutk_dead":
+                raise cloud_auth.CloudError(401, "unauthenticated")
+            return "u-B"
+        auth = cloud_auth.read_cloud_auth(self.ws, user_id=me)
+        self.assertEqual((tuple(auth), auth.refused, auth.credential_user_ids),
+                         ((None, None), "account_changed", ("u-B",)))
+
     def test_a_stamp_with_no_credential_at_all_is_plain_signed_out(self):
         self.stamp("u-A")
         auth = cloud_auth.read_cloud_auth(self.ws)

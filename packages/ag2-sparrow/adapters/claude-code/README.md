@@ -193,7 +193,16 @@ as its result, which the bridge delivers to that room. A task file with no
 writes one on every task, in `remote_gateway_bridge._write_task`); the shared
 resolver's "no tier means owner" is not relied on here. `install
 --allow-non-owner` (persisted in the config, shown by `verify`, off by default)
-submits non-owner tasks as data, each carrying the shared
+submits team and guest tasks without collaborator access as data. `install
+--allow-collaborator` (the same: persisted, shown by `verify`, off by default)
+submits an attested collaborator's task (the team tier with the broker's
+`collaborator: true`), as the relay loop and the routine and cloud-session
+adapters gate it; `--allow-non-owner` does not imply it. Unlike those adapters,
+which answer a collaborator on an isolated read-only turn, this one submits it
+into the owner's session: the session holds the owner's history, tools and
+credentials with permission prompts off, and the note below is the only guard.
+An isolated collaborator turn here is follow-up work. Each submitted non-owner
+task carries the shared
 `ag2_sparrow.task_io.NON_OWNER_NOTE`, the one policy text every adapter renders
 (pinned in `register.ts`; a CI test holds it byte-identical to the shared owner):
 
@@ -344,7 +353,7 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url>   # asks for the code; or, by hand:
+ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks for the code; or, by hand:
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
@@ -362,7 +371,7 @@ working tree under edit, say).
 are the agent's whole setup:
 
 ```bash
-ag2-sparrow-claude-local connect --base <s.space backend URL>
+ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent's Matrix ID>
 # asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
 
@@ -374,7 +383,10 @@ tests), and a relay that is not on `--base`'s host or a host under it is
 refused unless you name its host with `--trust-relay-host`; a refused relay URL is never written.
 
 `connect` first checks the CLI version, tmux, the plugin and the Claude login,
-so a machine that cannot run the agent never spends the single-use code. It
+then what would refuse later: a config or unit it may not change, and for the
+root an earlier install recorded, a held root, a busy agent lock or a seat that
+cannot be written (with no recorded root, any agent operation in progress). A
+machine that cannot run the agent never reads or spends the single-use code. It
 then redeems the code (`POST <base>/connect/poll`; a 503, or a 202 "still
 redeeming" with its `retry_after`, retried with backoff; a used, expired or
 revoked code refused with one line) for the agent's id and relay
@@ -407,7 +419,7 @@ or the `ai.ag2.sparrow.claude-local-bridge` agent): `ag2-sparrow` with
 Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
-one bridge).
+one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the
@@ -477,7 +489,14 @@ launcher starts the session on the adapter's **own** tmux server and socket
 refuses a socket path over 100 bytes): `env -i` with `PATH`, `HOME`, `TERM`,
 `USER` and the allowlist, `-f /dev/null`, `update-environment` cleared, and
 the session's environment set in the one `new-session -e K=V …` step (tmux 3.2
-or newer; `install` and `verify` check `tmux -V`). The pane's command is
+or newer). `install` and `connect` resolve tmux once: `--tmux <path>`, else the
+one the config records, else `PATH`, the desktop app's
+`~/Library/Application Support/space.ag2.app/engine/bin`, `/opt/homebrew/bin`
+and `/usr/local/bin`, taking the first that answers `tmux -V` with 3.2 or newer;
+a missing, silent (timed out) or old tmux is its own error. The absolute path
+(a link kept as named) is recorded as `TMUX`, and the managed launch, the
+probes, `verify`, `attach`, the stop path and `uninstall` run exactly that file,
+never a `tmux` looked up on the manager's `PATH`. The pane's command is
 the console script's
 `hold --generation=<32 hex> --` and nothing else: the work root, config dir, session id and HITL store reach `hold`
 through that environment, and the launcher reads `#{pane_start_command}` back
@@ -707,8 +726,9 @@ mtime delta.
   machine is the owner's path meanwhile.
 - On macOS the launchd user agent stops at logout; on Linux `install` asks
   for linger.
-- `--allow-non-owner` hands team and guest text to a session running under
+- With `--allow-collaborator` an attested collaborator's text, and with
+  `--allow-non-owner` any other team or guest text, reaches a session running under
   `bypassPermissions` (the default mode): the only guard between that text and
   every tool, file and credential the session can reach is the
-  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn it on only for
-  rooms whose members you would let type into that session yourself.
+  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn either flag
+  on only for people and rooms you would let type into that session yourself.

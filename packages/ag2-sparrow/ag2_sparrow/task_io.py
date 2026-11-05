@@ -181,6 +181,7 @@ def install_id():
 
 # The one liveness policy, re-exported for the lifecycle's injection seam (it imports no holder_lock).
 verify_lineage = holder_lock.verify_lineage
+parent_pid = holder_lock.parent_pid
 
 
 def process_identity():

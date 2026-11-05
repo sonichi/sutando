@@ -34,7 +34,16 @@ def local_tid(broker_tid: str, instance: str) -> str:
     return f"task-{instance}~{broker_tid}" if instance else broker_tid
 
 
+def first_run(local_tid: str) -> str:
+    """The local id of the task's first run; a malformed run suffix is left as it is."""
+    try:
+        return local_task_protocol.split_run_id(local_tid)[0]
+    except ValueError:
+        return local_tid
+
+
 def broker_tid(local_tid: str, instance: str) -> str:
+    local_tid = first_run(local_tid)
     prefix = f"task-{instance}~"
     if instance and local_tid.startswith(prefix):
         return local_tid[len(prefix):]
@@ -43,6 +52,7 @@ def broker_tid(local_tid: str, instance: str) -> str:
 
 def owns(local_tid: str, instance: str) -> bool:
     """Whether `instance` wrote this local id: its own prefix, or no `~` for the primary."""
+    local_tid = first_run(local_tid)
     return local_tid.startswith(f"task-{instance}~") if instance else "~" not in local_tid
 
 

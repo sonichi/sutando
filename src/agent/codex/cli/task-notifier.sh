@@ -227,6 +227,20 @@ clear_automation_leftover() {
   log_notifier "cleared rejected automation input '$leftover' from the composer"
 }
 
+# A timed-out idle wait keeps the frame (the live area that blocked it is gone from
+# scrollback once it clears) and counts the round; the third surfaces once.
+note_idle_timeout() {
+  local seat="$1" pane target rounds
+  target="$(core_target)" \
+    && pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" \
+    && printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" save-frame \
+         --workspace "$WORKSPACE_DIR" --seat "$SESSION" --kind not-idle >/dev/null 2>&1
+  rounds="$("$NOTIFIER_PY" "$PANE_GATE_PY" idle-timeout --workspace "$WORKSPACE_DIR" --seat "$SESSION" 2>/dev/null)"
+  case "$rounds" in
+    surface*) log_notifier "$seat has not become idle for ${rounds#surface } rounds; tasks are waiting (frames in state/pane-frames/$SESSION/, record in state/notifier-stalls/)" ;;
+  esac
+}
+
 wait_for_core_idle() {
   local started cleared=0
   started="$(date +%s)"
@@ -240,11 +254,17 @@ wait_for_core_idle() {
       continue
     fi
     if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
-      echo "task-notifier: core did not become idle within ${CORE_READY_TIMEOUT}s; restarting notifier without submitting" >&2
+      local seat="core"
+      [ -n "${WORKER_INSTANCE:-}" ] && seat="worker seat $WORKER_INSTANCE"
+      echo "task-notifier: $seat did not become idle within ${CORE_READY_TIMEOUT}s; restarting notifier without submitting" >&2
+      note_idle_timeout "$seat"
       return 1
     fi
     sleep "$POLL_INTERVAL"
   done
+  [ -d "$WORKSPACE_DIR/state/notifier-stalls" ] \
+    && "$NOTIFIER_PY" "$PANE_GATE_PY" idle-ok --workspace "$WORKSPACE_DIR" --seat "$SESSION" >/dev/null 2>&1
+  return 0
 }
 
 # This script previously had no logging at all, which made a lost submit

@@ -11,7 +11,7 @@ make_fixture() {
   local fix="$1"
   mkdir -p "$fix/src/agent/claude/cli" "$fix/src/agent/codex/cli" "$fix/scripts" "$fix/bin"
   cp "$REPO/src/agent/start-cli.sh" "$REPO/src/agent/restart-guard.sh" \
-    "$REPO/src/agent/tmux-socket-guard.sh" "$REPO/src/agent/core-runtime-record.sh" "$fix/src/agent/"
+    "$REPO/src/agent/tmux-socket-guard.sh" "$REPO/src/agent/core-runtime-record.sh" "$REPO/src/agent/launch-path.sh" "$fix/src/agent/"
   for rt in claude codex; do  # each stub confirms its core at once
     printf '#!/bin/bash\necho "LAUNCHER %s $* tmux=$(command -v tmux) sock=${SUTANDO_TMUX_SOCKET:-unset}" >> "$TMUX_LOG"\nREPO=%q; . "$REPO/src/agent/core-runtime-record.sh"; persist_confirmed_desktop_selection %s\n' \
       "$rt" "$fix" "$rt" > "$fix/src/agent/$rt/cli/start-cli.sh"

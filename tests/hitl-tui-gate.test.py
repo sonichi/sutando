@@ -85,6 +85,23 @@ class TestRequirement(unittest.TestCase):
             self.assertEqual([a.kind for a in r.actions], ["authenticate", "open_terminal"])
             self.assertIsNone(G.keys_for(clicked(r, "authenticate"), LOGIN if gate else None, state))
 
+    def test_a_signed_out_codex_core_never_gets_a_claude_sign_in_card(self):
+        expired = "  ⎿  Login expired · Please run /login"
+        for gate, state, prompt in (("login", "blocked-human", LOGIN), (None, "logged-out", None),
+                                    ("login", "logged-out", expired)):
+            r = G.requirement_for(state, gate, prompt, "s", "d", FALLBACK, runtime="codex")
+            self.assertEqual(r.kind, "auth")
+            self.assertEqual(r.runtime, "codex")
+            text = " ".join([r.title or "", r.message] + [a.label for a in r.actions])
+            self.assertNotIn("Claude", text)
+            self.assertEqual(r.title, "Codex needs you to sign in again")
+            self.assertIn("codex login", r.message)
+
+    def test_an_unnamed_runtime_gets_a_generic_sign_in_card(self):
+        r = G.requirement_for("logged-out", None, None, "s", "d", FALLBACK, runtime="agy")
+        self.assertEqual(r.kind, "auth")
+        self.assertNotIn("Claude", " ".join([r.title or "", r.message] + [a.label for a in r.actions]))
+
     def test_press_enter_is_a_confirmation_that_continues(self):
         r = req("press-enter", PRESS)
         self.assertEqual(r.kind, "confirmation")
@@ -219,6 +236,21 @@ class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
 
     def test_the_allowlist_is_the_only_way_in(self):
         self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
+
+
+class TestNoCaretKeepsTheBlockedCard(unittest.TestCase):
+    """Without a caret keys_for can never answer, so the card must not offer a button."""
+
+    def test_options_without_a_caret_get_no_buttons(self):
+        flat = PERM.replace("  ❯ 1. Yes", "    1. Yes")
+        r = req("permission", flat)
+        self.assertEqual(r.kind, G.FALLBACK_KIND)
+        self.assertEqual([a.id for a in r.actions], ["open_terminal"])
+        self.assertEqual(r.message, FALLBACK)
+
+    def test_a_dashed_rule_is_frame_not_question(self):
+        dashed = "  " + "╌" * 40 + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No"
+        self.assertEqual(G.question(dashed, "d"), "Do you want to proceed?")
 
 
 if __name__ == "__main__":
