@@ -60,9 +60,10 @@ class Host:
     """One fake per job, each answering only the commands that name it exactly; the rest answer 0."""
 
     def __init__(self, runners):
-        self.launchers, self.bridges, self.runners = {}, {}, runners
+        self.launchers, self.bridges, self.runners, self.roots = {}, {}, runners, {}
 
     def add(self, shape: cm.Shape, root) -> None:
+        self.roots[shape.job] = str(root)
         self.launchers[shape.job] = bx.LauncherJob(shape, root)
         self.bridges[shape.job] = bx.BridgeJob(cb.bridge_shape(shape))
         self.runners.append(self.launchers[shape.job])
@@ -118,7 +119,8 @@ class MultiBase(fx.AgentRootBase):
             for n, b in self.host.bridges.items():
                 launcher = self.host.launchers[n]
                 moved = [c for c in b.calls[seen[n][0]:] + launcher.calls[seen[n][1]:] if bx.verb_of(c) in LIFECYCLE]
-                self.assertFalse(b.active and moved and not launcher.alive(),
+                served = launcher.alive() or cm.lock_held(self.host.roots[n]) == "held"     # a foreground session too
+                self.assertFalse(b.active and moved and not served,
                                  f"{n}'s bridge runs without its session after a failed install: {out.getvalue()}"
                                  f"{err.getvalue()}")
         return rc, out.getvalue(), err.getvalue()

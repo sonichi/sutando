@@ -987,6 +987,16 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
 
+    def test_a_connect_whose_session_start_is_refused_leaves_no_bridge_running_without_it(self):
+        """connect wrote the job and asked the manager to start it (its first change), the start was refused, and a
+        bridge from before still runs: no session serves it, so the failed connect stops it too."""
+        fake = self.bridged({("systemctl", "start"): 1})
+        fake.active = fake.registered = True
+        rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertFalse(fake.active, err)
+        self.assertIn("since its session is not running", err)
+
     def test_a_bridge_left_unregistered_by_a_refused_start_is_the_only_bridge_removed(self):
         fake = self.bridged()
         fake.table["bootstrap"] = 5

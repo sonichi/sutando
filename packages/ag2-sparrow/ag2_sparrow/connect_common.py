@@ -1668,14 +1668,15 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     if problem:
         return _refuse(f"{problem}; nothing was applied")
     before = lock_holder(root)
+    mark_mutated()
     if unit_text is not None or manager != "absent":
         problem = stop_supervisor(shape)
         if problem:
-            return _refuse(f"{problem}; nothing was applied")
+            return _refuse(f"{problem}; its stop was asked for and nothing else was applied")
         print(f"stopped: {job_name(shape)}")
     problem = _await_free(root)
     if problem:
-        return _refuse(f"{problem} after the stop; nothing was applied")
+        return _refuse(f"{problem} after the stop; {job_name(shape)} was stopped and nothing else was applied")
     if revise is not None:
         values = revise(old, values)
     for key in ("INBOX_DIR", "RESULTS_DIR"):
@@ -1772,6 +1773,7 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
                            f"definition: run {job_command(shape, 'install')} to change it; nothing was applied")
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         Path(values[key]).mkdir(parents=True, exist_ok=True)
+    mark_mutated()
     for path, text, mode in files:
         problem = _publish_noclobber(path, text, mode)
         if problem:
@@ -1784,6 +1786,22 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
 
 
 _PENDING: dict = {}
+_MUTATED: dict = {}
+
+
+def begin_operation() -> None:
+    """A new install invocation on this thread: no session or bridge of it has been touched yet."""
+    _MUTATED[threading.get_ident()] = False
+
+
+def mark_mutated() -> None:
+    """Called just before this invocation first stops, writes or starts a session or bridge: only from here does a
+    failure owe the bridge reconciliation (cb.orphan_bridge)."""
+    _MUTATED[threading.get_ident()] = True
+
+
+def mutated() -> bool:
+    return _MUTATED.get(threading.get_ident(), False)
 START_SEEN_S = 5.0      # a manager may report no main pid just after a start it accepted
 
 

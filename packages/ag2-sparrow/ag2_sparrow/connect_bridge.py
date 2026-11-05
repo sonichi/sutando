@@ -380,7 +380,8 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
     `local`, the install that wires the agent's bridge, refused first while another adapter's bridge serves
     the agent. The job it started is settled once the lock is released (cm.settle), all of it inside the
     agent's fence (`fence`, cm.fence_name), so no other operation on the agent runs before that settle ends.
-    A failed install then runs `orphan()`: no bridge of the agent is left running without its session."""
+    An install that failed after it first touched a session or bridge (cm.mark_mutated) then runs `orphan()`: no
+    bridge of the agent is left running without its session; a refusal before that point leaves everything as it was."""
     try:
         with cm.agent_fence(fence):
             try:
@@ -389,6 +390,7 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
                     if problem:
                         print(f"error: {problem}; nothing was changed", file=sys.stderr)
                         return cm.EXIT_UNUSABLE
+                    cm.begin_operation()
                     try:
                         rc = fn()
                     except BaseException:
@@ -398,7 +400,7 @@ def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fen
                 print(f"error: {e}", file=sys.stderr)
                 rc = 1
             rc = cm.settle(root, rc)
-            line = orphan() if rc != 0 and orphan is not None else ""
+            line = orphan() if rc != 0 and orphan is not None and cm.mutated() else ""
             if line:
                 print(line, file=sys.stderr)
             return rc

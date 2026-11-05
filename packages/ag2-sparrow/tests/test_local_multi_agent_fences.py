@@ -263,5 +263,61 @@ class Round8(MultiBase):
                 decl.write_text("not json")
 
 
+@expand
+class Round9(MultiBase):
+    def _foreground_kept(self, adapter):
+        """A refusal before install touches anything leaves everything as it was: with the managed job stopped and
+        a live foreground (debug) session holding the root, a reinstall is refused ("nothing was applied") and the
+        holder, the running bridge, the config and both units are byte-identical; under sparrowd, the declaration
+        too. Its controls, failures after the install itself stopped the session, still stop the bridge."""
+        a = job(adapter, ALPHA)
+        root, bridge = self.root_of(ALPHA), self.host.bridges[a.job]
+        decl = cb.bridge_home(root) / cb.DECLARATION
+        for sparrowd in (False, True):
+            with self.subTest(sparrowd=sparrowd):
+                if sparrowd:
+                    lm.Round5.sparrowd(self)
+                    self.assertEqual(cb._sources.write_seat_credentials(
+                        cb.bridge_home(root), agent_id=ALPHA, instance="c" * 32, tier="owner",
+                        relay_url="https://relay.backend.example/relay", bearer="bearer-SEAT0001"), "")
+
+                def full():
+                    if not sparrowd:
+                        return self.install(adapter, ALPHA)
+                    return self.run_cli(adapter, *self.install_argv(adapter), "--token-env-file", cb.seat_file(root))
+                rc, out, err = full()
+                self.assertEqual(rc, 0, out + err)
+                with mock.patch.object(sm, "_run", side_effect=self.host), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(cm.stop_supervisor(a), "")
+                holder = fx.hold(str(root), adapter)
+                self.addCleanup(lambda h=holder: h.poll() is None and fx.unhold(h))
+                self.assertTrue(bridge.active if not sparrowd else decl.exists(), "the bridge serves the foreground session")
+                before = (self.files(a), decl.read_bytes() if decl.exists() else None)
+                for again in (full, lambda: self.run_cli(adapter, "install", "--agent", ALPHA)):
+                    rc, out, err = again()
+                    self.assertEqual(rc, 1, out + err)
+                    self.assertIn("nothing was applied", err)
+                    self.assertNotIn("stopped:", out + err, "nothing was stopped")
+                    self.assertIsNone(holder.poll(), "the foreground session still holds the root")
+                    self.assertEqual((self.files(a), decl.read_bytes() if decl.exists() else None), before,
+                                     "the config, both units and the declaration are byte-identical")
+                    self.assertTrue(bridge.active if not sparrowd else decl.exists(), "the bridge still serves it")
+                fx.unhold(holder)
+                self.assertEqual(full()[0], 0)
+                with mock.patch.object(cm, "_await_free", return_value="still held (test)"):
+                    rc, out, err = full()
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertIn("was stopped and nothing else was applied", err)
+                self.assertIn("since its session is not running" if not sparrowd else "was withdrawn: its session", err)
+                self.assertFalse(bridge.active if not sparrowd else decl.exists())
+                self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", ALPHA)[0], 0)
+    test_a_refusal_before_any_change_keeps_a_foreground_session_and_its_bridge = per_manager(_foreground_kept)
+
+    def install_argv(self, adapter):
+        if adapter == CL.name:
+            return ["install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
+                    "--hmac-key-file", str(self.home / "task-hmac.key")]
+        return ["install", "--codex", str(self.codex), "--codex-home", str(self.codex_home)]
+
 if __name__ == "__main__":
     unittest.main()

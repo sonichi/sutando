@@ -254,7 +254,7 @@ class ConnectInstall(ConnectBase):
                       {("systemctl", "stop"): None}):
             rc, _, err = self.install_with(self.runner(table), False, "--permission-mode", "plan")
             self.assertEqual(rc, 1, table)
-            self.assertIn("nothing was applied", err)
+            self.assertRegex(err, r"(nothing|its stop was asked for and nothing else) was applied")
             self.assertEqual(cli.config_path().read_text(), before, "the old config stands")
         for table in ({("systemctl", "show"): (1, "", "Failed to connect to bus\n")}, {("systemctl", "show"): None}):
             rc, _, err = self.install_with(self.runner(table), False, "--permission-mode", "plan")
@@ -478,7 +478,8 @@ class ConnectOrphan(ConnectBase):
         early = Early(root=None)
         rc, out, err = self.install_with(early, True, "--permission-mode", "default")
         self.assertEqual(rc, 1)
-        self.assertIn(f"{self.work} is held by launcher pid {old} after the stop; nothing was applied", err)
+        self.assertIn(f"{self.work} is held by launcher pid {old} after the stop; ", err)
+        self.assertIn(" was stopped and nothing else was applied", err)
         self.assertNotIn(ConnectInstall.ACQUIRED, out)
         self.assertNotIn("bootstrap", early.verbs("launchctl"), "no start over a root that is not free")
         self.assertEqual(cli.config_path().read_text(), before, "nothing written")
