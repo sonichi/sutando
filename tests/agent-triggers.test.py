@@ -8,6 +8,9 @@ manifest sets `"playbook": true` may run; a playbook id never resolves outside s
 
 Run: python3 tests/agent-triggers.test.py
 """
+import contextlib
+import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -25,6 +28,21 @@ sys.path.insert(0, str(REPO / "src"))
 
 import agent_triggers as at  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
+
+SRC_COPY = at
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The ag2-sparrow copy is a verbatim vendor of src/; the same suite runs against both.
+VENDORED_COPY = _load("sparrow_agent_triggers",
+                      REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "agent_triggers.py")
+lint = _load("lint_skill_triggers", REPO / "scripts" / "lint-skill.py")
 
 
 class Registry(unittest.TestCase):
@@ -130,10 +148,34 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(Path(run("--playbook", "room-onboard")),
                          REPO / "skills" / "room-onboard" / "SKILL.md")
 
+    def test_cli_in_process(self):
+        def run(*args):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(at._main(["resolve", "--skills-root", str(self.skills), *args]), 0)
+            return out.getvalue().strip()
+        self.assertEqual(run("--event-type", "room.joined"), str(self.skills / "room-onboard" / "SKILL.md"))
+        self.assertEqual(run("--playbook", "plain-skill"), "none")
+
+    def test_lint_refuses_a_non_boolean_playbook_flag(self):
+        for value, ok in ((True, True), (False, True), ("yes", False), (1, False)):
+            d = self.skills / f"lint-{len(str(value))}-{ok}"
+            d.mkdir()
+            (d / "manifest.json").write_text(json.dumps(
+                {"name": d.name, "version": "0.1.0", "owner": "github:x/y", "stability": "experimental",
+                 "playbook": value}))
+            errors, _warnings = lint._lint_manifest(d)
+            self.assertEqual(not any("playbook must be a boolean" in e for e in errors), ok, (value, errors))
+
     def test_shipped_room_onboard_opts_in(self):
         manifest = json.loads((REPO / "skills" / "room-onboard" / "manifest.json").read_text())
         self.assertIs(manifest.get("playbook"), True)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=1)
+    ok = True
+    for copy in (SRC_COPY, VENDORED_COPY):
+        at = copy
+        print(f"== {copy.__file__}")
+        ok &= unittest.main(verbosity=1, exit=False).result.wasSuccessful()
+    sys.exit(0 if ok else 1)
