@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from hitl import manager as hm  # noqa: E402
+from hitl import manager as hm, readable  # noqa: E402
 from hitl.manager import HitlManager, HitlStore, archive_health  # noqa: E402
 from hitl.projector import (  # noqa: E402
     fallback_body,
@@ -77,7 +77,8 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(wire["status"], "pending")
         self.assertEqual(wire["revision"], 1)
         self.assertIn("Sutando needs your attention", first["body"])
-        self.assertIn("Qingyun's Air", first["body"])
+        self.assertNotIn("Qingyun's Air", first["body"], "the machine is not the owner's to read")
+        self.assertEqual(wire["device"]["name"], "Qingyun's Air", "it is still on the wire")
 
         self.mgr.resolve(req.id)
         project(self.mgr, self.send, ROOM)
@@ -202,14 +203,28 @@ class ProjectorTests(unittest.TestCase):
 
 
 class FallbackWhereTests(unittest.TestCase):
-    def test_the_plain_text_says_which_machine_when_the_host_is_known(self):
+    """The machine routes and secures the card; it is not what a person reads to decide.
+    Dropping it from the plain text drops nothing from the event: `device` is structured
+    on the wire either way, host label included."""
+
+    def test_the_plain_text_never_names_the_machine_however_the_host_reads(self):
         import hitl.schema as SCHEMA
         from hitl.projector import fallback_body
+        for host in ("Chis-MacBook-Pro", ""):
+            with mock.patch.object(SCHEMA, "device_host", return_value=host):
+                body = fallback_body(make_req())
+                for leak in ("(on ", "Chis-MacBook-Pro", "Qingyun's Air"):
+                    self.assertNotIn(leak, body, host)
+                self.assertEqual(body, "⚠ Sutando needs your attention — "
+                                       "Claude Code needs to sign in again")
+
+    def test_the_device_the_body_no_longer_names_is_still_wired_whole(self):
+        import hitl.schema as SCHEMA
         with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
-            self.assertIn("(on Chis-MacBook-Pro · Qingyun's Air)", fallback_body(make_req()))
-        with mock.patch.object(SCHEMA, "device_host", return_value=""):
-            self.assertIn("(on Qingyun's Air)", fallback_body(make_req()))
-            self.assertNotIn("(on ", fallback_body(make_req(device=None)))
+            req = make_req()
+            self.assertEqual(readable.card(req)["device"], req.to_wire()["device"])
+            self.assertEqual(readable.card(req)["device"],
+                             {"id": "d1", "name": "Qingyun's Air", "host": "Chis-MacBook-Pro"})
 
 
 class ArchiveTests(unittest.TestCase):

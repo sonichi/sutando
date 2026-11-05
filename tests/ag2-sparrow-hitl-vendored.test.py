@@ -11,7 +11,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / "packages" / "ag2-sparrow"
-HITL = ("__init__.py", "schema.py", "host.py", "manager.py", "projector.py", "renotify.py", "replies.py")
+HITL = ("__init__.py", "schema.py", "host.py", "manager.py", "projector.py", "readable.py", "renotify.py",
+        "replies.py")
 
 
 class VendoredHitl(unittest.TestCase):
