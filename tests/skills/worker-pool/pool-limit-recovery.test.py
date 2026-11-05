@@ -38,6 +38,12 @@ class LimitRecovery(unittest.TestCase):
         state, decisions = ps.evaluate(state, {"worker": obs}, now, expected_period_s=100000)
         return state, decisions["worker"]
 
+    def test_reset_parser_fallbacks_and_calendar_dates(self):
+        self.assertIsNone(sup.pl.reset_at("resets 2pm (Invalid/Timezone)", NOW))
+        self.assertIsNone(sup.pl.reset_at("resets someday", NOW))
+        self.assertEqual(sup.pl.reset_at("resets tomorrow 2pm (UTC)", NOW), NOW + 26 * 3600)
+        self.assertEqual(sup.pl.reset_at("resets 2026-11-05 14:00 (UTC)", NOW), NOW + 7200)
+
     def test_future_reset_waits_even_without_a_watcher(self):
         obs = self.observation(" · resets Nov 5 at 2pm (UTC)")
         state, action = self.tick(ps.SupervisionState(), obs, NOW)
@@ -118,6 +124,21 @@ class LimitRecovery(unittest.TestCase):
                 with patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
                     refused = remedy.retry_limit(ws, REPO, wid, runner=changed)
                 self.assertEqual(refused["outcome"], "pane-changed-or-pending")
+            with patch.object(remedy.sup, "_open_tmux", return_value=(None, "fixture-worker")):
+                self.assertEqual(remedy.retry_limit(ws, REPO, wid)["outcome"], "unsupported-or-no-session")
+            with patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
+                with patch.object(remedy.subprocess, "run", side_effect=OSError("capture failed")):
+                    self.assertEqual(remedy.retry_limit(ws, REPO, wid)["outcome"], "capture-failed")
+                ask = remedy._sibling("pool_ask")
+                with patch.object(ask, "ask", side_effect=ValueError("routing failed")):
+                    self.assertEqual(remedy.retry_limit(ws, REPO, wid, runner=runner)["outcome"], "delivery-failed")
+                with patch.object(remedy.sup, "is_paused", side_effect=[False, True]):
+                    self.assertEqual(remedy.retry_limit(ws, REPO, wid, runner=runner)["outcome"], "rearm-queued")
+                def failed_sender(argv, **kwargs):
+                    if argv[0] == "tmux":
+                        return runner(argv, **kwargs)
+                    raise subprocess.TimeoutExpired(argv, 60)
+                self.assertEqual(remedy.retry_limit(ws, REPO, wid, runner=failed_sender)["outcome"], "wake-failed")
             sup.set_paused(ws, wid, True)
             self.assertEqual(remedy.retry_limit(ws, REPO, wid)["outcome"], "no-work-or-paused")
 
