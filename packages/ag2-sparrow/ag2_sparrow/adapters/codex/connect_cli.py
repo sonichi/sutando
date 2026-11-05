@@ -154,7 +154,10 @@ def install(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    local = cm.job_for(LOCAL, where["agent_id"]) if mode != EXTERNAL else LOCAL
+    local, problem = cm.agent_job(LOCAL, where["agent_id"]) if mode != EXTERNAL else (LOCAL, "")
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     bridge = cb.bridge_shape(local)
     values = {"CODEX": os.path.abspath(codex), "INBOX_DIR": str(Path(root) / "tasks"),
               "RESULTS_DIR": str(Path(root) / "results"),
@@ -223,7 +226,7 @@ def run(args, popen=subprocess.Popen) -> int:
     check-then-acquire runs under the shape's operation lock (install and uninstall take the same one)
     and its holder record carries the debug label, which install never accepts as its launcher."""
     problem = "" if args.debug else cm.managed_problem(LOCAL)
-    local, why = cm.select_job(LOCAL, getattr(args, "agent", None)) if args.debug else cm.job_from_env(LOCAL)
+    local, why = selected(args) if args.debug else cm.job_from_env(LOCAL)
     problem = problem or why
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -287,8 +290,13 @@ def _supervise(child, state: dict) -> int:
     return rc
 
 
+def selected(args) -> "tuple[Shape | None, str]":
+    """The job --agent, --work or --single names, else the only one installed."""
+    return cm.select_job(LOCAL, getattr(args, "agent", None), getattr(args, "work", None), getattr(args, "single", False))
+
+
 def verify(args) -> int:
-    local, problem = cm.select_job(LOCAL, getattr(args, "agent", None))
+    local, problem = selected(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -320,7 +328,7 @@ def verify(args) -> int:
 
 
 def uninstall(args) -> int:
-    local, problem = cm.select_job(LOCAL, getattr(args, "agent", None))
+    local, problem = selected(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -344,8 +352,7 @@ def session_options(p) -> None:
 
 
 def agent_option(p):
-    p.add_argument("--agent", help="the agent's Matrix ID (@name:server); needed only when several are installed")
-    return p
+    return cm.job_options(p)
 
 
 def main(argv=None) -> int:
@@ -386,8 +393,8 @@ def main(argv=None) -> int:
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
     agent_option(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
                  ).set_defaults(func=uninstall)
-    sub.add_parser("list", help="each agent installed here: its job, the manager's state and its work root"
-                   ).set_defaults(func=list_cmd)
+    sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
+                   "selector that names it").set_defaults(func=list_cmd)
     args = ap.parse_args(argv)
     return args.func(args)
 

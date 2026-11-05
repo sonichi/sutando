@@ -54,9 +54,11 @@ the bridge's connected status and its unit; `uninstall` stops and removes that u
 Several agents run side by side as claude-local's do: an agent installed with `--token-env-file` gets
 a job of its own, `ai.ag2.sparrow.codex-local.<agent key>` (systemd:
 `ag2-sparrow-codex-local.<agent key>.service`), with its bridge, config, operation lock and log under
-that key; `verify`, `uninstall` and `debug-run` take `--agent <Matrix ID>`, needed only when several are
-installed; `list` shows each one. A `--work` install, and a job an earlier release installed for one
-agent, keep the fixed `ai.ag2.sparrow.codex-local` and are verified, reinstalled and removed as they are.
+that key; `verify`, `uninstall` and `debug-run` take one selector, `--agent <Matrix ID>`, `--work <dir>`
+(an explicit-root job, by its recorded root) or `--single` (the fixed job), needed only when several are
+installed; `list` shows each one with its selector. A `--work` install, and a job an earlier release
+installed for one agent, keep the fixed `ai.ag2.sparrow.codex-local` and are verified, reinstalled and
+removed as they are; one whose config was removed is found again by its marked bridge unit.
 
 `install` checks `codex --version` against the pin (0.160.1, the version the stdio shape was measured
 on; parsed from the line starting with `codex`; older is one line and exit 2, nothing written), then

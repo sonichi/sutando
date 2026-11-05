@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import re
 import io
 import os
 import subprocess
@@ -113,6 +114,27 @@ class MultiBase(fx.AgentRootBase):
         else:
             argv = ["install", "--codex", str(self.codex), "--codex-home", str(self.codex_home)]
         return self.run_cli(adapter, *argv, "--token-env-file", str(self.tokens[agent]), *extra)
+
+    def install_work(self, adapter: str):
+        """An explicit-root install (`--work`): the adapter's single fixed job, recording no agent."""
+        self.relay.write_text(f"REMOTE_TASK_TOKEN={fx.TOKEN}\n")
+        if adapter == CL.name:
+            argv = ["install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
+                    "--hmac-key-file", str(self.home / "task-hmac.key")]
+        else:
+            argv = ["install", "--codex", str(self.codex), "--codex-home", str(self.codex_home)]
+        rc, out, err = self.run_cli(adapter, *argv, "--work", str(self.work))
+        self.assertEqual(rc, 0, out + err)
+
+    def token_for(self, agent: str) -> Path:
+        path = self.home / f"{cm.agent_identity.root_segment(agent)}.env"
+        path.write_text(f"REMOTE_TASK_TOKEN={fx.TOKEN}\nAGENT_MXID={agent}\n")
+        path.chmod(0o600)
+        self.tokens[agent] = path
+        return path
+
+    def calls(self) -> int:
+        return sum(len(j.calls) for j in [*self.host.launchers.values(), *self.host.bridges.values()])
 
     def installed(self, adapter: str, agent: str, *extra):
         rc, out, err = self.install(adapter, agent, *extra)
@@ -224,10 +246,10 @@ class SideBySide(MultiBase):
                 rc, out, err = self.run_cli(adapter, *argv)
                 self.assertFalse(execv.called, "attach opens no pane")
                 self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
-                self.assertIn("2 agents are installed", err)
+                self.assertIn("2 jobs are installed", err)
                 for agent in (ALPHA, BETA):
-                    self.assertIn(f"{agent} ({cm.job_name(job(adapter, agent))})", err)
-                self.assertIn("pass --agent <Matrix ID>", err)
+                    self.assertIn(f"{agent} ({cm.job_name(job(adapter, agent))}; --agent {agent})", err)
+                self.assertIn("pass the selector of the one you mean", err)
         self.assertEqual(sum(len(j.calls) for j in [*self.host.launchers.values(), *self.host.bridges.values()]), calls)
         self.assertEqual({**self.files(job(adapter, ALPHA)), **self.files(job(adapter, BETA))}, snapshot)
         rc, out, err = self.run_cli(adapter, "verify", "--agent", "not-a-matrix-id")
@@ -260,7 +282,7 @@ class SideBySide(MultiBase):
         self.assertEqual((self.files(single), self.launcher_pid(single)), (single_files, pid), "beta leaves it as it is")
         rc, out, err = self.run_cli(adapter, "verify")
         self.assertEqual(rc, cm.EXIT_UNUSABLE)
-        self.assertIn(f"{ALPHA} ({cm.job_name(single)})", err)
+        self.assertIn(f"{ALPHA} ({cm.job_name(single)}; --agent {ALPHA})", err)
         b_files = self.files(b)
         rc, out, err = self.run_cli(adapter, "uninstall", "--agent", ALPHA)
         self.assertEqual(rc, 0, out + err)
@@ -298,8 +320,8 @@ class SideBySide(MultiBase):
     test_one_agent_is_still_one_bridge_across_adapters = per_manager(_cross)
 
     def _unreadable(self, adapter):
-        """A single-agent job whose config cannot be read still holds its agent's bridge: the agent's own job is
-        refused while that bridge unit names it, on this adapter and the other."""
+        """A single-agent job whose config cannot be read is still its agent's (its bridge unit names it): this
+        adapter's install goes to that job and refuses on its config; the other adapter's is refused by its bridge."""
         with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
             self.installed(adapter, ALPHA)
         conf = cm.config_path(job(adapter, ""))
@@ -308,14 +330,230 @@ class SideBySide(MultiBase):
             with self.subTest(name=name):
                 rc, out, err = self.install(name, ALPHA)
                 self.assertNotEqual(rc, 0, out + err)
-                self.assertIn(f"already has a bridge, run by {adapter} ({cm.job_name(cb.bridge_shape(job(adapter, '')))})", err)
+                self.assertIn("fix or remove it by hand" if name == adapter else
+                              f"already has a bridge, run by {adapter} ({cm.job_name(cb.bridge_shape(job(adapter, '')))})",
+                              err)
                 self.assertFalse(cm.config_path(job(name, ALPHA)).exists())
                 self.assertFalse(self.host.launchers[job(name, ALPHA).job].calls, "its job is never asked to start")
 
     test_an_unreadable_single_agent_config_still_holds_its_bridge = per_manager(_unreadable)
 
+    def _explicit(self, adapter):
+        """An explicit-root job beside an agent's own: each is selected by its own flag (--work, --agent), the
+        refusal names --work for it, and verify and uninstall of either never touch the other."""
+        single, b = job(adapter, ""), job(adapter, BETA)
+        self.host.add(single, self.work)
+        self.install_work(adapter)
+        self.assertEqual(cm.recorded_agent(single), "")
+        self.installed(adapter, BETA)
+        rc, out, err = self.run_cli(adapter, "verify")
+        self.assertEqual(rc, cm.EXIT_UNUSABLE)
+        self.assertIn(f"no agent recorded ({cm.job_name(single)}; --work {self.work})", err)
+        for selector, mine, other in ((["--work", str(self.work)], single, b), (["--agent", BETA], b, single)):
+            with self.subTest(selector=selector):
+                files, pid, calls = self.files(other), self.launcher_pid(other), len(self.host.calls_naming(other))
+                self.assertIn(f"PASS config: {cm.config_path(mine)}", self.run_cli(adapter, "verify", *selector)[1])
+                rc, out, err = self.run_cli(adapter, "uninstall", *selector)
+                self.assertEqual(rc, 0, out + err)
+                self.assertFalse(cm.config_path(mine).exists())
+                self.assertEqual((self.files(other), self.launcher_pid(other)), (files, pid), "the other is untouched")
+                self.assertEqual(len(self.host.calls_naming(other)), calls, "and its job never named")
+                (self.install_work(adapter) if mine == single else self.installed(adapter, BETA))
+        self.assertEqual(self.run_cli(adapter, "verify", "--work", str(self.home / "elsewhere"))[0], cm.EXIT_UNUSABLE)
+        rc, out, err = self.run_cli(adapter, "uninstall", "--work", str(self.work), "--agent", BETA)
+        self.assertEqual(rc, cm.EXIT_UNUSABLE)
+        self.assertIn("each select a job: pass one", err)
+
+    test_an_explicit_root_job_beside_an_agents_own_is_selected_by_its_root = per_manager(_explicit)
+
+    def _leftover(self, adapter):
+        """A single unit left without its config counts as installed: the agent-less form refuses naming --single,
+        and uninstall --single removes it without naming the agent's own job."""
+        single, a = job(adapter, ""), job(adapter, ALPHA)
+        self.installed(adapter, ALPHA)
+        unit, problem = cm.render_supervisor(single)
+        self.assertEqual(problem, "")
+        cm._write(cm.supervisor_path(single), unit, 0o644)
+        files, pid, calls = self.files(a), self.launcher_pid(a), len(self.host.calls_naming(a))
+        rc, out, err = self.run_cli(adapter, "verify")
+        self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"no agent recorded ({cm.job_name(single)}; --single)", err)
+        rc, out, err = self.run_cli(adapter, "uninstall", "--single")
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(cm.supervisor_path(single).exists())
+        self.assertEqual((self.files(a), self.launcher_pid(a)), (files, pid))
+        self.assertEqual(len(self.host.calls_naming(a)), calls)
+        self.assertEqual(cm.installed_jobs(single), [a])
+
+    test_a_single_unit_left_without_its_config_is_selected_by_single = per_manager(_leftover)
+
+    def _recovered(self, adapter):
+        """A single-agent job whose config was removed (as an unreadable config's refusal says to) is found again by
+        its bridge unit: install keeps that job; uninstall --agent stops it and unwires its bridge; the next
+        install is the agent's own job."""
+        single, a = job(adapter, ""), job(adapter, ALPHA)
+        with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+            self.installed(adapter, ALPHA)
+        bridge = cb.bridge_shape(single)
+        cm.config_path(single).unlink()
+        self.assertEqual((cm.recorded_agent(single), cm.recorded_root(single)), (ALPHA, str(self.root_of(ALPHA))))
+        self.assertIn(f"{ALPHA}  {cm.job_name(single)}", self.run_cli(adapter, "list")[1])
+        self.installed(adapter, ALPHA)
+        self.assertTrue(cm.config_path(single).exists(), "install rewrote the single job's config")
+        self.assertFalse(cm.config_dir(a).exists(), "and made no job of the agent's own")
+        cm.config_path(single).unlink()
+        rc, out, err = self.run_cli(adapter, "uninstall", "--agent", ALPHA)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(set(self.files(single).values()), {None}, "its unit and its bridge unit are removed")
+        self.assertFalse(self.host.bridges[single.job].active, "its bridge is stopped")
+        self.assertIn(f"removed: {cm.supervisor_path(bridge)}", out)
+        self.installed(adapter, ALPHA)
+        self.assertTrue(cm.config_path(a).exists(), "the next install is the agent's own job")
+
+    test_a_single_job_whose_config_was_removed_is_recovered_by_its_bridge_unit = per_manager(_recovered)
+
+    def _unmarked(self, adapter):
+        """A single job's bridge unit that no longer carries install's marker names no job to recover, yet still
+        names its agent: that agent's own install on the same adapter is refused, one agent one bridge."""
+        single, a = job(adapter, ""), job(adapter, ALPHA)
+        with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+            self.installed(adapter, ALPHA)
+        cm.config_path(single).unlink()
+        unit = cm.supervisor_path(cb.bridge_shape(single))
+        unit.write_text(unit.read_text().replace("Written by", "Edited from"))
+        self.assertEqual(cm.recovered_config(single), {})
+        rc, out, err = self.install(adapter, ALPHA)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"already has a bridge, run by {adapter}", err)
+        self.assertFalse(cm.config_path(a).exists())
+        self.assertFalse(self.host.launchers[a.job].calls)
+
+    test_an_unmarked_single_bridge_unit_still_holds_its_agent = per_manager(_unmarked)
+
+    def test_the_printed_claude_commands_name_the_job(self):
+        """With several agents, every command verify prints, and the card's attach line, selects this job."""
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                self.mac = mac
+                for agent in (ALPHA, BETA):
+                    self.installed(CL.name, agent)
+                out = self.run_cli(CL.name, "verify", "--agent", BETA)[1]
+                line = f"INFO attach: {claude_cli.COMMAND} attach --agent {BETA}"
+                self.assertIn(line, out)
+                cfg = cm.read_config(cm.config_path(job(CL.name, BETA)))
+                self.assertEqual(claude_cli.launcher.Launcher(cfg, cm.config_dir(job(CL.name, BETA))).attach_command(),
+                                 f"{claude_cli.COMMAND} attach --agent {BETA}")
+                with mock.patch.object(os, "execv") as execv:
+                    rc, out, err = self.run_cli(CL.name, *line.split(claude_cli.COMMAND + " ")[1].split())
+                self.assertTrue(execv.called, err)
+                self.assertIn(str(cm.config_dir(job(CL.name, BETA))), " ".join(execv.call_args[0][1]))
+                self.assertEqual(cm.command_for(CL, {}, "stop --confirm"), f"{claude_cli.COMMAND} stop --confirm --single")
+                for agent in (ALPHA, BETA):
+                    self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", agent)[0], 0)
+
+
+# Pairs that shared one key before the digest form took its `__` separator: a long id and a plain one,
+# and an id whose case folds away and a plain one.
+PAIRS = (("@ab:cdefghijklmnopqrstuvwxyz.example", "@ab:cdefghijkl-99dc128207"),
+         ("@Mixed:Case.Server", "@mixed:case.se-9d2a90782e"))
+PAIR = PAIRS[0]
+
+
+def dash_key(agent_id: str) -> str:
+    """The digest form without its `__` separator: what let a plain id spell another agent's key."""
+    segment = cm.agent_identity.root_segment(agent_id)
+    if cm.AGENT_KEY_RE.fullmatch(segment):
+        return segment
+    return f"{segment[:13].rstrip('._-')}-{cm.hashlib.sha256(agent_id.encode()).hexdigest()[:10]}"
+
 
 class Selection(MultiBase):
+    def test_a_job_whose_config_records_an_agent_of_another_key_is_never_acted_on(self):
+        for adapter in CLIS:
+            with self.subTest(adapter=adapter):
+                a = job(adapter, ALPHA)
+                cm._write(cm.config_path(a), cm.render_config(a, {"AGENT_ID": BETA, "ROOT": str(self.root_of(BETA)),
+                                                                  "CODEX": str(self.codex), "CLAUDE": str(self.claude),
+                                                                  "SESSION_ID": fx.SESSION_ID}), 0o600)
+                before = cm.config_path(a).read_bytes()
+                for argv in (["verify"], ["uninstall"], ["verify", "--work", str(self.root_of(BETA))]):
+                    rc, out, err = self.run_cli(adapter, *argv)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn(f"records {BETA}, whose job is not {cm.job_name(a)}", err)
+                with mock.patch.dict(os.environ, {cm.AGENT_VAR: a.agent}):
+                    rc, out, err = self.run_cli(adapter, "run")
+                self.assertEqual(rc, cm.EXIT_UNUSABLE)
+                self.assertIn("whose job is not", err)
+                self.assertEqual(cm.config_path(a).read_bytes(), before)
+                self.assertEqual(self.host.calls_naming(a), [])
+                cm.config_path(a).unlink()
+
+    def test_another_job_of_this_adapter_whose_config_names_the_agent_refuses_its_install(self):
+        for adapter in CLIS:
+            with self.subTest(adapter=adapter):
+                other = job(adapter, BETA)     # a config moved by hand under another agent's key
+                cm._write(cm.config_path(other), cm.render_config(other, {
+                    "AGENT_ID": ALPHA, "BRIDGE": "sparrowd", "ROOT": str(self.root_of(ALPHA))}), 0o600)
+                rc, out, err = self.install(adapter, ALPHA)
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertIn(f"{ALPHA} already has a bridge, run by {adapter} (declared for sparrowd)", err)
+                self.assertFalse(cm.config_path(job(adapter, ALPHA)).exists())
+                cm.config_path(other).unlink()
+
+    def test_the_colliding_pairs_get_two_keys_and_a_digest_key_is_never_a_literal_one(self):
+        for first, second in PAIRS:
+            self.assertEqual(dash_key(first), dash_key(second), "the pair the dash form gave one key")
+            self.assertNotEqual(cm.agent_key(first), cm.agent_key(second))
+        self.assertEqual(cm.agent_key(PAIRS[0][0]), "ab_cdefghijk__99dc128207")
+        digest_form = re.compile(r"__[0-9a-f]{10}$")
+        ids = [f"@{loc}:{srv}" for loc in ("a", "ab", "x-y", "a.b", "q" * 20, "A", "Mixed", "a_b", "Q" * 20)
+               for srv in ("s", "ab.cd", "x-1.example", "y" * 20, "S.Y", "z" * 60)]
+        for agent in ids:
+            segment, key = cm.agent_identity.root_segment(agent), cm.agent_key(agent)
+            literal = key == segment
+            self.assertEqual(literal, not digest_form.search(key), f"{agent} -> {key}")
+            self.assertTrue("__" not in segment or re.search(r"__[0-9a-f]{12}$", segment),
+                            "only root_segment's own digest form holds the separator, followed by 12 hex")
+        self.assertEqual(len({cm.agent_key(a) for a in ids}), len(set(ids)), "distinct ids, distinct keys")
+
+    def test_each_colliding_pair_installs_verifies_and_uninstalls_side_by_side(self):
+        for (first, second), adapter in zip(PAIRS, CLIS):
+            with self.subTest(pair=first, adapter=adapter):
+                for agent in (first, second):
+                    self.token_for(agent)
+                    self.host.add(job(adapter, agent), self.agents / cm.agent_identity.root_segment(agent))
+                    self.installed(adapter, agent)
+                for agent in (first, second):
+                    self.assertIn(f"PASS config: {cm.config_path(job(adapter, agent))}",
+                                  self.run_cli(adapter, "verify", "--agent", agent)[1])
+                kept = (self.files(job(adapter, second)), self.launcher_pid(job(adapter, second)))
+                self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", first)[0], 0)
+                self.assertFalse(cm.config_path(job(adapter, first)).exists())
+                self.assertEqual((self.files(job(adapter, second)), self.launcher_pid(job(adapter, second))), kept)
+                self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", second)[0], 0)
+
+    def test_a_job_whose_config_records_another_agent_is_never_acted_on(self):
+        """Should two agents ever share a key, a verb for one refuses the job the other installed."""
+        with mock.patch.object(cm, "agent_key", dash_key):
+            for (first, second), adapter in [(p, a) for p in PAIRS for a in CLIS]:
+                for agent in (first, second):
+                    self.token_for(agent)
+                shared = job(adapter, first)
+                self.host.add(shared, self.agents / cm.agent_identity.root_segment(first))
+                with self.subTest(adapter=adapter):
+                    self.installed(adapter, first)
+                    files, pid, calls = self.files(shared), self.launcher_pid(shared), len(self.host.calls_naming(shared))
+                    for argv in (["verify", "--agent", second], ["uninstall", "--agent", second]):
+                        rc, out, err = self.run_cli(adapter, *argv)
+                        self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                        self.assertIn(f"records {first}, not {second}", err)
+                    rc, out, err = self.install(adapter, second)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn(f"records {first}, not {second}", err)
+                    self.assertEqual((self.files(shared), self.launcher_pid(shared)), (files, pid), "the first is untouched")
+                    self.assertEqual(len(self.host.calls_naming(shared)), calls)
+                    self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", first)[0], 0)
+
     def test_install_agent_must_be_the_token_files(self):
         for adapter in CLIS:
             with self.subTest(adapter=adapter):
@@ -380,7 +618,7 @@ class Selection(MultiBase):
                 if want:
                     self.assertEqual(key, want, "a short plain id keeps its root segment")
                 else:
-                    self.assertRegex(key, r"-[0-9a-f]{10}$", "anything else carries a digest of the id")
+                    self.assertRegex(key, r"__[0-9a-f]{10}$", "anything else carries a digest of the id")
                 shape = cm.for_key(CL, key)
                 self.assertTrue(sm.UNIT_RE.fullmatch(shape.service_name), shape.service_name)
                 self.assertTrue(sm.UNIT_RE.fullmatch(cb.bridge_shape(shape).service_name))

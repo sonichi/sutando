@@ -188,25 +188,64 @@ def job_name(shape: Shape) -> str:
 # ── one job per agent ────────────────────────────────────────────────────────
 
 def agent_key(agent_id: str) -> str:
-    """The agent's job key: its root segment when that is short enough, else a readable prefix and a digest
-    of the id. A valid launchd label part, systemd unit name part and path segment."""
+    """The agent's job key: its root segment when that is short enough, else a readable prefix, `__` and a
+    digest of the id. A valid launchd label part, systemd unit name part and path segment."""
     segment = agent_identity.root_segment(agent_id)
     if AGENT_KEY_RE.fullmatch(segment):
         return segment
+    # A plain segment has no `__`; root_segment's own digest form ends in 12 hex, never `__` and 10.
     digest = hashlib.sha256(agent_id.strip().encode("utf-8")).hexdigest()[:10]
-    return f"{segment[:AGENT_KEY_MAX - 11].rstrip('._-') or 'agent'}-{digest}"
+    return f"{segment[:AGENT_KEY_MAX - 12].rstrip('._-') or 'agent'}__{digest}"
 
 
 def for_key(shape: Shape, key: str) -> Shape:
     return dataclasses.replace(shape, agent=key)
 
 
-def recorded_agent(shape: Shape) -> str:
-    """The AGENT_ID the job's config records; '' for none, or for a config that cannot be read."""
+def bridge_shape(local: Shape) -> Shape:
+    """The agent's gateway bridge, when `local`'s install runs it: the console script with no arguments."""
+    return Shape(name=f"{local.name}-bridge", command="ag2-sparrow", writer=local.command,
+                 description=f"the gateway bridge of the {local.name} agent", cli="ag2-sparrow",
+                 min_version=(0, 0, 0), version_anchor="", version_note="", required_keys=(), config_keys=(),
+                 env_keep=(), kept="", run_args=(), service_args=(), agent=local.agent)
+
+
+def unit_environ(text: str) -> dict:
+    """The variables a unit or plist runs with, as render_supervisor wrote them."""
+    if text.startswith("<?xml"):
+        try:
+            env = plistlib.loads(text.encode("utf-8")).get("EnvironmentVariables")
+        except Exception:  # noqa: BLE001 - an unparsable plist names no agent
+            return {}
+        return env if isinstance(env, dict) else {}
+    return {m.group(1): re.sub(r"\\(.)", r"\1", m.group(2)).replace("%%", "%")
+            for m in re.finditer(r'^Environment="([A-Z_][A-Z0-9_]*)=(.*)"$', text, re.M)}
+
+
+def recovered_config(shape: Shape) -> dict:
+    """For a job whose config is gone or unreadable, what its own marked bridge unit records (its root, agent,
+    token file and state dir); {} when there is no such unit. Lets recovery find the job again."""
+    bridge = bridge_shape(shape)
+    text, problem = owned_text(supervisor_path(bridge), supervisor_marker(bridge), "supervisor file")
+    env = unit_environ(text) if text and not problem else {}
+    tasks = env.get("AGENT_CONNECT_TASK_DIR", "")
+    if not tasks or not os.path.isabs(tasks):
+        return {}
+    return {"ROOT": os.path.dirname(tasks), "AGENT_ID": env.get("AGENT_MXID", ""), "BRIDGE": "unit",
+            "TOKEN_ENV_FILE": env.get("AG2_DEVICE_ENV", ""), "TOKEN_VAULT_KEY": "",
+            "BRIDGE_STATE_DIR": env.get("AGENT_CONNECT_STATE_DIR", "")}
+
+
+def _recorded(shape: Shape, key: str) -> str:
+    """`key` as the job's config records it; for a config that is gone or unreadable, as its bridge unit does."""
     try:
-        return read_config(config_path(shape)).get("AGENT_ID", "")
+        return read_config(config_path(shape)).get(key, "")
     except (OSError, ValueError):
-        return ""
+        return recovered_config(shape).get(key, "")
+
+
+def recorded_agent(shape: Shape) -> str:
+    return _recorded(shape, "AGENT_ID")
 
 
 def job_for(shape: Shape, agent_id: str) -> Shape:
@@ -214,6 +253,25 @@ def job_for(shape: Shape, agent_id: str) -> Shape:
     (it keeps its job, and is verified and removed as it is), else the agent's own."""
     single = for_key(shape, "")
     return single if recorded_agent(single) == agent_id else for_key(shape, agent_key(agent_id))
+
+
+def agent_job(shape: Shape, agent_id: str) -> "tuple[Shape | None, str]":
+    """job_for, refused when that job's config records another agent: never act on a job that is not its own."""
+    job = job_for(shape, agent_id)
+    other = recorded_agent(job)
+    if other and other != agent_id:
+        return None, (f"{config_path(job)} records {other}, not {agent_id}: the job {job_name(job)} is not this "
+                      "agent's; nothing was done")
+    return job, ""
+
+
+def key_problem(job: Shape) -> str:
+    """'' unless a per-agent job's config records an agent whose key is not the job's own."""
+    agent = recorded_agent(job) if job.agent else ""
+    if agent and agent_key(agent) != job.agent:
+        return (f"{config_path(job)} records {agent}, whose job is not {job_name(job)}; nothing was done: fix or "
+                "remove that config by hand")
+    return ""
 
 
 def installed_jobs(shape: Shape) -> list:
@@ -230,23 +288,65 @@ def installed_jobs(shape: Shape) -> list:
     return jobs + [for_key(shape, k) for k in sorted(keys) if AGENT_KEY_RE.fullmatch(k)]
 
 
+def recorded_root(shape: Shape) -> str:
+    return _recorded(shape, "ROOT")
+
+
+def job_selector(shape: Shape) -> str:
+    """The flag that selects this job: its agent, else (the single job) its work root, else --single."""
+    agent, root = recorded_agent(shape), recorded_root(shape)
+    if agent:
+        return f"--agent {agent}"
+    if root:
+        return f"--work {shlex.quote(root)}"
+    return "--single" if not shape.agent else f"none: fix or remove {config_path(shape)} by hand"
+
+
+def command_for(shape: Shape, cfg: dict, verb: str) -> str:
+    """`<command> <verb>` naming this job, for a line shown outside this host: never a path, so --single
+    for a single job that records no agent."""
+    agent = cfg.get("AGENT_ID") or ""
+    return f"{shape.command} {verb} " + (f"--agent {agent}" if agent else "--single")
+
+
 def job_label(shape: Shape) -> str:
-    return f"{recorded_agent(shape) or 'no agent recorded'} ({job_name(shape)})"
+    return f"{recorded_agent(shape) or 'no agent recorded'} ({job_name(shape)}; {job_selector(shape)})"
 
 
-def select_job(shape: Shape, agent_id: str = "") -> "tuple[Shape | None, str]":
-    """(the job a command acts on, ''): --agent's, else the only one installed (with none, the single-agent
-    job, which says it is not installed); several and no --agent is (None, the refusal naming each)."""
+def select_job(shape: Shape, agent_id: str = "", work: str = "", single: bool = False) -> "tuple[Shape | None, str]":
+    """(the job a command acts on, ''): --agent's, the job whose work root is --work, the single job (--single),
+    else the only one installed (with none, the single job, which says it is not installed); several and no
+    selector is (None, the refusal naming each with its selector)."""
     agent_id = (agent_id or "").strip()
+    if sum(map(bool, (agent_id, work, single))) > 1:
+        return None, "--agent, --work and --single each select a job: pass one"
     if agent_id:
         if not AGENT_ID_RE.fullmatch(agent_id):
             return None, f"--agent {agent_id} is not a Matrix ID (@name:server)"
-        return job_for(shape, agent_id), ""
+        return agent_job(shape, agent_id)
+    if single:
+        return for_key(shape, ""), ""
     jobs = installed_jobs(shape)
+    if work:
+        root = str(Path(work).expanduser().resolve())
+        found = [j for j in jobs if recorded_root(j) == root]
+        if len(found) == 1:
+            return (None, key_problem(found[0])) if key_problem(found[0]) else (found[0], "")
+        return None, (f"no job installed with {shape.command} records the work root {root}" if not found else
+                      f"several jobs record the work root {root}: " + ", ".join(job_label(j) for j in found))
     if len(jobs) <= 1:
-        return (jobs or [for_key(shape, "")])[0], ""
-    return None, (f"{len(jobs)} agents are installed with {shape.command}: "
-                  + ", ".join(job_label(j) for j in jobs) + "; pass --agent <Matrix ID>")
+        job = (jobs or [for_key(shape, "")])[0]
+        return (None, key_problem(job)) if key_problem(job) else (job, "")
+    return None, (f"{len(jobs)} jobs are installed with {shape.command}: "
+                  + ", ".join(job_label(j) for j in jobs) + "; pass the selector of the one you mean")
+
+
+def job_options(p):
+    """--agent, --work and --single on a verb that acts on one installed job; needed only when several are."""
+    p.add_argument("--agent", help="the agent's Matrix ID (@name:server): that agent's job")
+    p.add_argument("--work", help="the job whose recorded work root is this directory (an explicit-root install)")
+    p.add_argument("--single", action="store_true", help="the adapter's single fixed job, even with no readable config")
+    return p
 
 
 def job_from_env(shape: Shape, environ=None) -> "tuple[Shape | None, str]":
@@ -254,7 +354,8 @@ def job_from_env(shape: Shape, environ=None) -> "tuple[Shape | None, str]":
     key = (os.environ if environ is None else environ).get(AGENT_VAR, "")
     if key and not AGENT_KEY_RE.fullmatch(key):
         return None, f"{AGENT_VAR}={key!r} is not an agent key; run {shape.command} install again"
-    return for_key(shape, key), ""
+    job = for_key(shape, key)
+    return (None, key_problem(job)) if key_problem(job) else (job, "")
 
 
 def list_jobs(shape: Shape) -> int:
@@ -265,7 +366,7 @@ def list_jobs(shape: Shape) -> int:
     for job in jobs:
         cfg, problem = owned_config(job)
         print(f"{recorded_agent(job) or '-'}  {job_name(job)}  {manager_detail(job)}  "
-              f"{(cfg or {}).get('ROOT') or problem or 'no config'}")
+              f"{(cfg or {}).get('ROOT') or problem or 'no config'}  ({job_selector(job)})")
     return 0
 
 
@@ -1248,7 +1349,7 @@ def _managed_here(shape: Shape, root: str) -> str:
     """'' only when the active job's recorded root is `root` and the lock's record is live and names
     this shape and install; an unreadable config, another root, a stale record or another holder refuse."""
     cfg, problem = owned_config(shape)
-    managed = (cfg or {}).get("ROOT", "")
+    managed = (cfg or ({} if problem else recovered_config(shape))).get("ROOT", "")
     rec = lock_holder(root)
     ours = rec.get("live") is True and rec.get("adapter") == shape.name and rec.get("install_id") == install_id()
     if problem or managed != root or not ours:
@@ -1866,10 +1967,10 @@ def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
     a shape whose session outlives its launcher stops it there. `token_file(config)` names the token
     file the install configured, for the kept line."""
     for _attempt in range(2):
-        root = (owned_config(shape)[0] or {}).get("ROOT", "")
+        root = (owned_config(shape)[0] or recovered_config(shape)).get("ROOT", "")
         try:
             with (agent_lock(root) if root else contextlib.nullcontext()), operation_lock(shape):
-                if (owned_config(shape)[0] or {}).get("ROOT", "") != root:
+                if (owned_config(shape)[0] or recovered_config(shape)).get("ROOT", "") != root:
                     continue
                 busy = "" if root else agent_operation_in_progress()
                 if busy:
@@ -1893,8 +1994,10 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
     cfg, problem = owned_config(shape)
     if problem:
         return _refuse(problem)
-    root = cfg["ROOT"] if cfg else ""
-    relay = token_file(cfg) if token_file is not None and cfg else None
+    # With the config gone, its bridge unit still names the root and the bridge to unwire.
+    known = cfg or recovered_config(shape) or None
+    root = known["ROOT"] if known else ""
+    relay = token_file(known) if token_file is not None and known else None
     manager = manager_state(shape)
     if manager == "unknown":
         return _refuse(f"{job_name(shape)}'s state is unknown; nothing was removed", recovery_lines(shape, root) if root else ())
@@ -1911,7 +2014,7 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
             return _refuse(f"{problem}; {kept}", recovery)
         print(f"stopped: {job_name(shape)}")
     if root and before_free is not None:
-        problem = before_free(cfg)
+        problem = before_free(known)
         if problem:
             return _refuse(f"{problem}; {kept}", recovery)
     if root:

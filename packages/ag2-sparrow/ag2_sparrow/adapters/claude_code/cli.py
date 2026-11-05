@@ -187,7 +187,10 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     root, mode, agent_id = where["root"], where["mode"], where["agent_id"]
-    local = cm.job_for(LOCAL, agent_id) if mode != EXTERNAL else LOCAL
+    local, problem = cm.agent_job(LOCAL, agent_id) if mode != EXTERNAL else (LOCAL, "")
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     bridge = cb.bridge_shape(local)
     tmux, problem = resolve_tmux(args, local)
     problem = problem or launcher.socket_problem(config_dir(local))
@@ -276,7 +279,7 @@ def connect_preflight(args) -> str:
         return f"{plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)"
     login = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser()
                                                                          .resolve()) if args.claude_config_dir else ""}
-    local = cm.job_for(LOCAL, args.agent)       # redeem_into_seat checked the id before this runs
+    local = cm.agent_job(LOCAL, args.agent)[0] or LOCAL     # redeem_into_seat checked the id and the job
     return (version_problem(claude) or resolve_tmux(args, local)[1] or launcher.socket_problem(config_dir(local))
             or auth_problem(login) or hmac_settings(args)[2])
 
@@ -390,13 +393,15 @@ def projection_lines(cfg: dict) -> list:
         if mgr.needs_projection(req.id):
             why = "no primary gateway" if not (store_root.parent.parent / "owner-routing.json").exists() \
                 else "gateway predates claude-local"
-            out.append(f"INFO pending projection: {req.id} ({why}); on this machine: {COMMAND} stop --confirm")
+            out.append(f"INFO pending projection: {req.id} ({why}); on this machine: "
+                       f"{cm.command_for(LOCAL, cfg, 'stop --confirm')}")
     return out
 
 
 def selected(args) -> "Shape | None":
     """The job --agent names, else the only one installed; None (said) when several are and none is named."""
-    local, problem = cm.select_job(LOCAL, getattr(args, "agent", None))
+    local, problem = cm.select_job(LOCAL, getattr(args, "agent", None), getattr(args, "work", None),
+                                   getattr(args, "single", False))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
     return local
@@ -480,7 +485,7 @@ def verify(args) -> int:
     waiting = pane_dialog(rec, local)
     if waiting:
         cm.check(results, False, "session", f"the pane waits at Claude Code's {waiting} dialog, so no task is "
-                 f"answered; run {COMMAND} attach and answer it")
+                 f"answered; run {cm.command_for(LOCAL, cfg, 'attach')} and answer it")
     if rec.get("stall"):
         print(f"INFO {'needs attention' if rec['stall'].get('reason', '').startswith('abnormal') else 'suspected hang'}: "
               f"{rec['stall'].get('reason')} (card {(rec.get('hitl') or {}).get('id') or 'not raised'})")
@@ -492,7 +497,7 @@ def verify(args) -> int:
         print(f"INFO the pane-key guard on {sock} is uncertain: creation is fenced until recovered")
     for line in projection_lines(cfg):
         print(line)
-    print(f"INFO attach: {COMMAND} attach")
+    print(f"INFO attach: {cm.command_for(LOCAL, cfg, 'attach')}")
     return 0 if all(results) else 1
 
 
@@ -601,8 +606,7 @@ def session_options(p) -> None:
 
 
 def agent_option(p):
-    p.add_argument("--agent", help="the agent's Matrix ID (@name:server); needed only when several are installed")
-    return p
+    return cm.job_options(p)
 
 
 def main(argv=None) -> int:
@@ -656,8 +660,8 @@ def main(argv=None) -> int:
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
-    sub.add_parser("list", help="each agent installed here: its job, the manager's state and its work root"
-                   ).set_defaults(func=list_cmd)
+    sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
+                   "selector that names it").set_defaults(func=list_cmd)
     inbox.add_parser(sub)
     args = ap.parse_args(argv)
     return args.func(args)

@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import plistlib
 import re
 import shlex
 import sys
@@ -32,12 +31,7 @@ BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 CONFIG_KEYS = ("AGENT_ID", "BRIDGE", "TOKEN_ENV_FILE", "TOKEN_VAULT_KEY", "BRIDGE_STATE_DIR")
 
 
-def bridge_shape(local: cm.Shape) -> cm.Shape:
-    """The agent's gateway bridge, when `local`'s install runs it: the console script with no arguments."""
-    return cm.Shape(name=f"{local.name}-bridge", command="ag2-sparrow", writer=local.command,
-                    description=f"the gateway bridge of the {local.name} agent", cli="ag2-sparrow",
-                    min_version=(0, 0, 0), version_anchor="", version_note="", required_keys=(), config_keys=(),
-                    env_keep=(), kept="", run_args=(), service_args=(), agent=local.agent)
+bridge_shape = cm.bridge_shape
 
 
 def bridge_mode(cfg: dict) -> str:
@@ -175,16 +169,7 @@ def _writer(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _unit_environ(text: str) -> dict:
-    """The variables a bridge unit or plist runs with, as cm.render_supervisor wrote them."""
-    if text.startswith("<?xml"):
-        try:
-            env = plistlib.loads(text.encode("utf-8")).get("EnvironmentVariables")
-        except Exception:  # noqa: BLE001 - an unparsable plist names no agent
-            return {}
-        return env if isinstance(env, dict) else {}
-    return {m.group(1): re.sub(r"\\(.)", r"\1", m.group(2)).replace("%%", "%")
-            for m in re.finditer(r'^Environment="([A-Z_][A-Z0-9_]*)=(.*)"$', text, re.M)}
+_unit_environ = cm.unit_environ
 
 
 def _named(name: str, command: str, key: str = "") -> cm.Shape:
@@ -573,7 +558,9 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     The bearer never leaves the seat's token file."""
     agent_id = (agent_id or "").strip()
     problem = connect_agent_problem(agent_id)
-    local = local if problem else cm.job_for(local, agent_id)     # the agent's own job, or its earlier one
+    if not problem:     # the agent's own job, or its earlier one
+        job, problem = cm.agent_job(local, agent_id)
+        local = job or local
     problem = problem or (preflight() or cm.active_job_problem(local) or agent_owner_problem(local, agent_id)
                           or known_root_problem(local))
     code, why = cm.read_code(code_arg) if not problem else ("", "")

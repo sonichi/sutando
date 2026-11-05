@@ -335,10 +335,9 @@ class Launcher:
     def record(self) -> dict:
         return self._with_record(lambda rec: None)
 
-    @staticmethod
-    def attach_command() -> str:
-        """What the card shows: the adapter's own command, never a host path."""
-        return "%s attach" % LOCAL.command
+    def attach_command(self) -> str:
+        """What the card shows: the adapter's own command naming this job, never a host path."""
+        return cm.command_for(LOCAL, self.cfg, "attach")
 
     # ── create / adopt ───────────────────────────────────────────────────────
 
