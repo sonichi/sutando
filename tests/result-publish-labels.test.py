@@ -6,6 +6,7 @@ Run: python3 tests/result-publish-labels.test.py
 from __future__ import annotations
 
 import contextlib
+import importlib
 import io
 import json
 import sys
@@ -20,9 +21,9 @@ _GW, _IMPORT_READS = isolate_then_import()
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src'))
 sys.path.insert(1, str(REPO / 'packages' / 'ag2-sparrow'))
-import result_labels as rl  # noqa: E402
-import result_publish as rp  # noqa: E402
-from ag2_sparrow import remote_gateway_bridge as gw  # noqa: E402
+rl = importlib.import_module('result_labels')
+rp = importlib.import_module('result_publish')
+gw = importlib.import_module('ag2_sparrow.remote_gateway_bridge')
 
 
 class Publish(unittest.TestCase):
