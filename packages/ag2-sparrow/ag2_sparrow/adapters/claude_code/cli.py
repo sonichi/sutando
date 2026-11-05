@@ -525,7 +525,8 @@ def uninstall(args) -> int:
     local = selected(args)
     if local is None:
         return EXIT_UNUSABLE
-    return cm.uninstall(local, before_free=lambda cfg: _stop_and_unregister(cfg, local), token_file=kept_token)
+    return cm.uninstall(local, before_free=lambda cfg: _stop_and_unregister(cfg, local), token_file=kept_token,
+                        cleanup=lambda: [launcher.remove_run_dir(config_dir(local))])
 
 
 def list_cmd(_args) -> int:

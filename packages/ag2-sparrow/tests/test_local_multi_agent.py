@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import re
+import shutil
 import io
 import os
 import subprocess
@@ -412,6 +413,53 @@ class SideBySide(MultiBase):
 
     test_a_single_job_whose_config_was_removed_is_recovered_by_its_bridge_unit = per_manager(_recovered)
 
+    def run_files(self, adapter: str, shape: cm.Shape) -> None:
+        """What a launcher leaves: claude-local's locks, alarm, socket and pane-keys guard; codex-local's none."""
+        if adapter != CL.name:
+            return
+        for name in shape.run_files:
+            (cm.config_dir(shape) / name).touch()
+        sock = claude_cli.launcher.socket_path(cm.config_dir(shape))
+        self.assertEqual(claude_cli.launcher.run_dir_problem(cm.config_dir(shape)), "")
+        sock.touch()
+        fx.tmux_pane_keys.prepare_guard(sock)
+
+    def _cleanup(self, adapter):
+        """uninstall removes the agent's config dir and run dir once they hold only this job's files; a file it
+        did not write, the other adapter's config, or an uncertain pane-keys fence keeps them, untouched."""
+        a, b = job(adapter, ALPHA), job(adapter, BETA)
+        other = CX.name if adapter == CL.name else CL.name
+        cases = [("clean", None), ("foreign file", "notes.txt"), ("the other adapter's config", f"{other}.conf")]
+        if adapter == CL.name:
+            cases.append(("an uncertain fence", "uncertain"))
+        for name, extra in cases:
+            with self.subTest(case=name):
+                self.installed(adapter, ALPHA)
+                self.run_files(adapter, a)
+                run = cm.run_dir(cm.config_dir(a))
+                planted = None
+                if extra == "uncertain":
+                    planted = fx.tmux_pane_keys.guard_path(claude_cli.launcher.socket_path(cm.config_dir(a))) / extra
+                elif extra:
+                    planted = cm.config_dir(a) / extra
+                if planted is not None:
+                    planted.write_text("not uninstall's")
+                rc, out, err = self.run_cli(adapter, "uninstall", "--agent", ALPHA)
+                self.assertEqual(rc, 0, out + err)
+                self.assertFalse(cm.config_path(a).exists())
+                if planted is None:
+                    self.assertFalse(cm.config_dir(a).exists(), out)
+                    self.assertFalse(run.exists() and run != cm.config_dir(a), out)
+                    self.assertIn(f"removed: {cm.config_dir(a)}", out)
+                else:
+                    self.assertEqual(planted.read_text(), "not uninstall's", "an entry it did not write is kept")
+                    self.assertIn(f"kept: {planted.parent if extra != 'uncertain' else run}", out)
+                    shutil.rmtree(cm.config_dir(a), ignore_errors=True)
+                    shutil.rmtree(run, ignore_errors=True)
+                self.assertFalse(cm.config_dir(b).exists(), "and nothing of another agent's was there to touch")
+
+    test_uninstall_removes_the_agents_config_and_run_dirs_once_only_its_files_are_left = per_manager(_cleanup)
+
     def _unmarked(self, adapter):
         """A single job's bridge unit that no longer carries install's marker names no job to recover, yet still
         names its agent: that agent's own install on the same adapter is refused, one agent one bridge."""
@@ -446,7 +494,8 @@ class SideBySide(MultiBase):
                 with mock.patch.object(os, "execv") as execv:
                     rc, out, err = self.run_cli(CL.name, *line.split(claude_cli.COMMAND + " ")[1].split())
                 self.assertTrue(execv.called, err)
-                self.assertIn(str(cm.config_dir(job(CL.name, BETA))), " ".join(execv.call_args[0][1]))
+                self.assertIn(str(claude_cli.launcher.socket_path(cm.config_dir(job(CL.name, BETA)))),
+                              execv.call_args[0][1])
                 self.assertEqual(cm.command_for(CL, {}, "stop --confirm"), f"{claude_cli.COMMAND} stop --confirm --single")
                 for agent in (ALPHA, BETA):
                     self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", agent)[0], 0)
@@ -462,7 +511,7 @@ PAIR = PAIRS[0]
 def dash_key(agent_id: str) -> str:
     """The digest form without its `__` separator: what let a plain id spell another agent's key."""
     segment = cm.agent_identity.root_segment(agent_id)
-    if cm.AGENT_KEY_RE.fullmatch(segment):
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,23}", segment):     # round 1's 24-character bound
         return segment
     return f"{segment[:13].rstrip('._-')}-{cm.hashlib.sha256(agent_id.encode()).hexdigest()[:10]}"
 
@@ -488,6 +537,22 @@ class Selection(MultiBase):
                 self.assertEqual(self.host.calls_naming(a), [])
                 cm.config_path(a).unlink()
 
+    def test_a_64_character_key_keeps_the_tmux_socket_short(self):
+        """The socket of an agent's own job sits in a short run dir named by its key's digest, so a key as long
+        as a root segment gets fits the platform's socket path limit; a single job keeps its socket in place."""
+        socks = []
+        for agent in ("@" + "a" * 30 + ":" + "b" * 33, "@" + "a" * 30 + ":" + "b" * 32 + "c"):
+            shape = job(CL.name, agent)
+            self.assertEqual(len(shape.agent), 64)
+            sock = claude_cli.launcher.socket_path(cm.config_dir(shape))
+            self.assertEqual(sock.parent.parent, cm.config_root() / cm.RUN_DIR)
+            self.assertLessEqual(len(str(sock)) - len(str(self.home)), 64, sock)
+            socks.append(sock)
+        self.assertNotEqual(*socks)
+        self.assertEqual(claude_cli.launcher.socket_path(cm.config_dir(CL)), cm.config_dir(CL) / "claude-local.sock")
+        self.assertEqual(claude_cli.launcher.run_dir_problem(cm.config_dir(job(CL.name, ALPHA))), "")
+        self.assertEqual(oct(os.stat(cm.run_dir(cm.config_dir(job(CL.name, ALPHA)))).st_mode & 0o777), "0o700")
+
     def test_another_job_of_this_adapter_whose_config_names_the_agent_refuses_its_install(self):
         for adapter in CLIS:
             with self.subTest(adapter=adapter):
@@ -504,7 +569,7 @@ class Selection(MultiBase):
         for first, second in PAIRS:
             self.assertEqual(dash_key(first), dash_key(second), "the pair the dash form gave one key")
             self.assertNotEqual(cm.agent_key(first), cm.agent_key(second))
-        self.assertEqual(cm.agent_key(PAIRS[0][0]), "ab_cdefghijk__99dc128207")
+        self.assertEqual(cm.agent_key(PAIRS[0][0]), "ab_cdefghijklmnopqrstuvwxyz.example")
         digest_form = re.compile(r"__[0-9a-f]{10}$")
         ids = [f"@{loc}:{srv}" for loc in ("a", "ab", "x-y", "a.b", "q" * 20, "A", "Mixed", "a_b", "Q" * 20)
                for srv in ("s", "ab.cd", "x-1.example", "y" * 20, "S.Y", "z" * 60)]
@@ -607,6 +672,8 @@ class Selection(MultiBase):
     def test_the_agent_key(self):
         long_id = "@" + "x" * 40 + ":" + "y" * 40 + ".example"
         cases = {ALPHA: "alpha.agent_ag2.space", "@support-cc.agent:s.space": "support-cc.agent_s.space",
+                 "@support-cc-2.agent:s.space": "support-cc-2.agent_s.space",
+                 "@" + "a" * 30 + ":" + "b" * 33: "a" * 30 + "_" + "b" * 33,
                  "@Mixed:Case.Server": None, long_id: None}
         keys = set()
         for agent, want in cases.items():
@@ -615,10 +682,9 @@ class Selection(MultiBase):
                 self.assertEqual(key, cm.agent_key(agent), "stable")
                 self.assertTrue(cm.AGENT_KEY_RE.fullmatch(key), key)
                 self.assertLessEqual(len(key), cm.AGENT_KEY_MAX)
+                self.assertEqual(key, cm.agent_identity.root_segment(agent), "the key is the agent's root segment")
                 if want:
-                    self.assertEqual(key, want, "a short plain id keeps its root segment")
-                else:
-                    self.assertRegex(key, r"__[0-9a-f]{10}$", "anything else carries a digest of the id")
+                    self.assertEqual(key, want)
                 shape = cm.for_key(CL, key)
                 self.assertTrue(sm.UNIT_RE.fullmatch(shape.service_name), shape.service_name)
                 self.assertTrue(sm.UNIT_RE.fullmatch(cb.bridge_shape(shape).service_name))

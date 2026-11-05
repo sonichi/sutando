@@ -11,7 +11,7 @@ import subprocess
 
 TIMEOUT_S = 30
 # A per-agent job adds `.<agent key>` (connect_common.AGENT_KEY_RE) before the suffix.
-UNIT_RE = re.compile(r"ag2-sparrow(-[a-z0-9-]+)?(\.[a-z0-9][a-z0-9._-]{0,23})?\.service")
+UNIT_RE = re.compile(r"ag2-sparrow(-[a-z0-9-]+)?(\.[a-z0-9][a-z0-9._-]{0,63})?\.service")
 
 
 def _run(cmd: list, timeout: float = TIMEOUT_S) -> "subprocess.CompletedProcess | None":

@@ -77,9 +77,11 @@ MANAGED_VAR = "AG2_SPARROW_MANAGED"
 # The agent key of the job whose unit sets it, so `run` reads that agent's config; unset: the single-agent job.
 AGENT_VAR = "AG2_SPARROW_AGENT"
 AGENTS_DIR = "agents"   # under the config dir: one dir per agent key, holding each adapter's config
-AGENT_KEY_MAX = 24      # keeps claude-local's tmux socket, under the agent's config dir, within the path limit
+AGENT_KEY_MAX = 64      # a root segment's own bound: every agent's key is its readable root segment
 AGENT_KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,%d}" % (AGENT_KEY_MAX - 1))
 AGENT_ID_RE = re.compile(r"@[^\s:]+:\S+")
+
+RUN_DIR = "run"         # short per-job dirs for files with a path limit (a tmux socket), by a key's digest
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,7 @@ class Shape:
     # (root, holder record) -> the launcher pid whose run spawned that holder outside its own process
     # tree (a tmux pane), proven from the shape's records; None when it cannot be proven.
     holder_launcher: object = None
+    run_files: tuple = ()   # the files a job leaves in its config dir besides its config and operation lock
     writer: str = ""        # the install that writes the unit, when it is not `command`'s own
     agent: str = ""         # the agent key of a per-agent job; '' is the single-agent job of earlier installs
 
@@ -146,6 +149,43 @@ def config_root() -> Path:
 def config_dir(shape: Shape) -> Path:
     """Where the job's config, operation lock and run files live: the agent's own dir for a per-agent job."""
     return config_root() / AGENTS_DIR / shape.agent if shape.agent else config_root()
+
+
+def run_dir(config_dir) -> Path:
+    """Where a job keeps a file whose path has a limit: its config dir, or for an agent's own job (whose key
+    may be 64 characters) a short dir named by the key's digest."""
+    d = Path(config_dir)
+    if d.parent.name != AGENTS_DIR:
+        return d
+    return d.parent.parent / RUN_DIR / hashlib.sha256(d.name.encode("utf-8")).hexdigest()[:16]
+
+
+def remove_if_only(path, accept, whose: str = "this job's") -> str:
+    """Remove the dir `path` only when `accept(entry)` holds for every entry in it: 'removed: …', '' when there
+    is none, else the line saying what kept it. Nothing is removed while one entry is not ours."""
+    path = Path(path)
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.name)
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        return f"kept: {path} ({e.strerror or e})"
+    foreign = [e.name for e in entries if not accept(e)]
+    if foreign:
+        return f"kept: {path}, which holds {', '.join(foreign[:5])}, not {whose}"
+    try:
+        for e in entries:
+            shutil.rmtree(e.path) if e.is_dir(follow_symlinks=False) else os.unlink(e.path)
+        os.rmdir(path)
+    except OSError as e:
+        return f"kept: {path} ({e.strerror or e})"
+    return f"removed: {path}"
+
+
+def remove_config_dir(shape: Shape) -> str:
+    """After an agent's own job is uninstalled: its config dir, once it holds only this job's run files."""
+    owned = {f"{shape.name}.oplock", *shape.run_files}
+    return remove_if_only(config_dir(shape), lambda e: e.name in owned and e.is_file(follow_symlinks=False))
 
 
 def config_path(shape: Shape) -> Path:
@@ -188,12 +228,12 @@ def job_name(shape: Shape) -> str:
 # ── one job per agent ────────────────────────────────────────────────────────
 
 def agent_key(agent_id: str) -> str:
-    """The agent's job key: its root segment when that is short enough, else a readable prefix, `__` and a
-    digest of the id. A valid launchd label part, systemd unit name part and path segment."""
+    """The agent's job key: its root segment, one per agent (as its root is), readable whenever the id is
+    plain. A valid launchd label part, systemd unit name part and path segment."""
     segment = agent_identity.root_segment(agent_id)
     if AGENT_KEY_RE.fullmatch(segment):
         return segment
-    # A plain segment has no `__`; root_segment's own digest form ends in 12 hex, never `__` and 10.
+    # Unreached while root_segment keeps its bound; its digest form ends in 12 hex, so this one never collides.
     digest = hashlib.sha256(agent_id.strip().encode("utf-8")).hexdigest()[:10]
     return f"{segment[:AGENT_KEY_MAX - 12].rstrip('._-') or 'agent'}__{digest}"
 
@@ -1962,7 +2002,7 @@ def kept_line(shape: Shape, relay=None) -> str:
     return f"kept: {relay} (Sparrow's token) and {shape.kept}" if relay and Path(relay).exists() else f"kept: {shape.kept}"
 
 
-def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
+def uninstall(shape: Shape, before_free=None, token_file=None, cleanup=None) -> int:
     """`before_free(config) -> problem` runs after the manager stop and before the root must read free:
     a shape whose session outlives its launcher stops it there. `token_file(config)` names the token
     file the install configured, for the kept line."""
@@ -1976,14 +2016,14 @@ def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
                 if busy:
                     return _refuse(f"no config names the root {job_name(shape)} serves, and an operation on an agent "
                                    f"holds {busy}; nothing was removed; run {shape.command} uninstall once it ends")
-                return _uninstall_locked(shape, before_free, token_file)
+                return _uninstall_locked(shape, before_free, token_file, cleanup)
         except Busy as e:
             return _refuse(str(e))
     return _refuse(f"{shape.job}'s configured root changed while uninstall waited for its lock; nothing was "
                    f"removed; run {shape.command} uninstall again")
 
 
-def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
+def _uninstall_locked(shape: Shape, before_free=None, token_file=None, cleanup=None) -> int:
     """any -> absent, config last: stop through the manager, its explicit absent (systemd: inactive and
     disabled), the lock free, the marked unit removed, systemd reloaded with LoadState=not-found, then the
     config. Any unknown or failure keeps the config, so a rerun still knows the root; every step re-runs."""
@@ -2034,6 +2074,9 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
     if cfg is not None:
         conf.unlink()
         print(f"removed: {conf}")
+    for line in ([remove_config_dir(shape)] if shape.agent else []) + list(cleanup() if cleanup is not None else []):
+        if line:
+            print(line)
     print(kept_line(shape, relay))
     return 0
 

@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -42,7 +43,44 @@ TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
 
 
 def socket_path(config_dir) -> Path:
-    return Path(config_dir) / SOCKET_NAME
+    """The job's tmux socket: in its config dir, or for an agent's own job in its short run dir."""
+    return cm.run_dir(config_dir) / SOCKET_NAME
+
+
+def run_dir_problem(config_dir) -> str:
+    """'' once an agent's own run dir exists as this user's own 0700 dir (a single job's socket stays in its
+    config dir, as before), else why not."""
+    path = cm.run_dir(config_dir)
+    if path == Path(config_dir):
+        return ""
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        st = os.lstat(path)
+    except OSError as e:
+        return "the socket dir %s cannot be made (%s)" % (path, e.strerror or e)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return "the socket dir %s is not this user's own 0700 dir; remove it by hand" % path
+    return ""
+
+
+def remove_run_dir(config_dir) -> str:
+    """After uninstall: an agent's own run dir, once it holds only its socket and that socket's pane-keys guard
+    with nothing but its mutex (a pending send or an uncertain fence keeps it)."""
+    path = cm.run_dir(config_dir)
+    if path == Path(config_dir):
+        return ""
+    guard = SOCKET_NAME + ".pane-keys-lock"
+
+    def ours(e) -> bool:
+        if e.name == SOCKET_NAME:
+            return not e.is_dir(follow_symlinks=False)
+        if e.name == guard:
+            return e.is_symlink() and os.path.realpath(os.path.dirname(os.readlink(e.path)) or path) == \
+                os.path.realpath(path)
+        if e.name.startswith(guard + ".") and e.is_dir(follow_symlinks=False):
+            return sorted(os.listdir(e.path)) in ([], ["mutex"])
+        return False
+    return cm.remove_if_only(path, ours)
 
 
 def socket_problem(config_dir) -> str:
@@ -612,7 +650,8 @@ class Launcher:
         return None, self.apply_effects(rec)
 
     def serve(self) -> int:
-        problem = socket_problem(self.config_dir) or self.tmux_missing or tmux_problem(self.tm.tmux, self.run)
+        problem = (socket_problem(self.config_dir) or run_dir_problem(self.config_dir) or self.tmux_missing
+                   or tmux_problem(self.tm.tmux, self.run))
         if problem:
             self.log("refusing to start: %s" % problem)
             return cm.EXIT_UNUSABLE

@@ -426,12 +426,17 @@ one bridge). One agent is one bridge whichever adapter runs it: install refuses,
 **Several agents on one host.** Each agent installed on its own root (no
 `--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`
 (systemd: `ag2-sparrow-claude-local.<agent key>.service`), its bridge
-`…claude-local-bridge.<agent key>`, and its config, operation lock, tmux socket
-and launcher log under `~/.config/ag2-sparrow/agents/<agent key>/`. The unit
-sets `AG2_SPARROW_AGENT=<agent key>`, so `run` reads that agent's config. The
-agent key is the root segment when it is at most 24 characters, else a readable
-prefix, `__` and 10 hex of the id's sha256 (a plain segment never holds `__`,
-so no agent's literal key can spell another's digest key). A job whose config
+`…claude-local-bridge.<agent key>`, and its config, operation lock and run
+files under `~/.config/ag2-sparrow/agents/<agent key>/`. The unit sets
+`AG2_SPARROW_AGENT=<agent key>`, so `run` reads that agent's config. The agent
+key is the agent's root segment (above), the same name as its root: readable for
+a plain id, up to 64 characters, and one per agent as the root is. The tmux
+socket has a path limit, so an agent's own job keeps it in a short dir,
+`~/.config/ag2-sparrow/run/<16 hex of the key's sha256>/`. `uninstall` removes
+the agent's config dir and run dir once they hold only this job's own files (its
+locks, alarm, socket and a pane-keys guard holding only its mutex); a file it
+did not write, another adapter's config or an uncertain fence keeps the dir, and
+says so. A job whose config
 records an agent that is not the one asked for, or whose key is not that
 agent's, is refused and never acted on. `verify`, `uninstall`, `attach` and
 `stop` take one selector: `--agent <Matrix ID>`, `--work <dir>` (the job whose
