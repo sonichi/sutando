@@ -42,7 +42,8 @@ a loopback host) and a relay on `--base`'s host or under it unless `--trust-rela
 retries a 202 or 503 on a 1, 2, 4, 8, 16 s backoff, and says why a 404'd code is gone. The credential
 owner writes the seat beside the agent's root (`<root>.bridge/channels/ag2space/{.env,token}`, 0600,
 `GATEWAY_INSTANCE` minted once and kept across reconnects), then `install --token-env-file <seat>/.env`
-runs. The bearer is only ever in the seat's `token`.
+runs. The bearer is only ever in the seat's `token`. A code is one-time and redeemed; the token is the
+credential it yields.
 
 **The agent's bridge.** `--work` is a root a bridge you run feeds, as before. `--token-env-file` alone
 makes the root the agent's own (`<agents dir>/<segment of its id>`) and has install wire that agent's

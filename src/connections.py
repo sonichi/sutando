@@ -7,7 +7,7 @@ the gateway URL exactly as the relay issued it, and the vault key the secret liv
 (`token_ref`). The secret itself never enters this file: `add_connection` stores it
 through the secret vault and fails closed when the vault cannot take it.
 
-Adding is two-step and source-agnostic (a pasted code, a browser flow, an env var all
+Adding is two-step and source-agnostic (a pasted token or connect string, a browser flow, an env var all
 arrive as a token): `preview_connection` asks the gateway embedded in the token who the
 token is, and `add_connection` saves only when the caller's `expected_server` matches
 what that preview says now. Adding is idempotent per server, never changes which row is
@@ -38,7 +38,7 @@ disabled row cannot become primary. `update_token` replaces the secret under a r
 `token_ref` with a new code for the same server and agent (anything else is refused by code),
 clears the flag and relaunches; it is refused while a higher-precedence source (the row's
 environment variable) would shadow the vault. The legacy unsuffixed row is the environment's:
-`disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`); a fresh code for its server goes
+`disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`); a fresh relay token for its server goes
 through `add_connection`, which adopts it into a named row and retires the legacy one (`legacy_readopt`
 in `CAPABILITIES`). Every such refusal is a
 `Refusal` whose `CODE` each surface returns unchanged.
@@ -3149,7 +3149,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                  environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
                  vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
                  resolver=None, getaddrinfo=None) -> dict:
-    """Replace the secret under `instance`'s token_ref with a new code for the same connection
+    """Replace the secret under `instance`'s token_ref with a new relay token for the same connection
     (the homeserver's Get new token or Revoke, an agent moved away and back), then relaunch the
     bridge the way `reconnect` does. The row keeps its instance, primary flag and added_at;
     `gateway_url` and the identity fields follow the preview (a row without an agent identity
@@ -3553,7 +3553,7 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
     refused. `resolver` (as `preview_connection`'s) also maps servers; None reads the registry offline.
     Returns {ok, instance, agent_mxid, mcp, rooms, dry_run}, or {ok: False, reason, detail} with a
     MOVE_REASONS reason (nothing written) or a Refusal code (`added` says whether the row exists),
-    and `server`, the successor a connect code should come from."""
+    and `server`, the successor a relay token should come from (the app's Add agent flow)."""
     environ = os.environ if environ is None else environ
     probe = dict(fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, resolver=resolver)
     ds = _dotspace()

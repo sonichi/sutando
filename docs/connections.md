@@ -6,6 +6,10 @@ remote-gateway bridge instance. The directory of connections lives at
 the CLI (`scripts/connections.py`), the runtime API (`connection.*` methods) and
 startup (`src/startup-runtime.sh`) all call that module and never touch the file.
 
+**Words used here.** A *connect code* is the one-time `acp.…` code the app's Add agent flow creates with a
+new agent; `connect --code -` redeems it once and yields the agent id and a long-lived *relay token*, kept in
+the seat's token file. `add` and `update_token` take that token, or a legacy `url|secret` connect string.
+
 ## The model
 
 | Field | Meaning |
@@ -143,7 +147,7 @@ key unchanged. A row keyed by identity is never demoted.
 ### Re-adopting the legacy row's server
 
 The legacy row (`instance: ""`) runs on `REMOTE_TASK_TOKEN` from the environment, and getting a
-new code from the portal rotates that credential. So a **verified** code that matches the legacy
+new token from the Add agent flow rotates that credential. So a **verified** token that matches the legacy
 row (by server, as above) and is not the secret that row already holds (its vault key, the
 environment or the channel env file) is not "already connected": `add` adopts it. Under one hold of
 the record lock it stores the secret under the new row's `token_ref`
@@ -321,8 +325,8 @@ since the copy), `agent_mismatch` (another agent or owner), `unverified` (a serv
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
 s.space). Then fall back to a code:
 
-1. Get a connect code for this agent at s.space's agent portal.
-2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
+1. Get this agent's relay token (the legacy `url|secret` connect string) from the app's Add agent flow.
+2. `python3 scripts/connections.py add '<connect string>'` — quote it (it holds a `|`); it previews the
    server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
 3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
    — starts the s.space bridge as primary, waits for it to connect, then stops and parks the
@@ -389,7 +393,7 @@ still without a lease after `LEASE_TIMEOUT_S` is killed and the launch fails (`l
 `reconnect(instance)` clears the flag, stops the bridge if one is
 running, learns the identity its token answers to now and launches it again; the other
 connections keep running. A plain `launch` of a disabled row is refused by name
-("disconnected; reconnect it"). `update_token(instance, token)` is for a code that was
+("disconnected; reconnect it"). `update_token(instance, token)` is for a relay token that was
 rotated or revoked on the homeserver (Get new token, Revoke) or an agent moved away and
 back. It is refused with the vault and the row untouched, in this order: on the legacy row
 (`legacy_row_unmanaged`); when the row's `token_ref` is **set in the environment**

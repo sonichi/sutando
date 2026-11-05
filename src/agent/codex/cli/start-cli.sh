@@ -507,7 +507,7 @@ fi
 
 check_external_helpers || exit 1
 
-# Clients hand connect codes to the local agent API, and startup.sh is not the only way a
+# Clients hand relay tokens to the local agent API, and startup.sh is not the only way a
 # core starts. An --external-helpers embedder owns its services; the API is not the core.
 ensure_local_agent_api() {
   [ -z "$EXTERNAL_HELPERS" ] || return 0
