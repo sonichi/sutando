@@ -92,6 +92,7 @@ check(("**" + TRIGGER_OWNER) not in re.sub(r"\s+", " ", without_section),
       "control: deleting the owning section fails the ownership requirement")
 
 route_section = text.split("### Provider-specific awareness delivery\n", 1)[-1].split("\n## ", 1)[0]
+route_section = re.sub(r"\s+", " ", route_section)
 check("For Matrix routes" in item9 and "#provider-specific-awareness-delivery" in item9,
       "item 9 branches away from the Matrix-only helper")
 check("**Matrix:**" in route_section and "scripts/notify_reviewers.py" in route_section,
@@ -100,7 +101,7 @@ check('**Discord, including `exclusive: true`:**' in route_section
       and '<@STAND_ID>' in route_section
       and 'python3 src/discord-bridge.py send CHANNEL_ID --body-file BODY_FILE' in route_section,
       "exclusive Discord uses the existing addressed provider sender")
-check("awareness is\n  still unsatisfied" in route_section
+check("awareness is still unsatisfied" in route_section
       and "Hand the exact artifact" in route_section,
       "unsupported/refused delivery requires immediate handoff, never satisfied awareness")
 

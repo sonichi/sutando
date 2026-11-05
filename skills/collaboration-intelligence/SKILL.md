@@ -212,23 +212,21 @@ excuses the other's absence. Step 3 escalates and is time-gated rather than gap-
    shared room contradicts that contract and produces the defect this section exists to remove:** a
    durable request created while a reachable person stays unaware, with no immediate-awareness action
    available until the horizon. If no addressed route is constructible at all, **the awareness
-   requirement is NOT satisfied** — hand the item to an owner or a reachable replacement and record
-   that handoff as the terminal outcome. This is deliberately **not** symmetric with the
-   durable-request branch: losing durable queue state can still leave the party aware, whereas
+   requirement is NOT satisfied** — hand the item to the owner via `scripts/ask-owner.py`
+   (include the artifact, blocked route and decision needed), or to a reachable replacement,
+   and record the delivered handoff as the terminal outcome. This is deliberately **not** symmetric
+   with the durable-request branch: losing durable queue state can still leave the party aware, whereas
    losing the awareness channel leaves nobody contacted. Re-evaluate host-local unreachability when
    a route becomes available, and keep this case pinned through the horizon rather than letting it
    lapse into satisfied. Step 3 remains the later escalation; it must never be used to delay
    first awareness.
-3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
-   **when the ask is first made**, derived from the item's urgency and the team's conventions, and
-   record it with the ask. Escalate only when the horizon has passed, **every constructible channel
-   is confirmed *delivered*** — a **durable** channel recorded unavailable counts as **satisfied, not
-   pending**, while an unavailable **awareness** channel does not and instead triggers the handoff
-   above, since escalating to a personal channel is itself an addressed route and cannot be the
-   terminal step when no addressed route exists —
-   and the state has still not changed. A fixed number of hours invented here would
-   impose a uniform SLA on teams that do not share one; no horizon at all is "wait forever" wearing
-   patience's clothes.
+3. **At the recorded horizon, follow [Ownership horizon](#ownership-horizon).** Set
+   `escalate_after` when the ask is first made, using the item's urgency and the team's
+   conventions. Once it is due and the state has not changed, use that section's owner-routed
+   reassignment question; this is not authorization to direct-message the human reviewer.
+   Every constructible channel must first be confirmed delivered. A durable channel recorded
+   unavailable is satisfied, not pending; an unavailable awareness channel requires the immediate
+   handoff in step 2 instead of waiting for the horizon.
 
 Include the artifact, what changed, and the exact action needed.
 
@@ -316,9 +314,10 @@ replace its Stand with a human, or send on a second surface to make that helper 
   a refusal. Record the delivered notification and timestamp alongside the platform request.
 - **Unsupported provider, unavailable Discord sender, or refused delivery:** awareness is
   still unsatisfied. Hand the exact artifact, intended party, route and refusal to the owner
-  or a reachable replacement now. Record the handoff and its recipient; if no handoff can be
-  delivered, report the blocker to the user. Do not record a successful notification or wait
-  for the escalation horizon. Retry only after the route or refusal changes.
+  via `scripts/ask-owner.py`, or to a reachable replacement now. Record the handoff and its
+  recipient; if a replacement cannot be reached, report the blocker through `scripts/ask-owner.py`.
+  Check its delivery report: a failed owner handoff remains unresolved. Do not record a successful
+  notification or wait for the escalation horizon. Retry only after the route or refusal changes.
 
 The platform review request remains a separate step. A successful request, a printed command,
 or a nonzero sender exit is never evidence that awareness was delivered.
@@ -606,6 +605,8 @@ you are handing the item to someone else.
 nudge.** "Any update?" with nothing new on your side is what gets a channel muted, and
 a muted channel costs you every future nudge that mattered.
 
+### Ownership horizon
+
 **But what elapsed time disqualifies is repeating yourself — not asking whether the
 item still has a live owner.** Those are different messages and only the first is
 noise. So there are two tests before sending, and they key on different variables:
@@ -618,7 +619,11 @@ noise. So there are two tests before sending, and they key on different variable
   your side by construction** — nothing of yours changes when it happens, so elapsed
   time is the *only* signal that can surface it. Pick that horizon deliberately and
   write it down with the ask — an unnamed "eventually" is how eleven days happen — and
-  when it arrives send a reassignment question, never an "any update?".
+  when it arrives send the owner a reassignment question with `scripts/ask-owner.py`, never an
+  "any update?" or an unsolicited direct message to the reviewer. For example:
+  `python3 scripts/ask-owner.py "Who should take over <artifact>?" --context "<blocker and attempted routes>" --unless-open`.
+  When serving a delivered task, include `--task-file <path-to-that-task>` to preserve its route.
+  Check the delivery report and retain an unresolved handoff if delivery failed.
 
 If neither test fires, the item is correctly in their queue — leave it.
 
