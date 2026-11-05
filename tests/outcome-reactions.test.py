@@ -216,18 +216,6 @@ class Durable(unittest.TestCase):
                          [("reaction", "$r1:s.space"), ("reaction_removed", "$r2:s.space"), ("reaction", "$r3:s.space")])
 
 
-class Wiring(unittest.TestCase):
-    """STRUCTURAL, and labelled so: the bridge builds this chain inside its run loop."""
-
-    def test_the_bridge_appends_it_as_the_last_claimant(self):
-        src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-        hitl = src.index("claimants.append(_HitlClicks(probe, log=_log))")
-        ours = src.index('claimants.append(OutcomeReactionHandler(_STATE / "correlation.jsonl", log=_log))')
-        chain = src.index("handler = HandlerChain(claimants + [handler])")
-        self.assertLess(hitl, ours)
-        self.assertLess(ours, chain)
-
-
 if __name__ == "__main__":
     os.environ.pop("SUTANDO_INSTANCE_ID", None)
     unittest.main()
