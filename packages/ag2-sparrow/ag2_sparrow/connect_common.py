@@ -355,13 +355,13 @@ def declaration_problem(shape: Shape) -> str:
     text, _problem = owned_text(supervisor_path(bridge), supervisor_marker(bridge), "supervisor file")
     if text and unit_environ(text).get("AGENT_CONNECT_TASK_DIR") and not recovered_config(shape):
         found.append(f"the bridge unit {supervisor_path(bridge)} is not proven this job's (its agent and root do not "
-                     f"match); stop and remove it by hand ({stop_command(bridge)}; rm {supervisor_path(bridge)})")
+                     f"match); stop and remove it by hand ({stop_command(bridge)}; rm {shlex.quote(str(supervisor_path(bridge)))})")
     for root in dict.fromkeys(roots):
         got, why = _declared_config(shape, root)
         why = why or ("is not bound to this job's unit" if got and not unit_root(shape) else "")
         if why:
             found.append(f"the bridge declaration at {Path(root + '.bridge') / DECLARATION} {why}; remove it by hand "
-                         f"(rm {Path(root + '.bridge') / DECLARATION})")
+                         f"(rm {shlex.quote(root + '.bridge')}/{DECLARATION})")
     if not found:
         return ""
     return "; ".join(found) + "; nothing was changed: remove one only once nothing serves its agent"
@@ -1049,6 +1049,61 @@ class operation_lock:
         return False
 
 
+FENCE_WAIT_S = 60.0     # longer than an install's own settle (CONFIRM_TIMEOUT_S), so a queued operation waits it out
+_FENCES: dict = {}
+
+
+def fence_name(shape: Shape, agent_id: str = "") -> str:
+    """The agent an operation on `shape` acts for, as both adapters name it: its key, from the agent id, the
+    job's own key or the agent its config or units record; a job that records none is fenced as itself."""
+    if shape.agent:
+        return shape.agent
+    agent = agent_id or recorded_agent(shape)
+    return agent_key(agent) if agent else f"job.{shape.job}"
+
+
+class agent_fence:
+    """The per-agent fence every install, connect and uninstall holds for its whole operation, through the
+    deferred work settle runs (await_started), on either adapter. Unlike the agent lock, no launcher takes it,
+    so an operation can hold it while its own launcher is admitted; nested takes in one thread share it."""
+
+    def __init__(self, name: str):
+        self.path, self.entered = config_root() / LOCKS_DIR / f"agent.{name}.fence", False
+
+    def __enter__(self):
+        key = (threading.get_ident(), str(self.path))
+        if key in _FENCES:
+            _FENCES[key][1] += 1
+            self.entered = True
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                     0o600)
+        deadline = time.monotonic() + FENCE_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise Busy(f"another operation on this agent is in progress (fence {self.path}); wait for it, "
+                               "then try again")
+                time.sleep(0.1)
+        _FENCES[key] = [fd, 1]
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.entered:
+            self.entered = False
+            key = (threading.get_ident(), str(self.path))
+            _FENCES[key][1] -= 1
+            if _FENCES[key][1] == 0:
+                os.close(_FENCES.pop(key)[0])
+        return False
+
+
 def holder_line(root: str) -> str:
     """held by launcher pid N | held by an unrecorded holder | free | unknown (why). The flock is held
     by a launcher for its own life only, so a held lock names a live launcher or a holder between its
@@ -1644,10 +1699,34 @@ def _repairable(shape: Shape, root: str, problem: str) -> "tuple[dict | None, st
     if why or text is None:
         return None, problem
     cfg = read_config_lenient(config_path(shape))
-    recorded = {r for r in (cfg.get("ROOT", ""), unit_root(shape)) if r}
-    if recorded != {root}:
+    if _recorded_roots(shape, cfg) != {root}:
         return None, problem
     return dict(cfg, ROOT=root), ""
+
+
+def _recorded_roots(shape: Shape, cfg: dict) -> set:
+    """Every root the job records: its config's (read line by line) and its own marked unit's."""
+    return {r for r in (cfg.get("ROOT", ""), unit_root(shape)) if r}
+
+
+def proven_record(shape: Shape, root: str) -> "tuple[dict, str]":
+    """(what `shape`'s install recorded, '') only once it is proven this job's on `root`, before any recorded path
+    or option is read for use: a marked config whose every recorded root is `root`, or with no config, what
+    recovered_config proves. ({}, '') when nothing is recorded; ({}, why) when the record is not proven."""
+    conf = config_path(shape)
+    if not os.path.lexists(conf):
+        cfg = recovered_config(shape)
+        return (cfg, "") if not cfg or cfg.get("ROOT") == root else \
+            ({}, f"what its bridge records serves {cfg.get('ROOT')}, not {root}")
+    text, problem = owned_text(conf, shape.marker, "config")
+    if problem or text is None:
+        return {}, problem or f"{conf} could not be read"
+    cfg = read_config_lenient(conf)
+    roots = _recorded_roots(shape, cfg)
+    if roots != {root}:
+        return {}, (f"{conf} and its unit record the root {', '.join(sorted(roots)) or 'nowhere'}, not {root}; fix or "
+                    f"remove it by hand (rm {shlex.quote(str(conf))})")
+    return cfg, ""
 
 
 def _connect_install_locked(shape: Shape, values: dict, root: str, revise, precheck, holder, root_id) -> int:
@@ -2232,11 +2311,14 @@ def uninstall(shape: Shape, before_free=None, token_file=None, cleanup=None) -> 
     file the install configured, for the kept line."""
     for _attempt in range(2):
         root = (owned_config(shape)[0] or recovered_config(shape)).get("ROOT", "")
+        # With no root recovered, an agent's own job still names its agent's root: its lock is the one to hold.
+        held = root or (canonical_root(str(Path(_dirs.agents_dir()) / shape.agent), "")[0] if shape.agent else "")
         try:
-            with (agent_lock(root) if root else contextlib.nullcontext()), operation_lock(shape):
+            with agent_fence(fence_name(shape)), (agent_lock(held) if held else contextlib.nullcontext()), \
+                    operation_lock(shape):
                 if (owned_config(shape)[0] or recovered_config(shape)).get("ROOT", "") != root:
                     continue
-                busy = "" if root else agent_operation_in_progress()
+                busy = "" if held else agent_operation_in_progress()
                 if busy:
                     return _refuse(f"no config names the root {job_name(shape)} serves, and an operation on an agent "
                                    f"holds {busy}; nothing was removed; run {uninstall_command(shape)} once it ends")

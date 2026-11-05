@@ -63,7 +63,10 @@ removed as they are; one whose config was removed is found again by its marked b
 `verify` prints, `install <selector>`, reuses the job's recorded token file and flags and rewrites a
 marked config that no longer loads when the root it and the unit record is the same. The bridge starts
 (or is declared) only once the session holds its root; when it never does, it is left stopped, its unit
-removed or its declaration withdrawn.
+removed or its declaration withdrawn. Nothing recorded is read or run until the record is proven the job's
+on the root its selector names. Install, connect and uninstall hold the agent's fence
+(`~/.config/ag2-sparrow/locks/agent.<agent key>.fence`, shared with claude-local) through the settle of the
+session they started; a failed install that leaves the session not running stops the bridge too.
 
 `install` checks `codex --version` against the pin (0.160.1, the version the stdio shape was measured
 on; parsed from the line starting with `codex`; older is one line and exit 2, nothing written), then

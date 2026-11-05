@@ -175,7 +175,10 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
 
 
 def install(args) -> int:
-    cb.recorded_install_args(args, LOCAL, RECORDED)
+    problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     claude = shutil.which(args.claude) or args.claude
     problem = version_problem(claude)
     if problem:
@@ -263,7 +266,8 @@ def install(args) -> int:
                   file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
-    return cb.under_agent_lock(root, installed, local if mode != EXTERNAL else None, agent_id)
+    return cb.under_agent_lock(root, installed, local if mode != EXTERNAL else None, agent_id, cm.fence_name(local, agent_id),
+                               orphan=lambda: cb.orphan_bridge(dict(values, ROOT=root), COMMAND, bridge, local))
 
 
 def hmac_settings(args) -> "tuple[str, bool, str, str]":
@@ -302,7 +306,11 @@ def connect_preflight(args) -> str:
 
 def connect(args) -> int:
     """Preflight, redeem the code into the agent's seat beside its root (connect_bridge's), then install
-    exactly as `install` does with the seat's .env as the token env file."""
+    exactly as `install` does with the seat's .env as the token env file, all inside the agent's fence."""
+    return cb.fenced(args.agent, lambda: _connect(args))
+
+
+def _connect(args) -> int:
     seat, problem = cb.redeem_into_seat(args.base, args.code, args.trust_relay_host, lambda: connect_preflight(args),
                                          LOCAL, args.agent)
     if problem:

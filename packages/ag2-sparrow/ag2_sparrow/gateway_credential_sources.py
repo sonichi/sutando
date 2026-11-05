@@ -85,7 +85,8 @@ def _declaration_owned(path: str, written_by: str, record: "dict | None" = None)
     except (ValueError, AttributeError):
         ours = False
     if not ours:
-        return False, f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
+        return False, (f"{path} was not written by install; remove it by hand (rm {shlex.quote(path)}) if it is yours "
+                       "to remove")
     if record is not None:
         record.update(loaded)
     return True, ""

@@ -456,7 +456,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
     def files(self):
         """Every file under the test home, by bytes, but the empty operation lock files: what a refused connect
         may not change."""
-        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix != ".oplock" and p.name != cm.SEAT_LOCK and p.parent.name != ".locks"}
+        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix not in (".oplock", ".fence") and p.name != cm.SEAT_LOCK and p.parent.name != ".locks"}
 
     def assert_refused_untouched(self, fake, why, spent="the code is spent and nothing was written", unspent=False):
         """connect refuses before the seat, the agent's seat byte-identical and no file anywhere changed;
@@ -1192,7 +1192,8 @@ class ConnectCode(UndoSeams, AgentRootBase):
             rc = real(*a, **kw)
             got = []
             t = threading.Thread(target=lambda: got.append(cm.uninstall(LA)))
-            with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), mock.patch.object(cm, "FENCE_WAIT_S", 0.3), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
                 t.start()
                 t.join(30)
             gap.append((got[0], err.getvalue()))
@@ -1238,7 +1239,9 @@ class ConnectCode(UndoSeams, AgentRootBase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(cm.uninstall(LA), 1)
-        self.assertIn("no config names the root", err.getvalue())
+        # An agent's own job names its agent's root by its key, so it waits on that root's own lock.
+        self.assertIn(f"another operation on this agent is in progress (lock {cm.agent_lock_path(self.root)})",
+                      err.getvalue())
         unhold(holder)
         with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(sm, "_run", side_effect=self.bridged()):
             self.assertEqual(cm.uninstall(LA), 0)

@@ -460,7 +460,14 @@ install flags, rewrites a marked config that no longer loads when the root it an
 the unit record is the same, and mints a new session id for a malformed one. An
 install's bridge starts (or its declaration is written) only once the session
 holds its root; when it never does, the bridge is left stopped, its unit removed
-or its declaration withdrawn.
+or its declaration withdrawn. A repair reads and runs nothing recorded until the
+record is proven the job's: a marked config whose every recorded root (and its
+unit's) is the root the selector names. Every install, connect and uninstall of
+an agent, on either adapter, holds that agent's fence
+(`~/.config/ag2-sparrow/locks/agent.<agent key>.fence`) from start through the
+settle of the session it started, so no other operation on the agent lands in
+between; a failed install that leaves the session not running stops the agent's
+bridge too (or withdraws its declaration).
 An explicit root keeps the single fixed job.
 
 **From a single-agent install.** A job an earlier release installed keeps its

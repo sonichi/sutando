@@ -145,7 +145,10 @@ RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBO
 
 
 def install(args) -> int:
-    cb.recorded_install_args(args, LOCAL, RECORDED)
+    problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     codex = shutil.which(args.codex) or args.codex
     problem = version_problem(codex)
     if problem:
@@ -187,7 +190,9 @@ def install(args) -> int:
                   f"{cb.rerun_install(local, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
-    return cb.under_agent_lock(root, installed, local if mode != EXTERNAL else None, where["agent_id"])
+    return cb.under_agent_lock(root, installed, local if mode != EXTERNAL else None, where["agent_id"],
+                               cm.fence_name(local, where["agent_id"]),
+                               orphan=lambda: cb.orphan_bridge(dict(values, ROOT=root), COMMAND, bridge, local))
 
 
 def connect_preflight(args) -> str:
@@ -212,6 +217,10 @@ def connect(args) -> int:
         return EXIT_UNUSABLE
     if not args.base:
         args.parser.error("the following arguments are required: --base")
+    return cb.fenced(args.agent, lambda: _connect(args))
+
+
+def _connect(args) -> int:
     seat, problem = cb.redeem_into_seat(args.base, args.code, args.trust_relay_host, lambda: connect_preflight(args),
                                          LOCAL, args.agent)
     if problem:

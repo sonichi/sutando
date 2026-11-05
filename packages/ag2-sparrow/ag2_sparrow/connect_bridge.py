@@ -241,19 +241,29 @@ def connect_agent_problem(agent_id) -> str:
     return ""
 
 
-def recorded_install_args(args, local: cm.Shape, fields) -> None:
+def recorded_install_args(args, local: cm.Shape, fields) -> str:
     """`install <selector>` with no token env file of its own: the job the selector names lends its recorded token
     file and options (`fields`: (config key, option, value from the recorded one)), each only where the command
-    did not give that option, so a printed repair line reinstalls that job as it was installed."""
+    did not give that option, so a printed repair line reinstalls that job as it was installed. Nothing recorded
+    is used, or run, unless cm.proven_record proves the record that job's on its own root: else why not."""
     if getattr(args, "token_env_file", None) or getattr(args, "inbox", None):
-        return
-    work, key, single = getattr(args, "work", None) or "", getattr(args, "key", None), getattr(args, "single", False)
-    if not (getattr(args, "agent", None) or key or single or work):
-        return
-    job, _ = cm.select_job(local, getattr(args, "agent", None), work, single, key)
+        return ""
+    agent, work = getattr(args, "agent", None) or "", getattr(args, "work", None) or ""
+    key, single = getattr(args, "key", None), getattr(args, "single", False)
+    if not (agent or key or single or work):
+        return ""
+    job, _ = cm.select_job(local, agent, work, single, key)
     if job is None:
-        return
-    cfg = cm.read_config_lenient(cm.config_path(job)) or cm.recovered_config(job)
+        return ""
+    segment = job.agent or (cm.agent_key(agent) if agent else "")
+    root = str(Path(work).expanduser().resolve()) if work else \
+        cm.canonical_root(str(_dirs.agents_dir() / segment), "")[0] if segment else cm.unit_root(job)
+    if not root:
+        return ""
+    cfg, problem = cm.proven_record(job, root)
+    if problem:
+        return (f"{problem}; nothing it records was used or run; or pass the agent's own --token-env-file and "
+                "options")
     if not work and cfg.get("TOKEN_ENV_FILE"):
         args.token_env_file = cfg["TOKEN_ENV_FILE"]
     opts = getattr(getattr(args, "parser", None), "_option_string_actions", {})
@@ -262,6 +272,7 @@ def recorded_install_args(args, local: cm.Shape, fields) -> None:
         recorded = value(cfg.get(cfg_key) or "")
         if recorded and dest not in given:
             setattr(args, dest, recorded)
+    return ""
 
 
 def _dest_of(opts: dict, given: str) -> str:
@@ -363,26 +374,66 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
     return ""
 
 
-def under_agent_lock(root: str, fn, local: "cm.Shape | None" = None, agent_id: str = "") -> int:
+def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fence: str, orphan=None) -> int:
     """fn() under the agent lock for `root`, so an install's local setup and its bridge wiring are one
     operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy. With
     `local`, the install that wires the agent's bridge, refused first while another adapter's bridge serves
-    the agent. The job it started is settled once the lock is released (cm.settle)."""
+    the agent. The job it started is settled once the lock is released (cm.settle), all of it inside the
+    agent's fence (`fence`, cm.fence_name), so no other operation on the agent runs before that settle ends.
+    A failed install then runs `orphan()`: no bridge of the agent is left running without its session."""
     try:
-        with cm.agent_lock(root):
-            problem = bridge_owner_problem(local, root, agent_id) if local is not None else ""
-            if problem:
-                print(f"error: {problem}; nothing was changed", file=sys.stderr)
-                return cm.EXIT_UNUSABLE
+        with cm.agent_fence(fence):
             try:
-                rc = fn()
-            except BaseException:
-                cm.abort_pending(root)
-                raise
+                with cm.agent_lock(root):
+                    problem = bridge_owner_problem(local, root, agent_id) if local is not None else ""
+                    if problem:
+                        print(f"error: {problem}; nothing was changed", file=sys.stderr)
+                        return cm.EXIT_UNUSABLE
+                    try:
+                        rc = fn()
+                    except BaseException:
+                        cm.abort_pending(root)
+                        raise
+            except cm.Busy as e:
+                print(f"error: {e}", file=sys.stderr)
+                rc = 1
+            rc = cm.settle(root, rc)
+            line = orphan() if rc != 0 and orphan is not None else ""
+            if line:
+                print(line, file=sys.stderr)
+            return rc
     except cm.Busy as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    return cm.settle(root, rc)
+
+
+def fenced(agent_id, fn) -> int:
+    """fn() inside `agent_id`'s fence (connect: the redemption and the install it runs are one operation); an id
+    that is not one runs fn() unfenced, which refuses it."""
+    if not (agent_id and cm.AGENT_ID_RE.fullmatch(agent_id)):
+        return fn()
+    try:
+        with cm.agent_fence(cm.agent_key(agent_id)):
+            return fn()
+    except cm.Busy as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def orphan_bridge(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape) -> str:
+    """After a failed install, under the agent's fence: when `local`'s session job is not running, its bridge is
+    stopped, or its declaration withdrawn, so no bridge runs without its session; the line saying so, or ''."""
+    mode = bridge_mode(cfg)
+    if mode == EXTERNAL or cm.manager_state(local) == "active":
+        return ""
+    if mode != UNIT:
+        line = _withdraw(cfg, command)
+        return f"{line}: its session is not running" if line else ""
+    if cm.manager_state(bridge) != "active":
+        return ""
+    problem = cm.stop_supervisor(bridge)
+    return (f"{cm.job_name(bridge)} could not be stopped ({problem}): stop it by hand ({cm.stop_command(bridge)})"
+            if problem else f"stopped: {cm.job_name(bridge)}, since its session is not running")
 
 
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
