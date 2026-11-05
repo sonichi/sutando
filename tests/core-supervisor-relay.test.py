@@ -32,6 +32,9 @@ sys.path.insert(0, os.path.join(_HERE, "..", "src"))
 _spec = importlib.util.spec_from_file_location("core_supervisor_relay", _SRC)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+# These cases exercise the macOS path, which the owner turns on (notifications.macos); the
+# gate itself is pinned in macos-notifications-opt-in.test.py.
+_mod._macos_notifications_on = lambda: True
 should_escalate = _mod.should_escalate
 compose_message = _mod.compose_message
 run_cycle = _mod.run_cycle

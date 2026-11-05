@@ -58,6 +58,8 @@ export const HEADER_KEYS: readonly string[] = [
 	'hitl_click',
 	'owner_mentioned',
 	'task_layout',
+	'hook',
+	'summon',
 	'local_time',
 	'parent_task',
 	'parent_generation',

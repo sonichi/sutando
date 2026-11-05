@@ -9,6 +9,7 @@
 # Usage:
 #   bash scripts/sutando-config.sh workspace     # print resolved workspace path
 #   bash scripts/sutando-config.sh vault-enabled # print "true" or "false"
+#   bash scripts/sutando-config.sh macos-notifications # print "true" or "false" (notifications.macos)
 #   bash scripts/sutando-config.sh vault-url     # print vault remote_url (may be empty)
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
 #   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
@@ -104,6 +105,15 @@ import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
 print('true' if resolve_vault().get('enabled') else 'false', end='')
+"
+    ;;
+
+  macos-notifications)
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_macos_notifications
+print('true' if resolve_macos_notifications() else 'false', end='')
 "
     ;;
 
@@ -831,7 +841,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|macos-notifications|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

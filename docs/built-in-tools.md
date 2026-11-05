@@ -2,6 +2,14 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+**Voice room tools** — the optional `ag2space-voice` skill reads, searches and writes
+s.space rooms through the registered MCP connection. A `no_credential` or
+`credential_refused` answer means the owner must reconnect through Connect in the app;
+say that instead of saying the room is unavailable or does not exist. This applies to
+name lookup with an empty room index as well as direct reads and writes. These credential
+failures happen before dispatch. Other write failures can still return `outcome_unknown`
+with an operation ID: do not claim nothing ran or retry automatically.
+
 **Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
 connector tools, first:
 - `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`
@@ -273,6 +281,8 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 
 **Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to s.space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
 
+**AG2 Space rooms over MCP (no desktop app)** — `skills/ag2-space-mcp/`: the hosted AG2 Space MCP runs every room Action server-side as the agent itself. `python3 skills/ag2-space-mcp/scripts/register.py --apply` registers an `ag2-space` http entry whose `headersHelper` is `ag2-sparrow-mcp headers`, which mints a short-lived token per connect from the agent credential in the ag2space channel env. Then `ag2.whoami` names the agent. Covers messages, thread replies and summons, reading Commons comments back, PDFs, publishing a page, media, Commons pages, databases, comments and folders (`room.commons.*`), and `commons.capabilities`. A Codex core uses `docs/codex-core.md` instead; the desktop app registers its own connector.
+
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
 **Trusted capability catalog** — discover, inspect, install, and update skills
@@ -421,4 +431,9 @@ or refused core turn. Read `<workspace>/state/quota-state.json` (written by the 
 `python3 skills/quota-tracker/scripts/read-quota.py` prints the same with remaining percentages and
 `--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
 core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
-model (above) is the way to keep going before then.
+model (above) is the way to keep going before then. A core that died on a limit is not relaunched
+until the reset (or a backoff of 5 to 60 minutes when none is given), and the owner gets one DM
+saying so. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
+launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as is; the next revive
+then starts the core. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+`... clear` lifts it.

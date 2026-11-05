@@ -1113,6 +1113,13 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+def effective_item_id(root: Path, item_id: str, no_send: bool) -> str:
+    """The item a result for `item_id` is delivered under: a suppressed close for an item already
+    delivered rides its own record."""
+    accepted = (read_item(root, item_id) or {}) if no_send else {}
+    return f"{item_id}.lease-close" if accepted.get("status") == "DELIVERED" else item_id
+
+
 PROOF_VERSION = 1
 
 

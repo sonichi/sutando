@@ -53,6 +53,8 @@ def pool():
     wi.start_incarnation(ws, WID, "s1", tmux_socket=SOCK, tmux_session=wi.tmux_session_name(WID))
     pd.deliveries_dir(ws, WID).mkdir(parents=True)
     (pd.deliveries_dir(ws, WID) / "task-owed.txt").write_bytes(b"")
+    (ws / "tasks").mkdir(exist_ok=True)
+    (ws / "tasks" / "task-owed.txt").write_text("task: hello\n")
     return ws
 
 

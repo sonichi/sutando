@@ -273,12 +273,22 @@ for i in "${!HOOKS[@]}"; do
   # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
   LEGACY_SHAPE=""
   [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  # A skill hook starts with the fail-open guard on ITS OWN path (`[ -f <path> ] || exit 0; `).
+  # Another revision of this installer spells the rest differently (the interpreter resolved at
+  # event time), and no operator writes that guard: an entry that opens with our guard for our
+  # path and carries the marker is ours whatever follows, so the two spellings never coexist.
+  GUARD_SHAPE=""
+  case "$CMD" in
+    "[ -f "*" ] || exit 0; "*)
+      _guard="${CMD%% ] || exit 0; *} ] || exit 0; "
+      GUARD_SHAPE="^$(re_escape "$_guard").*$(re_escape "$MARKER")" ;;
+  esac
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
+           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
        | map(contains($marker) and (. != $cmd)
-             and (test($shape) or ($legacy != "" and test($legacy))))
+             and (test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard))))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
@@ -286,14 +296,14 @@ for i in "${!HOOKS[@]}"; do
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
   jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
+     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
           and ((.command // "")
-               | test($shape) or ($legacy != "" and test($legacy)))
+               | test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard)))
           | not
         ))
       )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -252,6 +253,35 @@ class TheLadderSurvivesBetweenTicks(Base):
         self.assertEqual(out["decisions"][wid], ps.NOTHING)
         self.assertFalse(sup.state_path(self.ws).exists())
 
+    def spent_sentinel(self, wid):
+        inbox = sup.pd.deliveries_dir(self.ws, wid)
+        inbox.mkdir(parents=True, exist_ok=True)
+        s = inbox / "task-spent.txt"
+        s.write_bytes(b"")
+        os.utime(s, (1.0, 1.0))
+        return s
+
+    def test_only_a_persisting_sweep_archives_spent_sentinels(self):
+        wid = make_worker(self.ws)
+        s = self.spent_sentinel(wid)
+        out = sup.tick(self.ws, 10000.0, worker_ids=[wid], runner=Tmux())
+        self.assertTrue(s.exists(), "a delivery-time check archived a sentinel; it must stay read-only")
+        self.assertEqual(out["sentinels_retired"], {})
+        out = sup.tick(self.ws, 10000.0, runner=Tmux(), persist=False)
+        self.assertTrue(s.exists(), "--no-persist archived a sentinel; a diagnostic must change nothing")
+        self.assertEqual(out["sentinels_retired"], {})
+        out = sup.tick(self.ws, 10000.0, runner=Tmux())
+        self.assertFalse(s.exists())
+        self.assertEqual(out["sentinels_retired"], {wid: 1})
+        self.assertTrue((sup.pd.deliveries_dir(self.ws, wid) / "archive" / "task-spent.txt").is_file())
+
+    def test_an_archive_failure_is_reported_not_swallowed(self):
+        wid = make_worker(self.ws)
+        self.spent_sentinel(wid)
+        with patch.object(sup, "retire_spent_sentinels", side_effect=OSError(18, "Cross-device link")):
+            out = sup.tick(self.ws, 10000.0, runner=Tmux())
+        self.assertIn("Cross-device link", out["sentinel_retire_errors"].get(wid, ""))
+
     def test_a_fast_check_right_after_a_sweep_is_not_a_resume(self):
         wid = make_worker(self.ws)
         sup.tick(self.ws, 1000.0, runner=Tmux())
@@ -448,7 +478,8 @@ class TheCommandLine(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
                          {"decisions", "observations", "resumed", "not_supervised", "routing",
-                          "wedged", "wedge_kinds", "auth_expired"})
+                          "wedged", "wedge_kinds", "auth_expired", "sentinels_retired",
+                          "sentinel_retire_errors", "delivery_blocks", "notifier_stalls"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)

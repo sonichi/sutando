@@ -9,6 +9,7 @@ and a fenced key can check, in the same server command, that the turn is still t
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -54,6 +55,44 @@ def read(ws: Path, prompt_id: str):
     return turn if turn is None or isinstance(turn, dict) else UNKNOWN
 
 
+def open_dialog(ws: Path, task_id: str) -> "dict | None":
+    """The newest open permission dialog of an unended turn that names `task_id`: {tool, at}, or None
+    (none open, or a record that cannot be read: a reader fails to "not waiting", never to a guess)."""
+    try:
+        data = json.loads(path(ws).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    turns = data.get("turns") if isinstance(data, dict) else None
+    if not isinstance(turns, dict):
+        return None
+    found = [t["dialog"] for t in turns.values()
+             if isinstance(t, dict) and t.get("ended") is None and isinstance(t.get("dialog"), dict)
+             and isinstance(t.get("tasks"), list) and task_id in t["tasks"]]
+    return max(found, key=lambda d: d.get("at") or 0, default=None)
+
+
+def has_open_tool(ws: Path, task_id: str, *, now=None, max_age_s=900.0) -> bool:
+    """Whether all unmatched task-bound tool starts remain within the exemption bound."""
+    try:
+        data = json.loads(path(ws).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    turns = data.get("turns") if isinstance(data, dict) else None
+    if not isinstance(turns, dict):
+        return False
+    now = time.time() if now is None else now
+    starts = []
+    for turn in turns.values():
+        if (not isinstance(turn, dict) or turn.get("ended") is not None
+                or not isinstance(turn.get("tasks"), list) or task_id not in turn["tasks"]):
+            continue
+        opened, stamps = turn.get("open_tools"), turn.get("tool_started", {})
+        if isinstance(opened, dict):
+            starts.extend(stamps.get(key) if isinstance(stamps, dict) else None for key in opened)
+    return bool(starts) and all(type(stamp) in (int, float) and math.isfinite(stamp)
+                               and 0 <= now - stamp < max_age_s for stamp in starts)
+
+
 def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
     """Fold one hook payload into its turn's record."""
     event, pid = payload.get("hook_event_name"), payload.get("prompt_id")
@@ -80,10 +119,26 @@ def record(payload: dict, ws: Path, now: "float | None" = None) -> None:
             # Only that a dialog is open: its tool input may carry secrets and nothing reads it.
             tool = payload.get("tool_name")
             turn["dialog"] = {"tool": tool if type(tool) is str else None, "at": now}
-        elif event in ("PreToolUse", "PostToolUse"):
+        elif event in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
             turn["dialog"] = None
+            tool_id = payload.get("tool_use_id")
+            tool_name = payload.get("tool_name")
+            key = ("id:" + tool_id if isinstance(tool_id, str) and tool_id
+                   else "name:" + tool_name if isinstance(tool_name, str) and tool_name else None)
+            opened = turn.setdefault("open_tools", {})
+            starts = turn.setdefault("tool_started", {})
+            if key and event == "PreToolUse":
+                if key not in opened:
+                    starts[key] = now
+                opened[key] = opened.get(key, 0) + 1 if key.startswith("name:") else 1
+            elif key and key in opened:
+                if opened[key] > 1:
+                    opened[key] -= 1
+                else:
+                    del opened[key]
+                    starts.pop(key, None)
         elif event == "Stop":
-            turn.update(ended=now, dialog=None)
+            turn.update(ended=now, dialog=None, open_tools={}, tool_started={})
         turn["seen"] = now
         turns[pid] = turn
         for old in sorted(turns, key=lambda k: turns[k].get("seen") or 0)[:-TURNS_KEPT]:

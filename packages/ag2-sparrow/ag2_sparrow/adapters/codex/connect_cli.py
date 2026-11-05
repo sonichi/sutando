@@ -12,7 +12,7 @@ check passed, with `--held`, attaches it as the consumer whose liveness fences t
 on SIGTERM; a root another session holds is exit 75, which the manager does not relaunch over.
 `verify` checks each part; `uninstall` removes only what install wrote. With `--token-env-file` and no
 `--work`, the root is the agent's own and install also wires its bridge (connect_bridge's, as claude-local's).
-`connect --base --code` checks the machine, redeems AG2 Space's one-time code into the agent's seat, then
+`connect --base --agent --code` checks the machine, redeems AG2 Space's one-time code into the agent's seat, then
 runs install with that seat; it is off in this release and refuses unless `--experimental-connect` is given. The relay token stays in its env or seat file and the Codex login in
 CODEX_HOME: neither is copied. Stdlib only.
 """
@@ -171,7 +171,7 @@ def install(args) -> int:
                   f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
-    return cb.under_agent_lock(root, installed)
+    return cb.under_agent_lock(root, installed, LOCAL if mode != EXTERNAL else None, where["agent_id"])
 
 
 def connect_preflight(args) -> str:
@@ -197,7 +197,7 @@ def connect(args) -> int:
     if not args.base:
         args.parser.error("the following arguments are required: --base")
     seat, problem = cb.redeem_into_seat(args.base, args.code, args.trust_relay_host, lambda: connect_preflight(args),
-                                         LOCAL)
+                                         LOCAL, args.agent)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -248,8 +248,8 @@ def _checked(popen, op) -> int:
     state = cm.stop_state()
     before = cm.stop_handlers(state)
     try:
-        return _held(cfg, cm.work_root(cfg), popen, state, cm.debug_adapter(LOCAL) if op is not None else "",
-                     op.release if op is not None else None)
+        return cm.retired(state, _held(cfg, cm.work_root(cfg), popen, state,
+                                       cm.debug_adapter(LOCAL) if op is not None else "", op.release if op is not None else None))
     finally:
         cm.restore_handlers(state, before)
 
@@ -338,6 +338,8 @@ def main(argv=None) -> int:
     c.add_argument("--base", help="the s.space backend URL the code was issued by")
     c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
+    c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for, as "
+                   "the app's connect command names it; without it connect refuses and the code is not used")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when s.space told you to)")
     session_options(c)
