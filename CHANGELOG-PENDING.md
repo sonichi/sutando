@@ -40,6 +40,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Changed
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
+- ag2-sparrow codex-local: `ag2-sparrow-codex-local connect --base <url> --agent <Matrix ID>` works without `--experimental-connect`; the old flag is still accepted, does nothing and prints one deprecation warning. `--agent` stays required and every pre-redemption check is unchanged. ([#6259])
 - macOS notifications are off by default. Sutando posts no macOS desktop notification (pending questions, bridge restarts, health checks, the agent shepherd, voice offline/online, context drop, screen recording) unless `sutando.config.local.json` sets `"notifications": {"macos": true}`. The same alerts still reach the owner's DM or the core's task queue. There is no exception: the gateway bridge's no-workspace alert, which has no DM to fall back on, is silent too unless you opt in. Windows and Linux notifications are unchanged.
 
 ## Security
