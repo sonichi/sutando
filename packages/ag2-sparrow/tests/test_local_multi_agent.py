@@ -1066,6 +1066,27 @@ class Round6(MultiBase):
                 decl.unlink()
                 self.assertEqual(self.run_cli(CL.name, "uninstall", "--single")[0], 0)
 
+    def test_a_declaration_serving_another_root_is_never_recovered(self):
+        """The fixed job's declaration beside its own root B, edited to feed another root's tasks: it serves not the
+        root the job's unit records, so nothing is recovered and B's uninstall refuses naming it."""
+        argv = self.sparrowd()
+        single = job(CL.name, "")
+        decl = cb.bridge_home(self.root_of(BETA)) / cb.DECLARATION
+        self.host.add(single, self.root_of(BETA))
+        os.environ["AGENT_MXID"] = BETA
+        with mock.patch.object(cm, "job_for", side_effect=lambda shape, agent: cm.for_key(shape, "")):
+            self.assertEqual(self.run_cli(CL.name, *argv)[0], 0)
+        body = json.loads(decl.read_text())
+        body["env"]["AGENT_CONNECT_TASK_DIR"] = str(self.root_of(ALPHA) / "tasks")
+        decl.write_text(json.dumps(body))
+        cm.config_path(single).unlink()
+        kept = (cm.supervisor_path(single).read_bytes(), decl.read_bytes(), self.launcher_pid(single))
+        self.assertEqual(cm.recovered_config(single), {})
+        rc, out, err = self.run_cli(CL.name, "uninstall", "--single")
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"rm {decl}", err)
+        self.assertEqual((cm.supervisor_path(single).read_bytes(), decl.read_bytes(), self.launcher_pid(single)), kept)
+
     def test_an_unreadable_or_unbound_declaration_fails_closed_and_names_its_manual_path(self):
         """An agent's own job reduced to an unreadable declaration, and a legacy fixed job whose declaration its
         unit cannot vouch for: uninstall refuses (non-zero), names the declaration and its `rm`, and moves nothing."""
@@ -1214,6 +1235,20 @@ class Selection(MultiBase):
                 self.assertEqual(rc, cm.EXIT_UNUSABLE)
                 self.assertIn(f"--agent {BETA} is not the agent this install serves ({ALPHA})", err)
                 self.assertFalse(cm.config_root().joinpath(cm.AGENTS_DIR).exists())
+
+    def test_install_key_and_single_must_name_the_job_its_token_makes(self):
+        """A printed repair line `install --key K` or `install --single` never installs over another job: run with
+        a token for another agent, install refuses and writes nothing."""
+        for adapter in CLIS:
+            with self.subTest(adapter=adapter):
+                for extra in (["--key", job(adapter, BETA).agent], ["--single"]):
+                    rc, out, err = self.install(adapter, ALPHA, *extra)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn("nothing was changed", err)
+                    self.assertEqual(cm.installed_jobs(job(adapter, "")), [])
+                rc, out, err = self.install(adapter, ALPHA, "--key", job(adapter, ALPHA).agent)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.run_cli(adapter, "uninstall", "--agent", ALPHA)[0], 0)
 
     def test_with_none_installed_the_agentless_form_is_the_single_agent_job(self):
         for adapter in CLIS:
