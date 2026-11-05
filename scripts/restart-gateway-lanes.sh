@@ -43,4 +43,12 @@ mkdir -p "$LOGS_DIR"
 source "$REPO/src/startup-runtime.sh"
 
 start_gateway_lanes
+if [ "$GATEWAY_LANES_CONFIGURED" != "1" ]; then
+  echo "No gateway lane started: no gateway token in $CLAUDE_CONFIG_DIR/channels/ag2space or the environment. Task watcher untouched." >&2
+  exit 1
+fi
+if [ "$GATEWAY_LANES_NOT_LAUNCHED" != "0" ]; then
+  echo "$GATEWAY_LANES_NOT_LAUNCHED gateway lane(s) not launched, named above; see $LOGS_DIR/remote-gateway-bridge.log. Task watcher untouched." >&2
+  exit 1
+fi
 echo "Gateway lane(s) (re)started where configured. Task watcher untouched."
