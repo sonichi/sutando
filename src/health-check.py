@@ -8770,7 +8770,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
     orphans: list[tuple[str, int]] = []
-    unreadable = 0
+    unreadable = unretired = 0
     for path in entries:
         # Per-file isolation on purpose. One unreadable entry must not decide
         # the answer for the whole directory: with the guard around the loop
@@ -8828,11 +8828,15 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         except (OSError, ValueError, ImportError):
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
+            unretired += 1
             continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    # A skip was never a lost reply, but a consumer should still have retired it from results/.
+    if unretired:
+        partial += f"; {unretired} skip-marked result(s) still live past the threshold, unretired"
     if not orphans:
         status = "warn" if unreadable else "ok"
         return {"name": name, "status": status,

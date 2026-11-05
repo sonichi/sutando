@@ -16,7 +16,9 @@ The CLI refuses a `source: cron` task's result that names no destination and
 carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
 Owner-facing cron output goes through a channel-bound result instead (a task
 with a destination header, or a proactive result routed to the owner's channel);
-`--allow-undeliverable` publishes anyway.
+`--allow-undeliverable` publishes anyway. A skip-marked body for such a task is
+published straight into the month's `results/archive/`: the same missing bridge is
+the one that would otherwise retire it, so a live copy stays in `results/` forever.
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ import sys
 from pathlib import Path
 
 __all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "undeliverable_reason", "main"]
+           "undeliverable_reason", "retired_path", "main"]
 
 STAGED_SUFFIX = ".tmp"
 
@@ -99,12 +101,12 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
-def undeliverable_reason(path: str | Path, text: str) -> str | None:
-    """Why no bridge would deliver `text` published at `path`, or None when one would.
+def _unrouted_cron_task(path: str | Path) -> str | None:
+    """The task id when `path` is the live result of a `source: cron` task naming no destination.
 
-    Fails open: an unknown name, a missing task file or a helper that will not load publishes."""
+    Fails open: an unknown name, a missing task file or a helper that will not load reads as routed."""
     try:
-        protocol, markers, archive, wsd = _helpers()
+        protocol, _, archive, wsd = _helpers()
     except ImportError:
         return None
     target = Path(path).resolve()
@@ -127,10 +129,42 @@ def undeliverable_reason(path: str | Path, text: str) -> str | None:
         return None
     if any((headers.get(k) or "").strip() for k in ("channel_id", "chat_id")):
         return None
+    return task_id
+
+
+def _skips_delivery(text: str) -> bool:
+    markers = _helpers()[1]
+    return markers.has_skip_action(markers.parse_markers(text).actions)
+
+
+def undeliverable_reason(path: str | Path, text: str) -> str | None:
+    """Why no bridge would deliver `text` published at `path`, or None when one would.
+
+    Fails open: an unknown name, a missing task file or a helper that will not load publishes."""
+    task_id = _unrouted_cron_task(path)
     # A [channel:] redirect does not count: no consumer reads a channel-less cron result to see it.
-    if markers.has_skip_action(markers.parse_markers(text).actions):
+    if task_id is None or _skips_delivery(text):
         return None
     return f"{task_id} is a cron task with no channel_id or chat_id"
+
+
+def retired_path(path: str | Path, text: str) -> Path | None:
+    """Where a skip-marked body for an unrouted cron task is published instead of `path`, or None.
+
+    No bridge visits such a result, so none would archive it after reading the skip; it goes
+    straight into the month's `results/archive/`, which every result reader already walks."""
+    task_id = _unrouted_cron_task(path)
+    if task_id is None or not _skips_delivery(text):
+        return None
+    import time
+    from datetime import datetime
+    protocol = _helpers()[0]
+    target = Path(path).resolve()
+    dest = protocol.archive_month_dir(target.parent, datetime.now().isoformat()) / target.name
+    # Never overwrite a record: an occupied slot takes the epoch-suffixed re-archive name readers know.
+    if dest.exists():
+        dest = dest.with_name(f"{dest.stem}-{int(time.time())}.txt")
+    return dest
 
 
 def main(argv: list[str]) -> int:
@@ -149,7 +183,14 @@ def main(argv: list[str]) -> int:
               "proactive result routed to the owner's channel), start it with [no-send], "
               "or pass --allow-undeliverable", file=sys.stderr)
         return 2
-    publish_text(args[0], text)
+    dest = None if allow else retired_path(args[0], text)
+    if dest is None:
+        publish_text(args[0], text)
+        return 0
+    publish_text(dest, text)
+    print(f"result_publish: published {Path(args[0]).name} to {dest.parent} instead of results/: "
+          "a cron task with no channel_id or chat_id has no bridge, so nothing would retire "
+          "this skipped body from the live directory")
     return 0
 
 
