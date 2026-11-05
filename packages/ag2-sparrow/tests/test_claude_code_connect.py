@@ -35,7 +35,7 @@ import dataclasses  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     _dirs, _Resp, AGENT, AGENT_LOCK_HOLDER, AgentRootBase, Backend, BASE, BEARER, card, cb, cli, cm, CODE,
-    ConnectBase, CONTENDER, hold, hold_mod, inbox, L, launcher, PKG, ran, records, RELAY, REPLACER, SEAT_HOLDER,
+    BA, ConnectBase, CONTENDER, hold, hold_mod, inbox, L, LA, launcher, PKG, ran, records, RELAY, REPLACER, SEAT_HOLDER,
     REAL_TMUX_VERSION, seed_seat, SESSION_ID, shape_mod, sm, START_VERBS, SUCCESSOR_WRITER, task_io, tmux_pane_keys,
     TOKEN, unhold,
     UNPUBLISHED, wait_for, wait_gone,
@@ -63,7 +63,7 @@ class ConnectVerify(ConnectBase):
                       "the shared tri-state, naming the lock's holder")
         self.assertNotIn("launcher pid", out)
         self.assertIn("INFO session id: %s" % cli.read_config(cli.config_path())["SESSION_ID"], out)
-        self.assertIn(f"INFO attach: {cli.COMMAND} attach", out)
+        self.assertIn(f"INFO attach: {cli.COMMAND} attach --work {self.work}", out)
         self.assertIn("PASS hitl store: %s (the bridge's, beside its default store under %s)"
                       % (cli.hitl_store_root(), _dirs.state_dir()), out)
         runner.stop_session()
@@ -71,14 +71,16 @@ class ConnectVerify(ConnectBase):
         self.assertIn(f"INFO session: {self.work} free", out)
         self.assertNotEqual(rc, 0, "a configured bridge with no session job is a failed verify")
         self.assertIn(f"FAIL job: {cli.SERVICE_NAME} is unknown, so no session answers the tasks its configured bridge "
-                      f"passes on: run {cli.COMMAND} install again, or {cli.COMMAND} uninstall", out)
+                      f"passes on: run {cli.COMMAND} install --work {self.work} again, or {cli.COMMAND} uninstall "
+                      f"--work {self.work}", out)
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
         self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
         self.configure(BRIDGE_STATE_DIR="", HITL_STORE="/elsewhere/hitl/requirements-claude-local")
         out = self.main("verify")[1]
         self.assertNotIn("hitl", self.checks(out), "a config from before the key: no row derived from the store itself")
         self.assertIn(f"INFO hitl store: /elsewhere/hitl/requirements-claude-local (a config from before BRIDGE_STATE_DIR: "
-                      f"the bridge's state dir is read as its parent; run {cli.COMMAND} install to record it)", out)
+                      f"the bridge's state dir is read as its parent; run {cli.COMMAND} install --work {self.work} to "
+                      "record it)", out)
         self.configure()
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
         with mock.patch.object(shape_mod, "PLUGIN", self.home / "no-shipped-plugin"):
@@ -112,7 +114,7 @@ class ConnectVerify(ConnectBase):
         out = self.main("verify")[1]
         self.assertEqual(self.checks(out)["plugin"], "PASS", out)
         self.assertIn(f"PASS plugin: recorded plugin dir {old} missing; using the shipped plugin {cli.PLUGIN} "
-                      f"(re-run {cli.COMMAND} install to record it)", out)
+                      f"(re-run {cli.COMMAND} install --work {self.work} to record it)", out)
 
     def test_a_recorded_plugin_dir_that_holds_a_plugin_stays_the_override(self):
         self.configure()
@@ -331,7 +333,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
 
-    local, tmux_tree = L, True
+    local, tmux_tree = LA, True
 
     def seam_fake(self):
         return self.bridged()
@@ -411,11 +413,11 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertRegex(values["GATEWAY_INSTANCE"], r"^[0-9a-f]{32}$")
         cfg = self.cfg()
         self.assertEqual((cfg["ROOT"], cfg["TOKEN_ENV_FILE"], cfg["AGENT_ID"]), (str(self.root), str(seat / ".env"), AGENT))
-        unit = cm.service_path(cli.BRIDGE).read_text()
+        unit = cm.service_path(BA).read_text()
         self.assertIn('Environment="REMOTE_TASK_SEAT=1"\n', unit)
         self.assertIn(f'Environment="REMOTE_TASK_TOKEN_FILE={seat / "token"}"\n', unit)
         self.assertIn("setup: built-in", out)
-        for text in (out, err, unit, cli.config_path().read_text(), (seat / ".env").read_text()):
+        for text in (out, err, unit, cli.config_path(LA).read_text(), (seat / ".env").read_text()):
             self.assertNotIn(BEARER, text)
 
     def seated_by_another_adapter(self):
@@ -437,8 +439,8 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertIn(f"{self.root} is held by launcher pid {holder.pid}; stop what holds it", err)
         self.assertIn("the code is spent and nothing was written", err)
         self.assertEqual(len(backend.calls), 1, "the root is known only from the redemption's agent id")
-        self.assertFalse(cli.config_path().exists())
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+        self.assertFalse(cli.config_path(LA).exists())
+        self.assertFalse(cm.service_path(BA).exists())
 
     def test_a_free_root_passes_installs_own_check_and_connect_proceeds(self):
         self.seated_by_another_adapter()
@@ -454,7 +456,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
     def files(self):
         """Every file under the test home, by bytes, but the empty operation lock files: what a refused connect
         may not change."""
-        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix != ".oplock" and p.name != cm.SEAT_LOCK and p.parent.name != ".locks"}
+        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix not in (".oplock", ".fence") and p.name != cm.SEAT_LOCK and p.parent.name != ".locks"}
 
     def assert_refused_untouched(self, fake, why, spent="the code is spent and nothing was written", unspent=False):
         """connect refuses before the seat, the agent's seat byte-identical and no file anywhere changed;
@@ -472,9 +474,10 @@ class ConnectCode(UndoSeams, AgentRootBase):
 
     def test_a_job_active_for_another_root_does_not_vouch_for_a_held_root(self):
         a = self.home / "agent-a"
-        fake = self.bridged(root=a)
+        fake = self.bridged(root=a, shape=L)
         rc, _out, err = self.install_default(fake, "--work", str(a))
         self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.job_for(L, AGENT), L, "the explicit root's job records the host's agent: it is that agent's")
         self.root.mkdir(parents=True)
         holder = hold(self.root, "codex-local")
         try:
@@ -495,24 +498,25 @@ class ConnectCode(UndoSeams, AgentRootBase):
                 shutil.rmtree(self.agents, ignore_errors=True)
                 root = str(self.home / "agent-a") if root == "elsewhere" else root
                 adapter, install = adapter if isinstance(adapter, tuple) else (adapter, "")
-                cli.config_path().unlink(missing_ok=True)
+                cli.config_path(LA).unlink(missing_ok=True)
                 if root is not None:
-                    self.configure(ROOT=str(self.root) if root in ("root", "unparsable") else root)
+                    self.configure(LA, ROOT=str(self.root) if root in ("root", "unparsable") else root)
                 if root == "unparsable":
-                    cli.config_path().write_text(cli.config_path().read_text() + "ROOT='unclosed\n")
+                    cli.config_path(LA).write_text(cli.config_path(LA).read_text() + "ROOT='unclosed\n")
                 fake = self.bridged(adapter=adapter, install=install)
                 self.root.mkdir(parents=True)
                 fake.runner.start_session()
                 try:
-                    self.assert_refused_untouched(fake, f"{cm.job_name(L)} is running for", unspent=True)
+                    self.assert_refused_untouched(fake, f"{cm.job_name(LA)} is running for", unspent=True)
                 finally:
                     fake.runner.stop_session()
 
     def test_an_independent_holder_of_this_shape_on_the_root_is_refused_while_the_job_serves_another(self):
         a = self.home / "agent-a"
-        fake = self.bridged(root=a)
+        fake = self.bridged(root=a, shape=L)
         rc, _out, err = self.install_default(fake, "--work", str(a))
         self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.job_for(L, AGENT), L, "the explicit root's job records the host's agent: it is that agent's")
         self.root.mkdir(parents=True)
         holder = hold(self.root, L.name)
         try:
@@ -521,7 +525,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
             unhold(holder)
 
     def test_a_stale_record_of_this_shape_does_not_vouch_for_a_successor_that_has_not_published(self):
-        self.configure(ROOT=str(self.root))
+        self.configure(LA, ROOT=str(self.root))
         self.root.mkdir(parents=True)
         dead = hold(self.root, L.name)
         dead.kill()
@@ -535,7 +539,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
             self.assertEqual((rec["adapter"], rec["pid"], rec["live"]), (L.name, dead.pid, False))
             self.assertIn("is held by a holder with no live record", cm._managed_here(L, str(self.root)),
                           "install's own check needs the record to be live")
-            self.assert_refused_untouched(fake, f"{cm.job_name(L)} is running for", unspent=True)
+            self.assert_refused_untouched(fake, f"{cm.job_name(LA)} is running for", unspent=True)
         finally:
             fake.runner.stop_session()
 
@@ -852,10 +856,11 @@ class ConnectCode(UndoSeams, AgentRootBase):
 
     def test_a_failed_install_after_connect_names_the_seat_that_recovers_the_spent_code(self):
         seat = cli.bridge_home(self.root) / "channels" / "ag2space" / ".env"
-        rerun = (f"{cli.COMMAND} install --plugin-dir {self.plugin} --claude-config-dir {self.home / '.claude-sutando'} "
+        rerun = (f"{cli.COMMAND} install --agent {AGENT} --plugin-dir {self.plugin} --claude-config-dir "
+                 f"{self.home / '.claude-sutando'} "
                  f"--hmac-key-file {self.home / 'task-hmac.key'} --permission-mode plan --token-env-file {seat}")
         with mock.patch.object(cm, "console_script",
-                               side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
+                               side_effect=lambda shape: "" if shape == BA else str(self.bin / shape.command)):
             rc, _out, err = self.connect(Backend(), None, "--permission-mode", "plan")
         self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
         self.assertIn("the session is installed but its bridge is not: ag2-sparrow was not found beside", err)
@@ -867,14 +872,14 @@ class ConnectCode(UndoSeams, AgentRootBase):
         fake.runner.stop_session()
         before = len(fake.runner.calls)
         with mock.patch.object(cm, "console_script",
-                               side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
+                               side_effect=lambda shape: "" if shape == BA else str(self.bin / shape.command)):
             rc, out, err = self.connect(Backend(), fake)
         self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
         self.assertIn("its bridge is not: ag2-sparrow was not found beside", err)
         starts = [c for c in fake.runner.calls[before:] if fake.runner.verb(c) in START_VERBS]
         self.assertEqual(len(starts), 1, "install started the job once; nothing started it again")
         self.assertNotIn("next:", out)
-        self.assertIn(f"; this attempt was undone: {cm.job_name(L)}, the job its install started, was stopped", err)
+        self.assertIn(f"; this attempt was undone: {cm.job_name(LA)}, the job its install started, was stopped", err)
         self.assertIsNone(fake.runner.pid(), "the job this attempt started is not left running")
 
     def test_a_job_started_after_the_seat_write_is_left_running_and_connect_refuses(self):
@@ -908,7 +913,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         real, raced = cm.start_supervisor, []
 
         def raced_then_started(shape, **kw):
-            if shape is L and not raced:
+            if shape == LA and not raced:
                 fake.runner.start_session()
                 raced.append(fake.runner.pid())
             return real(shape, **kw)
@@ -924,14 +929,14 @@ class ConnectCode(UndoSeams, AgentRootBase):
         fake, real, stray = self.bridged(), cm.start_supervisor, []
 
         def stray_first(shape, **kw):
-            if shape is L and not stray:
+            if shape == LA and not stray:
                 stray.append(hold(self.root, L.name))   # a launcher no manager started, outside the lock protocol
             return real(shape, **kw)
         with mock.patch.object(cm, "start_supervisor", side_effect=stray_first):
             rc, out, err = self.connect(Backend(), fake)
         try:
             self.assertNotEqual(rc, 0, out + err)
-            self.assertIn(f"(pid {stray[0].pid}) is not the process {cm.job_name(L)} runs as", err)
+            self.assertIn(f"(pid {stray[0].pid}) is not the process {cm.job_name(LA)} runs as", err)
             self.assertIsNone(stray[0].poll(), "the stray is left as it is")
             self.assertNotIn("next:", out)
         finally:
@@ -953,42 +958,51 @@ class ConnectCode(UndoSeams, AgentRootBase):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"{self.root} was replaced after install started {cm.job_name(L)}; {cm.job_name(L)}, which "
+        self.assertIn(f"{self.root} was replaced after install started {cm.job_name(LA)}; {cm.job_name(LA)}, which "
                       f"held the directory that was there, was stopped; nothing at {self.root} was touched", err)
         self.assertIsNone(fake.runner.pid(), "the job this attempt started is not left on the parked root")
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "the bridge was not wired")
+        self.assertFalse(cm.service_path(BA).exists(), "the bridge was not wired")
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
 
-    def test_a_root_replaced_while_the_bridge_is_wired_leaves_the_running_bridge_and_unwinds_the_rest(self):
+    def test_a_root_replaced_while_the_bridge_is_wired_never_starts_it_and_unwinds_the_rest(self):
         fake, real = self.bridged(), cb.wire_bridge
 
         def wired_then_replaced(*a, **kw):
             got = real(*a, **kw)
-            self.assertTrue(cm.service_path(cli.BRIDGE).exists())
+            self.assertTrue(cm.service_path(BA).exists())
             self.replace_root_now()
             return got
         with mock.patch.object(cb, "wire_bridge", side_effect=wired_then_replaced):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"the bridge this attempt wired ({cm.job_name(cli.BRIDGE)}) is active and was left, since stopping it would "
-                      f"name whatever runs as it now: stop it by hand ({cm.stop_command(cli.BRIDGE)})", err)
-        self.assertIn(f"{cm.job_name(L)}, which held the directory that was there, was stopped; nothing at {self.root} was "
+        self.assertIn(f"the bridge unit this attempt wrote ({cm.service_path(BA)}) was removed", err)
+        self.assertIn(f"{cm.job_name(LA)}, which held the directory that was there, was stopped; nothing at {self.root} was "
                       "touched", err)
-        self.assertTrue(cm.service_path(cli.BRIDGE).exists(), "a running bridge is left: its manager stops it only by name")
-        self.assertTrue(fake.active, "and it still runs")
-        self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
+        self.assertFalse(cm.service_path(BA).exists(), "the bridge waited for the session, so it never started")
+        self.assertFalse(fake.active)
+        self.assertFalse({"stop", "bootout", "restart", "start"} & bridge_verbs(fake), "nothing named the bridge to its manager")
         self.assertIsNone(fake.runner.pid(), "this attempt's job is stopped")
         self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
         self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
+
+    def test_a_connect_whose_session_start_is_refused_leaves_no_bridge_running_without_it(self):
+        """connect wrote the job and asked the manager to start it (its first change), the start was refused, and a
+        bridge from before still runs: no session serves it, so the failed connect stops it too."""
+        fake = self.bridged({("systemctl", "start"): 1})
+        fake.active = fake.registered = True
+        rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertFalse(fake.active, err)
+        self.assertIn("since its session is not running", err)
 
     def test_a_bridge_left_unregistered_by_a_refused_start_is_the_only_bridge_removed(self):
         fake = self.bridged()
         fake.table["bootstrap"] = 5
         with mock.patch.object(cm, "is_macos", return_value=True):
             rc, out, err = self.connect(Backend(), fake)
-            plist = cm.supervisor_path(cli.BRIDGE)
+            plist = cm.supervisor_path(BA)
         self.assertNotEqual(rc, 0, out + err)
         self.assertIn(f"the bridge unit this attempt wrote ({plist}) was removed", err)
         self.assertFalse(plist.exists(), "an unregistered unit holding this attempt's bytes is removed")
@@ -996,7 +1010,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
     def test_connect_changes_no_jobs_definition_and_refuses_when_it_would(self):
         fake = self.running_job()
         fake.runner.stop_session()
-        conf = cli.config_path()
+        conf = cli.config_path(LA)
         conf.write_text(conf.read_text().replace("ROOT=", "# edited by hand\nROOT=", 1))
         before = conf.read_bytes()
         rc, out, err = self.connect(Backend(), fake)
@@ -1030,18 +1044,18 @@ class ConnectCode(UndoSeams, AgentRootBase):
     def test_install_uninstall_and_wiring_wait_for_the_agent_lock_and_refuse(self):
         fake = self.running_job()
         fake.runner.stop_session()
-        cfg = cm.read_config(cli.config_path())
+        cfg = cm.read_config(cli.config_path(LA))
         holder = self.agent_lock_holder()
         with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), mock.patch.object(sm, "_run", side_effect=fake), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
             before = len(fake.runner.calls)
             self.assertEqual(cm.install(L, {}, str(self.root)), 1)
-            self.assertEqual(cm.uninstall(L), 1)
-            wired = cb.wire_bridge_bound(cfg, cli.COMMAND, cli.BRIDGE, L, None)
+            self.assertEqual(cm.uninstall(LA), 1)
+            wired = cb.wire_bridge_bound(cfg, cli.COMMAND, BA, L, None)
         self.assertEqual(err.getvalue().count("another operation on this agent is in progress"), 2, err.getvalue())
         self.assertIn("another operation on this agent is in progress", wired)
         self.assertEqual(fake.runner.calls[before:], [], "nothing reached the manager")
-        self.assertTrue(cli.config_path().exists(), "uninstall removed nothing")
+        self.assertTrue(cli.config_path(LA).exists(), "uninstall removed nothing")
         holder.kill()
         holder.wait(timeout=30)
         with cm.agent_lock(str(self.root), wait_s=1):
@@ -1050,15 +1064,15 @@ class ConnectCode(UndoSeams, AgentRootBase):
     def test_a_launcher_does_not_act_on_the_root_until_the_operation_ends(self):
         self.root.mkdir(parents=True)
         holder = self.agent_lock_holder()
-        rc, err, _seen = self.launch_with(L)
+        rc, err, _seen = self.launch_with(LA)
         self.assertEqual(rc, cm.EXIT_RETRY, err)
         self.assertIn("the launcher does not act on the root, and the manager starts it again", err)
-        unit = cm.render_supervisor(L)[0]
+        unit = cm.render_supervisor(LA)[0]
         self.assertIn(f"RestartPreventExitStatus={cm.EXIT_HELD}\n", unit, "only 75 stops systemd's restarts")
         self.assertNotIn(str(cm.EXIT_RETRY), unit.split("RestartPreventExitStatus=")[1].splitlines()[0])
         self.assertNotEqual(cm.launchd_exit(cm.EXIT_RETRY), 0, "launchd restarts a non-zero exit")
         unhold(holder)
-        rc, err, _seen = self.launch_with(L)
+        rc, err, _seen = self.launch_with(LA)
         self.assertEqual(rc, cm.EXIT_UNUSABLE, err)
         self.assertIn("stop here", err, "once the operation ended the launcher took the root")
 
@@ -1085,15 +1099,15 @@ class ConnectCode(UndoSeams, AgentRootBase):
         def wired_then_replaced(*a, **kw):
             got = real(*a, **kw)
             self.replace_root_now()
-            cm.supervisor_path(L).write_text(foreign)     # a successor's definition, published meanwhile
+            cm.supervisor_path(LA).write_text(foreign)     # a successor's definition, published meanwhile
             return got
         with mock.patch.object(cb, "wire_bridge", side_effect=wired_then_replaced):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertNotIn("next:", out)
-        self.assertIn(f"{cm.job_name(L)} is no longer the job this connect started (its unit or launcher changed), so "
+        self.assertIn(f"{cm.job_name(LA)} is no longer the job this connect started (its unit or launcher changed), so "
                       f"it was left as it is: stop it by hand", err)
-        self.assertEqual(cm.supervisor_path(L).read_text(), foreign, "the successor's unit is untouched")
+        self.assertEqual(cm.supervisor_path(LA).read_text(), foreign, "the successor's unit is untouched")
         self.assertIsNotNone(fake.runner.pid(), "its job was not stopped")
 
     def test_unwinding_stops_this_attempts_job_and_leaves_a_held_replacement_alone(self):
@@ -1117,7 +1131,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
 
     def test_a_definition_published_by_another_writer_first_is_not_clobbered(self):
         fake, real, theirs = self.bridged(), cm.tempfile.mkstemp, "[Service]\nExecStart=/theirs\n"
-        sup = cm.supervisor_path(L)
+        sup = cm.supervisor_path(LA)
 
         def raced(*a, **kw):
             if kw.get("prefix") == f".{sup.name}." and not sup.exists():
@@ -1136,8 +1150,8 @@ class ConnectCode(UndoSeams, AgentRootBase):
         table = {("launchctl", "bootstrap"): loaded, ("launchctl", "print"): (0, "\tstate = running\n", "")}
         run = lambda cmd, timeout=30: subprocess.CompletedProcess(cmd, *table[(cmd[0], cmd[1])])  # noqa: E731
         with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(sm, "_run", side_effect=run):
-            self.assertEqual(cm.start_supervisor(L, restart=False), "")
-            self.assertIn("launchctl bootstrap failed", cm.start_supervisor(L))
+            self.assertEqual(cm.start_supervisor(LA, restart=False), "")
+            self.assertIn("launchctl bootstrap failed", cm.start_supervisor(LA))
 
     def _main_with(self, fake, *argv):
         with mock.patch.object(sm, "_run", side_effect=fake):
@@ -1187,8 +1201,9 @@ class ConnectCode(UndoSeams, AgentRootBase):
         def installed_then_uninstall_tries(*a, **kw):
             rc = real(*a, **kw)
             got = []
-            t = threading.Thread(target=lambda: got.append(cm.uninstall(L)))
-            with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), contextlib.redirect_stderr(io.StringIO()) as err:
+            t = threading.Thread(target=lambda: got.append(cm.uninstall(LA)))
+            with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), mock.patch.object(cm, "FENCE_WAIT_S", 0.3), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
                 t.start()
                 t.join(30)
             gap.append((got[0], err.getvalue()))
@@ -1198,30 +1213,30 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(gap[0][0], 1, "uninstall could not step in between install's setup and its bridge")
         self.assertIn("another operation on this agent is in progress", gap[0][1])
-        self.assertTrue(cli.config_path().exists() and cm.service_path(cli.BRIDGE).exists(), "installed and wired whole")
+        self.assertTrue(cli.config_path(LA).exists() and cm.service_path(BA).exists(), "installed and wired whole")
 
     def test_uninstall_rereads_the_root_under_its_lock_and_never_acts_on_an_unlocked_one(self):
         a, b, c = self.home / "agents" / "agent-a", self.home / "agents" / "agent-b", self.home / "agents" / "agent-c"
         for swaps, acted in (([b], True), ([b, c], False)):
             with self.subTest(swaps=len(swaps)):
-                self.configure(ROOT=str(a))
+                self.configure(LA, ROOT=str(a))
                 real_lock, real_un, todo, ran = cm.agent_lock, cm._uninstall_locked, list(swaps), []
 
                 def lock(root, *args, **kw):
                     got = real_lock(root, *args, **kw)
                     if todo:
-                        self.configure(ROOT=str(todo.pop(0)))   # another install moves the root meanwhile
+                        self.configure(LA, ROOT=str(todo.pop(0)))   # another install moves the root meanwhile
                     return got
 
                 def uninstall_locked(*args, **kw):
-                    root = cm.read_config(cli.config_path())["ROOT"]
+                    root = cm.read_config(cli.config_path(LA))["ROOT"]
                     ran.append((root, any(str(cm.agent_lock_path(root)) in str(k) for k in cm._AGENT_HELD)))
                     return 0
                 err = io.StringIO()
                 with mock.patch.object(cm, "agent_lock", side_effect=lock), \
                         mock.patch.object(cm, "_uninstall_locked", side_effect=uninstall_locked), \
                         contextlib.redirect_stderr(err):
-                    rc = cm.uninstall(L)
+                    rc = cm.uninstall(LA)
                 if acted:
                     self.assertEqual((rc, ran), (0, [(str(b), True)]), "acted on B with B's lock held")
                 else:
@@ -1233,11 +1248,13 @@ class ConnectCode(UndoSeams, AgentRootBase):
         holder = self.agent_lock_holder()
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(cm.uninstall(L), 1)
-        self.assertIn("no config names the root", err.getvalue())
+            self.assertEqual(cm.uninstall(LA), 1)
+        # An agent's own job names its agent's root by its key, so it waits on that root's own lock.
+        self.assertIn(f"another operation on this agent is in progress (lock {cm.agent_lock_path(self.root)})",
+                      err.getvalue())
         unhold(holder)
         with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(sm, "_run", side_effect=self.bridged()):
-            self.assertEqual(cm.uninstall(L), 0)
+            self.assertEqual(cm.uninstall(LA), 0)
         self.assertIn("nothing to remove", out.getvalue())
 
     def test_an_identity_mismatch_at_start_leaves_a_unit_that_is_no_longer_this_attempts(self):
@@ -1248,14 +1265,14 @@ class ConnectCode(UndoSeams, AgentRootBase):
             rec = real(*a, **kw)
             if rec is not None and not os.path.exists(str(self.root) + ".parked"):
                 self.replace_root_now()
-                cm.supervisor_path(L).write_text(foreign)
+                cm.supervisor_path(LA).write_text(foreign)
             return rec
         with mock.patch.object(cm, "_fresh_holder", side_effect=held_then_moved):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
         self.assertIn("is no longer the job this connect started (its unit or launcher changed)", err)
         self.assertIsNotNone(fake.runner.pid(), "not stopped")
-        self.assertEqual(cm.supervisor_path(L).read_text(), foreign)
+        self.assertEqual(cm.supervisor_path(LA).read_text(), foreign)
 
     def test_the_real_launcher_started_by_install_and_by_connect_ends_up_alive(self):
         for how in ("install", "connect"):
@@ -1274,7 +1291,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
                 self.assertEqual((rec["owner_pid"], rec["live"]), (fake.runner.pid(), True), "and holds the root")
                 fake.runner.stop_session()
                 with mock.patch.object(sm, "_run", side_effect=fake), contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(cm.uninstall(L), 0)
+                    self.assertEqual(cm.uninstall(LA), 0)
 
     def test_a_launcher_holding_the_agent_lock_past_the_wait_is_left_and_reported(self):
         for shim in (False, True):
@@ -1286,7 +1303,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
                 with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim), \
                         mock.patch.object(cm, "_signal_exact", wraps=cm._signal_exact) as signalled:
                     rc, out, err = self.connect(Backend(), fake)
-                    by_hand = f"({cm.stop_command(L)})"
+                    by_hand = f"({cm.stop_command(LA)})"
                 verbs, job = [r.verb(c) for c in r.calls], r.pid()
                 Path(r.pause).touch()
                 try:
@@ -1385,7 +1402,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
             self.assertEqual(cm.install(L, {}, str(self.root)), 1)
         self.assertIn("cannot be used", err.getvalue())
         self.assertIn("is not a directory only this user can use", err.getvalue())
-        rc, err, _seen = self.launch_with(L)
+        rc, err, _seen = self.launch_with(LA)
         self.assertEqual(rc, cm.EXIT_RETRY, err)
         self.assertIn("cannot be used", err)
         self.assertNotIn("Traceback", err)
@@ -1397,7 +1414,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
                 fake.runner.real, fake.runner.shim = True, shim
 
                 def external_first(shape, *a, **kw):
-                    if shape is L and not external:
+                    if shape == LA and not external:
                         fake.runner.start_session(by_manager=True)   # someone else starts the job after the check
                         external.append(fake.runner.session)
                     return real(shape, *a, **kw)
@@ -1441,8 +1458,8 @@ class ConnectCode(UndoSeams, AgentRootBase):
         pid, before, backend = fake.runner.pid(), (self.seat() / "token").read_bytes(), Backend()
         rc, out, err = self.connect(backend, fake)
         self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
-        self.assertIn(f"{cm.job_name(L)} is running for {self.root}; stop it first (systemctl --user stop "
-                      f"{L.service_name}), then connect again; the code was not used", err)
+        self.assertIn(f"{cm.job_name(LA)} is running for {self.root}; stop it first (systemctl --user stop "
+                      f"{LA.service_name}), then connect again; the code was not used", err)
         self.assertEqual(backend.calls, [], "the code is not spent")
         self.assertNotIn("stopped:", out)
         self.assertEqual((self.seat() / "token").read_bytes(), before)
@@ -1454,7 +1471,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
             rc, out, err = self.connect(backend)
         self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
         self.assertIn(f"state cannot be read; connect writes the seat only while it is stopped: stop it "
-                      f"(systemctl --user stop {L.service_name}), then connect again; the code was not used", err)
+                      f"(systemctl --user stop {LA.service_name}), then connect again; the code was not used", err)
         self.assertEqual(backend.calls, [])
 
     def test_a_stopped_job_connects_and_install_starts_it_with_the_new_seat(self):
@@ -1486,15 +1503,15 @@ class ConnectCode(UndoSeams, AgentRootBase):
         fake, real = self.bridged(), cm.start_supervisor
 
         def replaced_then_started(shape, **kw):
-            if shape is L:
+            if shape == LA:
                 os.rename(self.root, str(self.root) + ".parked")
                 os.mkdir(self.root)
             return real(shape, **kw)
         with mock.patch.object(cm, "start_supervisor", side_effect=replaced_then_started):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
-        self.assertIn(f"{self.root} was replaced after install started {cm.job_name(L)}", err)
-        self.assertIn(f"{cm.job_name(L)}, which held the directory that was there, was stopped", err)
+        self.assertIn(f"{self.root} was replaced after install started {cm.job_name(LA)}", err)
+        self.assertIn(f"{cm.job_name(LA)}, which held the directory that was there, was stopped", err)
         self.assertNotIn("next:", out)
         self.assertIsNone(fake.runner.pid(), "no launcher is left to take the replacement")
         self.assertEqual(task_io.lock_held(str(self.root)), "free")
@@ -1521,7 +1538,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertIn("already used or has expired; make a new one in s.space", err)
         self.assertFalse(self.seat().exists())
-        self.assertFalse(cli.config_path().exists())
+        self.assertFalse(cli.config_path(LA).exists())
 
     def test_a_503_is_retried_with_backoff_then_redeemed(self):
         sleeps = []
@@ -1653,10 +1670,10 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertIn(" ", str(link))
         self.assertEqual(self.cfg()["TMUX"], str(link), "the link as named, not its target")
         seen = []
-        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}), \
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", cm.AGENT_VAR: LA.agent}), \
                 mock.patch.object(launcher.Launcher, "_serve", lambda lc: seen.append(lc.tm.tmux) or 0):
             self.assertEqual(self.main("run")[0], 0, "the manager's restart, on launchd's PATH")
-            self.assertEqual(launcher.Launcher(cli.load_config()[0], cli.config_dir()).tm.tmux, str(link),
+            self.assertEqual(launcher.Launcher(cli.load_config(LA)[0], cli.config_dir(LA)).tm.tmux, str(link),
                              "stop and uninstall use the same")
             execs = []
             with mock.patch.object(os, "execv", lambda f, argv: execs.append(f)):
@@ -1672,7 +1689,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
             self.assertIn(why, err)
             self.assertIn("the code was not used", err)
             self.assertEqual((backend.calls, stdin.read()), ([], CODE + "\n"), "no code read, none redeemed")
-            self.assertFalse(cli.config_path().exists())
+            self.assertFalse(cli.config_path(LA).exists())
         with mock.patch.dict(os.environ, {"PATH": str(self.bin)}), mock.patch.object(launcher, "TMUX_DIRS", ()):
             refused("tmux was not found on PATH or in ~/Library/Application Support/space.ag2.app/engine/bin")
             refused("--tmux /nowhere/tmux is not an executable file", "--tmux", "/nowhere/tmux")
@@ -1728,7 +1745,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         unhold(holder)
         self.assertEqual((rc, backend.calls), (cli.EXIT_UNUSABLE, []), err)
         self.assertIn(f"another operation on an agent is in progress (lock {cm.agent_lock_path(self.root)})", err)
-        self.assertFalse(cli.config_path().exists())
+        self.assertFalse(cli.config_path(LA).exists())
 
     def test_under_a_host_supervisor_connect_declares_the_seat_with_no_vault_key(self):
         backend = Backend()
@@ -1737,7 +1754,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
             rc, out, err = self.connect(backend, fake)
         self.assertEqual(rc, 0, err)
         self.assertEqual(len(backend.calls), 1)
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "the supervisor runs it: no unit of its own")
+        self.assertFalse(cm.service_path(BA).exists(), "the supervisor runs it: no unit of its own")
         seat_env = str(self.seat() / ".env")
         cfg = self.cfg()
         self.assertEqual((cfg["BRIDGE"], cfg["TOKEN_ENV_FILE"], cfg["TOKEN_VAULT_KEY"]), ("sparrowd", seat_env, ""))
@@ -1832,8 +1849,8 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(home, self.agents / "probe.agent_ag2.space.bridge", "beside the root, never in it")
         self.assertEqual((cfg["TOKEN_ENV_FILE"], cfg["HITL_STORE"]),
                          (str(self.relay), str(home / "state" / "hitl" / "requirements-claude-local")))
-        unit = cm.service_path(cli.BRIDGE).read_text()
-        self.assertTrue(cm.marked(unit, cli.BRIDGE.marker))
+        unit = cm.service_path(BA).read_text()
+        self.assertTrue(cm.marked(unit, BA.marker))
         self.assertIn(f"Written by {cli.COMMAND} install", unit)
         self.assertIn(f"ExecStart={self.bin / 'ag2-sparrow'}\n", unit, "the bridge's console script, no arguments")
         env = sorted(ln for ln in unit.splitlines() if ln.startswith('Environment="'))
@@ -1841,9 +1858,9 @@ class ConnectAgentRoot(AgentRootBase):
                                       f'Environment="AGENT_CONNECT_RESULT_DIR={self.root}/results"',
                                       f'Environment="AGENT_CONNECT_STATE_DIR={home}/state"',
                                       f'Environment="AGENT_MXID={AGENT}"', f'Environment="AG2_DEVICE_ENV={self.relay}"']))
-        self.assertNotIn(TOKEN, unit + cli.config_path().read_text(), "the token stays in its file")
+        self.assertNotIn(TOKEN, unit + cli.config_path(LA).read_text(), "the token stays in its file")
         self.assertEqual(fake.verbs(), ["show", "enable", "restart"], "absent: registered and started, no stop")
-        self.assertIn(f"started: {cli.BRIDGE.service_name}, feeding {self.root}/tasks as {AGENT}", out)
+        self.assertIn(f"started: {BA.service_name}, feeding {self.root}/tasks as {AGENT}", out)
         self.assertTrue((home / "state").is_dir())
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["results", "tasks"], "the root stays fresh")
 
@@ -1862,13 +1879,13 @@ class ConnectAgentRoot(AgentRootBase):
         seat_env = seat / "channels" / "ag2space" / ".env"
         rc, _out, err = self.install_default(self.bridged(), "--token-env-file", str(seat_env))
         self.assertEqual(rc, 0, err)
-        unit = cm.service_path(cli.BRIDGE).read_text()
+        unit = cm.service_path(BA).read_text()
         for line in (f'Environment="AG2_DEVICE_ENV={seat_env}"', 'Environment="REMOTE_TASK_SEAT=1"',
                      f'Environment="GATEWAY_INSTANCE={"c" * 32}"', 'Environment="REMOTE_TASK_TIER=team"',
                      f'Environment="REMOTE_TASK_TOKEN_FILE={seat_env.parent / "token"}"', f'Environment="AGENT_MXID={AGENT}"',
                      'Environment="REMOTE_TASK_TOKEN="', 'Environment="REMOTE_TASK_URL="', 'Environment="AGENT_ID="'):
             self.assertIn(line + "\n", unit)
-        self.assertNotIn(bearer, unit + cli.config_path().read_text(), "the bearer stays in the seat's token file")
+        self.assertNotIn(bearer, unit + cli.config_path(LA).read_text(), "the bearer stays in the seat's token file")
 
     def test_a_seat_naming_another_agent_than_install_resolved_is_refused(self):
         from ag2_sparrow import gateway_credential_sources as owner
@@ -1880,7 +1897,7 @@ class ConnectAgentRoot(AgentRootBase):
                                                  str(seat / "channels" / "ag2space" / ".env"))
         self.assertNotEqual(rc, 0)
         self.assertIn(f"names @other.agent:ag2.space, not {AGENT}", err)
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+        self.assertFalse(cm.service_path(BA).exists())
 
     def test_a_malformed_seat_env_file_is_refused_before_the_bridge_is_wired(self):
         seat_env = self.home / "seat" / ".env"
@@ -1890,14 +1907,14 @@ class ConnectAgentRoot(AgentRootBase):
         rc, _out, err = self.install_default(fake, "--token-env-file", str(seat_env))
         self.assertNotEqual(rc, 0)
         self.assertIn("GATEWAY_INSTANCE", err)
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "no unit for a seat the bridge would refuse")
+        self.assertFalse(cm.service_path(BA).exists(), "no unit for a seat the bridge would refuse")
 
     def test_on_macos_the_bridge_is_a_plist_with_the_same_dirs(self):
         rc, _, err = self.install_default(self.bridged(), mac=True)
         self.assertEqual(rc, 0, err)
-        body = plistlib.loads(cm.plist_path(cli.BRIDGE).read_bytes())
+        body = plistlib.loads(cm.plist_path(BA).read_bytes())
         self.assertEqual(body["ProgramArguments"], [str(self.bin / "ag2-sparrow")])
-        self.assertEqual((body["Label"], body["KeepAlive"]), (cli.BRIDGE.agent_label, True))
+        self.assertEqual((body["Label"], body["KeepAlive"]), (BA.agent_label, True))
         self.assertEqual({k: body["EnvironmentVariables"][k] for k in ("AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR")},
                          {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks", "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results"})
 
@@ -1911,7 +1928,7 @@ class ConnectAgentRoot(AgentRootBase):
             rc, out, _ = self.main("verify")
             checks = ConnectVerify.checks(None, out)
             self.assertEqual((checks["bridge"], checks["relay"], checks["hitl"]), ("PASS", "PASS", "PASS"), out)
-            self.assertIn(f"PASS bridge unit: {cm.service_path(cli.BRIDGE)} ({cli.BRIDGE.service_name} active)", out)
+            self.assertIn(f"PASS bridge unit: {cm.service_path(BA)} ({BA.service_name} active)", out)
             self.assertIn(f"INFO agent: {AGENT}", out)
             (state / "gateway-status.dev.json").write_text("{torn")
             self.assertIn("PASS bridge", self.main("verify")[1], "an unreadable status is no bridge, never a crash")
@@ -1925,11 +1942,12 @@ class ConnectAgentRoot(AgentRootBase):
                 out = self.main("verify")[1]
                 self.assertIn("FAIL bridge: ", out, over)
                 self.assertIn(why, out)
-            self.assertIn(f"see journalctl --user -u {cli.BRIDGE.service_name}, or run {cli.COMMAND} install again", out)
+            self.assertIn(f"see journalctl --user -u {BA.service_name}, or run {cli.COMMAND} install --agent {AGENT} "
+                          "again", out)
             self.relay.chmod(0o644)
             self.assertEqual(ConnectVerify.checks(None, self.main("verify")[1])["relay"], "FAIL", "the agent's token file")
-            cm.service_path(cli.BRIDGE).unlink()
-            self.assertIn(f"FAIL bridge unit: {cm.service_path(cli.BRIDGE)} missing", self.main("verify")[1])
+            cm.service_path(BA).unlink()
+            self.assertIn(f"FAIL bridge unit: {cm.service_path(BA)} missing", self.main("verify")[1])
 
     def test_uninstall_removes_the_marked_bridge_unit_and_keeps_its_state_and_a_foreign_unit_refuses(self):
         fake = self.bridged()
@@ -1939,22 +1957,22 @@ class ConnectAgentRoot(AgentRootBase):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.verbs(), ["show", "stop", "disable", "show"])
-        self.assertIn(f"removed: {cm.service_path(cli.BRIDGE)}", out)
-        self.assertLess(out.index(f"removed: {cm.service_path(cli.BRIDGE)}"), out.index(f"removed: {cli.config_path()}"))
+        self.assertIn(f"removed: {cm.service_path(BA)}", out)
+        self.assertLess(out.index(f"removed: {cm.service_path(BA)}"), out.index(f"removed: {cli.config_path(LA)}"))
         self.assertTrue((cli.bridge_home(self.root) / "state").is_dir(), "the bridge's state is kept")
         self.assertIn(f"kept: {self.relay} (Sparrow's token)", out)
         fake = self.bridged()
         self.assertEqual(self.install_default(fake)[0], 0)
-        cm.service_path(cli.BRIDGE).write_text("[Service]\nExecStart=/mine\n")
+        cm.service_path(BA).write_text("[Service]\nExecStart=/mine\n")
         with mock.patch.object(sm, "_run", side_effect=fake):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 1)
         self.assertIn("was not written by install", err)
-        self.assertTrue(cli.config_path().exists(), "config last: kept on any refusal")
+        self.assertTrue(cli.config_path(LA).exists(), "config last: kept on any refusal")
         rc, _, err = self.install_default(fake)
         self.assertEqual(rc, 2, err)
         self.assertIn("the session is installed but its bridge is not", err)
-        cm.service_path(cli.BRIDGE).unlink()
+        cm.service_path(BA).unlink()
         for table, why in (({"show": None}, "state is unknown"), ({"stop": None}, "could not run"),
                            ({"restart": 1}, "restart")):
             fake.table = table
@@ -1973,7 +1991,7 @@ class ConnectAgentRoot(AgentRootBase):
         with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
         with mock.patch.object(cm, "console_script",
-                               side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
+                               side_effect=lambda shape: "" if shape == BA else str(self.bin / shape.command)):
             rc, _, err = self.install_default(fake)
         self.assertEqual(rc, 2, err)
         self.assertIn("its bridge is not: ag2-sparrow was not found beside", err)
@@ -1984,7 +2002,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(rc, 2)
         self.assertIn(f"the agent id is unknown, so its root cannot be named: bind the agent first, or set AGENT_MXID in "
                       f"{self.relay} or the environment, or pass --work <dir>", err)
-        self.assertFalse(cli.config_path().exists() or self.agents.exists(), "nothing written")
+        self.assertFalse(cli.config_path(LA).exists() or self.agents.exists(), "nothing written")
         with mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
             rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(self.home / "none.env"))
         self.assertEqual(rc, 2)
@@ -1997,7 +2015,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(rc, 2)
         self.assertIn(f"a running bridge already serves {AGENT}", err)
         self.assertIn("one token is one bridge", err)
-        self.assertFalse(cli.config_path().exists())
+        self.assertFalse(cli.config_path(LA).exists())
 
     def test_the_host_binding_names_the_agent_only_for_the_hosts_own_token(self):
         self.relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
@@ -2006,7 +2024,7 @@ class ConnectAgentRoot(AgentRootBase):
         (auth / "ag2space.json").write_text(json.dumps({"agent_id": "@bound:ag2.space"}))
         self.addCleanup((auth / "ag2space.json").unlink, missing_ok=True)
         bound = self.agents / "bound_ag2.space"
-        fake = self.bridged(root=bound)
+        fake = self.bridged(root=bound, shape=cm.for_key(L, cm.agent_key("@bound:ag2.space")))
         rc, _, err = self.install_default(fake)
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.cfg()["ROOT"], str(bound), "bind first: the host's binding names its own token's agent")
@@ -2019,11 +2037,12 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertIn(f"set AGENT_MXID in {other}", err, "another token never borrows the host's binding")
         other.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\nAGENT_MXID=@second:ag2.space\n")
         second = self.agents / "second_ag2.space"
-        rc, _, err = self.install_default(self.bridged(root=second), "--token-env-file", str(other))
+        rc, _, err = self.install_default(self.bridged(root=second, shape=cm.for_key(L, cm.agent_key("@second:ag2.space"))),
+                                          "--token-env-file", str(other))
         self.assertEqual(rc, 0, err)
         self.assertEqual((self.cfg()["ROOT"], self.cfg()["TOKEN_ENV_FILE"]), (str(second), str(other)))
         self.assertEqual(cli.kept_token(self.cfg()), str(other))
-        self.assertEqual(cm.kept_line(cli.LOCAL, str(other)), f"kept: {other} (Sparrow's token) and the Claude login",
+        self.assertEqual(cm.kept_line(LA, str(other)), f"kept: {other} (Sparrow's token) and the Claude login",
                          "uninstall names the token file this install configured, not the host's")
         self.assertNotEqual(second, bound, "two agents, two roots")
 
@@ -2035,9 +2054,9 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(rc, 1)
         self.assertIn(f"the work root {self.work} serves the agent @other:ag2.space, not {AGENT}; two agents never share "
                       "a root", err)
-        self.assertFalse(cli.config_path().exists(), "refused before anything was applied")
+        self.assertFalse(cli.config_path(LA).exists(), "refused before anything was applied")
         cfg = dict(self.values(AGENT_ID=AGENT), ROOT=str(self.work))
-        lc = launcher.Launcher(cfg, cli.config_dir())
+        lc = launcher.Launcher(cfg, cli.config_dir(LA))
         with mock.patch.object(tmux_pane_keys, "fence_status", return_value="clear"), \
                 mock.patch.object(task_io, "holder_consumer", return_value=None):
             ok, problem = lc.create(records.empty_supervisor())
@@ -2051,7 +2070,7 @@ class ConnectAgentRoot(AgentRootBase):
         rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
         self.assertEqual(rc, 0, err)
         self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["AGENT_ID"], self.cfg()["TOKEN_ENV_FILE"]), ("external", AGENT, ""))
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "an explicit root's bridge is yours")
+        self.assertFalse(cm.service_path(BA).exists(), "an explicit root's bridge is yours")
         self.assertEqual(cli.bridge_mode({}), "external", "a config from before BRIDGE existed")
 
     def test_install_records_the_bridges_state_dir_once_and_verify_reads_the_bridge_there(self):
@@ -2063,7 +2082,7 @@ class ConnectAgentRoot(AgentRootBase):
         beside = cli.bridge_home(self.root) / "state"
         self.assertEqual((self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"], cli.bridge_state(self.cfg())),
                          (str(beside), str(card.store_root(beside)), beside))
-        self.assertIn(f'Environment="AGENT_CONNECT_STATE_DIR={beside}"', cm.service_path(cli.BRIDGE).read_text(),
+        self.assertIn(f'Environment="AGENT_CONNECT_STATE_DIR={beside}"', cm.service_path(BA).read_text(),
                       "the unit is written from the recorded dir")
         rc, _, err = self.install_default(fake, "--bridge-state-dir", str(self.home / "elsewhere"))
         self.assertEqual(rc, 2)
@@ -2120,7 +2139,7 @@ class ConnectHostSupervised(AgentRootBase):
         rc, out, err = self.install_default(fake)
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.calls, [], "no bridge job of its own")
-        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+        self.assertFalse(cm.service_path(BA).exists())
         body = json.loads(self.decl().read_text())
         seg = "probe.agent_ag2.space"
         self.assertEqual(body["env"], {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks",
@@ -2175,7 +2194,7 @@ class ConnectHostSupervised(AgentRootBase):
             self.assertEqual(self.decl().read_text(), text)
             with mock.patch.object(sm, "_run", side_effect=fake):
                 self.assertEqual(self.main("uninstall")[0], 1)
-            self.assertTrue(cli.config_path().exists())
+            self.assertTrue(cli.config_path(LA).exists())
         self.decl().unlink()
         with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)

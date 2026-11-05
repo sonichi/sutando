@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import plistlib
 import re
 import shlex
 import sys
@@ -32,12 +31,7 @@ BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 CONFIG_KEYS = ("AGENT_ID", "BRIDGE", "TOKEN_ENV_FILE", "TOKEN_VAULT_KEY", "BRIDGE_STATE_DIR")
 
 
-def bridge_shape(local: cm.Shape) -> cm.Shape:
-    """The agent's gateway bridge, when `local`'s install runs it: the console script with no arguments."""
-    return cm.Shape(name=f"{local.name}-bridge", command="ag2-sparrow", writer=local.command,
-                    description=f"the gateway bridge of the {local.name} agent", cli="ag2-sparrow",
-                    min_version=(0, 0, 0), version_anchor="", version_note="", required_keys=(), config_keys=(),
-                    env_keep=(), kept="", run_args=(), service_args=())
+bridge_shape = cm.bridge_shape
 
 
 def bridge_mode(cfg: dict) -> str:
@@ -175,62 +169,65 @@ def _writer(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _unit_environ(text: str) -> dict:
-    """The variables a bridge unit or plist runs with, as cm.render_supervisor wrote them."""
-    if text.startswith("<?xml"):
-        try:
-            env = plistlib.loads(text.encode("utf-8")).get("EnvironmentVariables")
-        except Exception:  # noqa: BLE001 - an unparsable plist names no agent
-            return {}
-        return env if isinstance(env, dict) else {}
-    return {m.group(1): re.sub(r"\\(.)", r"\1", m.group(2)).replace("%%", "%")
-            for m in re.finditer(r'^Environment="([A-Z_][A-Z0-9_]*)=(.*)"$', text, re.M)}
+_unit_environ = cm.unit_environ
 
 
-def _named(name: str, command: str) -> cm.Shape:
+def _named(name: str, command: str, key: str = "") -> cm.Shape:
     return cm.Shape(name=name, command=command, description="", cli="", min_version=(0, 0, 0), version_anchor="",
-                    version_note="", required_keys=(), config_keys=(), env_keep=(), kept="")
+                    version_note="", required_keys=(), config_keys=(), env_keep=(), kept="", agent=key)
+
+
+def _config_paths() -> list:
+    """Each adapter's config on this host: the single-agent ones, then each agent's own."""
+    base = cm.config_root()
+    return sorted(base.glob("*.conf"))[:64] + sorted(base.glob(f"{cm.AGENTS_DIR}/*/*.conf"))[:256]
 
 
 def _other_bridges(local: cm.Shape, root, agent_id: str) -> dict:
-    """{adapter: (its command, its bridge mode, the agent it serves)} for each other adapter whose config or
-    bridge unit on this host names `root` or `agent_id` (root None: any agent)."""
+    """{job: (that job's Shape, its command, its bridge mode, the agent it serves)} for each other job on this
+    host whose config or bridge unit names `root` or `agent_id` (root None: any agent)."""
     def names(r, a):
         return root is None or r == root or bool(agent_id) and a == agent_id
-    found = {}
-    for path in sorted(cm.config_path(local).parent.glob("*.conf"))[:64]:
+    found, mine = {}, (local.name, local.agent)
+    for path in _config_paths():
+        job = _named(path.stem, "", path.parent.name if path.parent != cm.config_root() else "")
         text, _ = cm.file_text(path, "config")
         try:
             cfg = cm.read_config(path) if text else {}
         except (OSError, ValueError):
             cfg = {}
-        if path.stem != local.name and bridge_mode(cfg) != EXTERNAL and names(cfg.get("ROOT"), cfg.get("AGENT_ID")):
-            found[path.stem] = (_writer(text), bridge_mode(cfg), cfg.get("AGENT_ID") or cfg.get("ROOT"))
-    head, tail = cm.supervisor_path(bridge_shape(_named("*", ""))).name.split("*")
-    for path in sorted(cm.supervisor_path(bridge_shape(local)).parent.glob(f"{head}*{tail}"))[:64]:
-        name, (text, _) = path.name[len(head):-len(tail)], cm.file_text(path, "supervisor file")
+        if (job.name, job.agent) != mine and bridge_mode(cfg) != EXTERNAL and names(cfg.get("ROOT"), cfg.get("AGENT_ID")):
+            found[job.job] = (job, _writer(text), bridge_mode(cfg), cfg.get("AGENT_ID") or cfg.get("ROOT"))
+    head, tail = cm.supervisor_path(_named("*", "")).name.split("*")
+    for path in sorted(cm.supervisor_path(bridge_shape(local)).parent.glob(f"{head}*-bridge*{tail}"))[:256]:
+        base, _, key = path.name[len(head):-len(tail)].partition(".")
+        if not base.endswith("-bridge") or (key and not cm.AGENT_KEY_RE.fullmatch(key)):
+            continue
+        job = _named(base[:-len("-bridge")], "", key)
+        text, _ = cm.file_text(path, "supervisor file")
         env = _unit_environ(text or "")
         tasks = env.get("AGENT_CONNECT_TASK_DIR", "")
-        if name != local.name and tasks and names(os.path.dirname(tasks), env.get("AGENT_MXID")):
-            found.setdefault(name, (_writer(text), UNIT, env.get("AGENT_MXID") or tasks))
+        if (job.name, job.agent) != mine and tasks and names(os.path.dirname(tasks), env.get("AGENT_MXID")):
+            found.setdefault(job.job, (job, _writer(text), UNIT, env.get("AGENT_MXID") or tasks))
     return found
 
 
 def bridge_owner_problem(local: cm.Shape, root, agent_id: str = "") -> str:
-    """'' unless another adapter's bridge for this agent (root None: for any agent) is on this host or cannot
+    """'' unless another job's bridge for this agent (root None: for any agent) is on this host or cannot
     be shown gone: one agent is one bridge, whichever adapter runs it. A unit is gone once its file and job
     are; a host supervisor's declaration is the credential owner's to read, so only its uninstall clears it."""
-    for name, (command, mode, served) in sorted(_other_bridges(local, root, agent_id).items()):
-        other = bridge_shape(_named(name, command or f"ag2-sparrow-{name}"))
+    for _job, (job, command, mode, served) in sorted(_other_bridges(local, root, agent_id).items()):
+        owner = _named(job.name, command or f"ag2-sparrow-{job.name}", job.agent)
+        other = bridge_shape(owner)
         where = cm.job_name(other) if mode == UNIT else f"declared for {mode}"
         gone = mode == UNIT and not os.path.lexists(cm.supervisor_path(other)) and cm.manager_state(other) == "absent"
         if not gone:
-            return (f"{served} already has a bridge, run by {name} ({where}); one agent is one bridge: run "
-                    f"{other.writer} uninstall first, then this command again")
+            return (f"{served} already has a bridge, run by {job.name} ({where}); one agent is one bridge: run "
+                    f"{cm.uninstall_command(owner)} first, then this command again")
     return ""
 
 
-AGENT_ID_RE = re.compile(r"@[^\s:]+:\S+")
+AGENT_ID_RE = cm.AGENT_ID_RE
 
 
 def connect_agent_problem(agent_id) -> str:
@@ -241,6 +238,57 @@ def connect_agent_problem(agent_id) -> str:
     if not AGENT_ID_RE.fullmatch(agent_id):
         return (f"--agent {agent_id} is not a Matrix ID (@name:server); copy the connect command from the "
                 "app again")
+    return ""
+
+
+def recorded_install_args(args, local: cm.Shape, fields) -> str:
+    """`install <selector>` with no token env file of its own: the job the selector names lends its recorded token
+    file and options (`fields`: (config key, option, value from the recorded one)), each only where the command
+    did not give that option, so a printed repair line reinstalls that job as it was installed. Nothing recorded
+    is used, or run, unless cm.proven_record proves the record that job's on its own root: else why not."""
+    if getattr(args, "token_env_file", None) or getattr(args, "inbox", None):
+        return ""
+    agent, work = getattr(args, "agent", None) or "", getattr(args, "work", None) or ""
+    key, single = getattr(args, "key", None), getattr(args, "single", False)
+    if not (agent or key or single or work):
+        return ""
+    job, _ = cm.select_job(local, agent, work, single, key)
+    if job is None:
+        return ""
+    segment = job.agent or (cm.agent_key(agent) if agent else "")
+    root = str(Path(work).expanduser().resolve()) if work else \
+        cm.canonical_root(str(_dirs.agents_dir() / segment), "")[0] if segment else cm.unit_root(job)
+    if not root:
+        return ""
+    cfg, problem = cm.proven_record(job, root)
+    if problem:
+        return (f"{problem}; nothing it records was used or run; or pass the agent's own --token-env-file and "
+                "options")
+    if not work and cfg.get("TOKEN_ENV_FILE"):
+        args.token_env_file = cfg["TOKEN_ENV_FILE"]
+    opts = getattr(getattr(args, "parser", None), "_option_string_actions", {})
+    given = {_dest_of(opts, a.split("=", 1)[0]) for a in getattr(args, "argv", ()) if a.startswith("--")}
+    for cfg_key, dest, value in fields:
+        recorded = value(cfg.get(cfg_key) or "")
+        if recorded and dest not in given:
+            setattr(args, dest, recorded)
+    return ""
+
+
+def _dest_of(opts: dict, given: str) -> str:
+    """The option `given` names as argparse reads it: exactly, or by its unique prefix."""
+    if given in opts:
+        return opts[given].dest
+    found = {opts[o].dest for o in opts if o.startswith(given)}
+    return found.pop() if len(found) == 1 else ""
+
+
+def agent_arg_problem(given, agent_id: str) -> str:
+    """'' unless install's --agent names another agent than the one its token or root resolves to."""
+    given = (given or "").strip()
+    if given and given != agent_id:
+        return (f"--agent {given} is not the agent this install serves ({agent_id or 'it names none'}); pass that "
+                "agent's own token env file (--token-env-file); nothing was changed")
     return ""
 
 
@@ -274,22 +322,28 @@ def session_flags(args) -> list:
     return out
 
 
-def rerun_install(command: str, token_file: str, flags=()) -> str:
-    """The install that repeats one given the agent's own seat (`token_file`) and these session flags,
-    else the bare one."""
-    return f"{command} install " + (shlex.join([*flags, "--token-env-file", token_file]) if token_file else "again")
+def rerun_install(local: cm.Shape, token_file: str, flags=()) -> str:
+    """The install of the job `local` that repeats one given the agent's own seat (`token_file`) and these session
+    flags, else that job's install again."""
+    return cm.job_command(local, "install") + (" " + shlex.join([*flags, "--token-env-file", token_file]) if token_file
+                                               else " again")
 
 
-def spent_code_line(command: str, seat_env: str, flags=()) -> str:
+def spent_code_line(local: cm.Shape, seat_env: str, flags=()) -> str:
     """After a connect whose install failed: the code is spent, but the seat it wrote recovers it."""
     return (f"the code is spent and its credential is in the seat {seat_env}; once the line above is fixed, run "
-            f"{rerun_install(command, seat_env, flags)} (no new code is needed)")
+            f"{rerun_install(local, seat_env, flags)} (no new code is needed)")
+
+
+def bridge_owner(bridge: cm.Shape, command: str) -> cm.Shape:
+    """The job whose install wrote `bridge`."""
+    return _named(bridge.name[:-len("-bridge")], command, bridge.agent)
 
 
 def bridge_fix(cfg: dict, command: str, bridge: cm.Shape) -> str:
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
     if mode == UNIT:
-        return f"see {cm.launcher_log(bridge)}, or run {command} install again"
+        return f"see {cm.launcher_log(bridge)}, or run {cm.job_command(bridge_owner(bridge, command), 'install')} again"
     if mode != EXTERNAL:
         where = (f"the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}" if cfg.get("TOKEN_VAULT_KEY") else
                  f"the token in the seat {cfg.get('TOKEN_ENV_FILE')} names")
@@ -320,26 +374,83 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
     return ""
 
 
-def under_agent_lock(root: str, fn, local: "cm.Shape | None" = None, agent_id: str = "") -> int:
+def under_agent_lock(root: str, fn, local: "cm.Shape | None", agent_id: str, fence: str, orphan=None) -> int:
     """fn() under the agent lock for `root`, so an install's local setup and its bridge wiring are one
     operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy. With
     `local`, the install that wires the agent's bridge, refused first while another adapter's bridge serves
-    the agent. The job it started is settled once the lock is released (cm.settle)."""
+    the agent. The job it started is settled once the lock is released (cm.settle), all of it inside the
+    agent's fence (`fence`, cm.fence_name), so no other operation on the agent runs before that settle ends.
+    An install that failed after it first touched a session or bridge (cm.mark_mutated) then runs `orphan()`: no
+    bridge of the agent is left running without its session; a refusal before that point leaves everything as it was."""
+    cm.begin_operation()    # first: a refusal at the fence or the lock must not read the last invocation's mark
     try:
-        with cm.agent_lock(root):
-            problem = bridge_owner_problem(local, root, agent_id) if local is not None else ""
-            if problem:
-                print(f"error: {problem}; nothing was changed", file=sys.stderr)
-                return cm.EXIT_UNUSABLE
+        with cm.agent_fence(fence):
             try:
-                rc = fn()
-            except BaseException:
-                cm.abort_pending(root)
-                raise
+                with cm.agent_lock(root):
+                    problem = bridge_owner_problem(local, root, agent_id) if local is not None else ""
+                    if problem:
+                        print(f"error: {problem}; nothing was changed", file=sys.stderr)
+                        return cm.EXIT_UNUSABLE
+                    try:
+                        rc = fn()
+                    except BaseException:
+                        cm.abort_pending(root)
+                        raise
+            except cm.Busy as e:
+                print(f"error: {e}", file=sys.stderr)
+                rc = 1
+            rc = cm.settle(root, rc)
+            line = _reconciled(root, orphan) if rc != 0 and orphan is not None and cm.mutated() else ""
+            if line:
+                print(line, file=sys.stderr)
+            return rc
     except cm.Busy as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    return cm.settle(root, rc)
+
+
+def fenced(agent_id, fn) -> int:
+    """fn() inside `agent_id`'s fence (connect: the redemption and the install it runs are one operation); an id
+    that is not one runs fn() unfenced, which refuses it."""
+    if not (agent_id and cm.AGENT_ID_RE.fullmatch(agent_id)):
+        return fn()
+    try:
+        with cm.agent_fence(cm.agent_key(agent_id)):
+            return fn()
+    except cm.Busy as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def _reconciled(root: str, orphan) -> str:
+    """orphan() under the agent lock a launcher's admission takes, so no session can take the root between its
+    check of who holds the root and its teardown; while the lock is busy nothing is torn down, and said."""
+    try:
+        with cm.agent_lock(root):
+            return orphan()
+    except cm.Busy as e:
+        return f"the agent's bridge was left as it is ({e})"
+
+
+def orphan_bridge(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape) -> str:
+    """After a failed install, under the agent's fence and lock (_reconciled): when no session serves the root (its
+    managed job is not running and no live holder, managed or foreground, holds it), its bridge is stopped or its
+    declaration withdrawn, so no bridge runs without a session; the line saying so, or ''."""
+    mode, root = bridge_mode(cfg), cm.work_root(cfg)
+    if mode == EXTERNAL or cm.manager_state(local) == "active":
+        return ""
+    held = cm.lock_held(root)
+    if held != "free":
+        return f"the agent's bridge was kept: {root} is {cm.holder_line(root)}" if held == "held" else \
+            f"the agent's bridge was kept: who holds {root} cannot be read"
+    if mode != UNIT:
+        line = _withdraw(cfg, command)
+        return f"{line}: its session is not running" if line else ""
+    if cm.manager_state(bridge) != "active":
+        return ""
+    problem = cm.stop_supervisor(bridge)
+    return (f"{cm.job_name(bridge)} could not be stopped ({problem}): stop it by hand ({cm.stop_command(bridge)})"
+            if problem else f"stopped: {cm.job_name(bridge)}, since its session is not running")
 
 
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
@@ -381,7 +492,7 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
         return problem
     after = _bytes(artifact)
     note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
-        f"the bridge declaration is left for {command} uninstall to remove; "
+        f"the bridge declaration is left for {cm.uninstall_command(local)} to remove; "
     if before is None and after is not None:
         note = f"{_unwire_ours(cfg, command, bridge, artifact, after)}; "
     stopped = cm.stop_started(local, root)
@@ -392,17 +503,17 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
 
 
 def _unwire_ours(cfg: dict, command: str, bridge: cm.Shape, artifact: Path, wired: bytes) -> str:
-    """The undo of this attempt's wiring, under the start's undo. Its manager stops a bridge job only by
-    name, which could stop a start this attempt did not make, so a registered or running bridge is left and
-    said; only an unregistered unit that still holds the bytes this attempt wrote is removed."""
+    """The undo of this attempt's wiring, which never started it. Its manager stops a bridge job only by name,
+    which could stop a start this attempt did not make, so a running (or unreadable) bridge is left and said;
+    a unit that is not running and still holds the bytes this attempt wrote is removed."""
     if _bytes(artifact) != wired:
         return (f"{cm.job_name(bridge)} is no longer the unit this attempt wrote, so it was left: stop it by hand "
                 f"({cm.stop_command(bridge)})")
     state = cm.manager_state(bridge)
-    if state != "absent":
+    if state in ("active", "unknown"):
         return (f"the bridge this attempt wired ({cm.job_name(bridge)}) is {state} and was left, since stopping it "
-                f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run {command} "
-                "uninstall")
+                f"would name whatever runs as it now: stop it by hand ({cm.stop_command(bridge)}), or run "
+                f"{cm.uninstall_command(bridge_owner(bridge, command))}")
     try:
         artifact.unlink()
     except OSError as e:
@@ -424,22 +535,16 @@ def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
     if problem:
         return problem
     bridge_state(cfg).mkdir(parents=True, exist_ok=True)
+    # Inside an install, the bridge starts only once its session holds the root (cm.await_started).
+    pending = cm.pending_start(bridge_owner(bridge, command))
     if mode != UNIT:
-        path = bridge_home(root) / DECLARATION
-        name = worker_name(Path(root).name)
-        problem = _sources.write_bridge_declaration(
-            path, written_by=f"{command} install", host=mode, name=name, module=BRIDGE_MODULE,
-            env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
-        if problem:
-            return problem
-        if not cfg["TOKEN_VAULT_KEY"]:
-            print(f"declared: {path} ({mode} runs it as worker {name} on its next scan, with the seat "
-                  f"{cfg['TOKEN_ENV_FILE']} and the token file it names)")
-            return ""
-        print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
-              f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
-        print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
-              f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
+        def declare() -> str:
+            return _declare(cfg, command, env)
+        if pending is None:
+            return declare()
+        pending.setdefault("then", []).append(declare)
+        pending.setdefault("failed", []).append(lambda: _withdraw(cfg, command))
+        print(f"the bridge is declared for {mode} once the session holds {root}")
         return ""
     sup = cm.supervisor_path(bridge)
     text, problem = cm.owned_text(sup, cm.supervisor_marker(bridge), "supervisor file")
@@ -457,11 +562,58 @@ def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
             return problem
     cm._write(sup, unit, 0o644)
     print(f"installed: {sup}")
-    problem = cm.start_supervisor(bridge)
+
+    def start() -> str:
+        problem = cm.start_supervisor(bridge)
+        if problem:
+            left = _unstarted(cfg, command, bridge, sup, wired) if pending is not None else ""
+            return f"{problem}; {left}" if left else problem
+        print(f"started: {cm.job_name(bridge)}, feeding {root}/tasks as {cfg['AGENT_ID']}")
+        return ""
+    wired = unit.encode("utf-8")
+    if pending is None:
+        return start()
+    pending.setdefault("then", []).append(start)
+    pending.setdefault("failed", []).append(lambda: _unstarted(cfg, command, bridge, sup, wired))
+    print(f"{cm.job_name(bridge)} starts once the session holds {root}")
+    return ""
+
+
+def _unstarted(cfg: dict, command: str, bridge: cm.Shape, sup: Path, wired: bytes) -> str:
+    """The bridge unit an install wrote and never started (its session never held the root, or the start was
+    refused), removed as _unwire_ours does; '' when it no longer holds those bytes (an undo already took it)."""
+    return _unwire_ours(cfg, command, bridge, sup, wired) if _bytes(sup) == wired else ""
+
+
+def _declare(cfg: dict, command: str, env: dict) -> str:
+    """The declaration a host supervisor runs the agent's bridge from; '' or why not."""
+    root, mode = cm.work_root(cfg), bridge_mode(cfg)
+    name = worker_name(Path(root).name)
+    problem = _sources.write_bridge_declaration(
+        bridge_home(root) / DECLARATION, written_by=f"{command} install", host=mode, name=name,
+        module=BRIDGE_MODULE, env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
     if problem:
         return problem
-    print(f"started: {cm.job_name(bridge)}, feeding {root}/tasks as {cfg['AGENT_ID']}")
+    if not cfg["TOKEN_VAULT_KEY"]:
+        print(f"declared: {bridge_home(root) / DECLARATION} ({mode} runs it as worker {name} on its next scan, with "
+              f"the seat {cfg['TOKEN_ENV_FILE']} and the token file it names)")
+        return ""
+    print(f"declared: {bridge_home(root) / DECLARATION} ({mode} runs it as worker {name} on its next scan; the token "
+          f"is read from the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
+    print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
+          f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
     return ""
+
+
+def _withdraw(cfg: dict, command: str) -> str:
+    """After a session that never held its root: the agent's declaration this install owns, removed, so its
+    supervisor stops the bridge on its next scan; the line saying so, or why it was left."""
+    root = cm.work_root(cfg)
+    removed, problem = _sources.remove_bridge_declaration(bridge_home(root) / DECLARATION,
+                                                          written_by=f"{command} install")
+    if problem:
+        return f"the bridge declaration beside {root} was left ({problem})"
+    return f"the bridge declaration beside {root} was withdrawn" if removed else ""
 
 
 def unwire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
@@ -504,7 +656,8 @@ def relay_rows(results: list, cfg: dict, command: str, bridge: cm.Shape) -> None
         sup = cm.supervisor_path(bridge)
         text, problem = cm.supervisor_text(sup)
         cm.check(results, text is not None and cm.marked(text, cm.supervisor_marker(bridge)), "bridge unit",
-                 problem or (f"{sup} missing; run {command} install" if text is None else
+                 problem or (f"{sup} missing; run {cm.job_command(bridge_owner(bridge, command), 'install')}"
+                             if text is None else
                              f"{sup} ({cm.job_name(bridge)} {cm.manager_state(bridge)})"))
     elif mode != EXTERNAL:
         where = (f"the vault key {cfg.get('TOKEN_VAULT_KEY')}, read by {mode} at start" if cfg.get("TOKEN_VAULT_KEY")
@@ -553,6 +706,9 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     The bearer never leaves the seat's token file."""
     agent_id = (agent_id or "").strip()
     problem = connect_agent_problem(agent_id)
+    if not problem:     # the agent's own job, or its earlier one
+        job, problem = cm.agent_job(local, agent_id)
+        local = job or local
     problem = problem or (preflight() or cm.active_job_problem(local) or agent_owner_problem(local, agent_id)
                           or known_root_problem(local))
     code, why = cm.read_code(code_arg) if not problem else ("", "")
@@ -583,7 +739,7 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     if problem:
         lock.release()
         return None, problem
-    return dict(seat, lock=lock), ""
+    return dict(seat, lock=lock, local=local), ""
 
 
 def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict, str]":
@@ -614,7 +770,7 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
         seat["lock"].release()
     rc = cm.settle(seat["root"], rc)
     if rc == 0:
-        print(f"next: {command} verify (the bridge reports connected within a minute)")
+        print(f"next: {cm.job_command(seat['local'], 'verify')} (the bridge reports connected within a minute)")
     else:
-        print(f"error: {spent_code_line(command, seat['seat_env'], flags)}", file=sys.stderr)
+        print(f"error: {spent_code_line(seat['local'], seat['seat_env'], flags)}", file=sys.stderr)
     return rc
