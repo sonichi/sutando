@@ -2056,7 +2056,7 @@ class LauncherTmux(ConnectBase):
         order = []
         real_free, real_stray = cm._await_free, cli.stop_stray
         with mock.patch.object(cm, "_await_free", lambda root, *a, **k: order.append("free") or real_free(root, *a, **k)), \
-                mock.patch.object(cli, "stop_stray", lambda cfg: order.append("stray") or real_stray(cfg)), \
+                mock.patch.object(cli, "stop_stray", lambda cfg, *a: order.append("stray") or real_stray(cfg, *a)), \
                 mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, out + err)
@@ -2591,8 +2591,8 @@ class LocalCommands(ConnectBase):
         routing = state / "owner-routing.json"
         routing.unlink(missing_ok=True)
         line = cli.projection_lines(cli.load_config()[0])
-        self.assertEqual(line, ["INFO pending projection: %s (no primary gateway); on this machine: %s stop --confirm"
-                                % (req.id, cli.COMMAND)])
+        self.assertEqual(line, ["INFO pending projection: %s (no primary gateway); on this machine: %s stop --confirm "
+                                "--work %s" % (req.id, cli.COMMAND, self.work)])
         routing.write_text("{}")
         self.addCleanup(routing.unlink, missing_ok=True)
         self.assertIn("(gateway predates claude-local)", cli.projection_lines(cli.load_config()[0])[0])
@@ -3262,7 +3262,8 @@ class StartupDialogAndRefusals(ConnectBase):
             self.assertEqual(rc, cm.EXIT_HELD, "the manager stops: launchd's 0, systemd's RestartPreventExitStatus")
             self.assertEqual(launcher.launchd_exit(rc), 0)
             self.assertIn("is not a fresh work dir for this adapter (it holds stray)", self.lines[0])
-            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install again")
+            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install "
+                                            f"--work {self.work} again")
             lc = self.launcher()
             with mock.patch.object(inbox, "prepare_root", return_value="refusing to start: cannot check /w: EIO"):
                 self.assertEqual(lc.tick(lc.record())[0], launcher.EXIT_RETRY)
@@ -3293,7 +3294,7 @@ class StartupDialogAndRefusals(ConnectBase):
         for _ in range(3):
             rec = lc.observe(rec)
         self.assertEqual(self.lines, [f"the session waits at Claude Code's folder-trust dialog; answer it in the pane "
-                                      f"({cli.COMMAND} attach)", "the session is past its startup dialog"])
+                                      f"({cli.COMMAND} attach --single)", "the session is past its startup dialog"])
 
     def test_verify_fails_on_a_pane_waiting_at_a_dialog_and_reports_the_trust_record(self):
         runner = self.runner()
@@ -3310,7 +3311,7 @@ class StartupDialogAndRefusals(ConnectBase):
         self.assertEqual(rc, 1)
         self.assertIn(f"INFO folder trust: {self.inbox} recorded", out)
         self.assertIn(f"FAIL session: the pane waits at Claude Code's folder-trust dialog, so no task is answered; run "
-                      f"{cli.COMMAND} attach and answer it", out)
+                      f"{cli.COMMAND} attach --work {self.work} and answer it", out)
         for present, pane in ((True, READY_PANE), (False, TRUST_PANE), (None, TRUST_PANE)):
             with mock.patch.object(launcher.Tmux, "has_session", return_value=present), \
                     mock.patch.object(launcher.Tmux, "capture", return_value=pane):

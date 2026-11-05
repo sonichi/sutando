@@ -324,7 +324,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
+from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
@@ -1583,10 +1583,11 @@ def _guard_tier(tid: str, resolve, filter_enabled):
     return tfile, tier, scan_sensitive_data
 
 
-def _guarded_result_labels(tid: str) -> dict:
-    """The task's Activity title and outcome from its side file, each kept only when the result
-    guard passes it unchanged for the task's tier; {} when the guard cannot be loaded."""
-    labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}")
+def _guarded_result_labels(tid: str, generation=None) -> dict:
+    """The task's Activity title and outcome from its side file, when written for the bytes of
+    `generation`; each kept only when the result guard passes it unchanged for the task's tier."""
+    labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}",
+                                getattr(generation, "digest", None))
     if not labels:
         return {}
     try:
@@ -2652,6 +2653,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # the agent's safe parser must see which hook or row change it serves.
                 "hook",
                 "summon",
+                # AgentTrigger context, above "task" so the strict parser reads it: the event
+                # behind this task, its idempotency id and the playbook it names.
+                "event_type", "agent_trigger_id", "playbook",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2695,12 +2699,12 @@ def _context_header(name: str, value) -> "str | None":
         return None
     return line
 
-# Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
-# values outside this set degrade to "message" rather than passing through.
-_INTERACTION_TYPES = frozenset({
-    "message", "realtime_audio", "realtime_video",
-    "tool_initiated", "system_event", "self_reflective",
-})
+# Remote values outside the shared vocabulary degrade to "message" rather than passing through.
+_INTERACTION_TYPES = local_task_protocol.INTERACTION_TYPES
+# A value its sanitizer refuses is dropped: an unknown event or a non-token id never reaches the core.
+_TRIGGER_SANITIZERS = {"event_type": agent_triggers.event_type_value,
+                       "agent_trigger_id": agent_triggers.trigger_id_value,
+                       "playbook": agent_triggers.playbook_value}
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
@@ -6190,6 +6194,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if it not in _INTERACTION_TYPES:
                 it = "message"
             lines.append(f"interaction_type: {it}")
+        elif f in _TRIGGER_SANITIZERS:
+            val = _TRIGGER_SANITIZERS[f](task.get(f))
+            if val:
+                lines.append(f"{f}: {val}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.
@@ -9361,7 +9369,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["consolidated_into"] = consolidated_into
     doc.update(_result_contract(dm_only))
     # Activity labels ride the doc that carries dm_only; a broker without them ignores the keys.
-    doc.update(_guarded_result_labels(tid))
+    doc.update(_guarded_result_labels(tid, generation))
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
         doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK

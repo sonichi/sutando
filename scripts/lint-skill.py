@@ -71,7 +71,7 @@ KNOWN_TOP = {
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
     "hooks", "documented_for_core", "core_description", "supervised_worker",
     "pending_questions_store", "claude_plugin", "orphan_reaper", "audience", "on_launch",
-    "on_stop_requested",
+    "on_stop_requested", "playbook",
 }
 AUDIENCES = {"user", "developer"}
 # Fields a runtime scan activates straight from <repo>/skills, past the installers'
@@ -111,6 +111,10 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
     for k in m:
         if k not in KNOWN_TOP:
             warn(f"unknown manifest field '{k}'")
+
+    # playbook: opts the skill into AgentTrigger dispatch (src/agent_triggers.py).
+    if "playbook" in m and not isinstance(m["playbook"], bool):
+        err("playbook must be a boolean")
 
     # supervised_worker: sparrowd reads this to decide what to keep running, and
     # it names no skill, so a malformed block is a silently unsupervised daemon.
