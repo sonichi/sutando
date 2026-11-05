@@ -61,8 +61,10 @@ tmux_quote() { local sq="'\"'\"'"; printf "'%s'" "${1//\'/$sq}"; }
 TICKET="$WORK/ticket"
 STARTED="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$PPID" 2>/dev/null)"; STARTED="${STARTED%"${STARTED##*[! ]}"}"
 [ -n "$STARTED" ] || { echo "tmux-pane-keys: cannot read the guard's start time" >&2; exit 1; }
-ORPHAN="mv $(tmux_quote "$TICKET.claimed") $(tmux_quote "$TICKET.orphaned")"
-CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p $PPID 2>/dev/null)\" in \"$STARTED\"*Z*) $ORPHAN; false ;; \"$STARTED\"*) true ;; *) $ORPHAN; false ;; esac"
+# The server can retain a stale PATH; append the caller's working path for claim utilities.
+SERVER_PATH="PATH=\"\$PATH\":$(tmux_quote "$PATH"); export PATH;"
+ORPHAN="$SERVER_PATH mv $(tmux_quote "$TICKET.claimed") $(tmux_quote "$TICKET.orphaned")"
+CLAIM="$SERVER_PATH mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p $PPID 2>/dev/null)\" in \"$STARTED\"*Z*) $ORPHAN; false ;; \"$STARTED\"*) true ;; *) $ORPHAN; false ;; esac"
 
 KEYS="send-keys -t $(tmux_quote "$TARGET")"
 for key in "$@"; do
