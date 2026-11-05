@@ -55,7 +55,7 @@ class SspaceMigrationProbe(unittest.TestCase):
         out = hc.check_sspace_migration(self.ws)
         self.assertEqual(out["name"], "sspace-migration")
         self.assertEqual(out["status"], "warn")
-        self.assertIn("python3 scripts/connections.py add '<code>'", out["detail"])
+        self.assertIn("python3 scripts/connections.py add - --yes --expected-server s.space", out["detail"])
         self.assertLess(out["detail"].index("connections.py move --repo . --logs-dir"),
                         out["detail"].index("connections.py add"), "the existing secret is tried first")
         self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", out["detail"])
@@ -98,7 +98,7 @@ class SspaceMigrationProbe(unittest.TestCase):
     def test_doc_section_names_the_same_commands(self):
         doc = (REPO / "docs" / "connections.md").read_text()
         section = doc.split("### Moving a terminal-run core to s.space", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("python3 scripts/connections.py add '<code>'", section)
+        self.assertIn("python3 scripts/connections.py add - --yes --expected-server s.space", section)
         self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", section)
 
 

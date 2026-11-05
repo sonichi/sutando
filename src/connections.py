@@ -7,8 +7,8 @@ the gateway URL exactly as the relay issued it, and the vault key the secret liv
 (`token_ref`). The secret itself never enters this file: `add_connection` stores it
 through the secret vault and fails closed when the vault cannot take it.
 
-Adding is two-step and source-agnostic (a pasted token or connect string, a browser flow, an env var all
-arrive as a token): `preview_connection` asks the gateway embedded in the token who the
+Adding is two-step and source-agnostic (a pasted relay token, a browser flow, an env var all
+arrive as a `url|secret` relay token): `preview_connection` asks the gateway embedded in the token who the
 token is, and `add_connection` saves only when the caller's `expected_server` matches
 what that preview says now. Adding is idempotent per server, never changes which row is
 primary (the first row ever saved becomes primary; `set_primary` is the one way to move
@@ -35,7 +35,7 @@ and the launch record: the plan skips a disabled row, so a restart leaves it dow
 `reconnect` clears the flag. A bridge that will not stop leaves the row as it was
 (`BridgeStillRunning`); the primary cannot be disconnected while it is primary, and a
 disabled row cannot become primary. `update_token` replaces the secret under a row's existing
-`token_ref` with a new code for the same server and agent (anything else is refused by code),
+`token_ref` with a new relay token for the same server and agent (anything else is refused by code),
 clears the flag and relaunches; it is refused while a higher-precedence source (the row's
 environment variable) would shadow the vault. The legacy unsuffixed row is the environment's:
 `disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`); a fresh relay token for its server goes
@@ -2227,7 +2227,7 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
 
 
 def primary_token_from_channel_file(environ: Mapping[str, str]) -> str:
-    """The relay token (`url|secret`) the AG2 Space channel env file holds under either relay
+    """The relay token (`<relay_url>|<bearer>`) the AG2 Space channel env file holds under either relay
     spelling, read through the resolver `scripts/channel-env.sh` uses; '' when the environment
     names one itself, when no file resolves, or when the file holds none."""
     try:
@@ -3545,7 +3545,7 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
     """Move a connection to its server's successor with the agent's existing secret (a registry
     copied byte-for-byte keeps it valid until either side re-codes the agent).
 
-    The successor code (`successor_code`) must preview verified for the old row's agent localpart on
+    The successor token (`successor_code`) must preview verified for the old row's agent localpart on
     the successor server; then the row is added (`skip_backlog`), promoted, the MCP descriptor
     re-pointed (`mcp_descriptor_path`) and each legacy worker-room binding mirrored through `room_bindings` (an object with
     `load() -> {room: worker}` and `bind(room, worker)`, None when the worker pool is absent).
@@ -3553,7 +3553,8 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
     refused. `resolver` (as `preview_connection`'s) also maps servers; None reads the registry offline.
     Returns {ok, instance, agent_mxid, mcp, rooms, dry_run}, or {ok: False, reason, detail} with a
     MOVE_REASONS reason (nothing written) or a Refusal code (`added` says whether the row exists),
-    and `server`, the successor a relay token should come from (the app's Add agent flow)."""
+    and `server`, where a new relay token for this agent comes from (its settings there, Get new token,
+    never Add agent, which creates another agent)."""
     environ = os.environ if environ is None else environ
     probe = dict(fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, resolver=resolver)
     ds = _dotspace()
