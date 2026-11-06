@@ -2488,21 +2488,10 @@ def read_token(stdin=None, prompt=None) -> "tuple[dict | None, str]":
     """({relay_url, bearer}, '') or (None, why, never the value): one line, asked for without echo on a
     terminal, else read from stdin, then parse_token. The value never reaches argv, a log or an exception."""
     stdin = sys.stdin if stdin is None else stdin
-    try:
-        tty = bool(stdin is not None and stdin.isatty())
-    except (AttributeError, ValueError, OSError):
-        tty = False
-    try:
-        if tty:
-            line = (prompt or getpass.getpass)(TOKEN_PROMPT)
-        elif stdin is None:
-            line = ""
-        else:
-            line = stdin.readline(TOKEN_LINE_MAX + 1)
-    except (EOFError, OSError, ValueError, UnicodeDecodeError):
+    try:    # no stdin at all (None, closed) reads as no token
+        line = (prompt or getpass.getpass)(TOKEN_PROMPT) if stdin.isatty() else stdin.readline(TOKEN_LINE_MAX + 1)
+    except (AttributeError, EOFError, OSError, ValueError, UnicodeDecodeError):
         line = ""
-    if isinstance(line, bytes):
-        line = line.decode("utf-8", "replace")
     if len(line) > TOKEN_LINE_MAX:
         return None, f"the token line is longer than {TOKEN_LINE_MAX} characters; {TOKEN_SHAPE}"
     if not line.strip():

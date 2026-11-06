@@ -23,6 +23,7 @@ from unittest import mock
 
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.subprocess_coverage import covered_code  # noqa: E402
 
 isolate_os_environ()
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -44,11 +45,10 @@ MALFORMED = {"empty": "", "bare secret": BEARER, "no secret": f"{fx.RELAY}|", "n
 
 
 class Tty(io.StringIO):
+    readline = None     # a terminal's line is read through getpass, never echoed by a plain read
+
     def isatty(self):
         return True
-
-    def readline(self, *a):     # a terminal's line is read through getpass, never echoed by a plain read
-        raise AssertionError("a terminal is asked through getpass")
 
 
 class TokenStdin(fx.AgentRootBase):
@@ -296,7 +296,44 @@ class TokenStdin(fx.AgentRootBase):
                 self.assertNotIn(BEARER, out + err)
 
 
+    def test_a_busy_agent_lock_after_the_read_writes_nothing(self):
+        for name, mac in self.each():
+            with self.subTest(name=name, mac=mac):
+                self.fresh(name, mac)
+                before = self.snapshot()
+                with mock.patch.object(cb, "_seat_under_lock") as under, mock.patch.object(
+                        cm, "agent_lock", return_value=mock.Mock(__enter__=mock.Mock(side_effect=cm.Busy("agent busy")))):
+                    rc, out, err, _stdin, _ = self.paste(name, TOKEN, mac)
+                under.assert_not_called()
+                self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                self.assertIn("agent busy; nothing was written: run the same command once it is done", err)
+                self.assertEqual(self.snapshot(), before)
+
+
+class ReadToken(unittest.TestCase):
+    """cm.read_token's edges: no stdin, a failed read, an interrupted prompt and an over-long line are refusals."""
+
+    def test_no_or_unreadable_stdin_or_an_aborted_prompt_is_no_token(self):
+        broken = mock.Mock(isatty=mock.Mock(return_value=False), readline=mock.Mock(side_effect=OSError(5, "EIO")))
+        eof = mock.Mock(side_effect=EOFError)
+        for why, stdin, prompt in (("none", None, None), ("closed", broken, None), ("ctrl-d", Tty(), eof)):
+            with self.subTest(why), mock.patch.object(sys, "stdin", None):
+                self.assertEqual(cm.read_token(stdin, prompt),
+                                 (None, "no token was given: paste it when asked, or pipe one line into --token-stdin"))
+
+    def test_an_over_long_line_is_refused_without_its_value(self):
+        line = TOKEN + "x" * cm.TOKEN_LINE_MAX
+        got, why = cm.read_token(io.StringIO(line + "\n"))
+        self.assertIsNone(got)
+        self.assertIn(f"longer than {cm.TOKEN_LINE_MAX} characters", why)
+        self.assertNotIn(BEARER, why)
+
+
 XTRACE_DRIVER = "--xtrace-driver"
+
+
+DRIVER_CODE = ("import runpy, sys; sys.argv = [%r, %r, *sys.argv[1:]]; "
+               "runpy.run_path(sys.argv[0], run_name='__main__')")
 
 
 def xtrace_driver(name: str, mac: str) -> int:
@@ -332,9 +369,10 @@ class Xtrace(unittest.TestCase):
                         bash_env.write_text("set -x\n")
                         env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "SHELLOPTS": "xtrace", "BASH_ENV": str(bash_env),
                                "PS4": "+TRACE "}
-                        script = 'set -x; "$1" "$2" "$3" "$4" "$5" < "$6"'
-                        p = subprocess.run([bash, "-x", "-c", script, "bash", sys.executable, __file__, XTRACE_DRIVER,
-                                            name, mac, str(tok)], env=env, capture_output=True, text=True, timeout=300)
+                        script = 'set -x; "$1" -c "$2" "$3" "$4" < "$5"'
+                        code = covered_code(DRIVER_CODE % (str(Path(__file__).resolve()), XTRACE_DRIVER))
+                        p = subprocess.run([bash, "-x", "-c", script, "bash", sys.executable, code, name, mac, str(tok)],
+                                           env=env, capture_output=True, text=True, timeout=300)
                         self.assertIn("+TRACE", p.stderr, "the shell traced")
                         self.assertIn("SEAT-OK", p.stderr, p.stdout + p.stderr)
                         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
