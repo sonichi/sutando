@@ -370,7 +370,8 @@ The session loads the ag2space-inbox plugin this package ships;
 working tree under edit, say).
 
 **Connect with a code.** On a host with no core, run the connect command with the one-time acp. code
-that s.space issues for the agent; that is the agent's whole setup:
+that s.space issues for the agent (its API route `POST /api/connect/agent-code`, called with the
+owner's logged-in web session; app support is still to come); that is the agent's whole setup:
 
 ```bash
 ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent's Matrix ID>

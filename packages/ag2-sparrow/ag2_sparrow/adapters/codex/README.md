@@ -36,7 +36,8 @@ On a host with no core, `connect --experimental-connect --base <url> --agent <th
 agent's whole setup, with
 claude-local's `connect` behaviour, from the same package code (`connect_bridge`): it checks the
 machine before the code is spent (no host supervisor, no `AGENT_CONNECT_TASK_DIR`, the Codex pin, and
-`codex login status` under `--codex-home`), reads the code from a prompt or `--code -` (a code on the
+`codex login status` under `--codex-home`), reads the code (the one-time `acp.` code that s.space's API route
+`POST /api/connect/agent-code` issues for the owner; app support is still to come) from a prompt or `--code -` (a code on the
 command line works with a warning), requires https for `--base` and the relay URL (plain http only on
 a loopback host) and a relay on `--base`'s host or under it unless `--trust-relay-host` names it,
 retries a 202 or 503 on a 1, 2, 4, 8, 16 s backoff, and says why a 404'd code is gone. The credential

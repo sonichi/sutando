@@ -102,6 +102,7 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     ),
     "packages/ag2-sparrow/ag2_sparrow/connect_bridge.py": (
         "code in s.space once",
+        "code for the agent from s.space",
     ),
     "packages/ag2-sparrow/ag2_sparrow/connect_common.py": (
         "removed in s.space;",
