@@ -111,7 +111,7 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
         "\"s.space code: \"",
         "s.space is still redeeming",
         "s.space is busy",
-        "new one in s.space\"",
+        "new one from s.space,",
         "s.space refused the code",
         "s.space's answer",
     ),

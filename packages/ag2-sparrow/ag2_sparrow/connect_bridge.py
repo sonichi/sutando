@@ -234,10 +234,12 @@ def connect_agent_problem(agent_id) -> str:
     """'' when connect names its agent (--agent, the agent's Matrix ID), else why: the code names its
     agent only once redeemed, which spends it."""
     if not agent_id:
-        return "connect needs --agent <the agent's Matrix ID>; get a fresh code for the agent from s.space"
+        return ("connect needs --agent <the agent's Matrix ID>; get a fresh code for the agent from s.space, or "
+                "use install --token-env-file with the agent's relay token")
     if not AGENT_ID_RE.fullmatch(agent_id):
         return (f"--agent {agent_id} is not a Matrix ID (@name:server); pass --agent <Matrix ID>; "
-                "get a fresh code for the agent from s.space")
+                "get a fresh code for the agent from s.space, or use install --token-env-file with the "
+                "agent's relay token")
     return ""
 
 

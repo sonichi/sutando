@@ -1268,7 +1268,7 @@ class ConnectCode(UndoSeams, Base):
         self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|rotated-bearer-OOOO5555\n")
 
     def test_a_404_says_why_the_code_is_gone_and_writes_nothing(self):
-        for body, why in (({"error": "gone"}, "already used or has expired; make a new one in s.space"),
+        for body, why in (({"error": "gone"}, "already used or has expired; get a new one from s.space"),
                           ({"error": "agent_revoked"}, "the agent was removed in s.space; add it again"),
                           ({}, "already used or has expired")):
             with self.subTest(body=body):

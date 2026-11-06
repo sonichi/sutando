@@ -2418,7 +2418,8 @@ REDEEM_BACKOFF_S = (1, 2, 4, 8, 16)     # one wait per 503 or 202 before the nex
 RETRY_AFTER_MAX_S = 30
 STANDALONE_TIER = "owner"   # no core on the host to cap it (plan 9.2); the key is required
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
-GONE = {"agent_revoked": "the agent was removed in s.space; add it again there for a new code"}
+GONE = {"agent_revoked": ("the agent was removed in s.space; add it again, then use install --token-env-file "
+                          "with its new relay token")}
 
 
 def endpoint_problem(url: str, what: str) -> str:
@@ -2459,7 +2460,8 @@ def code_problem(base: str, code: str) -> str:
     if why:
         return why
     if not (code or "").startswith(CODE_PREFIX) or len(code) <= len(CODE_PREFIX) or any(c.isspace() for c in code):
-        return f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from s.space again"
+        return (f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from s.space again, or "
+                "put a relay token in install --token-env-file instead")
     return ""
 
 
@@ -2529,7 +2531,8 @@ def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | 
             return None, "s.space is busy (HTTP 503 on every try); the code is still valid, try again in a minute"
         if status == 404:
             reason = next((answer[k] for k in ("error", "reason", "state") if isinstance(answer.get(k), str)), "")
-            return None, GONE.get(reason, "the code was already used or has expired; make a new one in s.space")
+            return None, GONE.get(reason, "the code was already used or has expired; get a new one from s.space, "
+                                   "or use install --token-env-file with the agent's relay token")
         if status != 200:
             return None, f"s.space refused the code (HTTP {status})"
         fields = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}

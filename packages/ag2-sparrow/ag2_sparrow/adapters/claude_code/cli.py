@@ -653,12 +653,14 @@ def main(argv=None) -> int:
     session_options(p)
     p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="check this machine, redeem the one-time code from s.space for the agent's "
-                       "relay credential, write it to the agent's seat (mode 600), then install as install does")
+                       "relay credential, write it to the agent's seat (mode 600), then install as install does; "
+                       "with no acp. code, install --token-env-file with the agent's relay token instead")
     c.add_argument("--base", required=True, help="the s.space backend URL the code was issued by")
     c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
-    c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for, as "
-                   "the agent's Matrix ID; without it connect refuses and the code is not used")
+    c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for; "
+                   "without it connect refuses and the code is not used. No acp. code? use install "
+                   "--token-env-file with the agent's relay token instead")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when s.space told you to)")
     session_options(c)
