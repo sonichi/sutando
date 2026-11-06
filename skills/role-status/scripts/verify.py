@@ -49,12 +49,18 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Set
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from dotspace import LEGACY_SERVER
+
 
 # Union of both id alphabets: a token touching one of these on either side is a
 # different (longer) token, never this id.
 ID_CHARS = r"A-Za-z0-9._:@$+/=-"
-ACTOR_RE = re.compile(r"(?<![%s])ag2space:@[A-Za-z0-9._-]+:ag2\.space(?![%s])" % (ID_CHARS, ID_CHARS))
+ACTOR_RE = re.compile(r"(?<![%s])ag2space:@[A-Za-z0-9._-]+:%s(?![%s])"
+                      % (ID_CHARS, re.escape(LEGACY_SERVER), ID_CHARS))
 EVENT_RE = re.compile(r"(?<![%s])ag2space-message:\$[A-Za-z0-9_+/=-]+(?![%s])" % (ID_CHARS, ID_CHARS))
 MARKER = "EVIDENCE_JSON"
 
