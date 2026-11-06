@@ -511,8 +511,11 @@ Sutando checkout around it sends neither field.
   claims it for the run and generation in the same transition, before any effect (attachments,
   Stop, settle, publish). A reply written at the result's name after that is a new result; one that
   arrives after the task's lease closed is kept in `results/undelivered/` for review. A task id is
-  not retired while its pin is held, so the results directory must support hard links. Each
-  result is delivered on a worker of its own, so a send that hangs holds no other task's result.
+  not retired while its pin is held, so the results directory must support hard links. Results
+  ready together go out in intake order (the insertion order of `remote-task-rooms*.json`), one
+  at a time per room on that room's worker, and rooms run in parallel: a send that hangs holds
+  only its own room's later replies. A result that posts nothing (`[no-send]`, `[REPLIED]`,
+  `[deduped:]`) and one with no recorded room are delivered on a worker of their own.
 - Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
   upgraded; start logs that they are ignored, and attempts in flight across that upgrade are not
   resumed.

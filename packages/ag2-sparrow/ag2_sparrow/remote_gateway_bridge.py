@@ -328,7 +328,7 @@ from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_i
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
-from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import has_skip_action, parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from . import result_labels
@@ -6738,7 +6738,8 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
         # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
         # second sparrow instance ever runs. os.replace is atomic overwrite.
         tmp = TASK_ROOMS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(rooms, sort_keys=True))
+        # Insertion order is the intake order that ready results are delivered in.
+        tmp.write_text(json.dumps(rooms))
         os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"task-rooms persist failed ({diagnostics.describe(e)}) — continuing")
@@ -9712,9 +9713,10 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
     return True
 
 
-# A result's delivery runs on a worker of its own, so one task's stalled send never holds another's.
+# A room's results go out one at a time in intake order on that room's worker; rooms run in parallel.
 DELIVERY_PASS_WAIT_S = 5.0
 _DELIVERING: "set[str]" = set()
+_DELIVERING_ROOMS: "set[str]" = set()
 _DELIVERING_MUTEX = threading.Lock()
 
 
@@ -9723,13 +9725,58 @@ def _delivering(tid: str) -> bool:
         return tid in _DELIVERING
 
 
-def _start_delivery(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> threading.Thread:
+def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None) -> threading.Thread:
+    """One worker delivering `items` ((tid, rfile, raw, generation), in order) one after another;
+    with `room`, that room is busy until the last of them is done."""
     with _DELIVERING_MUTEX:
-        _DELIVERING.add(tid)
-    th = threading.Thread(target=_delivery_worker, args=(tid, rfile, raw, generation, inflight),
-                          name=f"result-{tid}", daemon=True)
+        _DELIVERING.update(item[0] for item in items)
+        if room:
+            _DELIVERING_ROOMS.add(room)
+
+    def run():
+        try:
+            for tid, rfile, raw, generation in items:
+                _delivery_worker(tid, rfile, raw, generation, inflight)
+        finally:
+            if room:
+                with _DELIVERING_MUTEX:
+                    _DELIVERING_ROOMS.discard(room)
+    th = threading.Thread(target=run, name=f"result-{items[0][0]}", daemon=True)
     th.start()
     return th
+
+
+def _room_busy(room: str) -> bool:
+    with _DELIVERING_MUTEX:
+        return room in _DELIVERING_ROOMS
+
+
+def _waits_for_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> bool:
+    """A reply whose room is still sending an earlier one waits for the next pass."""
+    room = rooms.get(tid)
+    if not room or not _room_busy(room):
+        return False
+    try:
+        raw = rfile.read_text(errors="replace")
+    except OSError:
+        return os.path.lexists(rfile)       # a missing result takes the ordinary not-ready path
+    return _ordered_room(tid, raw, rooms) is not None
+
+
+def _intake_ordered(tids, rooms: "dict[str, str]") -> list:
+    """`tids` in intake order (the task-room map's insertion order); unrecorded ones last, by id."""
+    pos = {t: n for n, t in enumerate(rooms)}
+    return sorted(tids, key=lambda t: (pos.get(t, len(pos)), t))
+
+
+def _ordered_room(tid: str, raw: str, rooms: "dict[str, str]") -> "str | None":
+    """The room whose reply order this result takes a place in; None for one that posts nothing."""
+    try:
+        if has_skip_action(parse_markers(raw).actions):
+            return None
+    except Exception:  # noqa: BLE001 — an unparsable body is ordered like any reply
+        pass
+    return rooms.get(tid) or None
 
 
 def _delivery_worker(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> None:
@@ -9759,7 +9806,9 @@ def _post_ready_results(inflight: set[str]) -> None:
     _recover_disposing_claims()
     _load_settle_pending()
     changed, started = False, []
-    for tid in list(inflight):
+    rooms = _load_task_rooms()
+    queued: "dict[str, list]" = {}
+    for tid in _intake_ordered(list(inflight), rooms):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
@@ -9774,6 +9823,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 continue
         if _ATTEMPTS is not None and _delivering(tid):
             continue                            # its delivery is still under way on its own worker
+        if _ATTEMPTS is not None and _waits_for_room(tid, rfile, rooms):
+            continue                            # an earlier reply in its room is still being sent
         raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
         if raw is None:
             # A disposed-of id whose task could not be archived earlier is retried here.
@@ -9785,8 +9836,13 @@ def _post_ready_results(inflight: set[str]) -> None:
             continue
         if _ATTEMPTS is None:
             changed |= _deliver_ready(tid, rfile, raw, generation, inflight)
+            continue
+        room = _ordered_room(tid, raw, rooms)
+        if room is None:
+            started.append(_start_delivery([(tid, rfile, raw, generation)], inflight))
         else:
-            started.append(_start_delivery(tid, rfile, raw, generation, inflight))
+            queued.setdefault(room, []).append((tid, rfile, raw, generation))
+    started += [_start_delivery(items, inflight, room) for room, items in queued.items()]
     _await_deliveries(started)
     if changed:
         _save_inflight(inflight)
