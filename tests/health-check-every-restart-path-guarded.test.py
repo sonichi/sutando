@@ -85,6 +85,17 @@ def action_audit(loop):
 
 
 class GuardedRestarts(unittest.TestCase):
+    def test_unreadable_metadata_refuses_restart(self):
+        with mock.patch.object(Path, "exists", side_effect=PermissionError("locked")):
+            allowed, reason = hc._checkout_is_canonical(Path("/fixture"))
+        self.assertFalse(allowed)
+        self.assertIn(hc.CHECKOUT_UNREADABLE, reason)
+
+    def test_unreadable_config_defaults_expected_branch(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "sutando_config.load_config", side_effect=OSError("unreadable")):
+            self.assertEqual(hc._resolve_expected_branch(Path("/fixture")), "main")
+
     def test_each_existing_dispatch_refuses_and_permits(self):
         cases = [issue("com.sutando.voice-agent"), issue("conversation-server"),
                  issue("slack-bridge"), issue("voice-transport", status="fail", _stuck_connecting=True)]
