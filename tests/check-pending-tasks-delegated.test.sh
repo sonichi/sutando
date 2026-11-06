@@ -1,0 +1,69 @@
+#!/bin/bash
+# The Stop hook (src/check-pending-tasks.sh) does not report a task the core
+# handed to a background agent while its marker (src/task_delegation.py) is
+# live; an expired, malformed or absent marker still blocks (#5918).
+# Isolation follows check-pending-tasks-in-progress-and-repeat.test.sh.
+# Run: bash tests/check-pending-tasks-delegated.test.sh
+set -u
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+HOOK="$REPO/src/check-pending-tasks.sh"
+PYBIN="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
+
+TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooktest-dg.XXXXXX")"
+export SUTANDO_TEST_MODE=1
+export SUTANDO_WORKSPACE="$TMPWS"
+export SUTANDO_CORE_SESSION=1
+export SUTANDO_STOP_HOOK_WATCHER_GATE=0
+
+_real() { (cd "$1" 2>/dev/null && pwd -P) || echo "$1"; }
+WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
+LIVE_WS="$(env -u SUTANDO_TEST_MODE -u SUTANDO_WORKSPACE bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
+if [ "$(_real "$WS")" != "$(_real "$TMPWS")" ]; then
+  echo "FAIL: workspace did not resolve to the test dir — refusing to run."; rm -rf "$TMPWS"; exit 1
+fi
+if [ -n "$LIVE_WS" ] && [ "$(_real "$WS")" = "$(_real "$LIVE_WS")" ]; then
+  echo "FAIL: test workspace is the live workspace — refusing to run."; rm -rf "$TMPWS"; exit 1
+fi
+trap 'rm -rf "$TMPWS"' EXIT
+
+FAILED=0
+ok()  { printf '  ok   %s\n' "$1"; }
+bad() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=1; }
+record_delivery() { "$PYBIN" "$REPO/src/turn_ledger.py" --workspace "$TMPWS" no-send "hook unit test" >/dev/null 2>&1 || true; }
+run_hook() { printf '' | bash "$HOOK" 2>"$TMPWS/err"; }
+mark() { "$PYBIN" "$REPO/src/task_delegation.py" mark "$@" --workspace "$WS" >/dev/null; }
+marker_for() {  # $1 task id, $2 delegated_at offset (s), $3 ttl: a marker written by the production writer
+  SUTANDO_SRC="$REPO/src" "$PYBIN" -c 'import os,sys,time; sys.path.insert(0, os.environ["SUTANDO_SRC"]); import task_delegation as m; m.mark(sys.argv[1], sys.argv[2], float(sys.argv[4]), now=time.time() + float(sys.argv[3]))' "$WS" "$1" "$2" "$3"
+}
+
+mkdir -p "$WS/tasks" "$WS/results" "$WS/deliveries" "$WS/state"
+TASK="task-cron-deal-sweep-hooktest-$$"
+printf 'id: %s\ntask: sweep deals\n' "$TASK" > "$WS/tasks/$TASK.txt"
+
+record_delivery
+OUT="$(run_hook)"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "an undelegated task blocks (the control)" ;; *) bad "an undelegated task blocks" "got: ${OUT:0:160}" ;; esac
+
+mark "$WS/tasks/$TASK.txt" --ttl 1800
+record_delivery
+OUT="$(run_hook)"
+[ "$OUT" = "{}" ] && ok "a task delegated with a live marker does not block" || bad "a delegated task does not block" "got: ${OUT:0:160}"
+
+marker_for "$TASK" -1900 1800
+OUT="$(run_hook)"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "an expired marker blocks again (a dead agent is caught)" ;; *) bad "an expired marker blocks" "got: ${OUT:0:160}" ;; esac
+
+printf '{"task_id":"%s","delegated_at":' "$TASK" > "$WS/state/task-delegations/$TASK.json"
+OUT="$(run_hook)"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "a malformed marker blocks" ;; *) bad "a malformed marker blocks" "got: ${OUT:0:160}" ;; esac
+
+OTHER="task-other-hooktest-$$"
+printf 'id: %s\ntask: other\n' "$OTHER" > "$WS/tasks/$OTHER.txt"
+mark "$TASK" --ttl 1800
+OUT="$(run_hook)"
+case "$OUT" in *"$OTHER.txt"*) ;; *) OUT="" ;; esac
+case "$OUT" in ""|*"$TASK.txt"*) bad "a marker skips only its own task" "got: ${OUT:0:200}" ;; *) ok "a marker skips only its own task; an undelegated neighbour still blocks" ;; esac
+
+if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
+exit "$FAILED"
