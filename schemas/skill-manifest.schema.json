@@ -39,6 +39,10 @@
       "enum": ["stable", "experimental", "deprecated"],
       "description": "Trust/maturity signal. stable = guaranteed contract; experimental = unstable API/behavior; deprecated = use another skill."
     },
+    "playbook": {
+      "type": "boolean",
+      "description": "Opts the skill into AgentTrigger playbook dispatch: a task's `playbook` header may name it (src/agent_triggers.py). Absent or false = a playbook header naming it is refused."
+    },
     "audience": {
       "type": "string",
       "enum": ["user", "developer"],

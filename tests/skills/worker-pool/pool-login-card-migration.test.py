@@ -194,6 +194,8 @@ class HumanCardMigration(unittest.TestCase):
         inbox = rem.pd.deliveries_dir(self.ws, self.wid)
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "task-human.txt").write_text("pending")
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        (self.ws / "tasks" / "task-human.txt").write_text("task: hello\n")
 
     def seed_human_ack(self):
         sup.save_state(self.ws, ps.SupervisionState(last_sample_at=self.now, workers={
@@ -233,6 +235,8 @@ class HumanCardMigration(unittest.TestCase):
         inbox = rem.pd.deliveries_dir(self.ws, WORKERS[1])
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "task-other.txt").write_text("pending")
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        (self.ws / "tasks" / "task-other.txt").write_text("task: hello\n")
         self.seed_human_ack()
         self.sweep()
         self.assertEqual(len(self.active()), 2)

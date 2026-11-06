@@ -38,6 +38,7 @@ NEEDED = (
     "src/agent/restart-guard.sh",
     "src/agent/core-runtime-record.sh",
     "src/agent/core-window.sh",
+    "src/agent/launch-path.sh",
     "src/core_runtime_record.py",
     "src/result_publish.py",
     "src/agent/task-event-handler-lookup.sh",
@@ -47,6 +48,21 @@ NEEDED = (
     "src/workspace_default.py",
     "src/sutando_config.py",
     "src/util_paths.py",
+    "src/delivery/__init__.py",
+    "src/delivery/codex_recovery.py",
+    "src/delivery/codex_pickup.py",
+    "src/delivery/task_dispatch.py",
+    "src/delivery/readiness.py",
+    "src/delivery/pane_gate.py",
+    "src/runtime_observation.py",
+    "src/local_task_protocol.py",
+    "src/task_priority.py",
+    "src/file_lock.py",
+    "src/cli_wedge.py",
+    "src/cli_wedge_patterns.py",
+    "src/sutando_platform.py",
+    "src/quota_availability.py",
+    "src/worker_auth_state.py",
     "src/agent/codex/cli/task-notifier.sh",
     "src/agent/codex/cli/task-notifier-supervisor.sh",
     "src/watch-tasks-stream.sh",
@@ -159,6 +175,8 @@ def run_branch(label: str, launcher_rel: str, env_extra: dict, *, tty: bool = Fa
         _exe(binp / "tmux", TMUX_STUB)
         _exe(binp / "pgrep", PGREP_STUB)
         _exe(binp / "codex", CODEX_STUB)
+        # The claude launcher refuses before tmux when `claude` does not resolve.
+        _exe(binp / "claude", CODEX_STUB)
         _exe(binp / "fswatch", "#!/bin/bash\nexit 0\n")
         # mktemp is load-bearing: without it claude_config_dir.sh fails and the
         # launcher exits before reaching tmux, making the assert vacuous.

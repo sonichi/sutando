@@ -30,6 +30,12 @@ persist every `/model` pick, so the file can lag the live session), else null.
 day on a live core: the send alone exited 0 while the CLI sat at the confirm dialog and the model had
 not changed — which is why the send is treated as initiation and the record follows acceptance.
 
+**`--offline` (core down).** With no core process for the session there is no CLI to take `/model`,
+so `--offline` writes `model` into the runtime's `settings.json` (other keys kept) and records
+`model-switch.json` with `accepted: false`; the core starts on it at its next launch. It is refused
+(exit 9) while any `claude --name <session>` runs, and never overwrites a settings file it cannot
+read (exit 1). The launcher's provider-limit hold uses it for the owner's "switch to <model>" reply.
+
 **A picker left on screen.** Right before the send the script writes an attribution record through
 `src/self_opened_gate.py` (`<workspace>/state/self-opened-gate.<session>.json`) and clears it once the
 CLI accepted or the script cancelled its own dialog. On exit 8 the record stays, its claim window

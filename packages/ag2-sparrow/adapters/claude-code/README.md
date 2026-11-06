@@ -357,10 +357,12 @@ ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks f
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
-ag2-sparrow-claude-local verify
-ag2-sparrow-claude-local attach          # the live pane; detach with the tmux prefix + d
-ag2-sparrow-claude-local stop --confirm  # confirm an open stall card's Stop on this machine
-ag2-sparrow-claude-local uninstall
+ag2-sparrow-claude-local verify [<selector>]
+ag2-sparrow-claude-local attach [<selector>]   # the live pane; detach with the tmux prefix + d
+ag2-sparrow-claude-local stop --confirm [<selector>]  # confirm an open stall card's Stop here
+ag2-sparrow-claude-local uninstall [<selector>]
+ag2-sparrow-claude-local list            # each job installed here, its agent, state and selector
+# <selector>: --agent <@agent:server> | --key <agent key> | --work <dir> (an explicit-root job) | --single (the fixed job)
 ```
 
 The session loads the ag2space-inbox plugin this package ships;
@@ -420,6 +422,68 @@ Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
 one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
+
+**Several agents on one host.** Each agent installed on its own root (no
+`--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`
+(systemd: `ag2-sparrow-claude-local.<agent key>.service`), its bridge
+`…claude-local-bridge.<agent key>`, and its config and run files under
+`~/.config/ag2-sparrow/agents/<agent key>/`; its operation lock is
+`~/.config/ag2-sparrow/locks/<job>.oplock`, which no cleanup removes. The unit
+sets `AG2_SPARROW_AGENT=<agent key>`, so `run` reads that agent's config, and
+`AG2_SPARROW_ROOT=<root>`, which binds recovery to that job's own root. The agent
+key is the agent's root segment (above), the same name as its root: readable for
+a plain id, up to 64 characters, and one per agent as the root is. The tmux
+socket has a path limit, so an agent's own job keeps it in a short dir,
+`~/.config/ag2-sparrow/run/<16 hex of the key's sha256>/`. `uninstall` removes
+the agent's config dir and run dir once they hold only this job's own files (its
+locks, alarm, socket and a pane-keys guard holding only its mutex); a file it
+did not write, another adapter's config or an uncertain fence keeps the dir, and
+says so. A job whose config
+records an agent that is not the one asked for, or whose key is not that
+agent's, is refused and never acted on. `verify`, `uninstall`, `attach` and
+`stop` take one selector: `--agent <Matrix ID>`, `--key <agent key>` (an agent's
+own job, even one left without its config), `--work <dir>` (the job whose recorded
+root is that directory: an explicit-root install), or `--single` (the fixed job,
+even a unit left without its config). With one job installed it can
+be left out; with several the command refuses and lists each job with its
+selector. `list` shows each job, its agent, the manager's state, its root and
+its selector: the one that names exactly that job in the current install state
+(`--agent` only when it selects that job alone). Every command a line tells you
+to run uses that same selector; the stall card's attach line, which leaves the
+host, never carries a path. An explicit-root job
+records the host's agent; when that agent also has its own job, `--agent` refuses
+as ambiguous and names each job's `--work <root>`. Installing,
+reinstalling (the restart) or uninstalling one agent never names another's job.
+`install <selector>` with no token
+file is the repair `verify` prints: it reuses the job's recorded token file and
+install flags, rewrites a marked config that no longer loads when the root it and
+the unit record is the same, and mints a new session id for a malformed one. An
+install's bridge starts (or its declaration is written) only once the session
+holds its root; when it never does, the bridge is left stopped, its unit removed
+or its declaration withdrawn. A repair reads and runs nothing recorded until the
+record is proven the job's: a marked config whose every recorded root (and its
+unit's) is the root the selector names. Every install, connect and uninstall of
+an agent, on either adapter, holds that agent's fence
+(`~/.config/ag2-sparrow/locks/agent.<agent key>.fence`) from start through the
+settle of the session it started, so no other operation on the agent lands in
+between; a failed install that leaves the session not running stops the agent's
+bridge too (or withdraws its declaration).
+An explicit root keeps the single fixed job.
+
+**From a single-agent install.** A job an earlier release installed keeps its
+fixed name (`ai.ag2.sparrow.claude-local`) for the agent its config names:
+`verify`, `install` (the restart) and `uninstall`, with or without `--agent`,
+act on it as before. Nothing is moved, and nothing is stopped by name. Other
+agents install beside it as jobs of their own. To give it a job of its own,
+`uninstall --agent <id>`, then `install` again. A job whose config is gone or
+unreadable (say, removed by hand as its refusal says) is found again by its own
+marked bridge unit, or under a host supervisor by the bridge declaration beside
+the root its own unit records (`<root>.bridge/worker.json`). A declaration is
+never adopted by search: a unit from an earlier release records no root, so its
+job is not recovered from a declaration, and a declaration no job here is proven
+to own is left, with the manual `rm` named. A recovered job's record: `install` keeps that job
+and writes the config again, and `uninstall --agent <id>` stops it, unwires its
+bridge (the unit, or the declaration) and removes its units.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the

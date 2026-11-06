@@ -24,8 +24,9 @@ occupancy and the holder record attribution, never readiness.
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
     [--allow-non-owner] [--model <m>] [--codex <path>]
 ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]
-ag2-sparrow-codex-local verify
-ag2-sparrow-codex-local uninstall
+ag2-sparrow-codex-local verify [--agent <@agent:server>]
+ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
+ag2-sparrow-codex-local list
 ```
 
 **Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
@@ -50,9 +51,26 @@ bridge, exactly as claude-local's install does: one launch environment (the root
 cleared) in a marked unit or launchd agent of its own, `ag2-sparrow-codex-local-bridge`. `verify` adds
 the bridge's connected status and its unit; `uninstall` stops and removes that unit too. One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
 
+Several agents run side by side as claude-local's do: an agent installed with `--token-env-file` gets
+a job of its own, `ai.ag2.sparrow.codex-local.<agent key>` (systemd:
+`ag2-sparrow-codex-local.<agent key>.service`), with its bridge, config and log under that key and its
+operation lock at `~/.config/ag2-sparrow/locks/<job>.oplock`, which no cleanup removes; `verify`,
+`uninstall` and `debug-run` take one selector, `--agent <Matrix ID>`, `--key <agent key>`, `--work <dir>`
+(an explicit-root job, by its recorded root) or `--single` (the fixed job), needed only when several are
+installed; `list` shows each one with its selector, and every command a line prints carries it. A `--work` install, and a job an earlier release
+installed for one agent, keep the fixed `ai.ag2.sparrow.codex-local` and are verified, reinstalled and
+removed as they are; one whose config was removed is found again by its marked bridge unit. The repair
+`verify` prints, `install <selector>`, reuses the job's recorded token file and flags and rewrites a
+marked config that no longer loads when the root it and the unit record is the same. The bridge starts
+(or is declared) only once the session holds its root; when it never does, it is left stopped, its unit
+removed or its declaration withdrawn. Nothing recorded is read or run until the record is proven the job's
+on the root its selector names. Install, connect and uninstall hold the agent's fence
+(`~/.config/ag2-sparrow/locks/agent.<agent key>.fence`, shared with claude-local) through the settle of the
+session they started; a failed install that leaves the session not running stops the bridge too.
+
 `install` checks `codex --version` against the pin (0.160.1, the version the stdio shape was measured
 on; parsed from the line starting with `codex`; older is one line and exit 2, nothing written), then
-runs as a quiescent replacement under one per-shape operation lock: stop the job and prove it absent,
+runs as a quiescent replacement under its job's operation lock: stop the job and prove it absent,
 prove the old root free, write the 0600 marked config (`~/.config/ag2-sparrow/codex-local.conf`, with
 `ROOT` persisted once) and the marked unit (tmp + replace), register and start, and require the root
 held by a fresh launcher of this shape within 30 s; anything less is one line and the files as

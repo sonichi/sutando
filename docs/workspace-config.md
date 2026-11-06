@@ -72,6 +72,16 @@ Known keys (`docs/sutando-config.schema.json` → `env.properties` is the refere
 | `SUTANDO_HEALTH_LOAD_PASSES` | `3` | health-check `system-load` | consecutive high passes before it warns |
 | `SUTANDO_HEALTH_LOAD_REAP` | `0` (unset is off) | health-check `system-load` | only exactly `1` lets every `--fix` run (the desktop app runs one every 30 min) reap leftover test processes automatically, at most once per episode; anything else is off |
 
+## macOS notifications (`notifications.macos`)
+
+Sutando posts no macOS desktop notifications unless you opt in:
+
+```json
+{ "notifications": { "macos": true } }
+```
+
+Off by default. Only a JSON `true` turns them on; any other value, or a config that cannot be read, leaves them off. Every macOS sender asks the one reader: `resolve_macos_notifications()` in `src/sutando_config.py` (TypeScript: `resolveMacosNotifications()` in `src/sutando_config.ts`; shell: `bash scripts/sutando-config.sh macos-notifications`, used by `src/macos-notify.sh`). With it off, pending questions, bridge restarts, the agent shepherd and health alerts still reach you through your DM or the core's task queue; a banner that only acknowledged your own action (a context drop, a screen recording) is simply not shown.
+
 ## Three common overrides
 
 ```json

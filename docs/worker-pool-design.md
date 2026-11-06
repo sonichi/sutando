@@ -118,9 +118,8 @@ deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  ...into its in
 
 **Retiring a finished sentinel.** The step that archives a task body (`task_archive.archive_file`
 for the chat bridges, the gateway's `_archive_result`) also renames that task's sentinel, under
-either suffix, into its inbox's `archive/`, holding the inbox's `.lock`. That step is the one
-owner of "this task is done"; nothing else retires a sentinel. Sentinels archived before that
-step existed are retired by `python3 src/task_archive.py retire-archived-pointers <workspace>`:
+either suffix, into its inbox's `archive/`, holding the inbox's `.lock`. This covers
+body-archive completion independently of the pool skill. Sentinels archived before that step existed are retired by `python3 src/task_archive.py retire-archived-pointers <workspace>`:
 
 - **What it moves:** a sentinel whose body is gone from `tasks/` and present in `tasks/archive/`
   (flat or `YYYY-MM/`) or `tasks/processed/`. A sentinel whose body is still in `tasks/` is pending
@@ -130,6 +129,19 @@ step existed are retired by `python3 src/task_archive.py retire-archived-pointer
   records the run in `state/migrations/retire-archived-pointers.v1.done`; a failed run writes no
   marker and retries on the next start. It runs in the sweep's background producer, so it never
   delays reading a new event.
+
+**Pool-driven retirement also moves spent sentinels to `archive/`.** The rule,
+`pool_delivery.sentinel_retirable`, says when a sentinel may leave: its task is archived or gone
+from everywhere, or answered with its payload out of `tasks/` or this recipient's done flag
+written. Until then the bridge still reads it for whose reply it is delivering.
+`pool_delivery.archive_finished` owns pool-driven retirement: it moves such sentinels into the recipient's
+`archive/` under the folder lock and re-checks the rule there, so a task re-queued meanwhile keeps
+its hold. `task_ids=` narrows it to some tasks; without it (the watcher's startup pass) a missing
+task's sentinel stays, because the inbox resolver still judges those. `prune_spent`, the boot
+`sweep` and the supervisor's retire name their ids and all go through it. A move that cannot happen (an unusable `archive/`) leaves
+the sentinel in the inbox. Every reader lists only the folder's top level, so an archived sentinel
+is no hold. `pool_delivery.py archive-finished <worker> --dry-run` prints the counts.
+`prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links. The clock counts from delivery: the hard-link move keeps the sentinel's mtime, so the first `prune_spent` pass after this deploys archives the old backlog and prunes everything older than 14 days at once.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from

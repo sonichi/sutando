@@ -13,6 +13,8 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             not supervised or advertised, and the router sends traffic addressed
             to it to the core. Work it still owes must be handed to the core
             (`--hand-off`, pool_delivery.hand_off_to_core) or the retire is refused.
+            A worker with its own agent loses it too: its connection row, lane
+            and vault secret (connections.retire_worker_identity).
     enable  lift both, then the owner restart (pool_remedy.restart).
     remove  drop a retired worker's roster row; its records stay on disk.
 
@@ -183,7 +185,23 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
         moved = {"handed_off": [], "kept": {}}
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
     return {**base, "result": "retired", "unbound": unbound,
-            "handed_off": moved["handed_off"], "kept": moved["kept"]}
+            "handed_off": moved["handed_off"], "kept": moved["kept"],
+            "identity": _retire_identity(workspace, wid)}
+
+
+def _retire_identity(workspace, wid: str) -> dict:
+    """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
+    (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
+    a lane still running as the worker would post the core's answers in the worker's name."""
+    import connections
+    try:
+        row = connections.retire_worker_identity(wid, workspace=Path(workspace))
+    except connections.ConnectionsError as e:
+        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
+    if row is None:
+        return {"result": "none"}
+    return {"result": "removed", "instance": row["instance"], "agent": row.get("agent_mxid") or "",
+            "note": "the agent stays on its server until the owner deletes it there"}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:

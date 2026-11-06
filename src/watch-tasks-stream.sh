@@ -1118,6 +1118,16 @@ trap cleanup EXIT
 # already-terminating group are both safe no-ops).
 trap 'cleanup; exit 0' HUP INT TERM
 
+# A worker's finished deliveries leave its inbox before the sweep resolves each entry.
+# The injected pool writer decides what is finished; a failure only costs a slower sweep.
+archive_finished_deliveries() {
+  local rc=0
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ -f "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
+  run_bounded 120 -- "$SUTANDO_PY_BIN" "$SUTANDO_POOL_DELIVERY_SCRIPT" --workspace "$WORKSPACE_DIR" \
+    --recipient "$SUTANDO_INSTANCE_ID" archive-finished >/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || echo "watch-tasks-stream: could not archive finished deliveries (rc $rc); sweeping every entry" >&2
+}
+
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
@@ -1140,6 +1150,7 @@ retire_archived_pointers_once() {
 # entry. One printf per line, the relay's shape too, keeps each line whole on the FIFO.
 sweep_entries() {
   local plan line
+  archive_finished_deliveries
   retire_archived_pointers_once
   plan="$(mktemp "$WATCH_RUNTIME_DIR/sweep-plan.XXXXXX")" || plan=""
   if [ -n "$plan" ] && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sweep-plan \
