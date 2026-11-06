@@ -181,6 +181,13 @@ task_in_progress() {
     --max-age "${SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE:-1800}" >/dev/null 2>&1
 }
 
+# A task handed to a background agent is not pending while its marker is live and
+# postdates the task file (src/task_delegation.py owns the policy); anything else blocks.
+delegated_to_background() {
+  [ -n "$PYBIN" ] && [ -f "$REPO_DIR/src/task_delegation.py" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/task_delegation.py" check "$1" --task-file "$2" --workspace "$WORKSPACE" >/dev/null 2>&1
+}
+
 UNPROCESSED=""
 UNPROCESSED_NAMES=""
 shopt -s nullglob 2>/dev/null
@@ -230,6 +237,7 @@ else
     claimed_by_a_worker "$TASK_ID" && continue
     already_delivered "$TASK_ID" "$f" && continue
     task_in_progress "$TASK_ID" "$f" && continue
+    delegated_to_background "$TASK_ID" "$f" && continue
     UNPROCESSED_NAMES="$UNPROCESSED_NAMES $BASENAME"
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
       # Readiness is owned by src/delivery/readiness.py; existence is not
