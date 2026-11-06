@@ -24,6 +24,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
+- **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`agent_triggers.py`** — AgentTrigger vocabulary and playbook dispatch: which platform events a task may name and which skill runs it.
 - **`agent_turn.py`** — Per-invocation turn context and the 3-outcome turn gate for relay tasks.
