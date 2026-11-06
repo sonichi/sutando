@@ -166,6 +166,10 @@ repair_claude_hook_paths
 # Registers the PERSONAL_CLAUDE.md compaction-reinject hook.
 install_claude_personal_hook
 
+# Restore owned hooks before spawning; unattended launches omit the transcript archiver.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
+
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
 #     script's cwd), exactly as before. Zero behavior change for OSS installs.
