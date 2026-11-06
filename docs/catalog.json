@@ -96,7 +96,7 @@
    ],
    "status": "active",
    "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema, PR checklists, chat-path task/result recipes, workspace resolution, vault recipes, per-channel pull namespace, voice session context",
-   "last_verified": "2026-10-10"
+   "last_verified": "2026-10-31"
   },
   "docs/codex-core.md": {
    "title": "Codex CLI as the Sutando core",

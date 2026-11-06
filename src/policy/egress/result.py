@@ -1270,7 +1270,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
                           scan_sensitive_data: bool = True, *,
                           suppress_journal=None, allow_attach: bool = False,
-                          honor_suppressions: bool = True, attach_roots=()):
+                          honor_suppressions: bool = True, attach_roots=(),
+                          skip_after_channel: bool = False):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
@@ -1280,6 +1281,10 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     suppress_journal: `(state_dir, task_id)` from an adapter that can write the
     record. A guarded suppression is journaled there and the marker is honoured;
     an adapter that omits it honours the marker with no record of its own.
+
+    skip_after_channel: the adapter's delivery verdict (parse_markers flag), used only
+    to decide what to journal, so whatever the adapter then closes silently is recorded.
+    The verdict itself keeps the plain parse: a non-owner's redirect-plus-skip is withheld.
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data,
@@ -1288,7 +1293,7 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     # An unreadable tier is not a decision to record: journalling it can only
     # fail the same way the tier read did, and its notice replaces the answer.
     if (suppress_journal is not None and is_guarded_tier(tier)
-            and tier != TIER_UNREADABLE and is_suppression_only(body)):
+            and tier != TIER_UNREADABLE and is_suppression_only(body, skip_after_channel=skip_after_channel)):
         state_dir, task_id = suppress_journal
         verdict = journal_suppressed_result(verdict, body, state_dir, task_id)
     if (suppress_journal is not None and verdict.kind == VERDICT_LEAK

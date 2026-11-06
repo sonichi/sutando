@@ -159,7 +159,7 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, has_skip_action  # noqa: E402
+from result_markers import parse_markers, has_skip_action, DELIVERY_SKIP_AFTER_CHANNEL  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
@@ -5044,11 +5044,12 @@ async def poll_results():
                     _aa_access, getattr(channel, "id", None))
                 reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO,
                                                              suppress_journal=(STATE_DIR, task_id),
-                                                             allow_attach=_allow_attach)
+                                                             allow_attach=_allow_attach,
+                                                             skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
                 if _withheld:
                     print(f"  [team-guard] withheld result for {task_id} "
                           f"(tier={_guard_tier}): {_withheld}", flush=True)
-                _parsed = parse_markers(reply_text)
+                _parsed = parse_markers(reply_text, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
                     # All dedup boundaries and retry limits belong to the shared
@@ -5573,7 +5574,7 @@ async def poll_proactive():
                         continue
                     # Parse ONCE, here, and reuse below: a second grammar would
                     # miss what parse_markers peels (D7 `**[core: N]**` headers).
-                    _pp = parse_markers(text)
+                    _pp = parse_markers(text, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
                     # Honor suppression markers, same as poll_dm_fallback —
                     # else a skip-marked file still gets DM-attempted here.
                     if has_skip_action(_pp.actions):
@@ -6001,7 +6002,7 @@ async def poll_dm_fallback():
                     _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
                 except OSError:
                     _peek = ""
-                _parsed_fb = parse_markers(_peek)
+                _parsed_fb = parse_markers(_peek, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
                 if has_skip_action(_parsed_fb.actions):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem

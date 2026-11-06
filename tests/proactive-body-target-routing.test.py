@@ -127,7 +127,7 @@ def main() -> int:
     tg_src = (REPO / "src" / "telegram-bridge.py").read_text(encoding="utf-8")
     check("silently drops [channel:] redirects" in tg_src,
           "3a) telegram-bridge still documents that it DROPS a [channel:] redirect")
-    check("parse_markers(reply_text)" in tg_src,
+    check("parse_markers(reply_text" in tg_src,
           "3a) and the drop happens at its parse_markers call, not a private branch")
     for tg_id in ("12345", "-1001234567890", "987654321"):
         check(target_channel_kind(tg_id) is None,

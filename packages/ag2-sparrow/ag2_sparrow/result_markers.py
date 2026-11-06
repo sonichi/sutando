@@ -218,6 +218,11 @@ _THREAD_ASK_RE = re.compile(r"^\s*\[thread\][ \t]*(?:\r?\n|\Z)", re.IGNORECASE)
 _DMONLY_STRIP_RE = re.compile(r"^[ \t]*\[dm-only\][ \t]*\r?\n?", re.IGNORECASE | re.MULTILINE)
 
 
+# Every consumer's delivery verdict on a guarded or owner-authored body (a skip after [channel:] is a
+# skip), read by each delivery decision and by the guard's journal; the guard itself reads plain.
+DELIVERY_SKIP_AFTER_CHANNEL = True
+
+
 def parse_markers(text: str, skip_after_channel: bool = False) -> ParseResult:
     """Parse a result-body string and return body + action list.
 
