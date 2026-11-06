@@ -166,6 +166,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
+- **`owner_channel.py`** — May the core speak in this channel?
 - **`owner_reply.py`** — Owner-reply plumbing for a launcher gate that runs while no core is up to read the owner's DM.
 - **`owner_room_access.py`** — How a room-database adapter reaches the owner's room: capability lookup, owner DM, agent identity and credentials.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
