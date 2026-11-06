@@ -442,5 +442,23 @@ class Exclusive(fx.AgentRootBase):
                 self.assertEqual(cb._writer(text), COMMANDS[CX.name])
 
 
+
+class BusyAgentLockAfterRedeem(unittest.TestCase):
+    def test_a_busy_agent_lock_after_the_code_is_spent_points_to_the_relay_token(self):
+        class Held:
+            def __enter__(self):
+                raise cm.Busy("another operation holds the agent")
+        redeemed = {"agent_id": fx.AGENT, "relay_url": "https://relay.example", "bearer": "b"}
+        with mock.patch.multiple(cm, agent_job=lambda *a: (None, ""), active_job_problem=lambda *a: "",
+                                 read_code=lambda *a: ("acp.x", ""), code_problem=lambda *a: "",
+                                 redeem_code=lambda *a: (redeemed, ""), relay_problem=lambda *a: "",
+                                 canonical_root=lambda *a: ("/nonexistent/root", ""), agent_lock=lambda *a: Held()), \
+                mock.patch.multiple(cb, agent_owner_problem=lambda *a: "", known_root_problem=lambda *a: ""):
+            seat, why = cb.redeem_into_seat("https://base.example", "-", "", lambda: "", CL, fx.AGENT)
+        self.assertIsNone(seat)
+        self.assertIn("the code is spent and nothing was written", why)
+        self.assertIn("install --token-env-file", why)
+
+
 if __name__ == "__main__":
     unittest.main()
