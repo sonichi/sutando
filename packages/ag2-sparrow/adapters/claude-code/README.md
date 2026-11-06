@@ -375,9 +375,9 @@ with no core, put it in a mode-600 env file as `REMOTE_TASK_TOKEN=<token>` with
 from that file, never from the command line. Under Sutando,
 store it with `vault set <KEY> "<token>"` (the key install prints; see below).
 
-The Sutando core's own agent has no Get token in the app: its token is managed on its machine (a
-desktop sign-in writes it; `scripts/connections.py update-token` stores one you already hold; see the
-repo's `docs/connections.md`).
+The Sutando core's own agent has no Get token in the app: its token is managed on its machine (the
+Sutando desktop app's s.space sign-in hands it to the local agent API; see the repo's
+`docs/connections.md`).
 
 **The agent's root and its bridge.** One bridge serves one agent (its relay
 token), so each agent gets its own root and its own bridge. With no `--work`,
