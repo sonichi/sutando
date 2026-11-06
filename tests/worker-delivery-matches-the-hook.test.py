@@ -207,13 +207,15 @@ else:
 print("the two LIVE owners of the suffix set agree")
 # The hook asks task_dispatch.py now, so the second copy is that module's.
 # Nothing else compares the two, and src/ may not import the skill to share one.
-spec = importlib.util.spec_from_file_location(
-    "task_dispatch_suffix_guard", ROOT / "src" / "delivery" / "task_dispatch.py")
-task_dispatch = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(task_dispatch)
-check(set(task_dispatch._WORKER_HOLD_SUFFIXES) == set(SENTINEL_SUFFIXES),
-      f"task_dispatch {sorted(task_dispatch._WORKER_HOLD_SUFFIXES)} == "
-      f"worker_delivery {sorted(SENTINEL_SUFFIXES)}")
+dispatch_path = ROOT / "src" / "delivery" / "task_dispatch.py"
+check(dispatch_path.is_file(), "the live task_dispatch suffix owner exists")
+if dispatch_path.is_file():
+    spec = importlib.util.spec_from_file_location("task_dispatch_suffix_guard", dispatch_path)
+    task_dispatch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(task_dispatch)
+    check(set(task_dispatch._WORKER_HOLD_SUFFIXES) == set(SENTINEL_SUFFIXES),
+          f"task_dispatch {sorted(task_dispatch._WORKER_HOLD_SUFFIXES)} == "
+          f"worker_delivery {sorted(SENTINEL_SUFFIXES)}")
 
 print(f"\n{'FAILED: ' + '; '.join(FAILED) if FAILED else 'all checks passed'}")
 sys.exit(1 if FAILED else 0)
