@@ -20,6 +20,8 @@ the channel env file's, else the launcher-named device file or channels/ag2space
 CLI (what an agent runs before introducing itself):
     python3 src/agent_display_name.py [--room ROOM] [--agent-mxid MXID] [--json]
 prints the name (with --json: {"name", "source", "agent_mxid"}). It never fails. Stdlib only.
+With --room, a room whose connection names no identity, or that no connection serves, resolves with
+no mxid (tiers 3 and 5): another server's room never borrows the primary agent's name.
 """
 from __future__ import annotations
 
@@ -142,7 +144,10 @@ def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
                          ("connection", lambda: connection_name(mxid, workspace)),
                          ("configured", lambda: configured_name(environ)),
                          ("localpart", lambda: localpart_name(mxid))):
-        got = name()
+        try:
+            got = name()
+        except Exception:  # noqa: BLE001 - a failing tier leaves the next one
+            got = ""
         if got:
             return got, source
     return FALLBACK_NAME, "fallback"
@@ -156,9 +161,11 @@ def _main(argv) -> int:
     args = ap.parse_args(argv)
     mxid = args.agent_mxid.strip() or None
     if mxid is None and args.room:
-        with contextlib.suppress(Exception):
+        try:
             from channel_credentials import room_agent_mxid
-            mxid = room_agent_mxid(args.room) or None
+            mxid = room_agent_mxid(args.room)  # None: one connection; '': none named for this room
+        except Exception:  # noqa: BLE001 - no connection serves the room: never borrow the primary's
+            mxid = ""
     if mxid is None:
         with contextlib.suppress(Exception):
             mxid = agent_mxid()

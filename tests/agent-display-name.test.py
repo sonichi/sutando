@@ -120,11 +120,38 @@ class EntryTest(Fixture):
                 got = json.loads(self.main("--room", "!r:example.invalid", "--json"))
             self.assertEqual(got, {"name": DISPLAY, "source": "connection", "agent_mxid": MXID})
             self.assertEqual(self.main("--agent-mxid", MXID).strip(), DISPLAY)
-            with mock.patch("channel_credentials.room_agent_mxid", side_effect=RuntimeError("no row")), \
+            with mock.patch("channel_credentials.room_agent_mxid", return_value=None), \
                     mock.patch.object(adn, "agent_mxid", return_value=MXID):
                 self.assertEqual(self.main("--room", "!r:example.invalid").strip(), DISPLAY)
             with mock.patch.object(adn, "agent_mxid", side_effect=RuntimeError("no identity")):
                 self.assertEqual(json.loads(self.main("--json"))["name"], "Sutando")
+
+
+class OtherServerRoomTest(Fixture):
+    """A room no connection names an identity for never borrows the primary agent's name."""
+
+    def greet(self, **room_agent):
+        primary = {"agent_mxid": MXID, "agent_display_name": DISPLAY}
+        out = io.StringIO()
+        with self.rows(primary), mock.patch.object(adn, "profile_name", return_value=""), \
+                mock.patch.object(adn, "agent_mxid", return_value=MXID), \
+                mock.patch("channel_credentials.room_agent_mxid", **room_agent), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(adn._main(["--room", "!r:other.invalid", "--json"]), 0)
+        return json.loads(out.getvalue())
+
+    def test_a_room_whose_connection_names_no_identity(self):
+        self.assertEqual(self.greet(return_value=""),
+                         {"name": "Sutando", "source": "fallback", "agent_mxid": ""})
+
+    def test_a_room_no_connection_serves(self):
+        import connections
+        got = self.greet(side_effect=connections.NoConnectionForRoom("no row for other.invalid"))
+        self.assertEqual(got, {"name": "Sutando", "source": "fallback", "agent_mxid": ""})
+
+    def test_a_failing_tier_never_fails_the_resolver(self):
+        with self.rows(), mock.patch.object(adn, "configured_name", side_effect=ImportError("gone")):
+            self.assertEqual(adn.resolve(MXID, fetch=profile(None)), ("Blue Fox", "localpart"))
 
 
 class GreetingPathsTest(Fixture):
