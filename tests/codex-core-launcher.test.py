@@ -550,7 +550,8 @@ exit 0
         marker = tmp / "codex-ran"
         for key in ("install", "local"):
             exe = dirs[key] / "codex"
-            exe.write_text(f'#!/bin/bash\nprintf "%s\\n%s\\n" {key} "$PATH" > "{marker}"\nexit 1\n')
+            auth_probe = f'  login) printf "%s\\n%s\\n" {key} "$PATH" > "{marker}"; exit 1 ;;\n'
+            exe.write_text(CODEX_STUB.replace("esac\nexit 0", auth_probe + "esac\nexit 0"))
             exe.chmod(0o755)
         (self.bin / "codex").unlink()
         env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
@@ -3078,7 +3079,8 @@ class CoreWindowRestartTests(unittest.TestCase):
         (self.case.bin / "tmux").symlink_to(REAL_TMUX)
         # A core that stays up like the real CLI; `login status` still succeeds.
         codex = self.case.bin / "codex"
-        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.write_text(CODEX_STUB.replace(' ;;', '; exit 0 ;;').replace(
+            "esac\nexit 0", "  login) exit 0 ;;\nesac\nexec sleep 300"))
         codex.chmod(0o755)
 
     def tmux(self, *args):
