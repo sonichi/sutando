@@ -164,7 +164,6 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
     out = []
     for job in read_crons(Path(path)):
         expr = job.get("cron", "")
-        skill = job.get("prompt_skill")
         nxt = next_run(expr, now) if expr else None
         if nxt:
             mins = int((nxt - now).total_seconds() // 60)

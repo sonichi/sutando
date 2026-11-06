@@ -124,6 +124,12 @@ export default tseslint.config(
     files: ['skills/overlay-apps/app/stats-renderer.js', 'skills/overlay-apps/app/stats.js'],
     languageOptions: { sourceType: 'script', globals: { ...globals.browser } },
   },
+  // The SCP voice client ships to a web surface, so `window` and the audio
+  // APIs are its runtime — but it is an ES module, so no sourceType override.
+  {
+    files: ['src/runtime-api/scp-voice.js'],
+    languageOptions: { globals: { ...globals.browser } },
+  },
   // --- no-explicit-any ratchet allowlist --------------------------------------
   // THIS LIST ONLY SHRINKS. It is the set of files that already contained `any`
   // when the rule was promoted to an error; for them the rule stays a warning so

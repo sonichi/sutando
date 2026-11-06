@@ -16,7 +16,6 @@ name: lint-hermetic-bridge-tests
 
 on:
   pull_request:
-    branches: [main, staging-workspace-revamp]
   push:
     branches: [main, staging-workspace-revamp]
 
