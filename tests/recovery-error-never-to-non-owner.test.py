@@ -172,6 +172,20 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
                         target.write_text((f"id: {TID}\n" if declared else "") + "task: hello\n")
                         self.assertEqual(td_mod.task_disposition(ws, TID), expected)
 
+    def test_package_loaded_archive_lookup_uses_the_same_identity_owner(self):
+        sys.path.insert(0, str(REPO))
+        try:
+            from src.local_task_protocol import find_archived_task
+        finally:
+            sys.path.remove(str(REPO))
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            target = ws / "tasks/archive" / f"{TID}.txt"
+            target.write_text("id: task-foreign\ntask: hello\n")
+            self.assertIsNone(find_archived_task(ws / "tasks", TID))
+            target.write_text(f"id: {TID}\ntask: hello\n")
+            self.assertEqual(find_archived_task(ws / "tasks", TID), target)
+
     def test_cli_accepts_the_notification_file_name(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
