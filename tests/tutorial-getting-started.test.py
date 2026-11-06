@@ -3,6 +3,11 @@
 and the room-commons calls publish makes, against a stub room_commons.py that keeps a fake room."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import hashlib
 import io
@@ -31,6 +36,9 @@ spec.loader.exec_module(gs)
 STUB = textwrap.dedent('''
     import json, os, sys
     from pathlib import Path
+    if os.environ.get("STUB_REEXEC") and not os.environ.get("STUB_REEXECED"):
+        # Room Commons' handoff to a python that has its deps: the same command line, run again.
+        os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], {**os.environ, "STUB_REEXECED": "1"})
     state = Path(os.environ["STUB_STATE"])
     db = json.loads(state.read_text()) if state.exists() else {"pages": {}, "calls": [], "next": 1}
     argv = sys.argv[1:]
@@ -45,7 +53,10 @@ STUB = textwrap.dedent('''
                                       if sized else rest[:1]))
     def save():
         state.write_text(json.dumps(db))
-    if cmd in os.environ.get("STUB_FAIL", "").split(","):
+    fail_at = os.environ.get("STUB_FAIL_AT", "")  # "<cmd>:<n>": the n-th call of cmd fails; "write" counts both writes
+    of = ("replace", "append") if fail_at.startswith("write:") else (fail_at.split(":")[0],)
+    nth = fail_at and cmd in of and sum(c[0] in of for c in db["calls"]) == int(fail_at.split(":")[1])
+    if cmd in os.environ.get("STUB_FAIL", "").split(",") or nth:
         save(); print("boom", file=sys.stderr); sys.exit(1)
     if cmd == "pages":
         listed = [{"id": None, "kind": "html", "title": "Main"}]
@@ -64,14 +75,23 @@ STUB = textwrap.dedent('''
         pass
     else:
         sys.exit(9)
+    edit = os.environ.get("STUB_EDIT_AFTER", "")  # "<cmd>:<n>:<append|prepend|inplace>": the owner edits right after that call
+    if edit and kind and cmd == edit.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(edit.split(":")[1]):
+        cur = db["pages"][kind]
+        db["pages"][kind] = (cur + "<p>OWNER NOTES</p>" if edit.endswith("append")
+                             else "<p>OWNER FIRST</p>" + cur if edit.endswith("prepend")
+                             else "<!--OWNER-->" + cur[12:] if cur else "<p>OWNER</p>")
+        db.setdefault("edits", []).append(db["pages"][kind])
     save()
 ''')
 
 
 TOUR = ["Your DM", "Rooms", "Commons", "Connect other agents", "Teamwork", "Calls & voice",
-        "Connect your apps", "Activity & notices", "Mobile"]
-FINALE = "You\u2019re set \u2014 ask Blue anything"
-IMPORT = "Import your Claude Code history"
+        "Connect your apps", "Activity & notices", "Get the mobile app", "Mobile"]
+FINALE = "You\u2019re set. Ask Blue anything"
+# The stub room-commons has no room_media.py: every full-resolution capture stays inlined.
+NO_MEDIA_SUPPORT = {"uploaded": [], "skipped": [], "fallback": list(gs.tour_page.hd_files(gs.tour_page.FEATURES)),
+                    "reason": "this room-commons has no room media support (room_media.py)"}
 
 
 class Page(HTMLParser):
@@ -107,20 +127,20 @@ def steps(page):
 
 
 class RenderTest(unittest.TestCase):
-    def test_tour_has_all_nine_sections_in_order(self):
+    def test_tour_has_all_ten_sections_in_order(self):
         for core in gs.CORES:
-            self.assertEqual(steps(gs.render_page("Blue", core))[:9], TOUR)
+            self.assertEqual(steps(gs.render_page("Blue", core))[:10], TOUR)
         self.assertLess(TOUR.index("Connect other agents"), TOUR.index("Teamwork"))
 
-    def test_import_section_only_on_a_claude_core(self):
-        claude = parse(gs.render_page("Blue", "claude"))
-        self.assertEqual(steps(gs.render_page("Blue", "claude")), TOUR + [IMPORT])
-        self.assertIn(gs.IMPORT_PROMPT, claude.buttons)
-        for core in ("codex", "unknown"):
-            page = parse(gs.render_page("Blue", core))
-            self.assertEqual(steps(gs.render_page("Blue", core)), TOUR)
-            self.assertNotIn(gs.IMPORT_PROMPT, page.buttons)
-            self.assertNotIn("Claude Code", gs.render_page("Blue", core))
+    def test_no_core_gets_a_claude_code_import_section(self):
+        for core in gs.CORES:
+            page = gs.render_page("Blue", core)
+            self.assertEqual(steps(page), TOUR)
+            self.assertNotIn("Import your Claude Code history", page)
+            self.assertNotIn("Import my Claude Code history", page)
+            self.assertNotIn('id="s-import"', page)
+            self.assertNotIn("Claude Code", page)
+        self.assertFalse(hasattr(gs, "IMPORT_PROMPT"))
 
     def test_unknown_core_value_is_refused(self):
         with self.assertRaises(ValueError):
@@ -131,7 +151,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual([b for b in parse(page).buttons if b],
                          [gs.tour_page.FINALE_PROMPT] + [s.prompt for s in gs.SECTIONS if s.prompt])
         self.assertIn(gs.CONNECT_PROMPT, parse(page).buttons)
-        self.assertIn("Settings &rarr; Integrations", page)
+        self.assertIn("Settings &rarr; Apps &rarr; Connected apps", page)
         self.assertIn("navigator.clipboard", page)
         self.assertIn("prefers-color-scheme: dark", page)
 
@@ -143,10 +163,10 @@ class RenderTest(unittest.TestCase):
 
     def test_every_prompt_says_where_to_paste_it(self):
         where = {s.id: s.where for s in gs.sections_for("claude") if s.prompt}
-        self.assertEqual(where, {"dm": "dm", "commons": "room", "teamwork": "room", "apps": "dm", "import": "dm"})
+        self.assertEqual(where, {"dm": "dm", "commons": "room", "teamwork": "room", "apps": "dm"})
         page = gs.render_page("Blue", "claude")
         self.assertEqual(page.count('<p class="paste">Paste in: a room</p>'), 2)
-        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 4)  # dm, apps, import, finale
+        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 3)  # dm, apps, finale
 
     def test_closing_card_is_hidden_until_everything_is_done(self):
         page = gs.render_page("Blue", "claude")
@@ -158,34 +178,34 @@ class RenderTest(unittest.TestCase):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")
         self.assertIn('<p class="step-title"><span id="step-title">Your DM</span>'
-                      '<span class="pos" id="step-pos" aria-hidden="true">1/9</span></p>', page)
+                      '<span class="pos" id="step-pos" aria-hidden="true">1/10</span></p>', page)
         self.assertNotRegex(page, r'id="step-title"[^>]*aria-live')  # announced once, by heading focus
         self.assertIn("stepPos.textContent = (cur + 1) + '/' + ids.length", gs.tour_page.SCRIPT)
         self.assertIn("stepTitle.textContent = titles[cur]", gs.tour_page.SCRIPT)
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or Muse (by Meta)", by["agents"].how)
+        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
-        self.assertTrue(by["import"].what.startswith("If you use Claude Code"))
-        self.assertIn("local Claude Code history", by["import"].what)
+        self.assertNotIn("import", by)
         self.assertIn("headphone icon in the room header", by["calls"].how)
         self.assertIn("Bring an agent?", by["calls"].how)
         self.assertIn("+ at the top of the room list", by["rooms"].how)
 
     def test_second_review_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Docs, HTML pages, PDFs, whiteboards, sheets and databases", by["commons"].what)
+        self.assertIn("Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases", by["commons"].what)
         self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
         self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
                       by["activity"].how)
-        self.assertIn(("settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"), by["apps"].images)
+        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings \u2192 Apps \u2192 Connected apps",
+                       "settings-integrations.png", None), by["apps"].images)
 
     def test_room_audience_says_your_agent(self):
         room = gs.render_page("Blue", "claude", "room")
         self.assertIn("<h1>Getting started with your agent</h1>", room)
-        self.assertIn("ask your agent anything", room)
+        self.assertIn("Ask your agent anything", room)
         self.assertNotIn("Blue", re.sub(r'src="data:[^"]*"', "", room))
         dm = gs.render_page("Blue", "claude", "dm")
         self.assertIn("<h1>Getting started with Blue</h1>", dm)
@@ -197,17 +217,26 @@ class RenderTest(unittest.TestCase):
         for core in gs.CORES:
             text = re.sub(r"data:image/[^\"]+", "", gs.render_page("Blue", core)).lower()
             self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
-        self.assertNotIn("02-microphone", " ".join(f for s in gs.SECTIONS for f, _ in s.images))
+        self.assertNotIn("02-microphone", " ".join(shot.file for s in gs.SECTIONS for shot in s.images))
 
     def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
         self.assertNotIn("Codex", agents.what + agents.how)
-        self.assertNotIn("Claude", agents.what + agents.how)
+        self.assertNotIn("Claude Code", agents.what + agents.how)  # Claude the app is one "Other" pick
 
     def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))
         self.assertNotEqual(gs.render_page("Kai"), gs.render_page("Mo"))
-        self.assertNotEqual(gs.render_page("Kai", "claude"), gs.render_page("Kai", "codex"))
+        # No bundled step names a runtime, so the core alone changes nothing; a list step that names
+        # one still shows on that core only.
+        self.assertEqual(gs.render_page("Kai", "claude"), gs.render_page("Kai", "codex"))
+        extra = gs.tour_page.Section("extra", "Extra", "What it is.", "Try it.", "Do the extra thing.", "dm",
+                                     runtime="claude")
+        features = gs.tour_page.FeatureList(gs.tour_page.FEATURES.revision, gs.tour_page.FEATURES.steps + (extra,))
+        claude = gs.render_page("Kai", "claude", features=features)
+        self.assertNotEqual(claude, gs.render_page("Kai", "codex", features=features))
+        self.assertIn("Do the extra thing.", claude)
+        self.assertNotIn("Do the extra thing.", gs.render_page("Kai", "codex", features=features))
 
     def test_name_is_escaped_everywhere(self):
         page = gs.render_page('<img src=x onerror="alert(1)">', "claude")
@@ -292,12 +321,17 @@ class InteractiveTest(unittest.TestCase):
     def test_an_svg_per_section_and_a_hero(self):
         self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 10)
         self.assertIn('class="hero-art"', self.page)
-        self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for("claude")})
+        for core in gs.CORES:
+            self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for(core)})
 
     def test_no_external_urls(self):
         for core in gs.CORES:
             page = gs.render_page("Blue", core)
-            bare = re.sub(r'src="data:image/jpeg;base64,[A-Za-z0-9+/=]+"', 'src=""', page)
+            bare = re.sub(r'src="data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+"', 'src=""', page)
+            # The phone step's App Store anchor is the one outbound URL: a link, never a resource.
+            store = re.findall(r'<a href="([^"]*)"', bare)
+            self.assertEqual(store, ["https://apps.apple.com/us/app/s-space/id6788541784"])
+            bare = bare.replace(f'href="{store[0]}"', 'href=""')
             self.assertNotRegex(bare, r"(?i)\b(?:https?:)?//[a-z0-9]")
             self.assertNotRegex(bare, r"(?i)<(?:link|iframe|object|embed)\b|url\(")
             self.assertEqual(re.findall(r'\bsrc="([^"]*)"', bare), [""] * bare.count("<img "))
@@ -326,11 +360,26 @@ class InteractiveTest(unittest.TestCase):
         self.assertNotIn("art.state.set('gs-done'", script)
         self.assertIn("typeof v.then === 'function'", script)
 
-    def test_accent_palette_meets_aa_on_cards_in_both_themes(self):
+    def test_step_accents_cycle_the_brand_palette_and_the_glyph_stays_legible(self):
         tp = gs.tour_page
-        for sid, (light, dark) in tp.ACCENTS.items():
-            self.assertGreaterEqual(tp.contrast(light, tp.CARD[0]), 4.5, sid)
-            self.assertGreaterEqual(tp.contrast(dark, tp.CARD[1]), 4.5, sid)
+        self.assertEqual(tp.BRAND, (("orange", "#f9a75c", "#f26a21"), ("yellow", "#f0e24a", "#ea931f"),
+                                    ("pink", "#f8cbfb", "#f38c64")))
+        for name, inner, outer in tp.BRAND:
+            self.assertIn(f"--{name}-in:{inner};", self.page)
+            self.assertIn(f"--{name}-out:{outer};", self.page)
+            for shade in (inner, outer):  # the ink glyph on either end of the gradient, in both themes
+                self.assertGreaterEqual(tp.contrast(tp.INK, shade), 4.5, (name, shade))
+        tones = re.findall(r'style="--accent-in:var\(--([a-z]+)-in\);--accent-out:var\(--\1-out\)"', self.page)
+        self.assertEqual(tones, [tp.BRAND[i % 3][0] for i in range(len(TOUR))])
+        self.assertNotIn("--a-", self.page)
+        self.assertIn("color:var(--ink); position:relative; display:grid; place-items:center;\n"
+                      "  background:radial-gradient(closest-side, var(--accent-in) 70%, var(--accent-out) 130%); }",
+                      self.page)
+
+    def test_the_hero_oval_is_the_solid_brand_orange(self):
+        self.assertIn("transform:rotate(36deg); opacity:1;\n"
+                      "  background:radial-gradient(closest-side, var(--orange-in) 42%, var(--orange-out) 100%); }",
+                      self.page)
 
     def test_page_scripts_parse(self):
         node = shutil.which("node")
@@ -442,7 +491,7 @@ def _jsdom_node():
     if not node:
         return None
     probe = subprocess.run([node, "-e", "require('jsdom')"], capture_output=True, text=True)
-    return (node, dict(os.environ)) if probe.returncode == 0 else None
+    return (node, isolated_child_env()) if probe.returncode == 0 else None
 
 
 class PageBehaviourTest(unittest.TestCase):
@@ -593,6 +642,27 @@ class CredentialTest(unittest.TestCase):
         self.assertTrue(env["AG2_REMOTE_TOKEN"].endswith("|not-a-real-secret"))
         self.assertNotIn("OTHER", env)
 
+    def test_a_secondary_lane_only_install_finds_the_lane_token(self):
+        # The device file holds only the lane's suffixed keys: its token key, and the dir naming the identity file.
+        app = self.tmp / "app"
+        channels = app / "channels"
+        (channels / "ag2space").mkdir(parents=True)
+        (channels / "s.space").mkdir()
+        device = channels / "ag2space" / ".env"
+        device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n"
+                          "REMOTE_TASK_CHANNEL_DIR_S_DSPACE='s.space'\n")
+        (channels / "s.space" / ".env").write_text(
+            "AG2_REMOTE_TOKEN=https://relay.test.invalid/relay|dir-secret\n"
+            "AGENT_MXID=@lane.agent:example.test\n")
+        (channels / "active-gateway-lane").write_text("s_dspace\n")
+        env = {"CLAUDE_CONFIG_DIR": str(app), "SUTANDO_APP_SUPPORT": str(app),
+               "AG2_DEVICE_ENV": str(device), "PATH": os.environ.get("PATH", "")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            got = gs.commons_env(self.script)
+            mxid = gs.agent_mxid()
+        self.assertTrue(got.get("AG2_REMOTE_TOKEN", "").endswith("|lane-secret"))
+        self.assertEqual(mxid, "@lane.agent:example.test")
+
     def test_an_env_credential_wins_and_nothing_is_mixed_in(self):
         with mock.patch.dict(os.environ, {**self.base, "AG2_API_ROOT": "https://other.test.invalid"},
                              clear=True):
@@ -613,6 +683,23 @@ class CredentialTest(unittest.TestCase):
         self.assertIn("boom [redacted]", done.stdout)
         self.assertNotIn("not-a-real-secret", done.stdout + done.stderr)
         self.assertNotIn("relay.test.invalid/relay|", done.stdout + done.stderr)
+
+    def test_a_secondary_lane_only_install_reads_the_active_lanes_token(self):
+        support = self.tmp / "app-support"
+        device = support / "channels" / "ag2space" / ".env"
+        device.parent.mkdir(parents=True)
+        (support / "channels" / "active-gateway-lane").write_text("s_dspace\n")
+        device.write_text("AG2_REMOTE_TOKEN_S_DSPACE=https://relay.test.invalid/relay|lane-secret\n"
+                          "AG2_REMOTE_TOKEN_OTHER=https://relay.test.invalid/relay|other-secret\n"
+                          "REMOTE_TASK_URL=https://leftover.test.invalid/relay\n")
+        (self.config / "channels" / "ag2space" / ".env").unlink()
+        lane = {**self.base, "CLAUDE_CONFIG_DIR": str(support), "SUTANDO_APP_SUPPORT": str(support),
+                "AG2_DEVICE_ENV": str(device)}
+        with mock.patch.dict(os.environ, lane, clear=True):
+            env = gs.commons_env(self.script)
+        self.assertEqual(env.get("AG2_REMOTE_TOKEN"), "https://relay.test.invalid/relay|lane-secret")
+        self.assertNotIn("ROOM_COMMONS_TOKEN", env)
+        self.assertNotIn("REMOTE_TASK_URL", env, "a leftover URL never pairs with the lane token")
 
     def test_redact_hides_credential_values_and_token_halves(self):
         env = {"AG2_REMOTE_TOKEN": "https://relay.test.invalid/r|s3cr3t-value", "ROOM_KEY": "short",
@@ -654,7 +741,7 @@ class ChunkTest(unittest.TestCase):
         self.assertEqual("".join(parts), text)
         self.assertTrue(all(len(p.encode("utf-8")) <= 7 for p in parts))
         self.assertEqual(gs.chunks(""), [])
-        self.assertLess(gs.CHUNK_BYTES, 131_072)  # Linux MAX_ARG_STRLEN, below Commons' 196,608
+        self.assertLess(gs.CHUNK_BYTES, 196_608)  # Room Commons takes 196,608 bytes in one write
 
 
 class AssetTest(unittest.TestCase):
@@ -662,34 +749,37 @@ class AssetTest(unittest.TestCase):
         tp = gs.tour_page
         seen = {}
         for s in tp.sections_for("claude"):
-            for f, _ in s.images:
-                digest = hashlib.sha256((tp.ASSETS / f).read_bytes()).hexdigest()
-                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {f}")
+            for shot in s.images:
+                digest = hashlib.sha256((tp.ASSETS / shot.file).read_bytes()).hexdigest()
+                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {shot.file}")
                 seen[digest] = s.id
 
 
     def test_every_step_image_exists_and_is_small(self):
         tp = gs.tour_page
-        used = {f for s in tp.sections_for("claude") for f, _ in s.images}
-        files = {p.name: p.stat().st_size for p in tp.ASSETS.glob("*.jpg")}
-        self.assertEqual(used, set(files))
+        used = {shot.file for s in tp.sections_for("claude") for shot in s.images}
+        files = {name: (tp.ASSETS / name).stat().st_size for name in used}  # the inlined fallbacks
+        hd = {shot.hd for s in tp.sections_for("claude") for shot in s.images if shot.hd}
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        self.assertEqual(used | hd, on_disk)
         self.assertTrue(all(size <= 60_000 for size in files.values()), files)
         self.assertLessEqual(sum(files.values()), 500_000)
         for s in tp.sections_for("claude"):
-            for f, alt in s.images:
-                self.assertTrue(alt.strip(), f)
+            for shot in s.images:
+                self.assertTrue(shot.alt.strip(), shot.file)
+                self.assertEqual(shot.asset, Path(shot.file).stem)  # today's asset names are the file stems
 
     def test_each_step_with_an_image_renders_it_inline(self):
         page = gs.render_page("Blue", "claude")
         for s in gs.tour_page.sections_for("claude"):
             block = page[page.index(f'id="s-{s.id}"'):]
             block = block[:block.index("</section>")]
-            self.assertEqual(block.count('<img src="data:image/jpeg;base64,'), len(s.images), s.id)
-        for sid in ("rooms", "commons", "teamwork", "calls", "apps", "activity", "mobile"):
+            self.assertEqual(len(re.findall(r'<img src="data:image/(?:jpeg|png);base64,', block)), len(s.images), s.id)
+        for sid in ("rooms", "commons", "teamwork", "calls", "apps", "activity", "phone", "mobile"):
             self.assertTrue([s for s in gs.SECTIONS if s.id == sid][0].images, sid)
 
     def test_rendered_page_size_is_bounded(self):
-        self.assertLess(len(gs.render_page("Blue", "claude").encode()), 400_000)
+        self.assertLessEqual(len(gs.render_page("Blue", "claude").encode()), 300_000)
 
 
 class EdgeTest(unittest.TestCase):
@@ -766,7 +856,7 @@ class MainTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.stub = self.tmp / "room_commons.py"
         self.stub.write_text(STUB)
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in isolated_child_env().items()
                if not k.startswith(("SUTANDO_", "AG2", "REMOTE_TASK", "AGENT_", "ROOM_C", "MATRIX_"))
                and k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME")}
         env.update({"CLAUDE_CONFIG_DIR": str(self.tmp / "claude"), "STUB_STATE": str(self.tmp / "room.json"),
@@ -815,8 +905,11 @@ class MainTest(unittest.TestCase):
                                  "--owner", "@owner:example.test", "--room-commons", str(self.stub),
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out), {"ok": True, "action": "created", "kind": "html-p1",
-                                           "summoned": True, "name": "Blue"})
+        got = json.loads(out)
+        self.assertEqual(got.pop("upload"), NO_MEDIA_SUPPORT)
+        self.assertEqual(got, {"ok": True, "action": "created", "kind": "html-p1",
+                               "summoned": True, "name": "Blue", "list": "file",
+                               "revision": gs.tour_page.FEATURES.revision, "media": []})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
@@ -852,9 +945,62 @@ class MainTest(unittest.TestCase):
     def test_publish_failure_exits_4(self):
         os.environ["STUB_FAIL"] = "pages"
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
-                                 "--room-commons", str(self.stub))
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 4)
         self.assertIn("pages failed", json.loads(out)["reason"])
+
+    def test_publish_refuses_without_an_agent_identity_and_resolves_one_from_the_device_file(self):
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub))
+        self.assertEqual(code, 4)
+        self.assertIn("no agent identity", json.loads(out)["reason"])
+        self.assertFalse((self.tmp / "room.json").exists())  # refused before any Commons call
+        device = self.tmp / "device.env"
+        device.write_text("AGENT_MXID=@kai.agent:example.test\n")  # the identity, no usable token
+        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(device)}):
+            self.assertEqual(gs.agent_mxid(), "@kai.agent:example.test")
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        page = self.room_state()["pages"]["html-p1"]
+        self.assertEqual(gs.read_marker(page), ("@kai.agent:example.test", gs.tour_page.FEATURES.revision))
+        with mock.patch.dict(os.environ, {"AGENT_MXID": "@env.agent:example.test"}):
+            self.assertEqual(gs.agent_mxid(), "@env.agent:example.test")
+        channels = self.tmp / "claude" / "channels" / "ag2space"
+        channels.mkdir(parents=True)
+        (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
+        self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
+
+    def test_the_identity_is_resolved_once_for_the_name_and_the_tag(self):
+        with mock.patch.object(gs, "agent_mxid", side_effect=["@alpha.agent:example.test", "@beta.agent:example.test"]) \
+                as resolver, mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "auto", "--core", "codex",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", "Alpha"))
+        self.assertEqual(resolver.call_count, 1)
+        page = self.room_state()["pages"]["html-p1"]
+        self.assertIn("<h1>Getting started with Alpha</h1>", page)
+        self.assertEqual(gs.read_marker(page)[0], "@alpha.agent:example.test")
+
+    def test_a_malformed_identity_is_refused_before_any_commons_call(self):
+        def attempt(*extra, env=None):
+            with mock.patch.dict(os.environ, env or {}):
+                return self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), *extra)
+        device = self.tmp / "device.env"
+        device.write_text("AGENT_MXID=kai.agent\n")
+        for case in (("--agent-mxid", "   "), ("--agent-mxid", "kai"), ("--agent-mxid", "!kai:example.test"),
+                     ("--agent-mxid", "@kai example.test"), ("--agent-mxid", "@kai:"),
+                     (("env",), {"AGENT_MXID": "not-an-mxid"}), (("env",), {"AGENT_MXID": " \t "}),
+                     (("env",), {"AG2_DEVICE_ENV": str(device)})):
+            extra, env = (case, None) if case[0] != ("env",) else ((), case[1])
+            code, out, _ = attempt(*extra, env=env)
+            self.assertEqual(code, 4, case)
+            self.assertIn("identity", json.loads(out)["reason"])
+            self.assertFalse((self.tmp / "room.json").exists(), case)
+        code, out, _ = attempt("--agent-mxid", "  @kai.agent:example.test\n")  # whitespace is cleaned, once
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        self.assertEqual(gs.read_marker(self.room_state()["pages"]["html-p1"])[0], "@kai.agent:example.test")
 
 
     # The setup app's saved inputs: <workspace>/state/onboarding/tutorial-inputs.json.
@@ -943,13 +1089,14 @@ class PersonalTest(unittest.TestCase):
 
     def test_invalid_entries_fall_back_per_slot(self):
         bad = {"dm": "see https://example.test", "commons": "x" * (gs.tour_page.PROMPT_MAX + 1),
-               "teamwork": "line one\nline two", "apps": 42, "import": "<b>bold</b>", "finale": "   ",
-               "unknown-slot": "ignored", "mobile": "not a prompt slot"}
+               "teamwork": "line one\nline two", "apps": 42, "finale": "   ",
+               "unknown-slot": "ignored", "mobile": "not a prompt slot", "import": "a removed slot"}
         self.assertEqual(gs.tour_page.clean_prompts(bad), {})
         self.assertEqual(gs.render_page("Blue", "claude", prompts=bad), gs.render_page("Blue", "claude"))
         self.assertEqual(gs.tour_page.clean_prompts({"dm": " ok ", "apps": "www.example.test",
                                                      "commons": "Read example.com for me"}), {"dm": "ok"})
         self.assertEqual(gs.tour_page.clean_prompts(["dm", "x"]), {})
+        self.assertEqual(gs.tour_page.clean_prompts({"dm": "<b>bold</b>"}), {})
 
     def test_the_slot_decides_where_to_paste_not_the_text(self):
         page = gs.render_page("Blue", "codex", prompts={"commons": "Ask in your DM: plan my week."})
@@ -979,7 +1126,7 @@ class PersonalTest(unittest.TestCase):
 
     def test_roles_take_the_first_contact_payload_as_given(self):
         labels = gs.tour_page.role_labels
-        self.assertEqual(labels("Founder, Sales."), ["Founder", "Sales"])  # cinny-webclient#2231's line
+        self.assertEqual(labels("Founder, Sales."), ["Founder", "Sales"])  # the first-contact "I picked:" line
         self.assertEqual(labels("I picked: Founder, Sales."), ["Founder", "Sales"])  # the whole line
         self.assertEqual(labels("  i PICKED :researcher, founder"), ["Researcher", "Founder"])
         self.assertEqual(labels("Product Manager, Designer."), ["Product Manager", "Designer"])
@@ -1084,6 +1231,95 @@ class FakeActions:
         return {"kind": self.kind or made[operation_id], "surface": "html", "operation_id": operation_id}
 
 
+
+class RoutedIdentityTest(unittest.TestCase):
+    """Two connections whose agent ids differ by server: the page a room's own server's identity
+    tagged is this agent's, whatever the primary channel's AGENT_MXID names (#5980 routes the call)."""
+
+    def setUp(self):
+        from _helpers.three_connections import ThreeConnections, ROOMS
+        self.tmp = Path(tempfile.mkdtemp(prefix="tutorial-routed-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.three, self.room = ThreeConnections(self), ROOMS["dev.s.space"]
+        self.three.channel_file("ag2.space", "AGENT_MXID=@kai.agent:ag2.space\n")
+        self.three.channel_file("dev.s.space", "AGENT_MXID=@kai.agent:dev.s.space\n")
+        self.stub, self.state = self.tmp / "room_commons.py", self.tmp / "room.json"
+        self.stub.write_text(STUB)
+        # As on a desktop install: the process names the primary channel's identity.
+        env = {"STUB_STATE": str(self.state), "AGENT_MXID": "@kai.agent:ag2.space"}
+        for patcher in (mock.patch.dict(os.environ, env),
+                        mock.patch.object(gs, "_workspace", return_value=self.three.workspace)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.door = FakeActions(self.state, by="@kai.agent:dev.s.space")
+        door = mock.patch.object(gs, "connect_actions", return_value=self.door)
+        door.start()
+        self.addCleanup(door.stop)
+
+    def test_a_plain_publish_finds_the_page_its_rooms_identity_made_and_never_creates_a_second(self):
+        mine = "@kai.agent:dev.s.space"
+        self.state.write_text(json.dumps({"pages": {"html-p1": gs.render_page("Kai", "codex", "dm", mine)},
+                                          "by": {"html-p1": mine}, "calls": [], "next": 2}))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = gs.main(["publish", "--room", self.room, "--name", "Kai", "--core", "codex",
+                            "--room-commons", str(self.stub)])
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["kind"], "html-p1")
+        db = json.loads(self.state.read_text())
+        self.assertEqual(sorted(db["pages"]), ["html-p1"], "a second Getting started page was created")
+        self.assertEqual(self.door.ops, [])
+        self.assertEqual(gs.read_marker(db["pages"]["html-p1"])[0], mine)
+
+    def test_a_page_an_earlier_run_tagged_with_the_primary_identity_is_still_this_agents(self):
+        # Listed by the room's identity, tagged with the primary one: what the unrouted run wrote.
+        self.state.write_text(json.dumps({"pages": {"html-p1": gs.render_page("Kai", "codex", "dm", "@kai.agent:ag2.space")},
+                                          "by": {"html-p1": "@kai.agent:dev.s.space"}, "calls": [], "next": 2}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = gs.main(["publish", "--room", self.room, "--name", "Kai", "--core", "codex",
+                            "--room-commons", str(self.stub)])
+        self.assertEqual((code, json.loads(out.getvalue())["kind"]), (0, "html-p1"), out.getvalue())
+        db = json.loads(self.state.read_text())
+        self.assertEqual(sorted(db["pages"]), ["html-p1"], "a second Getting started page was created")
+        self.assertEqual(gs.read_marker(db["pages"]["html-p1"])[0], "@kai.agent:dev.s.space")
+
+    def test_another_agents_page_is_never_taken_for_an_alias(self):
+        page = {"kind": "html-p1", "by": "@someone.agent:dev.s.space"}
+        text = gs.render_page("Kai", "codex", "dm", "@kai.agent:ag2.space")
+        self.assertFalse(gs.owned(page, text, "@kai.agent:dev.s.space", ("@kai.agent:ag2.space",)))
+        self.assertTrue(gs.owned({**page, "by": ""}, text, "@kai.agent:dev.s.space", ("@kai.agent:ag2.space",)))
+        self.assertFalse(gs.owned({**page, "by": ""}, text, "@kai.agent:dev.s.space"))
+
+    def test_the_rooms_identity_comes_from_its_own_connection(self):
+        import channel_credentials
+        self.assertEqual(channel_credentials.room_agent_mxid(self.room), "@kai.agent:dev.s.space")
+        self.assertEqual(channel_credentials.room_agent_mxid("!room:ag2.space"), "@kai.agent:ag2.space")
+
+    def test_a_room_whose_connection_names_no_identity_is_refused_not_given_anothers(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = gs.main(["publish", "--room", "!room:s.space", "--name", "Kai", "--core", "codex",
+                            "--room-commons", str(self.stub)])
+        self.assertEqual(code, 4)
+        self.assertIn("no agent identity", json.loads(out.getvalue())["reason"])
+        self.assertFalse(self.state.exists() and json.loads(self.state.read_text())["pages"])
+
+
+REAL_RUN = subprocess.run
+
+
+def linux_exec_limit(test: unittest.TestCase) -> None:
+    """Hold every exec to Linux's 131,072-byte cap on one argument, whatever the host."""
+    def run(argv, *a, **kw):
+        if any(len(str(x).encode("utf-8")) >= 131_072 for x in argv):
+            raise OSError(7, "Argument list too long")
+        return REAL_RUN(argv, *a, **kw)
+    patcher = mock.patch.object(subprocess, "run", run)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class PublishTest(unittest.TestCase):
     ROOM = "!dm:ag2.space"
     ME = "@agent:example.test"
@@ -1098,6 +1334,7 @@ class PublishTest(unittest.TestCase):
         self.door = FakeActions(self.state)
         os.environ["STUB_STATE"] = str(self.state)
         os.environ.pop("STUB_FAIL", None)
+        linux_exec_limit(self)
 
     def tearDown(self):
         os.environ.pop("STUB_STATE", None)
@@ -1120,14 +1357,18 @@ class PublishTest(unittest.TestCase):
 
     def test_first_run_creates_writes_and_summons(self):
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True})
+        self.assertEqual(out.pop("upload"), NO_MEDIA_SUPPORT)
+        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True,
+                               "revision": gs.tour_page.FEATURES.revision, "media": []})
         room = self.room()
         self.assertEqual(room["pages"], {"html-p1": self.page()})
         parts = gs.chunks(self.page())
         self.assertGreater(len(parts), 1)  # the page is over one write's limit
-        self.assertIn(gs.owner_marker(self.ME), parts[0])  # the create's own body carries ownership
+        # The create's own body carries ownership, and the list revision the page was built from.
+        self.assertEqual(gs.read_marker(parts[0]), (self.ME, gs.tour_page.FEATURES.revision))
+        self.assertTrue(gs.page_digest_ok(self.page()))  # the tag's digest covers the whole page
         self.assertEqual([c[0] for c in room["calls"]],
-                         ["pages", "create", "read", "append", "summon"])
+                         ["pages", "create", "read", "read"] + ["append", "read"] * (len(parts) - 1) + ["summon"])
         appended = [c for c in room["calls"] if c[0] == "append"]
         self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in appended))
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
@@ -1148,18 +1389,58 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(out["action"], "updated")
         self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
 
-    def test_a_large_change_clears_in_pieces_then_appends_in_pieces(self):
+    def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()
         before = len(self.room()["calls"])
-        old, new = self.page(), self.page(core="claude")
+        old, new = self.page(), self.page(name="Kai")
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
-        out = self.publish(core="claude")
+        with mock.patch.object(gs, "one_call", return_value=False):  # above the one-call budget
+            out = self.publish(name="Kai")
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
-        self.assertEqual([c[0] for c in calls if c[0] == "replace"], ["replace"] * len(gs.chunks(old)))
-        self.assertTrue(all(c[3] == 0 and c[2] <= gs.CHUNK_BYTES for c in calls if c[0] == "replace"))
-        self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)))
+        replaces = [c for c in calls if c[0] == "replace"]
+        self.assertEqual(replaces, [["replace", "html-p1", len(old.encode()), len(gs.chunks(new)[0].encode())]])
+        self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)) - 1)
         self.assertEqual(self.room()["pages"], {"html-p1": new})
+
+    def test_arguments_travel_in_a_private_file_whatever_their_size(self):
+        big = "x" * 300_000  # over Linux's 131,072-byte cap on one exec argument
+        self.state.write_text(json.dumps({"pages": {"html-p1": ""}, "calls": [], "next": 2}))
+        real, seen = subprocess.run, []  # the exec-limit guard: a payload in argv would fail here
+
+        def spy(argv, **kw):
+            path = Path(argv[-1])
+            seen.append((argv, path, path.stat().st_mode & 0o777, json.loads(path.read_text())))
+            return real(argv, **kw)
+        with mock.patch.object(gs.subprocess, "run", spy):
+            gs.Commons(self.stub, self.ROOM).run("append", self.ROOM, big, kind="html-p1")
+        argv, path, mode, carried = seen[0]
+        self.assertEqual(self.room()["pages"]["html-p1"], big)
+        self.assertTrue(all(len(a) < 1000 for a in argv))
+        self.assertEqual((mode, carried[-1]), (0o600, big))
+        self.assertFalse(path.exists())  # removed once the call returns
+        self.assertGreater(gs.call_budget()[0], gs.tour_page.PAGE_MAX_BYTES)  # every page is one replace
+
+    def test_the_arguments_survive_room_commons_re_running_itself_under_another_python(self):
+        os.environ["STUB_REEXEC"] = "1"
+        try:
+            out = self.publish(owner="@chi:ag2.space")
+            self.assertEqual((out["action"], out["summoned"]), ("created", True))
+            self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
+            self.assertEqual(self.publish(name="Kai")["action"], "updated")  # a whole-page replace, re-run too
+            self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
+        finally:
+            os.environ.pop("STUB_REEXEC")
+
+    def test_a_page_no_call_can_hold_is_never_rewritten_in_pieces(self):
+        commons = gs.Commons(self.stub, self.ROOM)
+        old, new = self.page(), self.page(core="claude")
+        self.state.write_text(json.dumps({"pages": {"html-p1": old}, "calls": [], "next": 2}))
+        with mock.patch.object(gs, "call_budget", return_value=(131_071, 2_000_000)):  # holds no 214 KB text
+            self.assertFalse(gs.rewritable(old, new))
+            with self.assertRaisesRegex(gs.PublishError, "left as is, not rewritten in pieces"):
+                commons.rewrite("html-p1", old, new)
+        self.assertEqual((self.room()["pages"]["html-p1"], self.room()["calls"]), (old, []))
 
     def test_a_small_change_is_one_replace(self):
         commons = gs.Commons(self.stub, self.ROOM)
@@ -1169,11 +1450,12 @@ class PublishTest(unittest.TestCase):
         self.assertEqual([c[0] for c in self.room()["calls"]], ["replace"])
         self.assertEqual(self.room()["pages"]["html-p1"], "<p>new</p>")
 
-    def test_core_change_rewrites_the_same_page(self):
+    def test_core_change_alone_leaves_the_page_unchanged(self):
+        # No bundled step names a runtime, so a Claude Code core renders the same page as Codex.
         self.publish()
         out = self.publish(core="claude")
-        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
-        self.assertIn(gs.IMPORT_PROMPT, self.room()["pages"]["html-p1"])
+        self.assertEqual((out["action"], out["kind"]), ("unchanged", "html-p1"))
+        self.assertNotIn("Import my Claude Code history", self.room()["pages"]["html-p1"])
 
     def test_removed_page_is_created_again(self):
         self.publish()
@@ -1194,7 +1476,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(entry["state"], "creating")
         out = self.publish(owner="@chi:ag2.space")
         # the landed page carries this agent's tag, so the rerun finishes it without a second create
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.door.ops, [entry["operation_id"]])
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
 
@@ -1202,6 +1484,9 @@ class PublishTest(unittest.TestCase):
         self.door.fail = "after"
         with self.assertRaises(gs.PublishError):
             self.publish(name="Old")
+        out = self.publish(name="New")  # finishes the journalled "Old" page first; "New" waits
+        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", "Old"))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Old")})
         out = self.publish(name="New")
         self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
@@ -1257,7 +1542,7 @@ class PublishTest(unittest.TestCase):
                 self.publish()
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
         out = self.publish()
-        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
+        self.assertEqual((out["action"], out["kind"]), ("resumed", "html-p1"))  # finished from its journal
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
         self.assertEqual(self.room()["pages"]["html-p1"], self.page())
         self.assertEqual(len(self.door.ops), 1)
@@ -1274,7 +1559,7 @@ class PublishTest(unittest.TestCase):
             with self.assertRaisesRegex(gs.PublishError, "could not record html-p1"):
                 self.publish()
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("unchanged", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
 
     def test_lost_marker_recovers_the_page_by_its_ownership_marker(self):
@@ -1303,7 +1588,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "pending")
         os.environ.pop("STUB_FAIL")
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
         self.assertEqual(len(self.door.ops), 1)
 
@@ -1368,7 +1653,7 @@ class CliTest(unittest.TestCase):
             self.assertEqual(done.stdout, gs.render_page("Sutando", core))
 
     def test_detect_core_reads_the_engine_resolver(self):
-        env = dict(os.environ, SUTANDO_CORE_RUNTIME="codex")
+        env = isolated_child_env(SUTANDO_CORE_RUNTIME="codex")
         done = subprocess.run([sys.executable, "-c",
                                "import importlib.util as u;s=u.spec_from_file_location('g',%r);"
                                "m=u.module_from_spec(s);s.loader.exec_module(m);print(m.detect_core())"
@@ -1382,7 +1667,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout)["reason"], "room-commons not installed")
 
     def test_bad_name_exits_2(self):
-        done = self.run_cli("publish", "--room", "!r:x", "--name", " ")
+        done = self.run_cli("render", "--name", " ")  # publish checks room-commons and the identity first
         self.assertEqual(done.returncode, 2)
 
 

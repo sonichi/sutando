@@ -48,6 +48,11 @@ from unittest import mock
 import tempfile
 import time
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 LEDGER_CLI = REPO / "src" / "turn_ledger.py"
 ROOM_OPS = REPO / "skills" / "agent-room-ops"
@@ -381,7 +386,7 @@ print(json.dumps(turn_ledger.read_entries()))
 '''
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
+        env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
                    ROOM_OPS=str(ROOM_OPS), SRC=str(REPO / "src"), WS=str(ws))
         out = subprocess.run([sys.executable, "-c", driver], capture_output=True,
                              text=True, env=env)
@@ -567,7 +572,7 @@ def test_an_unrecognised_stop_never_blocks() -> None:
 
 def _hook_with_open_stdin(ws: pathlib.Path, written: str) -> dict:
     """Run the real hook with a writer that sends `written` and never closes stdin."""
-    env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+    env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     proc = subprocess.Popen(["/bin/bash", str(REPO / "src" / "check-pending-tasks.sh")],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -599,9 +604,27 @@ def test_a_payload_read_that_times_out_still_gates() -> None:
                   again == {} and turn_ledger.last_stop_ts(ws) != before, repr(again))
 
 
+def test_a_no_send_counts_for_this_turn_only() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.record_no_send("before any stop", ws, "s1")
+        check("no boundary yet: no turn to speak of", not turn_ledger.no_send_this_turn(ws, "s1"))
+        turn_ledger.mark_stop(ws, "s1")
+        check("an older no-send belongs to an earlier turn", not turn_ledger.no_send_this_turn(ws, "s1"))
+        time.sleep(0.01)
+        turn_ledger.record_no_send("nothing to say", ws, "s1")
+        check("a no-send after the boundary is this turn's", turn_ledger.no_send_this_turn(ws, "s1"))
+        check("...and the CLI says so by exit code",
+              turn_ledger.main(["--workspace", str(ws), "--session", "s1", "no-send-this-turn"]) == 0)
+        turn_ledger.mark_stop(ws, "s2")
+        check("another session's no-send is not this one's", not turn_ledger.no_send_this_turn(ws, "s2"))
+        check("...exit 1", turn_ledger.main(["--workspace", str(ws), "--session", "s2", "no-send-this-turn"]) == 1)
+
+
 def main() -> int:
     for fn in (
         test_module_records_both_kinds,
+        test_a_no_send_counts_for_this_turn_only,
         test_the_file_is_bounded_and_keeps_the_newest,
         test_concurrent_writers_do_not_lose_or_interleave_a_line,
         test_an_archived_result_is_dated_not_dismissed,
@@ -1061,7 +1084,7 @@ def _run_hook_script(script: pathlib.Path, ws: pathlib.Path, session_id: str | N
     `session_id=None` omits the env var entirely, simulating a caller outside
     Claude Code (or a hook whose session could not be determined).
     """
-    env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+    env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if session_id:
         env["CLAUDE_CODE_SESSION_ID"] = session_id
@@ -1108,7 +1131,7 @@ def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
               decision == {}, repr(decision))
 
     def _run_ledger_cli(ws: pathlib.Path, session_id: str, *args: str) -> None:
-        env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
+        env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
                    CLAUDE_CODE_SESSION_ID=session_id)
         out = subprocess.run([sys.executable, str(ledger_cli), *args],
                              capture_output=True, text=True, env=env)

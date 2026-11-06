@@ -66,6 +66,12 @@ Exit code: 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import re
@@ -119,7 +125,7 @@ def fake_vault(values: dict[str, str]):
 
 
 def _shell_env(vault: dict[str, str], resolver: bool) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items()
+    env = {k: v for k, v in isolated_child_env().items()
            if not k.startswith("TWILIO_") and not k.startswith("FAKE_VAULT_")}
     env["PATH"] = f"{SHIM_DIR}{os.pathsep}{env.get('PATH', '')}"
     for key, value in vault.items():

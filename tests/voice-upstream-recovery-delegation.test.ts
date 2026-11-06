@@ -1,4 +1,5 @@
-// voice-agent.ts hands upstream recovery to bodhi's upstreamRecovery and keeps no redial of its own.
+// voice-agent.ts hands upstream recovery to bodhi's upstreamRecovery; its only redial is the
+// verifier wake, which repeats bodhi's real-client attach redial for a ?verify=1 connection.
 // voice-agent.ts runs main() at import, so this reads the source.
 // Run: npx tsx --test tests/voice-upstream-recovery-delegation.test.ts
 import { describe, it } from 'node:test';
@@ -24,8 +25,17 @@ describe('voice-agent.ts delegates upstream recovery to bodhi', () => {
 		assert.match(src, /\t\t\tstuckConnectingMs: parseStuckConnectingMs\(process\.env\.VOICE_STUCK_CONNECTING_MS\),\n/);
 	});
 
+	it('answers ?verify=1 with the immediate frame, the attach redial and the idle restore', () => {
+		assert.match(src, /\t\t\.\.\.createVerifierHooks\(\{\n\t\t\temitImmediate: \(\) => emitAgentState\(\{ immediate: true \}\),\n/);
+		assert.match(src, /= session\.recoverUpstream\(\{ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false \}\);/);
+		assert.match(src, /\t\t\tarmIdleRestore: \(\) => probeIdleRestore\.arm\(\),\n/);
+		assert.match(src, /\t\t\tprobeIdleRestore\.fence\(\);\n/);
+	});
+
 	it('keeps no private redial, park timer or silence coordinator', () => {
-		assert.doesNotMatch(src, /\.recoverUpstream\(|handleClientConnected\(\)|suppressClientAutoActions/);
+		// The one redial is the verifier wake: the call bodhi makes when a real client attaches.
+		assert.equal(src.match(/\.recoverUpstream\(/g)?.length, 1);
+		assert.doesNotMatch(src, /handleClientConnected\(\)|suppressClientAutoActions/);
 		assert.doesNotMatch(src, /voice-redial-scheduler|voice-connect-watchdog|voice-upstream-recovery|voice-silence-recovery-coordinator/);
 		assert.doesNotMatch(src, /idleTeardownTimer|scheduleIdleTeardown/);
 	});

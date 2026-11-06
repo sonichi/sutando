@@ -7,7 +7,8 @@ refuses a whole heartbeat whose row is malformed, so a row that does not match i
 contract (alive: bool|null; motion: idle|moving|unknown; condition:
 healthy|abnormal|unknown; reason: a [a-z0-9-]{1,40} slug or null; since: epoch
 seconds or null) is dropped and logged, never sent. Empty stdout means no row.
-This module owns that contract for every row the bridge sends; it names no adapter."""
+A row whose motion is unknown gets Sparrow's own (with_motion). This module owns
+that contract for every row the bridge sends; it names no adapter."""
 from __future__ import annotations
 
 import json
@@ -59,6 +60,14 @@ def validate(value) -> "tuple[dict | None, str | None]":
     if row["since"] is not None and not _epoch(row["since"]):
         return None, "since must be epoch seconds or null"
     return row, None
+
+
+def with_motion(row: "dict | None", busy: bool) -> "dict | None":
+    """`row` with an unknown motion read from Sparrow's own state: moving while an item
+    it pulled waits for its result to be posted, else idle. A known motion stands."""
+    if row is None or row.get("motion") != "unknown":
+        return row
+    return {**row, "motion": "moving" if busy else "idle"}
 
 
 def run(command: str, timeout: float = TIMEOUT_S,

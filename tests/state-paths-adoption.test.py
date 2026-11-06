@@ -136,6 +136,9 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # task_lifecycle names tasks/, results/ and state/ under a caller-given work
+    # dir and is vendored where src/ (the resolver) is not importable.
+    "src/task_lifecycle.py",
     # holder_lock's only "state/" token is a legacy pidfile under a caller-given
     # work root; the module is vendored where src/ (the resolver) is not importable.
     "src/holder_lock.py",

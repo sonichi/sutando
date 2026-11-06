@@ -1,17 +1,22 @@
 """Print the routing fields of every open task file in a task dir as one JSON array.
 
 The Hatch hook script calls this so its wake payload carries structured fields read
-with Sparrow's own header parser, never prose scraped by the shell."""
+with Sparrow's own header parser, never prose scraped by the shell. A hook that tells its
+worker what `held: true` means runs this with HELD_AWARE_ENV=1; for any other hook (one
+registered before the held branch, which a package upgrade does not rewrite) a held task is
+left out of the list, so that hook never wakes a worker for it."""
 from __future__ import annotations
 
 import argparse
 import ipaddress
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-from ... import gateway_instance, local_task_protocol
+from ... import gateway_instance, local_task_protocol, task_hold
+from ...task_io import attested_headers
 
 SNIPPET_MAX = 500
 REPLY_CONTEXT_MAX = 2000
@@ -21,6 +26,7 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
                      rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
+HELD_AWARE_ENV = "HATCH_HOOK_HELD_AWARE"
 CHANNEL_KINDS = ("dm", "room")
 _SENDER_PREFIX = re.compile(r"\[AG2Space\s+[^\]]+\]\s*")
 # The gateway folds a message onto one line, so a reply fallback ("> <@sender> quoted"
@@ -38,16 +44,6 @@ def valid_mxid(value: str) -> bool:
         except ValueError:
             return False
     return m["port"] is None or 0 < int(m["port"]) <= 65535
-
-
-def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
-    """Headers a tier or routing decision may read: the strict task-last parse, or the
-    trusted last-wins scan only when `task_layout: mid` sits above `task:`, where no
-    body text can claim it. The gateway writes access_tier last, below the body."""
-    strict = local_task_protocol.parse_task_headers(text)
-    if (strict.headers.get("task_layout") or "").strip() == "mid":
-        return local_task_protocol.parse_task_headers_trusted(text)
-    return strict
 
 
 def _split(text: str) -> "tuple[str, str]":
@@ -123,6 +119,9 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
                                  "body": reply["body"][:REPLY_CONTEXT_MAX],
                                  "label": label[:REPLY_CONTEXT_MAX] if label else None}
+    # A parked item is flagged on every wake, so a fresh worker session never answers it.
+    if task_hold.read(result_dir, tid) is not None:
+        item["held"] = True
     return item
 
 
@@ -157,7 +156,10 @@ def main(argv=None) -> int:
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2
-    json.dump(list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance), sys.stdout)
+    items = list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance)
+    if os.environ.get(HELD_AWARE_ENV) != "1":
+        items = [item for item in items if not item.get("held")]
+    json.dump(items, sys.stdout)
     sys.stdout.write("\n")
     return 0
 

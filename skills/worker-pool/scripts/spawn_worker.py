@@ -86,7 +86,7 @@ class SpawnRetained(SpawnRefused):
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, **kw)
+    return subprocess.run(argv, **{"capture_output": True, "text": True, **kw})
 
 
 def per_instance_sentinel_supported(repo, runner=_run) -> bool:
@@ -130,7 +130,9 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
     """
     socket = socket or default_socket()
     try:
-        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
+        # Captured whatever the runner: absence is read from stderr, so a bare runner reads "unknown".
+        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"],
+                   capture_output=True, text=True)
     except Exception as e:                                   # noqa: BLE001
         return "unknown", f"tmux could not be run: {e}"
     rc = getattr(r, "returncode", None)
@@ -290,7 +292,8 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
                 return {"ensured": False, "conflict": True, "plist": legacy["plist"],
                         "why": "legacy timer is installed but not loaded; "
                                "run an explicit install to migrate it"}
-            if st.get("loaded"):
+            want = prt.stop_interrupt_setting()
+            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):
                 return {"ensured": False, "why": "already installed",
                         "plist": st["plist"], "label": st["label"]}
 

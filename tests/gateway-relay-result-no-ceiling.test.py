@@ -37,6 +37,9 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 _TESTS = Path(__file__).resolve().parent
@@ -44,8 +47,7 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 sys.path.insert(0, str(_TESTS))
-from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
 
 from _helpers import gateway_relay, older_bridge  # noqa: E402
 from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw  # noqa: E402
@@ -890,7 +892,7 @@ class WithdrawnAccess(_Bridge):
         """Staged under the owner cap, then acked under a guest cap: kept staged, unpublished."""
         with patch.object(gw, "_post_ack_first", return_value="retry"):
             self.assertFalse(gw._take_ack_first(voice_ask(), set(gw._load_inflight())))
-        [staged] = sorted(gw._held_dir().glob(f"{ASK_A}.txt.*.tmp"))
+        [staged] = sorted(gw._held_dir().glob(f".{ASK_A}.txt.*.tmp"))
         if age:
             landed = time.time() - age
             os.utime(staged, (landed, landed))
@@ -1198,14 +1200,16 @@ class NoCeiling(_Loop):
         self.bridges.stop(first)
         age_retry(self.outbox_root, ASK_A, 700)
         token_file.write_text("REMOTE_TASK_TOKEN=rotated-secret\n")       # the re-onboard lands
+        token_file.chmod(0o600)
         second = self.bridges.start()
         self.bridges.wait_for(lambda: self.relay.results, second, "the result sent again")
         self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), second, "its mark retired")
         self.bridges.polls_after(second)
         self.bridges.stop(second)
-        self.assertGreaterEqual(self.logged("waiting for token rotation")
-                                + self.logged("token file already rotated"), 1,
-                                "the poll loop never entered its credential recovery")
+        # A bridge started after the re-onboard takes the rotated token from the file at startup.
+        self.assertGreaterEqual(self.logged("waiting for token rotation") + self.logged("token file already rotated")
+                                + self.logged("token loaded from REMOTE_TASK_TOKEN_FILE"), 1,
+                                "the rotated credential was never picked up from the token file")
         self.assertEqual(self.relay.results, [ANSWER])
         accepted = [bearer for p, bearer in self.relay.posted if p == ANSWER]
         self.assertEqual(accepted[-1], "Bearer rotated-secret")
@@ -1237,7 +1241,7 @@ class AfterADowngrade(_Loop):
 
     def older(self, step: str, answered: str = ""):
         out = self.root / f"older-{step}.json"
-        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_") and k != "GATEWAY_INSTANCE"}
+        env = hermetic_env(self.root / "home")
         done = subprocess.run(
             [sys.executable, "-c", _OLDER, str(_TESTS), str(self.ws), step, answered,
              json.dumps({"GATEWAY_INSTANCE": self.INSTANCE} if self.INSTANCE else {}), str(out)],
@@ -1363,7 +1367,7 @@ class WithdrawnAccessThroughTheLoop(_Loop):
     def test_withdrawn_past_the_threshold_after_a_restart_ends_once_and_stays_ended(self):
         self.relay.queue.append(voice_ask())
         self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
-        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f".{ASK_A}.txt.*.tmp"))
         landed = time.time() - 700.0                     # staged ten minutes and more ago
         os.utime(staged, (landed, landed))
         self.bridges.env["REMOTE_TASK_TIER"] = "guest"   # the operator withdrew local access
@@ -1385,7 +1389,7 @@ class WithdrawnAccessThroughTheLoop(_Loop):
     def test_a_crash_after_the_failed_is_accepted_leaves_the_mark_for_the_end_to_retire_last(self):
         self.relay.queue.append(voice_ask())
         self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
-        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f".{ASK_A}.txt.*.tmp"))
         landed = time.time() - 700.0
         os.utime(staged, (landed, landed))
         self.bridges.env["REMOTE_TASK_TIER"] = "guest"

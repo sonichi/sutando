@@ -53,6 +53,7 @@ inbox = pd.deliveries_dir(ws, WID)
 inbox.mkdir(parents=True)
 archive = pd.results_dir(ws) / "archive"
 archive.mkdir(parents=True)
+(ws / "tasks").mkdir()
 # The measured shape: many zero-byte .txt sentinels, no .accepted, no done flags,
 # every one answered, its reply already drained into the archive.
 for i in range(148):
@@ -65,8 +66,9 @@ check("fixture: a delivered reply is ready to task_dispatch",
 check("fixture: no sentinel was ever accepted", list(inbox.glob("*.accepted")), [])
 check("148 answered zero-byte sentinels owe nothing", worker_owes(ws, WID), False)
 
-# (a) a zero-byte sentinel, never accepted, no result anywhere: owed.
+# (a) a zero-byte sentinel, never accepted, its task live in tasks/, no result anywhere: owed.
 (inbox / "task-1799999999.txt").write_bytes(b"")
+(ws / "tasks" / "task-1799999999.txt").write_text("task: hello\n")
 check("(a) zero-byte .txt, no .accepted, no result: owed", worker_owes(ws, WID), True)
 
 (pd.results_dir(ws) / "task-1799999999.txt").write_text("")
@@ -81,6 +83,7 @@ check("(b) its reply in results/archive/: not owed", worker_owes(ws, WID), False
 
 # (c) a task the worker really accepted and has not answered: owed.
 (inbox / "task-1800000000.accepted").write_bytes(b"")
+(ws / "tasks" / "task-1800000000.txt").write_text("task: hello\n")
 check("(c) accepted, no result: owed", worker_owes(ws, WID), True)
 (archive / "task-1800000000.txt").write_text("answered\n")
 check("(c) accepted, then answered: not owed", worker_owes(ws, WID), False)

@@ -6,10 +6,18 @@ opened outside. Standard library only: skills import it without the rest of core
 """
 from __future__ import annotations
 
+import os
 import re
+import sys
 import urllib.parse
+from typing import Optional
 
-DEFAULT_VIA = "ag2.space"
+try:
+    import dotspace
+except ImportError:  # imported by file path: the sibling resolver sits in this directory
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dotspace
+
 MATRIX_TO = "https://matrix.to/#/"
 # The app's route section for a room; a URL path segment, not a filesystem path.
 ROOM_ROUTE = "home"
@@ -19,16 +27,52 @@ _ROOM = re.compile(r"^[!#][^\s:]+:\S+$")
 _DB_PAGE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
-def room_link(room_id: str, event_id: str = "", via: str = DEFAULT_VIA) -> str:
-    """`https://matrix.to/#/<room>[/<event>][?via=<server>]`; empty `via` drops the query."""
+def app_origin_for(room_id: str) -> str:
+    """The room server's registered app origin, or empty for an unknown server; no network I/O."""
+    server = dotspace.server_of_matrix_id(room_id)
+    instance = dotspace.dotspace_for(server, fetch=dotspace.NO_FETCH)
+    return instance.app_origin if instance.is_dotspace else ""
+
+
+def default_via(room_id: str = "") -> str:
+    """`?via=` for `room_id`: its own server's DotSpace (rooms are `!x:server`), else the install's."""
+    if dotspace.server_of_matrix_id(room_id):
+        return dotspace.link_via_for(room_id, fetch=dotspace.NO_FETCH)
+    return dotspace.default_link_via(primary_server=_primary_server())
+
+
+def _primary_server() -> str:
+    """The primary connection's server, "" where core's connections record cannot be read."""
+    try:
+        from connections import primary_server
+        return primary_server()
+    except Exception:  # noqa: BLE001 - a skill importing this without core falls back to the legacy via
+        return ""
+
+
+def __getattr__(name: str):
+    # `DEFAULT_VIA` stays importable; it is the install's via, resolved on each read.
+    if name == "DEFAULT_VIA":
+        return default_via()
+    raise AttributeError(name)
+
+
+def room_link(room_id: str, event_id: str = "", via: Optional[str] = None) -> str:
+    """`https://matrix.to/#/<room>[/<event>][?via=<server>]`; `via` None takes the room's
+    server's DotSpace (`default_via`), empty `via` drops the query."""
+    via = default_via(room_id) if via is None else via.strip().lower()
+    if via and not dotspace.is_server_name(via):
+        via = ""  # an explicit via that is not a server name never reaches the query
     frag = f"{room_id}/{event_id}" if event_id else room_id
     return f"{MATRIX_TO}{frag}?via={via}" if via else f"{MATRIX_TO}{frag}"
 
 
-def surface_link(origin: str, room_id: str, surface: str, page: str | None = None) -> str:
+def surface_link(room_id: str, surface: str, page: Optional[str] = None, *, origin: Optional[str] = None) -> str:
     """`<origin>/<ROOM_ROUTE>/<room, encodeURIComponent>?surface=<surface>[&page=<page>]`.
 
-    Raises ValueError for an origin that is not an http(s) URL or a room that is no room id/alias."""
+    Origin defaults to the room registry; a keyword override is explicit. Raises ValueError
+    for an unknown app origin, invalid http(s) override, or invalid room id/alias."""
+    origin = app_origin_for(room_id) if origin is None else origin
     m = _ORIGIN.match((origin or "").strip())
     if not m:
         raise ValueError(f"not an app origin: {origin!r}")
@@ -39,7 +83,7 @@ def surface_link(origin: str, room_id: str, surface: str, page: str | None = Non
     return "/".join((m.group(1), ROOM_ROUTE, room_path)) + "?" + urllib.parse.urlencode(query)
 
 
-def database_link(origin: str, room_id: str, db_id: str | None = None) -> str:
+def database_link(room_id: str, db_id: Optional[str] = None, *, origin: Optional[str] = None) -> str:
     """The room's Database surface, on database `db_id` when that id is one a link may name."""
     page = (db_id or "").strip().lower()
-    return surface_link(origin, room_id, "database", page if _DB_PAGE.fullmatch(page) else None)
+    return surface_link(room_id, "database", page if _DB_PAGE.fullmatch(page) else None, origin=origin)

@@ -80,6 +80,17 @@ class Gate(unittest.TestCase):
                            stdin=subprocess.DEVNULL, timeout=120)
         return r.stdout.strip().splitlines()[-1], r.stderr
 
+    def test_pane_check_resolves_the_selected_managed_binary_off_path(self):
+        managed = write_exe(self.tmp / "managed" / "claude", "exit 0\n")
+        write_exe(self.bin1 / "tmux", "echo PATH=/usr/bin:/bin\n")
+        result = subprocess.run(
+            ["bash", "-c", '. "$1"; claude_cli_resolves', "pane-check",
+             str(REPO / "src/agent/claude/cli/session-launch.sh")],
+            env=dict(self.env, SUTANDO_CORE_CLI_BIN=managed),
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_healthy_host_keeps_the_same_command(self):
         fake_cli(self.bin1 / "claude", "2.1.286", CLAUDE_FLAGS)
         self.assertEqual(self.gate()[0], "rc=0 bin=claude")

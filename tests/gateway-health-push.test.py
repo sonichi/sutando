@@ -15,6 +15,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 _SANDBOX = tempfile.TemporaryDirectory()
 os.environ["AGENT_CONNECT_STATE_DIR"] = str(Path(_SANDBOX.name) / "state")
@@ -85,7 +90,8 @@ class Snapshot(Base):
                 mock.patch.object(rgb, "HEALTH_TTL_S", 0.0):
             self.assertIsNone(rgb._health_snapshot())
             self.assertIsNone(rgb._health_snapshot())
-        self.assertEqual(logs, ["health snapshot unavailable: OSError: gone"])
+        self.assertEqual(len(logs), 1, logs)  # once per error, and only its type and location
+        self.assertRegex(logs[0], r"^health snapshot unavailable: OSError at [\w.-]+:\d+$")
 
 
 class Rows(unittest.TestCase):
@@ -149,9 +155,9 @@ class WorkersPush(Base):
 
 
 class Heartbeat(Base):
-    def beat(self, s, force=False):
+    def beat(self, s, force=False, inflight=()):
         with mock.patch.object(rgb, "_health_snapshot", return_value=s), mock.patch.object(rgb, "_req") as req:
-            sent = rgb._post_heartbeat(set(), force=force)
+            sent = rgb._post_heartbeat(set(inflight), force=force)
         return req.call_args.args[2] if sent else None
 
     def test_the_core_row_and_capability_ride_the_heartbeat(self):
@@ -165,6 +171,10 @@ class Heartbeat(Base):
         self.assertIsNone(self.beat(snap(core=agent("core", "core"))))
         sick = snap(core=agent("core", "core", condition="abnormal", reason="needs-login"))
         self.assertEqual(self.beat(sick)["health"]["reason"], "needs-login")
+
+    def test_the_snapshot_row_keeps_its_own_motion_whatever_is_in_flight(self):
+        body = self.beat(snap(core=agent("core", "core", motion="unknown")), inflight={"task-1"})
+        self.assertEqual(body["health"]["motion"], "unknown")
 
     def test_without_health_the_heartbeat_is_unchanged(self):
         body = self.beat(None, force=True)
@@ -193,7 +203,7 @@ class SignedInIdentity(Base):
         path = self.ws / "state" / "gateway-status.json"
         with mock.patch.object(rgb, "GATEWAY_STATUS_FILE", path), \
                 mock.patch.object(rgb, "_reenroll_identity", return_value=ME):
-            rgb._emit_gateway_status(connected)
+            rgb._emit_gateway_status(connected, poll_ok_ts=rgb.time.time() if connected else None)
         return json.loads(path.read_text())
 
     def test_the_sidecar_names_the_identity_only_while_connected(self):
