@@ -792,7 +792,7 @@ def case_s_checkout_is_canonical() -> list[str]:
     # REPO has a real .git, so the mocked probes are actually reached; a
     # gitless literal like "/repo" would short-circuit at the bundle check.
     gitful = str(REPO)
-    env_no_pin = {k: v for k, v in os.environ.items() if k != "SUTANDO_EXPECTED_BRANCH"}
+    env_no_pin = hermetic_env()
 
     def fake_run(argv, **kwargs):
         if "rev-parse" in argv:
@@ -1036,7 +1036,7 @@ def case_p2_stale_guard_verdicts_wire_through_main() -> list[str]:
     re-authorize the restart)."""
     fails = []
     stale = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
-    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
+    plan = ("/usr/local/bin/python3-probed", hermetic_env())
     hcm = hc  # alias for brevity
     cases = [
         ("canonical", (True, "clean + on main"), True),
@@ -1064,9 +1064,8 @@ def case_p3_pinned_config_full_wiring() -> list[str]:
     bridge (keweichen P2: the config contract, not a hardcoded main)."""
     fails = []
     stale = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
-    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
-    ambient = {k: v for k, v in os.environ.items()
-               if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SUTANDO_EXPECTED_BRANCH")}
+    plan = ("/usr/local/bin/python3-probed", hermetic_env())
+    ambient = hermetic_env()
     with tempfile.TemporaryDirectory() as td:
         pinned = Path(td) / "pinned"
         pinned.mkdir()

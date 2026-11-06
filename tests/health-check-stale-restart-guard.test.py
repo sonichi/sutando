@@ -10,6 +10,10 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -80,7 +84,7 @@ def main() -> int:
     import os
     import subprocess
     import tempfile
-    env_no_override = {k: v for k, v in os.environ.items() if k != "SUTANDO_EXPECTED_BRANCH"}
+    env_no_override = hermetic_env()
     try:
         hc.git_argv("--version")
     except FileNotFoundError:

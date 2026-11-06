@@ -10,8 +10,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections import Counter
 from unittest import mock
+
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
+from collections import Counter  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src/health-check.py")
