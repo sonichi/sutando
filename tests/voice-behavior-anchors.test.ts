@@ -146,6 +146,27 @@ test('instructions: googleSearch=false omits the search line (capability honesty
 	assert.ok(!off.includes('- Google Search for current-info queries'));
 });
 
+test('instructions: behavioral questions stay in the conversation', () => {
+	assert.ok(instructions.includes("- Questions about the system's CODE or internals that your instructions don't cover"));
+	assert.ok(instructions.includes('answer directly from these instructions. Do NOT ship the meta-conversation to work.'));
+	assert.ok(!instructions.includes('- Questions about the system, architecture, code, capabilities'));
+});
+
+test('instructions: delegation acknowledges once and identifies the delivery destination', () => {
+	assert.ok(instructions.includes('Acknowledge ONCE with the destination: "Sending to core — I\'ll speak the answer here."'));
+	assert.ok(instructions.includes('do NOT repeat "Working on it" on every turn'));
+	assert.ok(instructions.includes('- DELEGATION DESTINATION: when you call work, tell the user where the result will arrive'));
+	assert.ok(instructions.includes('ask or offer the options ("speak it here, send to your DM, or post to the room?") BEFORE calling work.'));
+});
+
+test('instructions: current facts require search or delegation without a spoken guess', () => {
+	for (const googleSearch of [true, false]) {
+		const text = cfg.buildInstructions(ctx({ googleSearch }), OVERRIDES);
+		assert.ok(text.includes('- REAL-TIME FACTS (news, scores, prices, weather, current events): NEVER speak a guessed answer'));
+		assert.ok(text.includes('Use Google Search if available; otherwise delegate to work WITHOUT stating any guess first.'));
+	}
+});
+
 test('instructions: meeting-active swaps BOTH conditional rules', () => {
 	const meeting = cfg.buildInstructions(ctx({ meeting: true }), OVERRIDES);
 	assert.ok(meeting.includes('⚠️ MEETING MODE IS CURRENTLY ACTIVE.'));

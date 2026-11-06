@@ -30,11 +30,43 @@ class AgentsView:
         self.cores_dir = Path(state_dir) / "cores"
 
     def list_agents(self) -> dict:
+        agents = self._entries()
+        return {"agents": agents}
+
+    def _entries(self) -> list:
         agents = []
         if self.cores_dir.is_dir():
             for f in sorted(self.cores_dir.glob("*.alive")):
                 agents.append(self._entry(f))
-        return {"agents": agents}
+        self._annotate_superseded(agents)
+        return agents
+
+    @staticmethod
+    def _identity_key(entry: dict):
+        # Absent start time is not evidence of sameness: pid alone recycles.
+        # Only the writer's scalar types qualify — others cannot key a dict.
+        pid, started = entry.get("pid"), entry.get("started_at")
+        if isinstance(pid, bool) or isinstance(started, bool):
+            return None
+        if not isinstance(pid, int) or not isinstance(started, (int, float)):
+            return None
+        return (pid, started)
+
+    def _annotate_superseded(self, agents: list) -> None:
+        """A dead heartbeat whose (pid, started_at) matches a LIVE one is the
+        same process under a stale host label — annotate, never hide or delete."""
+        live = {}
+        for a in agents:
+            k = self._identity_key(a)
+            if k is not None and a.get("alive"):
+                live.setdefault(k, a["agentId"])
+        for a in agents:
+            if a.get("alive"):
+                continue
+            k = self._identity_key(a)
+            holder = live.get(k) if k is not None else None
+            if holder is not None and holder != a["agentId"]:
+                a["supersededBy"] = holder
 
     def agent_status(self, agent_id: str) -> dict | None:
         """Status for one agent, or None if no heartbeat file matches.
@@ -42,11 +74,10 @@ class AgentsView:
         payload's self-reported host."""
         if not agent_id:
             return None
-        if self.cores_dir.is_dir():
-            for f in self.cores_dir.glob("*.alive"):
-                entry = self._entry(f)
-                if agent_id in (f.stem, entry.get("host")):
-                    return entry
+        # Built from the full set so a superseded entry reports it here too.
+        for entry in self._entries():
+            if agent_id in (entry.get("agentId"), entry.get("host")):
+                return entry
         return None
 
     def _entry(self, f: Path) -> dict:
