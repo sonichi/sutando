@@ -374,7 +374,9 @@ working tree under edit, say).
 agent's relay token without echoing it (on a terminal), or reads one line from stdin when it is piped. It
 takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_REMOTE_TOKEN='…'` line (quotes
 and `export ` stripped); anything else, or a relay that is not https (plain http only on a loopback host, for tests), is
-refused with nothing written. The
+refused with nothing written. Before anything is written, the relay's `GET /v1/whoami` (5 s timeout) must name exactly
+`--agent` for the token: a token for another agent (both ids named), a rejected token (401/403), an answer
+naming no agent, or no answer at all is refused and nothing is written. The
 token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
 through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
 refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no

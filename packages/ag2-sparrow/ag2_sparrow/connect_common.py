@@ -2520,17 +2520,55 @@ def parse_token(line: str) -> "tuple[dict | None, str]":
 
 
 def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
+    return _request_json(url, body, opener)
+
+
+def _request_json(url: str, body, opener, bearer: str = "", timeout: float = REDEEM_TIMEOUT_S) -> "tuple[int, bytes]":
+    """(status, body) of a POST of `body`, or a GET when it is None, with `bearer` as its Authorization."""
     with gateway_instance.gateway_call(url):
-        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
-                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if bearer:
+            headers.update({"Authorization": f"Bearer {bearer}", "User-Agent": "sutando-gateway-client/1.0"})
+        req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode("utf-8"),
+                                     method="GET" if body is None else "POST", headers=headers)
         try:
-            with (opener or urllib.request.urlopen)(req, timeout=REDEEM_TIMEOUT_S) as resp:
+            with (opener or urllib.request.urlopen)(req, timeout=timeout) as resp:
                 return resp.status, resp.read(64 * 1024)
         except urllib.error.HTTPError as e:
             try:
                 return e.code, e.read(64 * 1024) or b""
             except Exception:  # noqa: BLE001 - an unreadable error body is only an empty one
                 return e.code, b""
+
+
+WHOAMI_PATH = "/v1/whoami"
+WHOAMI_TIMEOUT_S = 5
+
+
+def token_agent_problem(token: dict, agent_id: str, opener=None) -> str:
+    """'' when the relay's whoami names exactly `agent_id` for the token's bearer; else why, never the value.
+    Fails closed: a mismatch, a rejected token, an answer naming no agent, or no answer at all."""
+    try:
+        status, raw = _request_json(token["relay_url"].rstrip("/") + WHOAMI_PATH, None, opener,
+                                    bearer=token["bearer"], timeout=WHOAMI_TIMEOUT_S)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return (f"the relay could not be reached to check the token ({diagnostics.describe(e)}); check the "
+                "connection, then run the command again")
+    if status in (401, 403):
+        return (f"the relay rejected the token (HTTP {status}): it is revoked, expired or not this relay's; "
+                "copy it from s.space again")
+    if status != 200:
+        return f"the relay did not confirm the token (HTTP {status}); run the command again later"
+    got = _answer(raw).get("agent_mxid")
+    got = got.strip() if isinstance(got, str) else ""
+    if not AGENT_ID_RE.fullmatch(got):
+        return "the relay's answer names no agent for the token; run the command again later"
+    if got != agent_id:
+        return (f"the token is for {got}, not {agent_id}: paste {agent_id}'s own token, or run the command "
+                f"with --agent {got}")
+    return ""
 
 
 def _answer(raw: bytes) -> dict:

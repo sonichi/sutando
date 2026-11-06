@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import io
+import json
 import os
 import shutil
 import stat
@@ -18,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +45,22 @@ FORMS = {"bare": TOKEN, "remote_task_token": f"REMOTE_TASK_TOKEN={TOKEN}",
 MALFORMED = {"empty": "", "bare secret": BEARER, "no secret": f"{fx.RELAY}|", "no separator": fx.RELAY,
              "plain http": f"http://relay.backend.example/relay|{BEARER}", "other key": f"OTHER_TOKEN={TOKEN}",
              "space in secret": f"{fx.RELAY}|{BEARER} extra", "url with query": f"{fx.RELAY}?x=1|{BEARER}"}
+
+
+class Relay:
+    """The relay's GET /v1/whoami: `agent` for the pasted bearer, else 401; `status` or `down` override it."""
+
+    def __init__(self, agent=fx.AGENT, status=200, down=False):
+        self.agent, self.status, self.down, self.calls = agent, status, down, []
+
+    def __call__(self, req, timeout=None):
+        self.calls.append((req.full_url, req.get_method(), req.get_header("Authorization"), timeout))
+        if self.down:
+            raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+        status = self.status if req.get_header("Authorization") == f"Bearer {BEARER}" else 401
+        if status != 200:
+            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(b'{"error":"unauthorized"}'))
+        return fx._Resp(200, json.dumps({"agent_mxid": self.agent} if self.agent else {}).encode())
 
 
 class Tty(io.StringIO):
@@ -77,10 +96,12 @@ class TokenStdin(fx.AgentRootBase):
         return ["install", *named, "--token-stdin", "--codex", str(self.codex), "--codex-home", str(self.codex_home),
                 *extra]
 
-    def run_cli(self, name, argv, jobs, mac, stdin):
+    def run_cli(self, name, argv, jobs, mac, stdin, relay=None):
         out, err = io.StringIO(), io.StringIO()
         self.mac = mac
+        self.relay_fake = relay or Relay()
         with mock.patch.object(sm, "_run", side_effect=jobs), mock.patch.object(sys, "stdin", stdin), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=self.relay_fake), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 rc = CLIS[name].main(argv)
@@ -88,10 +109,10 @@ class TokenStdin(fx.AgentRootBase):
                 rc = e.code
         return rc, out.getvalue(), err.getvalue()
 
-    def paste(self, name, line, mac, jobs=None, *extra, agent=fx.AGENT):
+    def paste(self, name, line, mac, jobs=None, *extra, agent=fx.AGENT, relay=None):
         stdin = io.StringIO(line + "\n")
         jobs = jobs or bx.Jobs(self.root, self.runners)
-        return (*self.run_cli(name, self.argv(name, *extra, agent=agent), jobs, mac, stdin), stdin, jobs)
+        return (*self.run_cli(name, self.argv(name, *extra, agent=agent), jobs, mac, stdin, relay), stdin, jobs)
 
     def snapshot(self):
         files = {}
@@ -296,6 +317,41 @@ class TokenStdin(fx.AgentRootBase):
                 self.assertNotIn(BEARER, out + err)
 
 
+    def test_the_relay_must_name_exactly_this_agent_for_the_token(self):
+        other = "@other.agent:ag2.space"
+        cases = (("mismatch", dict(agent=other), f"the token is for {other}, not {fx.AGENT}: paste {fx.AGENT}'s own "
+                  f"token, or run the command with --agent {other}"),
+                 ("401", dict(status=401), "the relay rejected the token (HTTP 401)"),
+                 ("403", dict(status=403), "the relay rejected the token (HTTP 403)"),
+                 ("500", dict(status=500), "the relay did not confirm the token (HTTP 500)"),
+                 ("no agent", dict(agent=""), "the relay's answer names no agent for the token"),
+                 ("unreachable", dict(down=True), "the relay could not be reached to check the token"))
+        for name, mac in self.each():
+            for why, kw, said in cases:
+                with self.subTest(name=name, mac=mac, why=why):
+                    relay = Relay(**kw)
+                    self.fresh(name, mac)
+                    before = self.snapshot()
+                    rc, out, err, _stdin, jobs = self.paste(name, TOKEN, mac, relay=relay)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn(said, err)
+                    self.assertIn("nothing was written", err)
+                    self.assertEqual(self.snapshot(), before, "no seat, config or unit")
+                    self.assertFalse(self.seat().exists())
+                    self.assertFalse(any(b.started() for b in jobs.bridges.values()))
+                    self.assertNotIn(BEARER, out + err)
+                    self.assertEqual(len(relay.calls), 1)
+
+    def test_the_whoami_check_is_one_short_authenticated_get_before_the_write(self):
+        for name, mac in self.each():
+            with self.subTest(name=name, mac=mac):
+                self.fresh(name, mac)
+                rc, out, err, _stdin, jobs = self.paste(name, FORMS["remote_task_token"], mac)
+                self.assert_installed(name, rc, out, err, jobs, mac)
+                self.assertEqual(self.relay_fake.calls, [(fx.RELAY + "/v1/whoami", "GET", f"Bearer {BEARER}",
+                                                          cm.WHOAMI_TIMEOUT_S)])
+                self.assertLessEqual(cm.WHOAMI_TIMEOUT_S, 5)
+
     def test_a_busy_agent_lock_after_the_read_writes_nothing(self):
         for name, mac in self.each():
             with self.subTest(name=name, mac=mac):
@@ -344,7 +400,8 @@ def xtrace_driver(name: str, mac: str) -> int:
         case.fresh(name, mac == "1")
         jobs = bx.Jobs(case.root, case.runners)
         case.mac = mac == "1"
-        with mock.patch.object(sm, "_run", side_effect=jobs):
+        with mock.patch.object(sm, "_run", side_effect=jobs), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=Relay()):
             rc = CLIS[name].main(case.argv(name))
         token = (case.seat() / "token").read_text() if (case.seat() / "token").exists() else ""
         print("SEAT-OK" if token == f"{fx.RELAY}|{BEARER}\n" else "SEAT-MISSING", file=sys.stderr)

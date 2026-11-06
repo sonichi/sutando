@@ -793,7 +793,8 @@ def token_stdin_problem(args) -> str:
 def token_into_seat(local: cm.Shape, agent_id, preflight, read=None) -> "tuple[dict | None, str]":
     """redeem_into_seat for a token pasted on stdin (cm.read_token) instead of a code: every refusal that needs
     no token (the agent id, `preflight(job)`, a running job, another adapter's bridge for the agent, the root
-    and its seat) comes before the token is read; the seat is the one connect writes for this agent."""
+    and its seat) comes before the token is read, and the relay's whoami must name exactly `agent_id` for it
+    before anything is written; the seat is the one connect writes for this agent."""
     agent_id = (agent_id or "").strip()
     if not agent_id:
         problem = "--token-stdin needs --agent <the agent's Matrix ID>"
@@ -811,6 +812,7 @@ def token_into_seat(local: cm.Shape, agent_id, preflight, read=None) -> "tuple[d
     if problem:
         return None, f"{problem}; the token was not read"
     token, problem = (read or cm.read_token)()
+    problem = problem or cm.token_agent_problem(token, agent_id)
     if problem:
         return None, f"{problem}; nothing was written"
     return _seat_held(local, root, dict(token, agent_id=agent_id), TOKEN_WORDS)
