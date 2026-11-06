@@ -9,7 +9,9 @@ or relay."""
 from __future__ import annotations
 
 import contextlib
+import http.server
 import importlib
+import threading
 import io
 import json
 import os
@@ -99,9 +101,10 @@ class TokenStdin(fx.AgentRootBase):
     def run_cli(self, name, argv, jobs, mac, stdin, relay=None):
         out, err = io.StringIO(), io.StringIO()
         self.mac = mac
-        self.relay_fake = relay or Relay()
-        with mock.patch.object(sm, "_run", side_effect=jobs), mock.patch.object(sys, "stdin", stdin), \
-                mock.patch.object(urllib.request, "urlopen", side_effect=self.relay_fake), \
+        self.relay_fake = Relay() if relay is None else relay
+        relayed = mock.patch.object(cm, "_open_with_bearer", side_effect=self.relay_fake) if self.relay_fake \
+            else contextlib.nullcontext()     # False: the real no-redirect opener, against a real server
+        with mock.patch.object(sm, "_run", side_effect=jobs), mock.patch.object(sys, "stdin", stdin), relayed, \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 rc = CLIS[name].main(argv)
@@ -342,6 +345,82 @@ class TokenStdin(fx.AgentRootBase):
                     self.assertNotIn(BEARER, out + err)
                     self.assertEqual(len(relay.calls), 1)
 
+    def test_a_relay_reflecting_the_bearer_never_gets_it_printed(self):
+        reflected = (f"@{BEARER}:example.test", f"@{BEARER.lower()}:example.test", f"@x:{BEARER.lower()}.example")
+        for name, mac in self.each():
+            for agent in reflected:
+                with self.subTest(name=name, mac=mac, agent=agent):
+                    self.fresh(name, mac)
+                    before = self.snapshot()
+                    rc, out, err, _stdin, _jobs = self.paste(name, TOKEN, mac, relay=Relay(agent=agent))
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn(f"the relay named a different agent than {fx.AGENT} for the token", err)
+                    self.assertNotIn(BEARER.lower(), (out + err).lower())
+                    self.assertNotIn("QQQQ7777".lower(), (out + err).lower())
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_an_id_that_is_not_a_plain_matrix_id_is_never_echoed(self):
+        for name, mac in self.each():
+            for agent in ("@Other.Agent:ag2.space", "@other:ag2.space/see-https://evil.example", "@o:h\x1b[2Jx"):
+                with self.subTest(name=name, mac=mac, agent=agent):
+                    self.fresh(name, mac)
+                    rc, out, err, _stdin, _jobs = self.paste(name, TOKEN, mac, relay=Relay(agent=agent))
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn(f"the relay named a different agent than {fx.AGENT} for the token", err)
+                    self.assertNotIn(agent, out + err)
+                    self.assertFalse(self.seat().exists())
+
+    def test_a_redirect_is_refused_before_the_credential_leaves_for_its_target(self):
+        seen = []
+
+        def server(handler):
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+            return srv.server_address[1]
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                seen.append(dict(self.headers))
+                body = json.dumps({"agent_mxid": fx.AGENT}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        target = server(Target)
+
+        for code, where in ((302, f"http://localhost:{target}/v1/whoami"), (307, f"http://localhost:{target}/v1/whoami"),
+                            (301, "/v1/whoami-elsewhere")):
+            class Redirect(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):  # noqa: N802
+                    self.send_response(code)
+                    self.send_header("Location", where)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+                def log_message(self, *a):
+                    pass
+            relay = server(Redirect)
+            for name, mac in self.each():
+                with self.subTest(code=code, name=name, mac=mac):
+                    self.fresh(name, mac)
+                    before = self.snapshot()
+                    rc, out, err, _stdin, jobs = self.paste(name, f"http://127.0.0.1:{relay}|{BEARER}", mac, relay=False)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertIn(f"the relay redirected (HTTP {code}); not following with a credential; nothing was "
+                                  "written", err)
+                    self.assertEqual(seen, [], "the redirect's target never receives a request, nor the bearer")
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertFalse(any(b.started() for b in jobs.bridges.values()))
+                    self.assertNotIn(BEARER, out + err)
+        self.fresh(CL.name, False)
+        rc, out, err, _stdin, jobs = self.paste(CL.name, f"http://127.0.0.1:{target}|{BEARER}", False, relay=False)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([h.get("Authorization") for h in seen], [f"Bearer {BEARER}"], "the control: a direct relay")
+
     def test_the_whoami_check_is_one_short_authenticated_get_before_the_write(self):
         for name, mac in self.each():
             with self.subTest(name=name, mac=mac):
@@ -401,7 +480,7 @@ def xtrace_driver(name: str, mac: str) -> int:
         jobs = bx.Jobs(case.root, case.runners)
         case.mac = mac == "1"
         with mock.patch.object(sm, "_run", side_effect=jobs), \
-                mock.patch.object(urllib.request, "urlopen", side_effect=Relay()):
+                mock.patch.object(cm, "_open_with_bearer", side_effect=Relay()):
             rc = CLIS[name].main(case.argv(name))
         token = (case.seat() / "token").read_text() if (case.seat() / "token").exists() else ""
         print("SEAT-OK" if token == f"{fx.RELAY}|{BEARER}\n" else "SEAT-MISSING", file=sys.stderr)

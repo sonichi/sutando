@@ -376,7 +376,8 @@ takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_
 and `export ` stripped); anything else, or a relay that is not https (plain http only on a loopback host, for tests), is
 refused with nothing written. Before anything is written, the relay's `GET /v1/whoami` (5 s timeout) must name exactly
 `--agent` for the token: a token for another agent (both ids named), a rejected token (401/403), an answer
-naming no agent, or no answer at all is refused and nothing is written. The
+naming no agent, a redirect (never followed with the token), or no answer at all is refused and nothing
+is written. An agent id from the relay is shown only when it is a plain Matrix ID holding no part of the token. The
 token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
 through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
 refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no

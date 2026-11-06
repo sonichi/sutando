@@ -2523,8 +2523,20 @@ def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
     return _request_json(url, body, opener)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx comes back as its own status: a request carrying a credential never follows one."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_with_bearer(req, timeout):
+    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
 def _request_json(url: str, body, opener, bearer: str = "", timeout: float = REDEEM_TIMEOUT_S) -> "tuple[int, bytes]":
-    """(status, body) of a POST of `body`, or a GET when it is None, with `bearer` as its Authorization."""
+    """(status, body) of a POST of `body`, or a GET when it is None, with `bearer` as its Authorization;
+    a request with a bearer never follows a redirect (its 3xx is the status returned)."""
     with gateway_instance.gateway_call(url):
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -2534,7 +2546,7 @@ def _request_json(url: str, body, opener, bearer: str = "", timeout: float = RED
         req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode("utf-8"),
                                      method="GET" if body is None else "POST", headers=headers)
         try:
-            with (opener or urllib.request.urlopen)(req, timeout=timeout) as resp:
+            with (opener or (_open_with_bearer if bearer else urllib.request.urlopen))(req, timeout=timeout) as resp:
                 return resp.status, resp.read(64 * 1024)
         except urllib.error.HTTPError as e:
             try:
@@ -2544,6 +2556,8 @@ def _request_json(url: str, body, opener, bearer: str = "", timeout: float = RED
 
 
 WHOAMI_PATH = "/v1/whoami"
+# A relay's answer is shown only as a plain Matrix ID (the localpart grammar), never as free text.
+STRICT_AGENT_ID_RE = re.compile(r"@[a-z0-9._=/+-]+:[A-Za-z0-9.-]+(?::[0-9]{1,5})?")
 WHOAMI_TIMEOUT_S = 5
 
 
@@ -2556,6 +2570,8 @@ def token_agent_problem(token: dict, agent_id: str, opener=None) -> str:
     except (urllib.error.URLError, OSError, ValueError) as e:
         return (f"the relay could not be reached to check the token ({diagnostics.describe(e)}); check the "
                 "connection, then run the command again")
+    if 300 <= status < 400:
+        return f"the relay redirected (HTTP {status}); not following with a credential"
     if status in (401, 403):
         return (f"the relay rejected the token (HTTP {status}): it is revoked, expired or not this relay's; "
                 "copy it from s.space again")
@@ -2566,8 +2582,10 @@ def token_agent_problem(token: dict, agent_id: str, opener=None) -> str:
     if not AGENT_ID_RE.fullmatch(got):
         return "the relay's answer names no agent for the token; run the command again later"
     if got != agent_id:
-        return (f"the token is for {got}, not {agent_id}: paste {agent_id}'s own token, or run the command "
-                f"with --agent {got}")
+        if not STRICT_AGENT_ID_RE.fullmatch(got) or diagnostics.holds_or_is_piece(got):
+            return f"the relay named a different agent than {agent_id} for the token: paste {agent_id}'s own token"
+        return (f"the token is for {got}, not {agent_id}: paste {agent_id}'s own token, or run the command with "
+                f"--agent {got}")
     return ""
 
 
