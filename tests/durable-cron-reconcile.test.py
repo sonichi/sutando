@@ -128,13 +128,26 @@ class DurableCronReconcileTest(unittest.TestCase):
                 "not-an-object",
                 {"cron": "* * * * *", "prompt": "missing name"},
                 {"name": "", "cron": "* * * * *", "prompt": "empty name"},
-                {"name": "proactive", "cron": "* * * * *", "prompt": "/proactive-loop"},
             ]))
 
             result = reconcile_launchd.reconcile(crons, state, now=10)
 
             self.assertEqual(result, {"migrated": [], "runner_needed": False})
             self.assertFalse(state.exists())
+
+    def test_noncanonical_loop_mentions_remain_ordinary_schedules(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            crons, state = root / "crons.json", root / "state.json"
+            entries = [
+                {"name": "proactive", "cron": "* * * * *", "prompt": "/proactive-loop"},
+                {"name": "main-loop", "cron": "* * * * *", "prompt": "send a report"},
+            ]
+            crons.write_text(json.dumps(entries))
+            result = reconcile_launchd.reconcile(crons, state, now=10)
+            self.assertEqual(result, {"migrated": ["proactive", "main-loop"], "runner_needed": True})
+            self.assertEqual(json.loads(crons.read_text()), [dict(e, launchd=True) for e in entries])
+            self.assertEqual(json.loads(state.read_text()), {"proactive": 10, "main-loop": 10})
 
     def test_default_paths_use_workspace_and_host_helpers(self):
         crons, state = reconcile_launchd._default_paths()

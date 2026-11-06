@@ -187,7 +187,7 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
         if raw_entry.get("execution") != "codex-task" and not implicit_main_loop:
             continue
         entry = dict(raw_entry)
-        if canonical_main_loop:
+        if implicit_main_loop:
             # Codex has no session CronCreate surface. Turn the canonical loop
             # into one low-priority task per fire while keeping crons.json
             # unchanged so switching back to Claude restores session ownership.

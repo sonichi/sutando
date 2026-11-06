@@ -97,9 +97,7 @@ def is_proactive_loop(entry: dict) -> bool:
     it) and hands it to Codex (which cannot), leaving it owned by nobody.
     """
     kind, target = select_execution_form(entry)
-    if kind in (SHELL, MALFORMED):
-        return False
-    return target.strip().lstrip("/") == LOOP_SKILL or entry.get("name") == LOOP_NAME
+    return kind == SKILL and target == LOOP_SKILL and entry.get("name") == LOOP_NAME
 
 
 def launchd_eligible(entry: dict) -> bool:

@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
@@ -54,10 +55,14 @@ check(sel({"prompt_skill": "fallback"})[0] == cef.SKILL,
 _spec = importlib.util.spec_from_file_location(
     "cron_runner_prod", REPO / "src" / "cron-runner.py")
 _runner = importlib.util.module_from_spec(_spec)
-try:
+sys.path.insert(0, str(REPO / "src"))
+import workspace_default  # noqa: E402
+import task_envelope  # noqa: E402
+
+_import_sandbox = tempfile.TemporaryDirectory()
+_unused_workspace = Path(_import_sandbox.name) / "unused"
+with mock.patch.object(workspace_default, "resolve_workspace", return_value=_unused_workspace):
     _spec.loader.exec_module(_runner)
-except SystemExit:
-    pass
 import dashboard_schedules as _ds  # noqa: E402
 
 
@@ -66,17 +71,26 @@ def _runner_emits(entry):
     with tempfile.TemporaryDirectory() as td:
         tasks = Path(td) / "tasks"
         tasks.mkdir()
-        prev = os.environ.get("SUTANDO_TASKS_DIR")
-        os.environ["SUTANDO_TASKS_DIR"] = str(tasks)
-        try:
+        previous_tasks_env = os.environ.get("SUTANDO_TASKS_DIR")
+        previous = (_runner.WORKSPACE, _runner.TASKS_DIR, _runner._emit_cron_telemetry)
+        with mock.patch.dict(os.environ, {"SUTANDO_TASKS_DIR": str(tasks)}), \
+                mock.patch.object(_runner, "TASKS_DIR", tasks), \
+                mock.patch.object(_runner, "WORKSPACE", Path(td)), \
+                mock.patch.object(_runner, "_emit_cron_telemetry") as telemetry, \
+                mock.patch.object(task_envelope, "stamp_text", wraps=task_envelope.stamp_text) as stamp:
             written = _runner.emit_task(entry.get("name", "j"), entry)
+            check(written.parent == tasks, "runner writes only to the temporary tasks directory")
+            check(stamp.call_count == 1 and stamp.call_args.args[1] == Path(td),
+                  "envelope stamping uses only the temporary workspace")
+            check(telemetry.call_count == 1, "telemetry is intercepted instead of emitted")
+            check((Path(td) / "state/auth/task-hmac.key").is_file(),
+                  "real envelope writer creates its key inside the temporary workspace")
             m = re.search(r"^task:\s*(.*)$", written.read_text(), re.M)
-            return m.group(1) if m else ""
-        finally:
-            if prev is None:
-                os.environ.pop("SUTANDO_TASKS_DIR", None)
-            else:
-                os.environ["SUTANDO_TASKS_DIR"] = prev
+        check((_runner.WORKSPACE, _runner.TASKS_DIR, _runner._emit_cron_telemetry) == previous,
+              "all patched runner globals are restored")
+        check(os.environ.get("SUTANDO_TASKS_DIR") == previous_tasks_env, "task-directory environment is restored")
+        check(not _unused_workspace.exists(), "the import-time workspace remains untouched")
+        return m.group(1) if m else ""
 
 
 def _dashboard_kind(entry):
@@ -136,6 +150,8 @@ check(cef.select_for_executor({}, cef.CODEX_FORMS) == (cef.PROMPT, ""),
       "emptiness is the executor's rule, not the form selector's")
 check(cef.select_for_executor({"prompt_skill": "fallback"}, cef.CODEX_FORMS)
       == (cef.SKILL, "fallback"), "codex still runs an ordinary skill entry")
+
+_import_sandbox.cleanup()
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

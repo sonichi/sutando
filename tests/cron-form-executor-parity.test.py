@@ -287,5 +287,34 @@ for label, entry, want in (("mixed", LOOP_MIXED, "down"), ("plain", LOOP_PLAIN, 
           f"health on the {label} record must be {want} (got {r['status']!r}: {r['detail']!r})")
 
 
+views = _load("schedules_view", REPO / "src/runtime-api/schedules_view.py")
+# Only the unmarked canonical pair permits bootstrap payload substitution.
+for label, extra, expected, synthetic in (
+    ("canonical bootstrap", {"name": "main-loop", "prompt_skill": "proactive-loop"}, "proactive-loop", True),
+    ("named direct prompt", {"name": "main-loop", "execution": "codex-task", "prompt": "send a report"}, "send a report", False),
+    ("bare direct prompt", {"name": "plain", "execution": "codex-task", "prompt": "proactive-loop"}, "proactive-loop", False),
+    ("slash direct prompt", {"name": "slash", "execution": "codex-task", "prompt": "/proactive-loop"}, "/proactive-loop", False),
+    ("ordinary Codex job", {"name": "ordinary", "execution": "codex-task", "prompt": "ordinary work"}, "ordinary work", False),
+    ("explicit canonical pair", {"name": "main-loop", "execution": "codex-task", "prompt_skill": "proactive-loop"}, "/proactive-loop", False),
+):
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        cfg = write(ws, [{"cron": "0 6 * * *", "timezone": "UTC", **extra}])
+        row = views.SchedulesView(cfg).list_schedules()["schedules"][0]
+        fired = sched.tick(ws, "h", datetime(2026, 7, 15, 6, 0, tzinfo=timezone.utc), include_main_loop=True)
+        tasks = list((ws / "tasks").glob("*.txt"))
+        check(fired["job_count"] == 1 and len(tasks) == 1, f"{label}: real tick emits one task")
+        body = tasks[0].read_text().split("\ntask: ", 1)[1].rstrip("\n")
+        advertised = ("/" if row["kind"] == "skill" else "") + row["prompt_or_skill"]
+        if synthetic:
+            check(row["kind"] == "skill" and row["prompt_or_skill"] == expected,
+                  "canonical bootstrap: API retains the configured loop skill")
+            check(body.startswith("Run exactly one proactive-loop pass") and "[no-send]" in body,
+                  "canonical bootstrap: the documented silent pass still runs")
+        else:
+            check(body == expected == advertised, f"{label}: actual task and API preserve the configured payload")
+            check("[no-send]" not in body, f"{label}: ordinary task is not silently rewritten")
+
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
