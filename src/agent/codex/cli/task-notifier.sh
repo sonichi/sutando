@@ -18,7 +18,6 @@ fi
 # (a worker's <workspace>/deliveries/<id>); its parent is right only for the core.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
-RESULT_PAIRING_DIR="$WORKSPACE_DIR/state/result-pairing"
 # The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
@@ -465,14 +464,13 @@ submit_task() {
     log_notifier "refusing --event $filename: Codex session is unavailable"
     return 1
   fi
-  local q_python q_writer q_file q_results q_receipts task_id
+  local q_python q_writer q_file q_results task_id
   task_id="$(task_id_of "$filename")"
   printf -v q_python '%q' "$NOTIFIER_PY"
   printf -v q_writer '%q' "$REPO/src/result_write.py"
   printf -v q_file '%q' "$filename"
   printf -v q_results '%q' "$RESULTS_DIR"
-  printf -v q_receipts '%q' "$RESULT_PAIRING_DIR"
-  prompt="$prompt Publish with $q_python $q_writer write $q_file --results-dir $q_results --receipts-dir $q_receipts ; body on stdin with FIRST line exactly 'task: $task_id'. Never hand-write that file."
+  prompt="$prompt Publish with $q_python $q_writer write $q_file --results-dir $q_results ; body on stdin with FIRST line exactly 'task: $task_id'. Never hand-write that file."
   # The responsive path retains context until the actual result, including across notifier restarts.
   # The diagnostic --event path keeps its original prompt.
   if [ "$wait_for_result" != "0" ]; then

@@ -182,16 +182,15 @@ def _resolve_dirs(args):
     """(results_dir, receipts_dir) from explicit flags, else the workspace."""
     results = args.get("results-dir")
     receipts = args.get("receipts-dir")
-    if results is None or receipts is None:
+    if results is None:
         workspace = args.get("workspace")
         if workspace is None:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from workspace_default import resolve_workspace
             workspace = str(resolve_workspace())
-        if results is None:
-            results = str(Path(workspace) / "results")
-        if receipts is None:
-            receipts = str(receipts_dir_for(workspace))
+        results = str(Path(workspace) / "results")
+    if receipts is None:
+        receipts = result_context(Path(results) / "task-placeholder.txt")[0]
     return Path(results), Path(receipts)
 
 

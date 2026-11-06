@@ -82,6 +82,16 @@ class ReceiptBoundary(unittest.TestCase):
             self.assertFalse(has_ready_result(results, "task-a.txt"))
             self.assertTrue(has_ready_result(results, "task-a-123.txt"))
 
+    def test_cli_custom_result_root_matches_default_reader(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td) / "custom-output"
+            process = subprocess.run(
+                [sys.executable, str(REPO / "src/result_write.py"), "write", "a",
+                 "--results-dir", str(results)], input="task: a\ncustom answer",
+                capture_output=True, text=True, env=isolated_child_env())
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(read_ready_result(results / "task-a.txt"), "custom answer")
+
     def test_custom_result_root_pins_keep_their_receipt_namespace(self):
         with tempfile.TemporaryDirectory() as td:
             results = Path(td) / "custom-output"
