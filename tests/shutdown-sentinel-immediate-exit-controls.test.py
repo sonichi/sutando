@@ -17,26 +17,52 @@ Run: python3 tests/shutdown-sentinel-immediate-exit-controls.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import pty
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
 REAL_REPO = Path(__file__).resolve().parent.parent
 NEEDED = (
     "src/agent/claude/cli/start-cli.sh",
+    "src/agent/claude/cli/session-launch.sh",
     "src/agent/codex/cli/start-cli.sh",
     "src/agent/restart-guard.sh",
+    "src/agent/core-runtime-record.sh",
+    "src/agent/core-window.sh",
+    "src/agent/launch-path.sh",
+    "src/core_runtime_record.py",
+    "src/result_publish.py",
+    "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
+    "src/local_services.sh",
     "src/shutdown.py",
     "src/workspace_default.py",
     "src/sutando_config.py",
     "src/util_paths.py",
+    "src/delivery/__init__.py",
+    "src/delivery/codex_recovery.py",
+    "src/delivery/codex_pickup.py",
+    "src/delivery/task_dispatch.py",
+    "src/delivery/readiness.py",
+    "src/delivery/pane_gate.py",
+    "src/runtime_observation.py",
+    "src/local_task_protocol.py",
+    "src/task_priority.py",
+    "src/file_lock.py",
+    "src/cli_wedge.py",
+    "src/cli_wedge_patterns.py",
+    "src/sutando_platform.py",
+    "src/quota_availability.py",
+    "src/worker_auth_state.py",
     "src/agent/codex/cli/task-notifier.sh",
     "src/agent/codex/cli/task-notifier-supervisor.sh",
     "src/watch-tasks-stream.sh",
@@ -68,6 +94,30 @@ esac
 # the window is created — the child that exited immediately.
 PGREP_STUB = "#!/bin/bash\nexit 1\n"
 CODEX_STUB = "#!/bin/bash\nexit 0\n"
+
+
+def _reap_fixture_children(tmp: str) -> None:
+    """The launcher backgrounds a relay loop and a monitor that outlive it; kill whatever
+    still references the fixture before deleting it, or rmtree races their writes."""
+    marker = os.path.basename(tmp)
+    for _ in range(100):
+        pids = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
+        if not pids:
+            return
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, ValueError):
+                os.kill(int(pid), signal.SIGTERM)
+        time.sleep(0.02)
+    failures.append(f"fixture children survived teardown: {pids}")
+
+
+@contextlib.contextmanager
+def _fixture():
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            yield tmp
+        finally:
+            _reap_fixture_children(tmp)
 
 
 def _launch(cmd, env, cwd, tty: bool):
@@ -106,7 +156,7 @@ def _launch(cmd, env, cwd, tty: bool):
 
 
 def run_branch(label: str, launcher_rel: str, env_extra: dict, *, tty: bool = False) -> None:
-    with tempfile.TemporaryDirectory() as tmp:
+    with _fixture() as tmp:
         root, binp = Path(tmp) / "repo", Path(tmp) / "bin"
         binp.mkdir(parents=True)
         missing = False
@@ -125,6 +175,8 @@ def run_branch(label: str, launcher_rel: str, env_extra: dict, *, tty: bool = Fa
         _exe(binp / "tmux", TMUX_STUB)
         _exe(binp / "pgrep", PGREP_STUB)
         _exe(binp / "codex", CODEX_STUB)
+        # The claude launcher refuses before tmux when `claude` does not resolve.
+        _exe(binp / "claude", CODEX_STUB)
         _exe(binp / "fswatch", "#!/bin/bash\nexit 0\n")
         # mktemp is load-bearing: without it claude_config_dir.sh fails and the
         # launcher exits before reaching tmux, making the assert vacuous.

@@ -64,8 +64,8 @@ def delivery_id(task: TaskId, boundary: str) -> DeliveryId:
                       f"{escape_component(boundary)}")
 
 
-# Readable <= 80 units; digest form is 95-97 (fill 78-80, '.', 16 hex): the
-# two encodings share one grammar and are disjoint by length alone.
+# Readable <= 80 units; digest form is >80 with a character-aligned prefix.
+# The two encodings share one grammar and are disjoint by length alone.
 _LEGACY_READABLE = 80
 _LEGACY_DIGEST = 16
 # An empty content key has no readable prefix of its own; this sentinel fills

@@ -17,7 +17,7 @@ So this tool never accepts a list. It reads `held_item_ids` from the state file
 and applies explicit add/remove operations:
 
   idle-held.py --state <ws>/state/idle-streak.json --remove cinny-717 --reason merged
-  idle-held.py --state ... --add ds-pr-13:owner
+  idle-held.py --state ... --add ds-pr-13:owner --note owner/repo#13
   idle-held.py --state ... --remove X --reason "..." --write | idle-surface-hash.py --state ... --commit
 
 A removal REQUIRES a reason, because a silent shrink is the failure that
@@ -123,6 +123,17 @@ def apply_ops(items, adds, removes):
 
 
 BRANCH_SHA = re.compile(r"`?([\w./-]+/[\w./-]+)`?\s*@\s*`?([0-9a-f]{7,40})`?")
+
+
+def refuse_blank(values, flag: str, paired: str) -> "str | None":
+    """A present-but-blank explanation passes a count check and satisfies nothing:
+    the audit sees the key and does not even list it as missing."""
+    for i, v in enumerate(values):
+        if not str(v).strip():
+            return (f"REFUSED: {flag} #{i + 1} is blank. A count check cannot tell a "
+                    f"blank explanation from a real one, so {paired} would record an "
+                    f"unauditable entry with the key present.")
+    return None
 
 
 def audit_notes(doc, repo) -> int:
@@ -268,6 +279,10 @@ def main(argv=None) -> int:
     ap.add_argument("--remove", action="append", default=[], metavar="ID")
     ap.add_argument("--reason", action="append", default=[],
                     help="why an id is being removed; one per --remove")
+    ap.add_argument("--note", action="append", default=[],
+                    help="the held item's note; one per --add. Any string is "
+                         "accepted; an `owner/repo#n` in it is what --audit-prs "
+                         "reads, and a hold with no PR needs a note all the same")
     ap.add_argument("--write", action="store_true",
                     help="persist the new held_item_ids (atomic; other keys untouched)")
     ap.add_argument("--audit-prs", action="store_true",
@@ -331,9 +346,22 @@ def main(argv=None) -> int:
     if a.audit_notes:
         return audit_notes(doc, a.audit_notes)
 
+    for _vals, _flag, _paired in ((a.reason, "--reason", "--remove"),
+                                 (a.note, "--note", "--add")):
+        _err = refuse_blank(_vals, _flag, _paired)
+        if _err:
+            print(_err, file=sys.stderr)
+            return 1
+
     if a.remove and len(a.reason) != len(a.remove):
         print(f"REFUSED: {len(a.remove)} --remove but {len(a.reason)} --reason. "
               "A silent shrink is the failure this tool exists to stop.", file=sys.stderr)
+        return 1
+
+    if a.add and len(a.note) != len(a.add):
+        print(f"REFUSED: {len(a.add)} --add but {len(a.note)} --note. A hold with no "
+              "note is invisible to --audit-prs, which is the other half of the "
+              "silent-shrink failure.", file=sys.stderr)
         return 1
 
     adds = []
@@ -362,6 +390,8 @@ def main(argv=None) -> int:
           file=sys.stderr)
     for rid, why in zip(a.remove, a.reason):
         print(f"  removed {rid}: {why}", file=sys.stderr)
+    for (aid, _g), note in zip(adds, a.note):
+        print(f"  added {aid}: {note}", file=sys.stderr)
 
     if a.write:
         def apply_under_lock(fresh):
@@ -375,6 +405,11 @@ def main(argv=None) -> int:
             log = fresh.setdefault("held_item_removals", [])
             for rid, why in zip(a.remove, a.reason):
                 log.append({"id": rid, "reason": why})
+            # Same lock as the id write: an id that lands without its note is the
+            # unauditable hold this pairing exists to prevent.
+            notes = fresh.setdefault("held_item_notes", {})
+            for (aid, _g), note in zip(adds, a.note):
+                notes[aid] = note
             return None
 
         res = locked_update(state, apply_under_lock, indent=2)

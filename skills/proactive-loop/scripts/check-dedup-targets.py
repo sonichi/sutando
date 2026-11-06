@@ -109,7 +109,9 @@ def main(argv) -> int:
         if not rd.is_dir():
             print("cannot answer: no results/ directory", file=sys.stderr)
             return 2
-        files = [f for f in rd.glob("*.txt")] + [f for f in (rd / "archive").glob("*.txt")]
+        # Results archive into month subdirectories (see agent-api.py, which iterates
+        # archive/*/), so a flat glob audits almost nothing.
+        files = [f for f in rd.glob("*.txt")] + [f for f in (rd / "archive").glob("**/*.txt")]
     bad = check(ws, files)
     print(f"checked {len(files)} result file(s)")
     for name, tid, why in bad:

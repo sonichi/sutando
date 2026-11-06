@@ -2,17 +2,22 @@
 """Append one row to the agent's event log, which the desktop client streams into the room's
 events drawer and the dock's Events panel.
 
-  activity.py append "<line>" --kind processing|thinking|working|notice \
+  activity.py append "<line>" --kind processing|thinking|working|notice|wedge \
       [--task-id ID --from MXID --text "<the user's message>"] [--room ROOM_ID]
   activity.py done "<what was done>" --task-id ID [--room ROOM_ID]
+  activity.py queue --task-file <workspace>/tasks/<task>.txt      -> {"depth": N, "position": K}
 
 A row: {"ts": epoch, "room": ROOM, "line": str, "kind": str, "task": {"id","from","text"}, "done": bool}
 at <workspace>/state/agent-activity.jsonl. Rows of a task stay live in the drawer until its `done` row.
+
+`--kind wedge` is the exception to all of that: the seat is stopped and needs the owner. It is written
+with NO room, so the client shows it wherever the owner is looking and shows it even through a drawer
+they dismissed — dismissing quiets activity, and a blocker is not activity, it is why activity stopped.
+Passing --room with it is refused; --task-file still names the task, just not a room.
 """
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import sys
@@ -20,90 +25,67 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-from workspace_default import resolve_workspace  # noqa: E402
-
-KINDS = ("processing", "thinking", "working", "notice", "done")
-TEXT_MAX = 160
-
-
-def log_path(workspace: Path | None = None) -> Path:
-    return (workspace or resolve_workspace()) / "state" / "agent-activity.jsonl"
+from workspace_default import resolve_workspace  # noqa: E402,F401
+from task_queue import position as queue_position  # noqa: E402
+from activity_rows import (  # noqa: E402,F401  (the writer lives in core; the CLI keeps these names)
+    KINDS, LIVE_ROWS, TEXT_MAX, append, day_of, day_range, index_path, log_path, open_task_index,
+    rotate, summaries_path, summarize, task_from_file,
+)
 
 
-def default_room(workspace: Path | None = None) -> str | None:
-    """The room of the owner's latest AG2 Space message; a row with no room shows only in the dock."""
-    p = (workspace or resolve_workspace()) / "state" / "last-owner-activity.json"
+def queued(task_file: Path, workspace: Path | None = None) -> int:
+    """A `queued` notice for a task file that just landed: the message reached the device before any
+    turn picked it up. Written only when the file names a room and a message; a cron or bookkeeping
+    task has neither and must not appear in the owner's room. Never falls back to the default room."""
     try:
-        d = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None
-    return d.get("channel_id") if d.get("channel") == "ag2space" else None
-
-
-def task_from_file(path: Path) -> tuple[dict, str | None]:
-    """({id, from, text}, room) read from a task file's headers; text is the first task: line."""
-    fields: dict = {}
-    for l in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        k, _, v = l.partition(":")
-        if k in ("id", "user_id", "task", "channel_id") and k not in fields:
-            fields[k] = v.strip()
-    task = {"id": fields.get("id") or path.stem}
-    if fields.get("user_id"):
-        task["from"] = fields["user_id"]
-    if fields.get("task"):
-        task["text"] = fields["task"][:TEXT_MAX]
-    return task, fields.get("channel_id") or None
-
-
-def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
-           done: bool = False, workspace: Path | None = None, live_rows: int | None = None) -> dict:
-    if kind not in KINDS:
-        raise ValueError(f"kind must be one of {KINDS}")
-    rec: dict = {"ts": time.time(), "line": line.strip(), "kind": kind}
-    if room:
-        rec["room"] = room
-    if task:
-        rec["task"] = task
-    if done:
-        rec["done"] = True
-    path = log_path(workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # One lock for the append AND the rotation; the log is opened only under it, so no writer holds
-    # an inode that a concurrent rotation replaces.
-    with open(path.with_suffix(".lock"), "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        rotate(path, live_rows if live_rows is not None else LIVE_ROWS)
-    return rec
-
-
-LIVE_ROWS = 400
-
-
-def rotate(path: Path, keep: int = LIVE_ROWS) -> None:
-    """The live file keeps the newest `keep` rows; older rows move to <name>.archive.jsonl, so every
-    reader that re-parses the live file per event stays bounded. Called with the writer lock held."""
-    try:
-        rows = path.read_text(encoding="utf-8").splitlines()
+        task, room = task_from_file(task_file)
     except OSError:
-        return
-    if len(rows) <= keep:
-        return
-    with open(path.with_name(path.stem + ".archive.jsonl"), "a", encoding="utf-8") as arch:
-        arch.write("\n".join(rows[:-keep]) + "\n")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text("\n".join(rows[-keep:]) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+        return 0
+    # Only a task that names a room AND a message can mount under one: a room-addressed task with no
+    # source_message_id would leave a queued row the client can never place.
+    if not room or not task.get("text") or not task.get("event"):
+        return 0
+    rec = append("queued", kind="notice", room=room, task=task, workspace=workspace)
+    print(json.dumps(rec, ensure_ascii=False))
+    return 0
+
+
+def queue(task_file: Path, workspace: Path | None = None) -> int:
+    """Where this task stands in the pending list: depth (how many are pending) and its 1-based
+    position, 0 when it is no longer pending. The first line to a task's conversation names it.
+    When tasks/ cannot be read: nothing on stdout, the reason on stderr, exit 1 — never a zero."""
+    ws = workspace or task_file.resolve().parent.parent
+    task_id = task_file.stem
+    try:
+        task_id = task_from_file(task_file)[0]["id"]
+    except OSError:
+        pass
+    try:
+        print(json.dumps(queue_position(ws, task_id)))
+    except OSError as exc:
+        print(f"activity: queue not counted, tasks/ could not be read: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    q = sub.add_parser("queued", help="the message reached this device and no turn has it yet; from the task file only")
+    q.add_argument("--task-file", required=True)
+    q.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
+    qp = sub.add_parser("queue", help="this task's {depth, position} in the pending list")
+    qp.add_argument("--task-file", required=True)
+    qp.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     for name, help_ in (("append", "one event"), ("done", "the task is finished: its rows leave the drawer")):
         s = sub.add_parser(name, help=help_)
         s.add_argument("line")
-        s.add_argument("--room", default=None, help="room id; default: the owner's latest AG2 Space room")
+        s.add_argument("--event", dest="task_event", default=None, help="event id of the user message this row belongs to")
+        if name == "done":
+            s.add_argument("--into", dest="task_into", default=None,
+                           help="consolidated reply: event id of the message whose reply answered this one too")
+        s.add_argument("--room", default=None,
+                       help="room id; default: task-file room, otherwise unset. Refused with --kind wedge")
         s.add_argument("--workspace", default=None, help=argparse.SUPPRESS)  # tests only
         s.add_argument("--task-id", default=None)
         s.add_argument("--task-file", default=None, help="a task file: fills --task-id/--from/--text/--room from its headers")
@@ -112,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
         if name == "append":
             s.add_argument("--kind", choices=KINDS[:-1], default="notice")
     a = ap.parse_args(argv)
+    if a.cmd == "queued":
+        return queued(Path(a.task_file), Path(a.workspace) if a.workspace else None)
+    if a.cmd == "queue":
+        return queue(Path(a.task_file), Path(a.workspace) if a.workspace else None)
     task = None
     room = a.room
     if a.task_file:
@@ -125,10 +111,19 @@ def main(argv: list[str] | None = None) -> int:
             task["from"] = a.task_from
         if a.task_text:
             task["text"] = a.task_text[:TEXT_MAX]
+    if a.task_event:
+        task = dict(task or {}, event=a.task_event)
+    if getattr(a, "task_into", None):
+        task = dict(task or {}, into=a.task_into)
     done = a.cmd == "done"
+    kind = "done" if done else a.kind
+    if kind == "wedge":
+        if a.room:
+            ap.error("a wedge belongs to the owner, not a room: drop --room")
+        room = None  # roomless = the client's global row: every room, and through a dismissed drawer
     ws = Path(a.workspace) if a.workspace else None
-    rec = append(a.line, kind="done" if done else a.kind, room=room or default_room(ws), task=task, done=done,
-                 workspace=ws)
+    rec = append(a.line, kind=kind, room=room,
+                 task=task, done=done, workspace=ws)
     print(json.dumps(rec, ensure_ascii=False))
     return 0
 

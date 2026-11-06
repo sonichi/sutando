@@ -7,12 +7,20 @@ the warn to restore `PreCompact -> session-handoff.sh`. These tests pin the
 repair, and pin that it stays keyed on a structured field rather than on the
 warn's prose.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -28,6 +36,17 @@ def _load():
 
 
 hc = _load()
+
+# The probe is Claude-only (#5414); pin the runtime so a codex host still exercises it.
+_RUNTIME_PIN = mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"})
+
+
+def setUpModule():
+    _RUNTIME_PIN.start()
+
+
+def tearDownModule():
+    _RUNTIME_PIN.stop()
 
 
 def _fixture(root: Path, hooks_array: str, settings: dict):
@@ -169,6 +188,52 @@ class DispatchWiring(unittest.TestCase):
             "apply_claude_hooks_fix(checks, stream=", src,
             "handler is defined but never dispatched — --fix would be inert",
         )
+
+
+class TestDeadHookRepair(FixHandlerGating):
+    """Dead entries are repaired by the installer that owns their family, which prunes them."""
+
+    def _dead(self, family, path="/var/folders/x/repo/src/hint.sh"):
+        return {"name": "claude-hooks", "status": "warn", "detail": "x",
+                "_dead_hooks": [{"event": "SessionStart", "command": f'bash "{path}"',
+                                 "path": path, "family": family}]}
+
+    def test_a_dead_compact_hint_runs_its_own_installer_once(self):
+        calls = self._run(self._dead("personal-claude-compact-hint.sh"))
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("install-personal-claude-hook.sh", " ".join(map(str, calls[0])))
+
+    def test_two_dead_entries_of_one_family_run_the_installer_once(self):
+        check = self._dead("schedule-crons-session-hint.sh")
+        check["_dead_hooks"].append(dict(check["_dead_hooks"][0], path="/elsewhere/hint.sh"))
+        calls = self._run(check)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("install-session-start-hook.sh", " ".join(map(str, calls[0])))
+
+    def test_an_owning_installer_that_fails_warns_instead_of_raising(self):
+        import io
+        real, real_probe = subprocess.run, hc.check_claude_hook_registration
+
+        def boom(cmd, *a, **k):
+            raise OSError("bash vanished")
+
+        hc.subprocess.run = boom
+        hc.check_claude_hook_registration = lambda *a, **k: {"name": "claude-hooks", "status": "warn", "detail": "still dead"}
+        buf = io.StringIO()
+        try:
+            hc.apply_claude_hooks_fix([self._dead("personal-claude-compact-hint.sh")], stream=buf)
+        finally:
+            hc.subprocess.run = real
+            hc.check_claude_hook_registration = real_probe
+        self.assertIn("could not run install-personal-claude-hook.sh", buf.getvalue())
+        self.assertIn("bash vanished", buf.getvalue())
+
+    def test_a_foreign_family_is_reported_not_deleted(self):
+        import io
+        buf = io.StringIO()
+        calls = self._run(self._dead("someone-elses-tool.sh"), out=buf)
+        self.assertEqual(calls, [])
+        self.assertIn("not a family a Sutando installer owns", buf.getvalue())
 
 
 if __name__ == "__main__":

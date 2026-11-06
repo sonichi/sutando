@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -71,7 +73,9 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
 
     if not addition:
         return {"mode": "report", "bytes": b_bytes, "lines": b_lines,
-                "limit": mod.MEMORY_INDEX_LOAD_BYTES, "already_dropped": sorted(already),
+                "limit": mod.MEMORY_INDEX_LOAD_BYTES,
+                "line_limit": getattr(mod, "MEMORY_INDEX_LOAD_LINES", None),
+                "already_dropped": sorted(already),
                 "dropped": [], "addition_loads": None}
 
     if not addition.endswith("\n"):
@@ -83,9 +87,27 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
     add_rows = entries(addition.splitlines())
     addition_loads = add_rows.issubset(entries(after)) if add_rows else None
     return {"mode": "adding", "bytes": a_bytes, "lines": a_lines,
-            "limit": mod.MEMORY_INDEX_LOAD_BYTES, "already_dropped": sorted(already),
+            "limit": mod.MEMORY_INDEX_LOAD_BYTES,
+            "line_limit": getattr(mod, "MEMORY_INDEX_LOAD_LINES", None),
+            "already_dropped": sorted(already),
             "dropped": dropped, "addition_loads": addition_loads,
-            "delta_bytes": a_bytes - b_bytes}
+            "delta_bytes": a_bytes - b_bytes, "delta_lines": a_lines - b_lines}
+
+
+def format_head(r: dict) -> str:
+    """BOTH limits: the binding one is not always bytes, and lines bind sooner.
+
+    Printing only the byte limit let 196/200 lines read as informational while it
+    was four lines from a cut that drops rows silently.
+    """
+    head = f"{r['bytes']:,} / {r['limit']:,} B"
+    head += (f" \u00b7 {r['lines']} / {r['line_limit']} lines" if r.get("line_limit")
+             else f" \u00b7 {r['lines']} lines")
+    if r["mode"] == "adding":
+        head += f"   addition: {r['delta_bytes']:+,} B"
+        if r.get("delta_lines") is not None:
+            head += f" / {r['delta_lines']:+d} line(s)"
+    return head
 
 
 def main(argv=None) -> int:
@@ -118,10 +140,11 @@ def main(argv=None) -> int:
         addition = a.adding
 
     r = evaluate(mod, index.read_text(errors="ignore"), addition, a.at_top)
-    head = f"{r['bytes']:,} B / {r['lines']} lines load (limit {r['limit']:,} B)"
-    if r["mode"] == "adding":
-        head += f"   addition: {r['delta_bytes']:+,} B"
-    print(head)
+    # Name the file: a verdict with no path reads as one about whichever index the caller
+    # had in mind. Only an index the env chose (no --index given) earns the env marker.
+    src = " ($SUTANDO_MEMORY_DIR)" if a.index is None and os.environ.get("SUTANDO_MEMORY_DIR") else ""
+    print(f"index: {index}{src}")
+    print(format_head(r))
 
     if r["already_dropped"]:
         print(f"\n⚠ ALREADY NOT LOADING — {len(r['already_dropped'])} row(s) past the cut today:")
@@ -137,11 +160,29 @@ def main(argv=None) -> int:
         print(f"\n✗ REFUSE — this addition drops {len(r['dropped'])} row(s) that load today:")
         for e in r["dropped"][:10]:
             print(f"    {e[:100]}")
-        print("\n  Free room FIRST. Run scripts/memory-hub-containment.py before trimming,")
-        print("  so a row you remove is still carried by its hub.")
+        # Names no containment script: the one previously cited never existed,
+        # so the advice was unrunnable at the one moment it is read — a refusal.
+        print("\n  Free room FIRST, and check the row is still reachable from its hub")
+        print("  before removing it. health-check.py's memory-index probe reports the")
+        print("  loaded prefix; which rows go is the owner's call.")
     if r["addition_loads"] is False:
         bad = True
         print("\n✗ REFUSE — the addition itself lands past the cut and would never load.")
+    # A row whose slug has no file behind it is a CREATE, and a create spends the
+    # one scarce resource here: a permanent index line. Fitting is not warrant.
+    if r["mode"] == "adding":
+        mem_dir = index.parent
+        # Indexes differ on whether a target carries `.md` — MEMORY.md omits it,
+        # MEMORY-archive.md keeps it — so accept either rather than assuming one.
+        missing = [g for g in re.findall(r"\]\(([A-Za-z0-9_./-]+)\)", addition)
+                   if not ((mem_dir / g).is_file() or (mem_dir / f"{g}.md").is_file())]
+        if missing:
+            print("\n⚠ CREATES A NEW MEMORY FILE — fitting is not the same as warranted:")
+            for g in missing[:5]:
+                print(f"    {g}  (no file behind this slug)")
+            print("  Appending the lesson to an existing memory costs NO index line;")
+            print("  only the line is scarce, the file body is not.")
+
     if not bad:
         print("\n✓ safe — no row that loads today stops loading, and the addition loads.")
     return 1 if (bad or r["already_dropped"]) else 0

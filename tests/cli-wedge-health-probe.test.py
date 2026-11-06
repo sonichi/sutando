@@ -2,6 +2,12 @@
 """health-check's cli-wedge probe: absent socket / unreadable pane are readings
 of nothing (ok), a static pane with work outstanding warns, a retry loop warns,
 and idle never does. The tmux and heartbeat seams are replaced with fakes."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -31,6 +37,13 @@ class CliWedgeProbe(unittest.TestCase):
         (ws / "tasks").mkdir()
         self.ws = ws
         self._saved = (hc.WORKSPACE_DIR, hc._resolve_tmux_bin, hc._resolve_launch_env)
+        import cli_wedge
+        self._cli_wedge = cli_wedge
+        self._saved_pid_ancestors = cli_wedge._pid_ancestors
+        chain = [os.getpid(), os.getppid()]
+        cli_wedge._pid_ancestors = lambda: chain
+        # A fixed fake pane PID can equal a real ancestor on the runner; this one never does.
+        pane_pid = max(chain) + 1
         # The check reads time.time(); the fake clock advances 60 s per beat so runs last.
         self._saved_time = hc.time
         import time as _time
@@ -50,8 +63,8 @@ class CliWedgeProbe(unittest.TestCase):
         # a real-looking identity, and — like tmux with two windows — no bare `=sutando-core`.
         self.frames_file = ws / "frames.txt"
         self.idx = ws / "frames.idx"
-        self.tmux = ws / "tmux"
-        self.tmux.write_text(
+        script = ws / ("tmux.py" if os.name == "nt" else "tmux")
+        script.write_text(
             "#!/usr/bin/env python3\n"
             "import sys, pathlib\n"
             "a = sys.argv\n"
@@ -65,16 +78,21 @@ class CliWedgeProbe(unittest.TestCase):
             "    sys.stderr.write(\"can't find pane: \" + t + \"\\n\"); sys.exit(1)\n"
             "if 'display-message' in a:\n"
             "    fmt = a[-1]\n"
-            "    print(os.environ.get('FAKE_PANE_ID', '%987654') + ':' + os.environ.get('FAKE_PANE_PID', '4242')) if 'pane_id' in fmt else print('4242:1788000000'); sys.exit(0)\n"
+            f"    print(os.environ.get('FAKE_PANE_ID', '%987654') + ':' + os.environ.get('FAKE_PANE_PID', '{pane_pid}')) if 'pane_id' in fmt else print('{pane_pid}:1788000000'); sys.exit(0)\n"
             f"ff = pathlib.Path({str(self.frames_file)!r}); idx = pathlib.Path({str(self.idx)!r})\n"
             "frames = ff.read_text().split('\\n===\\n')\n"
             "i = int(idx.read_text()) if idx.exists() else 0\n"
             "idx.write_text(str(i + 1))\n"
             "sys.stdout.write(frames[min(i, len(frames) - 1)])\n"
         )
-        self.tmux.chmod(0o755)
+        script.chmod(0o755)
+        if os.name == "nt":
+            self.tmux = ws / "tmux.cmd"
+            self.tmux.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        else:
+            self.tmux = script
         hc._resolve_tmux_bin = lambda *a, **k: str(self.tmux)
-        hc._resolve_launch_env = lambda: dict(os.environ)
+        hc._resolve_launch_env = lambda: isolated_child_env()
 
     def write_alive(self, label, socket, session):
         import time as _time
@@ -100,6 +118,7 @@ class CliWedgeProbe(unittest.TestCase):
         hc.WORKSPACE_DIR, hc._resolve_tmux_bin, hc._resolve_launch_env = self._saved
         hc._local_host_labels = self._saved_labels
         hc.time = self._saved_time
+        self._cli_wedge._pid_ancestors = self._saved_pid_ancestors
         self.tmp.cleanup()
 
     def test_missing_detector_module_is_a_detail_not_a_failure(self):
@@ -147,14 +166,19 @@ class CliWedgeProbe(unittest.TestCase):
         self.assertIn("idle", c["detail"])
         self.assertEqual(c["evidence"]["sample_count"], 3)
 
-    def test_static_pane_with_work_outstanding_warns(self):
+    def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
+        # The queue no longer decides a verdict (Chi), so the probe warns on TEXT.
+        self.frames = ["❯ \n⏵⏵ APIError: 500 Internal Server Error\n"] * 12
+        for _ in range(12):
+            c = self.check()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("reads the pane, not the process", c["detail"])
+
+    def test_a_static_pane_does_not_warn_however_much_is_queued(self):
         (self.ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": self._t[0] + 60.0}))
         for _ in range(3):
             c = self.check()
-        self.assertEqual(c["status"], "warn")
-        self.assertIn("static-with-work", c["detail"])
-        self.assertTrue(c["evidence"]["work_outstanding"])
-        self.assertIn("reads the pane, not the process", c["detail"])
+        self.assertNotEqual(c["status"], "warn")
 
     def test_retry_loop_warns_even_when_the_pane_moves(self):
         self.frames = [f"Connection error. Retrying in {3 * (i % 3)}s (attempt {i}/10) 04:2{i % 10}:11\n" for i in range(12)]
@@ -229,6 +253,14 @@ class CliWedgeProbe(unittest.TestCase):
 
     def test_an_outside_caller_still_samples(self):
         with patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            c = self.check()
+        self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
+        self.assertTrue((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())
+
+    def test_a_runner_parent_pid_equal_to_the_old_fixed_pane_pid_still_samples(self):
+        self.tearDown()
+        with patch("os.getppid", return_value=4242):
+            self.setUp()
             c = self.check()
         self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
         self.assertTrue((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())

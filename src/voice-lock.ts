@@ -6,11 +6,8 @@
  * The helper is the SINGLE implementation of the lock transaction; this
  * module only shells out to it. Two normative rules live here:
  *
- * - R4/T1: the interpreter is resolved once via `sutando-config.sh
- *   python-bin` (which smoke-tests execute+`import fcntl` and prints an
- *   absolute path or exits non-zero) — never bare `python3`, never
- *   `/usr/bin/python3` (Xcode-stub trap). The resolver is injectable for
- *   failure tests.
+ * - R4/T1: resolve a smoke-tested absolute interpreter path once. POSIX uses
+ *   `sutando-config.sh python-bin`; Windows probes Python with `import msvcrt`.
  * - R3: there is NO unguarded legacy writer. If the interpreter or helper is
  *   unavailable, lock operations FAIL CLOSED with an actionable error — the
  *   caller must not fall back to an in-process bare-pid lock.
@@ -43,6 +40,42 @@ export function resolveLockPython(
 	repoRoot: string = REPO_ROOT,
 	spawnImpl: SpawnSyncFn = spawnSync as unknown as SpawnSyncFn,
 ): PythonResolution {
+	if (process.platform === 'win32') {
+		const candidates: Array<{ cmd: string; prefix: string[] }> = [];
+		if (process.env.SUTANDO_PY) {
+			candidates.push({ cmd: process.env.SUTANDO_PY, prefix: [] });
+		} else {
+			candidates.push(
+				{ cmd: 'python', prefix: [] },
+				{ cmd: 'py', prefix: ['-3'] },
+				{ cmd: 'python3', prefix: [] },
+			);
+		}
+		const failures: string[] = [];
+		for (const candidate of candidates) {
+			let probe: SpawnSyncReturns<string>;
+			try {
+				probe = spawnImpl(
+					candidate.cmd,
+					[...candidate.prefix, '-c', 'import msvcrt,sys;print(sys.executable)'],
+					{ encoding: 'utf-8' },
+				);
+			} catch (e) {
+				failures.push(`${candidate.cmd}: ${(e as Error)?.message ?? e}`);
+				continue;
+			}
+			const bin = (probe.stdout ?? '').trim();
+			if (!probe.error && probe.status === 0 && bin) {
+				return { ok: true, bin };
+			}
+			failures.push(`${candidate.cmd}: exit ${probe.status}`);
+		}
+		return {
+			ok: false,
+			detail: `no usable Windows Python (${failures.join('; ')})`,
+		};
+	}
+
 	const script = join(repoRoot, 'scripts', 'sutando-config.sh');
 	let res: SpawnSyncReturns<string>;
 	try {

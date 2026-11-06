@@ -18,6 +18,12 @@ Checks:
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
+  - Sustained system load against the core count, with its top CPU users
+    (src/system_load.py)
+  - Extra per-host probes declared in
+    <workspace>/hosts/<host-label>/health-checks-extra.json (opt-in; see
+    check_user_defined). Each entry is {"name", "command"[, "timeout"]};
+    exit 0 reads ok, anything else warn, with the command's output as the detail.
 """
 
 import ast
@@ -28,6 +34,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import statistics
 import shutil
@@ -57,20 +64,41 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from channel_env_resolve import channel_configured  # noqa: E402
+from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
+import session_runtime  # noqa: E402
+import wedge_probes  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_platform import (  # noqa: E402
+    find_pids,
+    probe_pids,
+    process_executable as _platform_process_executable,
+    process_snapshot as _platform_process_snapshot,
+)
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
+from loop_completion import completion_path, read_completion  # noqa: E402
+from cron_loop_policy import (  # noqa: E402
+    _cron_field_values, _cron_can_never_fire, _entry_marked_parked, main_loop_problem, core_loop_is_parked,
+)
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import pool_suspension  # noqa: E402
+import tmux_pane_keys  # noqa: E402
+import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
+    status_path as _gateway_lane_status_path,
     safe_num as _gateway_num,
+    verdict_from_record as _gateway_verdict_from_record,
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+import skill_roots  # noqa: E402
+import system_load  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -141,9 +169,7 @@ def _default_memory_dir() -> str:
     claude_home_path() honors CLAUDE_CONFIG_DIR, falling back to ~/.claude
     only when it is unset (preserving the old path for ad-hoc launches).
     """
-    repo = Path(__file__).parent.parent.resolve()
-    slug = claude_project_slug(repo)
-    return str(Path(claude_home_path()) / "projects" / slug / "memory")
+    return str(default_memory_dir())
 
 # SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
 # report on the same directory the runtime reads, so it opts out of #1724.
@@ -550,6 +576,22 @@ def resolve_web_client_port(
     return {"port": port}
 
 
+DISCORD_FLAP_SESSIONS_PER_HOUR = 6
+
+
+def _discord_flap_detail(state_dir: Path, now: "float | None" = None) -> "str | None":
+    """The warn detail when the Discord bridge opened too many new gateway sessions in the last
+    hour, read from the record the bridge alone writes; None when it did not."""
+    import time
+    import gateway_sessions
+    now = time.time() if now is None else now
+    n = gateway_sessions.count_recent(state_dir / "discord-bridge.sessions.json", now)
+    if n < DISCORD_FLAP_SESSIONS_PER_HOUR:
+        return None
+    return (f"running but gateway flapping ({n} new sessions in the last hour; "
+            f"see the [discord.gateway] lines in its log)")
+
+
 def check_voice_stack(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -643,21 +685,48 @@ def _vault_remote_url(vault: "dict | None" = None) -> str:
 # Checks
 # ---------------------------------------------------------------------------
 
-def twilio_configured(env_content: str) -> bool:
-    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+# Everything conversation-server.ts exits without (its own startup check).
+TWILIO_SERVER_VARS = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+
+
+def _dotenv_active_value(env_content: str, var: str) -> str:
+    """The value of an ACTIVE `var=` line in .env text; '' when the line is
+    absent, commented out, or has nothing after the `=`."""
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(var + "="):
+            value = stripped.split("=", 1)[1].strip()
+            if value:
+                return value
+    return ""
+
+
+def twilio_configured(env_content: str, vault_get=None) -> bool:
+    """True when every credential the phone server refuses to start without
+    (TWILIO_SERVER_VARS) resolves: an ACTIVE line with a value in .env, or the
+    Keychain vault (`vault set …`) for each one.
 
     A plain substring test also matched the commented placeholder shipped in
     the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
     never configured Twilio still ran the conversation-server + tunnel
     checks — and startup.sh's matching gate kept a public ngrok tunnel open
-    to a port with nothing behind it (caught 2026-07-02). startup.sh's
-    phone block carries the anchored-grep equivalent of this test.
+    to a port with nothing behind it (caught 2026-07-02). Asking for the SID
+    alone reopened the same hole from the other side: the documented setup
+    vaults the SID + token first and writes TWILIO_PHONE_NUMBER only at
+    `twilio-setup.py buy`, and in that gap the server exits at once while the
+    check reported it down on every run (review of #4666). startup.sh's phone
+    block (`twilio_creds_present`) answers the same question through the
+    channel-token resolver with the anchored test as its grep fallback;
+    tests/health-check-twilio-gate.test.py drives both. `vault_get` is the
+    test seam for the vault tier (None reads the real Keychain).
     """
-    for line in env_content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
-            return True
-    return False
+    for var in TWILIO_SERVER_VARS:
+        if _dotenv_active_value(env_content, var):
+            continue
+        if token_from_vault(var, vault_get=vault_get):
+            continue
+        return False
+    return True
 
 
 def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
@@ -713,12 +782,7 @@ _VAULT_SCANNER_SCRIPTS = {
 def _proc_executable(pid: "str | int") -> "str | None":
     """Executable path of `pid`, or None. `comm` is one field, so a path with
     spaces survives it — argv cannot be split back apart reliably."""
-    try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.stdout.strip() or None
+    return _platform_process_executable(pid)
 
 
 # The script must appear as its own argv token — a `-c` payload that merely
@@ -751,6 +815,44 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
             found.add(exe)
     return sorted(found)
 
+
+
+PROACTIVE_STUCK_S = 600
+
+
+def check_proactive_undelivered(results_dir: "Path | None" = None, now: "float | None" = None) -> dict:
+    """An undestined proactive message (results/proactive-*.txt with no `.to-<channel>` tag) no
+    bridge has claimed for 10 minutes: an owner message stranded silently. Destined files are
+    check_stranded_destined_proactive's; presenter mode holds every delivery on purpose. Names
+    only the count and the oldest age, never a file's content."""
+    check = {"name": "proactive-undelivered", "status": "ok", "detail": ""}
+    results_dir = WORKSPACE_DIR / "results" if results_dir is None else results_dir
+    now = time.time() if now is None else now
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
+        from proactive_routing import proactive_destination
+    except ImportError as e:
+        check["detail"] = f"could not load proactive_routing: {e} — no reading"
+        return check
+    if presenter_mode_active(results_dir.parent):
+        check["detail"] = "presenter mode active — deliveries intentionally held"
+        return check
+    try:
+        ages = [now - p.stat().st_mtime for p in results_dir.glob("proactive-*.txt")
+                if proactive_destination(p.name) is None]
+    except OSError as e:
+        check["detail"] = f"results/ not readable ({type(e).__name__}) — no reading"
+        return check
+    stuck = [a for a in ages if a >= PROACTIVE_STUCK_S]
+    if stuck:
+        check["status"] = "warn"
+        check["detail"] = (f"{len(stuck)} proactive message(s) unclaimed for over {PROACTIVE_STUCK_S // 60} min "
+                           f"(oldest {int(max(stuck) // 60)} min): no bridge is delivering them; see the bridge "
+                           "logs' 'proactive … held' / 'left for another lane' lines")
+    else:
+        check["detail"] = f"{len(ages)} pending, none older than {PROACTIVE_STUCK_S // 60} min"
+    return check
 
 
 def check_cli_wedge() -> dict:
@@ -804,6 +906,21 @@ def check_cli_wedge() -> dict:
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
 
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    # This host's socket: the freshest synced heartbeat may belong to another machine.
+    sock = Path(socket or _local_core_socket() or os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"))
+    sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
+                            for lock in sock.parent.glob("*.pane-keys-lock")}
+    states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
+    fenced = sorted(path for path, state in states.items() if state == "uncertain")
+    if fenced:
+        return {"name": "pane-key-fence", "status": "fail", "detail": (
+            f"automated sends blocked on {', '.join(fenced)}; stop the old server and reconcile "
+            "delivery before explicit recovery (docs/codex-core.md)")}
+    return {"name": "pane-key-fence", "status": "ok",
+            "detail": "busy" if "busy" in states.values() else "clear"}
+
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -848,7 +965,8 @@ def check_secret_scanner_mode() -> dict:
             "status": "ok",
             "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
         }
-    fix = f"{degraded[0]} -m pip install detect-secrets"
+    from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
+    fix = install_hint(degraded[0])
     return {
         "name": "secret-scanner",
         "status": "warn",
@@ -856,7 +974,7 @@ def check_secret_scanner_mode() -> dict:
                    f"({', '.join(degraded)}): detect-secrets missing, so its provider "
                    f"detectors and entropy checks are off and inbound text is scanned by "
                    f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
-                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+                   f"Fix: {fix}"),
     }
 
 
@@ -1036,6 +1154,10 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+# A core restart briefly removes .alive; a hold that outlives one is an outage, not a restart.
+CRON_HOLD_DOWN_AFTER_S = 300
+
+
 def check_cron_runner(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -1047,11 +1169,14 @@ def check_cron_runner(
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
     crons_file = workspace / "hosts" / host / "crons.json"
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
     name = "cron-runner"
     try:
         crons = json.loads(crons_file.read_text())
     except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+        problem = main_loop_problem([], runtime)
+        return {"name": name, "status": "down" if problem else "ok",
+                "detail": problem or "no schedules configured"}
     except (OSError, json.JSONDecodeError) as exc:
         return {"name": name, "status": "fail", "detail": f"cannot read crons.json ({exc})"}
     if not isinstance(crons, list):
@@ -1077,6 +1202,9 @@ def check_cron_runner(
             "status": "down",
             "detail": f"{orphaned} configured schedule(s) have no durable Codex owner",
         }
+    problem = main_loop_problem(crons, runtime)
+    if problem:
+        return {"name": name, "status": "down", "detail": problem}
     if not launchd_count:
         return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
 
@@ -1123,99 +1251,27 @@ def check_cron_runner(
             "status": "down",
             "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
         }
+    # A runner that ticks on time can still emit nothing: it holds every prompt-backed fire
+    # while the core heartbeat is missing, and records that hold here.
+    try:
+        hold = json.loads((workspace / "state" / "cron-runner-hold.json").read_text())
+    except (OSError, ValueError):
+        hold = None
+    if isinstance(hold, dict) and isinstance(hold.get("since"), (int, float)):
+        held_for = max(0, int(float(time.time() if now is None else now) - hold["since"]))
+        names = ", ".join(str(n) for n in hold.get("held", [])) or "due schedules"
+        return {
+            "name": name,
+            "status": "down" if held_for >= CRON_HOLD_DOWN_AFTER_S else "warn",
+            "detail": (f"cron-runner has held {names} for {held_for}s and emitted no task: "
+                       f"{hold.get('reason', 'core heartbeat not fresh')}"),
+        }
     return {
         "name": name,
         "status": "ok",
         "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
-
-_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
-                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
-
-
-def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
-    """Expand one numeric cron field to its value set, or None if not understood.
-
-    None means "do not reason about this expression" — every caller below treats
-    an unparseable field as schedulable, so a parser gap can never invent a
-    never-fires verdict.
-    """
-    out: "set[int]" = set()
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            return None
-        step = 1
-        if "/" in part:
-            part, _, raw_step = part.partition("/")
-            if not raw_step.isdigit() or int(raw_step) < 1:
-                return None
-            step = int(raw_step)
-        if part in ("*", "?"):
-            start, end = lo, hi
-        elif "-" in part.lstrip("-"):
-            start_s, _, end_s = part.partition("-")
-            if not (start_s.isdigit() and end_s.isdigit()):
-                return None
-            start, end = int(start_s), int(end_s)
-        elif part.isdigit():
-            start = end = int(part)
-        else:
-            return None  # names (JAN/MON), L, W, # — not our business
-        if start > end or start < lo or end > hi:
-            return None
-        out.update(range(start, end + 1, step))
-    return out or None
-
-
-def _cron_can_never_fire(expr: str) -> bool:
-    """True only when a 5-field cron's day-of-month/month pair is impossible.
-
-    A deliberately-parked entry is the real case: this host carries
-    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
-    is syntactically valid and can never occur. /schedule-crons cannot register
-    it, so it was counted as expected-but-missing and the session-crons guard
-    warned on every run, permanently. A guard that always warns is a guard
-    nobody reads, and this one exists to catch a SILENT failure (a peer
-    instance registered 2/18 with no error) — so a standing false positive
-    disables exactly the signal it was built to raise.
-
-    Deliberately conservative: day-of-week must be unrestricted, because cron
-    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
-    Anything unparseable returns False (schedulable).
-    """
-    parts = expr.split()
-    if len(parts) != 5:
-        return False
-    _, _, dom_f, month_f, dow_f = parts
-    if dow_f.strip() not in ("*", "?"):
-        return False  # OR-semantics with day-of-week — it can still fire
-    doms = _cron_field_values(dom_f, 1, 31)
-    months = _cron_field_values(month_f, 1, 12)
-    if doms is None or months is None:
-        return False
-    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
-
-
-def _entry_marked_parked(entry: dict) -> bool:
-    """True when the entry carries an explicit "deliberately disabled" signal.
-
-    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
-    signature of a parked job and of an active typo — someone meaning "the 31st,
-    monthly" and writing February. Excluding on the date alone would let a
-    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
-    omits it and this guard reports green forever: the precise silent-miss class
-    the check exists to surface.
-
-    Two accepted signals: an explicit `disabled: true` field, and the
-    established convention of DISABLED in the entry name (used by this host's
-    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
-    """
-    if entry.get("disabled") is True:
-        return True
-    name = entry.get("name")
-    return isinstance(name, str) and "DISABLED" in name
 
 
 def check_session_cron_registration(
@@ -1259,6 +1315,10 @@ def check_session_cron_registration(
 
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+            return False
+        if entry_owner(entry) != CRON_CORE:
+            # Worker-pinned entries register via that worker's own /startup,
+            # not here — counting them would warn forever.
             return False
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
@@ -1531,6 +1591,7 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
     ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    "sutando.config.local.json",  # sutando_config's workspace config layer
     # The two lock guards that legitimately sit at the ROOT, by name. Exempt
     # until they migrate to state/locks/ the way workspace_lock.py already
     # writes <workspace>/state/locks/<role>.lock.guard.
@@ -1579,6 +1640,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
     "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
+    "dismissed-questions.json",  # per-host, alongside pending-questions.md
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",
@@ -1603,6 +1665,67 @@ def check_workspace_wiring() -> "dict | None":
         "name": "workspace-wiring",
         "status": status,
         "detail": f"{state}: {report['detail']} — {fix}",
+    }
+
+
+def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """The periodic wakeup for decision-card clicks: a deferred click, or a handoff whose lease ran
+    out unacked, has no task left to trigger its retry, so this warns until a `clicks` pass runs."""
+    import pending_questions_reader as pq_reader  # noqa: PLC0415 — the core contract, adapter injected
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        due, _ = pq_reader.due_clicks(ws, skill_roots.declared(pq_reader.DECLARATION, ws))
+    except Exception:  # noqa: BLE001 — an unreadable store is not a click owed
+        return None
+    if not due:
+        return None
+    return {"name": "decision-card-clicks", "status": "warn",
+            "detail": (f"{len(due)} decision-card click(s) owe a pass or need attention ({', '.join(due)}) — run "
+                       "`python3 src/pending_questions_reader.py clicks` and handle its output as for a "
+                       "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
+
+
+def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when the connections record has rows but no primary, or a primary whose bridge has no
+    proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
+    import connections  # noqa: PLC0415
+    found = connections.notes(Path(workspace_dir) if workspace_dir else WORKSPACE_DIR)
+    if not found:
+        return None
+    status = "warn" if any(level == "warn" for level, _ in found) else "ok"
+    return {"name": "connections-primary", "status": status, "detail": "; ".join(text for _, text in found)}
+
+
+CURRENT_TRACK_READ_BUDGET = 32 * 1024
+
+
+def check_context_read_budget() -> "dict | None":
+    """Warn when the per-pass mandatory read has outgrown a session's headroom.
+
+    Every proactive pass reads hosts/<host>/current-track.md FIRST (context-reconstruct),
+    and the file is append-only. Measured 2026-09-06: 222 KB on one host (~55k tokens),
+    170 KB on another — a session could spend most of its context before acting, and one
+    agent then declined granted work as "at the end of its context". The owner's rule is
+    that context state never grounds a decline; this probe makes the cause visible before
+    it does. Fix is scripts/current-track-rotate.py (head + archive, nothing deleted).
+    Returns None under the budget, so a healthy install gains no line.
+    """
+    path = WORKSPACE_DIR / "hosts" / _host_label() / "current-track.md"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None                      # no file, or unreadable: another probe's job
+    if size <= CURRENT_TRACK_READ_BUDGET:
+        return None
+    return {
+        "name": "context-read-budget",
+        "status": "warn",
+        "detail": (
+            f"hosts/{_host_label()}/current-track.md is {size} B (~{size // 4} tokens), over the "
+            f"{CURRENT_TRACK_READ_BUDGET} B per-pass read budget; every pass reads it first. "
+            f"Fix: python3 scripts/current-track-rotate.py {path} (keeps the preamble and the "
+            f"newest entries, archives the rest beside it; nothing deleted)"
+        ),
     }
 
 
@@ -1681,6 +1804,40 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+# The compact forms a compacted index uses for entries, shared by the two
+# readers below so a row cannot be an entry for one and invisible to the other.
+INDEX_ENTRY_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
+_INDEX_ROW_ENTRY = re.compile(
+    r"^\s*[-*] .*(?:\]\(|(?<![\w-])(?:"
+    + "|".join(re.escape(s) for s in INDEX_ENTRY_ABBREV.values())
+    + r")[\w-])"
+)
+
+
+def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
+    """True when a corpus holds memories rather than just an untouched index.
+
+    MEMORY.md is the index every corpus ships with, so counting it makes a bare
+    project dir read as populated forever. Nothing can be invisible there — the
+    corpus has no memories — and a warning that can never clear is the exact
+    failure this probe's scope filter already guards against elsewhere. An index
+    carrying entries still counts: that says something wrote here.
+    """
+    if any(p.name != "MEMORY.md" for p in mds):
+        return True
+    index = mem / "MEMORY.md"
+    if not index.is_file():
+        return False
+    try:
+        text = index.read_text(errors="replace")
+    except OSError:
+        return True  # unreadable: report rather than silently drop a real corpus
+
+    # Anchor on the bullet, not the link: a compacted index writes `- f:slug`.
+    return any(_INDEX_ROW_ENTRY.search(ln) for ln in text.splitlines())
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -1724,8 +1881,9 @@ def check_memory_dir_siblings() -> "dict | None":
             continue
         if _slug_derivation_key(entry.name) != live_key:
             continue  # unrelated project, not a slug split
-        count = len(list(mem.glob("*.md")))
-        if count == 0:
+        mds = list(mem.glob("*.md"))
+        count = len(mds)
+        if not _corpus_holds_memories(mem, mds):
             continue
         key = str(mem.resolve())  # collapse symlinked twins onto one entry
         if key not in seen or count > seen[key][1]:
@@ -1933,11 +2091,16 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     # `-z` makes git read NUL-separated input, which is the only delimiter a
     # POSIX filename cannot contain.
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    # stdin is a file, not `input=`: with macOS's pipe pool spent, poll() calls a full pipe writable,
+    # communicate() blocks in os.write while git blocks on stdout, and timeout= never fires.
     try:
-        proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
-            input=rels, capture_output=True, text=True, timeout=60,
-        )
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(rels.encode("utf-8"))
+            stdin.seek(0)
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
+                stdin=stdin, capture_output=True, text=True, timeout=60,
+            )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
         return "unmeasured"
     # `-v` names the RULE that decided each path, and that is the whole point:
@@ -2321,11 +2484,15 @@ def _index_growth_note(index: Path, effective_bytes: int,
             stamps.append((sha, int(at)))
         if not stamps:
             return _TREND_UNAVAILABLE
-        batch = subprocess.run(
-            git_argv("-C", str(repo), "cat-file", "--batch"),
-            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
-            capture_output=True, timeout=20,
-        )
+        # Defensive: this stdin (<= 12 short specs) is too small to deadlock, but it stays
+        # off `input=` like `_carrier_target_verdict`, whose larger stdin can.
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write("".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode())
+            stdin.seek(0)
+            batch = subprocess.run(
+                git_argv("-C", str(repo), "cat-file", "--batch"),
+                stdin=stdin, capture_output=True, timeout=20,
+            )
         if batch.returncode != 0:
             return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []
@@ -2450,9 +2617,6 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
-    # An index that outgrows the load budget compacts its entries to prefix
-    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
-    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
 
     def _referenced_in(hay: str, name: str) -> bool:
         stem = name[:-3] if name.endswith(".md") else name
@@ -2460,7 +2624,7 @@ def check_memory_index_integrity() -> "dict | None":
             return True
         # Without this the probe calls an indexed file unindexed, and the
         # "fix" it invites — expanding the index — is what blows the read limit.
-        for full, short in _INDEX_ABBREV.items():
+        for full, short in INDEX_ENTRY_ABBREV.items():
             if not stem.startswith(full):
                 continue
             token = short + stem[len(full):]
@@ -2794,6 +2958,49 @@ def check_onboarding_status() -> "dict | None":
             "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
 
 
+#: A live HITL store this large means settled records stopped being archived;
+#: the gateway re-reads every live record each second.
+HITL_LIVE_WARN = 200
+
+
+def check_hitl_archive() -> "dict | None":
+    """Warn when the HITL archive step is failing or the live store regrew.
+
+    None when this host has no HITL store. Read-only; never raises.
+    """
+    name = "hitl-archive"
+    try:
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, store_roots
+        default, *siblings = store_roots(WORKSPACE_DIR)
+        h = archive_health(default)
+        failed_elsewhere = [i for root in siblings
+                            for i in (archive_health(root) or {}).get("projection_failed", [])]
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
+        return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
+    if h is None:
+        if not failed_elsewhere:
+            return None
+        h = {"live": 0, "failures": 0, "error": "", "reported": False, "stale": False}
+    problems = []
+    if h["stale"]:
+        problems.append(f"archive status stale: not refreshed in over "
+                        f"{ARCHIVE_STATUS_STALE_S // 60} min (last reported "
+                        f"{h['failures']} failure(s)); is the gateway pulsing?")
+    elif h["failures"]:
+        problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
+    if h["live"] > HITL_LIVE_WARN:
+        problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
+                        f"each one every second")
+    failed = [*(h.get("projection_failed") or []), *failed_elsewhere]
+    if failed:
+        problems.append(f"{len(failed)} card(s) could not be projected ({', '.join(failed[:5])}): "
+                        f"the relay refused them; the gateway log names the error")
+    if problems:
+        return {"name": name, "status": "warn", "detail": "; ".join(problems)}
+    state = "archive healthy" if h["reported"] else "no archive report yet"
+    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, {state}"}
+
+
 def check_host_subtrees() -> dict:
     """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
 
@@ -3082,6 +3289,7 @@ _SERVICE_SOURCES = (
     # KeepAlive jobs in src/launchd/ whose program SURVIVES as a process. A
     # wrapper that `exec`s is gone from the table, so its payload's row covers it.
     ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
+    ("src/launchd/gateway-bridge-wrapper.sh", "gateway-bridge-wrapper.sh"),
     ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
@@ -3135,6 +3343,323 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
         return None          # no such remote ref (fresh clone, renamed remote)
     raw = out.stdout.strip()
     return int(raw) if raw.isdigit() else None
+
+
+def check_sync_conflicts_unmerged(workspace: "Path | None" = None,
+                                  repo_root: "Path | None" = None) -> dict:
+    """Peer content the sync preserved and nobody merged back.
+
+    `_resolve_conflicts_keep_ours` keeps OUR side on a conflict and banks THEIRS
+    under the git dir. That happens at exit 0, and the sync cron is told to speak
+    only on failure, so the fact lands where nothing reads it. Measured on two
+    hosts the same hour: both agents read past the line while quoting other rows.
+
+    Counts the preserved files; it does NOT diff them against the live copy.
+    That diff is what `scripts/sync-conflicts-report.py` does and it costs 24s
+    over 892 MB here and over 120s on a peer -- a per-pass probe cannot run it,
+    and a probe whose only reachable arm is its timeout prints a tick forever.
+    """
+    name = "sync-conflicts-unmerged"
+    ws = Path(workspace) if workspace else resolve_workspace()
+    try:
+        # `rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
+        # its parent; require the toplevel to BE the workspace, as the reporter does.
+        r = subprocess.run(git_argv("-C", str(ws), "rev-parse", "--show-toplevel", "--git-dir"),
+                           capture_output=True, text=True, timeout=10)
+        lines = r.stdout.strip().splitlines()
+        if r.returncode != 0 or len(lines) < 2:
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git checkout — no conflict backups to read"}
+        if Path(lines[0]).resolve() != Path(ws).resolve():
+            return {"name": name, "status": "ok",
+                    "detail": f"{ws} is not a git top level (git resolved {lines[0]}) — not asserting a count"}
+        gitdir = Path(lines[1])
+        if not gitdir.is_absolute():
+            gitdir = Path(ws) / gitdir
+    except Exception as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not resolve the vault git dir ({type(exc).__name__}) — not asserting a count"}
+    root = gitdir / "sutando-sync-conflicts"
+    if not root.is_dir():
+        return {"name": name, "status": "ok", "detail": "no conflict backups — keep-ours has discarded nothing"}
+    try:
+        batches = sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError as exc:
+        return {"name": name, "status": "ok",
+                "detail": f"could not read {root} ({exc.__class__.__name__}) — not asserting a count"}
+    batch_files, unreadable_dirs = _sync_conflicts_walk_batches(batches)
+    # The digest is IN the writer's key so retiring one copy cannot silence a
+    # later, DIFFERENT one at the same path; the reporter owns that identity.
+    try:
+        retired = set(json.loads((root / ".retired.json").read_text()))
+    except Exception:
+        retired = set()
+    entry_key = _sync_conflicts_entry_key()
+    if entry_key is None:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(batch_files)} peer file(s) preserved across {len(batches)} keep-ours "
+                           "batch(es); the reporter's retirement key could not be loaded, so "
+                           "retirement is UNOBSERVED here rather than assumed — run "
+                           f"`python3 scripts/sync-conflicts-report.py \"{ws}\"`")}
+    live, unobserved = [], []
+    for batch, f in batch_files:
+        try:
+            # errors="replace" matches the writer: a different decode is a
+            # different digest, and every copy would then read un-retired.
+            key = entry_key(batch.name, f.relative_to(batch), f.read_text(errors="replace"))
+        except OSError:
+            unobserved.append(f)
+            continue
+        if key not in retired:
+            live.append(f)
+    if unreadable_dirs and not live:
+        # A subtree os.walk could not list may hold live, un-retired files we
+        # structurally never enumerated -- never report clean while that holds.
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unreadable_dirs)} subdirectory read failure(s) across "
+                           f"{len(batches)} keep-ours batch(es) ({len(unobserved)} file(s) also "
+                           "unreadable) — retirement is UNOBSERVED for whatever those subtrees "
+                           "hold, not asserting clean")}
+    if not live and not unobserved:
+        return {"name": name, "status": "ok",
+                "detail": "no preserved peer files outstanding — all retired or none kept"}
+    if not live:
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(unobserved)} preserved peer file(s) could not be read, so their "
+                           "retirement is UNOBSERVED — not asserting they are retired")}
+    oldest = batches[0].name if batches else "?"
+    return {"name": name, "status": "warn",
+            "detail": (f"{len(live)} peer file(s) preserved across {len(batches)} keep-ours batch(es), "
+                       f"oldest {oldest}, not retired — whether each is still absent from the live copy "
+                       f"is what `python3 scripts/sync-conflicts-report.py \"{ws}\"` computes")}
+
+
+def _sync_conflicts_walk_batches(batches: "list[Path]") -> "tuple[list[tuple[Path, Path]], list[str]]":
+    """Enumerate files under each batch, reporting subtrees `rglob` would hide.
+
+    `Path.rglob()` swallows `OSError` when `scandir` fails on a subdirectory and
+    silently treats it as empty rather than raising -- a permission-denied
+    subtree then reads as "no files here" instead of "unreadable", which is how
+    a batch holding live, un-retired content could report a clean verdict.
+    `os.walk`'s `onerror` hook is what makes that failure visible.
+    """
+    pairs: list[tuple[Path, Path]] = []
+    unreadable: list[str] = []
+    for batch in batches:
+        for dirpath, _dirnames, filenames in os.walk(
+                str(batch), onerror=lambda exc: unreadable.append(str(exc))):
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.is_file():
+                    pairs.append((batch, p))
+    pairs.sort(key=lambda bf: (bf[0].name, bf[1]))
+    return pairs, unreadable
+
+
+def _sync_conflicts_entry_key():
+    """The reporter OWNS retirement identity; a second spelling here would drift."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / "sync-conflicts-report.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_sync_conflicts_report", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._entry_key
+    except Exception:
+        return None
+
+
+def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
+    """Warn when a long-running skills process is executing code older than disk.
+
+    `live-tree-drift` covers the repo side; nothing covered the skills side, and a
+    skill pulled while its driver is running does not reach that driver -- the
+    process froze its code at launch. Measured 2026-09-10: three pulls in one day
+    left the content driver on superseded code, visible only as the `v=<sha>` stamp
+    in its own log, compared by hand. Absent stamp or absent repo is ok, not warn:
+    a driver that never ran has no drift.
+    """
+    name = "skills-driver-code-drift"
+    import re as _re
+    ws = workspace or resolve_workspace()
+    log = Path(ws) / "state" / "content-driver.log"
+    skills = Path(ws) / "skill-repos" / "sutando-skills"
+    if not log.exists() or not (skills / ".git").exists():
+        return {"name": name, "status": "ok",
+                "detail": "no content-driver log or skills checkout — nothing long-running to compare"}
+    try:
+        stamps = _re.findall(r"v=[0-9a-f]+@([0-9a-f]+)", log.read_text(errors="replace"))
+        running = stamps[-1] if stamps else ""
+        # git_argv, never a bare "git": the stock macOS /usr/bin/git is a CLT stub
+        # that raises an install dialog no timeout or except can suppress.
+        head = subprocess.run(git_argv("-C", str(skills), "rev-parse", "--short", "HEAD"),
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except GitUnavailable:
+        return {"name": name, "status": "ok", "detail": "no runnable git on this host — not asserting drift"}
+    except Exception:
+        return {"name": name, "status": "ok", "detail": "could not read driver stamp or skills HEAD — not asserting drift"}
+    if not running:
+        return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
+    if not head:
+        return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
+    # Never compare two abbreviations: each writer picks its own length, so they
+    # agree until a colliding object lands and `--short` grows. Resolve both.
+    def _git(*args, timeout=10):
+        return subprocess.run(git_argv("-C", str(skills), *args),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _oid(rev):
+        """(state, oid) — 'ok' | 'absent' | 'unknown'.
+
+        A nonzero exit does not establish absence: an unreadable loose object,
+        a signal, or exit 128 all fail while the commit is right there. Absence
+        is established POSITIVELY, by asking how many objects carry the prefix.
+        """
+        try:
+            r = _git("rev-parse", "--verify", f"{rev}^{{commit}}")
+            if r.returncode == 0 and r.stdout.strip():
+                return ("ok", r.stdout.strip())
+            # --disambiguate takes an object PREFIX. A symbolic name like HEAD
+            # matches nothing, which would read as absence rather than a failure.
+            if not _re.fullmatch(r"[0-9a-fA-F]{4,40}", rev or ""):
+                return ("unknown", "")
+            d = _git("rev-parse", f"--disambiguate={rev}")
+        except Exception:
+            return ("unknown", "")
+        # rc 0 with nothing on stdout and a complaint on stderr is a FAILED
+        # read, not an empty candidate set: an unreadable object dir does this.
+        if d.returncode != 0 or (not d.stdout.strip() and d.stderr.strip()):
+            return ("unknown", "")
+        n = len([ln for ln in d.stdout.split() if ln.strip()])
+        # 0 candidates is the only positively-established absence. One candidate
+        # that would not resolve means present-but-unreadable; >1 is ambiguous.
+        return ("absent", "") if n == 0 else ("unknown", "")
+    head_state, head_oid = _oid("HEAD")
+    if head_state != "ok":
+        return {"name": name, "status": "ok",
+                "detail": f"HEAD in the skills checkout is {head_state} — not asserting drift"}
+    run_state, run_oid = _oid(running)
+    # Unobserved is not stale. An ambiguous prefix or an unrunnable git says
+    # nothing about the driver; only a resolvable, different commit does.
+    if run_state == "unknown":
+        return {"name": name, "status": "ok",
+                "detail": (f"could not identify the driver stamp {running} (ambiguous prefix, "
+                           f"unreadable object, or git unavailable) — INCONCLUSIVE, not asserting "
+                           f"drift or a re-arm")}
+    same = run_oid == head_oid
+    if same:
+        return {"name": name, "status": "ok",
+                "detail": f"content-driver running {running}, matches skills HEAD ({head})"}
+    return {"name": name, "status": "warn",
+            "detail": (f"content-driver is running {running} but skills HEAD is {head} — the pull did not reach "
+                       f"the process, which froze its code at launch. Merged skill fixes are NOT in effect. "
+                       f"Re-arm the driver (TaskStop + Monitor) and confirm the stamp moves to {head}.")}
+
+
+# A git write holds index.lock for well under a second; five minutes is ~300x
+# the slowest legitimate case measured here and 113x below the incident's 9.4h.
+GIT_LOCK_STALE_S = 300.0
+
+# `git rev-parse --local-env-vars` (git 2.50) plus the two discovery bounds. Any
+# of these inherited makes git answer for ANOTHER repository despite `-C`.
+GIT_REPO_SELECTION_ENV = frozenset({
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
+
+
+def _git_dir(repo: Path) -> "Path | None":
+    """The real .git directory, as GIT resolves it.
+
+    Asking git is what proves the answer belongs to THIS checkout. A
+    hand-parsed `gitdir:` pointer can name any existing directory, and the
+    probe would then advise removing an unrelated repository's lock; git's own
+    resolver also sidesteps `Path.resolve()`, whose symlink-loop RuntimeError
+    would escape an always-on sweep. Unresolvable means no remedy, not a guess.
+    """
+    import subprocess as _sp
+    env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_SELECTION_ENV}
+    try:
+        r = _sp.run(git_argv("-C", str(repo), "rev-parse", "--absolute-git-dir"),
+                    capture_output=True, timeout=20, env=env)
+    except (OSError, ValueError, _sp.SubprocessError):
+        return None
+    # Bytes, not text: universal newlines would fold a CR in the NAME into
+    # "\n", and only the record terminator comes off — a trailing space stays.
+    raw = r.stdout.removesuffix(b"\n")
+    if r.returncode != 0 or not raw:
+        return None
+    try:
+        g = Path(os.fsdecode(raw))
+        return g if g.is_dir() else None
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+def check_git_index_lock(repo_dir: "Path | None" = None,
+                         now: "float | None" = None) -> dict:
+    """Warn when `.git/index.lock` has outlived any plausible git operation.
+
+    A crashed or killed git leaves the lock behind, and from then on EVERY
+    write in that checkout fails with "Another git process seems to be
+    running" — add, checkout, commit, stash, rebase. Nothing else surfaces it:
+    the failure is per-command, so a seat that does not happen to write sees a
+    healthy repo, and a seat that does write reads the message as a transient
+    collision and retries later. Measured on the live checkout 2026-09-04: a
+    ZERO-byte lock, 9.4 hours old, with no process holding it, had been
+    silently failing git writes for the whole night.
+
+    Read-only and warn-only: a lock younger than the threshold is an ordinary
+    in-flight write, and an unreadable repo is not this probe's business.
+    """
+    name = "git-index-lock"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    gitdir = _git_dir(repo)
+    if gitdir is None:
+        return {"name": name, "status": "ok",
+                "detail": f"{repo} is not a git checkout — nothing to lock"}
+    lock = gitdir / "index.lock"
+    try:
+        # lstat, not stat: a DANGLING symlink named index.lock still occupies the
+        # directory entry, so git's exclusive create fails while stat() says absent.
+        st = lock.lstat()
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no index.lock — git writes are unblocked"}
+    except (OSError, ValueError, RuntimeError) as e:
+        # Only a missing file is an absence; any other stat error leaves the
+        # question unanswered, and "unblocked" would state an unmade measurement.
+        return {"name": name, "status": "warn",
+                "detail": (f"cannot tell whether {lock} exists "
+                           f"({type(e).__name__}: {getattr(e, 'strerror', None) or e}) "
+                           f"— this is UNMEASURED, not a clean checkout")}
+    age = (now if now is not None else time.time()) - st.st_mtime
+    if age < 0:
+        # A future mtime makes every age comparison meaningless, and "in flight"
+        # would report an in-progress write this probe never observed.
+        return {"name": name, "status": "warn",
+                "detail": (f"{lock} is dated {-age:.0f}s in the FUTURE — its age is UNMEASURED, "
+                           f"not young; git writes may be blocked. Check the clock, then inspect "
+                           f"the lock by hand")}
+    if age < GIT_LOCK_STALE_S:
+        return {"name": name, "status": "ok",
+                "detail": f"index.lock present but only {age:.0f}s old — a git write is in flight"}
+    hrs = age / 3600.0
+    when = f"{hrs:.1f}h" if hrs >= 1 else f"{age / 60:.0f}m"
+    # A path with spaces splits into separate argv words, so an unquoted
+    # command would probe — and remove — operands that are not the lock.
+    q = shlex.quote(str(lock))
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{lock} is {when} old ({st.st_size} bytes) — every git write in this checkout "
+                   f"is failing with \"Another git process seems to be running\". Confirm nothing "
+                   f"holds it (`lsof {q}`; a real writer also keeps a git process in `ps`), "
+                   f"then `rm {q}`"),
+    }
 
 
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
@@ -3654,6 +4179,9 @@ ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
 def _default_local_notifier(msg: str) -> bool:
     """Owner surface that does not depend on any Sutando bridge. True only on a
     zero exit, so a missing osascript reads as undelivered rather than success."""
+    from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+    if not resolve_macos_notifications():
+        return False  # off unless the owner opted in: reported as undelivered
     safe = str(msg).replace('"', "").replace("\\", "")
     try:
         return subprocess.run(
@@ -3667,7 +4195,7 @@ def _default_local_notifier(msg: str) -> bool:
 # Per-bridge EXACT detail: gateway-bridge's other warns (not-serving, duplicate
 # pileup) describe a live process, so only this string may respawn one.
 GATEWAY_DOWN_DETAIL = (
-    "configured but NOT running — ag2.space mobile messages will not be delivered"
+    "configured but NOT running — gateway messages will not be delivered"
 )
 DOWN_BRIDGE_DETAILS = {
     "telegram-bridge": "configured but not running",
@@ -4274,6 +4802,63 @@ def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
         service, lstart_by_pid, time.time())
 
 
+def _phone_server_active_calls(health_url: str = "http://127.0.0.1:3100/health") -> int:
+    """Live calls the phone server reports, 0 when it does not answer (nothing to protect)."""
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(health_url, timeout=2) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        n = d.get("activeCalls") if isinstance(d, dict) else 0
+        return int(n) if isinstance(n, (int, float)) and n > 0 else 0
+    except Exception:
+        return 0
+
+
+def _phone_server_launch_argv() -> list:
+    """The bundled artifact when it exists (no tsx in a packaged install), else the source."""
+    bundled = REPO_DIR / "dist" / "conversation-server.js"
+    if bundled.exists():
+        return ["node", str(bundled)]
+    return ["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"]
+
+
+def fix_conversation_server(c: dict, *, settle_s: float = 1.0) -> str:
+    """Restart the phone server, never mid-call: a stale server with live calls is
+    deferred (it drains on SIGTERM, but the owner's call comes first); a stale one
+    is killed only after a re-check right before the kill; the launch is the
+    bundled artifact when it exists."""
+    stale = c.get("status") == "stale"
+    live = _phone_server_active_calls()
+    if stale and live:
+        return f"stale but {live} call(s) active — deferred, run --fix again later"
+    if stale:
+        # Old PIDs first so the new process neither bind-fails nor lands beside a zombie.
+        try:
+            old_pids = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "conversation-server"],
+                capture_output=True, text=True
+            ).stdout.strip().split("\n")
+            old_pids = _filter_pids_this_checkout([p for p in old_pids if p])
+            if _phone_server_active_calls():
+                return "a call started — deferred"
+            for pid in old_pids:
+                if pid:
+                    subprocess.run(["/bin/kill", pid], check=False)
+            time.sleep(settle_s)
+        except Exception:
+            pass
+    subprocess.Popen(_phone_server_launch_argv(),
+                     cwd=str(REPO_DIR),
+                     stdout=open("/tmp/conversation-server.log", "a"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    return "restarted (stale code)" if stale else "restarted"
+
+
+def _C_LOCALE_ENV() -> dict:
+    """The environment for a `ps -o lstart` whose output is parsed in English."""
+    return {**os.environ, "LC_ALL": "C"}
+
+
 def _proc_lstarts(pgrep_pattern: str) -> tuple:
     """(start timestamps, {pid: lstart}) for THIS checkout's matching processes.
 
@@ -4301,9 +4886,11 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
         pids = _filter_pids_this_checkout(pids)
         if not pids:
             return [], {}
+        # LC_ALL=C: macOS formats lstart in the locale's %c, and a non-English
+        # one broke the English strptime below (P1-19).
         _ps = subprocess.run(
             ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
         )
         if _ps.returncode != 0:
             return [], None
@@ -4884,26 +5471,8 @@ LAUNCH_RECORD_SKEW_SEC = 5
 
 
 def _runtime_may_skip_proxy() -> bool:
-    """True when this core's runtime is not expected to produce Anthropic quota headers.
-
-    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
-    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
-    resolves), so its ABSENCE positively excludes Codex rather than merely being
-    unknown — which is why absence is treated as proxy-routed instead of silencing the
-    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
-    treated as non-proxy and stays silent: a corrupted status file must not manufacture
-    a health warning.
-
-    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
-    this file and nothing resets it, so after a Codex -> Claude switch a stale
-    `{"runtime": "codex"}` sits there describing a core that is no longer running
-    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
-    silence this check on a host that IS proxy-routed — the mirror of the false
-    positive this function was added to fix. So a marker whose `started_at` predates
-    the running core's own start is treated as absent, i.e. proxy-routed.
-
-    When #2406 lands a Claude-side writer, tighten this to positive identification of
-    a proxy-routed runtime instead of inferring it from absence.
+    """Interpret the last confirmed launch record, excluding observations older than the live core.
+    Missing records retain the legacy proxy expectation; malformed records fail silent.
     """
     path = status_read_path("core-runtime.json", WORKSPACE_DIR)
     try:
@@ -5172,64 +5741,14 @@ def core_env_has_proxy_url(
     Both subprocess calls are injectable so the contract is testable without a live
     core; production passes neither.
     """
-    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
-    if ps_runner is None:
-        def ps_runner(pid):
-            return subprocess.run(
-                ["ps", "eww", "-o", "command=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=15,
-            )
+    from quota_availability import seat_env_base_url  # src/ is on sys.path
     sock = socket_path or _local_core_socket()
     if not sock:
         return None                       # no live LOCAL core -> unknown, not a bypass
-    # `-s` = every pane in the SESSION, not just the current window's.
-    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
-    if panes is None or getattr(panes, "returncode", 1) != 0:
-        return None                       # no such session / tmux unavailable
-    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
-    if not pids:
-        return None
-    # Identify the core by argv, not by position: `--name <session>` is what
-    # start-cli.sh passes and no sibling window carries it.
-    #
-    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
-    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
-    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
-    # True where the contract is None). This is the SAME lookalike class as the
-    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
-    # axis and then introduced the identical hole on the session-name axis.
-    def _names_this_session(argv: str) -> bool:
-        toks = argv.split()
-        for i, t in enumerate(toks):
-            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
-                return True
-            if t == f"--name={session}":  # the =-joined spelling
-                return True
-        return False
-
-    matches = []
-    for pid in pids:
-        try:
-            proc = ps_runner(pid)
-        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
-            return None
-        if proc is None or getattr(proc, "returncode", 1) != 0:
-            continue                      # this pane vanished; keep looking
-        out = proc.stdout or ""
-        if _names_this_session(out):
-            matches.append(out)
-    # Zero matches: the core is not in this session (or ps could not read any pane).
-    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
-    if len(matches) != 1:
-        return None
-    tokens = matches[0].split()
-    # `ps eww` prints argv alone when the env is unreadable, so "no KEY=VALUE pair"
-    # is what keeps an unreadable env reporting None rather than an empty env.
-    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
-    if not env_pairs:
-        return None
-    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
-
+    env = seat_env_base_url(sock, session,
+                            tmux_runner=tmux_runner or (lambda s, *a: _run_tmux(s, *a)),
+                            ps_runner=ps_runner)
+    return None if not env.observed else env.base_url is not None
 
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
@@ -5463,10 +5982,14 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["detail"] = f"{len(ledger)} ledger entr(y/ies) but none carry a parsable ts"
         return check
 
+    from quota_availability import models_match  # src/ is on sys.path
     own = _own_core_model()
+    # `default` names no model, so no rejection could ever be attributed to it.
+    if own and own.strip().lower() == "default":
+        own = None
     if own:
-        mine = [p for p in dated if p[0].get("model") == own]
-        others = [p for p in dated if p[0].get("model") != own]
+        mine = [p for p in dated if models_match(own, p[0].get("model"))]
+        others = [p for p in dated if not models_match(own, p[0].get("model"))]
         attribution = f"counting model={own}"
     else:
         mine, others = dated, []
@@ -5594,10 +6117,12 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
-    # Every unified window is read, not just 5h/7d: a per-model window such as
-    # 7d_oi can be the one rejected while the headline windows sit low.
+    # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
+    # low); overage is shown but never pages, it is purchase eligibility.
+    from quota_availability import classify_limit_state, limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
-    full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
+    full = [w for w, (u, st) in _limit_windows(headers).items()
+            if st == "rejected" or (u is not None and u >= 0.9)]
     if windows and not full:
         summary = _window_summary(windows)
         check["status"] = "warn"
@@ -5608,6 +6133,11 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
             "not paging. If THIS core were stuck, its own passes would stop and "
             "quota-telemetry would go stale."
         )
+        return check
+
+    if classify_limit_state(data) == "overage":
+        # A rejected window with extra usage allowed is served, not stuck.
+        check["detail"] = f"core serving on extra usage (status={status}, {_window_summary(windows)})"
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
@@ -5637,24 +6167,6 @@ def _window_summary(windows: dict) -> str:
         elif u is not None:
             parts.append(f"{w} {u:.0%}")
     return ", ".join(parts)
-
-
-def _quota_windows(headers: dict) -> dict:
-    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
-    window, as (utilization or None, that window's own status or None)."""
-    out = {}
-    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
-    for k, v in headers.items():
-        if not (k.startswith(prefix) and k.endswith(suffix)):
-            continue
-        w = k[len(prefix):-len(suffix)]
-        try:
-            u = float(v)
-        except (TypeError, ValueError):
-            u = None
-        st = headers.get(f"{prefix}{w}-status")
-        out[w] = (u, str(st) if st is not None else None)
-    return out
 
 
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
@@ -6020,7 +6532,7 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    Fix when this check fails: `npm install` (installs the package.json pin)
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
 
     Scans whichever artifact the voice-agent ACTUALLY loads, because that
@@ -6095,7 +6607,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm install`."
         )
     return check
 
@@ -6272,6 +6784,69 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
+def _stamper_age_h() -> Optional[float]:
+    """Bound first-proof migration grace by installation of the explicit writer."""
+    p = REPO_DIR / "scripts" / "core-status.sh"
+    try:
+        if "--loop-complete" not in p.read_text(encoding="utf-8", errors="replace"):
+            return None
+        return (time.time() - p.stat().st_mtime) / 3600
+    except OSError:
+        return None
+
+
+def check_cron_schedule() -> dict:
+    """Detect absent or stale host-specific proof of a completed proactive pass."""
+    name = "cron-schedule"
+    workspace = Path(WORKSPACE_DIR)
+    host = _host_label()
+    try:
+        entries = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, ValueError):
+        entries = []
+    if isinstance(entries, list) and core_loop_is_parked(entries):
+        return {"name": name, "status": "ok", "detail": "core loop deliberately parked; completion not expected"}
+
+    def _h(env_name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(env_name, str(default)))
+            return value if 0 < value < float("inf") else default
+        except ValueError:
+            return default
+
+    warn_h = _h("SUTANDO_CRON_STALE_WARN_H", 7.0)
+    fail_h = max(warn_h, _h("SUTANDO_CRON_STALE_FAIL_H", 26.0))
+    completed_at = read_completion(workspace, host)
+    if completed_at is None:
+        if completion_path(workspace, host).exists():
+            return {"name": name, "status": "warn",
+                    "detail": f"invalid or unreadable loop completion record for {host}"}
+        stamper_h = _stamper_age_h()
+        if stamper_h is not None and 0 <= stamper_h <= warn_h:
+            return {"name": name, "status": "ok",
+                    "detail": (f"awaiting first loop completion for {host}; writer installed "
+                               f"{stamper_h:.1f}h ago (grace <= {warn_h:.0f}h)")}
+        return {"name": name, "status": "warn",
+                "detail": (f"no loop completion proof for {host}; the loop may never have STARTED. "
+                           "Check the configured driver and complete one proactive pass")}
+
+    age_h = (time.time() - completed_at) / 3600
+    if age_h < 0:
+        return {"name": name, "status": "warn",
+                "detail": f"loop completion for {host} is future-dated; cannot verify liveness"}
+    if age_h > fail_h:
+        return {"name": name, "status": "fail",
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{fail_h:.0f}h). Check the configured driver; Claude CronCreate "
+                           "jobs expire after 7d")}
+    if age_h > warn_h:
+        return {"name": name, "status": "warn",
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{warn_h:.0f}h). Check the configured driver")}
+    return {"name": name, "status": "ok",
+            "detail": f"last loop pass for {host} closed {age_h:.1f}h ago"}
+
+
 def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     """Detect a stuck core proactive loop via stale core-status.json.
 
@@ -6295,21 +6870,21 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
         # half-written file caught between os.write() syscalls. Fall through
         # to ok so the next tick sees a (re-)written status.
         return {"name": name, "status": "ok", "detail": f"core-status.json unreadable: {str(e)[:60]}"}
-    state = data.get("status")
-    ts = data.get("ts")
+    state = data.get("status") if isinstance(data, dict) else None
+    ts = data.get("ts") if isinstance(data, dict) else None
     if state != "running":
         return {"name": name, "status": "ok", "detail": f"status={state}"}
-    if not isinstance(ts, (int, float)):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return {"name": name, "status": "ok", "detail": "running, no ts"}
-    age = int(time.time() - ts)
-    if age > threshold_sec:
-        step = data.get("step", "?")
+    now = time.time()
+    stale = wedge_probes.core_status_verdict(data, now, threshold_sec)  # the wedge detector's rule too
+    if stale:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"running for {age}s on '{step}' — last heartbeat > {threshold_sec}s ago",
+            "detail": f"running for {stale['age']}s on '{stale['step']}' — last heartbeat > {threshold_sec}s ago",
         }
-    return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
+    return {"name": name, "status": "ok", "detail": f"running ({int(now - ts)}s ago)"}
 
 
 def check_core_supervisor() -> dict:
@@ -6325,7 +6900,8 @@ def check_core_supervisor() -> dict:
     "needs you" line + the prompt excerpt; degraded states (crashed / hung /
     gateway-down) → warn; healthy (running / idle-ready / blocked-known, the
     last being pre-seeded/auto-answered) → ok. File missing → ok (monitor not
-    running, or a pre-supervisor install).
+    running, or a pre-supervisor install). File present but unparseable → warn:
+    it can hide a hard blocker, and the relay escalates on it too.
     """
     name = "core-supervisor"
     sig_path = status_read_path("core-supervisor.json", WORKSPACE_DIR)
@@ -6334,13 +6910,18 @@ def check_core_supervisor() -> dict:
     try:
         data = json.loads(sig_path.read_text())
     except Exception as e:
-        return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+        data, err = None, str(e)[:60]
+    else:
+        err = f"expected an object, got {type(data).__name__}"
+    if not isinstance(data, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"core-supervisor.json unreadable ({err}) — a blocked core can't be ruled out"}
     state = data.get("state", "unknown")
     detail = state
     prompt = data.get("prompt")
     if prompt:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
-    needs_user = {"blocked-human", "logged-out"}
+    needs_user = wedge_probes.NEEDS_USER
     degraded = {"crashed", "hung", "gateway-down"}
     # `gateway-down` means "core up, relay gateway not running". On a host with no
     # gateway configured that is the DESIGNED state — startup.sh never launches the
@@ -6350,7 +6931,7 @@ def check_core_supervisor() -> dict:
     # which is how a status tool teaches its reader to skip the warn line.
     if state == "gateway-down" and not _gateway_configured():
         return {"name": name, "status": "ok",
-                "detail": "core up; ag2.space gateway not configured on this host"}
+                "detail": "core up; gateway not configured on this host"}
     if state in needs_user:
         return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
     if state in degraded:
@@ -6359,27 +6940,22 @@ def check_core_supervisor() -> dict:
 
 
 def _gateway_configured() -> bool:
-    """Is the ag2.space mobile gateway configured on this host?
+    """Is a gateway configured on this host: any enabled connection row, or the legacy relay token?
 
     `startup.sh` is deliberately silent when it is not — "a Sutando-only user
     never sees it" — so absence of the bridge is the EXPECTED state, not a fault.
     Shared by the two probes that must agree about that; they did not, which is
     the bug this helper exists to close.
     """
+    import connections  # noqa: PLC0415
+    if connections.enabled_rows(WORKSPACE_DIR):
+        return True
     try:
         if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
             return True
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        if gw_env.exists():
-            return any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                # errors="replace" is load-bearing, not cosmetic: without it a
-                # single non-UTF-8 byte raises, the except below swallows it, and a
-                # CONFIGURED gateway reads as unconfigured — which now also silences
-                # the gateway-down warn. Fail-open on a decode error is exactly the
-                # class this PR closes. (Caught in review by Sutando-Pro.)
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
+        # Which file defines the token is content, not filename, and the same
+        # owner answers it for startup and for runtime-health.
+        return channel_configured(claude_home_path("channels"), "ag2space")
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
@@ -6416,13 +6992,39 @@ def _gateway_lock_pids() -> "dict[str, str]":
     return out
 
 
+def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when every connection row is on the legacy DotSpace and none on its successor: a
+    terminal-run core is never moved by the desktop and goes silent if the legacy one goes read-only."""
+    import connections  # noqa: PLC0415
+    import dotspace  # noqa: PLC0415
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        # Read the record as it is: list_connections may import or adopt rows, a write.
+        rows = connections._read(connections.record_path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable record is reported by the connections surfaces
+        return None
+    legacy, target = dotspace.LEGACY_SERVER, dotspace.SUCCESSOR_SERVER
+    servers = {dotspace.dotspace_for(str(r.get("server") or ""), fetch=dotspace.NO_FETCH).server for r in rows}
+    if servers != {legacy}:
+        return None
+    inst = connections.instance_for(target)
+    return {"name": "sspace-migration", "status": "warn",
+            "detail": (f"only connected to {legacy}, no {target} connection — from the repo first try the "
+                       "agent's existing secret: python3 scripts/connections.py move --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (if it is refused, get a connect '
+                       f"code at {target}'s agent portal, then run: python3 scripts/connections.py add "
+                       f"'<code>' && python3 scripts/connections.py promote {inst} --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (docs/connections.md, '
+                       f'"Moving a terminal-run core to {target}"))')}
+
+
 def check_gateway_bridge() -> "dict | None":
-    """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
+    """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
     local core (and results back up).
 
     Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
-    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    AG2_REMOTE_TOKEN in env or under channels/ag2space/) — a Sutando-only user
     without the mobile gateway never sees this check. Otherwise: ``warn`` when
     configured-but-not-running (with the delivery impact spelled out) or on a
     duplicate-process pileup, ``ok`` when a single instance is running.
@@ -6435,16 +7037,18 @@ def check_gateway_bridge() -> "dict | None":
     if not configured:
         return None
     try:
-        gw = subprocess.run(
-            # remote-relay-bridge.py is a shipped compat stub running the same
-            # client, so an instance under the old name is a real duplicate.
-            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
-            capture_output=True, text=True,
-        )
-        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+        # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
+        # apart. The relay name is a compat stub, so it is a real duplicate.
+        pids, probe_ok = probe_pids(r"remote-(gateway|relay)-bridge\.py$")
     except Exception:
-        pids = []
+        pids, probe_ok = [], False
     if not pids:
+        if not probe_ok:
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": "process probe failed — gateway bridge state unknown",
+            }
         return {
             "name": "gateway-bridge",
             "status": "warn",
@@ -6507,10 +7111,10 @@ def check_gateway_bridge() -> "dict | None":
             "name": "gateway-bridge",
             "status": "warn",
             "detail": f"process running but NOT serving — {since}; "
-                      "ag2.space mobile messages are not being delivered",
+                      f"{_gateway_where()} messages are not being delivered",
         }
     if verdict is True:
-        return _gateway_ok_unless_lane_stalled("running + connected")
+        return _gateway_ok_unless_lane_stalled(_gateway_connected_detail())
     # The bridge rewrites this file on every poll outcome, so silence past the
     # freshness window means the writer stopped — evidence, not absence of it.
     stale_age = _gateway_status_stale_age_s()
@@ -6521,7 +7125,7 @@ def check_gateway_bridge() -> "dict | None":
             "detail": (
                 f"process running but its status sidecar has not been written for "
                 f"{stale_age:.0f}s (freshness window {GATEWAY_STATUS_MAX_AGE_S:.0f}s) — "
-                "the bridge is not reporting poll outcomes, so ag2.space mobile "
+                f"the bridge is not reporting poll outcomes, so {_gateway_where()} "
                 "messages may not be delivered"
             ),
         }
@@ -6531,25 +7135,70 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": ("process running but its status sidecar carries an unusable "
                        "timestamp — the writer is not reporting poll outcomes, so "
-                       "ag2.space mobile messages may not be delivered"),
+                       f"{_gateway_where()} messages may not be delivered"),
         }
     # Primary said nothing and is not merely stale, so it may not exist at all.
     # Ask the lanes before calling a live PID healthy — one of them owns it.
     lanes = _gateway_lane_verdicts()
     if lanes and not any(serving for _, serving, _ in lanes):
-        never = [ln for ln, _, ever in lanes if not ever]
+        never = [_gateway_lane_label(ln) for ln, _, ever in lanes if not ever]
         why = (f"lane {', '.join(never)} has never completed a poll" if never
-               else f"lane {', '.join(ln for ln, _, _ in lanes)} is not connected")
+               else f"lane {', '.join(_gateway_lane_label(ln) for ln, _, _ in lanes)} is not connected")
         return {
             "name": "gateway-bridge",
             "status": "warn",
             "detail": (f"process running but NOT serving — {why}; "
-                       "ag2.space mobile messages are not being delivered"),
+                       "messages on those connections are not being delivered"),
         }
     if lanes:
-        served = ", ".join(ln for ln, serving, _ in lanes if serving)
+        served = ", ".join(_gateway_lane_label(ln) for ln, serving, _ in lanes if serving)
         return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
     return _gateway_ok_unless_lane_stalled("running")
+
+
+def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
+    """Every row as stored (no sidecar read, no lease probe); [] with no connections record."""
+    import connections  # noqa: PLC0415
+    return connections.read_rows(WORKSPACE_DIR if workspace is None else workspace)
+
+
+def _gateway_primary_sidecar() -> Path:
+    """The desktop's active lane's sidecar when it exists, else the primary connection's: the
+    unsuffixed one, read legacy-aware, when no row is primary."""
+    return Path(status_read_path(_gateway_lane_status_path(WORKSPACE_DIR / "state").name, WORKSPACE_DIR))
+
+
+def _gateway_where() -> str:
+    """The primary connection's server, for a message the owner reads; "gateway" without one."""
+    import connections  # noqa: PLC0415
+    return connections.primary_server(WORKSPACE_DIR) or "gateway"
+
+
+def _gateway_connected_detail() -> str:
+    import connections  # noqa: PLC0415
+    server = connections.primary_server(WORKSPACE_DIR)
+    return f"running + connected ({server})" if server else "running + connected"
+
+
+def _gateway_lanes_not_served(state_dir: Path) -> "set[str]":
+    """Lane names a scan of `state_dir` skips: the primary's own (read as the primary) and every
+    parked or disabled row's, whose sidecar goes stale by design."""
+    import connections  # noqa: PLC0415
+    root = Path(state_dir)
+    out = set()
+    for r in _gateway_rows(root.parent if root.name == "state" else root):
+        if r.get("primary") or r.get("parked") or r.get("disabled"):
+            out.update([r["instance"], *connections.alias_instances(r)])
+    return out
+
+
+def _gateway_lane_label(lane: str, rows: "list[dict] | None" = None) -> str:
+    """`lane (server)` when a row names the lane's server, else the lane alone."""
+    import connections  # noqa: PLC0415
+    rows = _gateway_rows() if rows is None else rows
+    server = next((r["server"] for r in rows
+                   if lane in (r["instance"], *connections.alias_instances(r)) and r.get("server")), "")
+    return f"{lane} ({server})" if server else lane
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
@@ -6563,7 +7212,7 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     """Hours since the sidecar's `last_ok_ts`; None when it is absent or
     unusable, so an unknown start is never reported as a fresh one."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     try:
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
@@ -6586,7 +7235,7 @@ def check_runtime_identity(path: "Path | None" = None,
     an UNREADABLE or MALFORMED one warns — the probe's own input being
     damaged must never render as a clean pass."""
     name = "runtime-identity"
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     p = Path(p)
     if not p.exists():
         return {"name": name, "status": "ok",
@@ -6711,8 +7360,11 @@ def _gateway_lane_verdicts(state_dir: "Path | None" = None,
         entries = sorted(root.glob("gateway-status.*.json"))
     except OSError:
         return out
+    skip = _gateway_lanes_not_served(root)
     for f in entries:
         lane = f.name[len("gateway-status."):-len(".json")]
+        if lane in skip:
+            continue
         v = read_gateway_verdict(f, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
         if v is None:
             continue
@@ -6737,31 +7389,91 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
         entries = sorted(root.glob("gateway-status.*.json"))
     except OSError:
         return out
+    skip = _gateway_lanes_not_served(root)
     for f in entries:
         lane = f.name[len("gateway-status."):-len(".json")]
+        if lane in skip:
+            continue
         age = _gateway_status_stale_age_s(f, now=now)
         if age is not None:
             out.append((lane, age))
     return out
 
 
-def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
+def _gateway_lane_record(lane: str, state_dir: "Path | None" = None) -> "dict | None":
+    """The lane sidecar's last parsed record, or None when absent/unreadable.
+
+    Raw only: `gateway_serving` owns what a record MEANS, so connectivity is
+    never interpreted here. Separate from `_gateway_stale_lanes`, whose
+    (lane, age) contract several callers and tests depend on.
+    """
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    try:
+        rec = json.loads((root / f"gateway-status.{lane}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> dict:
     """The ok verdict for the bridge, demoted to warn when any lane's sidecar
     has gone silent — the primary being healthy says nothing about a lane."""
     stalled = _gateway_stale_lanes()
     if not stalled:
         return {"name": "gateway-bridge", "status": "ok", "detail": detail}
-    names = ", ".join(
-        f"{ln} (last write {age:.0f}s ago)" if age < 3600
-        else f"{ln} (last write {age / 3600:.1f}h ago)"
-        for ln, age in stalled)
+    rows = _gateway_rows()
+
+    def _aged(ln, age):
+        ln = _gateway_lane_label(ln, rows)
+        return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
+                else f"{ln} (last write {age / 3600:.1f}h ago)")
+
+    # Freshness is already decided, so ask the owner what the record MEANT.
+    # None is "no opinion" — never report that as the record saying connected.
+    import time as _time
+    _now = _time.time() if now is None else now
+    silent, failed, unknown, never = [], [], [], []
+    for ln, age in stalled:
+        rec = _gateway_lane_record(ln) or {}
+        err = rec.get("error")
+        verdict = _gateway_verdict_from_record(rec, now=_now, max_age=float("inf"))
+        if verdict is None:
+            unknown.append((ln, age, err))
+        elif verdict.connected is False or err:
+            failed.append((ln, age, err))
+        elif verdict.never_polled:
+            never.append((ln, age, err))
+        else:
+            silent.append((ln, age, err))
+    parts = []
+    if silent:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in silent)} stopped "
+            "writing its sidecar — its last record still says connected, so only "
+            "the silence shows it")
+    if never:
+        parts.append(
+            f"lane {', '.join(_aged(ln, age) for ln, age, _ in never)} stopped "
+            "while claiming connection it never completed a poll on — its record "
+            "has no successful poll to point at")
+    for ln, age, err in unknown:
+        # Schema drift must not cost the operator the error string; `failed`
+        # prints it and this branch holds the same value.
+        why = f", but it recorded: {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped writing its sidecar and its "
+                     "last record carries no usable connectivity"
+                     f"{why} — read the file rather than trusting either state")
+    for ln, age, err in failed:
+        why = f": {str(err)[:120]}" if err else ""
+        parts.append(f"lane {_aged(ln, age)} stopped after recording a "
+                     f"failure{why} — read that, not the silence")
     return {
         "name": "gateway-bridge",
         "status": "warn",
         "detail": (
-            f"{detail}, but lane {names} stopped writing its sidecar — its last "
-            "record still says connected, so only the silence shows it; messages "
-            "on that lane are not being delivered (retired lane? remove "
+            f"{detail}, but " + "; ".join(parts) + "; messages on that lane are "
+            "not being delivered (retired lane? remove "
             "state/gateway-status.<lane>.json)"
         ),
     }
@@ -6776,7 +7488,7 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
     together with "sidecar stopped being written" — only the latter is a signal.
     """
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     try:
         ts = json.loads(Path(p).read_text()).get("ts")
@@ -6796,7 +7508,7 @@ def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
     Separate from the age helper because its caller reads None as healthy: a
     writer emitting garbage is an outage, and has no age to report.
     """
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     try:
         raw = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
@@ -6812,7 +7524,7 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
     The sidecar verdict itself is owned by gateway_serving; only the freshness
     window is this reader's."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
     return None if v is None else v.serving
@@ -6839,9 +7551,14 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing, unpublished = [], [], []
+    unconsumed, trailing, unpublished, dead = [], [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
+        # A deleted script still completes — the handler runs and writes a no-op —
+        # so every completion lane reports it on time and lateness is the wrong verdict.
+        if j.get("missing_script"):
+            dead.append((j["name"], j["missing_script"]))
+            continue
         if not j["artifacts"]:
             # `conditional` declares that absence is expected, so it cannot also
             # be the blind spot that pins this probe to warn with no path back.
@@ -6880,7 +7597,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 # send the reader to the wrong layer. Separate bucket, separate cause.
                 bucket = unpublished if j.get("completion_today") else unconsumed
                 bucket.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed and not unpublished:
+    if not late and not missed and not drifted and not unconsumed and not unpublished and not dead:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6909,6 +7626,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             bits.append(f"{n}: {c} run(s), median +{m} min late, measured from output "
                         f"— no dispatch record retained for this job, so a late "
                         f"schedule and a slow pickup cannot be told apart here")
+    for n, ref in sorted(dead):
+        bits.append(f"{n}: SCHEDULED BUT CANNOT RUN — {ref} does not exist. Its slot "
+                    f"still fires and the handler still writes a result, so every "
+                    f"completion lane reports it finishing on time; the schedule "
+                    f"entry outlived the script and needs removing or restoring")
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
@@ -6987,6 +7709,60 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
+
+
+_CRON_NOT_A_RUN = re.compile(
+    r"\b(?:not|never|instead|rather|without|avoid|stop|skip)\b[^.;]{0,40}$", re.I)
+
+
+#: Not a complete literal: shell expansion (`$VAR`, `$(cmd)`, backtick, leading
+#: `~`), a glob, or a brace list — none of which name one path by spelling.
+_CRON_NOT_LITERAL = re.compile(r"[$`*?\[\]{}]|^~")
+
+
+def _cron_missing_script(entry: dict) -> Optional[str]:
+    """First script path a cron entry invokes that is not on disk, else None.
+
+    A job whose script was deleted still leaves a task-cron RESULT — the handler
+    runs, finds nothing, and writes a no-op — so every completion lane reports it
+    as finishing on time. Only the schedule's own command distinguishes "ran and
+    produced nothing" from "cannot run at all", which is why this is read here
+    and not inferred from a result body: `[no-send]` is also what a job writes
+    when it delivered by another route (a DM), so the marker does not separate
+    the two cases and the referenced path does.
+    """
+    cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
+    # Only an INVOKED path counts, and only when the reference is unambiguous:
+    # this verdict makes the operator delete a schedule, so doubt must read ok.
+
+    # `\b` is not a token boundary: `.` is a non-word char, so `\bsh` matched the
+    # extension of any *.sh and captured a shell-expansion fragment (#3672).
+    for m in re.finditer(r"(?:^|\s)(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
+        raw = m.group(1).rstrip(";&|")
+        # `\S+` stops at a space, so a quoted path containing one arrives
+        # truncated; the unbalanced quote is what shows the token was cut.
+        if raw[:1] in "\"'" and not raw.endswith(raw[:1]):
+            continue
+        ref = raw.strip("\"'")
+        if not ref.endswith((".py", ".sh", ".ts", ".mjs")):
+            continue
+        # A negation before the interpreter makes this a mention, not a run.
+        if _CRON_NOT_A_RUN.search(cmd[:m.start()]):
+            continue
+        # A `cd` earlier in the command moves the base a relative path resolves
+        # against, and REPO_DIR is then the wrong one: doubt must read ok.
+        if not ref.startswith("/") and re.search(r"(?:^|\s|&&|;)cd\s", cmd[:m.start()]):
+            continue
+        # Only a complete literal names one path: `$JOB_ROOT/live.sh` and
+        # `nightly-*.sh` both run while that spelling never exists on disk.
+        if _CRON_NOT_LITERAL.search(ref):
+            continue
+        # An absolute path resolves on its own; only a repo-relative one is
+        # judged against REPO_DIR, so a valid /tmp script is never "missing".
+        target = Path(ref) if ref.startswith("/") else REPO_DIR / ref
+        if not target.exists():
+            return ref
+    return None
 
 
 def _daily_dispatch_minutes(tasks: Path, job: str, limit: int = 7) -> list:
@@ -7099,23 +7875,32 @@ def check_daily_cron_punctuality() -> dict:
         launchd = bool(e.get("launchd"))
         # Each lane is a preference, not a restriction: `launchd` says how a job is
         # SCHEDULED, which does not determine what dated evidence it leaves behind.
-        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
-                else _daily_artifact_minutes(ws / "results", stem))
-        used_artifact_lane = not launchd
-        # Both directions, so neither lane's absence reads as the job's silence:
-        # without the launchd arm a daily artifact reports "no dated artifact" forever.
-        if not arts:
-            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
-                    else _daily_completion_minutes(ws / "state", jname))
-            used_artifact_lane = bool(arts) and launchd
-        # Last resort, and the only lane needing no per-job config: a job that
-        # publishes nothing dated still leaves a task-cron result when it finishes.
-        # Unconditional, not the no-artifact fallback below: a job that published
-        # artifacts then lost its producer keeps history, hiding its completion.
+        # Lanes are a preference, but a lane that is merely STALE must not shadow a
+        # later one holding today: fall through on freshness, not just emptiness.
+        today_str = now.strftime("%Y-%m-%d")
+        lane_thunks = [
+            (lambda: (_daily_completion_minutes(ws / "state", jname) if launchd
+                      else _daily_artifact_minutes(ws / "results", stem)), not launchd),
+            (lambda: (_daily_artifact_minutes(ws / "results", stem) if launchd
+                      else _daily_completion_minutes(ws / "state", jname)), launchd),
+            (lambda: _daily_task_record_minutes(ws / "results", jname), False),
+        ]
+        # Lazy: a lane holding today stops the scan, so the common case still costs
+        # one lane. Only a job with no fresh record anywhere pays for all three.
+        arts, used_artifact_lane, fallback = [], False, None
+        for thunk, flag in lane_thunks:
+            rows = thunk()
+            if any(d == today_str for d, _ in rows):
+                arts, used_artifact_lane = rows, flag
+                break
+            if fallback is None and rows:
+                fallback = (rows, flag)
+        else:
+            if fallback:
+                arts, used_artifact_lane = fallback
+        # Unconditional: `completion_today` below reads it even when a fresher
+        # lane supplied `arts`, so it is not the thunk list's third lane.
         completions = _daily_task_record_minutes(ws / "results", jname)
-        if not arts:
-            arts = completions
-            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
@@ -7129,6 +7914,7 @@ def check_daily_cron_punctuality() -> dict:
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "newest_artifact": newest, "artifact_age_days": age_days,
+            "missing_script": _cron_missing_script(e),
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             # Consumption is a DIFFERENT fact from publication: a task can finish
@@ -7293,11 +8079,12 @@ def check_disk_space() -> dict:
     targets = {}
     for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
         try:
-            st = os.statvfs(str(path))
+            device = path.stat().st_dev
+            free_gib = shutil.disk_usage(path).free / (1024 ** 3)
         except OSError as e:
             return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
         # Key by device so the same volume isn't reported twice.
-        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+        targets[device or label] = (label, path, free_gib)
 
     worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
     where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
@@ -7307,6 +8094,60 @@ def check_disk_space() -> dict:
     if worst_free < DISK_WARN_GIB:
         return {"name": name, "status": "warn", "detail": f"{where} — below {DISK_WARN_GIB:.0f} GiB"}
     return {"name": name, "status": "ok", "detail": where}
+
+
+def installed_skills_dir() -> Path:
+    """Where skills/install.sh links installed skills; the repo's own skills/ is the shipped copy."""
+    return Path(claude_home_path("skills"))
+
+
+def check_system_load(workspace: Optional[Path] = None, **probes) -> dict:
+    """Sustained load against the core count (src/system_load.py). The cause classifier is the
+    script an installed (linked) skill declares for system_load.DECLARATION, resolved here and injected."""
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    found, name = _installed_reaper()
+    return system_load.check(
+        ws / "state" / system_load.STATE_NAME,
+        ratio=system_load.setting(config_get(system_load.RATIO_KEY), system_load.DEFAULT_RATIO, float),
+        passes=system_load.setting(config_get(system_load.PASSES_KEY), system_load.DEFAULT_PASSES, int),
+        classifier=found.script, unavailable=found.reason, reaper_name=name,
+        reap_on=system_load.reap_enabled(config_get(system_load.REAP_KEY)), **probes)
+
+
+def _installed_reaper():
+    """(Declaration, declaring skill's name) for system_load.DECLARATION in the installed skills dir."""
+    roots = [installed_skills_dir()]
+    found = skill_roots.declared(system_load.DECLARATION, roots=roots)
+    name = next((n for n, p in skill_roots.declared_scripts(system_load.DECLARATION, roots) if p == found.script), None)
+    return found, name
+
+
+def apply_system_load_reap(checks: list, workspace: Optional[Path] = None, stream=None, **probes) -> Optional[dict]:
+    """--fix for `system-load`: when it warns with action reap-once, run the installed orphan reaper
+    once for this episode (system_load.reap_once) and rewrite the row to say what happened."""
+    row = next((c for c in checks if c.get("name") == system_load.NAME), None)
+    if not row or row.get("status") != "warn" or row.get("action") != system_load.ACTION_REAP:
+        return None
+    out = stream or sys.stdout
+
+    def log(line: str) -> None:
+        print(line, file=out, flush=True)
+
+    if not system_load.reap_enabled(config_get(system_load.REAP_KEY)):
+        log(f"system-load: not reaped: reaping is off ({system_load.REAP_KEY}=1 enables it)")
+        return {"action": "disabled"}
+    found, _ = _installed_reaper()
+    if found.script is None:
+        reason = found.reason or "no installed skill declares an orphan reaper"
+        log(f"system-load: not reaped: {reason}")
+        system_load.annotate(row, None, unreaped=reason)
+        return {"action": "no-reaper", "reason": reason}
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    state_path = ws / "state" / system_load.STATE_NAME
+    result = system_load.reap_once(state_path, found.script, log=log, **probes)
+    if result["action"] != "busy":
+        system_load.annotate(row, system_load.read_state(state_path).get("episode"))
+    return result
 
 
 @functools.lru_cache(maxsize=1)
@@ -7334,8 +8175,19 @@ def _is_ephemeral(target: str) -> bool:
     Equality counts: a link pointing AT the root is as ephemeral as one pointing
     inside it, and a trailing-slash prefix test answers False for exactly that case.
     """
-    t = os.path.normpath(target).rstrip("/") or "/"
-    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
+    t = os.path.normcase(os.path.normpath(target))
+    roots = (os.path.normcase(os.path.normpath(r)) for r in _ephemeral_roots())
+    return any(t == r or t.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def _is_skill_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        # Directory junctions are mount-point reparse tags, including on Python 3.11.
+        return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, AttributeError):
+        return False
 
 
 def check_skill_symlinks() -> dict:
@@ -7388,8 +8240,13 @@ def check_skill_symlinks() -> dict:
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
     misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
+    from skill_audience import developer_opt_in, installable  # noqa: PLC0415
+    developer = developer_opt_in()
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # skills/install.sh does not link these here, so --fix must not either.
+        if installable(skill_dir, developer).reason is not None:
             continue
         # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
         # slash-invocable skills the installer links. Manifest-loaded and
@@ -7399,13 +8256,14 @@ def check_skill_symlinks() -> dict:
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if dst.is_symlink() and not dst.exists():
+        is_link = _is_skill_link(dst)
+        if is_link and not dst.exists():
             broken.append(skill_name)
-        elif not dst.exists() and not dst.is_symlink():
+        elif not dst.exists() and not is_link:
             unlinked.append(skill_name)
-        elif dst.is_dir() and not dst.is_symlink():
+        elif dst.is_dir() and not is_link:
             shadowed.append(skill_name)
-        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+        elif (is_link and _is_ephemeral(os.path.realpath(dst))
               and not _is_ephemeral(str(skills_src.resolve()))):
             # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
             # is self-consistent, and another DURABLE clone is a supported layout.
@@ -7423,7 +8281,7 @@ def check_skill_symlinks() -> dict:
         for entry in sorted(skills_dst.iterdir()):
             if entry.name in repo_names:
                 continue
-            if entry.is_symlink() and not entry.exists():
+            if _is_skill_link(entry) and not entry.exists():
                 orphaned.append(entry.name)
     except OSError:
         pass
@@ -7772,6 +8630,58 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
     return out
 
 
+def check_pool_suspended() -> dict:
+    """A pool suspension never expires; only resuming the pool lifts it. One still present
+    while a core runs means the host never resumed it, and no worker is being healed."""
+    name = "pool-suspended"
+    try:
+        rec = pool_suspension.read(WORKSPACE_DIR)
+    except OSError as e:
+        return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
+    if rec is None:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    what = rec["reason"][:80] + (f" since {rec['at']}" if rec["at"] is not None else "")
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
+    return {"name": name, "status": "warn",
+            "detail": f"pool suspended ({what}) while a core is running, so no worker is being "
+                      "healed; repair: resume the worker pool"}
+
+
+def check_pool_advertisement() -> dict:
+    """The picker follows the roster only through the advertisement the bridge
+    sends; a roster version that file does not carry is a pin nobody was told."""
+    name = "pool-advertisement"
+    roster_p = WORKSPACE_DIR / "state" / "roster.json"
+    ad_p = WORKSPACE_DIR / "state" / "pool-advertisement.json"
+    if not roster_p.exists():
+        return {"name": name, "status": "ok", "detail": "no pool roster"}
+    try:
+        roster = json.loads(roster_p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn", "detail": f"roster.json unreadable: {e}"}
+    rv = roster.get("version")
+    rooms = len(roster.get("bindings") or {})
+    repair = "re-publish the pool advertisement from the roster"
+    try:
+        ad = json.loads(ad_p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"name": name, "status": "warn",
+                "detail": f"roster v{rv} ({rooms} binding(s)) has no advertisement — "
+                          f"the picker was never told; repair: {repair}"}
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn",
+                "detail": f"pool-advertisement.json unreadable: {e}; repair: {repair}"}
+    workers = ad.get("workers") if isinstance(ad, dict) else None
+    av = workers.get("roster_version") if isinstance(workers, dict) else None
+    if av != rv:
+        return {"name": name, "status": "warn",
+                "detail": f"binding unpublished: advertisement carries roster v{av}, "
+                          f"roster is v{rv} ({rooms} binding(s)); repair: {repair}"}
+    return {"name": name, "status": "ok",
+            "detail": f"advertisement matches roster v{rv} ({rooms} binding(s))"}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -7966,7 +8876,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
     orphans: list[tuple[str, int]] = []
-    unreadable = 0
+    unreadable = unretired = 0
     for path in entries:
         # Per-file isolation on purpose. One unreadable entry must not decide
         # the answer for the whole directory: with the guard around the loop
@@ -8024,11 +8934,15 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         except (OSError, ValueError, ImportError):
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
+            unretired += 1
             continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    # A skip was never a lost reply, but a consumer should still have retired it from results/.
+    if unretired:
+        partial += f"; {unretired} skip-marked result(s) still live past the threshold, unretired"
     if not orphans:
         status = "warn" if unreadable else "ok"
         return {"name": name, "status": status,
@@ -8165,12 +9079,26 @@ def check_proactive_quarantine() -> dict:
                 "detail": "no quarantined proactive bodies (undelivered/ absent)"}
     now = time.time()
     try:
-        entries = list(quarantine.iterdir())
+        top = list(quarantine.iterdir())
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn",
                 "detail": f"could not scan results/undelivered/: {e}"}
     kept: list[tuple[str, int, int]] = []
     unreadable = 0
+    # Explicit walk, not `rglob`: rglob swallows an unreadable subdirectory,
+    # and a dropped body is the one failure this probe exists to prevent.
+    entries: list[Path] = []
+    pending = list(top)
+    while pending:
+        item = pending.pop()
+        try:
+            if item.is_dir():
+                pending.extend(item.iterdir())
+                continue
+        except OSError:
+            unreadable += 1
+            continue
+        entries.append(item)
     for path in entries:
         # Per-file isolation, same reason as check_orphaned_results: one
         # unreadable entry must not decide the answer for the directory.
@@ -8195,7 +9123,9 @@ def check_proactive_quarantine() -> dict:
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
             continue
-        kept.append((path.name, int(age), int(arrived)))
+        # Relative to the quarantine root: two subdirectories can hold the
+        # same filename, and this label is what a reader opens.
+        kept.append((str(path.relative_to(quarantine)), int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:
@@ -8247,12 +9177,7 @@ def _ps_snapshot() -> "str | None":
     a nonzero exit: its empty stdout would otherwise read as a successful scan
     that found nothing, which is the absence callers must not assert.
     """
-    try:
-        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5)
-    except Exception:  # noqa: BLE001
-        return None
-    return done.stdout if done.returncode == 0 else None
+    return _platform_process_snapshot()
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -8269,6 +9194,11 @@ def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None
         if len(parts) >= 2 and parts[0] == str(pid):
             return parts[1]
     return None
+
+
+# Module-level names, looked up at call time: the suites that fabricate pids
+# rebind these here, and the wrappers below must see what they bound.
+_proc_argv_vector = watcher_identity.proc_argv_vector
 
 
 def _proc_argv(pid: int) -> str:
@@ -8335,8 +9265,12 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
     if not stale and not abandoned:
         status = "warn" if unreadable else "ok"
+        # Name the window, not an absolute absence: a body younger than the
+        # threshold is skipped above and is still undelivered.
         return {"name": name, "status": status,
-                "detail": f"no undelivered proactive bodies{partial}"}
+                "detail": f"no proactive body older than {threshold_age_sec // 60}m "
+                          f"and no claim older than {claim_threshold_age_sec // 60}m"
+                          f"{partial}"}
     parts = []
     if stale:
         stale.sort(key=lambda item: -item[1])
@@ -8353,63 +9287,180 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
-# The argv must BE the script invocation, not merely mention it. A substring
-# test counts the observer: any shell whose command line contains the name —
-# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
-# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
-# match reported 3 trees where 2 were real, the phantom being the shell that
-# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
-# fix is to anchor on the whole command rather than search inside it.
-_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
+def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
+    """True/False from the EXECUTED script; None when nothing can prove it.
+    The policy is `watcher_identity`; this binds it to the argv reader above."""
+    return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
-def _is_watcher_argv(argv: str) -> bool:
-    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
-    parts = argv.split()
-    if len(parts) != 2:
-        return False
-    exe, script = parts
-    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
-            and script.endswith("watch-tasks-stream.sh"))
+def _watcher_role_and_inbox(argv: str, pid: "int | None" = None) -> tuple:
+    """(`--role`, `--inbox`) of a proven watcher, (None, None) when its operands
+    cannot be read. A sentinel proves a watcher holds the inbox; only the role
+    says whether the SESSION does, or merely the supervisor's standby."""
+    ops = watcher_identity.classify_argv(argv, pid, argv_vector=_proc_argv_vector).operands
+    return watcher_identity.watcher_role(ops), watcher_identity.watcher_inbox(ops)
+
+
+# Read from the module that defines the precedence; a copy here is how this
+# reader and `rundir.agent_id` come to disagree about the same process.
+
+
+def _pid_env_first(pid: str, names):
+    """First of `names` set in THAT process's environment, "" if it states none.
+
+    Tri-state on purpose: None is "cannot read", never "default" -- naming a
+    sentinel from THIS process's env is how a named watcher gets the canonical file.
+    """
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:  # noqa: BLE001  -- not linux, or not permitted
+        try:
+            out = subprocess.run(["ps", "-Eww", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        # `ps` concatenates argv and env with spaces, so a value containing one is
+        # UNRECOVERABLE: `worker 7` reads back as `worker`, a different sentinel.
+        toks = out.stdout.split()
+        printed_env = any(re.match(r"^[A-Z_][A-Z0-9_]*=", k) for k in toks)
+        if not printed_env:
+            return None
+        if any(k.startswith(f"{name}=") for name in names for k in toks):
+            return None                               # present but not recoverable
+        return ""                                     # printed, and states none
+    seen = {}
+    for raw in environ.split(b"\0"):
+        for name in names:
+            prefix = name.encode() + b"="
+            if raw.startswith(prefix):
+                seen.setdefault(name, raw.split(b"=", 1)[1].decode("utf-8", "replace"))
+    for name in names:
+        if seen.get(name):
+            return seen[name]
+    return ""
+
+
+def _pid_instance_id(pid: str):
+    """The instance half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, ("SUTANDO_INSTANCE_ID",))
+
+
+def _pid_actor_id(pid: str):
+    """The actor half from THAT process's environment. See `_pid_env_first`."""
+    return _pid_env_first(pid, actor_env_names())
+
+
+def _watcher_sentinel_target(state_dir, pid):
+    """The sentinel path for the watcher at `pid`, or None when its identity is
+    not authoritative. A guess here is published as a repair target."""
+    inst = _pid_instance_id(pid)
+    actor = _pid_actor_id(pid)
+    if inst is None or actor is None:
+        return None
+    try:
+        # BOTH halves explicitly. None means "resolve from the caller", and the
+        # caller here is health-check -- a different actor than the watcher.
+        defaults = stated_default_identity(state_dir)
+        if defaults is None:
+            return None
+        return watcher_sentinel_path(state_dir, instance=(inst or defaults[0]),
+                                     agent=(actor or defaults[1]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _peer_multiplicity_parts(groups, tracked_targets, ps_out):
+    """Peer targets carrying more than one root, ownership deciding which stays.
+
+    Computed on EVERY path, never only when no tracked-target duplicate exists:
+    a duplicate on one target must not hide a duplicate on another.
+    """
+    peer = {t: rs for t, rs in groups.items()
+            if t not in tracked_targets and len(rs) > 1}
+    if not peer:
+        return []
+    own_x, sup_x = _split_roots_by_owner(
+        [r for rs in peer.values() for r in rs], ps_out)
+    parts = []
+    for tgt, rs in peer.items():
+        _s = [r for r in rs if r in sup_x]
+        _o = [r for r in rs if r in own_x]
+        if _s and _o:
+            parts.append(f"{', '.join(rs)} share one instance — keep the supervised "
+                         f"{', '.join(_s)} and stop the ownerless {', '.join(_o)}")
+        elif _s:
+            parts.append(f"{', '.join(rs)} share one instance and are ALL supervised — "
+                         f"reduce through the launcher that owns them, do NOT stop them")
+        else:
+            parts.append(f"{', '.join(rs)} share one instance — keep ONE and stop "
+                         f"the rest")
+    return parts
+
+
+def _group_roots_by_target(state_dir, roots):
+    """(target -> [pids], unresolvable pids). The ONE identity policy both the
+    sentinel-present and no-sentinel branches classify with."""
+    groups, unknown = {}, []
+    for r in roots:
+        target = _watcher_sentinel_target(state_dir, r)
+        if target is None:
+            unknown.append(r)
+        else:
+            groups.setdefault(str(target), []).append(r)
+    return groups, unknown
+
+
+def _ps_watcher_index(ps_output: str) -> tuple:
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse."""
+    return watcher_identity.ps_watcher_index(ps_output, is_watcher=_is_watcher_argv)
+
+
+def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
+    """(ownerless, supervised) for the roots GIVEN, by each root's own parent.
+
+    A known parent that is not init still owns the process; advice that does not
+    separate the two tells an operator to stop somebody's live child.
+    """
+    own, sup = [], []
+    for r in roots:
+        r = str(r)
+        pp = _pid_parent(r, ps_output)
+        if pp and pp not in ("1", "0"):
+            sup.append(r)
+        else:
+            own.append(r)
+    return own, sup
 
 
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
-    """Map root PID -> set of PIDs for each distinct watcher TREE running.
+    """Root PID -> member PIDs per distinct watcher TREE; None runs `ps`.
+    A failed `ps` is {} here -- callers that must tell that apart take `_ps_snapshot()`."""
+    return watcher_identity.watcher_trees(ps_output, is_watcher=_is_watcher_argv)
 
-    Each watcher is several processes (a shell wrapper, the script, a
-    subshell), so counting matching lines overcounts. A "root" is a match
-    whose parent is not itself a match — one per independent watcher. Callers
-    need the whole tree, not just the root, to tell which tree owns the
-    sentinel PID (the sentinel records the script's PID, not the wrapper's).
 
-    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
-    the reason in _proc_argv: pgrep would match the caller. Our own argv is
-    the health-check invocation, but we drop it explicitly anyway.
-    """
-    if ps_output is None:
-        try:
-            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                                       capture_output=True, text=True,
-                                       timeout=5).stdout
-        except Exception:  # noqa: BLE001
-            return {}
-    me = str(os.getpid())
-    parent = {}
-    for line in ps_output.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or parts[0] == me:
-            continue
-        if not _is_watcher_argv(parts[2]):
-            continue
-        parent[parts[0]] = parts[1]
-    trees: dict = {}
-    for pid in parent:
-        root, seen = pid, set()
-        while parent.get(root) in parent and root not in seen:
-            seen.add(root)
-            root = parent[root]
-        trees.setdefault(root, set()).add(pid)
-    return trees
+def extras_present(trees, live) -> bool:
+    """Any watcher tree not claimed by a live sentinel."""
+    tracked = {str(x) for x in live}
+    return any(not (members & tracked) for members in trees.values())
+
+
+def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
+    """The runtime whose notifier armed this watcher: the worker's roster row
+    (spawn_worker records it; a Claude core can host a Codex worker), else the core's."""
+    try:
+        rows = json.loads((WORKSPACE_DIR / "state" / "roster.json")
+                          .read_text(encoding="utf-8")).get("workers") or {}
+    except (OSError, ValueError, AttributeError):
+        rows = {}
+    parts = set(Path(inbox).parts) if inbox else set()
+    for wid, row in rows.items():
+        if wid and (wid in sentinel.name or wid in parts):
+            if isinstance(row, dict) and row.get("runtime") in ("claude", "codex"):
+                return row["runtime"]
+            break
+    return "claude" if _claude_runtime_selected() else "other"
 
 
 def check_task_watcher() -> dict:
@@ -8434,7 +9485,10 @@ def check_task_watcher() -> dict:
     as one that is always green.
     """
     name = "task-watcher"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # EVERY instance's sentinel: on a pool host each watcher writes its own, so
+    # a probe that reads one file classifies the other N-1 as untracked.
+    sentinels = watcher_sentinel_paths(WORKSPACE_DIR / "state")
+    pid_file = sentinels[0] if sentinels else watcher_sentinel_path(WORKSPACE_DIR / "state")
     # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
     # so take the snapshot here: None is unavailable, "" is genuinely empty.
     ps_out = _ps_snapshot()
@@ -8459,54 +9513,342 @@ def check_task_watcher() -> dict:
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
-            supervised = [r for r, pp in parents.items() if pp and pp != "1"]
+            ownerless, supervised = _split_roots_by_owner(roots, ps_out)
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
                 # `--fix` re-stamps the sentinel instead: the pid is a live watcher,
                 # so naming it restores Stop-hook cleanup without the restart.
+                # The target comes from the WATCHER's identity, never this process's:
+                # the canonical path claims the wrong instance for a named watcher.
+                target = _watcher_sentinel_target(WORKSPACE_DIR / "state", roots[0])
+                if target is None:
+                    return {"name": name, "status": "warn",
+                            "_sentinel_restamp_pid": roots[0],
+                            "detail": f"watcher pid {roots[0]} runs under a live session "
+                                      f"(ppid {parents[roots[0]]}) but wrote no PID sentinel, "
+                                      "and its own SUTANDO_INSTANCE_ID is unreadable from here, "
+                                      "so the repair target cannot be named without guessing "
+                                      "which instance owns it. Do NOT stop it — it IS draining "
+                                      "tasks/. Restart it cleanly when tasks/ is empty."}
                 return {"name": name, "status": "warn",
                         "_sentinel_restamp_pid": roots[0],
+                        "_sentinel_restamp_path": str(target),
                         "detail": f"watcher pid {roots[0]} runs under a live session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
+            # ONE identity snapshot for every derivation below: three separate
+            # resolver reads can disagree if a process's identity changes between.
+            _snap = {r: _watcher_sentinel_target(WORKSPACE_DIR / "state", r) for r in roots}
+            _tgt = lambda rs: ({str(_snap[r]) for r in rs if _snap[r] is not None},
+                               [r for r in rs if _snap[r] is None])
+            _all_t, _unknown = _tgt(roots)
+            _sup_t, _su = _tgt(supervised)
+            _own_t, _ou = _tgt(ownerless)
+            if _unknown:
+                cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(roots)}); {len(_unknown)} "
+                        f"({', '.join(_unknown)}) have no resolvable (agent, instance), so "
+                        f"whether any task is processed twice is UNKNOWN — do not reduce the count")
+            elif len(_all_t) == len(roots) and len(roots) > 1:
+                cost = (f"{len(roots)} watcher(s) with no PID sentinel (pids {', '.join(roots)}) "
+                        f"resolve to {len(_all_t)} DISTINCT instances — not duplicates, and no "
+                        f"task is processed twice; do not reduce the count")
+            else:
+                _n = max((sum(1 for r in roots if _snap[r] is not None
+                              and str(_snap[r]) == x) for x in _all_t), default=len(roots))
+                cost = (f"{len(roots)} watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(roots)}) — {_n} share one instance target, so its "
+                        f"tasks are processed {_n}x")
+            count = cost
+            _sup_dupe = (not _su) and len(_sup_t) < len(supervised)
+            _reduce = "; reduce those through the launcher that owns them" if _sup_dupe else ""
+            # Per TARGET, not all-or-nothing: covered targets need no restart,
+            # and an unknown SUPERVISED root may alias any of them.
+            _covered = sorted(_own_t & _sup_t)
+            _uncovered = sorted(_own_t - _sup_t)
+            if _ou:
+                _stop = (f"Do NOT stop {', '.join(_ou)} — UNKNOWN identity: it may be the only "
+                         f"watcher for its instance")
+            elif _su:
+                _stop = (f"Do NOT stop {', '.join(ownerless)} — supervised {', '.join(_su)} has "
+                         f"UNKNOWN identity and may serve the same instance: restarting would "
+                         f"duplicate it, and not restarting may leave a gap")
+            elif _uncovered and _covered:
+                # Cardinality alone lets an operator restart the covered one and
+                # leave the uncovered instance absent: name which pid is which.
+                _by = {}
+                for r in ownerless:
+                    _by.setdefault(str(_snap[r]), []).append(r)
+                # ONE representative per uncovered target: restarting every root
+                # on a target recreates the duplicate the stop just removed.
+                _re = [_by[x][0] for x in _uncovered if x in _by]
+                _served = [r for r in ownerless if str(_snap[r]) in _covered]
+                _peer = [r for r in ownerless if r not in _re and r not in _served]
+                _why = "; ".join(filter(None, [
+                    f"{', '.join(_served)} — a supervised watcher already serves that instance"
+                    if _served else "",
+                    f"{', '.join(_peer)} — a peer above already covers that instance"
+                    if _peer else ""]))
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}), then restart "
+                         f"{', '.join(_re)} and NOT {_why}")
+            elif _covered:
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and do NOT restart — "
+                         f"a supervised watcher already serves that instance")
+            elif len(_uncovered) > 1:
+                _stop = (f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart "
+                         f"{len(_uncovered)} cleanly — one per instance, NOT one")
+            else:
+                _stop = f"Stop ONLY the ownerless ({', '.join(ownerless)}) and restart one cleanly"
+            if ownerless and supervised:
+                lead = (f"{count}. {_stop}. Do NOT stop {', '.join(supervised)} "
+                        f"— supervised{_reduce}")
+            elif ownerless:
+                lead = (f"{len(ownerless)} orphaned watcher(s) running with no PID sentinel "
+                        f"(pids {', '.join(ownerless)}) — draining tasks/ unsupervised; {_stop}")
+            else:
+                _r = _reduce.replace("reduce those through", "reduce the count through")
+                lead = f"{count}. Do NOT stop any of them: each is supervised{_r}"
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
-                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{lead}. ownerless: {', '.join(ownerless) or 'none'}; "
+                              f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
-    try:
-        pid = int(pid_file.read_text().strip())
-    except Exception as e:  # noqa: BLE001
-        return {"name": name, "status": "warn",
-                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
-    argv = _proc_argv(pid)
-    if not argv:
+                          "restart via Monitor (timeout_ms 1800000, re-armed on its expiry notice): "
+                          "bash src/watch-tasks-stream.sh --role session --inbox "
+                          "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
+                          "($SUTANDO_TASKS_DIR as the inbox when set); until then the standby "
+                          "supervisor announces tasks through the pane after its 45 s grace"}
+    # Classify EVERY sentinel, because each names a different watcher. The
+    # single-sentinel host takes exactly the branches it always did.
+    live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
+    collided = []
+    live_argv = {}
+    for sp in sentinels:
+        try:
+            spid = int(sp.read_text().strip())
+        except Exception as e:  # noqa: BLE001
+            unreadable.append((sp, str(e)[:40]))
+            continue
+        sargv = _proc_argv(spid)
+        if not sargv:
+            dead_pids.append((spid, sp))
+        else:
+            # The module's own predicate, not a substring: a stranger carrying
+            # the script name as a DATA argument passes `in` and is counted live.
+            verdict = _is_watcher_argv(sargv, spid)
+            if verdict is False:
+                reused.append((spid, sargv, sp))
+            elif verdict is None:
+                unprovable.append((spid, sargv, sp))
+            else:
+                # A dict keyed by pid DROPS the second file naming one pid, and
+                # two sentinels for one process is a real anomaly, not a tie.
+                if spid in live:
+                    collided.append((spid, live[spid], sp))
+                live[spid] = sp
+                live_argv[spid] = sargv
+
+    if not live:
+        # Aggregate EVERY record class before advising: a per-class early
+        # return turns a dropped UNKNOWN into restart advice.
+        notes = []
+        if unreadable:
+            notes.append(f"unreadable PID sentinel ({unreadable[0][1]})")
+        if unprovable:
+            upid, uargv, _usp = unprovable[0]
+            notes.append(f"UNKNOWN: cannot prove pid {upid} is the watcher from its argv "
+                         f"({uargv[:50]})")
+        if reused:
+            rpid, rargv, _rsp = reused[0]
+            notes.append(f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}")
+        # An identity we cannot prove vetoes BOTH directions: a restart may
+        # duplicate the live watcher behind it, a stop may kill it.
+        veto = bool(unprovable)
+        pid = dead_pids[0][0] if dead_pids else 0
+
         if roots:
-            # The sentinel tracks only the MOST RECENT start, so a dead one does
-            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
+            # A dead sentinel does NOT mean nothing drains tasks/ — restarting
+            # here is what makes the duplicates.
+            own, sup = _split_roots_by_owner(roots, ps_out)
+            _dg, _du = _group_roots_by_target(WORKSPACE_DIR / "state", own)
+            _sg2, _ = _group_roots_by_target(WORKSPACE_DIR / "state", sup)
+            # Every sentinel here is dead, so an ownerless root is its instance's
+            # ONLY watcher unless a supervised peer serves the same target.
+            _sole = [o for tgt, rs in _dg.items() if tgt not in _sg2 for o in rs]
+            if _du or _sole:
+                own = [o for o in own if o not in _du and o not in _sole]
+            _blind = "".join([
+                f"; UNKNOWN identity, do NOT stop: {', '.join(_du)}" if _du else "",
+                (f"; do NOT stop {', '.join(_sole)} — the only watcher for that instance, "
+                 f"and its sentinel is already dead") if _sole else ""])
+            _lead = ("; ".join(notes) + "; ") if notes else ""
+            _lead += (f"sentinel pid {pid} is dead but " if dead_pids
+                      else "no live sentinel but ")
+            _stop = ("no stop advice while a sentinel identity is unprovable" if veto
+                     else f"ownerless, safe to stop: {', '.join(own) or 'none'}")
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
-                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{_lead}{len(roots)} watcher(s) still "
+                              f"run; tasks/ IS being drained{_blind}. "
+                              f"{_stop}; "
+                              f"supervised, leave alone (a live parent owns them): "
+                              f"{', '.join(sup) or 'none'}"}
+
+        if not notes and dead_pids:
+            return {"name": name, "status": "warn",
+                    "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); "
+                              f"restart it"}
+        if dead_pids:
+            notes.append(f"sentinel pid {pid} is dead (crashed — sentinel left behind)")
+        if veto:
+            advice = ("not restarting and not stopping it; re-check when the process "
+                      "vector is readable")
+        elif unreadable or dead_pids:
+            advice = "restart the watcher"
+        else:
+            advice = ""
         return {"name": name, "status": "warn",
-                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
-    if "watch-tasks-stream" not in argv:
-        # PID reuse: the sentinel outlived the watcher and the OS handed the
-        # number to something else. `kill -0` alone would call this alive.
+                "detail": "; ".join(notes) + (f" — {advice}" if advice else "")}
+
+    faults = []
+    if dead_pids:
+        faults.append("crashed: " + ", ".join(
+            f"{sp.name} (pid {spid} dead)" for spid, sp in dead_pids))
+    if reused:
+        faults.append("PID reuse: " + ", ".join(
+            f"{sp.name} (pid {spid} is {sargv[:32]})" for spid, sargv, sp in reused))
+    if unreadable:
+        faults.append("unreadable: " + ", ".join(
+            f"{sp.name} ({err})" for sp, err in unreadable))
+    if unprovable:
+        faults.append("UNKNOWN: " + ", ".join(
+            f"{sp.name} (pid {spid} unprovable from argv)" for spid, _a, sp in unprovable))
+    if collided:
+        faults.append("one pid, two sentinels: " + ", ".join(
+            f"{a.name} and {b.name} both name pid {spid}" for spid, a, b in collided))
+    # A sentinel fault must not be skipped by an earlier remediation return:
+    # UNKNOWN or conflicting records veto destructive advice about extra trees.
+    tracked = {str(p) for p in live}
+    # EVERY classified record, not just the unprovable ones: a dead, reused or
+    # unreadable sentinel vanished just as silently through the extras returns.
+    if faults and extras_present(trees, live):
+        _veto = ("no stop or restart is advised while a sentinel record is unprovable or "
+                 "conflicting — resolve the records first"
+                 if (unprovable or collided) else
+                 "these records name instances whose watcher state is already known-bad; "
+                 "resolve them before acting on the untracked tree(s)")
         return {"name": name, "status": "warn",
-                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
-    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+                "detail": "; ".join(faults) + f". Untracked watcher tree(s) are present too, but "
+                          f"{_veto}"}
+    extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
+        # A root count is not an identity: only a shared sentinel target makes
+        # two roots duplicates, and an unresolvable one authorises nothing.
+        state_dir = WORKSPACE_DIR / "state"
+        tracked_targets = {str(sp) for sp in live.values()}
+        _groups, unknown = _group_roots_by_target(state_dir, extras)
+        dupes = [r for tgt, rs in _groups.items() if tgt in tracked_targets for r in rs]
+        distinct = [r for tgt, rs in _groups.items() if tgt not in tracked_targets for r in rs]
+        if unknown:
+            return {"name": name, "status": "warn",
+                    "detail": f"UNKNOWN: {len(unknown)} untracked watcher tree(s) "
+                              f"({', '.join(unknown)}) whose (agent, instance) identity does not "
+                              f"resolve — NOT stopping and NOT reducing: the same instruction "
+                              f"recreates a duplicate for one instance and removes the only "
+                              f"watcher for another. Resolve identity first"}
+        if distinct and not dupes:
+            _parts = _peer_multiplicity_parts(_groups, tracked_targets, ps_out)
+            if _parts:
+                _act = "; among themselves " + "; ".join(_parts)
+            else:
+                _act = ". Do NOT stop them"
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(distinct)} watcher tree(s) ({', '.join(distinct)}) belong to a "
+                              f"DIFFERENT instance than any tracked sentinel — not duplicates of a "
+                              f"tracked watcher; each is missing its own sentinel record{_act}; "
+                              f"register their sentinels"}
+        keep = ", ".join(str(p) for p in sorted(live))
+        own, sup = _split_roots_by_owner(dupes, ps_out)
+        # The peer analysis runs here too: a tracked-target duplicate must not
+        # make a duplicate on ANOTHER target vanish into "left alone".
+        _pparts = _peer_multiplicity_parts(_groups, tracked_targets, ps_out)
+        if distinct and _pparts:
+            extra_note = (f" ({len(distinct)} further tree(s) are a different instance — not "
+                          f"duplicates of a tracked watcher, but among themselves "
+                          f"{'; '.join(_pparts)})")
+        else:
+            extra_note = ("" if not distinct else
+                          f" ({len(distinct)} further tree(s) are a different instance, left alone)")
         return {"name": name, "status": "warn",
-                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
-                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
-                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
-    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+                "detail": f"{len(trees)} watcher trees running — {len(dupes)} share a sentinel "
+                          f"target with a tracked watcher, so those duplicate its work{extra_note}. "
+                          f"Keep the tracked one(s) ({keep}). "
+                          f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
+                          f"supervised, leave alone (a live parent owns them): "
+                          f"{', '.join(sup) or 'none'}"}
+    alive = ", ".join(str(p) for p in sorted(live))
+    # An anomaly belongs to the instance whose sentinel carries it, so a live
+    # PEER is not evidence about a crashed one and must not discard its record.
+    if faults:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(dead_pids) + len(reused) + len(unreadable) + len(unprovable) + len(collided)} "
+                          f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
+                          f"Each is a separate instance's "
+                          "record; a live peer does not clear it"}
+    # The standby stamps the same sentinel as the session watcher it stands in
+    # for, so a live sentinel proves an announcer, never that the session works.
+    _roles = {_p: _watcher_role_and_inbox(live_argv[_p], _p) for _p in live}
+    # Per resolved inbox: a standby beside a live session watcher of it is the handoff.
+    _held = {watcher_identity.canonical_inbox(_i) for _r, _i in _roles.values()
+             if _r == "session" and _i}
+    standby_only, standby_note = [], []
+    for _p in sorted(live):
+        _role, _inbox = _roles[_p]
+        if _role != "standby" or watcher_identity.canonical_inbox(_inbox) in _held:
+            continue
+        _entry = f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})"
+        # Only a Claude runtime runs Monitor; Codex's notifier always arms the
+        # standby (src/agent/codex/cli/start-cli.sh), so there it IS the delivery path.
+        _held_by = standby_only if _watcher_runtime(live[_p], _inbox) == "claude" else standby_note
+        _held_by.append(_entry)
+    standby_note = (f"; {len(standby_note)} sentinel(s) name the standby watcher, "
+                    f"the delivery path on a runtime that is not Claude (no session "
+                    f"watcher is expected there): {'; '.join(standby_note)}"
+                    if standby_note else "")
+    if standby_only:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(standby_only)} sentinel(s) name only the STANDBY watcher: "
+                          f"{'; '.join(standby_only)}. No session-role watcher holds that "
+                          "inbox, so its session is not draining tasks itself — a worker "
+                          "whose turn ended logged out (\"Login expired · Please run /login\") "
+                          "never re-arms its Monitor, and the standby only announces through "
+                          "the pane. Degraded, not clear: run /login in that session if it "
+                          "asks, then re-arm via the Monitor tool: "
+                          "bash src/watch-tasks-stream.sh --role session --inbox <inbox>"
+                          f"{standby_note}"}
+    # A watcher holds its inbox whether or not anything consumes what it
+    # announces; the reader is the only difference visible from outside.
+    unread = []
+    for _p in sorted(live):
+        _sink = watcher_identity.output_sink(_p)
+        if _sink.observed and _sink.read is False:
+            unread.append(f"{_p} -> {_sink.kind} {_sink.target}".rstrip())
+    if unread:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(unread)} announce(s) where nothing is reading: "
+                          f"{'; '.join(unread)}. That inbox is held but not served — "
+                          "a session start will exit naming the holder, so clearing it "
+                          "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
+    if len(live) == 1:
+        return {"name": name, "status": "ok",
+                "detail": f"streaming watcher alive (pid {alive}){standby_note}"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(live)} streaming watchers alive, one per instance "
+                      f"(pids {alive}){standby_note}"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
@@ -8529,6 +9871,16 @@ def _worker_hard_timeout_s() -> float:
     except (TypeError, ValueError):
         return _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
     return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+
+
+def _bridge_auth_held(channel: str) -> bool:
+    """True while channel-bridge-wrapper.sh holds this bridge on a rejected token (stamp: epoch, wrapper pid)."""
+    stamp = WORKSPACE_DIR / "state" / "channel-bridge-supervisor" / f"{channel}.auth-held"
+    try:
+        lines = stamp.read_text().split()
+        return len(lines) >= 2 and _pid_alive(int(lines[1]))
+    except (OSError, ValueError):
+        return False
 
 
 def _task_claim_thresholds() -> tuple[float, float]:
@@ -8698,6 +10050,116 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
             "detail": "no migrated outbox roots — dual-read window not active"}
 
 
+
+def check_withheld_reviews_readable(workspace_dir: Optional[Path] = None) -> dict:
+    """A withheld-review record the bridge cannot read as a record makes every owner Yes/No
+    in the DM answer "please reply again" until it is inspected or removed."""
+    name = "withheld-reviews-readable"
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    try:
+        from policy.egress import result as guard  # noqa: PLC0415 - the bridge's own strict rule
+    except ImportError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot load the review guard ({exc})"}
+    base = workspace / "state" / guard.WITHHELD_RESULT_DIR
+    bad = []
+    for path, reason in guard.namespace_problems(base):
+        shown = path.relative_to(workspace) if path.is_relative_to(workspace) else path.name
+        bad.append(f"{shown} ({reason})")
+    if bad:
+        shown = ", ".join(bad[:4]) + (f" (+{len(bad) - 4} more)" if len(bad) > 4 else "")
+        return {"name": name, "status": "warn",
+                "detail": f"{len(bad)} withheld-review record(s) unreadable; owner replies get "
+                          f"'please reply again' until each is inspected or removed: {shown}"}
+    return {"name": name, "status": "ok", "detail": "every withheld-review record reads"}
+
+
+def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
+    """A PARKED outbound item is a reply the owner never received, and nothing
+    retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
+    that nothing in production could lift. Until now it was visible only to
+    someone who ran the CLI by hand."""
+    name = "outbox-parked"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    # On EACCES glob yields nothing and is_dir() either answers False or raises,
+    # by version; iterdir raises on all, and only ENOENT means "nothing to park".
+    try:
+        roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — parked replies unjudged"}
+    if not roots:
+        return {"name": name, "status": "ok",
+                "detail": "no outbox root — nothing to park (this 0 is untestable)"}
+    try:
+        import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+        import outbox_cli  # noqa: PLC0415 - its body_gone is the requeue refusal's own rule
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
+    parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
+    stranded: list[tuple[str, str, str]] = []  # QUEUED with nothing left to send
+    unreadable: list[str] = []
+    for root in roots:
+        # An unreadable ROOT reaches here too, and a raise would abort every
+        # later check, so nothing but ENOENT may pass as an empty outbox.
+        items_dir = outbox._items_dir(Path(root))
+        try:
+            list(items_dir.iterdir())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            unreadable.append(f"{root.name} ({exc})")
+            continue
+        for d in outbox.list_items(root, status="PARKED"):
+            iid = str(d.get("item_id") or "?")
+            gone = d.get("item_id") and outbox_cli.body_gone(root, iid, results)
+            parked.append((root.name, iid, "body-gone" if gone else str(d.get("reason") or "")))
+        for d in outbox.list_items(root, status="QUEUED"):
+            iid = str(d.get("item_id") or "")
+            # Unclaimed and with no body anywhere: nothing will ever pick it up.
+            if iid and outbox.read_delivery_claim(root, iid) is None and outbox_cli.body_gone(root, iid, results):
+                stranded.append((root.name, iid, "queued-no-body"))
+    if unreadable:
+        return {"name": name, "status": "warn",
+                "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
+                          + "; ".join(unreadable)}
+    if parked or stranded:
+        parked.sort()
+        stranded.sort()
+
+        def listing(items):
+            shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                               for root_name, item_id, _reason in items[:4])
+            return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
+        # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        gone = [p for p in parked if p[2] == "body-gone"]
+        unknown = [p for p in parked if p[2] == "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] not in ("outcome-unknown", "body-gone")]
+        parts = []
+        if gone:
+            parts.append(f"{len(gone)} cannot be requeued, their body is gone (archived under "
+                         f"results/archive/) — re-send manually: {listing(gone)}")
+        if stranded:
+            parts.append(f"{len(stranded)} QUEUED with nothing to send (an earlier requeue of a "
+                         f"body-less reply) — re-send manually: {listing(stranded)}")
+        if undelivered:
+            parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
+                         f"{listing(undelivered)}")
+        if unknown:
+            parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
+                         f"checking the room: {listing(unknown)}")
+        recover = (f" Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                   f"(the root varies per item; a single hardcoded root under-reports)"
+                   if undelivered or unknown else "")
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(parked)} reply/replies PARKED; " if parked else "")
+                          + "; ".join(parts) + "." + recover}
+    return {"name": name, "status": "ok",
+            "detail": f"no parked replies across {len(roots)} outbox root(s)"}
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """A claim whose task file still exists is queued or running, so no age condemns it;
     one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
@@ -8795,10 +10257,15 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid = str(check.get("_sentinel_restamp_pid") or "")
     if not pid.isdigit():
         return "no re-stampable watcher pid"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # The CHECK's path, not this process's ambient one: the two resolve from the
+    # environment and a repair that re-derives it can stamp another instance.
+    target = check.get("_sentinel_restamp_path")
+    if not target:
+        return "check named no sentinel path — not re-stamped"
+    pid_file = Path(target)
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
-    if not _is_watcher_argv(_proc_argv(int(pid))):
+    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
         return f"pid {pid} is no longer the watcher — not re-stamped"
     try:
         # Separate try: mkdir raises FileExistsError when state/ is a plain
@@ -8817,7 +10284,7 @@ def fix_task_watcher_sentinel(check: dict) -> str:
         return f"could not write {pid_file}: {e}"
     # The probe above was a snapshot taken BEFORE publication; retract our own
     # stamp if it went stale mid-write.
-    if not _is_watcher_argv(_proc_argv(int(pid))):
+    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
         try:
             # Read-then-unlink, NOT arbitrated the way the write above is:
             # POSIX has no conditional unlink, so a claim landing here is lost.
@@ -8851,6 +10318,7 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
 
 # The one owned hook whose effect leaves the workspace; excluded from unattended repair.
 _TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
+_TRANSCRIPT_ARCHIVE_FAMILY = "sutando-conversations/"
 
 
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
@@ -8873,7 +10341,31 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     """
     out = stream if stream is not None else sys.stdout
     for c in checks:
-        if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
+        if c["name"] != "claude-hooks" or not (c.get("_unregistered_hooks") or c.get("_dead_hooks")):
+            continue
+        for rec in c.get("_dead_hooks") or []:
+            owner_script = _HOOK_FAMILY_INSTALLERS.get(str(rec.get("family")))
+            if not owner_script:
+                print(f"  {c['name']}: not repairing dead {rec.get('event')} hook "
+                      f"{rec.get('path')} — not a family a Sutando installer owns", file=out)
+                continue
+        for owner_script in sorted({_HOOK_FAMILY_INSTALLERS[r["family"]]
+                                    for r in c.get("_dead_hooks") or []
+                                    if r.get("family") in _HOOK_FAMILY_INSTALLERS}):
+            print(f"  {c['name']}: pruning dead entries via {Path(owner_script).name}", file=out)
+            try:
+                proc = subprocess.run(["bash", str(REPO_DIR / owner_script)],
+                                      capture_output=True, text=True, timeout=60)
+                emitted = (proc.stdout or "") + (proc.stderr or "")
+                lines = [ln for ln in emitted.splitlines() if ln.strip()]
+                print(f"  {c['name']}: " + (lines[-1].strip() if lines
+                                           else f"installer exited {proc.returncode}"), file=out)
+            except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
+                print(f"  {c['name']}: could not run {Path(owner_script).name} ({exc})", file=out)
+        if not c.get("_unregistered_hooks"):
+            fresh = check_claude_hook_registration()
+            c.clear()
+            c.update(fresh)
             continue
         installer = REPO_DIR / "src" / "install-claude-hooks.sh"
         # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
@@ -8991,18 +10483,7 @@ def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
     exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
     if exists is None or exists.returncode != 0:
         return None
-    runtime = _run_tmux(
-        socket_path,
-        "show-environment",
-        "-t",
-        f"={session}",
-        "SUTANDO_CORE_RUNTIME",
-    )
-    if (
-        runtime is None
-        or runtime.returncode != 0
-        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
-    ):
+    if session_runtime.read(session, lambda *a: _run_tmux(socket_path, *a)) != "codex":
         return None
     return target
 
@@ -9045,8 +10526,17 @@ def _command_runs_script(command: str, expected: Path) -> bool:
 
 
 def _probe_codex_task_notifier(target: dict) -> dict:
-    """Inspect the exact managed notifier tmux session for one healthy pane."""
-    name = "codex-task-notifier"
+    return _probe_task_notifier(target, name="codex-task-notifier",
+                                expected=_expected_codex_notifier_entrypoint())
+
+
+def _probe_task_notifier(target: dict, *, name: str, expected: Path,
+                         script: "Path | None" = None) -> dict:
+    """Inspect the exact managed notifier tmux session for one healthy pane.
+
+    `script`, when given, is the notifier the supervisor must be running; the
+    supervisor's own default is another runtime's, so the pane command alone
+    cannot certify which one is live."""
     socket_path = target["socket"]
     watcher_session = f"{target['session']}-watcher"
     exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
@@ -9087,7 +10577,6 @@ def _probe_codex_task_notifier(target: dict) -> dict:
             "status": "warn",
             "detail": f"managed tmux session {watcher_session!r} has a dead pane",
         }
-    expected = _expected_codex_notifier_entrypoint()
     if not _command_runs_script(command, expected):
         return {
             "name": name,
@@ -9097,12 +10586,27 @@ def _probe_codex_task_notifier(target: dict) -> dict:
                 f"command; expected {expected.name}"
             ),
         }
+    if script is not None:
+        env = _run_tmux(socket_path, "show-environment", "-t", f"={watcher_session}",
+                        "SUTANDO_NOTIFIER_SCRIPT")
+        configured = ""
+        if env is not None and env.returncode == 0:
+            configured = env.stdout.strip().partition("=")[2]
+        if configured != str(script):
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"managed tmux session {watcher_session!r} runs notifier "
+                    f"{configured or '(supervisor default)'!r}; expected {script}"
+                ),
+            }
     return {
         "name": name,
         "status": "ok",
         "detail": (
             f"managed notifier healthy in {watcher_session!r} "
-            f"({expected.name})"
+            f"({(script or expected).name})"
         ),
     }
 
@@ -9239,6 +10743,89 @@ def check_codex_presence(which=shutil.which, consumer=None) -> dict:
     return {"name": name, "status": "warn", "detail": detail}
 
 
+# The bridge writes this verbatim when the sandbox could not produce a reply.
+SANDBOX_UNAVAILABLE_MARK = "Sandbox unavailable"
+
+
+def check_sandbox_delegation(window_sec: int = 86400) -> dict:
+    """Report guest/team tasks that got the fallback sentinel instead of an answer.
+
+    Resolving on PATH is not drivability: `codex-presence` stayed ok for two days
+    while every `codex exec` exited 1 on an unsupported model pin. Keying on the
+    sentinel is cause-agnostic — pin, login, quota or wiped binary all land here —
+    and it fires only when a real sender was actually denied a reply.
+    """
+    name = "sandbox-delegation"
+    results_dir = WORKSPACE_DIR / "results"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    # results/ is drained fast, so the evidence is usually already in the
+    # month-partitioned archive; scan both or a same-day outage reads as clean.
+    roots = [results_dir]
+    # archive-stale-results.py sweeps into results/archive-<date>/, a SIBLING of
+    # archive/, on a retention tunable below this probe's fixed 24h window.
+    try:
+        roots += [results_dir / e.name for e in os.scandir(results_dir)
+                  if e.is_dir() and e.name.startswith("archive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
+    archive = results_dir / "archive"
+    if archive.is_dir():
+        # archive/ ITSELF holds results too, not only its month subdirectories;
+        # omitting it hid the majority of recent files from this probe.
+        roots.append(archive)
+        try:
+            roots += [archive / e.name for e in os.scandir(archive) if e.is_dir()]
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"could not scan results/archive/: {exc}"}
+    hits, unreadable = [], 0
+    for root in roots:
+        try:
+            # scandir, not glob: glob swallows a directory-level EACCES and
+            # yields nothing, so an unscannable dir would report a clean one.
+            entries = list(os.scandir(root))
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"could not scan {root.name}/: {exc}"}
+        for e in entries:
+            if not e.name.endswith(".txt") or not e.name.startswith("task-"):
+                continue
+            try:
+                if now - e.stat().st_mtime > window_sec:
+                    continue
+                with open(e.path, "r", encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(200)
+            except OSError:
+                # Per-file isolation: one unreadable entry must not decide the
+                # answer for the directory.
+                unreadable += 1
+                continue
+            if SANDBOX_UNAVAILABLE_MARK in head:
+                hits.append(e.name)
+    if not hits:
+        detail = (f"no sandboxed delegation failed in the last {window_sec // 3600}h "
+                  "(0 fallback sentinels written)")
+        if unreadable:
+            detail += f"; {unreadable} result file(s) unreadable"
+        return {"name": name, "status": "ok", "detail": detail}
+    shown = ", ".join(sorted(hits)[:3])
+    detail = (
+        f"{len(hits)} guest/team task(s) in the last {window_sec // 3600}h got "
+        f"'{SANDBOX_UNAVAILABLE_MARK}' instead of a reply ({shown}"
+        f"{', …' if len(hits) > 3 else ''}). The sandbox is the ONLY permitted path "
+        "for a non-owner task, so those senders were answered by nobody. "
+        "Isolation held; the capability behind it did not. Run "
+        "`codex exec --sandbox read-only -C /tmp -- 'reply OK'` to see the reason "
+        "— a model pin in ~/.codex/config.toml the installed CLI rejects is one."
+    )
+    if unreadable:
+        detail += f" ({unreadable} result file(s) unreadable.)"
+    return {"name": name, "status": "warn", "detail": detail}
+
+
 def check_codex_task_notifier() -> dict:
     """Detect a missing managed notifier even when a bare watcher looks alive."""
     if not _codex_runtime_selected():
@@ -9271,7 +10858,118 @@ def check_codex_task_notifier() -> dict:
                 "session could not be verified"
             ),
         }
-    return _probe_codex_task_notifier(target)
+    probe = _probe_codex_task_notifier(target)
+    from delivery.codex_pickup import warning
+    stalled = warning(WORKSPACE_DIR)
+    if stalled and probe["status"] == "ok":
+        return {"name": "codex-task-notifier", "status": "warn", "detail": stalled}
+    return probe
+
+
+def _claude_runtime_selected() -> bool:
+    try:
+        return resolve_core_runtime(REPO_DIR) == "claude"
+    except Exception:  # noqa: BLE001 — config check reports the underlying error
+        return False
+
+
+def _local_claude_notifier_target(heartbeat: "dict | None" = None) -> "dict | None":
+    """Socket + session of the live Claude core, from its own heartbeat record."""
+    if heartbeat is None:
+        heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return None
+    socket_path = heartbeat.get("socket")
+    session = heartbeat.get("session")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not isinstance(session, str) or not session:
+        return None
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
+    if exists is None or exists.returncode != 0:
+        return None
+    return {"socket": socket_path, "session": session}
+
+
+def check_claude_task_notifier() -> dict:
+    """The Claude core's standby notifier lives in `<session>-watcher`, like Codex's."""
+    name = "claude-task-notifier"
+    if not _claude_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "Claude runtime not selected — notifier not expected"}
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return {"name": name, "status": "ok",
+                "detail": "no fresh local core heartbeat — notifier not expected"}
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return {"name": name, "status": "warn",
+                "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
+    supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+    notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
+    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether `pid` is a running process we may signal (kill -0)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def fix_claude_task_notifier() -> str:
+    """Notifier-only recovery for the Claude core, mirroring the Codex one: the
+    canonical launcher, run without --restart, recreates a missing `<session>-watcher`
+    and leaves the live core alone (P1-23: the standby notifier went missing and
+    only a full relaunch brought it back)."""
+    if not _claude_runtime_selected():
+        return "not repaired — Claude runtime is not selected"
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return "not repaired — no fresh local Claude core heartbeat"
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return "not repaired — the live Claude core session could not be verified"
+    # The shared launcher injects --restart when the session records another
+    # runtime, and spawns a new core when the heartbeat's process is gone.
+    recorded = session_runtime.read(target["session"], lambda *a: _run_tmux(target["socket"], *a))
+    if recorded != "claude":
+        return f"not repaired — the live core records a different runtime ({recorded or 'unreadable'})"
+    core_pid = heartbeat.get("pid")
+    if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
+        return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
+    if check_claude_task_notifier()["status"] == "ok":
+        return "already healthy"
+    launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
+    if not launcher.is_file():
+        return "not repaired — canonical launcher is missing"
+    env = _resolve_launch_env()
+    env["SUTANDO_TMUX_SOCKET"] = target["socket"]
+    env["SUTANDO_TMUX_SESSION"] = target["session"]
+    env["SUTANDO_CORE_RUNTIME"] = "claude"
+    try:
+        launched = subprocess.run(["/bin/bash", str(launcher)], env=env,
+                                  capture_output=True, text=True, timeout=120)
+    except Exception as error:  # noqa: BLE001
+        return f"not repaired — launcher failed ({type(error).__name__})"
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:120]}" if detail else ""
+        return f"not repaired — launcher exited {launched.returncode}{suffix}"
+    if _local_claude_notifier_target(_fresh_local_core_record()) != target:
+        return "not repaired — local Claude core changed during repair"
+    after = check_claude_task_notifier()
+    if after["status"] != "ok":
+        return f"not repaired — {after['detail']}"
+    return "repaired managed notifier; live core session preserved"
 
 
 def fix_codex_task_notifier() -> str:
@@ -10096,7 +11794,8 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
         labels = "/".join(e["label"] for e in entries if e.get("label"))
     except (OSError, ValueError, TypeError, AttributeError):
         labels = ""
-    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+    watch = "watcher-watchdog + hotkeys"
+    return f"running ({watch}: {labels})" if labels else f"running ({watch}, none published)"
 
 
 def _outermost_bundle(comm: str) -> Optional[Path]:
@@ -10671,6 +12370,40 @@ def check_vault_manifest_integrity(
     }
 
 
+def _hook_script_path(command: str) -> Optional[str]:
+    """The script a hook command runs; the installer module owns the parse, this is a fallback."""
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from claude_hooks_settings import script_path_of
+        return script_path_of(command)
+    except Exception:  # noqa: BLE001 — an older checkout without the module still gets a probe
+        parts = command.split()
+        for i, tok in enumerate(parts):
+            if tok in ("bash", "sh", "python3", "python", "node"):
+                return parts[i + 1].strip("'\"") if i + 1 < len(parts) else None
+        return parts[0].strip("'\"") if parts else None
+
+
+def _runs_a_script(command: str) -> bool:
+    """True when the command hands a script FILE to an interpreter (bash/sh/python/node).
+
+    `bash -c '…'` runs inline text, not a file, and a command carrying an unexpanded `$VAR`
+    cannot be judged by path existence; both are skipped rather than read as dead.
+    """
+    parts = command.split()
+    if len(parts) < 2 or Path(parts[0]).name not in ("bash", "sh", "zsh", "python", "python3", "node"):
+        return False
+    return not parts[1].startswith("-") and "$" not in command
+
+
+#: Which installer re-adds (and, since it prunes, repairs) each Sutando-owned hook family.
+_HOOK_FAMILY_INSTALLERS = {
+    "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
+    "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+    "watcher-rearm-session-hint.sh": "scripts/install-watcher-rearm-hook.sh",
+}
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
 ) -> dict:
@@ -10701,6 +12434,10 @@ def check_claude_hook_registration(
         failure that looks healthiest.
     """
     name = "claude-hooks"
+    # These hooks only fire inside a Claude core; under Codex there is nothing to register.
+    if _codex_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "not applicable — core runtime is codex; Claude hooks are not used"}
     repo = Path(repo_dir or REPO_DIR)
     installer = repo / "src" / "install-claude-hooks.sh"
     if not installer.is_file():
@@ -10800,20 +12537,83 @@ def check_claude_hook_registration(
             # Present, but not actually invoking this checkout's script — either aimed
             # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
-    if missing or foreign:
+    # Present-but-dead is invisible to the owned-list check above: a registered hook whose
+    # script is gone fails on every fire. Relative paths resolve against the project.
+    dead: list[str] = []
+    dead_records: list[dict] = []
+    project_dir = settings.resolve().parent.parent
+    # Owned families are judged above (present / missing / foreign); the dead scan covers
+    # the rest, and only commands that run a script through an interpreter.
+    owned_families = {Path(marker).name for _e, marker, _c in owned}
+    for event, groups in hooks.items():
+        for g in _as_list(groups):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                cmd = str(h.get("command", ""))
+                if not _runs_a_script(cmd):
+                    continue
+                script = _hook_script_path(cmd)
+                if not script or Path(script).name in owned_families:
+                    continue
+                target = Path(script) if Path(script).is_absolute() else project_dir / script
+                if not target.exists():
+                    family = Path(script).name
+                    dead.append(f"{event}:{family} -> {script}")
+                    dead_records.append({"event": event, "command": cmd,
+                                         "path": script, "family": family})
+    if missing or foreign or dead:
         bits = []
         if missing:
             bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if dead:
+            bits.append(f"{len(dead)} registered but the script no longer exists — every fire "
+                        f"fails 'No such file' ({', '.join(dead)})")
         if foreign:
             bits.append(f"{len(foreign)} registered but NOT running the installer's command "
                         f"— a different program, another checkout, or the path is "
                         f"only an argument ({', '.join(foreign)})")
+        # The bare installer registers the opt-in-only transcript archiver, so the remedy
+        # must not prescribe it when that hook is the only thing missing.
+        only_archive = bool(missing) and set(missing) == {_TRANSCRIPT_ARCHIVE_HOOK} and not foreign
+        remedy = ("that hook copies full transcripts to ~/Desktop and is left to explicit opt-in — "
+                  "it is not repaired automatically; run `bash src/install-claude-hooks.sh` only if "
+                  "you intend to enable it"
+                  if only_archive else
+                  "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
+        # The omit flag gates DEPRECATED_HOOKS, so prescribing it skips the very pruning a
+        # foreign entry needs and reports `removed=0`, which reads as a successful run.
+        if foreign:
+            # The flag gates ONE deprecated entry (the legacy archive `cp`), not pruning
+            # at large — every other DEPRECATED_HOOKS entry is pruned with it set.
+            archive_foreign = [f for f in foreign if _TRANSCRIPT_ARCHIVE_FAMILY in f]
+            if archive_foreign:
+                remedy = ("for the archive family, do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 "
+                          "— that flag is what adds the legacy archive form to the prune list, so with "
+                          f"it set {', '.join(archive_foreign)} is never cleared. Run `bash "
+                          "src/install-claude-hooks.sh` plain, which also REGISTERS the ~/Desktop "
+                          "archiver: if this host does not want it, delete that one PreCompact entry "
+                          "afterwards")
+            else:
+                remedy = ("re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "
+                          "src/install-claude-hooks.sh` — the flag scopes out only the archive entry, "
+                          f"so {', '.join(foreign)} is still pruned and the ~/Desktop archiver is not "
+                          "installed. If an entry is genuinely foreign (another program or checkout) "
+                          "the installer cannot own it — remove that one by hand")
+        if dead and not missing and not foreign:
+            remedy = ("re-run the installer that owns each family — it prunes dead copies "
+                      "(`bash scripts/install-personal-claude-hook.sh`, "
+                      "`bash scripts/install-session-start-hook.sh`)")
         result = {"name": name, "status": "warn",
-                  "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+                  "detail": f"{'; '.join(bits)} in {settings} — {remedy}"}
         if missing:
             # Keyed structurally so --fix cannot fire on the warn branches the
             # installer can't repair; `foreign` excluded (displacement unverified).
             result["_unregistered_hooks"] = list(missing)
+        if dead_records:
+            result["_dead_hooks"] = dead_records
         return result
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
 
@@ -11075,15 +12875,9 @@ def _live_core_runtime(socket: str, sessions) -> "str | None":
     """
     seen = set()
     for sess in sessions:
-        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
-                        "SUTANDO_CORE_RUNTIME")
-        if res is None or res.returncode != 0:
-            continue
-        out = (res.stdout or "").strip()
-        if out.startswith("SUTANDO_CORE_RUNTIME="):
-            val = out.split("=", 1)[1].strip()
-            if val:
-                seen.add(val)
+        val = session_runtime.read(sess, lambda *a: _run_tmux(socket, *a))
+        if val:
+            seen.add(val)
     return seen.pop() if len(seen) == 1 else None
 
 
@@ -11288,6 +13082,48 @@ def proxy_liveness_status(proxy_check: dict) -> str:
     return proxy_check.get("status")
 
 
+def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
+    """Escalate `check` to 'warn' when the proxy's own last-recorded credential
+    state (quota-state.json, written by recordCredentialState()) is 'exhausted'
+    and was recorded by the current process (a record older than the process
+    start is ignored). Advisory: silent on any read/parse failure, and never
+    runs unless the caller's own gate already proved the port is 'ok'/'stale'.
+    """
+    if check["status"] not in ("ok", "stale"):
+        return
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or state.get("credential_state") != "exhausted":
+        return
+    detail = state.get("credential_state_detail") or "no detail recorded"
+    at = state.get("credential_state_at")
+    age = ""
+    at_ts = None
+    if isinstance(at, str):
+        from datetime import datetime as _dt  # local: not at module scope in this file
+        try:
+            at_ts = _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            age_s = time.time() - at_ts
+            age = f" ({int(age_s / 60)}m ago)" if age_s >= 0 else ""
+        except ValueError:
+            pass
+    # Written only on a transition, never reset at startup: a restart inherits
+    # a stale 'exhausted' record, which predates the process that would prove it.
+    starts, _ = _proc_lstarts("credential-proxy")
+    if at_ts is not None and starts and at_ts < max(starts):
+        return
+    check["status"] = "warn"
+    check["detail"] = (
+        f"listening, but its own last-recorded credential state is 'exhausted'{age}: "
+        f"{detail} — requests are likely 401ing/502ing despite the port being open"
+    )
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -11308,6 +13144,7 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+        _credential_proxy_wedge_from_quota_state(check)
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
@@ -11325,6 +13162,140 @@ def menubar_app_state(dev_bin, app_bin, plist, is_macos: bool) -> str:
     if not is_macos:
         return "not-applicable"
     return "expected-missing" if plist.exists() else "not-applicable"
+
+
+#: Per-host declaration of EXTRA, user-defined probes — same `hosts/<host>/` JSON
+#: convention as skills/proactive-loop/scripts/tool-suites-check.py's extras.
+USER_CHECKS_FILE = "health-checks-extra.json"
+#: Name prefix so an extra row is never mistaken for a built-in probe.
+USER_CHECK_PREFIX = "extra:"
+USER_CHECK_TIMEOUT_S = 30.0
+USER_CHECK_DETAIL_CAP = 300
+#: Only DETAIL_CAP characters survive normalization; reading the whole sink lets an
+#: opt-in command size this process's memory. 200x headroom over what is rendered.
+USER_CHECK_OUTPUT_READ_CAP = 65536
+
+
+def user_checks_path(workspace_dir: Optional[Path] = None,
+                     host: "str | None" = None) -> Path:
+    """Where this host declares its extra checks.
+
+    `hosts/<host>/` and not `state/`: the vault already carries the former, and
+    a `state/` path is re-ignored by the carve-out emitted after the includes.
+    """
+    ws = WORKSPACE_DIR if workspace_dir is None else Path(workspace_dir)
+    return ws / "hosts" / (host or _host_label()) / USER_CHECKS_FILE
+
+
+def load_user_checks(path: Path) -> list:
+    """Declared checks, or `[]` for absent / unreadable / malformed.
+
+    A hand-edited file must never take the health check down with it, so every
+    failure here degrades to "this host declares no extras".
+    """
+    try:
+        decl = json.loads(Path(path).read_text())
+    except Exception:
+        return []
+    entries = decl.get("checks") if isinstance(decl, dict) else None
+    out = []
+    for entry in _as_list(entries):
+        if not isinstance(entry, dict):
+            continue
+        name, command = entry.get("name"), entry.get("command")
+        if not (isinstance(name, str) and name.strip()):
+            continue
+        if not (isinstance(command, str) and command.strip()):
+            continue
+        out.append({
+            "name": name.strip(),
+            "command": command,
+            "timeout": _positive_seconds(entry.get("timeout")) or USER_CHECK_TIMEOUT_S,
+        })
+    return out
+
+
+def _reap_user_command_group(pgid: int) -> None:
+    """A shell can exit 0 while its background children keep running; the group
+    `start_new_session` created must be cleared on that path too, not only on timeout."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _kill_user_command_tree(proc) -> None:
+    """SIGKILL the group `start_new_session` gave this command, not just the shell
+    — killing the shell alone leaves its children running past the timeout."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_user_command(command: str, timeout_s: float, cwd: Path) -> "tuple[int, str]":
+    """Run one declared command bounded in time; return (exit code, output).
+
+    Output lands in a FILE, never a pipe: a command that leaves a background
+    grandchild holding the pipe open would block the drain past the timeout.
+    """
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as sink:
+        try:
+            proc = subprocess.Popen(command, shell=True, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                                    stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            return 127, f"{type(exc).__name__}: {exc}"
+        # start_new_session makes the child its own group leader, so the group id is
+        # its pid — captured before the wait reaps it and the attribute is stale.
+        pgid = proc.pid
+        try:
+            code = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_user_command_tree(proc)
+            code = 124
+        else:
+            _reap_user_command_group(pgid)
+        sink.seek(0)
+        return code, sink.read(USER_CHECK_OUTPUT_READ_CAP)
+
+
+def run_user_check(decl: dict, cwd: Optional[Path] = None) -> dict:
+    """One extra probe: exit 0 is `ok`, anything else `warn`, output as the detail.
+
+    `warn` on purpose — an extra check must not change the exit code or wake the
+    notifier surfaces, so a host's own probe can never mask or manufacture an alert.
+    """
+    name = f"{USER_CHECK_PREFIX}{decl['name']}"
+    # Suppression is a property of the CHECK, not of its status: --emit-task,
+    # --notify-on-fail and --notify-slack each read a bare warn as a failure.
+    quiet = {"name": name, "alerting": False}
+    try:
+        code, output = run_user_command(decl["command"], decl["timeout"],
+                                        cwd if cwd is not None else REPO_DIR)
+    except Exception as exc:
+        return {**quiet, "status": "warn",
+                "detail": f"could not run: {type(exc).__name__}: {exc}"[:USER_CHECK_DETAIL_CAP]}
+    detail = " ".join(output.split())[:USER_CHECK_DETAIL_CAP] or "(no output)"
+    if code == 124:
+        return {**quiet, "status": "warn",
+                "detail": f"TIMEOUT after {decl['timeout']:.0f}s (killed): {detail}"}
+    if code == 0:
+        return {**quiet, "status": "ok", "detail": detail}
+    return {**quiet, "status": "warn", "detail": f"exit {code}: {detail}"}
+
+
+def check_user_defined(workspace_dir: Optional[Path] = None,
+                       host: "str | None" = None) -> list:
+    """Every extra probe this host declares — `[]` when it declares none."""
+    try:
+        decls = load_user_checks(user_checks_path(workspace_dir, host))
+    except Exception:
+        return []
+    return [run_user_check(d) for d in decls]
 
 
 def run_all_checks() -> list[dict]:
@@ -11409,6 +13380,8 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
+    checks.append(check_proactive_undelivered())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -11440,9 +13413,21 @@ def run_all_checks() -> list[dict]:
     if _root_tidy:
         checks.append(_root_tidy)
 
+    _read_budget = check_context_read_budget()
+    if _read_budget:
+        checks.append(_read_budget)
+
     _wiring = check_workspace_wiring()
     if _wiring:
         checks.append(_wiring)
+
+    _card_clicks = check_decision_card_clicks()
+    if _card_clicks:
+        checks.append(_card_clicks)
+
+    _no_primary = check_connections_primary()
+    if _no_primary:
+        checks.append(_no_primary)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
@@ -11481,8 +13466,14 @@ def run_all_checks() -> list[dict]:
     # Per-host channel access.json backup drift (live vs vault-carried copy)
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
+    checks.append(check_git_index_lock())
     checks.append(check_live_checkout_branch())
+    checks.append(check_skills_driver_code_drift())
+    checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
+    hitl_archive_check = check_hitl_archive()
+    if hitl_archive_check is not None:
+        checks.append(hitl_archive_check)
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
@@ -11505,10 +13496,13 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             else:
+                # The bundled desktop runs dist/conversation-server.js: an engine
+                # update refreshes that artifact without touching the source.
                 mark_stale_if_outdated(
                     c,
                     REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
                     "conversation-server.ts",
+                    binary_path=REPO_DIR / "dist" / "conversation-server.js",
                 )
             # Compose after BOTH branches — the non-ok rewrite replaces check_port's
             # diagnosis, and the healthy branch never composed a pin at all.
@@ -11568,19 +13562,9 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            # Anchor on the .py suffix so we don't match unrelated processes
-            # whose command line happens to contain "discord-bridge" (shell
-            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
-            # name produces false-positive "multiple processes" warnings
-            # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            # rc 1 is the authoritative no-match; any other non-zero exit is a
-            # PROBE ERROR and must not read as "bridge is down".
-            _probe_ok = result.returncode in (0, 1)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
-            # A launcher's argv ends with the same script path, so it matches
-            # this pgrep too — see _drop_launcher_parents.
+            # Anchor to the script suffix; find_pids preserves anchors on every OS.
+            # Drop launcher parents so only actual pollers remain.
+            pids, _probe_ok = probe_pids(f"{proc_name}\\.py$")
             pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
@@ -11594,6 +13578,10 @@ def run_all_checks() -> list[dict]:
                         "detail": "process probe failed — bridge state unknown"}
                 _apply_pin_findings(_row, _pin_verdicts(name, None))
                 checks.append(_row)
+                continue
+            if _bridge_auth_held(channel_name):
+                checks.append({"name": name, "status": "fail", "detail": (
+                    "held: credential rejected — vault set the token, then bash src/restart.sh")})
                 continue
             # This exact detail string is a contract: fix_down_bridges()
             # matches it as a PREFIX to pick restart candidates (and the
@@ -11637,6 +13625,12 @@ def run_all_checks() -> list[dict]:
                 status = "warn"
                 detail = f"running but heartbeat stale ({int(hb_age)}s old)"
 
+        # Check 3b: gateway flapping. A heartbeat stays fresh through a loop of fresh sessions.
+        if name == "discord-bridge" and status == "ok":
+            flap = _discord_flap_detail(WORKSPACE_DIR / "state")
+            if flap:
+                status, detail = "warn", flap
+
         # Check 4: Stale code — process started before the source file's last
         # modification. This catches the case where a fix is on disk but the
         # running process is from a previous version (e.g., PR #203 silently
@@ -11650,7 +13644,7 @@ def run_all_checks() -> list[dict]:
         try:
             _psb = subprocess.run(
                 ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
             )
             ps_out = _psb.stdout.strip()
             if _psb.returncode == 0 and ps_out:
@@ -11770,6 +13764,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
@@ -11832,7 +13827,10 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
+            checks.append({"name": "sutando-app", "status": "warn",
+                           "detail": "not running — hotkeys disabled AND checkWatcher is "
+                                     "absent, so a dead task watcher is recovered by "
+                                     "nothing until the app restarts"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -11856,8 +13854,11 @@ def run_all_checks() -> list[dict]:
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
+    checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_pool_advertisement())
+    checks.append(check_pool_suspended())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
@@ -11866,14 +13867,23 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
+    checks.append(check_outbox_parked())
+    checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
+    checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
+    checks.append(check_sandbox_delegation())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
     checks.append(check_runtime_identity())
     checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
+    checks.append(check_system_load())
+
+    # Last, and only when this host declares any: a user probe must never
+    # delay or displace a built-in one.
+    checks.extend(check_user_defined())
 
     return checks
 
@@ -12101,6 +14111,10 @@ def notify_for_failures(
     defaults to `osascript` driving `display notification`. Tests inject a
     fake to avoid spamming the developer's own notification center.
     """
+    if notify_cmd is None:
+        from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+        if not resolve_macos_notifications():
+            return
     failures = [c for c in checks
                 if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
                 and not _alerts_suppressed(c)]
@@ -12293,14 +14307,34 @@ def _gateway_owner_room(source: str = "ag2space") -> "str | None":
     a health alert can carry host/config/outage details that must never leak into
     a team room (qingyun #2487 P1-privacy). Requiring an explicit config entry
     makes the target owner-controlled and owner-only by construction; unset means
-    no gateway post at all (the Slack surface stays as the backup)."""
-    return (_env_file_dict(claude_home_path("channels", source, ".env")).get("REMOTE_ALERT_ROOM") or "").strip() or None
+    no gateway post at all (the Slack surface stays as the backup). The primary
+    connection's own channel dir is read first when the primary is a named row."""
+    for src in dict.fromkeys((_primary_channel_source(source), source)):
+        room = (_env_file_dict(claude_home_path("channels", src, ".env")).get("REMOTE_ALERT_ROOM") or "").strip()
+        if room:
+            return room
+    return None
 
 
-def _gateway_creds(source: str = "ag2space") -> "tuple[str, str] | None":
-    """(url, token) for the gateway op:message endpoint, or None. Supports the
-    one-token onboarding form (REMOTE_TASK_TOKEN='https://gw|secret') and the
-    legacy AG2_REMOTE_URL / AG2_REMOTE_TOKEN aliases honored by startup.sh."""
+def _primary_channel_source(source: str = "ag2space") -> str:
+    """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
+    import connections
+    row = connections.primary_row(WORKSPACE_DIR)
+    return connections.lane_channel_dir(row["instance"]) if row and row.get("instance") else source
+
+
+def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":
+    """(url, token) for the gateway op:message endpoint, or None. With several connections,
+    the one serving `room`'s server (no room: the primary), and None when it has none. Else
+    the one-token form (REMOTE_TASK_TOKEN='https://gw|secret') or the legacy AG2_REMOTE_* aliases."""
+    import connections
+    try:
+        routed = connections.room_credential(room, workspace=WORKSPACE_DIR)
+    except connections.ConnectionsError:  # never answered with another server's token
+        return None
+    if routed is not None:
+        url, token = routed
+        return url.rstrip("/"), connections.secret_of(token) or token.strip()
     env = _env_file_dict(claude_home_path("channels", source, ".env"))
 
     def get(key: str) -> str:
@@ -12319,7 +14353,7 @@ def _default_gateway_sender(text: str) -> bool:
     the same transport notify.py uses (POST {url}/v1/room, op:message), so it
     reaches the owner even when the core is wedged. Returns True on a 2xx."""
     room = _gateway_owner_room()
-    creds = _gateway_creds()
+    creds = _gateway_creds(room=room) if room else None
     if not room or not creds:
         return False
     url, token = creds
@@ -12407,7 +14441,7 @@ def notify_gateway_for_failures(
     checks: list[dict],
     state_file: Optional[Path] = None,
     sender=None,
-) -> None:
+) -> bool:
     """DM the owner on ag2.space (the gateway) when health checks fail — the
     remote-visible surface the owner actually watches, and one that does NOT
     depend on the core agent being alive (posts straight to the gateway
@@ -12419,10 +14453,12 @@ def notify_gateway_for_failures(
     Slack surfaces never suppress each other, and dedup is recorded only on a
     SUCCESSFUL send so a transient gateway blip doesn't silence the alert.
     `sender` is injected by tests to avoid real network calls.
+
+    True when this failure set is in the owner's DM (sent now, or already sent for it).
     """
     failures = _slack_failures(checks)
     if not failures:
-        return
+        return False
 
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "health-last-gateway.json"
@@ -12435,7 +14471,7 @@ def notify_gateway_for_failures(
     history = _load_alert_history(state_file)
 
     if history.get(_LAST_HASH_KEY) == hash_key:
-        return
+        return True
 
     lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
     extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
@@ -12444,7 +14480,7 @@ def notify_gateway_for_failures(
     send = sender or _default_gateway_sender
     if not send(text):
         # Send failed — don't record dedup, so the next tick retries.
-        return
+        return False
 
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
@@ -12454,6 +14490,7 @@ def notify_gateway_for_failures(
         state_file.write_text(json.dumps(history))
     except Exception:
         pass
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -12619,32 +14656,25 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
 
 
 def _resolve_launch_env() -> dict:
-    """Environment for out-of-process core restarts (start-cli.sh --restart).
-
-    launchd's minimal PATH (``/usr/bin:/bin:/usr/sbin:/sbin``) cannot find the
-    tools start-cli.sh needs — homebrew ``tmux``, ``claude`` in ``~/.local/bin``,
-    or the Sutando.app-bundled ``node`` runtime — so the restart exits rc=127
-    (``node unavailable`` / ``exec: claude: not found``) and silently falls
-    through to the legacy fallback. Prepend all of them.
-
-    Extends the existing tmux-only PATH fix to node + claude. Incident
-    2026-07-10: the watchdog restart path was broken under launchd for ~70 min
-    (queue backlog) because every canonical restart hit rc=127. Same PATH-
-    narrowing class as _resolve_tmux_bin (2026-06-09), applied here.
-    """
+    """Env for out-of-process core probes and restarts: homebrew dirs prepended for tmux.
+    Node and ``claude`` dirs are the launchers' (src/agent/launch-path.sh), after any override."""
     env = dict(os.environ)
     extra = [
         "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
         "/usr/local/bin",                           # homebrew (Intel) / misc
-        str(Path.home() / ".local" / "bin"),        # `claude` install location
     ]
-    # Sutando.app-bundled node runtime: sibling of the repo inside the app bundle
-    # (Contents/Resources/{repo,runtime}). Absent in a plain dev checkout → skipped.
-    bundled_bin = REPO_DIR.parent / "runtime" / "bin"
-    if bundled_bin.is_dir():  # pragma: no cover — only present inside the app bundle
-        extra.append(str(bundled_bin))
     env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
     return env
+
+
+def _core_limit_hold(now: float) -> "dict | None":
+    """The launcher's provider-limit hold in force now, else None; unreadable is None."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import core_limit_hold
+        return core_limit_hold.active_hold(WORKSPACE_DIR, now)
+    except Exception:
+        return None
 
 
 def _default_core_restart() -> bool:
@@ -12664,6 +14694,84 @@ def _default_core_restart() -> bool:
         return False
 
 
+def _recovery_metric(event: str, **properties) -> None:
+    """Flush categorical events before watchdog exit; telemetry cannot break repairs."""
+    try:
+        from telemetry import capture
+        capture(event, properties, flush=True)
+    except Exception:
+        pass
+
+
+def _track_core_issue(state_file, **observation):
+    try:
+        from recovery_issues import track_core_issue
+        track_core_issue(state_file.with_name(state_file.stem + "-issues.json"),
+                         emit=_recovery_metric, **observation)
+    except Exception:
+        pass
+
+
+def _recovery_duration(seconds: float) -> str:
+    for threshold, bucket in ((60, "<1m"), (300, "1-5m"), (1800, "5-30m")):
+        if seconds < threshold:
+            return bucket
+    return ">=30m"
+
+
+def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=None) -> None:
+    """Observe fix health; only allowlisted check names leave local correlation state."""
+    try:
+        if fcntl is None:
+            return
+        state_file = state_file or WORKSPACE_DIR / "state" / "health-fix-metrics.json"
+        from recovery_issues import track_health_issues
+        track_health_issues(state_file.with_name(state_file.stem + "-issues.json"),
+                            checks, start=start, emit=_recovery_metric)
+        now = time.time() if now is None else now
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file.with_name(state_file.name + ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            pending = None
+            if state_file.exists():
+                try:
+                    pending = json.loads(state_file.read_text())
+                    if not (isinstance(pending, dict)
+                            and isinstance(pending.get("started"), (int, float))
+                            and isinstance(pending.get("checks"), list)
+                            and pending["checks"]
+                            and all(isinstance(name, str) for name in pending["checks"])):
+                        raise ValueError("invalid fix observation")
+                except (ValueError, TypeError):
+                    state_file.unlink()
+                    pending = None
+            if start:
+                names = [c["name"] for c in checks if c["status"] != "ok"]
+                if not names or pending is not None:
+                    return
+                tmp = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                                     prefix=".health-fix-", delete=False) as out:
+                        tmp = Path(out.name)
+                        json.dump({"started": now, "checks": names}, out)
+                    os.replace(tmp, state_file)
+                finally:
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
+                _recovery_metric("health_fix_started")
+            elif pending is not None:
+                statuses = {c["name"]: c["status"] for c in checks}
+                names = pending["checks"]
+                resolved = sum(statuses.get(name) == "ok" for name in names)
+                outcome = "all_resolved" if resolved == len(names) else "partially_resolved" if resolved else "unresolved"
+                state_file.unlink()
+                _recovery_metric("health_fix_result", outcome=outcome,
+                                 duration_bucket=_recovery_duration(now - pending["started"]))
+    except Exception:
+        pass
+
+
 def recover_core_if_wedged(
     state_file: Optional[Path] = None,
     now: Optional[float] = None,
@@ -12674,6 +14782,7 @@ def recover_core_if_wedged(
     restart_fn=None,
     stopped_fn=None,
     sender=None,
+    limit_hold_fn=None,
 ) -> "dict | None":
     """Auto-restart the core when it is alive-but-wedged. Returns a dict
     describing the action taken (for tests / observability), or None when no
@@ -12702,6 +14811,7 @@ def recover_core_if_wedged(
         lambda: _local_core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
     send = sender or _default_slack_sender
+    limit_hold_fn = limit_hold_fn or (lambda: _core_limit_hold(now))
 
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -12760,6 +14870,21 @@ def recover_core_if_wedged(
                   f"UNKNOWN, not dead; suppressing restart and RESETTING the "
                   f"confirmation window", file=sys.stderr)
             return {"action": "probe-failed", "probe": which}
+        _track_core_issue(state_file, alive=alive, task=cur_key, status_ts=status_ts)
+        pending = state.get("recovery_metric_pending")
+        if pending and alive and (
+            oldest is None or cur_key != pending["task"] or (
+                isinstance(status_ts, (int, float))
+                and isinstance(pending.get("status_ts"), (int, float))
+                and status_ts > pending["status_ts"]
+            )
+        ):
+            state.pop("recovery_metric_pending", None)
+            _save()
+            _recovery_metric("core_recovery_result", outcome="progress_resumed",
+                             trigger=pending["trigger"],
+                             duration_bucket=_recovery_duration(now - pending["started"]))
+
         wedged = (
             alive
             and oldest is not None
@@ -12777,6 +14902,15 @@ def recover_core_if_wedged(
                 _reset_observation()
                 _save()
             return None
+
+        # The launcher holds a core its provider refused for a limit; relaunching here
+        # would only DM "auto-relaunching" and meet the same hold.
+        hold = limit_hold_fn() if dead else None
+        if hold:
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
+            return {"action": "limit-hold", "until": hold.get("until"), "reason": hold.get("reason")}
 
         # Age alone cannot separate a wedge from one legitimately long task: reset the
         # window when the oldest task changes, the core advances, or the mode flips.
@@ -12810,9 +14944,22 @@ def recover_core_if_wedged(
         if last_restart and now - last_restart < RECOVER_COOLDOWN_SEC:
             return {"action": "cooldown", "oldest_age": oldest_age, "since_restart": int(now - last_restart)}
 
+        pending = state.pop("recovery_metric_pending", None)
+        if pending:
+            _save()
+            _recovery_metric("core_recovery_result", outcome="still_unhealthy",
+                             trigger=pending["trigger"],
+                             duration_bucket=_recovery_duration(now - pending["started"]))
+
         # Give-up cap: prune restart history to the trailing hour.
         history = [t for t in (state.get("restart_history") or []) if isinstance(t, (int, float)) and now - t < 3600]
         if len(history) >= RECOVER_MAX_PER_HOUR:
+            # Independent of notification success: a Slack outage must not
+            # emit a fresh give-up event on every watchdog tick.
+            if not state.get("recovery_metric_gave_up") or now - state["recovery_metric_gave_up"] > 3600:
+                state["recovery_metric_gave_up"] = now
+                _save()
+                _recovery_metric("core_recovery_gave_up")
             # DM once per give-up episode. Record gave_up_at only on a SUCCESSFUL
             # send so a Slack outage doesn't silence the give-up alert for an hour.
             if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
@@ -12856,11 +15003,25 @@ def recover_core_if_wedged(
         if not dm_ok:
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
-        if not restart_fn():
+        _track_core_issue(state_file, alive=alive, task=cur_key,
+                          status_ts=status_ts, start=True, cause=cur_mode)
+        _recovery_metric("core_recovery_attempted", trigger=cur_mode)
+        try:
+            restart_ok = restart_fn()
+        except Exception:
+            _recovery_metric("core_restart_result", outcome="exception", trigger=cur_mode)
+            raise
+        _recovery_metric("core_restart_result", outcome="started" if restart_ok else "failed",
+                         trigger=cur_mode)
+        if not restart_ok:
             # Restart launch failed — don't burn a cooldown/history slot, and
             # keep the observation so we stay confirmed and retry next pass.
             return {"action": "restart_failed", "dm_sent": dm_ok}
 
+        state["recovery_metric_pending"] = {
+            "started": now, "task": cur_key, "status_ts": status_ts, "trigger": cur_mode,
+        }
+        state.pop("recovery_metric_gave_up", None)
         history.append(now)
         state["restart_history"] = history
         state["last_restart"] = now
@@ -12908,9 +15069,8 @@ def recover_core_if_wedged(
 # detects a little later than it strictly could.
 #
 # Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
-# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
-# uses (`watcher` keystroke) when the task watcher dies — so the session
-# re-arms its own crons and keeps its context. Bounded by the SAME
+# core's tmux pane, so the session re-arms its own crons and keeps its
+# context. Bounded by the SAME
 # confirm/cooldown/give-up discipline as the wedge path so it can't
 # nudge-storm a pane.
 
@@ -12977,11 +15137,15 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     return best_socket or default
 
 
-def _resolve_tmux_bin(candidates: "tuple[str, ...]" = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")) -> str:
-    """Absolute tmux path when a known install location exists, else a bare
-    PATH lookup (run with _resolve_launch_env's healed PATH). Same
-    PATH-narrowing class as _resolve_launch_env: under launchd's minimal PATH,
-    homebrew tmux doesn't resolve. Candidates injectable for tests."""
+_TMUX_INSTALL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _resolve_tmux_bin(candidates: "Optional[tuple[str, ...]]" = None) -> str:
+    """Absolute tmux from homebrew or ~/.local/bin (neither is on launchd's PATH, and the
+    launch env does not add ~/.local/bin), else a bare PATH lookup. Candidates injectable."""
+    if candidates is None:
+        candidates = tuple(os.path.join(d, "tmux") for d in _TMUX_INSTALL_DIRS) + (
+            str(Path.home() / ".local" / "bin" / "tmux"),)
     for cand in candidates:
         if os.path.exists(cand):
             return cand
@@ -12994,9 +15158,8 @@ def _default_cron_nudge(
     session: Optional[str] = None,
 ) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
-    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
-    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    into its tmux pane. Returns True only when the session exists and
+    send-keys succeeded. tmux_bin/sock/session are
     injectable so tests can drive the real subprocess path against a fake
     tmux binary."""
     if sock is None:
@@ -13008,14 +15171,15 @@ def _default_cron_nudge(
     env = _resolve_launch_env()
     try:
         has = subprocess.run(
-            [tmux_bin, "-S", sock, "has-session", "-t", session],
+            [tmux_bin, "-S", sock, "has-session", "-t", f"={session}"],
             env=env, capture_output=True, timeout=15,
         )
         if has.returncode != 0:
             return False
         send = subprocess.run(
-            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
-            env=env, capture_output=True, timeout=15,
+            # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
+            tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
+            env=env, capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S,
         )
         return send.returncode == 0
     except Exception:
@@ -13249,6 +15413,31 @@ def summary_line(checks) -> str:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
             + ", ".join(c["name"] for c in warns))
+
+
+def publish_health_report(checks, state_dir=None):
+    """Publish only aggregate health; diagnostics and user data stay local."""
+    state_dir = Path(state_dir) if state_dir is not None else WORKSPACE_DIR / "state"
+    tmp = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        report = {"version": 1, "checked_at": time.time(), "total": len(checks),
+                  "failures": sum(is_issue(c) for c in checks)}
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_dir,
+                                         prefix=".agent-health-", delete=False) as out:
+            tmp = Path(out.name)
+            json.dump(report, out)
+        os.replace(tmp, state_dir / "agent-health.json")
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -13260,6 +15449,10 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
+    publish_health_report(checks)
+    track_health_fix(checks)
+    if do_fix:
+        track_health_fix(checks, start=True)
     issues = [c for c in checks if is_issue(c)]
     codex_notifier = (
         next(
@@ -13270,6 +15463,11 @@ def main():
             ),
             None,
         )
+        if do_fix
+        else None
+    )
+    claude_notifier = (
+        next((c for c in checks if c["name"] == "claude-task-notifier" and c["status"] == "warn"), None)
         if do_fix
         else None
     )
@@ -13291,6 +15489,11 @@ def main():
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_system_load_reap(checks, stream=sys.stderr if as_json else sys.stdout)
+
+    # Optional: the owner's ag2.space DM via the gateway, core-independent. It runs first,
+    # so --notify-on-fail falls back to macOS only for a set this DM did not deliver.
+    gateway_ok = notify_gateway_for_failures(checks) if do_notify_gateway else False
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -13298,7 +15501,7 @@ def main():
     # if --fix would resolve some issues. Independent dedup state from
     # emit-task — the two surfaces are deliberately decoupled so neither
     # can suppress the other.
-    if do_notify:
+    if do_notify and not gateway_ok:  # the app already pops one for a landed gateway DM
         notify_for_failures(checks)
 
     # Optional: remote Slack DM surface. Unlike --notify-on-fail (local
@@ -13308,13 +15511,6 @@ def main():
     # the launchd-supervised fallback invocation so outages self-report.
     if do_notify_slack:
         notify_slack_for_failures(checks)
-
-    # Optional: remote ag2.space (gateway) DM surface — the channel the owner
-    # actually watches. Same core-independent guarantee as --notify-slack, via
-    # the gateway op:message endpoint. Intended for the launchd fallback so an
-    # over-quota / wedged core self-reports where the owner will see it.
-    if do_notify_gateway:
-        notify_gateway_for_failures(checks)
 
     # Optional: auto-recover a wedged core (alive-but-stuck) by restarting it.
     # Independent of the checks list — keys off the queue-drain + heartbeat
@@ -13366,7 +15562,7 @@ def main():
                 pass
             else:
                 sys.exit(1)
-        elif codex_notifier is None:
+        elif codex_notifier is None and claude_notifier is None:
             sys.exit(0)
 
     # Human-readable
@@ -13482,25 +15678,7 @@ def main():
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
-                    # If stale, kill old PIDs first so the new process doesn't
-                    # bind-fail or end up alongside a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", "conversation-server.ts"],
-                                capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    subprocess.Popen(["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"],
-                                     cwd=str(REPO_DIR),
-                                     stdout=open("/tmp/conversation-server.log", "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    print(f"  {c['name']}: {fix_conversation_server(c)}")
 
     # Screen-capture (:7845) is optional, so a down server is downgraded to
     # warn and never enters `issues` — the fix loop above can't reach it. An
@@ -13524,6 +15702,8 @@ def main():
     # local Codex session and delegates topology to the canonical launcher.
     if codex_notifier:
         print(f"  codex-task-notifier: {fix_codex_task_notifier()}")
+    if claude_notifier:
+        print(f"  claude-task-notifier: {fix_claude_task_notifier()}")
 
     # Channel bridges have the same optional-component shape: "configured but
     # not running" is warn-only, so the fix loop above can't reach a dead
@@ -13544,6 +15724,7 @@ def main():
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
         residual_checks = run_all_checks()
+        publish_health_report(residual_checks)
         emit_task_for_failures(residual_checks)
 
     sys.exit(1 if issues else 0)

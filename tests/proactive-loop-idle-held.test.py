@@ -52,13 +52,13 @@ check("an id built from RECALL is refused, not silently applied",
 check("...and it names the near-miss so the real id is one read away",
       "sutando-3198" in err, err[:90])
 
-rc, out, _ = run(["--state", str(p), "--add", "new-thing:ci"])
+rc, out, _ = run(["--state", str(p), "--add", "new-thing:ci", "--note", "sonichi/sutando#1"])
 check("add appends the pair", rc == 0 and ["new-thing","ci"] in json.loads(out))
 
-rc, _, err = run(["--state", str(p), "--add", "cinny-717:owner"])
+rc, _, err = run(["--state", str(p), "--add", "cinny-717:owner", "--note", "n"])
 check("adding an existing id is refused", rc == 1 and "already held" in err, err[:70])
 
-rc, _, err = run(["--state", str(p), "--add", "nogate"])
+rc, _, err = run(["--state", str(p), "--add", "nogate", "--note", "n"])
 check("--add without a gate is refused", rc == 1 and "ID:GATE" in err, err[:70])
 
 # there is NO interface that takes a whole list — the defect, made unreachable
@@ -306,7 +306,7 @@ fresh = pathlib.Path(tempfile.mkdtemp()) / "s.json"
 fresh.write_text(json.dumps({"streak": 0, "noop_total": 48,
                              "last_surfaced_ids": ["3753:peer-review"]}))
 
-rc, _, err = run(["--state", str(fresh), "--add", "3857:owner", "--write"])
+rc, _, err = run(["--state", str(fresh), "--add", "3857:owner", "--note", "sonichi/sutando#3857", "--write"])
 check("PRE-CONTROL: --add on a keyless state still refuses",
       rc == 2 and "refusing to invent" in err, err[:80])
 
@@ -325,7 +325,7 @@ rc, _, err = run(["--state", str(fresh), "--init-empty"])
 check("--init-empty REFUSES a second time — it bootstraps, never clears",
       rc == 2 and "REFUSED" in err, err[:80])
 
-rc, _, _ = run(["--state", str(fresh), "--add", "3857:owner", "--write"])
+rc, _, _ = run(["--state", str(fresh), "--add", "3857:owner", "--note", "sonichi/sutando#3857", "--write"])
 check("THE POINT: --add works after the bootstrap",
       rc == 0 and json.loads(fresh.read_text())["held_item_ids"] == [["3857", "owner"]],
       str(json.loads(fresh.read_text()).get("held_item_ids"))[:60])
@@ -407,7 +407,7 @@ def _refuses_held(argv, label):
           f"rc={rc} changed={f.read_text() != before} err={str(err).strip()[:60]!r}")
 
 _refuses_held(["--init-empty"], "--init-empty")
-_refuses_held(["--add", "x:owner", "--write"], "--add --write")
+_refuses_held(["--add", "x:owner", "--note", "n", "--write"], "--add --write")
 _refuses_held(["--archive-orphan-notes", "--write"], "--archive-orphan-notes --write")
 
 _valid_h = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
@@ -440,7 +440,7 @@ def _under_race(argv, err="raced corruption", seed=None):
 
 for _argv, _label, _seed in (
         (["--init-empty"], "--init-empty", {"streak": 1}),
-        (["--add", "x:owner", "--write"], "--add --write", {"held_item_ids": []}),
+        (["--add", "x:owner", "--note", "n", "--write"], "--add --write", {"held_item_ids": []}),
         (["--archive-orphan-notes", "--write"], "--archive-orphan-notes --write",
          {"held_item_ids": [], "held_item_notes": {"gone": "n"}}),
 ):
@@ -456,7 +456,7 @@ _f.write_text(json.dumps({KEY_HELD: []}))
 _before = _f.read_text()
 ih.idle_state.read_state_strict = lambda path: ({KEY_HELD: [["x", "owner"]]}, None)
 try:
-    _rc, _, _err = run(["--state", str(_f), "--add", "x:owner", "--write"])
+    _rc, _, _err = run(["--state", str(_f), "--add", "x:owner", "--note", "n", "--write"])
 finally:
     ih.idle_state.read_state_strict = _orig_rss
 check("a racer that added the same id under the lock aborts the write (exit 1)",
@@ -486,6 +486,63 @@ check("the no-key refusal NAMES the flag that resolves it",
       _doc_d is None and "--init-empty" in (_err2 or ""), repr(_err2))
 check("...and still says what it refuses to do, so the reason survives",
       "refusing to invent one" in (_err2 or ""), repr(_err2))
+
+# --add without --note: an id lands in held_item_ids that --audit-prs can never
+# check, which is the silent-shrink failure pointing the other way (#4033).
+_np = state(BASE)
+_rc, _, _err = run(["--state", str(_np), "--add", "z:owner"])
+check("an add with NO note is refused", _rc == 1 and "invisible to --audit-prs" in _err, _err[:90])
+
+_rc, _, _err = run(["--state", str(_np), "--add", "z:owner", "--add", "y:owner", "--note", "n"])
+check("a --note count that does not match --add is refused",
+      _rc == 1 and "2 --add but 1 --note" in _err, _err[:90])
+
+_rc, _out, _err = run(["--state", str(_np), "--add", "z:owner", "--note", "sonichi/sutando#77"])
+check("a paired add still succeeds and echoes the note",
+      _rc == 0 and ["z","owner"] in json.loads(_out) and "added z: sonichi/sutando#77" in _err,
+      _err[:100])
+
+_wp = state(BASE)
+_rc, _, _ = run(["--state", str(_wp), "--add", "z:owner", "--note", "sonichi/sutando#77", "--write"])
+_after = json.loads(_wp.read_text())
+check("--write persists the note under the SAME lock as the id",
+      _rc == 0 and ["z","owner"] in _after["held_item_ids"]
+      and _after["held_item_notes"].get("z") == "sonichi/sutando#77",
+      json.dumps(_after.get("held_item_notes"))[:100])
+check("...and an unrelated pre-existing note survives that write",
+      _after["held_item_notes"].get("keep") == "must survive a write")
+
+_rc, _, _ = run(["--state", str(_wp), "--remove", "z", "--reason", "done"])
+check("a removal still needs no --note", _rc == 0)
+
+
+# A blank explanation passes a COUNT check and satisfies nothing: the audit sees the
+# key present and does not even list it among the missing (qingyun-wu, #4042).
+for _flag, _val, _label in (("--note", "", "an empty"), ("--note", "   ", "a whitespace-only")):
+    _bp = state(list(BASE))
+    _before = _bp.read_bytes()
+    _rc, _, _err = run(["--state", str(_bp), "--add", "blank:owner", _flag, _val, "--write"])
+    check(f"{_label} --note is REFUSED", _rc == 1, _err[:90])
+    check(f"...and {_label} --note leaves the file BYTE-IDENTICAL",
+          _bp.read_bytes() == _before)
+
+# The sibling flag has the same shape, and an unauditable REMOVAL is the silent
+# shrink this tool exists to stop.
+for _val, _label in (("", "an empty"), ("  ", "a whitespace-only")):
+    _bp = state(list(BASE))
+    _before = _bp.read_bytes()
+    _rc, _, _err = run(["--state", str(_bp), "--remove", "ds-pr-12", "--reason", _val, "--write"])
+    check(f"{_label} --reason is REFUSED", _rc == 1, _err[:90])
+    check(f"...and {_label} --reason leaves the file BYTE-IDENTICAL",
+          _bp.read_bytes() == _before)
+
+# The guard must not over-refuse: a non-PR explanation is explicitly allowed.
+_op = state(list(BASE))
+_rc, _, _ = run(["--state", str(_op), "--add", "prose:owner", "--note", "no PR; owner judgement", "--write"])
+check("a non-PR --note is still accepted", _rc == 0)
+_op2 = state(list(BASE))
+_rc2, _, _ = run(["--state", str(_op2), "--remove", "ds-pr-12", "--reason", "landed", "--write"])
+check("a plain --reason is still accepted", _rc2 == 0)
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

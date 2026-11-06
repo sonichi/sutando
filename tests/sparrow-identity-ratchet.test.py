@@ -39,37 +39,34 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
 
 # Shipped mint sites at the ratchet's introduction: (relpath, function) -> n.
 TASK_MINT_PIN = {
-    ("agent-api.py", "Handler.handle_twilio_voice"): 1,
-    ("agent-api.py", "Handler.handle_twilio_sms"): 1,
-    ("agent-api.py", "Handler.handle_twilio_transcription"): 1,
-    ("agent-api.py", "Handler.do_POST"): 1,
-    ("cron_task_id.py", "task_id"): 1,
-    # wall-clock mint behind a constant prefix, pre-existing; visible only
-    # since the scanner resolves module constants (this PR's widening).
-    ("task_workstreams.py", "_maybe_enqueue_classifier_task_locked"): 1,
-    ("discord-bridge.py", "_dedup_recover"): 1,
-    ("discord-bridge.py", "_handle_discord_message"): 1,
-    ("discord-bridge.py", "poll_results"): 1,
-    ("github-webhook.py", "WebhookHandler.do_POST"): 1,
-    ("health-check.py", "emit_task_for_failures"): 2,
-    # +1 from main: a deterministic `task-PRIO<LEVEL>` fixture asserting priority is
-    # serialized above `task:`. A fixed test id, not a runtime mint.
-    ("remote-gateway-bridge.test.py", "main"): 5,
-    ("slack-bridge.py", "_dedup_recover"): 1,
-    ("slack-bridge.py", "_write_task"): 1,
-    ("telegram-bridge.py", "_dedup_recover"): 1,
-    ("telegram-bridge.py", "main"): 1,
-    # Origination, not ingress: a client submits text over the local socket, so
-    # there is no provider_event_id for ingress_task_id to be injective over.
-    ("runtime-api/tasks_view.py", "TasksView.submit"): 1,
-    # Same shape: the Signal Room originates a task from room speech; nothing
-    # upstream carries a provider_event_id, so ingress_task_id has no domain.
-    ("signal_room_tasks.py", "submit_signal_room_task"): 1,
+    ('agent-api.py', 'Handler.do_POST'): 1,
+    ('agent-api.py', 'Handler.handle_twilio_sms'): 1,
+    ('agent-api.py', 'Handler.handle_twilio_transcription'): 1,
+    ('agent-api.py', 'Handler.handle_twilio_voice'): 1,
+    ('cron_task_id.py', 'task_id'): 1,
+    ('dedup_recovery.py', 'fresh_reask_id'): 1,
+    ('delivery/disposal.py', 'disposed_copy_exists'): 1,
+    ('discord-bridge.py', '_handle_discord_message'): 1,
+    ('github-webhook.py', 'WebhookHandler.do_POST'): 1,
+    ('health-check.py', 'emit_task_for_failures'): 2,
+    ('ingress_identity.py', 'provider_task_id'): 1,
+    ('remote-gateway-bridge.test.py', 'main'): 5,
+    ('runtime-api/tasks_view.py', 'TasksView._publish'): 1,
+    ('runtime-api/tasks_view.py', 'TasksView.submit_idempotent'): 1,
+    ('signal_room_tasks.py', 'submit_signal_room_task'): 1,
+    ('slack-bridge.py', '_write_task'): 1,
+    ('task_workstreams.py', '_maybe_enqueue_classifier_task_locked'): 1,
+    ('undelivered_quarantine.py', '_stem'): 1,
+    ('util_paths.py', 'composer_block_path'): 1,
 }
 
 # Pre-canonical delivery_id sites, pinned per (file, function) like
@@ -494,8 +491,10 @@ def _certified_nodes(tree, bindings: set) -> set:
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
                                   ast.ClassDef, ast.Lambda)):
                     return
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
                     names.add(n.id)
+                if isinstance(n, ast.ExceptHandler) and n.name:
+                    names.add(n.name)
                 for ch in ast.iter_child_nodes(n):
                     walk(ch)
             for n in nodes:
@@ -516,7 +515,7 @@ def _certified_nodes(tree, bindings: set) -> set:
                 # start from the pre-try state: keep the body's binds, none of its results.
                 partial = tuple(_assigned_in(node.body))
                 return ([(node.body + (node.orelse or []), ())]
-                        + [(h.body, partial) for h in node.handlers])
+                        + [(h.body, partial + ((h.name,) if h.name else ())) for h in node.handlers])
             if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
                 # A loop body may run ZERO times, so "body ran" and "body did not"
                 # are alternatives; orelse runs on both.
@@ -524,7 +523,9 @@ def _certified_nodes(tree, bindings: set) -> set:
                 tgt = tuple(n.id for n in ast.walk(node.target)
                             if isinstance(n, ast.Name)) if hasattr(node, "target") else ()
                 rest = node.orelse or []
-                return [(node.body + rest, tgt), (rest, ())]
+                # Any later iteration can enter with a body-assigned name invalidated.
+                carried = tuple(_assigned_in(node.body))
+                return [(node.body + rest, tgt + carried), (rest, ())]
             visit_expr(node.subject)
             cases = [(c.body, ()) for c in node.cases]
             return cases if _match_is_exhaustive(node) else cases + [([], ())]
@@ -998,6 +999,40 @@ class HandlerAndLoopTargetInvalidation(unittest.TestCase):
                                  text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         return out.stdout.strip()
+
+    def _run_real(self, source):
+        driver = ("import sys\nsys.path.insert(0, "
+                  + repr(str(REPO / "packages/ag2-sparrow")) + ")\n"
+                  + source + "\nprint(mint()['delivery_id'])\n")
+        result = subprocess.run([sys.executable, "-c", driver],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_later_iteration_cannot_inherit_a_stale_certification(self):
+        for loop in ("for _ in range(2):", "while n < 2:"):
+            for canonical in (False, True):
+                source = ("from ag2_sparrow.identity import delivery_id, TaskId\n"
+                          "def mint():\n"
+                          "    d = delivery_id(TaskId('task-x'), 'gw')\n"
+                          "    rec = {}\n    n = 0\n    " + loop + "\n"
+                          + ("        d = delivery_id(TaskId('task-x'), 'gw')\n" if canonical else "")
+                          + "        rec['delivery_id'] = d\n        d = 'raw'\n"
+                          "        n += 1\n    return rec\n")
+                with self.subTest(loop=loop, canonical=canonical):
+                    self.assertEqual(self._run_real(source), 'd:task-x@gw' if canonical else 'raw')
+                    self.assertEqual(self._d(source), {} if canonical else {('probe.py', 'mint'): 1})
+
+    def test_exception_target_invalidates_only_its_own_binding(self):
+        for binding in ('d', 'e'):
+            source = ("from ag2_sparrow.identity import delivery_id, TaskId\n"
+                      "def mint():\n    d = delivery_id(TaskId('task-x'), 'gw')\n"
+                      "    try:\n        raise ValueError('raw')\n"
+                      f"    except ValueError as {binding}:\n"
+                      "        return {'delivery_id': d}\n")
+            with self.subTest(binding=binding):
+                self.assertEqual(self._run_real(source), 'raw' if binding == 'd' else 'd:task-x@gw')
+                self.assertEqual(self._d(source), {('probe.py', 'mint'): 1} if binding == 'd' else {})
 
     def test_handler_entered_mid_body_leaves_the_raw_value_counted(self):
         self.assertEqual(self._d(self.TRY), {("probe.py", "mint"): 1},

@@ -2,6 +2,12 @@
 """Tests for the core wedge auto-recovery (`recover_core_if_wedged`) in"""
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys
@@ -13,6 +19,8 @@ REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+# Recovery tests must never send production analytics.
+hc._recovery_metric = lambda *args, **kwargs: None
 
 # Pin thresholds so the test is independent of any SUTANDO_RECOVER_* env override
 # present in the runner's environment.
@@ -401,25 +409,50 @@ def case_n_failed_dm_still_restarts_and_records() -> list[str]:
 
 
 def case_o_launch_env_path() -> list[str]:
-    """Regression for the 2026-07-10 launchd restart bug: under launchd's minimal"""
+    """Under launchd's minimal PATH the restart env prepends homebrew (tmux) and injects
+    no node/claude default dirs: those are the launchers' own, after any override."""
     import os
     fails = []
     saved = os.environ.get("PATH")
     try:
         os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"  # launchd minimal
-        env = hc._resolve_launch_env()
-        parts = env["PATH"].split(":")
-        for needed in ("/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local" / "bin")):
+        parts = hc._resolve_launch_env()["PATH"].split(":")
+        for needed in ("/opt/homebrew/bin", "/usr/local/bin"):
             if needed not in parts:
                 fails.append(f"o) resolved PATH missing {needed}")
-        if "/opt/homebrew/bin" in parts and "/usr/bin" in parts:
-            if parts.index("/opt/homebrew/bin") > parts.index("/usr/bin"):
-                fails.append("o) healed dirs must be PREPENDED (before the minimal PATH)")
+        if "/opt/homebrew/bin" in parts and parts.index("/opt/homebrew/bin") > parts.index("/usr/bin"):
+            fails.append("o) homebrew dirs must be PREPENDED (before the minimal PATH)")
+        injected = [p for p in parts if p.endswith(("/runtime/node/bin", "/runtime/bin", "/.local/bin"))]
+        if injected:
+            fails.append(f"o) default launch dirs injected ahead of the launcher's overrides: {injected}")
     finally:
         if saved is None:
             os.environ.pop("PATH", None)
         else:
             os.environ["PATH"] = saved
+    return fails
+
+
+def case_o3_tmux_probe_finds_a_local_bin_tmux() -> list[str]:
+    """health-check's own tmux probes still find a tmux that lives only in ~/.local/bin,
+    which the launch env no longer carries."""
+    import os
+    fails = []
+    saved = (os.environ.get("PATH"), os.environ.get("HOME"), getattr(hc, "_TMUX_INSTALL_DIRS", ()))
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / ".local" / "bin"
+        local.mkdir(parents=True)
+        (local / "tmux").write_text("#!/bin/sh\necho fake-local-tmux\n")
+        (local / "tmux").chmod(0o755)
+        try:
+            os.environ["PATH"], os.environ["HOME"] = "/usr/bin:/bin:/usr/sbin:/sbin", td
+            hc._TMUX_INSTALL_DIRS = ()
+            r = hc._run_tmux(str(Path(td) / "sock"), "list-sessions")
+            if r is None or "fake-local-tmux" not in (r.stdout or ""):
+                fails.append(f"o3) the ~/.local/bin tmux was not used: {r!r}")
+        finally:
+            os.environ["PATH"], os.environ["HOME"] = saved[0] or "", saved[1] or ""
+            hc._TMUX_INSTALL_DIRS = saved[2]
     return fails
 
 
@@ -835,6 +868,7 @@ def main() -> int:
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
         ("o", case_o_launch_env_path),
+        ("o3", case_o3_tmux_probe_finds_a_local_bin_tmux),
         ("p", case_p_wedged_to_dead_transition_reobserves),
         ("q", case_q_preupgrade_state_dead_reobserves),
     ]

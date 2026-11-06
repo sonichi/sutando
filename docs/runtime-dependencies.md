@@ -50,14 +50,14 @@ nothing else.
 | Discord bridge | `pip3 install discord.py` | bridge skipped (gated on the token *and* the import) |
 | Slack bridge | `pip3 install slack_bolt` | bridge skipped |
 | Telegram bridge | — *(standard library only)* | — |
-| Image generation | `pip3 install google-genai Pillow` | `skills/image-generation` unavailable |
+| Image generation | a Gemini key (managed, or `GEMINI_API_KEY`); *standard library only* — `Pillow` optional, for `--input` resizing | `skills/image-generation` reports `no_key`; video (`--video`) needs `pip3 install google-genai` and reports `sdk_missing` without it |
 | Voice | Gemini API key | text/core paths still work (`src/startup.sh:755`) |
 | Phone calls, SMS | Twilio account + ngrok | browser, Telegram and Discord paths still work |
 | Recording, subtitle burn, video concat | `ffmpeg` / `ffprobe` | those features unavailable |
 | Vault sync, self-upgrade, commit provenance | `git` | those features unavailable; everything else runs |
 | Agent-authored PR workflows | `gh` | unavailable |
 | OCR on screen captures | `tesseract` | unavailable |
-| Sutando.app watcher auto-restart | `tmux` | **core still starts** — `src/agent/claude/cli/start-cli.sh:613` falls back to a bare `exec claude`; only the auto-restart is lost |
+| Sutando.app watcher auto-restart | `tmux` | **core still starts** — `src/agent/claude/cli/start-cli.sh:973` falls back to a bare `exec claude`; only the auto-restart is lost |
 | Building `Sutando.app` from source | Xcode Command Line Tools | not needed if a prebuilt binary ships |
 
 Two entries worth calling out, because both have been overstated before:

@@ -14,16 +14,20 @@ nothing. No owner configured => inert, fail-closed.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from workspace_default import resolve_workspace
+try:
+    from ..local_task_protocol import reply_action_text   # the vendored package layout
+except ImportError:
+    from local_task_protocol import reply_action_text     # the repo's src/ on sys.path
 
 from .manager import HitlManager
-from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError
+from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
 
 REPLY_FIELD = "space.ag2.hitl.action"
 EVENT_TYPE = "message.created"
@@ -33,8 +37,10 @@ TUI_ACTION_KIND = "tui_select"
 
 
 def actions_dir(workspace: Optional[Path] = None) -> Path:
-    ws = Path(workspace) if workspace is not None else resolve_workspace()
-    return ws / "state" / "hitl" / "actions"
+    if workspace is None:
+        from workspace_default import resolve_workspace
+        workspace = resolve_workspace()
+    return Path(workspace) / "state" / "hitl" / "actions"
 
 
 def parse_reply(event: Dict[str, Any]) -> Optional[ActionReply]:
@@ -46,6 +52,21 @@ def parse_reply(event: Dict[str, Any]) -> Optional[ActionReply]:
         return ActionReply.from_wire(payload)
     except MalformedActionError:
         return None
+
+
+def is_room_question_reply(event: Dict[str, Any]) -> bool:
+    """True when the action belongs to backend-owned room-question HITL.
+
+    Room questions deliberately reuse ``space.ag2.hitl`` presentation, but
+    their answers are accepted by the backend.  They must never enter this
+    local owner/runtime authority merely because their Matrix content reached
+    the agent event or task relay.
+    """
+    content = event.get("content") or {}
+    payload = content.get(REPLY_FIELD)
+    return isinstance(payload, dict) and (
+        payload.get("scope") == "room" or "question_id" in payload
+    )
 
 
 def write_driver_action(workspace: Path, req: HumanRequirement, action: Action) -> Path:
@@ -75,11 +96,13 @@ class HitlReplyHandler:
     carrying the reply field; unrelated room traffic flows on untouched."""
 
     def __init__(self, manager: HitlManager, owner_mxid: Optional[str],
-                 workspace: Optional[Path] = None, log=print):
+                 workspace: Optional[Path] = None, log=print,
+                 authorize: Optional[Callable[[Dict[str, Any]], str]] = None):
         self._manager = manager
         self._owner = owner_mxid
         self._workspace = Path(workspace) if workspace is not None else None
         self._log = log
+        self._authorize = authorize
         self.last_path = None  # handler-contract compat (never promotes tasks)
         # What the most recent offer() did: applied | rejected | ignored (+ reason).
         self.last_outcome = None
@@ -87,10 +110,17 @@ class HitlReplyHandler:
         # Form task_to_event() last recognised: "click" (hitl_action) or
         # "fallback" (typed label) — a non-owner's fallback is a MESSAGE.
         self.last_branch = None
+        # True after an applied click whose requirement asks for an agent turn
+        # (turn_on_action): the caller keeps the click on the task path.
+        self.last_turn = False
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
-        return event.get("type") == EVENT_TYPE and isinstance(content.get(REPLY_FIELD), dict)
+        return (
+            event.get("type") == EVENT_TYPE
+            and isinstance(content.get(REPLY_FIELD), dict)
+            and not is_room_question_reply(event)
+        )
 
     def offer(self, event: Dict[str, Any]) -> List[str]:
         eid = str(event.get("event_id") or "")
@@ -100,6 +130,7 @@ class HitlReplyHandler:
         actor = str(event.get("actor_id") or "")
         self.last_outcome = "ignored"
         self.last_reason = ""
+        self.last_turn = False
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
@@ -110,21 +141,51 @@ class HitlReplyHandler:
             self.last_outcome = "rejected"
             self.last_reason = "malformed action payload"
             return claimed
+        reply = dataclasses.replace(
+            reply, room=str(event.get("room_id") or ""), sender=actor)
+        reason = self._authorize(event) if self._authorize is not None else ""
+        if reason:
+            self.last_outcome = "refused"
+            self.last_reason = str(reason)
+            self._log(f"hitl: {reply.hitl_id} refused for {actor} — {reason}")
+            return claimed
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
-            self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
-            self.last_outcome = "rejected"
-            self.last_reason = str(e)
+            redo = self._same_click_redelivered(reply)
+            if redo is None:
+                self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
+                self.last_outcome = "rejected"
+                self.last_reason = str(e)
+                return claimed
+            # The click was applied but the turn it asked for was never written (a death in
+            # between): the redelivery is the same click, so the turn is still owed, not stale.
+            self.last_outcome = "applied"
+            self.last_turn = True
+            self._log(f"hitl: {reply.hitl_id} -> {redo.id} redelivered; the turn is still owed")
             return claimed
         self.last_outcome = "applied"
         note = ""
-        if action.kind == TUI_ACTION_KIND and self._workspace is not None:
-            req = self._manager.get(reply.hitl_id)
-            if req is not None:
-                note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
+        req = self._manager.get(reply.hitl_id)
+        if req is not None and getattr(req, "turn_on_action", False):
+            self.last_turn = True
+            note = "; a turn follows"
+        if action.kind == TUI_ACTION_KIND and self._workspace is not None and req is not None:
+            note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    def _same_click_redelivered(self, reply: ActionReply):
+        """The Action when `reply` is the click already applied to a turn-requesting requirement
+        (in progress, same action, revision exactly one ahead of the click's), else None."""
+        req = self._manager.get(reply.hitl_id)
+        if req is None or not getattr(req, "turn_on_action", False) or req.status != STATUS_IN_PROGRESS:
+            return None
+        if req.chosen_action != reply.action_id or req.revision != reply.expected_revision + 1:
+            return None
+        if reply.guard != req.guard:
+            return None
+        return next((a for a in req.actions if a.id == reply.action_id), None)
 
     # -- task-relay path ---------------------------------------------------------
 
@@ -150,6 +211,8 @@ class HitlReplyHandler:
             "room_id": task.get("channel_id"),
             "actor_id": str(task.get("user_id") or ""),
         }
+        if "access_tier" in task:
+            base["access_tier"] = task.get("access_tier")
         self.last_branch = None
         payload = task.get("hitl_action")
         if isinstance(payload, dict):
@@ -224,11 +287,6 @@ def match_action(req: HumanRequirement, text: str):
     return None, None
 
 
-REPLY_CONTEXT_END = "[End AG2 Space reply context]"
-
-
 def _reply_text(task_text: str) -> str:
-    """The message text after the relay's quoted reply context. A wrong cut can
-    only fail to match a label (the task then stays a message), never pick one."""
-    head, sep, tail = task_text.rpartition(REPLY_CONTEXT_END)
-    return tail if sep else task_text
+    """The unquoted answer; owner, card identity and stale guards are checked separately."""
+    return reply_action_text(task_text)

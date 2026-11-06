@@ -25,6 +25,35 @@ const check = (name, cond, detail = '') => {
   if (!cond) failures++;
 };
 
+// --- empty-line doubling (measured 2026-09-08 against the live composer) ---------
+// Every multi-paragraph post failed the guard: X renders an empty line as its own
+// paragraph, so innerText returns 2n-1 newlines where n were requested (n >= 2).
+check('a paragraph break read back doubled is tolerated',
+  composerMatches('AAA\n\nBBB', 'AAA\n\n\nBBB'));
+check('two paragraph breaks — the real failing case',
+  composerMatches('a\n\nb\n\nc', 'a\n\n\nb\n\n\nc'));
+check('three requested newlines read back as five',
+  composerMatches('AAA\n\n\nBBB', 'AAA\n\n\n\n\nBBB'));
+check('a single newline is untouched by the rule',
+  composerMatches('AAA\nBBB', 'AAA\nBBB'));
+check('an EVEN run is not this artifact and still fails closed',
+  !composerMatches('AAA\n\nBBB', 'AAA\n\n\n\nBBB'));
+check('doubling does not launder a changed word',
+  !composerMatches('AAA\n\nBBB', 'AAA\n\n\nCCC'));
+check('the rule is asymmetric — requested text is never transformed',
+  !composerMatches('AAA\n\n\nBBB', 'AAA\n\nBBB'));
+
+// The edges are NOT the interior law (qingyun-wu, #4040). Measured 2026-09-08:
+// requested "\n\nAAA" reads back "\n\n\n\nAAA" — four, not the interior three —
+// and a trailing run is dropped by the composer outright. So an edge run is an
+// UNMEASURED difference and must still refuse.
+check('a leading-edge run is unmeasured and refuses',
+  !composerMatches('\n\na', '\n\n\na'));
+check('a trailing-edge run is unmeasured and refuses',
+  !composerMatches('a\n\n', 'a\n\n\n'));
+check('newlines-only is unmeasured and refuses',
+  !composerMatches('\n\n', '\n\n\n'));
+
 console.log('composer read-back guard');
 
 // --- must MATCH: benign editor-side transformations -----------------------------

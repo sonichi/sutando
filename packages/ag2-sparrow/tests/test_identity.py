@@ -10,6 +10,9 @@ import sys
 import tempfile
 import hashlib
 import unittest
+import uuid
+from contextlib import ExitStack
+from unittest import mock
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
@@ -52,17 +55,20 @@ class Vectors(unittest.TestCase):
 
 
 class PurityRatchet(unittest.TestCase):
-    """R1/R3 at the source level: the derivation module cannot reach a clock,
-    the process table, or entropy, so no identity can be time- or pid-seeded."""
+    """Derivation stays stable when ambient clock and entropy inputs change."""
 
-    def test_derive_module_has_no_impure_imports(self):
-        src = (PKG_ROOT / "ag2_sparrow" / "identity" / "derive.py").read_text()
-        for forbidden in ("import time", "import os", "import random",
-                          "import uuid", "import datetime", "from time",
-                          "from os", "from random", "from uuid",
-                          "from datetime"):
-            self.assertNotIn(forbidden, src,
-                             f"derive.py must not use {forbidden!r} (R1/R3)")
+    def test_derivation_ignores_clock_and_entropy(self):
+        results = []
+        for seed in (1, 9):
+            with ExitStack() as stack:
+                for name, value in (("time.time_ns", seed), ("time.time", float(seed)),
+                                    ("random.random", seed / 10),
+                                    ("uuid.uuid4", uuid.UUID(int=seed)),
+                                    ("os.urandom", bytes([seed]) * 16), ("os.getpid", seed)):
+                    stack.enter_context(mock.patch(name, return_value=value))
+                results.append([_KINDS[v["kind"]](v["args"]) for v in VECTORS["vectors"]])
+        self.assertEqual(results[0], results[1])
+        self.assertEqual({v["kind"] for v in VECTORS["vectors"]}, set(_KINDS))
 
 
 class Injectivity(unittest.TestCase):

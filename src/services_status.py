@@ -10,7 +10,8 @@ Why aggregate, not re-probe
 ---------------------------
 Each sidecar already leaves a liveness trace — the core heartbeat's
 `state/cores/<host>.alive` (mtime = liveness), the task watcher's
-`state/watch-tasks-stream.pid`, a listening TCP port for network services.
+a per-instance `state/watch-tasks-stream[-<instance>].pid`, a listening TCP
+port for network services.
 This emitter *reads those existing signals* and folds them into one file the
 UI can consume, rather than inventing a second, divergent source of truth.
 
@@ -54,7 +55,7 @@ from pathlib import Path
 # a status file written to the wrong tree is invisible to every post-M0 reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
-from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict, status_path as _lane_status_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 STATE_DIR = WORKSPACE / "state"
@@ -66,11 +67,15 @@ STATUS_PATH = STATE_DIR / "services-status.json"
 # Liveness window shared with the .alive heartbeat: a signal older than this is
 # treated as "the thing that writes it is gone", i.e. offline.
 ALIVE_TTL_S = 90.0
-# The gateway bridge rewrites state/gateway-status.json on EVERY poll outcome,
+# The gateway bridge rewrites its state/gateway-status sidecar on EVERY poll outcome,
 # so a sidecar older than this means the bridge is wedged or predates the
 # sidecar — either way it has no usable opinion and pgrep answers instead.
-GATEWAY_STATUS_PATH = STATE_DIR / "gateway-status.json"
 GATEWAY_STATUS_TTL_S = 180.0
+
+
+def gateway_status_path() -> Path:
+    """The desktop's active lane's sidecar under STATE_DIR when it exists, else the primary connection's."""
+    return _lane_status_path(STATE_DIR)
 
 
 def _host_label() -> str:
@@ -102,6 +107,49 @@ def probe_alive_file(path: Path, now: float, ttl: float = ALIVE_TTL_S) -> tuple[
         return ("offline", f"stale {int(age)}s", mtime)
     except OSError as e:  # pragma: no cover — defensive; hard to trigger in tests
         return ("unknown", f"stat failed: {e}", None)
+
+
+def probe_watcher_sentinels(state_dir: Path, pid_alive
+                            ) -> "tuple[str, str, float | None]":
+    """Every watcher sentinel as ONE row. Reporting the first file answers about
+    one instance, which is wrong in both directions on a pool: a dead historic
+    pid beside a live worker read `offline`, and the reverse read `running`.
+
+    Enumerated at probe time, so a sentinel written after startup is seen.
+    """
+    from util_paths import watcher_sentinel_path, watcher_sentinel_paths
+    found = watcher_sentinel_paths(state_dir)
+    if not found:
+        return probe_pidfile(watcher_sentinel_path(state_dir), pid_alive)
+    rows = [(sp.name, *probe_pidfile(sp, pid_alive)[:2]) for sp in found]
+    running = [r for r in rows if r[1] == "running"]
+    # Two sentinel FILES naming one pid is one watcher and a stale record, not
+    # two watchers; listing the pid twice reports a pool that does not exist.
+    seen = {}
+    for n, s, d in rows:
+        if s == "running":
+            seen.setdefault(d, []).append(n)
+    dup = {d: ns for d, ns in seen.items() if len(ns) > 1}
+    dup_note = ("; ".join(f"{' and '.join(ns)} both name {d}" for d, ns in dup.items())
+                if dup else "")
+    if dup and len(running) == len(rows):
+        return ("degraded", f"one pid, two sentinels: {dup_note}", None)
+    if len(running) == len(rows):
+        pids = ", ".join(d for _, _, d in rows)
+        return ("running", pids if len(rows) == 1 else
+                f"{len(rows)} watchers: {pids}", None)
+    rest = "; ".join(f"{n}: {d}" for n, s, d in rows if s != "running")
+    if not running:
+        # No instance is up. `unknown` outranks `offline`: an unreadable
+        # sentinel is a question, and answering it "offline" overstates.
+        worst = "unknown" if any(s == "unknown" for _, s, _ in rows) else "offline"
+        return (worst, rest, None)
+    # De-duplicate: two sentinels naming one live pid is one process, and
+    # counting it twice reports a pool that is not there.
+    ok = ", ".join(dict.fromkeys(d for _, s, d in rows if s == "running"))
+    live_n = len(set(d for _, s, d in rows if s == "running"))
+    tail = f"; one pid, two sentinels: {dup_note}" if dup_note else ""
+    return ("degraded", f"{live_n} of {len(rows)} up ({ok}); {rest}{tail}", None)
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
@@ -231,17 +279,13 @@ def service_registry() -> list[dict]:
     return [
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
-        # KNOWINGLY PRIMARY-ONLY (#2503): named GATEWAY_INSTANCE bridges publish
-        # SUFFIXED sidecars this probe does not read, and the pgrep fallback is
-        # identity-blind (instance identity lives only in env — the launcher's
-        # P1). With a live named secondary, a dead primary's stale sidecar falls
-        # through to pgrep and the secondary's process reads as "running".
-        # Instance-aware probing is tracked separately; until then this row
-        # reports the PRIMARY bridge only.
+        # Reads the active lane's sidecar, else the primary connection's; the pgrep fallback is
+        # identity-blind, so a live named secondary can still mask a dead primary once the sidecar is stale.
         {"id": "gateway", "name": "AG2 Gateway",
-         "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
+         "probe": ("gateway", gateway_status_path(), r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
-         "probe": ("pidfile", STATE_DIR / "watch-tasks-stream.pid")},
+         # Every instance's sentinel; one fixed name reported only the newest.
+         "probe": ("watcher_sentinels", STATE_DIR)},
         {"id": "voice-agent", "name": "Voice Agent",
          "probe": ("port", 9900)},
         {"id": "web-client", "name": "Web Client",
@@ -289,6 +333,8 @@ def build_payload(
             status, detail, since = probe_alive_file(arg, now)
         elif kind == "pidfile":
             status, detail, since = probe_pidfile(arg, pid_alive)
+        elif kind == "watcher_sentinels":
+            status, detail, since = probe_watcher_sentinels(arg, pid_alive)
         elif kind == "port":
             status, detail, since = probe_port(arg, connect)
         elif kind == "process":

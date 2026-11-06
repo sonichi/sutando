@@ -41,6 +41,12 @@ Exit 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import subprocess
@@ -94,7 +100,7 @@ def _commit_file(tmpdir: Path, path: str, content: bytes, msg: str,
     f = tmpdir / path
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_bytes(content)
-    env = dict(os.environ)
+    env = isolated_child_env()
     if when is not None:
         stamp = f"@{int(when)} +0000"
         env["GIT_AUTHOR_DATE"] = stamp
