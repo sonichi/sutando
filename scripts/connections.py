@@ -175,7 +175,7 @@ def cmd_move(args) -> int:
             print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
         elif out["reason"] != "successor_exists":
             server = out.get("server") or "<server>"
-            print(f"next: get a new relay token for this agent in its {server} settings (Get new token, not Add "
+            print(f"next: get a new relay token for this agent in its {server} settings (Get token, not Add "
                   f"agent), then run python3 scripts/connections.py add - --yes --expected-server {server} "
                   "(paste the token on stdin)")
         return 1

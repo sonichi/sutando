@@ -11,7 +11,7 @@ it creates a **new** agent; `connect --code -` redeems it once and writes that a
 token file. A *relay token* is the long-lived credential `<relay_url>|<bearer>` (older text calls it the
 `url|secret` connect string: the same bytes). `add` and `update_token` take only a relay token, since the
 gateway URL inside it is what they preview. An **existing** agent's new relay token comes from that agent's
-settings in the app (Get new token), never from Add agent, which creates another agent (`update_token` refuses its token: `token_agent_mismatch`).
+settings in the app (Get token), never from Add agent, which creates another agent (`update_token` refuses its token: `token_agent_mismatch`).
 
 ## The model
 
@@ -150,7 +150,7 @@ key unchanged. A row keyed by identity is never demoted.
 ### Re-adopting the legacy row's server
 
 The legacy row (`instance: ""`) runs on `REMOTE_TASK_TOKEN` from the environment, and getting a
-new relay token from the agent's settings (Get new token) rotates that credential. So a **verified** token that matches the legacy
+new relay token from the agent's settings (Get token) rotates that credential. So a **verified** token that matches the legacy
 row (by server, as above) and is not the secret that row already holds (its vault key, the
 environment or the channel env file) is not "already connected": `add` adopts it. Under one hold of
 the record lock it stores the secret under the new row's `token_ref`
@@ -328,7 +328,7 @@ since the copy), `agent_mismatch` (another agent or owner), `unverified` (a serv
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
 s.space). Then fall back to a new relay token:
 
-1. Get a new relay token for **this** agent on s.space: its settings in the app, Get new token (not Add
+1. Get a new relay token for **this** agent on s.space: its settings in the app, Get token (not Add
    agent, which creates another agent).
 2. `python3 scripts/connections.py add - --yes --expected-server s.space`, paste the token, then Ctrl-D.
    With `-` the token is read from stdin, so it stays out of shell history and the process list; stdin

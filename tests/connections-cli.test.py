@@ -506,7 +506,7 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
         self.assertEqual(rc, 1)
         self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
-        self.assertEqual(out, "next: get a new relay token for this agent in its s.space settings (Get new token, "
+        self.assertEqual(out, "next: get a new relay token for this agent in its s.space settings (Get token, "
                               "not Add agent), then run python3 scripts/connections.py add - --yes "
                               "--expected-server s.space (paste the token on stdin)\n")
         half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",

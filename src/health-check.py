@@ -7012,7 +7012,7 @@ def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None
             "detail": (f"only connected to {legacy}, no {target} connection — from the repo first try the "
                        "agent's existing secret: python3 scripts/connections.py move --repo . --logs-dir "
                        '"$(bash scripts/sutando-config.sh workspace)/logs" (if it is refused, get a new relay token '
-                       f"for this agent in its {target} settings (Get new token, not Add agent), then run: "
+                       f"for this agent in its {target} settings (Get token, not Add agent), then run: "
                        f"python3 scripts/connections.py add - --yes --expected-server {target} (paste the token "
                        f"on stdin) && python3 scripts/connections.py promote {inst} --repo . --logs-dir "
                        '"$(bash scripts/sutando-config.sh workspace)/logs" (docs/connections.md, '

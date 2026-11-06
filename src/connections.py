@@ -3553,7 +3553,7 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
     refused. `resolver` (as `preview_connection`'s) also maps servers; None reads the registry offline.
     Returns {ok, instance, agent_mxid, mcp, rooms, dry_run}, or {ok: False, reason, detail} with a
     MOVE_REASONS reason (nothing written) or a Refusal code (`added` says whether the row exists),
-    and `server`, where a new relay token for this agent comes from (its settings there, Get new token,
+    and `server`, where a new relay token for this agent comes from (its settings there, Get token,
     never Add agent, which creates another agent)."""
     environ = os.environ if environ is None else environ
     probe = dict(fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, resolver=resolver)
