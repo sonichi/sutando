@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -173,6 +174,51 @@ class Marker(unittest.TestCase):
                 self.assertEqual(m.main(["mark", TID]), 0)
         self.assertTrue(m.is_delegated(self.ws, TID))
 
+    def _holder(self, *a):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = m.main(["holder", TID, *a, "--workspace", str(self.ws)])
+        return rc, out.getvalue().strip(), err.getvalue()
+
+    def test_cli_holder_none_background_worker(self):
+        deliveries = self.ws / "deliveries"
+        self.assertEqual(self._holder()[:2], (1, ""))
+        self.assertEqual(self._holder("--deliveries", str(deliveries))[:2], (1, ""))
+        m.mark(self.ws, TID, 60)
+        self.assertEqual(self._holder("--task-file", str(self.task))[:2], (0, m.BACKGROUND_HOLDER))
+        (deliveries / "w1").mkdir(parents=True)
+        (deliveries / "w1" / f"{TID}.accepted").write_text("")
+        self.assertEqual(self._holder("--deliveries", str(deliveries))[:2], (0, m.WORKER_HOLDER))
+        m.clear(self.ws, TID)
+        self.assertEqual(self._holder("--deliveries", str(deliveries))[:2], (0, m.WORKER_HOLDER))
+        # Without --deliveries no worker lookup is injected: the sentinel is not consulted.
+        self.assertEqual(self._holder()[:2], (1, ""))
+
+    def test_cli_holder_marker_follows_the_given_task_file(self):
+        m.mark(self.ws, TID, 60)
+        os.utime(self.task, (time.time() + 1,) * 2)
+        self.assertEqual(self._holder("--task-file", str(self.task))[0], 1)
+
+    def test_cli_holder_unreadable_worker_store_is_rc_3(self):
+        deliveries = self.ws / "deliveries"
+        deliveries.write_text("a file where the dir goes")
+        rc, out, err = self._holder("--deliveries", str(deliveries))
+        self.assertEqual((rc, out), (3, ""))
+        self.assertIn("treat the task as held", err)
+
+    def test_cli_holder_without_the_dispatcher_has_no_worker(self):
+        deliveries = self.ws / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        (deliveries / "w1" / f"{TID}.txt").write_text("")
+        with mock.patch.dict(sys.modules, {"delivery.task_dispatch": None}):
+            self.assertEqual(self._holder("--deliveries", str(deliveries))[:2], (1, ""))
+
+    def test_cli_holder_calls_the_shared_predicate(self):
+        with mock.patch.object(m, "holder", return_value="w9") as h:
+            self.assertEqual(self._holder("--task-file", str(self.task))[:2], (0, "w9"))
+        h.assert_called_once()
+        self.assertEqual(h.call_args.kwargs["task_file"], str(self.task))
+
     def test_cli_help_exits_0(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(m.main(["--help"]), 0)
@@ -204,6 +250,44 @@ class Marker(unittest.TestCase):
         with mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
             m.mark(self.ws, TID, 60)
         self.assertTrue(m.is_delegated(self.ws, TID))
+
+
+class WorkspaceResolversAgree(unittest.TestCase):
+    """`mark` without --workspace and the Stop hook (scripts/sutando-config.sh) must name one workspace."""
+
+    def _env(self, **extra):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUTANDO_WORKSPACE", "SUTANDO_TEST_MODE", "SUTANDO_DEFAULT_WORKSPACE")}
+        env.update(extra)
+        return env
+
+    def _shell_ws(self, env) -> Path:
+        out = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
+                             env=env, capture_output=True, text=True, check=True).stdout.strip()
+        return Path(out).resolve()
+
+    def _python_ws(self, env) -> Path:
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from workspace_default import resolve_workspace;"
+                " print(resolve_workspace(migrate=False))")
+        out = subprocess.run([sys.executable, "-c", code, str(REPO / "src")], env=env,
+                             capture_output=True, text=True, check=True).stdout.strip()
+        return Path(out).resolve()
+
+    def test_default_resolution_agrees(self):
+        env = self._env()
+        self.assertEqual(self._python_ws(env), self._shell_ws(env))
+
+    def test_an_override_agrees_and_mark_lands_where_the_hook_reads(self):
+        with tempfile.TemporaryDirectory() as td:
+            cases = {"test-mode": self._env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=f"{td}/a")}
+            for label, env in cases.items():
+                with self.subTest(label):
+                    hook_ws = self._shell_ws(env)
+                    self.assertTrue(str(hook_ws).startswith(str(Path(td).resolve())), hook_ws)
+                    self.assertEqual(self._python_ws(env), hook_ws)
+                    subprocess.run([sys.executable, str(REPO / "src" / "task_delegation.py"), "mark", TID],
+                                   env=env, capture_output=True, check=True)
+                    self.assertTrue((hook_ws / m.SUBDIR / f"{TID}.json").is_file())
 
 
 if __name__ == "__main__":
