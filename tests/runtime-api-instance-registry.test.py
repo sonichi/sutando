@@ -183,5 +183,54 @@ class InstanceRegistryTests(unittest.TestCase):
         self.assertNotIn("/", p.name.replace(".json", ""))
 
 
+
+
+class ResolveEitherIdTests(unittest.TestCase):
+    """`sutando list` displays instance_id; attach/start must accept it.
+    Regression for the 2026-08-08 UX finding: `attach default` -> not_registered."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig = reg.registry_dir
+        reg.registry_dir = lambda: Path(self.tmp.name)
+
+    def tearDown(self):
+        reg.registry_dir = self._orig
+        self.tmp.cleanup()
+
+    def _write(self, agent_id, instance_id, tmux=True):
+        m = {"schema_version": 1, "instance_id": instance_id,
+             "identity": {"agent_id": agent_id},
+             "runtime": ({"type": "tmux", "tmux_socket": "/tmp/t.sock",
+                          "session": "s"} if tmux else {})}
+        (Path(self.tmp.name) / (reg._SAFE_ID.sub("_", agent_id) + ".json")
+         ).write_text(json.dumps(m))
+
+    def test_exact_agent_id_wins(self):
+        self._write("@a:x", "default")
+        r = reg.resolve_agent_id("@a:x")
+        self.assertTrue(r["ok"]); self.assertEqual(r["agent_id"], "@a:x")
+
+    def test_instance_id_resolves_unique(self):
+        self._write("@a:x", "default")
+        r = reg.resolve_agent_id("default")
+        self.assertTrue(r["ok"]); self.assertEqual(r["agent_id"], "@a:x")
+
+    def test_unknown_is_not_registered(self):
+        r = reg.resolve_agent_id("nope")
+        self.assertFalse(r["ok"]); self.assertIn("not_registered", r["error"])
+
+    def test_ambiguous_names_candidates_never_guesses(self):
+        self._write("@a:x", "default"); self._write("@b:x", "default")
+        r = reg.resolve_agent_id("default")
+        self.assertFalse(r["ok"])
+        self.assertIn("@a:x", r["error"]); self.assertIn("@b:x", r["error"])
+
+    def test_attach_by_instance_id_end_to_end(self):
+        self._write("@a:x", "default")
+        r = reg.attach("default")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["argv"][:2], ["tmux", "-S"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

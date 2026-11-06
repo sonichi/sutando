@@ -169,6 +169,8 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             next_str = ">7d" if expr else "invalid"
         if job.get("description"):
             desc = job["description"]
+        elif job.get("shell_command"):
+            desc = f'Runs shell command: {job["shell_command"]}'
         elif skill:
             desc = f"Runs the /{skill} skill"
         else:
