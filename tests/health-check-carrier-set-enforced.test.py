@@ -1031,15 +1031,6 @@ class CarrierSetProbe(unittest.TestCase):
                          f"hosts/*/ -> {outside}")
 
 
-class TheProbeSelectsTheIgnoredMatch(CarrierSetProbe):
-    """The formatter cases above supply the culprit; these make the PROBE pick it.
-
-    Handing `_stale_with_culprits` a dictionary tests the rendering and never the
-    selection, so `culprit = reps[0]` — naming a carried directory as the one git
-    ignores — passes every one of them. These drive the shipped probe over a real
-    git fixture instead.
-    """
-
     def _two_hosts_and_a_stray(self, stray: bool):
         # The generator's real carve-out: `!hosts/*/` + `!hosts/*/**` carries each
         # host subtree, and cannot reach a file sitting directly in `hosts/`.

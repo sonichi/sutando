@@ -2393,9 +2393,9 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
             f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
             f"backing them up ({_stale_with_culprits(stale, stale_culprit, workspace)}) — usually a "
             f"stale exclude file, fixed with `bash scripts/sync-workspace.sh --force-gitignore` "
-            f"(diff it first). If the ignored match is a FILE directly under a directory-shaped "
-            f"entry, regenerating cannot reach it (the carve-outs are `!<dir>/**`) — deal with that "
-            f"file instead"
+            f"(diff it first). For a glob-directory entry `<dir>/*/`, a FILE directly in "
+            f"`<dir>/` is outside the `!<dir>/*/**` carve-out; regenerating cannot reach "
+            f"that file — deal with it instead"
         )
     if safe:
         parts.append(
