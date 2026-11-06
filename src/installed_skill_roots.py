@@ -56,4 +56,3 @@ def installed_skill_roots(repo, workspace, env: Mapping[str, str] | None = None)
             seen.add(key)
             roots.append(c)
     return roots
-
