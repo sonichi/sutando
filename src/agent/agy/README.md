@@ -27,6 +27,10 @@ plan:
 - **No task injection.** Nothing reads `tasks/*.txt` and feeds it into the
   session this starts, unlike Codex's `task-notifier.sh` or Claude's file
   bridge. A launched session is a plain interactive agy shell.
+  An earlier version started a task notifier in a `<session>-watcher` tmux
+  session; every run of `start-cli.sh` (launch or attach) kills a leftover
+  session of exactly that name on its socket, so rerunning it after an
+  update retires the old notifier.
 - **No scheduler/cron integration.**
 - **No health-check integration, no `--restart` flag, no signal handling**
   beyond tmux's own. Not feature parity with the Claude/Codex launchers —

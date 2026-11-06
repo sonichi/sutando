@@ -224,6 +224,27 @@ class Classifier(unittest.TestCase):
                   [{"ts": 60.0 * i, "state": "i", "raw_state": "i", "patterns": []} for i in range(1, 12)]
         self.assertEqual(w.classify_window(entries, (False, ""), 660.0)["kind"], "idle")
 
+    def test_a_tool_status_line_carrying_a_timeout_setting_is_not_a_timeout(self):
+        for line in ("  \u23bf  Monitor started \u00b7 task btr403775 \u00b7 timeout 1800s",
+                     "Monitor started \u00b7 task b1 \u00b7 timeout 30s", "timeout=600", "timeout: 30",
+                     "Bash(sleep 5) timeout: 600000"):
+            self.assertNotIn("timeout", w.matched_patterns([line]), line)
+        for line in ("Request timed out", "API Error: Request timed out.", "Connection error: timed out",
+                     "timeout of 30000ms exceeded", "command timed out after 30s", "timed out 3 times",
+                     "Timeout 30000ms exceeded", "Operation timed out: 60", "Error: timeout 30s exceeded"):
+            self.assertIn("timeout", w.matched_patterns([line]), line)
+
+    def test_two_frames_with_only_the_monitor_line_are_not_a_retry_loop(self):
+        frame = IDLE + "  \u23bf  Monitor started \u00b7 task btr403775 \u00b7 timeout 1800s\n"
+        self.assertNotEqual(w.classify([frame, frame], False, 60)["kind"], "retry-loop")
+        with tempfile.TemporaryDirectory() as d:
+            entries = []
+            for t in (0.0, 60.0):
+                entries = w.append_window(Path(d), frame, t)
+            v = w.classify_window(entries, (False, ""), 60.0)
+        self.assertNotEqual(v["kind"], "retry-loop")
+        self.assertEqual(v["matched_patterns"], [])
+
     def test_retry_text_must_be_current_and_recurrent(self):
         # retry-loop = low novelty AND retry text that is current and recurrent
         frames = [retry_frame(0), IDLE, IDLE] + [retry_frame(i) for i in range(9)]

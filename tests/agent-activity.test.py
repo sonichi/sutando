@@ -56,6 +56,11 @@ def _bind_in_process(ws, task_id, sid):
     h.bind(h.paths(_pl.Path(ws)), task_id, sid)
 
 
+def _lookup_in_process(ws, sid):
+    h = load_at(REPO / "skills" / "agent-activity" / "hooks" / "activity-hook.py")
+    return h.bound_task(h.paths(Path(ws)), sid)[0]["id"]
+
+
 class Writer(unittest.TestCase):
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp())
@@ -89,6 +94,10 @@ class Writer(unittest.TestCase):
         with self.assertRaises(ValueError):
             card.append("x", kind="verbose", room=None, workspace=self.ws)
 
+    def test_a_wedge_is_a_kind_the_writer_takes(self):
+        rec = card.append("needs your sign-off", kind="wedge", room=None, workspace=self.ws)
+        self.assertEqual((rec["kind"], "room" in rec), ("wedge", False))
+
     def test_the_live_log_rotates_to_an_archive(self):
         for i in range(card.LIVE_ROWS + 3):
             card.append(f"row {i}", kind="notice", room=None, workspace=self.ws)
@@ -112,15 +121,6 @@ class Writer(unittest.TestCase):
         self.assertEqual(len(live), 25)
         self.assertEqual(sum(1 for l in live + arch if json.loads(l).get("done")), 8, "every done row survived")
 
-    def test_default_room_is_the_owners_latest_ag2space_room(self):
-        st = self.ws / "state"
-        st.mkdir()
-        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
-        self.assertEqual(card.default_room(self.ws), "!dm:s")
-        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "discord", "channel_id": "123"}))
-        self.assertIsNone(card.default_room(self.ws))
-        (st / "last-owner-activity.json").unlink()
-        self.assertIsNone(card.default_room(self.ws))
 
 
 class TaskFile(unittest.TestCase):
@@ -194,6 +194,45 @@ class WriterCli(unittest.TestCase):
     def test_done_without_a_task_is_refused(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             card.main(["done", "finished", "--workspace", str(self.ws)])
+
+    def test_a_wedge_is_written_without_a_room_even_from_a_task_file(self):
+        # The seat is stopped, not a room: the client shows a roomless row wherever the owner is,
+        # and through a drawer they dismissed. A task file still names the task, just not the room.
+        p = self.ws / "t.txt"
+        p.write_text("id: task-w\nchannel_id: !team:s\nuser_id: @q:s\ntask: hello\n")
+        rc, rec = self.run_main("append", "waiting on your go-ahead", "--kind", "wedge", "--task-file", str(p))
+        self.assertEqual((rc, rec["kind"], rec["task"]["id"], "room" in rec), (0, "wedge", "task-w", False))
+
+    def test_a_wedge_with_an_explicit_room_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            card.main(["append", "x", "--kind", "wedge", "--room", "!r:s", "--workspace", str(self.ws)])
+        self.assertFalse(card.log_path(self.ws).exists())
+
+    def test_taskless_append_never_borrows_the_owners_last_room(self):
+        st = self.ws / "state"
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
+        for kind in ("processing", "thinking", "working", "notice", "wedge"):
+            with self.subTest(kind=kind):
+                rc, rec = self.run_main("append", "background health check", "--kind", kind)
+                self.assertEqual(rc, 0)
+                self.assertIsNone(rec.get("room"))
+                stored = json.loads(card.log_path(self.ws).read_text().splitlines()[-1])
+                self.assertNotIn("room", stored)
+        self.assertEqual(self.run_main("append", "explicit", "--room", "!explicit:s")[1]["room"], "!explicit:s")
+
+    def test_task_file_room_and_explicit_override_are_preserved(self):
+        st = self.ws / "state"
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space", "channel_id": "!dm:s"}))
+        p = self.ws / "t.txt"
+        p.write_text("id: task-file\nchannel_id: !task:s\ntask: hello\n")
+        self.assertEqual(self.run_main("append", "working", "--task-file", str(p))[1]["room"], "!task:s")
+        self.assertEqual(self.run_main("append", "working", "--task-file", str(p),
+                                       "--room", "!explicit:s")[1]["room"], "!explicit:s")
+        p.write_text("id: task-file\ntask: background\n")
+        self.assertNotIn("room", self.run_main("append", "working", "--task-file", str(p))[1])
+        self.assertNotIn("room", self.run_main("done", "finished", "--task-file", str(p))[1])
 
     def test_task_file_plus_task_id_override(self):
         p = self.ws / "t.txt"
@@ -433,6 +472,104 @@ class Hook(unittest.TestCase):
         self.assertEqual(list(hook.open_tasks(self.p["log"])), ["t1"])
         self.assertEqual(hook.open_tasks(self.ws / "none.jsonl"), {})
 
+    def test_current_task_follows_pickup_order_not_late_activity(self):
+        old = "task-dev-s-space~task-081a8c5117a3803243"
+        current = "task-dev-s-space~task-5e9ee36bb149f176dd"
+        self.log({"kind": "processing", "task": {"id": old}},
+                 {"kind": "processing", "task": {"id": current}, "room": "!current:s"},
+                 {"kind": "notice", "task": {"id": "task-queued"}},
+                 {"kind": "working", "task": {"id": old}})
+        for tid in (old, current, "task-queued"):
+            hook.bind(self.p, tid, "S1")
+        for result in (False, True):
+            with self.subTest(archived_result=result):
+                if result:
+                    archive = self.ws / "results" / "archive"
+                    archive.mkdir(parents=True)
+                    (archive / f"{old}-1793524800.txt").write_text("answered")
+                hook.handle(self.pre("S1", "Bash", {"description": "Check status"}), self.p, self.run)
+                cmd = self.runs[-1]
+                self.assertEqual(cmd[cmd.index("--task-id") + 1], current)
+                self.assertEqual(cmd[cmd.index("--room") + 1], "!current:s")
+        self.log({"kind": "done", "task": {"id": current}, "done": True},
+                 {"kind": "working", "task": {"id": current}})
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+
+    def test_answer_cache_survives_hook_reload_and_is_session_scoped(self):
+        self.log({"ts": 10, "kind": "processing", "task": {"id": "task-cache"}})
+        hook.bind(self.p, "task-cache", "S1")
+        with mock.patch.object(hook, "find_result", wraps=hook.find_result) as lookup:
+            self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], "task-cache")
+            self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], "task-cache")
+            self.assertEqual(lookup.call_count, 1)
+        fresh = load_at(Path(hook.__file__))
+        with mock.patch.object(fresh, "find_result", wraps=fresh.find_result) as lookup:
+            self.assertEqual(fresh.bound_task(fresh.paths(self.ws), "S1")[0]["id"], "task-cache")
+            lookup.assert_not_called()
+            fresh.bind(self.p, "task-cache", "S2")
+            self.assertEqual(fresh.bound_task(self.p, "S2")[0]["id"], "task-cache")
+            self.assertEqual(lookup.call_count, 1)
+
+    def test_answer_cache_concurrent_writers_keep_each_sessions_entry(self):
+        import multiprocessing
+        ids = [f"task-cache{i}" for i in range(4)]
+        for i, tid in enumerate(ids):
+            self.log({"ts": i, "kind": "processing", "task": {"id": tid}})
+            hook.bind(self.p, tid, f"S{i}")
+        with multiprocessing.get_context("spawn").Pool(4) as pool:
+            found = pool.starmap(_lookup_in_process, [(str(self.ws), f"S{i}") for i in range(4)])
+            pool.close(); pool.join()
+        self.assertEqual(found, ids)
+        cache = hook.load_json(self.p["bind"].with_name("agent-activity.answers.json"), {})
+        self.assertEqual(sorted(cache), ids)
+        self.assertFalse(list((self.ws / "state").glob(".agent-activity.answers.json.*.tmp")))
+
+    def test_cached_negative_notices_a_result_and_archive_move(self):
+        tid = "task-cache"
+        self.log({"ts": 10, "kind": "processing", "task": {"id": tid}})
+        hook.bind(self.p, tid, "S1")
+        self.assertIsNotNone(hook.bound_task(self.p, "S1")[0])
+        results = self.ws / "results"
+        results.mkdir()
+        result = results / f"{tid}.txt"
+        result.write_text("answered")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        archive = results / "archive"
+        archive.mkdir()
+        result.rename(archive / f"{tid}-1234567890.txt")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        with mock.patch.object(hook, "find_result", side_effect=AssertionError("repeat archive scan")):
+            self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+
+    def test_same_id_pickup_after_done_reopens_with_an_old_result(self):
+        tid = "task-resume"
+        self.log({"ts": 10, "kind": "processing", "task": {"id": tid}})
+        hook.bind(self.p, tid, "S1")
+        results = self.ws / "results"
+        results.mkdir()
+        result = results / f"{tid}.txt"
+        result.write_text("old answer")
+        os.utime(result, (15, 15))
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        self.log({"ts": 20, "kind": "done", "done": True, "task": {"id": tid}},
+                 {"ts": 25, "kind": "working", "task": {"id": tid}})
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        self.log({"ts": 30, "kind": "processing", "room": "!resumed:s", "task": {"id": tid}})
+        hook.handle(self.pre("S1", "Bash", {"description": "Resume work"}), self.p, self.run)
+        cmd = self.runs[-1]
+        self.assertEqual(cmd[cmd.index("--task-id") + 1], tid)
+        self.assertEqual(cmd[cmd.index("--room") + 1], "!resumed:s")
+        result.write_text("new answer")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+
+    def test_bound_task_excludes_live_result_without_done(self):
+        self.log({"kind": "processing", "task": {"id": "task-finished"}})
+        hook.bind(self.p, "task-finished", "S1")
+        results = self.ws / "results"
+        results.mkdir()
+        (results / "task-finished.txt").write_text("answer")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+
     def test_processing_task_id_from_task_id_task_file_or_reference(self):
         (self.ws / "tasks" / "task-abc123.txt").write_text("id: task-abc123\ntask: x\n")
         self.assertEqual(hook.processing_task_id("python3 a/activity.py append 'x' --kind processing --task-id task-9", self.ws), "task-9")
@@ -450,6 +587,18 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.working_line("Bash", {"description": "First sentence. Second one"}), "First sentence.")
         self.assertEqual(len(hook.working_line("Bash", {"description": "x" * 300})), 100)
 
+    def test_working_line_names_the_file_for_edits_and_writes(self):
+        # These tools carry no description, so until now they produced no step line at all.
+        self.assertEqual(hook.working_line("Edit", {"file_path": "/Users/me/dev/repo/src/foo.py"}), "Editing src/foo.py")
+        self.assertEqual(hook.working_line("Write", {"file_path": "notes.md"}), "Writing notes.md")
+        self.assertEqual(hook.working_line("NotebookEdit", {"notebook_path": "/a/b/c.ipynb"}), "Editing b/c.ipynb")
+        self.assertEqual(hook.working_line("MultiEdit", {"file_path": "x/y/z"}), "Editing y/z")
+        self.assertEqual(hook.working_line("Edit", {"file_path": "/p/q.py", "description": "Fix the typo"}), "Fix the typo")
+        self.assertIsNone(hook.working_line("Edit", {}))
+        self.assertIsNone(hook.working_line("Edit", {"file_path": "   "}))
+        self.assertIsNone(hook.working_line("Read", {"file_path": "/p/q.py"}))
+        self.assertEqual(len(hook.working_line("Write", {"file_path": "a/" + "b" * 300})), 100)
+
     def test_a_processing_append_binds_the_task_to_this_session_and_writes_no_working_row(self):
         out = hook.handle(self.pre("S1", "Bash", {"command": "python3 activity.py append 'picked up' --kind processing --task-id task-1", "description": "Tag the task"}), self.p, self.run)
         self.assertEqual((out, self.runs), ([], []))
@@ -458,8 +607,8 @@ class Hook(unittest.TestCase):
         self.assertEqual((out, self.runs), ([], []), "the writer's own calls never become rows")
 
     def test_working_rows_go_only_to_the_task_bound_to_this_session(self):
-        self.log({"ts": 1, "room": "!team:s", "task": {"id": "t-team", "from": "@t:s", "text": "team task"}, "line": "a"},
-                 {"ts": 2, "room": "!dm:s", "task": {"id": "t-dm", "from": "@q:s", "text": "owner task"}, "line": "b"})
+        self.log({"ts": 1, "kind": "processing", "room": "!team:s", "task": {"id": "t-team", "from": "@t:s", "text": "team task"}, "line": "a"},
+                 {"ts": 2, "kind": "processing", "room": "!dm:s", "task": {"id": "t-dm", "from": "@q:s", "text": "owner task"}, "line": "b"})
         hook.bind(self.p, "t-team", "S-team")
         hook.bind(self.p, "t-dm", "S-dm")
         # the reviewer's control: a newer sidechain/other session must not reach the team room
@@ -476,7 +625,7 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.handle(self.pre("S-dm", "Bash", {"command": "x", "description": "After done"}), self.p, self.run), [], "a closed task takes no more rows")
 
     def test_stop_writes_this_sessions_last_narration_from_complete_lines_only(self):
-        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "t1", "text": "x"}, "line": "a"})
+        self.log({"ts": 1, "kind": "processing", "room": "!dm:s", "task": {"id": "t1", "text": "x"}, "line": "a"})
         hook.bind(self.p, "t1", "S1")
         tp = self.ws / "s1.jsonl"
         rows = [json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}),
@@ -554,7 +703,7 @@ class Hook(unittest.TestCase):
         return {"hook_event_name": "PostToolUse", "session_id": sid, "tool_name": tool, "tool_input": inp, "tool_response": {}}
 
     def test_done_is_written_after_the_result_write_and_only_if_the_file_exists(self):
-        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "task-abc123", "from": "@q:s", "text": "x"}, "line": "picked up"})
+        self.log({"ts": 1, "kind": "processing", "room": "!dm:s", "task": {"id": "task-abc123", "from": "@q:s", "text": "x"}, "line": "picked up"})
         hook.bind(self.p, "task-abc123", "S1")
         rpath = self.ws / "results" / "task-abc123.txt"
         write = {"file_path": str(rpath), "content": "reply"}
@@ -575,8 +724,8 @@ class Hook(unittest.TestCase):
 
     def test_two_open_tasks_in_one_session_the_newest_wins(self):
         # Review blocker: an abandoned older task must not keep receiving the session's rows.
-        self.log({"ts": 1, "room": "!r1:s", "task": {"id": "task-aaa111", "from": "@q:s", "text": "old"}, "line": "a"},
-                 {"ts": 2, "room": "!r2:s", "task": {"id": "task-bbb222", "from": "@q:s", "text": "new"}, "line": "b"})
+        self.log({"ts": 1, "kind": "processing", "room": "!r1:s", "task": {"id": "task-aaa111", "from": "@q:s", "text": "old"}, "line": "a"},
+                 {"ts": 2, "kind": "processing", "room": "!r2:s", "task": {"id": "task-bbb222", "from": "@q:s", "text": "new"}, "line": "b"})
         hook.bind(self.p, "task-aaa111", "S1")
         hook.bind(self.p, "task-bbb222", "S1")
         task, room = hook.bound_task(self.p, "S1")
@@ -627,7 +776,7 @@ class Hook(unittest.TestCase):
         self.assertEqual(self.runs, [])
 
     def test_main_reads_stdin_and_always_exits_zero(self):
-        self.log({"ts": 1, "room": "!dm:s", "task": {"id": "t1", "text": "x"}, "line": "a"})
+        self.log({"ts": 1, "kind": "processing", "room": "!dm:s", "task": {"id": "t1", "text": "x"}, "line": "a"})
         hook.bind(self.p, "t1", "S1")
         payload = json.dumps(self.pre("S1", "Bash", {"command": "ls", "description": "List files"}))
         self.assertEqual(hook.main(io.StringIO(payload), self.ws), 0)

@@ -28,6 +28,11 @@ import unittest
 import urllib.parse
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOM_OPS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
 sys.path.insert(0, str(_ROOM_OPS))
 import read as rd  # noqa: E402
@@ -267,6 +272,19 @@ class NormalizeCommonsCommentTests(unittest.TestCase):
                          "[area 1200,3400 2000x1500 bp on doc; picture: mxc://hs/pic1]")
         self.assertEqual(out[0]["body"], "look here")
 
+    def test_comment_preserves_media_and_reply_metadata(self):
+        message = {"event_id": "$e", "sender": HS, "body": "look here",
+                   "commons_comment": self.CC, "media_ref": "mxc://hs/pic1",
+                   "msgtype": "m.image", "mimetype": "image/png",
+                   "m.relates_to": {"rel_type": "m.thread", "event_id": "$root",
+                                    "m.in_reply_to": {"event_id": "$parent"}}}
+        result = rd._normalize([message])[0]
+        for key in ("commons_comment", "media_ref", "msgtype", "mimetype"):
+            self.assertEqual(result[key], message[key])
+        self.assertEqual(result["in_reply_to"], "$parent")
+        self.assertEqual(result["thread_root"], "$root")
+        self.assertIn("picture: mxc://hs/pic1", result["commons_comment_line"])
+
     def test_plain_message_grows_no_commons_keys(self):
         out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "hi"}])
         self.assertNotIn("commons_comment", out[0])
@@ -347,6 +365,20 @@ class NormalizeMediaRefTests(unittest.TestCase):
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertEqual(out[0]["msgtype"], "m.file")
 
+    def test_broker_shaped_media_event_keeps_its_handle(self):
+        # The broker names the handle `mxc` and adds `mimetype` (room_ops `_media_fields`).
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "guide.md",
+                              "msgtype": "m.file", "mxc": "mxc://hs/abc123",
+                              "mimetype": "text/markdown"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
+        self.assertEqual(out[0]["msgtype"], "m.file")
+        self.assertEqual(out[0]["mimetype"], "text/markdown")
+
+    def test_media_ref_wins_when_both_names_arrive(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "a.pdf",
+                              "media_ref": "mxc://hs/ref", "mxc": "mxc://hs/other"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/ref")
+
     def test_media_without_msgtype_grows_no_null(self):
         # Third case: media present, msgtype absent. The gateway is external, so this
         # cannot be ruled out from here — keep the same additive shape as plain text.
@@ -354,6 +386,7 @@ class NormalizeMediaRefTests(unittest.TestCase):
                               "media_ref": "mxc://hs/abc123"}])
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertNotIn("msgtype", out[0])
+        self.assertNotIn("mimetype", out[0])
 
     def test_no_media_ref_key_for_plain_message(self):
         # A text message must not grow a null media_ref — keep the shape additive.

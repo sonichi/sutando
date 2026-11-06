@@ -1,0 +1,193 @@
+{
+ "tests": [
+  "tests/collaborator-attachment-gate.test.py",
+  "tests/gateway-disposal-delegation.test.py",
+  "tests/health-check-outbox-parked.test.py",
+  "tests/team-guard-suppress-journaled-silent-close.test.py",
+  "tests/team-result-guard.test.py",
+  "tests/withheld-review-decision-final.test.py",
+  "tests/withheld-review-dm.test.py"
+ ],
+ "mutants": [
+  {
+   "name": "the folder helper skips the strict walk",
+   "file": "src/policy/egress/result.py",
+   "old": "    if not present(directory, stat.S_IFDIR):\n        directory.mkdir(mode=0o700, parents=True, exist_ok=True)\n        if not present(directory, stat.S_IFDIR):\n            raise FileNotFoundError(2, \"No such file or directory\", str(directory))\n    return directory",
+   "new": "    directory.mkdir(mode=0o700, parents=True, exist_ok=True)\n    return directory"
+  },
+  {
+   "name": "a move accepts a linked source",
+   "file": "src/policy/egress/result.py",
+   "old": "    if not present(source, stat.S_IFREG):                # a real file, reached through no link\n        raise FileNotFoundError(2, \"No such file or directory\", str(source))\n",
+   "new": ""
+  },
+  {
+   "name": "a move writes through an unverified target folder",
+   "file": "src/policy/egress/result.py",
+   "old": "    _ensure_dir(target.parent)\n    if not hasattr(os, \"O_DIRECTORY\"):",
+   "new": "    if not hasattr(os, \"O_DIRECTORY\"):"
+  },
+  {
+   "name": "a new review folder is created through a link",
+   "file": "src/policy/egress/result.py",
+   "old": "        os.chmod(_ensure_dir(directory), 0o700)\n    except OSError:\n        return TeamResultVerdict(VERDICT_LEAK",
+   "new": "        directory.mkdir(parents=True, exist_ok=True)\n        os.chmod(directory, 0o700)\n    except OSError:\n        return TeamResultVerdict(VERDICT_LEAK"
+  },
+  {
+   "name": "the reply does not use the shared preflight",
+   "file": "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
+   "old": "        problems = team_result_guard.namespace_problems(directory)",
+   "new": "        problems = []"
+  },
+  {
+   "name": "the preflight skips archive/superseded/",
+   "file": "src/policy/egress/result.py",
+   "old": "                            (directory / \"archive\" / \"superseded\", True),\n",
+   "new": ""
+  },
+  {
+   "name": "the preflight skips claims/",
+   "file": "src/policy/egress/result.py",
+   "old": "(directory / \"conflicts\", True), (directory / \"claims\", False),",
+   "new": "(directory / \"conflicts\", True),"
+  },
+  {
+   "name": "the preflight skips issued/",
+   "file": "src/policy/egress/result.py",
+   "old": "                            (directory / \"issued\", False)):",
+   "new": "                            ):"
+  },
+  {
+   "name": "the preflight does not check claims/ and issued/ entries",
+   "file": "src/policy/egress/result.py",
+   "old": "                if not records:\n                    present(path, stat.S_IFREG)  # a directory, FIFO or link here is unknown\n                elif",
+   "new": "                if not records:\n                    pass\n                elif"
+  },
+  {
+   "name": "the preflight accepts a non-object",
+   "file": "src/policy/egress/result.py",
+   "old": "                elif not isinstance(read_json_strict(path), dict):",
+   "new": "                elif read_json_strict(path) is None:"
+  },
+  {
+   "name": "the preflight reads through links",
+   "file": "src/policy/egress/result.py",
+   "old": "                elif not isinstance(read_json_strict(path), dict):",
+   "new": "                elif not isinstance(json.loads(Path(path).read_text(encoding=\"utf-8\")), dict):"
+  },
+  {
+   "name": "the health check scans on its own",
+   "file": "src/health-check.py",
+   "old": "    for path, reason in guard.namespace_problems(base):",
+   "new": "    for path, reason in []:"
+  },
+  {
+   "name": "the read opens only the leaf no-follow",
+   "file": "src/policy/egress/result.py",
+   "old": "    if not hasattr(os, \"O_DIRECTORY\"):  # no dir_fd walk on this platform: the leaf alone",
+   "new": "    if True:"
+  },
+  {
+   "name": "a directory step of the read follows links",
+   "file": "src/policy/egress/result.py",
+   "old": "            step = os.open(name, flags | nofollow, dir_fd=fd)",
+   "new": "            step = os.open(name, flags, dir_fd=fd)"
+  },
+  {
+   "name": "the read's namespace root follows a link",
+   "file": "src/policy/egress/result.py",
+   "old": "    fd = os.open(root, flags | nofollow)",
+   "new": "    fd = os.open(root, flags)"
+  },
+  {
+   "name": "a non-regular claims/ or issued/ entry reads as fine",
+   "file": "src/policy/egress/result.py",
+   "old": "                    present(path, stat.S_IFREG)  # a directory, FIFO or link here is unknown",
+   "new": "                    present(path)"
+  },
+  {
+   "name": "the suppression journal creates its folder through a link",
+   "file": "src/policy/egress/result.py",
+   "old": "        os.chmod(_ensure_dir(directory), 0o700)\n    except OSError:\n        return TeamResultVerdict(VERDICT_SUPPRESS",
+   "new": "        directory.mkdir(parents=True, exist_ok=True)\n        os.chmod(directory, 0o700)\n    except OSError:\n        return TeamResultVerdict(VERDICT_SUPPRESS"
+  },
+  {
+   "name": "the quarantine journal creates its folder through a link",
+   "file": "src/policy/egress/result.py",
+   "old": "        os.chmod(_ensure_dir(directory), 0o700)\n    except OSError:\n        return False",
+   "new": "        directory.mkdir(parents=True, exist_ok=True)\n        os.chmod(directory, 0o700)\n    except OSError:\n        return False"
+  },
+  {
+   "name": "the move syncs the folder it linked into by name, not by fd",
+   "file": "src/policy/egress/result.py",
+   "old": "            _fsync_fd(target_fd)                         # the directory linked into, by fd, not name",
+   "new": "            _fsync_directory(target.parent)"
+  },
+  {
+   "name": "the move follows a source swapped for a link",
+   "file": "src/policy/egress/result.py",
+   "old": "                    follow_symlinks=False)               # no-clobber: an existing file stays",
+   "new": "                    follow_symlinks=True)"
+  },
+  {
+   "name": "the record open blocks on a FIFO and accepts any file type",
+   "file": "src/policy/egress/result.py",
+   "old": "    flags = (os.O_RDONLY | getattr(os, \"O_NOFOLLOW\", 0) | getattr(os, \"O_NONBLOCK\", 0)\n             | getattr(os, \"O_CLOEXEC\", 0))",
+   "new": "    flags = os.O_RDONLY | getattr(os, \"O_NOFOLLOW\", 0)\n    _regular_only = lambda fd: fd  # noqa: E731"
+  },
+  {
+   "name": "the move does not re-verify the held folders before the unlink",
+   "file": "src/policy/egress/result.py",
+   "old": "            if not (_still_at(target_fd, target.parent) and _still_at(source_fd, source.parent)):\n                os.unlink(target.name, dir_fd=target_fd)  # rebound after the open: undo, keep the source\n                _fsync_fd(target_fd)\n                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")\n",
+   "new": ""
+  },
+  {
+   "name": "the move does not re-verify after the unlink",
+   "file": "src/policy/egress/result.py",
+   "old": "            if not _still_at(target_fd, target.parent):    # rebound between the check and the unlink",
+   "new": "            if False:"
+  },
+  {
+   "name": "a failed re-verification raises past the undo",
+   "file": "src/policy/egress/result.py",
+   "old": "    except OSError:\n        return False  # unknown is not \"still there\"",
+   "new": "    except ZeroDivisionError:\n        return False"
+  },
+  {
+   "name": "the walk accepts a Windows junction",
+   "file": "src/policy/egress/result.py",
+   "old": "        if stat.S_ISLNK(mode) or getattr(status, \"st_file_attributes\", 0) & _REPARSE_POINT:",
+   "new": "        if stat.S_ISLNK(mode):"
+  },
+  {
+   "name": "without directory fds a move falls back to moving by path",
+   "file": "src/policy/egress/result.py",
+   "old": "    if not hasattr(os, \"O_DIRECTORY\"):                   # no fd confinement here: refuse, never by path\n        raise OSError(f\"{source}: a confined move needs directory fds; the record stays\")",
+   "new": "    if not hasattr(os, \"O_DIRECTORY\"):\n        os.link(source, target)\n        _fsync_directory(target.parent)\n        os.unlink(source)\n        _fsync_directory(source.parent)\n        return"
+  },
+  {
+   "name": "the first rollback does not sync the removed copy",
+   "file": "src/policy/egress/result.py",
+   "old": "                _fsync_fd(target_fd)\n                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")",
+   "new": "                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")"
+  },
+  {
+   "name": "the second rollback does not sync the restored record",
+   "file": "src/policy/egress/result.py",
+   "old": "                _fsync_fd(source_fd)                     # the record is back before the copy goes\n",
+   "new": ""
+  },
+  {
+   "name": "the second rollback does not sync the removed copy",
+   "file": "src/policy/egress/result.py",
+   "old": "                _fsync_fd(target_fd)\n                raise OSError(f\"{target.parent}: moved during the move; the record was put back\")",
+   "new": "                raise OSError(f\"{target.parent}: moved during the move; the record was put back\")"
+  },
+  {
+   "name": "the held-folder re-check skips the walk",
+   "file": "src/policy/egress/result.py",
+   "old": "        if not present(directory, stat.S_IFDIR):\n            return False\n        held, there = os.fstat(fd), os.lstat(directory)",
+   "new": "        held, there = os.fstat(fd), os.lstat(directory)"
+  }
+ ]
+}

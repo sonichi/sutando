@@ -28,6 +28,9 @@ ESCALATE_AFTER_S = 180.0
 # A dead worker that still owes work recovers on the tick that confirms its
 # first detection, not after the full sustain.
 FAST_SUSTAINED_TICKS = 2
+# An idle seat whose watcher is live but whose owed task was never typed in: longer than any
+# normal hand-off, short enough that a blocked delivery is not left for an hour.
+UNDELIVERED_AFTER_S = 900.0
 
 # Beat readings, as pool_beat classifies them.
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
@@ -35,12 +38,14 @@ LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
 # offering an Escape, or an expired login. No card decision ends or types into a session.
-CARD_CAUSE, CARD_FROZEN, CARD_LOGIN = "card_cause", "card_frozen", "card_login"
-# The card each wedge kind asks for; "human" has none, it escalates.
-WEDGE_CARDS = {"abnormal": CARD_CAUSE, "stuck": CARD_FROZEN, "login": CARD_LOGIN}
+CARD_CAUSE, CARD_FROZEN, CARD_LOGIN, CARD_HUMAN, CARD_UNDELIVERED = (
+    "card_cause", "card_frozen", "card_login", "card_human", "card_undelivered")
+# Each wedge kind asks for a durable card.
+WEDGE_CARDS = {"abnormal": CARD_CAUSE, "stuck": CARD_FROZEN, "login": CARD_LOGIN,
+               "human": CARD_HUMAN, "undelivered": CARD_UNDELIVERED}
 
 # The worker's pane, as the caller reads one capture. GATE and LIMIT wait on a
-# human (a dialog, a spend or wait decision), so they escalate as a gate does.
+# human (a dialog, a spend or wait decision), so their cards offer only a terminal link.
 PANE_IDLE, PANE_WORKING, PANE_GATE, PANE_LIMIT, PANE_ABNORMAL, PANE_UNKNOWN = (
     "idle", "working", "gate", "limit", "abnormal", "unknown")
 # The CLI's own "Login expired · Please run /login": alive, and able to do no work.
@@ -72,6 +77,8 @@ class Observation:
     work_outstanding: bool | None = None
     pane: str | None = None
     pane_id: str | None = None
+    # Why typed delivery cannot reach this seat, when the caller can tell ("pane-key-fence").
+    delivery_block: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,25 +138,42 @@ def _is_watcher_loss(obs: Observation) -> bool:
             and obs.watcher_held is False)
 
 
+def _wait_part(pane_id: str | None) -> str | None:
+    """The progress half of a "raw:progress" frame id; None for a bare raw id."""
+    head, sep, tail = (pane_id or "").partition(":")
+    return tail if sep and head and tail else None
+
+
+def _wait_moved(obs: Observation, ev: WorkerEvidence) -> bool:
+    """The last tick read the same gate or limit and the work on screen has changed since
+    (pane_gate.progress_id): the session progresses under a stale banner."""
+    now, before = _wait_part(obs.pane_id), _wait_part(ev.last_pane_id)
+    return bool(ev.wedge_kind == "human" and now and before and now != before)
+
+
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
-    """"login" (the session is logged out), "human" (a gate or limit on screen),
+    """"login" (the session is logged out), "human" (a gate or limit on a frame
+    that has not moved since the last tick),
     "abnormal" (cli_wedge text), "stuck" (a turn whose raw frame has not changed
-    since the last tick), else None. A logged-out session is wedged whether or
-    not it owes work: nothing routed to it can ever run. Otherwise only a worker
-    that owes work is wedged: an idle pane at rest is healthy, and one that owes
-    work but sits at its prompt is the watcher rung's case."""
+    since the last tick), "undelivered" (an idle pane that owes work while its
+    watcher beats: the task was never typed in), else None. A logged-out session is
+    wedged whether or not it owes work: nothing routed to it can ever run. Otherwise
+    only a worker that owes work is wedged; one whose watcher is not live is the
+    watcher rung's case."""
     if obs.session_alive is not True:
         return None
     if obs.pane == PANE_LOGGED_OUT:
         return "login"
     if obs.work_outstanding is not True:
         return None
-    if obs.pane in _HUMAN_PANES:
+    if obs.pane in _HUMAN_PANES and not _wait_moved(obs, ev):
         return "human"
     if obs.pane == PANE_ABNORMAL:
         return "abnormal"
     if obs.pane == PANE_WORKING and obs.pane_id and obs.pane_id == ev.last_pane_id:
         return "stuck"
+    if obs.pane == PANE_IDLE and obs.watcher_beat == LIVE:
+        return "undelivered"
     return None
 
 
@@ -159,21 +183,32 @@ def _cleared_wedge(ev: WorkerEvidence) -> WorkerEvidence:
 
 
 def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
-                sustained_ticks: int, detect_after_s: float) -> tuple[WorkerEvidence, str]:
+                sustained_ticks: int, detect_after_s: float,
+                undelivered_after_s: float = UNDELIVERED_AFTER_S) -> tuple[WorkerEvidence, str]:
     """Same sustain and stale line as death, and one decision per episode: a gate
-    or limit escalates; abnormal text asks for a card naming its cause; a frozen
+    or limit asks for a terminal card; abnormal text asks for a card naming its cause; a frozen
     turn asks for a card offering Escape; an expired login asks for a card on
     the tick that reads it, since the banner is the CLI's own words and not a
     timing question a sustain could answer. No wedge kind restarts a session.
     The one decision is per (episode, kind): a pane that moves from one wedge
     straight into another is owed the new kind's decision, since the card already
     up names a condition the pane no longer shows."""
+    if ev.wedge_kind == "human" and (
+            obs.session_alive is not True or obs.pane in (None, PANE_UNKNOWN)
+            or (obs.pane in _HUMAN_PANES and obs.work_outstanding is None)):
+        return ev, NOTHING
     kind = _wedge_kind(obs, ev)
     ev = replace(ev, last_pane_id=obs.pane_id)
     if kind is None:
         return _cleared_wedge(ev), NOTHING
-    if ev.wedge_escalated and ev.wedge_kind not in (None, kind):
+    # A legacy acknowledgment cannot prove a login card exists; other kinds
+    # retain their existing compatibility behavior.
+    if ev.wedge_escalated and (ev.wedge_kind not in (None, kind)
+                              or (ev.wedge_kind is None and kind == "login")):
         ev = replace(ev, wedge_escalated=False)
+    if kind == "undelivered" and ev.wedge_kind != "undelivered":
+        # Its threshold is time spent idle and owing, not time since an earlier wedge began.
+        ev = replace(ev, wedge_first_detected_at=None, wedge_consecutive=0)
     ev = replace(
         ev,
         wedge_kind=kind,
@@ -184,10 +219,10 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     elapsed = now - ev.wedge_first_detected_at
     if kind != "login" and (ev.wedge_consecutive < sustained_ticks or elapsed < detect_after_s):
         return ev, NOTHING
+    if kind == "undelivered" and elapsed < undelivered_after_s:
+        return ev, NOTHING
     if ev.wedge_escalated:
         return ev, NOTHING
-    if kind == "human":
-        return replace(ev, wedge_escalated=True), ESCALATE
     # A card decision repeats each tick until `acknowledge` records that it was raised.
     return ev, WEDGE_CARDS[kind]
 
@@ -281,7 +316,11 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
     for worker_id, obs in observations.items():
         if obs.paused:
             # Owner-paused outranks every signal, and observing a paused worker
-            # never clears the pause. Its evidence is left exactly as it was.
+            # never clears the pause. Its evidence is left as it was, except that an
+            # undelivered episode ends: a pause is not time a delivery was refused.
+            ev = workers.get(worker_id)
+            if ev is not None and ev.wedge_kind == "undelivered":
+                workers[worker_id] = _cleared_wedge(ev)
             decisions[worker_id] = NOTHING
             continue
 

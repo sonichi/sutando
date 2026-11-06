@@ -91,8 +91,17 @@ class OneIndexPass(unittest.TestCase):
 
 class CardIsAcknowledgedOnlyOnceItExists(unittest.TestCase):
     def test_a_failed_first_attempt_is_retried_on_the_next_tick(self):
+        self.check_retry(ABNORMAL, ps.CARD_CAUSE)
+
+    def test_failed_human_card_creation_is_retried(self):
+        self.check_retry("  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n",
+                         ps.CARD_HUMAN)
+
+    def check_retry(self, pane, decision):
         ws = pool()
         (pd.deliveries_dir(ws, WID) / "task-owed.txt").write_bytes(b"")
+        (ws / "tasks").mkdir(exist_ok=True)
+        (ws / "tasks" / "task-owed.txt").write_text("task: hello\n")
         captures = {"card": 0}
 
         def runner(argv, **kw):
@@ -101,7 +110,7 @@ class CardIsAcknowledgedOnlyOnceItExists(unittest.TestCase):
                     captures["card"] += 1
                     if captures["card"] == 1:
                         return Done(1, err="no server running")
-                return Done(0, ABNORMAL)
+                return Done(0, pane)
             if "inbox-holders" in argv:
                 return Done(0, "4242 session\n")
             return Done(0)
@@ -117,7 +126,7 @@ class CardIsAcknowledgedOnlyOnceItExists(unittest.TestCase):
             outcomes.append((acted.get("cards") or {}).get(WID, {}).get("outcome"))
             escalated.append(sup.load_state(ws).workers[WID].wedge_escalated)
             now += 300.0
-        c = ps.CARD_CAUSE
+        c = decision
         self.assertEqual(decisions, ["nothing", "nothing", c, c, "nothing", "nothing"])
         self.assertEqual(outcomes, [None, None, "indeterminate", "carded", None, None])
         self.assertEqual(escalated, [False, False, False, True, True, True],

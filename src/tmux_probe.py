@@ -13,6 +13,8 @@ Dependency-light on purpose: stdlib only, so the 3-second liveness loop, the
 supervisor gate and the heartbeat can all import it without the rest of src/.
 """
 
+import os
+import shutil
 import subprocess
 from typing import Optional
 
@@ -23,6 +25,20 @@ ABSENT_SIGNATURES = (
     "no server running",
     "(No such file or directory)",
 )
+
+# A launchd or app-spawned PATH can lack Homebrew, where tmux usually lives.
+TMUX_CANDIDATES = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux")
+
+
+def tmux_binary() -> str:
+    """Resolve tmux from PATH, else the first known install that exists, else bare "tmux"."""
+    found = shutil.which("tmux")
+    if found:
+        return found
+    for cand in TMUX_CANDIDATES:
+        if os.path.exists(cand):
+            return cand
+    return "tmux"
 
 
 def classify(returncode: Optional[int], stderr) -> Optional[bool]:
@@ -45,12 +61,13 @@ def classify(returncode: Optional[int], stderr) -> Optional[bool]:
 
 
 def has_session(socket: str, session: str, timeout: float = 10,
-                tmux: str = "tmux") -> Optional[bool]:
-    """Run `tmux -S <socket> has-session -t =<session>` and classify it."""
+                tmux: Optional[str] = None) -> Optional[bool]:
+    """Run `tmux -u -S <socket> has-session -t =<session>` and classify it."""
+    tmux = tmux or tmux_binary()
     # Exact: a bare name also matches as a prefix, so a dead seat's `-input` session reads it alive.
     target = session if session.startswith("=") else "=" + session
     try:
-        r = subprocess.run([tmux, "-S", socket, "has-session", "-t", target],
+        r = subprocess.run([tmux, "-u", "-S", socket, "has-session", "-t", target],
                            capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None

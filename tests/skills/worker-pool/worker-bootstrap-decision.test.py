@@ -16,11 +16,17 @@ import importlib.util
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3] / "tests" / "_helpers"))
+from process_group import (STABLE_WATCHER_BODY, group_members as _group_members,  # noqa: E402
+                           kill_group as _kill_group, spawn_detached as _spawn_detached,
+                           popen_in_own_group, own_group)
 from unittest.mock import patch
 from pathlib import Path
 
@@ -190,9 +196,9 @@ class TestMain(Base):
         self.assertEqual(out[0], "start")
         sweep = [l for l in out if l.startswith("sweep=")]
         self.assertEqual(len(sweep), 1, out)
-        self.assertIn("stale=3", sweep[0])
+        self.assertIn("archived=3", sweep[0])
         self.assertIn("kept=1", sweep[0])
-        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-owed.txt"])
+        self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")), ["task-owed.txt"])
 
     def test_the_prune_never_releases_an_accepted_delivery(self):
         """On `skip` this worker's own watcher is live, so an accepted sentinel is
@@ -204,13 +210,13 @@ class TestMain(Base):
         (d / f"task-live{pd.ACCEPTED_SUFFIX}").touch()
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
+        self.assertEqual([p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")], [f"task-live{pd.ACCEPTED_SUFFIX}"],
                          "an in-flight delivery was renamed back to pending")
 
     def test_every_way_a_finished_sentinel_can_be_spent(self):
-        """`_nothing_can_re_queue` has three ways to say yes, and each is a real
-        shape: the payload is gone, a ready result is still on disk, or the
-        payload is archived. All three retire; none of them can re-queue."""
+        """Spent is sentinel_retirable: the payload is gone or a ready result is on
+        disk, and both are archived. A payload still live in tasks/ is kept even
+        with an archived copy, since the core's queue reads tasks/ and would re-run it."""
         pd = self._pd()
         d = self._inbox_dir()
         tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
@@ -226,13 +232,9 @@ class TestMain(Base):
         (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
         arch = pd.archived_payload(Path(self.ws), "task-arch")
         arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
-        # Each one alone, so a shared fixture cannot mask a branch that never runs.
-        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-gone"), "payload gone")
-        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-result"), "ready result")
-        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("retired=3", out)
-        self.assertEqual(list(d.iterdir()), [])
+        self.assertEqual(out, "archived=2 pruned=0 kept=1")
+        self.assertEqual([p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")], ["task-arch.txt"])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
         """The same task can sit in the folder as `.accepted` and `.txt`; the
@@ -242,13 +244,14 @@ class TestMain(Base):
         (d / f"task-two{pd.ACCEPTED_SUFFIX}").touch()
         (d / "task-two.txt").touch()
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("stale=1", out)
-        self.assertNotIn("stale=2", out)
-        self.assertEqual(len(list(d.iterdir())), 1, "the second name was judged again")
+        self.assertIn("archived=1", out)
+        self.assertNotIn("archived=2", out)
+        # Judged once, and both of its names leave together, as archive_finished moves them.
+        self.assertEqual([p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")], [])
 
     def test_a_finished_sentinel_whose_payload_could_be_re_queued_is_kept(self):
-        """`residue` calls a done flag alone `finished`, but with the payload still
-        in tasks/ and no findable result, removing the sentinel re-queues it."""
+        """A done flag alone is not spent: with the payload still in tasks/ and no
+        findable result, removing the sentinel re-queues it, archived copy or not."""
         pd = self._pd()
         d = self._inbox_dir()
         tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
@@ -256,13 +259,12 @@ class TestMain(Base):
             (tasks / f"{tid}.txt").write_text(f"id: {tid}\nsource: test\ntask: x\n")
             (d / f"{tid}.txt").touch()
             pd.mark_done(self.ws, WORKER, tid, published=True)
-        # task-done's reply is archived, so nothing can re-queue it; task-fin's is not.
+        # task-done also has an archived copy, but its live tasks/ file is what the core queues.
         arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
         arch.write_text("archived")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("retired=1", out)
-        self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], ["task-fin.txt"])
+        self.assertEqual(out, "archived=0 pruned=0 kept=2")
+        self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")), ["task-done.txt", "task-fin.txt"])
 
     def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
         """A prune that raises must leave the decision, its exit code and its first
@@ -518,18 +520,11 @@ class TestOwnershipIsScopedToThisSession(Base):
     def test_a_detached_watcher_on_this_inbox_is_not_this_sessions(self):
         """The real shape: a watcher reparented away from this session."""
         script = self.ws / "watch-tasks-stream.sh"
-        script.write_text("#!/bin/sh\nsleep 30\n")
-        out = subprocess.run(
-            ["bash", "-c", f'nohup bash "{script}" "{self.inbox}" >/dev/null 2>&1 & echo $!'],
-            capture_output=True, text=True, check=True).stdout.strip()
-        pid = int(out)
-        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        script.write_text(STABLE_WATCHER_BODY)
+        pid = _spawn_detached(script, self.inbox)
+        own_group(self, pid)
         import watcher_identity
-        for _ in range(50):
-            if watcher_identity.proc_argv_vector(pid) is not None:
-                break
-            time.sleep(0.02)
-        else:
+        if not _wait_for_exec(pid, str(script), watcher_identity.proc_argv_vector):
             self.skipTest("no authoritative argv read on this platform")
         table = wb._process_table()
         if wb.session_root(table, os.getppid()) is None:
@@ -541,6 +536,127 @@ class TestOwnershipIsScopedToThisSession(Base):
                            alive=lambda p: True)
         self.assertEqual(d, "start", why)
         self.assertIn("not started by this session", why)
+
+
+def _wait_for_exec(pid, script, read_argv, tries=250, delay=0.02):
+    """True once the production classifier accepts pid's argv as this script's
+    watcher; the forked `bash -c` and `nohup` stages are both rejected."""
+    import watcher_identity
+    for _ in range(tries):
+        argv = read_argv(pid)
+        if argv is not None and len(argv) >= 2 and argv[1] == script:
+            v = watcher_identity.classify_argv(" ".join(argv), pid, lambda _p: argv)
+            if v.watcher is True:
+                return True
+        time.sleep(delay)
+    return False
+
+
+STAGES = [None, ["bash", "-c", "nohup bash /w/watch-tasks-stream.sh /in &"],
+          ["nohup", "bash", "/w/watch-tasks-stream.sh", "/in"],
+          ["bash", "/w/watch-tasks-stream.sh", "/in"]]
+
+
+def _staged(seq):
+    it = iter(seq)
+    seen = []
+
+    def read(_pid):
+        v = next(it)
+        seen.append(v)
+        return v
+    return read, seen
+
+
+class TestWaitForExec(unittest.TestCase):
+    def test_consumes_every_pre_exec_stage_before_returning(self):
+        read, seen = _staged(STAGES)
+        self.assertTrue(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, delay=0))
+        self.assertEqual(len(seen), 4, "returned before the final exec landed")
+
+    def test_a_sequence_that_ends_at_nohup_is_not_a_watcher(self):
+        read, _ = _staged(STAGES[:3] + [STAGES[2]] * 5)
+        self.assertFalse(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, tries=8, delay=0))
+
+    def test_a_non_shell_with_the_script_in_argv1_is_not_a_watcher(self):
+        read, _ = _staged([["python3", "/w/watch-tasks-stream.sh", "/in"]] * 4)
+        self.assertFalse(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, tries=4, delay=0))
+
+    def test_gives_up_when_argv_never_names_the_script(self):
+        self.assertFalse(_wait_for_exec(1, "/w/x.sh", lambda _p: ["bash", "-c", "x"],
+                                        tries=3, delay=0))
+
+    def test_an_exec_into_the_last_command_is_rejected_by_the_classifier(self):
+        import watcher_identity
+        after = ["sleep", "30"]
+        v = watcher_identity.classify_argv(" ".join(after), 1, lambda _p: after)
+        self.assertIsNot(v.watcher, True)
+
+
+class TestFixtureTeardownOwnsTheProcessGroup(unittest.TestCase):
+    def test_killing_only_the_shell_would_orphan_its_sleep_child(self):
+        import watcher_identity
+        ws = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(ws)], capture_output=True))
+        script = ws / "watch-tasks-stream.sh"
+        script.write_text(STABLE_WATCHER_BODY)
+        pid = _spawn_detached(str(script), str(ws))
+        self.addCleanup(_kill_group, pid)
+        if not _wait_for_exec(pid, str(script), watcher_identity.proc_argv_vector):
+            self.skipTest("no authoritative argv read on this platform")
+        for _ in range(100):
+            if len(_group_members(pid)) >= 2:
+                break
+            time.sleep(0.02)
+        self.assertGreaterEqual(len(_group_members(pid)), 2, "shell and its sleep child")
+        subprocess.run(["kill", str(pid)], capture_output=True)      # the old teardown
+        time.sleep(0.2)
+        survivors = [p for p in _group_members(pid) if p != pid]
+        self.assertTrue(survivors, "the sleep child should have outlived a shell-only kill")
+        _kill_group(pid)
+        self.assertEqual(_group_members(pid), [])
+
+
+class TestFixtureWatcherArgvIsStable(unittest.TestCase):
+    """The detached fixture must keep the shell-plus-script argv for as long as
+    the gate may re-read it, not just at the moment the wait returns."""
+
+    def _spawn(self, body):
+        ws = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(ws)], capture_output=True))
+        script = ws / "watch-tasks-stream.sh"
+        script.write_text(body)
+        pid = _spawn_detached(script, ws)
+        own_group(self, pid)
+        return pid, str(script)
+
+    def _samples(self, pid, n=6, gap=0.1):
+        import watcher_identity
+        out = []
+        for _ in range(n):
+            argv = watcher_identity.proc_argv_vector(pid)
+            out.append(argv if argv is None else
+                       watcher_identity.classify_argv(" ".join(argv), pid, lambda _p: argv).watcher)
+            time.sleep(gap)
+        return out
+
+    def test_the_stable_body_stays_a_watcher_while_it_sleeps(self):
+        import watcher_identity
+        pid, script = self._spawn(STABLE_WATCHER_BODY)
+        if not _wait_for_exec(pid, script, watcher_identity.proc_argv_vector):
+            self.skipTest("no authoritative argv read on this platform")
+        self.assertEqual(self._samples(pid), [True] * 6)
+
+    def test_a_bare_sleep_body_shows_the_boundary_the_stable_body_avoids(self):
+        import watcher_identity
+        pid, script = self._spawn("#!/bin/sh\nsleep 30\n")
+        if not _wait_for_exec(pid, script, watcher_identity.proc_argv_vector):
+            self.skipTest("no authoritative argv read on this platform")
+        samples = self._samples(pid)
+        if False not in samples:
+            self.skipTest("this shell does not exec its last command in place")
+        # The pid stopped reading as a watcher mid-sleep: the hazard the
+        # stable body removes.
 
 
 class TestTheShippedStartupNamesTheInbox(Base):
@@ -634,8 +750,10 @@ class TestThroughTheProcessInspectionBoundary(Base):
                          alive=lambda p: True)
 
     def _spawn(self, argv):
-        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: (p.kill(), p.wait()))
+        # Own process group: the body keeps its shell resident, so teardown must
+        # take the shell and its sleep child together and prove nothing is left.
+        p = popen_in_own_group(argv)
+        own_group(self, p.pid, reap=p.wait)
         import watcher_identity
         for _ in range(50):
             if watcher_identity.proc_argv_vector(p.pid) is not None:
@@ -671,7 +789,7 @@ class TestThroughTheProcessInspectionBoundary(Base):
 
     def test_a_genuine_watcher_on_this_inbox_is_skipped(self):
         script = self.ws / "watch-tasks-stream.sh"
-        script.write_text("#!/bin/sh\nsleep 30\n")
+        script.write_text(STABLE_WATCHER_BODY)
         p = self._spawn(["bash", str(script), self.inbox])
         import watcher_identity
         if watcher_identity.proc_argv_vector(p.pid) is None:
@@ -681,7 +799,7 @@ class TestThroughTheProcessInspectionBoundary(Base):
 
     def test_a_genuine_watcher_on_another_inbox_starts_ours(self):
         script = self.ws / "watch-tasks-stream.sh"
-        script.write_text("#!/bin/sh\nsleep 30\n")
+        script.write_text(STABLE_WATCHER_BODY)
         p = self._spawn(["bash", str(script), str(self.ws / "deliveries" / OTHER)])
         import watcher_identity
         if watcher_identity.proc_argv_vector(p.pid) is None:

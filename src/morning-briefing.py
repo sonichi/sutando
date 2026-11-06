@@ -18,6 +18,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.request import urlopen
 from urllib.error import URLError
 
@@ -26,6 +27,7 @@ from urllib.error import URLError
 _SRC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
 _MACOS_TOOLS_SCRIPTS = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts"
@@ -97,32 +99,31 @@ def _run_applescript(script: str, timeout: int = 8) -> tuple[str | None, str]:
         return None, ""
 
 
-def weather_location_configured() -> bool:
-    """Are WEATHER_LAT/WEATHER_LON set for this install?
-
-    `config_get` reads the config stanza before os.environ, so an env-only
-    check answers a different question than the one get_weather() asks.
-    """
+def weather_coordinates() -> Optional[tuple[float, float]]:
+    """Return configured, valid coordinates without assuming a location."""
     from sutando_config import config_get
-    return bool(config_get("WEATHER_LAT") and config_get("WEATHER_LON"))
-
-
-def get_weather() -> str:
-    """Fetch current conditions from Open-Meteo (no key needed)."""
     try:
-        # Default to SF; override via TZ if possible
-        lat, lon = 37.77, -122.42
-        tz_result, _ = _run_applescript(
-            'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
-            timeout=3
-        )
-        # Use lat/lon from config (env legacy fallback) if set
-        from sutando_config import config_get
-        configured = weather_location_configured()
-        if configured:
-            lat = float(config_get("WEATHER_LAT"))
-            lon = float(config_get("WEATHER_LON"))
+        lat = float(config_get("WEATHER_LAT"))
+        lon = float(config_get("WEATHER_LON"))
+    except (TypeError, ValueError):
+        return None
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
 
+
+def weather_location_configured() -> bool:
+    return weather_coordinates() is not None
+
+
+def get_weather() -> Optional[str]:
+    """Fetch current conditions only for a configured location."""
+    coordinates = weather_coordinates()
+    if coordinates is None:
+        return None
+    lat, lon = coordinates
+    try:
+        from sutando_config import config_get
         unit = (config_get("WEATHER_UNIT", "fahrenheit") or "fahrenheit").strip().lower()
         if unit not in ("fahrenheit", "celsius"):
             unit = "fahrenheit"
@@ -146,9 +147,7 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        # Spoken aloud, so the label stays short and the remedy goes to the log.
-        where = "" if configured else " in San Francisco (default location)"
-        return f"{temp}{unit_symbol} and {desc}{where}, high of {high}, low of {low}{rain_note}"
+        return f"{temp}{unit_symbol} and {desc}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
@@ -593,28 +592,8 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
     return [body for _when, body in found[-5:]]
 
 
-def _load_notifier():
-    """Load check-pending-questions.py once, as a module.
-
-    Module level on purpose: loading it inside get_pending_questions() would make
-    the predicate unreachable to tests, which point the notifier at a fixture by
-    swapping `PQ_FILE` on the loaded module (the pattern
-    tests/check-pending-questions-open-status.test.py already uses). A per-call
-    load rebuilds a private copy every time, so a test can only ever exercise a
-    re-implementation of the delegation instead of the shipped function — which is
-    exactly how the first version of this change shipped a regression past its own
-    test. Its main() is __name__-guarded, so importing fires no notification.
-    """
-    import importlib.util
-
-    src = _SRC_DIR / "check-pending-questions.py"
-    spec = importlib.util.spec_from_file_location("_cpq_predicate", src)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_CPQ = _load_notifier()
+import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 
 
 #: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
@@ -683,69 +662,40 @@ def clip_for_speech(text: str, limit: int) -> str:
     return head + "\u2026"
 
 
-def get_pending_questions() -> list[str]:
-    """Return unanswered questions, delegating to check-pending-questions.py.
-
-    That module's `get_waiting_questions()` is the single source of truth for
-    "is this question still waiting". This function used to re-implement the
-    predicate, and the two copies drifted: on 2026-07-28 the notifier counted 33
-    and this counted 32. The missing entry was a live owner ask
-    ("/observe MVP: design fully resolved, build on your nod") dropped because
-    the local copy tested `'RESOLVED' in title.upper()` — a substring match that
-    fires on the word appearing anywhere in the prose, including in "NOT
-    self-resolved". An open question that goes uncounted goes unsurfaced.
-
-    Fixing only this copy would leave the duplicate in place to re-diverge —
-    #2351 had already fixed the notifier's side (`Status: open`) without this one
-    changing. So the predicate now lives in exactly one place.
-
-    That invariant was initially only half-true: this function still dropped
-    organizer shells and inline `[RESOLVED ...]` titles locally, so the two
-    consumers reported different counts (notifier 2 / briefing 1 on a corpus with
-    one active marker plus one open ask) — review finding on 919c35f2. Both
-    classifications now live in the shared parser, and nothing here judges
-    waiting-ness; this function only maps the result to display titles.
-
-    Deliberately no fallback parser: a second implementation is the bug. And a
-    failure here must not degrade to `[]`, which the briefing would render as the
-    confident "no pending questions" that this whole class of bug produces.
+def get_pending_questions() -> dict:
+    """{"count": n | None, "link": str | None, "unavailable": bool, "reason": str | None} from
+    the one pending-questions reader. The briefing speaks a COUNT and where to open it, never
+    the questions themselves: they are sent as they come up, not re-delivered on a schedule.
+    An unreadable room is `count` None — said as unknown, never as none.
     """
-    # The briefing resolves its OWN file and hands it to the predicate, rather
-    # than relying on the notifier's independent resolution. Two reasons: the two
-    # modules could otherwise read different files on a host where resolution
-    # differs, silently reintroducing the divergence this change removes; and it
-    # keeps `personal_path` as the single patch point the existing regression
-    # tests already use (tests/briefing-pending-status.test.py,
-    # tests/morning-briefing-pending-extract.test.py), so the seam does not move.
-    _CPQ.PQ_FILE = personal_path("pending-questions.md", WORKSPACE)
-
-    out: list[str] = []
-    for q in _CPQ.get_waiting_questions():
-        title = (q.get("title") or q.get("id") or "") if isinstance(q, dict) else str(q)
-        title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
-        if not title:
-            continue
-        out.append(clip_for_speech(title, 60))
-    return out
+    g = pending_questions_reader.gather(WORKSPACE, skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE))
+    for note in g["notes"]:
+        print(f"  pending questions: {note}", file=sys.stderr)
+    return {"count": None if g["unavailable"] else len(g["waiting"]), "link": g.get("link"),
+            "unavailable": g["unavailable"], "reason": g["reason"]}
 
 
+def pending_summary(pending) -> str:
+    """The count for the log line: a number, or "unknown (room unreachable)"."""
+    if not isinstance(pending, dict):
+        return str(len(pending or []))
+    return "unknown (room unreachable)" if pending.get("count") is None else str(pending["count"])
 
-def below_fold_count(total: int) -> int:
-    """How many waiting questions render on no surface the owner reads.
 
-    The notifier sends `questions[:VISIBLE_PREFIX]`, so waiting order IS
-    priority order and everything past it counts as open while reaching
-    nobody. Returns 0 when the prefix cannot be read — an unknown cutoff
-    must not be guessed into a number the briefing then states as fact.
-    """
-    prefix = getattr(_CPQ, "VISIBLE_PREFIX", None)
-    if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
-        # Say so: without this, an unreadable prefix and a genuinely unhidden
-        # list both render as no line, which is the silent no-op this fixes.
-        print(f"  below-fold: VISIBLE_PREFIX unreadable ({prefix!r}) — line omitted",
-              file=sys.stderr)
-        return 0
-    return max(0, total - prefix)
+def pending_line(pending) -> Optional[str]:
+    """The spoken/DM'd sentence for the count, or None when there is nothing to say."""
+    if not pending:
+        return None
+    if not isinstance(pending, dict):  # a bare list of titles: only its length is said
+        pending = {"count": len(pending)}
+    if pending.get("unavailable") or pending.get("count") is None:
+        return f"Pending questions: unknown — the room was unreachable ({pending.get('reason') or 'no count'})."
+    n = pending["count"]
+    if not n:
+        return None
+    where = f" Open it: {pending['link']}." if pending.get("link") else ""
+    noun = "One pending question is" if n == 1 else f"{n} pending questions are"
+    return f"{noun} waiting in your Pending questions database.{where}"
 
 
 def get_health_issues() -> "list[str] | None":
@@ -793,7 +743,8 @@ def get_health_issues() -> "list[str] | None":
         return None
 
 
-def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues) -> str:
+def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues,
+               *, weather_location_known=True) -> str:
     now = datetime.now()
     hour = now.hour
     if hour < 12:
@@ -806,7 +757,9 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     parts = [f"{greeting}."]
 
     # Weather
-    if weather:
+    if not weather_location_known:
+        parts.append("What city or town should I use for your weather forecast?")
+    elif weather:
         parts.append(f"It's {weather}.")
 
     # Calendar — None means the query failed (distinct from verified empty).
@@ -840,17 +793,10 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     elif reminders is None and REMINDERS_UNREAD_NOTE:
         parts.append(REMINDERS_UNREAD_NOTE)
 
-    # Pending questions
-    if pending_qs:
-        if len(pending_qs) == 1:
-            parts.append(f"One pending question waiting: {pending_qs[0]}.")
-        else:
-            # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
-            # yields FILE order, so index 0 is first-listed, not most important.
-            parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
-        hidden = below_fold_count(len(pending_qs))
-        if hidden:
-            parts.append(f"{hidden} of them render below the fold.")
+    # Pending questions: the count and where they live, never the questions
+    pq_line = pending_line(pending_qs)
+    if pq_line:
+        parts.append(pq_line)
 
     # Overnight Discord
     if discord_msgs:
@@ -876,7 +822,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     # returning [] at the time) produced a confident "Everything looks clean"
     # over two questions nobody had answered.
     if (events == [] and reminders == [] and health_issues == []
-            and not pending_qs):
+            and not pq_line and weather_location_known):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -912,8 +858,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
-    if weather and not weather_location_configured():
-        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
+    location_known = weather_location_configured()
+    if not location_known:
+        print("    (location unknown; asking the owner for their city or town)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
@@ -926,13 +873,14 @@ def main():
 
 
     pending_qs = get_pending_questions()
-    print(f"  pending questions: {len(pending_qs)}")
+    print(f"  pending questions: {pending_summary(pending_qs)}")
 
     health_issues = get_health_issues()
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
-    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues)
+    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues,
+                           weather_location_known=location_known)
 
     # Write voice result
     ts = int(time.time() * 1000)
@@ -943,7 +891,7 @@ def main():
     # suppresses any `[channel:]` redirect at the bridge, so this can never be
     # posted to a shared channel (result_markers.parse_markers). The marker is
     # stripped before delivery/voice, so the owner never sees it.
-    result_file.write_text(f"[dm-only]\n{narrative}")
+    publish_text(result_file, f"[dm-only]\n{narrative}")
     print(f"  → {result_file.name}")
 
     # Mark as done today

@@ -156,7 +156,8 @@ fi
 # Real shutdown recovery: the structural checks above accept any plain `"$var"`,
 # so only an end-to-end TERM proves recovery names the payload, not the sentinel.
 RTMP="$(mktemp -d)"
-RWS="$RTMP/ws"; RINBOX="$RWS/deliveries/w-test"
+# Not under deliveries/: that inbox is a worker's, and a worker never runs the core's handler.
+RWS="$RTMP/ws"; RINBOX="$RWS/inbox/w-test"
 mkdir -p "$RWS/tasks" "$RINBOX" "$RWS/results"
 RPAYLOAD="$RWS/tasks/task-probe1.txt"
 printf 'id: task-probe1\naccess_tier: owner\ntask: resolve me\n' > "$RPAYLOAD"
