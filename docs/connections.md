@@ -325,14 +325,8 @@ to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instan
 A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new token
 since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
-s.space). Then fall back to a code:
-
-1. Get a connect code for this agent at s.space's agent portal.
-2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
-   server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
-3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
-   — starts the s.space bridge as primary, waits for it to connect, then stops and parks the
-   ag2.space bridge (the legacy one included). A failure rolls back and changes nothing.
+s.space). Then, in the Sutando desktop app, open Homeserver connections and choose Update code…
+(Reconnect with a code… if it is paused).
 
 To go back: `unpark ''`, let its launcher resume the legacy bridge, then `promote ''`.
 

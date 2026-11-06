@@ -3553,7 +3553,8 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
     refused. `resolver` (as `preview_connection`'s) also maps servers; None reads the registry offline.
     Returns {ok, instance, agent_mxid, mcp, rooms, dry_run}, or {ok: False, reason, detail} with a
     MOVE_REASONS reason (nothing written) or a Refusal code (`added` says whether the row exists),
-    and `server`, the successor a connect code should come from."""
+    and `server`, the successor. After a refusal: in the Sutando desktop app, open Homeserver connections
+    and choose Update code… (Reconnect with a code… if it is paused)."""
     environ = os.environ if environ is None else environ
     probe = dict(fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, resolver=resolver)
     ds = _dotspace()

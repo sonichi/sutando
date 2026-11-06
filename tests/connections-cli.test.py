@@ -88,7 +88,7 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("move", "--dry-run")
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("move refused: no_successor", proc.stderr)
-        self.assertIn("connections.py add '<code>'", proc.stdout)
+        self.assertIn("open Homeserver connections and choose Update code\u2026", proc.stdout)
         self.assertFalse((self.ws / "state" / "connections.json").exists(), "a refusal writes nothing")
 
     def test_add_previews_then_asks(self):
@@ -506,8 +506,8 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
         self.assertEqual(rc, 1)
         self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
-        self.assertEqual(out, "next: get a connect code at s.space's agent portal, then run "
-                              "python3 scripts/connections.py add '<code>'\n")
+        self.assertEqual(out, "next: in the Sutando desktop app, open Homeserver connections and choose "
+                              "Update code\u2026 (Reconnect with a code\u2026 if it is paused)\n")
         half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",
                                    "added": True, "instance": "s-space"}
         rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=half)
