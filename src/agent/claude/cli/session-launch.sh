@@ -389,8 +389,8 @@ repair_claude_hook_paths() {
   [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_hooks_settings.py" ] || return 0
   local _dirs=("$REPO") _wd _d _args=()
   if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-    _wd="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-    [ -d "$_wd" ] && _dirs+=("$(cd "$_wd" && pwd -P)")
+    . "$REPO/scripts/core-working-dir.sh"
+    _wd="$(sutando_core_working_dir "$REPO")" && _dirs+=("$_wd")
   fi
   for _d in "${_dirs[@]}"; do
     _args+=(--settings "$_d/.claude/settings.json" --settings "$_d/.claude/settings.local.json")
