@@ -19,6 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from clean_watcher_env import clean_env  # noqa: E402
+from _helpers.process_group import popen_bound  # noqa: E402
 
 W = "0123456789abcdef0123456789abcdef"
 FAILURES: list[str] = []
@@ -53,8 +54,8 @@ def run_watcher(tmp: Path, ws: Path, inbox: Path, until, extra_env=None) -> str:
     env.update(extra_env or {})
     err = tmp / "err"
     with err.open("w") as fh:
-        p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)],
-                             cwd=str(REPO), env=env, stdout=subprocess.DEVNULL, stderr=fh, start_new_session=True)
+        p = popen_bound(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)],
+                             cwd=str(REPO), env=env, stdout=subprocess.DEVNULL, stderr=fh)
         wait_for(lambda: until(err.read_text()))
         time.sleep(0.5)
         os.killpg(p.pid, signal.SIGTERM)

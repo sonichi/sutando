@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from clean_watcher_env import clean_env  # noqa: E402
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 RESOLVER = REPO / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"
@@ -91,10 +92,9 @@ class Harness:
                    SUTANDO_INSTANCE_ID=W, SUTANDO_INSTANCE=W, SUTANDO_WORKSPACE_DIR=str(self.ws),
                    SUTANDO_RESULTS_DIR=str(self.ws / "results"), SUTANDO_INBOX_RESOLVER=str(self.resolver))
         env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
-        self.proc = subprocess.Popen(
+        self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", str(self.inbox), "--role", "standby", "--inbox", str(self.inbox)],
-            cwd=str(REPO), env=env, stdout=self.out.open("w"), stderr=self.err.open("w"),
-            start_new_session=True)
+            cwd=str(REPO), env=env, stdout=self.out.open("w"), stderr=self.err.open("w"))
 
     def emitted(self) -> list[str]:
         return [ln for ln in self.out.read_text().splitlines() if ln.startswith("TASK_FILE:")]

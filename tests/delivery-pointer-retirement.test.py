@@ -20,6 +20,10 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "skills" / "worker-pool" / "scripts"))
@@ -164,7 +168,7 @@ class Migration(Base):
         self.pointer("task-c1")
         out = subprocess.run([sys.executable, str(REPO / "src" / "task_archive.py"),
                               "retire-archived-pointers", str(self.ws)],
-                             capture_output=True, text=True, check=True).stdout
+                             capture_output=True, text=True, check=True, env=hermetic_env()).stdout
         self.assertIn('"retired": 1', out)
 
 
