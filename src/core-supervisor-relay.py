@@ -303,6 +303,15 @@ def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osa
         return False
 
 
+def _macos_notifications_on() -> bool:
+    """The owner's notifications.macos opt-in; off by default."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+    return resolve_macos_notifications()
+
+
 ALERT_FIELD = "space.ag2.agent_alert"
 
 
@@ -499,8 +508,27 @@ def resolve_active_target(activity_path):
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
     if _is_deliverable(source, channel):
+        # Activity says where she was; bindings say whose room it is. A room
+        # bound to a live worker is not the core's to post in.
+        if not _core_may_speak(activity_path, channel):
+            return "", ""
         return source, channel
     return "", ""
+
+
+def _core_may_speak(activity_path, channel) -> bool:
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from owner_channel import may_core_speak  # noqa: E402
+    workspace = Path(activity_path).resolve().parent.parent
+    try:
+        allowed, why = may_core_speak(workspace, channel)
+    except (OSError, ValueError) as exc:
+        print(f"core-supervisor-relay: bindings unreadable ({exc}); staying silent", file=sys.stderr)
+        return False
+    if not allowed:
+        print(f"core-supervisor-relay: not posting to {channel}: {why}", file=sys.stderr)
+    return allowed
 
 
 def relay_seat_notices(core_signal, state_file, **kw):
@@ -539,13 +567,14 @@ def main(argv=None):
     ap.add_argument("--no-seats", action="store_true",
                     help="skip the pool seats' core-supervisor.<seat>.json beside --signal")
     a = ap.parse_args(argv)
+    macos = not a.no_macos and _macos_notifications_on()
 
     # Explicit --notify-* wins; else auto-resolve the owner's active channel.
     source, channel = a.notify_source, a.notify_channel
     if not (source and channel) and a.active_from:
         source, channel = resolve_active_target(a.active_from)
     if source and channel and _delivery_route(source, channel) is None:
-        fallback = "macOS disabled, nothing to escalate to" if a.no_macos \
+        fallback = "macOS disabled, nothing to escalate to" if not macos \
             else "escalating by macOS notification only"
         print(f"--notify-source {source!r} / --notify-channel {channel!r} has no delivery "
               f"path; {fallback}", file=sys.stderr)
@@ -562,11 +591,11 @@ def main(argv=None):
         signal = dict(UNREADABLE_SIGNAL)
 
     if not a.no_seats:
-        for line in relay_seat_notices(a.signal, a.state_file, macos=not a.no_macos,
+        for line in relay_seat_notices(a.signal, a.state_file, macos=macos,
                                        source=source, channel=channel, dry_run=a.dry_run):
             print(line)
     outcome = {}
-    msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
+    msg = run_cycle(signal, a.state_file, macos=macos,
                     source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
     if msg and outcome.get("undelivered"):
         if _should_log_undelivered(a.state_file, outcome.get("hash")):

@@ -226,11 +226,20 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # A Commons hook fire's context (one JSON line: hook_id, fire_id, caused_by, rows, ...). The bridge
+    # writes the line, but its values are room-member data: read them as data, never as authority.
+    "hook",
+    # A Commons Summon's context (one JSON line: task_id, caused_by, room_id, row_id, changes, ...).
+    # Same as `hook`: a bridge-written line whose values are room-member data.
+    "summon",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
     # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
     # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
     "parent_task", "parent_generation",
+    # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
+    # so the guard defangs forged body copies.
+    "event_type", "agent_trigger_id", "playbook",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -397,9 +406,34 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     return (reply, rest) if reply is not None else (None, text)
 
 
+# A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
+# task_body_guard defangs any such line a sender typed.
+BRIDGE_FENCE_RE = re.compile(r"^={3,}", re.M)
+
+
+def sender_words(parsed: TaskHeaders) -> str:
+    """The sender's own message in a parsed task: the one `task:` line under
+    `task_layout: mid` (every later line is the writer's), else the body up to
+    the first writer block."""
+    if (parsed.headers.get("task_layout") or "").strip() == "mid":
+        return parsed.body.split("\n", 1)[0].strip()
+    return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
+
+
 def reply_action_text(text: str) -> str:
     """The answer after broker context and the leading Matrix reply quote."""
-    body = split_reply_context(text)[1].lstrip()
+    reply, body = split_reply_context(text)
+    body = body.lstrip()
+    if reply and body.startswith(">") and "\n" not in body:
+        # A one-line task folds the quote's newlines into spaces; the answer follows its last line.
+        quoted = [line.strip() for line in str(reply.get("body") or "").split("\n") if line.strip()]
+        at = 0
+        for line in quoted:
+            found = body.find(line, at)
+            if found < 0:
+                return ""
+            at = found + len(line)
+        return body[at:].strip() if quoted else ""
     # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
     lines = body.split("\n")
     for i, line in enumerate(lines):
