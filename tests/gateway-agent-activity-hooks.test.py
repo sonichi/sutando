@@ -3807,6 +3807,10 @@ class Hooks(unittest.TestCase):
         finally:
             release.set()
         drain.join(60)
+        # A's send finishes on its own worker, which the drain stopped waiting for: poll, bounded.
+        deadline = time.monotonic() + 60
+        while gw._ATTEMPTS.get(a) != {} and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.assertEqual(gw._ATTEMPTS.get(a), {}, "A settles once its send returns")
         del fakes
 
