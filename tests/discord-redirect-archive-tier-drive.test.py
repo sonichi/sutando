@@ -12,6 +12,12 @@ bridge against a hermetic temp workspace, run the real coroutine for one pass.
 Run: python3 tests/discord-redirect-archive-tier-drive.test.py   (exit 0/1)
 """
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import contextlib
 import importlib.util

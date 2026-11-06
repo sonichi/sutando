@@ -117,6 +117,7 @@ check("...and never writes a fresh mtime for it", _dead.exists(), False)
 _polls = {"n": 0}
 _touches = {"n": 0}
 _real_touch = pb.touch
+_real_sleep = pb.time.sleep
 
 
 def _gone_after_three(_pid, _start):
@@ -134,11 +135,63 @@ pb.target_gone, pb.touch, pb.time.sleep = _gone_after_three, _count_touch, (lamb
 try:
     _rc = pb.run_forever(_lived, 0.02, watch_pid=9999, poll_s=0.01)
 finally:
-    pb.target_gone, pb.touch, pb.time.sleep = _real_tg, _real_touch, pb.time.sleep
+    pb.target_gone, pb.touch, pb.time.sleep = _real_tg, _real_touch, _real_sleep
 
 check("the daemon returns 0 once its watched pid is gone", _rc, 0)
 check("it refreshed once at start and once after a full interval", _touches["n"], 2)
 check("it polled inside the interval, not once per 30 s", _polls["n"], 4)
+
+# --- Poll liveness cheaply; check identity before each refresh. -------------
+
+
+def _watch_timeline(*, death_at, starts):
+    clock = {"now": 0}
+    signals, reads, touches = [], [], []
+    real_start = pb.process_start_time
+
+    def kill(pid, sig):
+        signals.append(clock["now"])
+        if clock["now"] >= death_at:
+            raise ProcessLookupError()
+
+    def lstart(pid):
+        reads.append(clock["now"])
+        return starts.get(clock["now"], "T0")
+
+    def sleep(seconds):
+        clock["now"] += seconds
+        if clock["now"] > 100:
+            raise AssertionError("daemon did not stop")
+
+    pb.target_gone = lambda pid, start: _real_tg(pid, start, kill=kill, lstart=lstart)
+    pb.process_start_time = lstart
+    pb.touch = lambda path: touches.append(clock["now"])
+    pb.time.sleep = sleep
+    try:
+        rc = pb.run_forever("unused", 30, watch_pid=7, poll_s=1)
+    finally:
+        pb.target_gone, pb.process_start_time = _real_tg, real_start
+        pb.touch, pb.time.sleep = _real_touch, _real_sleep
+    return rc, signals, reads, touches
+
+
+_rc, _signals, _reads, _writes = _watch_timeline(death_at=32, starts={})
+check("signal liveness is checked every second through death", _signals, list(range(33)))
+check("ps identity is read only initially and at refresh, not each poll", _reads, [0, 30])
+check("death stops the writer before the next refresh", (_rc, _writes), (0, [0, 30]))
+
+_rc, _signals, _reads, _writes = _watch_timeline(death_at=90, starts={30: "T1"})
+check("PID reuse stops at the first refresh boundary", (_rc, _signals[-1]), (0, 30))
+check("a recycled PID never receives that refresh", _writes, [0])
+
+_rc, _signals, _reads, _writes = _watch_timeline(death_at=62, starts={30: ""})
+check("an unreadable identity does not stop a living PID", _writes, [0, 30, 60])
+check("identity checks resume after a transient ps failure", _reads, [0, 30, 60])
+check("death is still detected promptly after ps recovers", (_rc, _signals[-1]), (0, 62))
+
+_rc, _signals, _reads, _writes = _watch_timeline(death_at=90, starts={30: "", 60: "T1"})
+check("transient ps failure preserves the baseline for later reuse detection",
+      (_rc, _signals[-1], _writes), (0, 60, [0, 30]))
 
 # --- CLI: --watch-pid reaches the daemon, and --parent-pid still works alone ---
 
@@ -171,7 +224,7 @@ check("with no --watch-pid the CLI does not pass that kwarg at all "
       "(the untouched --parent-pid path is byte-for-byte unchanged)",
       "watch_pid" in _delegated, False)
 
-print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat --watch-pid ({18} checks)")
+print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat --watch-pid ({27} checks)")
 for f in fails:
     print("   ", f)
 sys.exit(1 if fails else 0)

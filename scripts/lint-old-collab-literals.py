@@ -6,7 +6,8 @@ forwarder, the env aliases, the ALB path until the service moves, a stored
 state path. A grep-to-zero gate would therefore fail today and teach nothing.
 This one holds a baseline of file -> count and fails when any file grows or a
 new file appears; phase C shrinks the baseline to nothing and the gate becomes
-grep-to-zero by itself.
+grep-to-zero by itself. It counts per file, so one occurrence removed and one
+added in the same file cancel out — review reads the diff for that.
 
 Run: python3 scripts/lint-old-collab-literals.py [--update]   (exit 0 ok / 1 fail)
 """
@@ -18,8 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Case-insensitive so the env aliases (ROOM_DOC_TOKEN, AG2_ROOM_DOC_URL) count too.
-PATTERN = re.compile(r"room-doc|room_doc|space\.ag2\.doc\b", re.IGNORECASE)
+# Case-insensitive so the env aliases (ROOM_DOC_TOKEN, AG2_ROOM_DOC_URL) count too;
+# the lookahead stops "room-document" without dropping "room_doc_client".
+PATTERN = re.compile(r"room[-_]doc(?![a-z])|space\.ag2\.doc\b", re.IGNORECASE)
 BASELINE_REL = Path("scripts") / "old-collab-literals.baseline.json"
 # Text files only; the baseline, this script and its test's fixture text are not evidence.
 SKIP = {str(BASELINE_REL), "scripts/lint-old-collab-literals.py", "tests/lint-old-collab-literals.test.py"}

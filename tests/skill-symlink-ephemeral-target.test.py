@@ -1,6 +1,12 @@
 """A skill symlink resolving INTO a temp dir must warn; one resolving into a
 different DURABLE clone must not — that layout is supported.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys
@@ -9,6 +15,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+DURABLE = Path(os.sep, "hermetic-durable")
 
 
 def _load():
@@ -82,7 +89,7 @@ class EphemeralSkillTarget(unittest.TestCase):
         passes on macOS and fails on Linux, where realpath('/tmp') is '/tmp'."""
         for root in self.hc._ephemeral_roots():
             self.assertTrue(self.hc._is_ephemeral(f"{root}/x/skills/a"), root)
-        self.assertFalse(self.hc._is_ephemeral(str(Path.home() / "repo" / "skills" / "a")))
+        self.assertFalse(self.hc._is_ephemeral(str(DURABLE / "repo" / "skills" / "a")))
 
     def test_a_root_itself_is_ephemeral(self):
         """A link pointing AT the root, not inside it. Every root carried a trailing
@@ -147,7 +154,7 @@ class EphemeralSkillTarget(unittest.TestCase):
             roots = self.hc._ephemeral_roots()
             self.assertNotIn("", roots)
             self.assertIn("/tmp", roots)
-            self.assertFalse(self.hc._is_ephemeral(str(Path.home() / "durable")))
+            self.assertFalse(self.hc._is_ephemeral(str(DURABLE)))
         self._with_tmpdir("", check)
 
 

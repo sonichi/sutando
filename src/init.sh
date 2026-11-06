@@ -287,12 +287,6 @@ tier1() {
   # there by workspace_default.py + dashboard/health-check readers expect it
   # at WORKSPACE_DIR / "build_log.md". Not seeded here.
 
-  create_file_if_missing "pending-questions.md" \
-    "# Pending Questions
-
-_(none open)_
-"
-
   # Status files live under state/ (the workspace root is structural —
   # directories only). create_file_if_missing mkdir's the parent.
   create_file_if_missing "state/contextual-chips.json" \

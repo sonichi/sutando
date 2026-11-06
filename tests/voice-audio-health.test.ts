@@ -7,6 +7,7 @@ import {
 	type HealthRow,
 } from '../src/voice-audio-health.js';
 import { evaluateMatrix } from '../src/voice-health-matrix.js';
+import { VoiceSession, type VoiceSessionConfig } from 'bodhi-realtime-agent';
 
 /** Int16LE PCM buffer at a constant normalized amplitude. */
 function pcm(amplitude: number, samples = 682): Buffer {
@@ -791,5 +792,23 @@ describe('P7 Tranche B — lineage, context occupancy, up= segment', () => {
 		const r2Red = evalOn(parsed, rFull.baseline, now.t + 30_000);
 		assert.equal(r2Red.verdict, r2Full.verdict);
 		assert.deepEqual(r2Red.facts, r2Full.facts);
+	});
+});
+
+describe('P7 D7.1 engine ledger — the installed bodhi VoiceSession', () => {
+	it('counts a frame fed through the public feedAudioFromClient', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const session = new VoiceSession({
+			sessionId: 'session_test', userId: 'u', apiKey: 'unused', port: 0,
+			agents: [{ name: 'main', instructions: 'x', tools: [] }], initialAgent: 'main',
+			geminiModel: 'unused', upstreamLossPolicy: 'hold', log: () => {},
+		} as unknown as VoiceSessionConfig);
+		led.wrapSession(session);
+		const b = pcm(0.3);
+		session.feedAudioFromClient(b);
+		const snap = led.getSnapshot(true);
+		assert.equal(snap.deliveredFrames, 1);
+		assert.equal(snap.deliveredBytes, b.length);
 	});
 });

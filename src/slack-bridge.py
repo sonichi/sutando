@@ -64,13 +64,25 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+from proactive_routing import (body_claimable_by, claims_unless_routed_elsewhere,  # noqa: E402
+                               other_bridges_configured)
 
 
-def _slack_claims_name(name: str) -> bool:
+def _other_bridges_configured() -> bool:
+    """Another bridge installed beside Slack on this host (channels/<bridge>/)."""
+    try:
+        return other_bridges_configured("slack", claude_home_path("channels"))
+    except Exception:
+        return False
+
+
+def _slack_claims_name(name: str, body=None) -> bool:
     """Filename-level claim decision — the policy lives in proactive_routing;
-    this adapter only binds its channel."""
-    return fallback_claims_name(name, "slack")
+    this adapter only binds its channel. A tag outranks; a body addressed to
+    Slack outranks activity routing; an untagged file is Slack's when the
+    owner was last active here, or with no record on a Slack-only install."""
+    return claims_unless_routed_elsewhere(name, OWNER_ACTIVITY_FILE, "slack",
+                                          body=body, other_bridges_configured=_other_bridges_configured())
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 import slack_access  # noqa: E402
 
@@ -83,9 +95,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -99,6 +112,7 @@ if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from channel_auth_exit import exit_auth_rejected  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 from slack_owner import resolve_proactive_owner_id  # noqa: E402
@@ -556,7 +570,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+            (target or {}).get("channel", ""), fresh_reask_id())
         if action == "requeue":
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
@@ -570,6 +584,17 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
     return report_disposition(action, delivered)
+
+
+def _guard_reply(task_id: str, target, reply_text: str) -> str:
+    """The body this reply leg may deliver: the shared guard's verdict for the asker's tier.
+    A route without a tier re-reads it from the task file; no task file guards as guest."""
+    tier = resolve_route_tier((target or {}).get("access_tier"), TASKS_DIR, task_id)
+    safe, withheld = guard_result_for_tier(reply_text, tier, REPO,
+                                           suppress_journal=(STATE_DIR, task_id))
+    if withheld:
+        print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
+    return safe
 
 
 def _pop_pending_reply(task_id: str):
@@ -604,7 +629,8 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
         _pop_pending_reply(task_id)
         raise
 
-# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# Per-task NUDGE timer, NOT task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (which
+# abandons a task at its deadline; this keeps waiting, hence still 10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
 # loops on the API error), no result file is ever written and the Slack user
 # gets silence. After this many seconds we post a one-time "still working /
@@ -628,8 +654,47 @@ _username_cache_lock = threading.Lock()
 _event_count = 0
 _event_count_lock = threading.Lock()
 
+_SLACK_AUTH_ERRORS = frozenset({
+    "invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired",
+    "not_allowed_token_type", "missing_scope"})
+
+
+def _slack_auth_error(exc: BaseException) -> bool:
+    """True when Slack answered with a credential rejection, not a transport fault."""
+    resp = getattr(exc, "response", None)
+    try:
+        code = resp.get("error") if resp is not None else None
+    except Exception:  # noqa: BLE001 — an unreadable response is simply not an auth answer
+        code = None
+    if code is None:
+        # Bolt's auth.test failure carries the response only inside its message.
+        m = re.search(r"'error': '(\w+)'", str(exc))
+        code = m.group(1) if m else None
+    return code in _SLACK_AUTH_ERRORS
+
+
+def _build_app(app_cls=App):
+    """Construct the Bolt app; its eager auth.test rejecting the bot token exits 78."""
+    try:
+        return app_cls(token=BOT_TOKEN)
+    except Exception as e:
+        if _slack_auth_error(e):
+            exit_auth_rejected("slack", "SLACK_BOT_TOKEN")
+        raise
+
+
+def _start_socket_mode(handler) -> None:
+    """Block on Socket Mode; apps.connections.open rejecting the app token exits 78."""
+    try:
+        handler.start()
+    except Exception as e:
+        if _slack_auth_error(e):
+            exit_auth_rejected("slack", "SLACK_APP_TOKEN")
+        raise
+
+
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
-app = App(token=BOT_TOKEN)
+app = _build_app()
 
 # Handler reference so the heartbeat writer can read LIVE socket state; the
 # heartbeat thread starts first, so main() wires this just before handler.start().
@@ -1243,6 +1308,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_content = (
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        f"local_time: {local_task_protocol.local_time_value()}\n"
         f"source: slack\n"
         f"interaction_type: message\n"
         f"{media_headers}"
@@ -1715,6 +1781,9 @@ def result_watcher():
                     archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
                     continue
 
+                # Non-owner results pass the shared egress guard before ANY marker below.
+                reply_text = _guard_reply(task_id, target, reply_text)
+
                 # Skip-marker check via unified parser (#873). Equivalent to
                 # the prior startswith trio but routed through one source of
                 # truth so future skip markers added in result_markers.py
@@ -1782,8 +1851,8 @@ def result_watcher():
                         continue
                     if not body_claimable_by(peek, "slack"):
                         continue
-                    # Explicit filename destination outranks the race.
-                    if not _slack_claims_name(f.name):
+                    # Tag, then a Slack address in the body, then activity routing.
+                    if not _slack_claims_name(f.name, peek):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.
@@ -1907,7 +1976,7 @@ def main():  # pragma: no cover
     handler = SocketModeHandler(app, APP_TOKEN)
     global _socket_handler
     _socket_handler = handler  # let the heartbeat thread read live socket state
-    handler.start()  # blocks
+    _start_socket_mode(handler)  # blocks
 
 
 if __name__ == "__main__":

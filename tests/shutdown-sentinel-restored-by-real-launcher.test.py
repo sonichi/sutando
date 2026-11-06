@@ -29,9 +29,15 @@ REAL_REPO = Path(__file__).resolve().parent.parent
 # Only what the launcher sources or shells out to before its bare-exec branch.
 NEEDED = (
     "src/agent/claude/cli/start-cli.sh",
+    "src/agent/claude/cli/session-launch.sh",
     # everything the launcher sources before its bare-exec branch; a missing one
     # kills it at line 23 and the sentinel then "survives" only by never being cleared.
     "src/agent/restart-guard.sh",
+    "src/agent/core-runtime-record.sh",
+    "src/agent/core-window.sh",
+    "src/agent/launch-path.sh",
+    "src/core_runtime_record.py",
+    "src/result_publish.py",
     "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
     "src/shutdown.py",
@@ -93,7 +99,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     proc = subprocess.run(
         ["bash", str(root / "src/agent/claude/cli/start-cli.sh")],
-        env={"HOME": os.environ.get("HOME", tmp), "PATH": str(binp), "TERM": "dumb"},
+        env={"HOME": tmp, "PATH": str(binp), "TERM": "dumb"},
         capture_output=True, text=True, timeout=180,
     )
 

@@ -149,6 +149,8 @@ def target_gone(pid: int, start_time: str, *, kill=os.kill,
         return True
     except PermissionError:
         pass  # it exists; we may just not be allowed to signal it
+    if not start_time:
+        return False
     current = lstart(pid)
     if start_time and current and current != start_time:
         return True
@@ -178,8 +180,10 @@ def run_forever(path, interval: float = BEAT_INTERVAL_S, *, parent_pid=None,
                 waited += step
                 if parent_pid is not None and parent_gone(parent_pid):
                     return 0
-                if watch_pid is not None and target_gone(watch_pid, watch_start):
-                    return 0
+                if watch_pid is not None:
+                    start = watch_start if waited >= interval else ""
+                    if target_gone(watch_pid, start):
+                        return 0
         touch(path)
 
 
