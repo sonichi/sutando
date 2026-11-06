@@ -839,11 +839,13 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
     return next(iter_result_candidates(results_dir, task_id), None)
 
 
-def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
+def find_archived_task(tasks_dir: Path, task_id: str, *, require_identity: bool = True) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first identity-matching path or None. Rejects
     malformed ids rather than globbing with them (traversal gate).
+    Publication occupancy checks may set `require_identity=False`: a foreign
+    record still reserves a slot, but must never authorize routing or recovery.
 
     The month scan uses `os.scandir` and filters on the NAME before asking
     whether the entry is a directory. The archive root holds one file per
@@ -891,7 +893,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
         # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST
         # record once `<id>.txt.1` exists, so `.exists()` here returned stale.
         hit = newest_archived(d, task_id)
-        if hit is not None and task_id_for(hit, accept=valid_archive_lookup_id) == task_id:
+        if hit is not None and (not require_identity or task_id_for(hit, accept=valid_archive_lookup_id) == task_id):
             return hit
     return None
 
