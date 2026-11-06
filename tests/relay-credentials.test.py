@@ -15,6 +15,10 @@ Hermetic: CLAUDE_CONFIG_DIR is a temp dir, the vault is a stub module, the repo
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys
@@ -84,7 +88,7 @@ class _Hermetic(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="relay-creds-"))
-        env = {k: v for k, v in os.environ.items() if k not in RELAY_KEYS}
+        env = {k: v for k, v in isolated_child_env().items() if k not in RELAY_KEYS}
         env["CLAUDE_CONFIG_DIR"] = str(self.tmp / "claude")
         env.pop("CLAUDE_HOME", None)
         p = mock.patch.dict(os.environ, env, clear=True)
@@ -196,9 +200,9 @@ class ResolverOrder(_Hermetic):
 
     def test_environment_is_never_written(self):
         self.only_in_repo()
-        before = dict(os.environ)
+        before = isolated_child_env()
         rc.resolve_relay_credentials()
-        self.assertEqual(dict(os.environ), before)
+        self.assertEqual(isolated_child_env(), before)
 
     def test_repr_hides_the_secret(self):
         tok = self.only_in_channel()

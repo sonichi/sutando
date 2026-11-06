@@ -6,6 +6,10 @@ resolving once, so a suite cannot pass or fail on a developer's real token.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import os
 import shutil
 import sys
