@@ -142,7 +142,7 @@ assert_result_paired() {
   task_id="$(task_id_of "$filename")"
   # Attestation, not presence: an empty or stale receipt is exactly what a
   # presence check cannot tell apart from a matching one.
-  if ! python3 "$REPO/src/result_write.py" attests "$task_id" \
+  if ! "$NOTIFIER_PY" "$REPO/src/result_write.py" attests "$task_id" \
       --results-dir "$RESULTS_DIR" --receipts-dir "$RESULT_PAIRING_DIR" >/dev/null 2>&1; then
     echo "task-notifier: the pairing receipt in $RESULT_PAIRING_DIR does not attest the bytes now in $filename; it was not written through src/result_write.py, or it was overwritten, so it may answer a different task" >&2
     return 1
@@ -473,13 +473,14 @@ submit_task() {
     log_notifier "refusing --event $filename: Codex session is unavailable"
     return 1
   fi
-  local q_writer q_file q_results q_receipts task_id
+  local q_python q_writer q_file q_results q_receipts task_id
   task_id="$(task_id_of "$filename")"
+  printf -v q_python '%q' "$NOTIFIER_PY"
   printf -v q_writer '%q' "$REPO/src/result_write.py"
   printf -v q_file '%q' "$filename"
   printf -v q_results '%q' "$RESULTS_DIR"
   printf -v q_receipts '%q' "$RESULT_PAIRING_DIR"
-  prompt="$prompt Publish with python3 $q_writer write $q_file --results-dir $q_results --receipts-dir $q_receipts ; body on stdin with FIRST line exactly 'task: $task_id'. Never hand-write that file."
+  prompt="$prompt Publish with $q_python $q_writer write $q_file --results-dir $q_results --receipts-dir $q_receipts ; body on stdin with FIRST line exactly 'task: $task_id'. Never hand-write that file."
   # The responsive path retains context until the actual result, including across notifier restarts.
   # The diagnostic --event path keeps its original prompt.
   if [ "$wait_for_result" != "0" ]; then

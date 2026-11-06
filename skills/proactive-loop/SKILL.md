@@ -6,12 +6,9 @@ user-invocable: true
 
 # Proactive Loop
 
-One pass = the numbered steps below, in order. Each step is a command, its exit codes, and what to
-do per code. The reasoning, measurements and incidents behind every step live in
-[`docs/proactive-loop-rationale.md`](../../docs/proactive-loop-rationale.md) under the same step
-number; read it when a step surprises you, never per pass. A rule belongs here only as a command a
-mechanism enforces; prose lessons go to the rationale doc (`tests/proactive-loop-skill-budget.test.py`
-caps this file and refuses date stamps in it).
+Run the numbered steps in order. Read [the rationale](../../docs/proactive-loop-rationale.md)
+when a step surprises you, not each pass. Keep enforceable commands here and prose lessons there;
+`tests/proactive-loop-skill-budget.test.py` caps this file and refuses date stamps.
 
 **Usage**: `/proactive-loop [interval]` (default 10m).
 
@@ -137,6 +134,6 @@ caps this file and refuses date stamps in it).
 11. **Heartbeat.** Substantive pass + #bot2bot configured + other bot active → `done: <one line>` via the
     `bot2bot-post` skill. Never fall back to `results/proactive-*.txt`. Never write `contextual-chips.json`.
 
-### Task result pairing
-
-For a delivered task, use `python3 src/result_write.py write <task-filename> --workspace "$WORKSPACE"` with the answer on stdin. Its first line must be `task: <bare-id>`; the writer strips that line. This detects a transposed or mistyped id, not whether the prose semantically answers the task: a writer supplying both matching ids can still pair the wrong prose. Verify the task before composing the reply.
+For task replies: `python3 src/result_write.py write <file> --workspace "$WORKSPACE"`;
+stdin starts with `task: <bare-id>`. This checks ids, not the prose's meaning.
+See [pairing limits](../../docs/delivery-protocol.md#task-result-pairing-partial-rollout).

@@ -55,7 +55,7 @@ exit 0
         # the naive pattern reports "no command" on exactly the fixed case.
         tok = r"(?:\\.|\S)+"
         cmd = re.search(
-            rf"(python3 {tok}result_write\.py write .*?--receipts-dir {tok})", txt)
+            rf"({tok} {tok}result_write\.py write .*?--receipts-dir {tok})", txt)
         self.assertIsNotNone(cmd, "the notifier emitted no write command")
         # Take the required first line from the prompt itself rather than
         # re-deriving the id — a re-typed probe drifts from what is instructed.

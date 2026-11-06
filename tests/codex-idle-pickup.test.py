@@ -207,7 +207,7 @@ class SchedulerTests(unittest.TestCase):
             (ws/"queue/task-a.txt").write_text("low")
             write(idle_record() if runtime is None else runtime, ws)
             script = Path(os.environ.get("PICKUP_TEST_NOTIFIER", REPO/"src/agent/codex/cli/task-notifier.sh")).read_text()
-            names = ["has_result", "task_payload", "log_notifier", "queue_head", "submit_task",
+            names = ["task_id_of", "has_result", "task_payload", "log_notifier", "queue_head", "submit_task",
                      "pickup_event", "finish_responsive_task", "reconcile_finished_pickups", "process_responsive_queue", "process_announced_queue"]
             functions = []
             for name in names:
@@ -233,6 +233,7 @@ deliver_prompt() {
 }
 ''' + '\n'.join(functions) + '\n' + scenario
             env = {"PATH":os.environ["PATH"], "HOME":temp, "WORKSPACE_DIR":temp,
+                   "REPO":str(REPO), "RESULT_PAIRING_DIR":str(ws/"state/result-pairing"),
                    "TASKS_DIR":str(ws/"tasks"), "RESULTS_DIR":str(ws/"results"), "queue_dir":str(ws/"queue"),
                    "PAYLOAD_DIR":str(ws/"payload"), "CONTEXT_DIR":str(ws/"context"),
                    "INFLIGHT_DIR":str(paths(ws)[0]), "YIELDED_DIR":str(paths(ws)[1]),
