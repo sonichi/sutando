@@ -735,5 +735,20 @@ class HeldRootRefusalTest(unittest.TestCase):
         release.assert_called_once()
 
 
+
+class TierMatrixTest(unittest.TestCase):
+    """The serve loop's own decision over tier_shapes.REFUSED with no flags, as an install without
+    --allow-non-owner runs it: the owner and the broker-stamped collaborator, nothing else."""
+
+    def test_only_the_owner_and_a_stamped_collaborator_reach_the_session(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import tier_shapes
+
+        def decide(root, name):
+            headers, _, _ = task_io.parse_task(os.path.join(root, "tasks", name + ".txt"))
+            return cc.admission(headers, False)
+        tier_shapes.check_matrix(self, decide, collaborator_admitted=True)
+
+
 if __name__ == "__main__":
     unittest.main()
