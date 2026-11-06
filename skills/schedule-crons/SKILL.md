@@ -55,7 +55,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    try: s.loader.exec_module(m)
    except SystemExit: pass
    ps = m._ps_snapshot()
-   sys.exit(2 if ps is None else (0 if m._watcher_trees(ps) else 1))"
+   sys.exit(2 if ps is None else (0 if m._watcher_trees_here(ps) else 1))"
    case $? in
      0) echo skip;;
      1) echo start;;
