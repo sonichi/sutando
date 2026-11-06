@@ -758,5 +758,32 @@ class HeldRootRefusalTest(unittest.TestCase):
         release.assert_called_once()
 
 
+
+class TierMatrixTest(unittest.TestCase):
+    """The serve loop's own decision over tier_shapes.REFUSED: only the owner by default."""
+
+    def test_only_the_owner_reaches_the_session_by_default(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import tier_shapes
+
+        def decide(root, name, allow_non_owner, allow_collaborator):
+            path = os.path.join(root, "tasks", name + ".txt")
+            headers, _, _ = task_io.parse_task(path)
+            with open(path, encoding="utf-8") as f:
+                raw = task_io.attested_headers(f.read()).headers
+            return cc.gate(raw, headers, allow_non_owner, allow_collaborator)[0]
+        tier_shapes.check_matrix(self, decide)
+
+    def test_the_refusal_says_which_flag_is_off(self):
+        headers = {"access_tier": "team", "collaborator": "true"}
+        self.assertEqual(task_io.gate({"access_tier": "team"}, headers),
+                         (None, "sender tier team (collaborator true) and --allow-collaborator is off"))
+        guest = {"access_tier": "guest", "collaborator": "false"}
+        self.assertEqual(task_io.gate({"access_tier": "guest"}, guest)[1],
+                         "sender tier guest (collaborator false) and --allow-non-owner is off")
+        self.assertEqual(task_io.gate({}, guest), (None, "malformed: no access_tier header"))
+        self.assertEqual(task_io.gate({"access_tier": "guest"}, guest, True), ("non_owner", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

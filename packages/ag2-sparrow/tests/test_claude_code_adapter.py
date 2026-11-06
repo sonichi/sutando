@@ -3363,5 +3363,14 @@ class StartupDialogAndRefusals(ConnectBase):
             self.assertEqual(cli.occupancy_line(str(self.work)), "held by hold pid 7, its claude pid 9 (manager active/running)")
 
 
+
+class TierMatrixTest(unittest.TestCase):
+    """The Mod's claim decision (inbox.admit) over tier_shapes.REFUSED: only the owner by default."""
+
+    def test_only_the_owner_reaches_the_session_by_default(self):
+        import tier_shapes
+        tier_shapes.check_matrix(self, lambda root, name, non_owner, collab: inbox.admit(root, name, non_owner, collab)[0])
+
+
 if __name__ == "__main__":
     unittest.main()
