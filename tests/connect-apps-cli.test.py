@@ -47,7 +47,22 @@ class FakeCloud(connectors.Cloud):
         self.enabled = enabled
         self.users = list(user) if isinstance(user, list) else [user]
         self.paths = []
+        self.posts = []
         self.error = None
+
+    def post(self, path, body=None):
+        if not self.signed_in():
+            raise connectors.Setup("not_signed_in", "not signed in")
+        self.posts.append((path, body))
+        if path.endswith("/default"):
+            wanted = path.split("/")[-2]
+            for c in self.connections:
+                if c.get("id") == wanted:
+                    for o in self.connections:
+                        if o.get("toolkit") == c.get("toolkit"):
+                            o["isDefault"] = o is c
+                    return {"ok": True}
+        raise cloud_auth.CloudError(404, "not_found", path)
 
     def get(self, path):
         if not self.signed_in():
@@ -1165,8 +1180,10 @@ class TestSwitch(Base):
         code, out = run(self.ws, ["status", "linear"], cloud)
         self.assertEqual(code, connectors.EXIT_OK)
         self.assertEqual(out["connections"], [
-            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com"},
-            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None}])
+            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com",
+             "isDefault": None},
+            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None,
+             "isDefault": None}])
         self.assertEqual(cloud.paths, ["/api/connectors"])
 
     def test_active_connections_keeps_ids_of_active_rows(self):
@@ -1452,6 +1469,72 @@ class TestCard(Base):
         self.assertEqual((connectors.list_markers(self.ws), self.spawned), ([], []))
 
 
+class TestCardStationAccount(Base):
+    """No card, from `card` or `await`, when the agent's account is not the one the station was stamped for."""
+
+    def stamp(self, user):
+        (self.ws / "state").mkdir(exist_ok=True)
+        stamp = {"version": 1, "has_station_entry": True, "cloud_user_id": user, "spawned_at": "2026-09-15T00:00:00Z"}
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+
+    def assert_no_card(self):
+        self.assertEqual((connectors.list_markers(self.ws), connectors.read_cards(self.ws), self.spawned), ([], [], []))
+
+    def test_card_on_another_account_posts_no_card_and_names_both(self):
+        self.stamp("u-desktop")
+        for private in (False, True):
+            with self.subTest(private=private):
+                room = SHARED if private else ROOM
+                code, out = run(self.ws, card_argv("googlecalendar", room=room, private=private),
+                                FakeCloud(self.ws, user="u-agent"), self.spawn)
+                self.assertEqual((code, out["reason"], out["cloud_user_id"], out["stamp_cloud_user_id"]),
+                                 (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop"))
+                self.assertEqual((out["wait_id"], out["message"], out["base"]), (None, None, "https://sutando.ag2.space"))
+                self.assert_no_card()
+
+    def test_await_on_another_account_posts_no_card_and_names_both(self):
+        self.stamp("u-desktop")
+        for argv in (await_argv("linear"), private_argv("linear")):
+            with self.subTest(private="--private" in argv):
+                code, out = run(self.ws, argv, FakeCloud(self.ws, user="u-agent"), self.spawn)
+                self.assertEqual((code, out["reason"], out["cloud_user_id"], out["stamp_cloud_user_id"], out["wait_id"]),
+                                 (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop", None))
+                self.assert_no_card()
+
+    def test_the_stamp_is_read_once_so_both_ids_come_from_one_read(self):
+        reads = [{"version": 1, "cloud_user_id": "u-desktop"}, None]
+        reader = mock.Mock(side_effect=lambda _ws: reads.pop(0))
+        with mock.patch.object(connectors, "read_station_stamp", reader):
+            code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws, user="u-agent"), self.spawn)
+        self.assertEqual((code, out["reason"], out["stamp_cloud_user_id"], reader.call_count),
+                         (connectors.EXIT_NO, "account_changed", "u-desktop", 1))
+        self.assert_no_card()
+
+    def test_the_stamped_account_still_gets_its_card(self):
+        self.stamp("u-owner")
+        code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, out["message"]["operation_id"]), (connectors.EXIT_OK, "task-abc:connect-card"))
+        self.assertEqual(self.spawned, [out["wait_id"]])
+
+    def test_no_stamp_or_an_unknown_account_keeps_the_card(self):
+        for name, stamped, user in (("no stamp", None, "u-agent"), ("stamp without account", "", "u-agent"),
+                                    ("unknown agent account", "u-desktop", "")):
+            with self.subTest(name):
+                stamp_file = self.ws / "state" / "station-core-stamp.json"
+                if stamped is None:
+                    stamp_file.unlink(missing_ok=True)
+                else:
+                    self.stamp(stamped)
+                task = f"task-{len(self.spawned)}"
+                self.origin(task)
+                with mock.patch.object(connectors, "ACCOUNT_RETRY_S", ()):
+                    code, out = run(self.ws, card_argv("googlecalendar", task=task, reply=f"$e{task}"),
+                                    FakeCloud(self.ws, user=user), self.spawn)
+                self.assertEqual(code, connectors.EXIT_OK)
+                self.assertIsNotNone(out["message"])
+                self.assertNotIn("reason", out)
+
+
 class TestCardSwitch(Base):
     def test_switch_payload_and_a_fresh_baseline(self):
         cloud = FakeCloud(self.ws, connections=linear_rows(OLD_ID))
@@ -1606,6 +1689,365 @@ class TestReadCache(Base):
         connectors.ConnectCache(self.ws, now=lambda: NOW).put_connections(self.rows("linear"))
         self.assertEqual(hook.connected_set(self.ws, NOW + 1), {"linear"})
         self.assertIsNone(hook.connected_set(self.ws, NOW + connectors.CACHE_TTL_S))
+
+
+
+class SetDefaultTests(unittest.TestCase):
+    """set-default: the agent changes which account an app uses (agent-universe #279)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.rows = [
+            {"id": "c1", "toolkit": "gmail", "name": "Gmail", "status": "active",
+             "accountLabel": "me@personal.com", "isDefault": True},
+            {"id": "c2", "toolkit": "gmail", "name": "Gmail", "status": "active",
+             "accountLabel": "me@work.com", "isDefault": False},
+            {"id": "c3", "toolkit": "gmail", "name": "Gmail", "status": "expired",
+             "accountLabel": "old@work.com", "isDefault": False},
+            {"id": "c4", "toolkit": "slack", "name": "Slack", "status": "active",
+             "accountLabel": None, "isDefault": True},
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_label_or_part_of_it_or_an_id_picks_the_account(self):
+        for sel in ("me@work.com", "ME@WORK.COM", "work", "c2"):
+            cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+            code, out = run(self.ws, ["set-default", "gmail", sel], cloud=cloud)
+            self.assertEqual(code, 0, sel)
+            self.assertEqual(out["account"]["id"], "c2")
+            self.assertEqual(cloud.posts, [("/api/connectors/c2/default", None)], sel)
+
+    def test_an_expired_account_cannot_become_the_default(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        code, out = run(self.ws, ["set-default", "gmail", "old@work.com"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "no_match")
+        self.assertEqual([c["id"] for c in out["candidates"]], ["c1", "c2"])
+        self.assertEqual(cloud.posts, [])
+
+    def test_a_name_that_fits_several_accounts_asks_instead_of_guessing(self):
+        rows = [dict(r) for r in self.rows]
+        rows[0]["accountLabel"] = "me@work.com"
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "ambiguous")
+        self.assertEqual(cloud.posts, [])
+
+    def test_an_app_with_nothing_connected_is_none(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        code, out = run(self.ws, ["set-default", "linear", "anything"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "none")
+
+    def test_a_cloud_without_defaults_is_a_setup_answer(self):
+        rows = [dict(r, isDefault=None) for r in self.rows]
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "unsupported")
+        self.assertEqual(cloud.posts, [])
+
+    def test_an_account_without_an_id_is_refused_not_posted(self):
+        rows = [dict(r) for r in self.rows]
+        rows[1]["id"] = None
+        cloud = FakeCloud(self.ws, connections=rows)
+        for sel in ("me@work.com", "work"):
+            code, out = run(self.ws, ["set-default", "gmail", sel], cloud=cloud)
+            self.assertEqual(code, 1, sel)
+            self.assertEqual(out["reason"], "no_id", sel)
+            self.assertEqual([c["id"] for c in out["candidates"]], ["c1", None])
+        self.assertEqual(cloud.posts, [], "nothing is posted to /api/connectors/None/default")
+        rows[1]["id"] = "  "
+        self.assertEqual(connectors.pick_account(rows, "gmail", "work")[1], "no_id")
+        # An id-less row that is not the one meant does not get in the way.
+        code, out = run(self.ws, ["set-default", "gmail", "personal"], cloud=cloud)
+        self.assertEqual((code, out["account"]["id"]), (0, "c1"))
+
+    def test_the_read_cache_shows_the_new_default_afterwards(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        # A fresh cache entry still names the old default: what `status` would serve before the write.
+        connectors.ConnectCache(self.ws).put_connections([dict(r) for r in self.rows])
+        code, _ = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 0)
+        cached = connectors.ConnectCache(self.ws).connections()
+        self.assertEqual({r["id"]: r["isDefault"] for r in cached if r["toolkit"] == "gmail"},
+                         {"c1": False, "c2": True, "c3": False})
+        self.assertEqual(cloud.paths.count("/api/connectors"), 2, "one live read to pick, one to refresh")
+        code, out = run(self.ws, ["status", "gmail"], cloud=cloud)
+        self.assertEqual(code, 0)
+        self.assertEqual({c["id"]: c["isDefault"] for c in out["connections"] if c["toolkit"] == "gmail"},
+                         {"c1": False, "c2": True, "c3": False})
+        self.assertEqual(cloud.paths.count("/api/connectors"), 2, "status was served from the refreshed cache")
+
+    def test_a_refused_or_unsupported_set_default_leaves_the_cache_alone(self):
+        cache = connectors.ConnectCache(self.ws)
+        cache.put_connections([dict(r) for r in self.rows])
+        cloud = FakeCloud(self.ws, connections=[dict(r, isDefault=None) for r in self.rows])
+        run(self.ws, ["set-default", "gmail", "nobody"], cloud=cloud)
+        run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual([r["isDefault"] for r in cache.connections()], [True, False, False, True])
+
+
+class CloudPostTests(unittest.TestCase):
+    """Cloud.post: one authenticated POST with get's error mapping (set-default is its only caller)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cloud(self, answer, token="sutk_test"):
+        def request(base, tok, method, path, body=None):
+            self.calls.append((base, tok, method, path, body))
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return connectors.Cloud(self.ws, read_auth=lambda _ws: ("https://sutando.ag2.space", token), request=request)
+
+    def test_posts_with_the_session_and_an_empty_body_by_default(self):
+        cloud = self.cloud({"ok": True})
+        self.assertEqual(cloud.post("/api/connectors/c2/default"), {"ok": True})
+        self.assertEqual(cloud.post("/api/x", {"a": 1}), {"ok": True})
+        self.assertEqual(self.calls, [("https://sutando.ag2.space", "sutk_test", "POST", "/api/connectors/c2/default", {}),
+                                      ("https://sutando.ag2.space", "sutk_test", "POST", "/api/x", {"a": 1})])
+        self.assertEqual(self.cloud(["not", "a", "dict"]).post("/api/x"), {})
+
+    def test_signed_out_is_a_setup_answer_before_any_request(self):
+        cloud = self.cloud({"ok": True}, token=None)
+        with self.assertRaises(connectors.Setup) as ctx:
+            cloud.post("/api/x")
+        self.assertEqual(ctx.exception.code, "not_signed_in")
+        self.assertEqual(self.calls, [])
+
+    def test_a_401_drops_the_session_and_other_cloud_errors_pass_through(self):
+        cloud = self.cloud(cloud_auth.CloudError(401, "unauthorized", "expired"))
+        with self.assertRaises(cloud_auth.CloudError):
+            cloud.post("/api/x")
+        self.assertIsNone(cloud.token, "the token is re-read on the next call")
+        cloud = self.cloud(cloud_auth.CloudError(404, "not_found", "/api/x"))
+        with self.assertRaises(cloud_auth.CloudError) as ctx:
+            cloud.post("/api/x")
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(cloud.token, "sutk_test")
+
+    def test_a_transport_error_becomes_a_network_cloud_error(self):
+        for exc in (OSError("reset"), ValueError("bad json")):
+            with self.subTest(exc):
+                with self.assertRaises(cloud_auth.CloudError) as ctx:
+                    self.cloud(exc).post("/api/x")
+                self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "network"))
+
+
+class TestStampedAccountCredential(unittest.TestCase):
+    """#5261: cloud_auth refuses a credential for another user than the stamp; connect-apps
+    names that as wrong_account instead of acting as that user or saying 'not signed in'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(self._tmp.name)
+        self.ws = tmp / "ws"
+        (self.ws / "state" / "auth").mkdir(parents=True)
+        (self.ws / "state" / "auth" / "cloud-auth.json").write_text(
+            json.dumps({"apiBase": "https://sutando.ag2.space", "token": "sutk_B"}))
+        (self.ws / "state" / "station-core-stamp.json").write_text(
+            json.dumps({"version": 1, "has_station_entry": True, "cloud_user_id": "u-A", "spawned_at": "x"}))
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUTANDO_PACKAGED", "SUTANDO_APP_SUPPORT", "SUTANDO_METERING_HEADERS")}
+        self.ids = {"sutk_B": "u-B"}
+        for p in (mock.patch.dict(os.environ, env, clear=True),
+                  mock.patch.object(cloud_auth.Path, "home", return_value=tmp / "home"),
+                  mock.patch.object(cloud_auth, "keychain_get", return_value=None),
+                  mock.patch.object(cloud_auth, "cloud_request", side_effect=self.me),
+                  mock.patch.object(cloud_auth, "_USER_IDS", {}, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def me(self, base, token, method, path, **_):
+        if token not in self.ids:
+            raise cloud_auth.CloudError(0, "network", "down")
+        return {"id": self.ids[token]}
+
+    def test_another_users_file_is_never_sent_and_reads_as_wrong_account(self):
+        sent = []
+        cloud = connectors.Cloud(self.ws, request=lambda *a, **k: sent.append(a) or {})
+        with self.assertRaises(connectors.Setup) as ctx:
+            cloud.get("/api/connectors")
+        self.assertEqual(ctx.exception.code, "wrong_account")
+        self.assertIn("u-B", str(ctx.exception))
+        self.assertIn("u-A", str(ctx.exception))
+        with self.assertRaises(connectors.Setup):
+            cloud.post("/api/x")
+        self.assertEqual(sent, [], "no call acts as the other account")
+
+    def test_an_unreachable_account_check_is_a_retriable_cloud_error(self):
+        self.ids = {}
+        with self.assertRaises(cloud_auth.CloudError) as ctx:
+            connectors.Cloud(self.ws, request=lambda *a, **k: {}).get("/api/connectors")
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "account_unverified"))
+        self.assertIn("try again", str(ctx.exception))
+        self.assertIn("temporarily unavailable", str(ctx.exception))
+        self.assertNotIn("sign in", str(ctx.exception))
+
+    def test_the_stamped_users_credential_still_serves(self):
+        self.ids = {"sutk_B": "u-A"}
+        cloud = connectors.Cloud(self.ws, request=lambda base, tok, *a, **k: {"connections": [], "tok": tok})
+        self.assertEqual(cloud.get("/api/connectors")["tok"], "sutk_B")
+        self.assertIsNone(cloud.refused)
+
+
+# One room.context.read entry as the tool returns it today: metadata only, no event content keys.
+CARD_ENTRY = {"sender": "@agent:ag2.space", "body": "Google Calendar isn't connected yet.", "event_id": "$card",
+              "ts": 1789000000000, "reactions": [], "msgtype": "m.text", "mxc": None, "mimetype": None,
+              "reply_to_event": "$evt1", "reply_to_sender": OWNER, "thread_root": None, "mentions": [],
+              "in_reply_to": None, "transcript": None, "transcript_role": None}
+
+
+def context_read(*entries):
+    """The whole room.context.read tool output around these entries, newest first."""
+    return {"status": "ok", "action": "room.context.read", "correlation_id": "c-1",
+            "result": {"messages": [*entries, {**CARD_ENTRY, "event_id": "$older", "body": "hi"}], "cursor": "s1"},
+            "next_action": None}
+
+
+READBACK_TODAY = context_read(CARD_ENTRY)
+
+
+class TestCardSelfCheck(Base):
+    """A DM card the owner may never see: `card` prints a plain-text fallback, `card-check` says when to post it."""
+
+    def armed(self, **kw):
+        code, out = run(self.ws, card_argv("googlecalendar", **kw), FakeCloud(self.ws), self.spawn)
+        self.assertEqual(code, connectors.EXIT_OK)
+        return out
+
+    def check(self, wait_id, readback, event_id="$card"):
+        path = self.ws / "readback.json"
+        path.write_text(readback if isinstance(readback, str) else json.dumps(readback))
+        return run(self.ws, ["card-check", wait_id, "--event-id", event_id, "--content-file", str(path)])
+
+    def test_card_prints_a_text_fallback_that_needs_no_card(self):
+        out = self.armed()
+        fb = out["fallback"]
+        self.assertEqual(set(fb), {"body", "reply_to", "operation_id"}, "plain text: no extra_content")
+        self.assertEqual((fb["reply_to"], fb["operation_id"]), ("$evt1", "task-abc:connect-text"))
+        self.assertIn("Settings → Integrations", fb["body"])
+        self.assertIn("Google Calendar", fb["body"])
+        self.assertNotIn("on the card", fb["body"])
+        self.assertIsNone(out["card_problem"])
+        self.assertIn("extra_content", out["message"], "a valid card is still posted as a card")
+
+    def test_a_card_the_client_would_reject_is_sent_as_the_text_fallback(self):
+        real = connectors.card_message
+
+        def bad(*a, **k):
+            msg = real(*a, **k)
+            msg["extra_content"]["space.ag2.connector"]["version"] = "1"
+            return msg
+
+        with mock.patch.object(connectors, "card_message", side_effect=bad):
+            out = self.armed()
+        self.assertEqual(out["card_problem"], "bad_version")
+        self.assertNotIn("extra_content", out["message"])
+        self.assertIn("Settings → Integrations", out["message"]["body"])
+        self.assertEqual(out["message"]["operation_id"], "task-abc:connect-text")
+
+    def test_connector_problem_mirrors_the_client_check(self):
+        good = {"version": 1, "for": OWNER, "toolkits": [{"slug": "gmail"}]}
+        cases = {
+            None: {"space.ag2.connector": good},
+            "missing": {"body": "x"},
+            "malformed": {"space.ag2.connector": "x"},
+            "bad_version": {"space.ag2.connector": {**good, "version": True}},
+            "bad_for": {"space.ag2.connector": {**good, "for": "owner"}},
+            "wrong_owner": {"space.ag2.connector": {**good, "for": "@other:ag2.space"}},
+            "bad_toolkits": {"space.ag2.connector": {**good, "toolkits": []}},
+        }
+        cases_more = {"bad_toolkits": {"space.ag2.connector": {**good, "toolkits": [{"slug": "Gmail!"}]}}}
+        for want, content in [*cases.items(), *cases_more.items()]:
+            with self.subTest(want):
+                self.assertEqual(connectors.connector_problem(content, OWNER), want)
+        six = {**good, "toolkits": [{"slug": f"a{i}"} for i in range(6)]}
+        self.assertEqual(connectors.connector_problem({"space.ag2.connector": six}), "bad_toolkits")
+
+    def test_a_readback_carrying_the_card_needs_no_fallback(self):
+        out = self.armed()
+        card = out["message"]["extra_content"]
+        shapes = {
+            "whole output, keys on the entry": context_read({**CARD_ENTRY, **card}),
+            "whole output, under content": context_read({**CARD_ENTRY, "content": {"msgtype": "m.text", **card}}),
+            "result only": context_read({**CARD_ENTRY, **card})["result"],
+            "one entry": {**CARD_ENTRY, **card},
+        }
+        for name, readback in shapes.items():
+            with self.subTest(name):
+                code, res = self.check(out["wait_id"], readback)
+                self.assertEqual((code, res["verdict"], res["fallback"]), (connectors.EXIT_OK, "ok", None))
+
+    def test_todays_readback_cannot_confirm_the_card_so_the_text_goes_out(self):
+        out = self.armed()
+        for name, readback in {"whole output": READBACK_TODAY, "result": READBACK_TODAY["result"]}.items():
+            with self.subTest(name):
+                code, res = self.check(out["wait_id"], readback)
+                self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, "unverifiable"))
+                self.assertEqual(res["fallback"], out["fallback"], "the same message, the same operation id")
+
+    def test_a_readback_without_the_card_or_with_a_broken_one_gets_the_fallback(self):
+        out = self.armed()
+        card = out["message"]["extra_content"]["space.ag2.connector"]
+        cases = {
+            "missing": context_read({**CARD_ENTRY, "content": {"body": "x", "msgtype": "m.text"}}),
+            "wrong_owner": context_read({**CARD_ENTRY, "space.ag2.connector": {**card, "for": "@other:ag2.space"}}),
+            "bad_msgtype": context_read({**CARD_ENTRY, "msgtype": "m.image", "space.ag2.connector": card}),
+            "not_found": context_read({**CARD_ENTRY, "event_id": "$other"}),
+            "not_found without an id": {k: v for k, v in CARD_ENTRY.items() if k != "event_id"},
+        }
+        for want, readback in cases.items():
+            with self.subTest(want):
+                code, res = self.check(out["wait_id"], readback)
+                self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, want.split(" ")[0]))
+                self.assertEqual(res["fallback"]["operation_id"], "task-abc:connect-text")
+
+    def test_a_private_wait_has_no_dm_card_to_check(self):
+        out = self.armed(private=True, lines=("Calendar isn't connected yet.",))
+        code, res = self.check(out["wait_id"], READBACK_TODAY)
+        self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_a_switch_fallback_says_switch(self):
+        cloud = FakeCloud(self.ws, connections=[{"id": "c1", "toolkit": "googlecalendar", "status": "active"}])
+        _, out = run(self.ws, card_argv("googlecalendar", switch=True), cloud, self.spawn)
+        _, res = self.check(out["wait_id"], READBACK_TODAY)
+        self.assertIn("Switch account", res["fallback"]["body"])
+        self.assertIn("other account", out["fallback"]["body"])
+
+    def test_a_closed_wait_needs_no_fallback(self):
+        out = self.armed()
+        connectors.claim(self.ws, out["wait_id"], "connected", NOW)
+        code, res = self.check(out["wait_id"], READBACK_TODAY)
+        self.assertEqual((code, res["verdict"], res["fallback"]), (connectors.EXIT_OK, "wait_closed", None))
+
+    def test_bad_input_is_a_setup_error(self):
+        out = self.armed()
+        code, res = self.check(out["wait_id"], "not json")
+        self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+        code, res = self.check("nope", READBACK_TODAY)
+        self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+        code, res = self.check(out["wait_id"], READBACK_TODAY, event_id=" ")
+        self.assertEqual((code, res["error"]), (connectors.EXIT_SETUP, "invalid_arguments"))
+
+    def test_the_readback_can_come_on_stdin(self):
+        out = self.armed()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(READBACK_TODAY))):
+            code, res = run(self.ws, ["card-check", out["wait_id"], "--event-id", "$card", "--content-file", "-"])
+        self.assertEqual((code, res["verdict"]), (connectors.EXIT_NO, "unverifiable"))
 
 
 if __name__ == "__main__":

@@ -37,8 +37,10 @@ Two pieces, both offline-first and fail-open:
    - Cloud origin is **declared in `manifest.json`'s `config` block** (the
      config-only manifest convention — see `skills/MANIFEST.md`), not invented
      as an env-only setting. Resolution order is
-     `$AG2_CLOUD_ORIGIN override > manifest default > CLOUD_FALLBACK`, so the
-     manifest is the single place to change the default.
+     `$AG2_CLOUD_ORIGIN override > manifest default > CLOUD_FALLBACK`. The
+     shipped manifest declares the key empty, so the default is this install's
+     DotSpace cloud (`dotspace.default_cloud_origin()`), never a fixed server;
+     set a value there only to pin one.
    - Rename-before-POST so events arriving mid-report are never lost;
      fold-back on failure so nothing is dropped. Always exits 0.
 

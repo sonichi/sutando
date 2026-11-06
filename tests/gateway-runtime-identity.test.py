@@ -14,6 +14,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 failures: list[str] = []
 
@@ -26,7 +31,7 @@ def check(cond, label):
 
 os.environ.setdefault("SUTANDO_TEST_MODE", "1")
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:1"
-os.environ["REMOTE_TASK_TOKEN"] = "t"
+os.environ["REMOTE_TASK_TOKEN"] = "runtime-identity-test-token"  # a token is withheld wherever it appears
 
 # ── loader injection survives the exec; sha matches the real checkout ──────
 spec = importlib.util.spec_from_file_location(

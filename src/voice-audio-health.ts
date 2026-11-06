@@ -612,8 +612,13 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       const s = session as Record<string, unknown> & object;
       if (wrapped.has(s)) return;
       wrapped.add(s);
+      // bodhi 0.4 removed handleAudioFromClient; observeAudioInput sees every
+      // inbound frame (local WS, RTC, feedAudioFromClient) before routing.
+      const observe = s.observeAudioInput as ((o: (pcm: unknown) => void) => unknown) | undefined;
       const origAudio = (s.handleAudioFromClient as ((d: unknown) => void) | undefined)?.bind(s);
-      if (origAudio) {
+      if (typeof observe === 'function') {
+        observe.call(s, (pcm: unknown) => noteIngress(pcm));
+      } else if (origAudio) {
         s.handleAudioFromClient = (data: unknown) => {
           noteIngress(data);
           origAudio(data);

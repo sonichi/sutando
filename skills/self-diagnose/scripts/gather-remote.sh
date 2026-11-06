@@ -262,7 +262,7 @@ echo "  persisted:    $PERSIST" >&2
 echo "$DIFF_MD"
 
 # TODO: secret-redaction audit.
-# gather.sh's outputs (build_log-tail.md, pending-questions.md, log tails)
+# gather.sh's outputs (build_log-tail.md, pending-questions.json, log tails)
 # are file-scope reads. Confirm no transitive token leak before this script
 # becomes user-facing — particularly the `health.txt` output, which today
 # echoes service detail strings that could include URLs.

@@ -14,12 +14,48 @@ lane that has never completed a poll carries `connected: true` with
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 
 # A record stamped further ahead than this is not clock skew, it is corruption.
 FUTURE_SKEW_S = 5.0
+
+# Selector values that mean "every lane", never one lane's file.
+_NOT_A_LANE = ("all", "primary")
+
+
+def active_lane() -> str | None:
+    """The desktop's signed-in gateway lane: the first line of
+    $SUTANDO_APP_SUPPORT/channels/active-gateway-lane when it is an instance name by the bridge's own
+    bound (connections.INSTANCE_RE) other than all/primary. None otherwise, and for a process started
+    without that variable (a shell-run job), which therefore reads the primary connection's sidecar."""
+    root = (os.environ.get("SUTANDO_APP_SUPPORT") or "").strip()
+    if not root:
+        return None
+    try:
+        lines = (Path(root) / "channels" / "active-gateway-lane").read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    lane = lines[0].strip() if lines else ""
+    from connections import INSTANCE_RE
+    return lane if INSTANCE_RE.fullmatch(lane) and lane not in _NOT_A_LANE else None
+
+
+def status_path(state_dir) -> Path:
+    """The active lane's `gateway-status.<lane>.json` when it exists, else the primary connection's
+    sidecar (the unsuffixed file without a primary row). s.space signs in as a secondary lane."""
+    lane = active_lane()
+    if lane:
+        p = Path(state_dir) / f"gateway-status.{lane}.json"
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            pass
+    from connections import primary_sidecar_name
+    return Path(state_dir) / primary_sidecar_name(state_dir)
 
 
 def safe_num(v, *, nonneg: bool = False) -> float | None:

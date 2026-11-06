@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
-"""Which installed skill provides a named capability? A generic lookup over
-`skills/*/manifest.json` `config` blocks, so core asks for the capability and
-never names a skill.
-
-The declaring skill owns the path: a relative command is resolved inside that
-skill's own directory (same containment rule as a declared hook), and anything
-that escapes it, or that is not an executable regular file, is not a provider.
-Two providers is ambiguity, not a choice: nothing is returned.
-
-Precedence is `skills/MANIFEST.md`'s: an env override beats this, so callers
-consult it only when their variable is unset.
-"""
+"""Run an installed skill capability without importing provider policy."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 import json
 import os
+import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from skill_hooks import resolve_hook_command  # noqa: E402  (one containment owner)
@@ -26,11 +16,10 @@ def _roots(repo_dir: Path) -> list[Path]:
     """The loader's two-directory scan (`skills/MANIFEST.md`): repo, then the
     optional private skills dir, whose personal skills may also declare one."""
     out = [Path(repo_dir) / "skills"]
-    for var in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR"):
-        d = os.environ.get(var)
-        if d:
-            out.append(Path(d) / "skills")
-    return out
+    private = os.environ.get("SUTANDO_MEMORY_DIR") or os.environ.get("SUTANDO_PRIVATE_DIR")
+    if private:
+        out.append(Path(private) / "skills")
+    return list(dict.fromkeys(root.resolve() for root in out))
 
 
 def providers(repo_dir: Path, key: str) -> list[tuple[str, Path]]:
@@ -50,34 +39,31 @@ def providers(repo_dir: Path, key: str) -> list[tuple[str, Path]]:
                 continue
             target = resolve_hook_command(manifest.parent, command)
             if target is None or not target.is_file() or not os.access(target, os.X_OK):
-                continue
+                raise ValueError(f"unusable {key} provider in {manifest}")
             found.append((str(data.get("name") or manifest.parent.name), target))
     return found
 
 
-def resolve(repo_dir: Path, key: str) -> tuple[Path | None, str]:
-    hits = providers(repo_dir, key)
-    if not hits:
-        return None, f"no installed skill provides {key}"
-    if len(hits) > 1:
-        return None, (f"{len(hits)} skills provide {key} "
-                      f"({', '.join(n for n, _ in hits)}); refusing to choose")
-    name, target = hits[0]
-    return target, f"{key} provided by the {name} skill"
-
-
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 2:
-        print("usage: skill_manifest_capability.py <repo-dir> <config-key>",
-              file=sys.stderr)
-        return 2
-    target, reason = resolve(Path(args[0]), args[1])
-    if target is None:
-        print(reason, file=sys.stderr)
-        return 1
-    print(str(target))
-    return 0
+    if len(args) == 4 and args[0] == "--check":
+        try:
+            hits = providers(Path(args[1]), args[2])
+            if not hits:
+                return 0
+            if len(hits) != 1:
+                raise ValueError(f"{len(hits)} providers declare {args[2]}; refusing to choose")
+            result = subprocess.run([str(hits[0][1]), args[3]], timeout=10,
+                                    capture_output=True, text=True, check=False)
+            print(result.stdout.strip() or result.stderr.strip() or
+                  f"routing prerequisite returned {result.returncode}")
+            return 0 if result.returncode == 0 else 1
+        except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            print(f"routing prerequisite failed: {exc}", file=sys.stderr)
+            return 1
+    print("usage: skill_manifest_capability.py --check <repo> <config-key> <workspace>",
+          file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

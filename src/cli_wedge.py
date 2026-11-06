@@ -83,7 +83,8 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("http-529", r"\b529\b"),
         ("reconnecting", r"\breconnect(ing)?\b"),
         ("connection-error", r"\bconnection (error|reset|refused)\b"),
-        ("timeout", r"\btimed? ?out\b"),
+        # "timeout 1800s" / "timeout=30" is a setting, not a timeout.
+        ("timeout", r"\btimed ?out\b|\btime ?out\b(?!\s*[=:]?\s*\d+(?:\.\d+)?[a-z]*\b(?!\s+exceeded))"),
         # A CLI told to stop by its provider: every turn ends the same way while the clock
         # moves; only text tells this from work — and it must be a limit HIT, not one mentioned.
     )
@@ -94,11 +95,15 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
 _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?"), "<ts>"),
     (re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp][Mm])?\b"), "<clock>"),
-    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|m|mins?|h|hrs?)\b"), "<dur>"),
+    # A compound duration ("3m 12s") is one field, so 12s and 3m 12s compare equal.
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)"
+                r"(?:\s+\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h))*\b"), "<dur>"),
     (re.compile(r"\b\d+(?:\.\d+)?[kKmM]?\s*tokens?\b"), "<tokens>"),
     (re.compile(r"\b\d+\s*/\s*\d+\b"), "<count>"),
     (re.compile(r"\b\d+(?:\.\d+)?%"), "<pct>"),
     (re.compile(r"\b(attempt|retry|retries|try|line|col|iteration|round|turn)\s+#?\d+\b", re.IGNORECASE), r"\1 #"),
+    # The CLI cycles its spinner line's leading glyph within one turn ("✢ Hatching…" → "✻ Hatching…").
+    (re.compile(r"^(\s*)[✻✶✳✢✽✺✹✷✸✦✧∗·*]\s+(?=[A-Z][A-Za-z-]+(?:…|\.\.\.))"), r"\1<spin> "),
     (re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒◴◷◶◵]"), "<spin>"),
     (re.compile(r"(?:\.\s?){2,}|…+"), "<dots>"),
     (re.compile(r"[─━═]{2,}"), "<rule>"),
@@ -116,22 +121,8 @@ PROVISIONAL_THRESHOLDS = {
     "status_ttl_s": 900,
     "min_duration_s": 60,
 }
-ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
-    (name, re.compile(rx, re.IGNORECASE))
-    for name, rx in (
-        ("quota-limit", r"(you('ve| have)? )?(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|(you('ve| have)? )?hit your\b.{0,24}\blimit\b|/?usage-credits\b"),
-        ("out-of-credits", r"(you('re| are)? )?out of (usage )?credits?\b|credit balance (is )?(too )?low\b|insufficient credits?\b"),
-        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b"),
-        ("compacting", r"compact(ing|ion)\b"),
-        ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
-        # Parked ON an error, which is not a retry: nothing is being attempted.
-        ("api-error", r"\bAPI ?Error\b|\b(internal server error|bad gateway|service unavailable)\b|\bHTTP [45]\d\d\b"),
-        ("network-error", r"\bnetwork error\b|\bfetch failed\b|\bcould not reach\b|\bE(CONNREFUSED|NOTFOUND|HOSTUNREACH)\b|\bdns (lookup )?failed\b"),
-    )
-)
-
-# Kept so an existing reader still sees the provider-limit family by name.
-PROVIDER_LIMIT_PATTERNS = ("quota-limit", "out-of-credits")
+# The abnormal-banner grammar lives in cli_wedge_patterns (importable without this detector).
+from cli_wedge_patterns import _AUTH_REJECTED, ABNORMAL_PATTERNS, PROVIDER_LIMIT_PATTERNS  # noqa: E402,F401
 DEFAULT_SESSION = "sutando-core"
 
 def normalize(frame: str) -> str:
@@ -180,13 +171,33 @@ LIVE_PARKED_BANNERS: tuple[tuple[str, re.Pattern], ...] = tuple(
     for name, rx in (
         ("quota-limit", r"^(?:you(?:'ve| have)? )?(?:hit|reached|exceeded) (?:your |the )?.{0,24}?(?:session|usage|weekly|daily|plan)? ?limit\b.{0,80}$|^(?:session|usage|weekly|daily|plan) limit (?:reached|exceeded|hit)\b.{0,80}$"),
         ("out-of-credits", r"^(?:you(?:'re| are)? )?out of (?:usage )?credits?\b.{0,80}$|^credit balance (?:is )?(?:too )?low\b.{0,80}$|^insufficient credits?\b.{0,80}$"),
-        ("needs-login", r"^(?:please )?(?:log ?in|sign ?in) to continue\b.{0,40}$|^session expired\b.{0,40}$|^authentication (?:required|failed)\b.{0,40}$|^run /login\b.{0,40}$"),
+        ("needs-login", r"^(?:please )?(?:log ?in|sign ?in) to continue\b.{0,40}$|^session expired\b.{0,40}$|^(?:login|oauth access token has) expired\b.{0,60}/login\b.{0,40}$|^(?:you(?:'re| are) )?not logged in\b.{0,60}/login\b.{0,40}$|^authentication (?:required|failed)\b.{0,40}$|^run /login\b.{0,40}$|^Select login method\b.{0,60}$|^Paste code here\b.{0,60}$|^Browser didn'?t open\b.{0,60}$"
+                        r"|^(?:" + _AUTH_REJECTED + r")"),
         ("compacting", r"^compacting (?:conversation|context)\b.{0,40}$"),
         ("awaiting-input", r"^(?:waiting|awaiting) for (?:your )?(?:input|approval|confirmation)\b.{0,40}$"),
         ("api-error", r"^API ?Error(?::\s*\S.{0,200}|\s*\(.{0,200}\).{0,80})?\s*$|^(?:internal server error|bad gateway|service unavailable)\b.{0,80}$|^HTTP [45]\d\d\b.{0,80}$"),
         ("network-error", r"^network error\b.{0,80}$|^fetch failed\b.{0,80}$|^could not reach\b.{0,80}$|^E(?:CONNREFUSED|NOTFOUND|HOSTUNREACH)\b.{0,80}$|^dns (?:lookup )?failed\b.{0,40}$"),
     )
 )
+
+
+_NEEDS_LOGIN_BANNER = dict(LIVE_PARKED_BANNERS)["needs-login"]
+
+# Auxiliary login hints runtime-health also reads as a marker (keychain, legacy CLI).
+LOGIN_HINT_MARKERS = ("run `claude login`", "run 'claude login'", "unlock-keychain")
+
+
+def needs_login_line(line: str) -> bool:
+    """Is this one line the CLI saying it needs /login? The one definition every reader
+    (runtime-health, worker_auth_state, core-input-watch) uses; judged as a whole line."""
+    return any(family == "parked" and name == "needs-login"
+               for family, name, _text in live_banner_lines(line))
+
+
+def login_marker_line(line: str) -> bool:
+    """needs_login_line, or one of the auxiliary LOGIN_HINT_MARKERS anywhere on the line."""
+    low = line.lower()
+    return needs_login_line(line) or any(m in low for m in LOGIN_HINT_MARKERS)
 
 
 def live_banner_lines(text: str) -> list:
@@ -198,6 +209,10 @@ def live_banner_lines(text: str) -> list:
         stripped = _BANNER_DECOR.sub("", ln).rstrip()
         if not stripped:
             continue
+        # A rejected credential retries too, but no retry clears it: login outranks retry.
+        if _NEEDS_LOGIN_BANNER.match(stripped):
+            hits.append(("parked", "needs-login", stripped))
+            continue
         if LIVE_RETRY_BANNER.match(stripped):
             hits.append(("retry", "retrying", stripped))
             continue
@@ -208,9 +223,52 @@ def live_banner_lines(text: str) -> list:
     return hits
 
 
+# The CLI's own "a turn is running" affordance. Motion is this module's axis, so
+# the single-frame form of it belongs beside the single-frame abnormal verdict.
+WORKING = re.compile(r"esc to interrupt", re.I)
+
+
+def frame_working(text: str) -> bool:
+    """Is this ONE capture a pane with a turn in flight? Complements classify()'s
+    frame-to-frame novelty, which needs two samples and cannot answer for one."""
+    return bool(WORKING.search(text))
+
+
 def live_retry_banner_lines(text: str) -> list:
     """The retry family only, as lines."""
     return [line for family, _, line in live_banner_lines(text) if family == "retry"]
+
+
+@dataclass(frozen=True)
+class FrameAbnormal:
+    kind: str          # provider-limit | retry-loop | abnormal
+    names: tuple       # "retry:retrying" plus each parked/abnormal family name
+    retrying: bool
+
+
+def frame_abnormal(text: str) -> Optional[FrameAbnormal]:
+    """One capture's abnormal verdict, ranked as `_classify_run` ranks a current
+    sample: provider-limit over retry over the rest. One frame has no recurrence,
+    so it reads the live (whole-line) detectors, never the searched RETRY_PATTERNS.
+    None means no abnormal text; motion, idleness and dialogs are the caller's."""
+    retrying = False
+    names: list = []
+    for family, name, _line in live_banner_lines(text):
+        if family == "retry":
+            retrying = True
+        elif name not in names:
+            names.append(name)
+    for name in matched_abnormal([text]):
+        if name not in names:
+            names.append(name)
+    if not retrying and not names:
+        return None
+    tagged = tuple((["retry:retrying"] if retrying else []) + names)
+    if any(n in PROVIDER_LIMIT_PATTERNS for n in names):
+        return FrameAbnormal("provider-limit", tagged, retrying)
+    if retrying and not names:
+        return FrameAbnormal("retry-loop", tagged, True)
+    return FrameAbnormal("abnormal", tagged, retrying)
 
 
 def matched_abnormal(frames: list) -> list:

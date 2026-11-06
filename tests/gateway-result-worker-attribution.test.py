@@ -12,7 +12,7 @@ reformatting it must not silently change routing or attribution.
 The fixture writes through pool_delivery.done_flag() rather than
 hand-spelling the path: packages/ag2-sparrow is a standalone PyPI package and
 cannot import skills/worker-pool/ in production, so both sides bind the same
-src/pool_record.py contract (bundled into the package) for the layout, the
+the pool_record contract (bundled into the package) for the layout, the
 recipient grammar and the record predicate. Building the fixture from the real
 writer keeps a future drift showing up as a failing test instead of a
 silently-always-empty lookup (sonichi/sutando, 2026-09-16: _worker_of
@@ -34,6 +34,11 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 _REPO = Path(__file__).resolve().parent.parent
 _SRC = _REPO / "src" / "remote-gateway-bridge.py"
@@ -72,6 +77,8 @@ class WorkerAttribution(unittest.TestCase):
         self.seen = {}
 
         class _Backend:
+            root = Path(self.workspace) / "results" / ".outbox"
+
             def publish(_s, tid, payload):
                 self.seen["payload"] = json.loads(payload.decode())
                 raise _Captured()

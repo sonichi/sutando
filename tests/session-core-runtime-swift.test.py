@@ -17,11 +17,14 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+import sys
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+from os_probes import SWIFTC_SKIP_REASON, swiftc_usable  # noqa: E402
 SWIFT_CONFIG = REPO / "src" / "Sutando" / "SutandoConfig.swift"
 _MODULE_CACHE = Path(tempfile.gettempdir()) / "sutando-swift-module-cache"
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class SessionCoreRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())

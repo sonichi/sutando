@@ -85,7 +85,7 @@ def _api_key() -> str:
 
 
 def _post(model: str, parts: list[dict]) -> str:
-    body = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0}}
+    body = {"contents": [{"parts": parts}]}
     url = _ENDPOINT.format(model=model, key=_api_key())
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
