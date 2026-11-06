@@ -3006,7 +3006,7 @@ case "${1:-}" in
   send-keys)
     printf 'send-keys\n' >> "$EVENT_LOG"
     if [ "${*: -1}" = C-m ]; then
-      printf 'done\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
+      paired_result task-owner.txt done
       : > "$PANE_BUF"
     else
       printf '%s' "${*: -1}" > "$PANE_BUF"
