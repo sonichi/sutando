@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { execSync } from 'node:child_process';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { personalPath } from '../../../src/util_paths.js';
+import { agentDisplayName } from '../../../src/agent-display-name.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -52,6 +53,7 @@ export interface PhoneInstructionDeps {
 		safeContext?: string;
 		repoUrl?: string;
 		standIdentityJson?: string;
+		agentName?: string;
 		now?: Date;
 	};
 }
@@ -95,7 +97,9 @@ function standIdLine(overrides?: PhoneInstructionDeps['overrides']): string {
 			? overrides.standIdentityJson
 			: readFileSync(personalPath('stand-identity.json'), 'utf-8');
 		const si = JSON.parse(raw);
-		return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : '';
+		if (!si.name) return '';
+		const name = overrides?.agentName !== undefined ? overrides.agentName : agentDisplayName();
+		return `Your Stand name is ${si.name}. When asked your name, say "I'm ${name}."`;
 	} catch { return ''; }
 }
 

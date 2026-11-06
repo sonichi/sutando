@@ -36,6 +36,8 @@ const DEPS = {
 		safeContext: 'Owner said: anchor line',
 		repoUrl: 'https://github.com/sonichi/sutando',
 		standIdentityJson: '{"name":"AnchorStand"}',
+		// The name the prompt rendered before agentDisplayName(): the fixture hashes stay byte-identical.
+		agentName: 'Sutando — AnchorStand',
 		now: new Date('2026-07-07T12:00:00Z'),
 	},
 };
@@ -103,6 +105,19 @@ test('variant semantics: the tuned conditionals land correctly', () => {
 	assert.ok(outputs.outbound_owner.includes('You are calling your owner AnchorOwner.'));
 	assert.ok(outputs.outbound_owner.includes('Owner-local time: '));
 	assert.ok(!outputs.inbound_verified.includes('## Tools'), 'owner-only sections stay owner-only');
+});
+
+test('self-introduction uses the display name; only the name changes', () => {
+	const shown = { ...DEPS, overrides: { ...DEPS.overrides, agentName: 'Display Name X' } };
+	let named = 0;
+	for (const [name, session] of Object.entries(VARIANTS)) {
+		const deps = name === 'outbound_owner_no_search' ? { ...shown, googleSearch: false } : shown;
+		const got = cfg.buildPhoneInstructions(session, deps);
+		assert.strictEqual(got, outputs[name].replace('say "I\'m Sutando — AnchorStand."', 'say "I\'m Display Name X."'), name);
+		assert.ok(!got.includes('Sutando — AnchorStand'), name);
+		if (got.includes('When asked your name, say "I\'m Display Name X."')) named++;
+	}
+	assert.ok(named > 0, 'some variant carries the self-introduction');
 });
 
 test('tryFastPath tripwire unchanged', () => {

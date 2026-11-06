@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
+import { agentDisplayName } from './agent-display-name.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
 import type { VoiceSurfaceContribution } from './skill-setup-runner.js';
@@ -53,6 +54,7 @@ export interface VoiceConfigContext {
  * env reads below run unchanged. */
 export interface ConfigOverrides {
 	standIdentityJson?: string;   // raw JSON string, as if read from disk
+	agentName?: string;           // the self-introduction name, as agentDisplayName() returns it
 	voiceContext?: string;
 	repoUrl?: string;
 	/** buildVoiceAgentContext() reads user_profile + build_log — machine- and
@@ -62,13 +64,17 @@ export interface ConfigOverrides {
 
 // ── Env-dependent readers (moved verbatim; override-first for tests) ────────
 
+function introName(overrides?: ConfigOverrides): string {
+	return overrides?.agentName !== undefined ? overrides.agentName : agentDisplayName();
+}
+
 function standIdentityLine(overrides?: ConfigOverrides): string {
 	try {
 		const raw = overrides?.standIdentityJson !== undefined
 			? overrides.standIdentityJson
 			: readFileSync(personalPath('stand-identity.json'), 'utf-8');
 		const si = JSON.parse(raw);
-		return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : '';
+		return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m ${introName(overrides)}."` : '';
 	} catch { return ''; }
 }
 
@@ -128,7 +134,7 @@ function repoUrlLine(overrides?: ConfigOverrides): string {
 
 // ── The tuned factories (moved verbatim from voice-agent.ts) ─────────────────
 
-export function buildGreeting(ctx: VoiceConfigContext): string {
+export function buildGreeting(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
 	// Reset note-viewing debounce so any note the user was already
 	// looking at (from a previous disconnected session) re-fires on
 	// the next watcher poll. Without this, a note opened while voice
@@ -182,8 +188,6 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 				: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
 		return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${modeState.marker}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
 	}
-	let standName = '';
-	try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
 	// Detect first-time user: no conversation log means brand new
 	const hasHistory = existsSync(join(WORKSPACE_DIR, 'logs', 'conversation.log'));
 	const tutorialHint = hasHistory ? '' : ' Then say: "If this is your first time, say tutorial and I\'ll walk you through what I can do."';
@@ -197,7 +201,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	if (modeState.isMeeting) {
 		return `[System: MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]${modeState.marker}`;
 	}
-	return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
+	return `[System: A user just connected. Say hi and introduce yourself as ${introName(overrides)} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 }
 
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {

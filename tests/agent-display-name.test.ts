@@ -1,0 +1,79 @@
+/**
+ * src/agent-display-name.ts: the voice and phone prompts take the agent's name from the Python
+ * resolver (src/agent_display_name.py), offline first, then the live answer once it lands.
+ * Run: npx tsx --test tests/agent-display-name.test.ts
+ */
+import { test, beforeEach } from 'node:test';
+import assert from 'node:assert';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const mod = await import('../src/agent-display-name.js');
+const { agentDisplayName, resetAgentDisplayNameForTests, nameFromJson, LIVE_REFRESH_MS, FALLBACK_AGENT_NAME } = mod;
+
+function runner(offline: string | Error, live: string | null) {
+	const calls: string[][] = [];
+	let pending: ((out: string | null) => void)[] = [];
+	return {
+		calls,
+		land() { const p = pending; pending = []; for (const done of p) done(live); },
+		sync(args: string[]) { calls.push(args); if (offline instanceof Error) throw offline; return offline; },
+		async(args: string[], done: (out: string | null) => void) { calls.push(args); pending.push(done); },
+	};
+}
+const json = (name: string) => JSON.stringify({ name, source: 'x', agent_mxid: '' }) + '\n';
+
+beforeEach(() => resetAgentDisplayNameForTests());
+
+test('the first build uses the offline answer, later builds the live one', () => {
+	const r = runner(json('Recorded Name'), json('Display Name X'));
+	assert.strictEqual(agentDisplayName(r, 0), 'Recorded Name');
+	assert.deepStrictEqual(r.calls, [['--json'], ['--offline', '--json']]);
+	r.land();
+	assert.strictEqual(agentDisplayName(r, 1), 'Display Name X');
+	assert.strictEqual(r.calls.length, 2, 'no second resolve inside the refresh window');
+});
+
+test('the live resolve reruns after the refresh window, so a rename is picked up', () => {
+	const r = runner(json('Old'), json('Renamed'));
+	agentDisplayName(r, 0);
+	agentDisplayName(r, LIVE_REFRESH_MS - 1);
+	assert.strictEqual(r.calls.filter(c => c.length === 1).length, 1);
+	agentDisplayName(r, LIVE_REFRESH_MS);
+	assert.strictEqual(r.calls.filter(c => c.length === 1).length, 2);
+	r.land();
+	assert.strictEqual(agentDisplayName(r, LIVE_REFRESH_MS + 1), 'Renamed');
+});
+
+test('a failed resolver falls back to the resolver\'s own last tier; a failed live run keeps the offline name', () => {
+	const broken = runner(new Error('python unavailable'), null);
+	assert.strictEqual(agentDisplayName(broken, 0), FALLBACK_AGENT_NAME);
+	resetAgentDisplayNameForTests();
+	const r = runner(json('Recorded Name'), null);
+	agentDisplayName(r, 0);
+	r.land();
+	assert.strictEqual(agentDisplayName(r, 1), 'Recorded Name');
+	const throwing = { sync: () => json('Offline'), async: () => { throw new Error('spawn failed'); } };
+	resetAgentDisplayNameForTests();
+	assert.strictEqual(agentDisplayName(throwing, 0), 'Offline');
+});
+
+test('only a JSON name is accepted', () => {
+	assert.strictEqual(nameFromJson(json('  A Name ')), 'A Name');
+	for (const bad of [null, '', 'not json', '{"name": 3}', '{}']) assert.strictEqual(nameFromJson(bad), '');
+});
+
+test('the default runner runs the real resolver', () => {
+	const tmp = mkdtempSync(join(tmpdir(), 'adn-ts-'));
+	const keys = ['AGENT_MXID', 'SUTANDO_DISPLAY_NAME', 'CLAUDE_CONFIG_DIR', 'SUTANDO_WORKSPACE'] as const;
+	const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+	try {
+		Object.assign(process.env, { AGENT_MXID: '@not-an-mxid', SUTANDO_DISPLAY_NAME: 'Display Name X',
+			CLAUDE_CONFIG_DIR: join(tmp, 'claude'), SUTANDO_WORKSPACE: join(tmp, 'workspace') });
+		assert.strictEqual(agentDisplayName(), 'Display Name X');
+	} finally {
+		for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+		rmSync(tmp, { recursive: true, force: true });
+	}
+});
