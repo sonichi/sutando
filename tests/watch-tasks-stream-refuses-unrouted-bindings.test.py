@@ -15,9 +15,11 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 sys.path.insert(0, str(REPO / "tests/fixtures"))
+sys.path.insert(0, str(REPO / "tests/_helpers"))
 import skill_manifest_capability as smc
 import routing_requirement as requirement
 from clean_watcher_env import clean_env
+from process_group import popen_bound
 
 W = "a" * 32
 KEY = "SUTANDO_TASK_ROUTING_REQUIREMENT"
@@ -168,9 +170,9 @@ class WatcherHarness:
         self.out = self.tmp / f"out{len(self.procs)}"
         self.err = self.tmp / f"err{len(self.procs)}"
         with open(self.out, "w") as o, open(self.err, "w") as e:
-            p = subprocess.Popen(["bash", f"{root}/src/watch-tasks-stream.sh", str(inbox), "--role", "session", "--inbox", str(inbox)],
+            p = popen_bound(["bash", f"{root}/src/watch-tasks-stream.sh", str(inbox), "--role", "session", "--inbox", str(inbox)],
                                  cwd=str(self.tmp), env=env, stdout=o, stderr=e,
-                                 text=True, start_new_session=True)
+                                 text=True)
         p._out, p._err = self.out, self.err
         self.procs.append(p)
         return p
