@@ -115,18 +115,13 @@ def clear(workspace, task_id: str) -> bool:
 
 
 def _prune_expired(d: Path, now: float) -> None:
-    # Keeps the store bounded: markers expired a day ago carry no signal.
-    try:
-        entries = list(d.glob("*.json"))
-    except OSError:
-        return
-    for p in entries:
+    # Keeps the store bounded: markers expired a day ago carry no signal; pruning is best effort.
+    for p in d.glob("*.json"):
         try:
             if now - p.stat().st_mtime > MAX_TTL_S + 86400:
                 p.unlink()
         except OSError:
             pass
-
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])

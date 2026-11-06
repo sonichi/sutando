@@ -5,13 +5,15 @@ Run: python3 tests/task-delegation.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -83,26 +85,59 @@ class Marker(unittest.TestCase):
         m.mark(self.ws, TID, 60)
         self.assertFalse(old.exists())
 
+    def _main(self, *a):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = m.main([*a, "--workspace", str(self.ws)])
+        return rc, err.getvalue()
+
     def test_cli_rcs(self):
-        def run(*a):
-            return subprocess.run([sys.executable, str(REPO / "src" / "task_delegation.py"), *a,
-                                   "--workspace", str(self.ws)], capture_output=True, text=True).returncode
-        task_file = f"/somewhere/tasks/{TID}.txt"
-        self.assertEqual(run("check", task_file), 1)
-        self.assertEqual(run("mark", task_file, "--ttl", "1800"), 0)
-        self.assertEqual(run("check", TID), 0)
-        self.assertEqual(run("mark", TID, "--ttl", "0"), 2)
-        self.assertEqual(run("clear", TID), 0)
-        self.assertEqual(run("check", TID), 1)
+        task_file = f"/fixture/tasks/{TID}.txt"
+        self.assertEqual(self._main("check", task_file)[0], 1)
+        self.assertEqual(self._main("mark", task_file, "--ttl", "1800")[0], 0)
+        self.assertEqual(self._main("check", TID)[0], 0)
+        self.assertEqual(self._main("mark", TID, "--ttl", "0")[0], 2)
+        self.assertEqual(self._main("bogus")[0], 2)
+        self.assertEqual(self._main("clear", TID)[0], 0)
+        self.assertEqual(self._main("check", TID)[0], 1)
+
+    def test_cli_resolves_the_workspace_when_not_given(self):
+        with mock.patch("workspace_default.resolve_workspace", return_value=self.ws):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(m.main(["mark", TID]), 0)
+        self.assertTrue(m.is_delegated(self.ws, TID))
+
+    def test_cli_help_exits_0(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(m.main(["--help"]), 0)
 
     def test_unwritable_store_fails_with_rc_1(self):
         (self.ws / "state").mkdir()
         (self.ws / "state" / "task-delegations").write_text("a file where the dir goes")
-        r = subprocess.run([sys.executable, str(REPO / "src" / "task_delegation.py"), "mark", TID,
-                            "--workspace", str(self.ws)], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 1, r.stderr)
-        self.assertIn("keeps blocking", r.stderr)
+        rc, err = self._main("mark", TID)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("keeps blocking", err)
 
+    def test_a_failed_replace_leaves_no_temp_and_no_marker(self):
+        with mock.patch.object(m.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                m.mark(self.ws, TID, 60)
+        self.assertEqual(list((self.ws / m.SUBDIR).iterdir()), [])
+        self.assertFalse(m.is_delegated(self.ws, TID))
+
+    def test_a_failed_temp_cleanup_still_raises_the_write_error(self):
+        with mock.patch.object(m.os, "replace", side_effect=OSError("disk full")), \
+                mock.patch.object(m.os, "unlink", side_effect=OSError("gone")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                m.mark(self.ws, TID, 60)
+
+    def test_a_marker_that_cannot_be_pruned_does_not_fail_the_write(self):
+        old = m.mark(self.ws, "task-old-1", 60)
+        t = time.time() - m.MAX_TTL_S - 86400 - 10
+        os.utime(old, (t, t))
+        with mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
+            m.mark(self.ws, TID, 60)
+        self.assertTrue(m.is_delegated(self.ws, TID))
 
 if __name__ == "__main__":
     unittest.main()
