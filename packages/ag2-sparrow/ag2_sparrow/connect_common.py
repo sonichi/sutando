@@ -1555,17 +1555,17 @@ def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, st
         return None, str(e)
 
 
-def active_job_problem(shape: Shape) -> str:
-    """'' unless `shape`'s job runs or its state cannot be read: connect writes a seat only for a stopped
-    agent, so a credential rotation is stop, then connect."""
+def active_job_problem(shape: Shape, verb: str = "connect") -> str:
+    """'' unless `shape`'s job runs or its state cannot be read: `verb` (connect, or install --token-stdin)
+    writes a seat only for a stopped agent, so a credential rotation is stop, then `verb`."""
     state = manager_state(shape)
     if state == "unknown":
-        return (f"{job_name(shape)}'s state cannot be read; connect writes the seat only while it is stopped: "
-                f"stop it ({stop_command(shape)}), then connect again")
+        return (f"{job_name(shape)}'s state cannot be read; {verb} writes the seat only while it is stopped: "
+                f"stop it ({stop_command(shape)}), then {verb} again")
     if state != "active":
         return ""
     served = (owned_config(shape)[0] or {}).get("ROOT") or "an unrecorded root"
-    return f"{job_name(shape)} is running for {served}; stop it first ({stop_command(shape)}), then connect again"
+    return f"{job_name(shape)} is running for {served}; stop it first ({stop_command(shape)}), then {verb} again"
 
 
 def _free_root_problem(root: str) -> str:
@@ -2478,18 +2478,112 @@ def read_code(arg, stdin=None, prompt=None) -> "tuple[str, str]":
     return arg.strip(), ""
 
 
+TOKEN_LINE_MAX = 8192
+TOKEN_PROMPT = "the agent's relay token (input hidden): "
+TOKEN_SHAPE = ("not a relay token: paste the agent's <relay_url>|<secret>, or its REMOTE_TASK_TOKEN= or "
+               "AG2_REMOTE_TOKEN= line")
+
+
+def read_token(stdin=None, prompt=None) -> "tuple[dict | None, str]":
+    """({relay_url, bearer}, '') or (None, why, never the value): one line, asked for without echo on a
+    terminal, else read from stdin, then parse_token. The value never reaches argv, a log or an exception."""
+    stdin = sys.stdin if stdin is None else stdin
+    try:    # no stdin at all (None, closed) reads as no token
+        line = (prompt or getpass.getpass)(TOKEN_PROMPT) if stdin.isatty() else stdin.readline(TOKEN_LINE_MAX + 1)
+    except (AttributeError, EOFError, OSError, ValueError, UnicodeDecodeError):
+        line = ""
+    if len(line) > TOKEN_LINE_MAX:
+        return None, f"the token line is longer than {TOKEN_LINE_MAX} characters; {TOKEN_SHAPE}"
+    if not line.strip():
+        return None, "no token was given: paste it when asked, or pipe one line into --token-stdin"
+    return parse_token(line)
+
+
+def parse_token(line: str) -> "tuple[dict | None, str]":
+    """({relay_url, bearer}, '') from the bare `<relay_url>|<bearer>` token or a REMOTE_TASK_TOKEN= /
+    AG2_REMOTE_TOKEN= line (`export ` and quotes allowed); the relay https, the bearer one seat line."""
+    text = line.strip()
+    raw = text if text.lower().startswith(("http://", "https://")) else _sources.token_file_token(text)
+    for value in (text, raw):
+        if value:
+            diagnostics.register_secret(value)
+    url, bearer = _sources.contract.parse_onboarding_token(raw.strip())
+    if bearer:
+        diagnostics.register_secret(bearer)
+    if not url or not bearer or any(c.isspace() or c == "|" or ord(c) < 0x20 or ord(c) == 0x7F for c in bearer):
+        return None, TOKEN_SHAPE
+    why = endpoint_problem(url, "the token's relay URL")
+    if why:
+        return None, why
+    diagnostics.register_gateway_url(url)
+    return {"relay_url": url, "bearer": bearer}, ""
+
+
 def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
+    return _request_json(url, body, opener)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx comes back as its own status: a request carrying a credential never follows one."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _request_json(url: str, body, opener, bearer: str = "", timeout: float = REDEEM_TIMEOUT_S) -> "tuple[int, bytes]":
+    """(status, body) of a POST of `body`, or a GET when it is None, with `bearer` as its Authorization;
+    a request with a bearer never follows a redirect (its 3xx is the status returned)."""
     with gateway_instance.gateway_call(url):
-        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
-                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if bearer:
+            headers.update({"Authorization": f"Bearer {bearer}", "User-Agent": "sutando-gateway-client/1.0"})
+        req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode("utf-8"),
+                                     method="GET" if body is None else "POST", headers=headers)
         try:
-            with (opener or urllib.request.urlopen)(req, timeout=REDEEM_TIMEOUT_S) as resp:
+            open_ = opener or (urllib.request.build_opener(_NoRedirect).open if bearer else urllib.request.urlopen)
+            with open_(req, timeout=timeout) as resp:
                 return resp.status, resp.read(64 * 1024)
         except urllib.error.HTTPError as e:
             try:
                 return e.code, e.read(64 * 1024) or b""
             except Exception:  # noqa: BLE001 - an unreadable error body is only an empty one
                 return e.code, b""
+
+
+WHOAMI_PATH = "/v1/whoami"
+# A relay's answer is shown only as a plain Matrix ID (the localpart grammar), never as free text.
+STRICT_AGENT_ID_RE = re.compile(r"@[a-z0-9._=/+-]+:[A-Za-z0-9.-]+(?::[0-9]{1,5})?")
+WHOAMI_TIMEOUT_S = 5
+
+
+def token_agent_problem(token: dict, agent_id: str, opener=None) -> str:
+    """'' when the relay's whoami names exactly `agent_id` for the token's bearer; else why, never the value.
+    Fails closed: a mismatch, a rejected token, an answer naming no agent, or no answer at all."""
+    try:
+        status, raw = _request_json(token["relay_url"].rstrip("/") + WHOAMI_PATH, None, opener,
+                                    bearer=token["bearer"], timeout=WHOAMI_TIMEOUT_S)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return (f"the relay could not be reached to check the token ({diagnostics.describe(e)}); check the "
+                "connection, then run the command again")
+    if 300 <= status < 400:
+        return f"the relay redirected (HTTP {status}); not following with a credential"
+    if status in (401, 403):
+        return (f"the relay rejected the token (HTTP {status}): it is revoked, expired or not this relay's; "
+                "copy it from s.space again")
+    if status != 200:
+        return f"the relay did not confirm the token (HTTP {status}); run the command again later"
+    got = _answer(raw).get("agent_mxid")
+    got = got.strip() if isinstance(got, str) else ""
+    if not AGENT_ID_RE.fullmatch(got):
+        return "the relay's answer names no agent for the token; run the command again later"
+    if got != agent_id:
+        if not STRICT_AGENT_ID_RE.fullmatch(got) or diagnostics.holds_or_is_piece(got):
+            return f"the relay named a different agent than {agent_id} for the token: paste {agent_id}'s own token"
+        return (f"the token is for {got}, not {agent_id}: paste {agent_id}'s own token, or run the command with "
+                f"--agent {got}")
+    return ""
 
 
 def _answer(raw: bytes) -> dict:
