@@ -4,6 +4,11 @@ which exist on disk but will never load (not in MEMORY.md, or stranded in a
 *-BACKUP tree). Run: python3 tests/memory-index-integrity.test.py"""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import tempfile
 import sys

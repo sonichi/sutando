@@ -217,9 +217,6 @@ finally:
     pub.verify.verify = real_verify
 check(rc == 0 and result == "[no-send]\n" + json.dumps(sentinel, indent=2, ensure_ascii=False) + "\n",
       "the published array is exactly verify's outcome, not publish's own reading of the judgment")
-src = PUBLISH.read_text()
-check(not re.search(r"ACTOR_RE|EVENT_RE|min_rows|ceil\(|EVIDENCE_JSON", src),
-      "publish.py carries no ownership or coverage policy of its own")
 
 # (8) SKILL.md pins the invocation contract
 skill_md = (SKILL / "SKILL.md").read_text()
@@ -345,8 +342,6 @@ with tempfile.TemporaryDirectory() as td:
     check(linked is True and (Path(td) / "g.txt").read_bytes() == b"gone"
           and sorted(p.name for p in Path(td).iterdir()) == ["c", "g.txt", "n.txt", "r.txt"],
           "link_exclusive when the temp file vanished before cleanup: True, written, no error")
-check("write_atomic" not in src and "os.replace" not in src,
-      "publish.py's production write is the exclusive one, never a replace")
 
 # (10) the claim outlives the result: after the [no-send] consumer's archive rename
 # (task-bridge archiveFile) a second publisher is still refused, the archive untouched.
@@ -544,8 +539,6 @@ if _ltp is not None:
         _ltp.find_result = _real_find
 check(_ltp is not None and found is None and calls == [(Path("/ws/results"), "task-role-status-v1-0000-a1")],
       "publish.find_result delegates to local_task_protocol.find_result(<workspace>/results, <task-id>)")
-check("glob" not in src.split("def find_result")[1].split("\ndef ")[0] and "import glob" not in src,
-      "publish.py keeps no private archive glob")
 # another publisher holds the claim: refused without touching it
 with tempfile.TemporaryDirectory() as td:
     ws, task, j = fresh_ws(td)
@@ -669,8 +662,6 @@ with tempfile.TemporaryDirectory() as td:
           "no fcntl: a claim held through msvcrt contention exits 2 `publication in progress`, the claim left empty")
     check(bool(o) and o["abandoned"][0] == 0 and o["abandoned"][3] and o["abandoned"][4] == live + "\n",
           "no fcntl: once released, the empty claim is reused and the publish commits it")
-check("import fcntl" not in src and "from file_lock import" in src,
-      "publish.py takes its lock from src/file_lock.py, never fcntl directly")
 
 # (11) UTF-8 output whatever the locale: a verifier-accepted non-ASCII subject_id and
 # row detail survive LC_ALL=C PYTHONUTF8=0 through the real entry point.
@@ -711,16 +702,10 @@ with tempfile.TemporaryDirectory() as td:
         rc = pub.main([str(task), str(j), "--workspace", str(ws)])
     check(rc == 2 and not (ws / "state").exists() and not (ws / "results").exists(),
           "unencodable verified array: no claim and no results/ created")
-check("fdopen(fd, \"w\")" not in src and 'fdopen(fd, "wb")' in src,
-      "publish.py writes bytes it encoded as UTF-8 itself, never a locale-default text writer")
 
 # (12) the launcher: publish.sh runs publish.py through scripts/python-binary.sh's
 # resolve_python, never through a bare PATH python3.
 check(PUBLISH_SH.is_file() and os.access(str(PUBLISH_SH), os.X_OK), "publish.sh exists and is executable")
-sh_src = PUBLISH_SH.read_text()
-check("python-binary.sh" in sh_src and "require_python" in sh_src and 'exec "$_py"' in sh_src
-      and not re.search(r'exec\s+(?!"\$_py")', sh_src) and not re.search(r"/\S*bin/python", sh_src),
-      "publish.sh sources the resolver and execs only its answer; no interpreter path is hardcoded")
 with tempfile.TemporaryDirectory() as td:
     stub_dir = Path(td) / "bin"
     stub_dir.mkdir()

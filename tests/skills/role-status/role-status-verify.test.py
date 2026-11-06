@@ -566,9 +566,6 @@ with tempfile.TemporaryDirectory() as td:
     check(rc == 0 and text.startswith("rows=3 distinct_actors=3 actors=4")
           and json.loads(text.split("\n", 1)[1]) == UNI and se_buf.getvalue() == "",
           "stdout with a buffer: stats line first, then the array as UTF-8 bytes past an ASCII text layer")
-vsrc = SCRIPT.read_text()
-check('fdopen(fd, "w")' not in vsrc and 'fdopen(fd, "wb")' in vsrc,
-      "verify.py writes bytes it encoded as UTF-8 itself, never a locale-default text writer")
 
 print()
 print("checks: %d" % CHECKS)

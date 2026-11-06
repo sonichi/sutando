@@ -5,7 +5,8 @@ exact after rotation, and the summary left at done.
 
 One owner: the agent-activity skill's CLI and the activity bus both write through here, so the
 lock, the rotation, the index and the summary cannot drift between them. Row shape is the contract
-the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done"}.
+the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done",
+"queue": {"depth","position"}?} — `queue` rides only on the queued row, from task_queue.position().
 """
 from __future__ import annotations
 
@@ -17,7 +18,9 @@ from pathlib import Path
 from file_lock import locked_file
 from workspace_default import resolve_workspace
 
-KINDS = ("processing", "thinking", "working", "notice", "done")
+# `wedge` = stopped, the owner has to act. Written roomless (see the CLI): it stops every task this
+# seat holds, so the client shows it in whatever room the owner is in, through a dismissed drawer.
+KINDS = ("processing", "thinking", "working", "notice", "wedge", "done")
 TEXT_MAX = 160
 LIVE_ROWS = 400
 
@@ -70,16 +73,6 @@ def open_task_index(workspace: Path | None = None) -> dict:
     """The tasks the index still holds open: what the hook falls back to when a task's rows have
     rotated out of the live log but its result now exists."""
     return _load_index(index_path(workspace))
-
-
-def default_room(workspace: Path | None = None) -> str | None:
-    """The room of the owner's latest AG2 Space message; a row with no room shows only in the dock."""
-    p = (workspace or resolve_workspace()) / "state" / "last-owner-activity.json"
-    try:
-        d = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None
-    return d.get("channel_id") if d.get("channel") == "ag2space" else None
 
 
 def acks_dir(workspace: Path | None = None) -> Path:
@@ -174,7 +167,8 @@ def _pid_in_log(path: Path, pid: str) -> bool:
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
            audience: str | None = None, projection: str | None = None,
-           pid: str | None = None, ts: float | None = None, replay: bool = False) -> dict:
+           pid: str | None = None, ts: float | None = None, replay: bool = False,
+           queue: dict | None = None) -> dict:
     """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
     index or summary not) is applied exactly once, each half checking what already landed."""
     if kind not in KINDS:
@@ -192,6 +186,8 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         rec["task"] = task
     if done:
         rec["done"] = True
+    if queue:
+        rec["queue"] = queue
     path = log_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     # One lock for the append AND the rotation; the log is opened only under it, so no writer holds

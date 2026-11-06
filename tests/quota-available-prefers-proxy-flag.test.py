@@ -122,6 +122,10 @@ def _run_real_script(tmp, *args, mutate=None):
     (scripts / "quota_availability.py").write_text(
         (REPO / "skills" / "quota-tracker" / "scripts" / "quota_availability.py").read_text()
     )
+    # The skill's module re-exports the src/ authority by path; the mirror needs both.
+    (tmp / "src" / "quota_availability.py").write_text(
+        (REPO / "src" / "quota_availability.py").read_text()
+    )
     (tmp / "src" / "workspace_default.py").write_text(
         "from pathlib import Path\n"
         "def status_read_path(name):\n"

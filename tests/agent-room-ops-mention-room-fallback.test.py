@@ -31,6 +31,11 @@ import unittest
 import urllib.error
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SKILL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "skills", "agent-room-ops")
 sys.path.insert(0, SKILL)
@@ -174,7 +179,7 @@ class TestMentionFallback(unittest.TestCase):
             return 200, {"ok": True, "event_id": "$evt"}
 
         self.M.http_json = fake_http_json
-        self.M.gateway = lambda: ("https://relay", {})
+        self.M.gateway = lambda *_a: ("https://relay", {})
         self.M.gate_allows = lambda *a, **k: True
         self.M.load_gate = lambda *a, **k: {}
         # The broker knows nobody unless a test tells it otherwise, so the
@@ -488,7 +493,7 @@ class TestMentionFallback(unittest.TestCase):
         self.assertEqual(self.posted, [])
 
     def test_no_gateway_is_named_after_the_resolve(self):
-        self.M.gateway = lambda: ("", {})
+        self.M.gateway = lambda *_a: ("", {})
         got = self._mention("sutando-sonichi", agents=[{"id": SONICHI}])
         self.assertFalse(got["ok"])
         self.assertEqual(got["reason"], "no gateway configured")

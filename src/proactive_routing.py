@@ -29,29 +29,14 @@ duplicate to every configured bridge.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
 
-# Channels whose bridges actually deliver `proactive-*.txt` files.
-# Other producers write `last-owner-activity.json` with channel values
-# like `"voice"` (voice agent registered an utterance) or
-# `"github-commits"` (auto-poll observed a new commit) — those are
-# activity-tracking signals, NOT message-delivery channels. When the
-# last activity was on a non-bridge channel, proactive messages must
-# still get delivered SOMEWHERE rather than stranded: Discord is the
-# default (the canonical first-channel install path).
-#
-# Per @rickchen007 PR #35 review: pre-fix, only `discord`/`telegram`
-# were treated as recognized — and an unrecognized value (`voice`,
-# `github-commits`, anything else) returned False for BOTH bridges,
-# silently stranding the proactive file in `results/` until the
-# next discord/telegram message restored a known activity channel.
-#
-# `ag2space` is the desktop gateway bridge (remote-gateway-bridge's
-# owner-DM drain); its owner-activity writer stamps that channel on
-# every owner message from the AG2 Space app.
-BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space"})
+# Bridges that deliver proactive files; any other activity channel (voice, github-commits)
+# still routes to a default bridge rather than stranding the file.
+BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space", "slack"})
 
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
@@ -67,7 +52,7 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
         messages right now. The decision rule:
 
           1. State file says ``data["channel"]`` is a known BRIDGE
-             channel (discord / telegram / ag2space) → claim only when
+             channel (discord / telegram / ag2space / slack) → claim only when
              ``last_channel == this_channel``. This is the message-
              routing match — owner was last reading there, follow-up
              goes there.
@@ -100,18 +85,15 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     if last_channel in BRIDGE_CHANNELS:
         return last_channel == this_channel
 
-    # Non-bridge channel (voice / github-commits / etc.): the owner
-    # most recently interacted on a surface that doesn't deliver DMs.
-    # Default Discord rather than strand the proactive file.
+    # Non-bridge channel: the owner was last on a surface that delivers no DMs,
+    # so default to Discord rather than strand the file.
     return this_channel == "discord"
 
 
 # The .to-<channel> tag rides between stem and suffix (globs/claims keep it).
 # Unlike the [channel:] BODY marker (room redirect), it selects WHICH BRIDGE.
 
-# Slack is deliberately a destination but NOT a BRIDGE_CHANNEL: it races
-# without activity routing — aimable, never the undestined-activity winner.
-PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS | {"slack"})
+PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS)
 
 _DESTINATION_RE = re.compile(r"\.to-([a-z0-9_-]+)\.txt\Z")
 
@@ -125,6 +107,41 @@ def proactive_filename(ts, channel: "str | None" = None) -> str:
     if channel not in PROACTIVE_DESTINATIONS:
         raise ValueError(f"unknown proactive destination {channel!r}")
     return f"proactive-{ts}.to-{channel}.txt"
+
+
+# A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
+# [.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
+_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
+
+
+def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
+    """Typed constructor for a proactive message about `task_id`; the reader is about_task()."""
+    name = proactive_filename(ts, channel).replace("proactive-", f"proactive-about-{task_id}--", 1)
+    if about_task(name) != task_id:
+        raise ValueError(f"not a task id and timestamp: {task_id!r}, {ts!r}")
+    return name
+
+
+#: The gateway's proactive outbox, under results/: its items are the delivery receipts.
+PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
+
+
+def proactive_item_id(stem: str, body: str) -> str:
+    """One outbox item per file name and body: a new body under a delivered name is a new send.
+    The room and thread are left out, since they are re-resolved on every pass."""
+    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+
+
+def about_task(name) -> "str | None":
+    """The task a proactive message is about, or None for any other proactive name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return m.group(1) if m else None
+
+
+def about_task_ts(name) -> "int | None":
+    """The `<ts>` a proactive message about a task was named with, or None for any other name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return int(m.group(2)) if m else None
 
 
 def proactive_destination(name) -> "str | None":
@@ -143,6 +160,41 @@ def should_claim_proactive_file(name, state_file_path: Path,
     if dest is not None:
         return dest == this_channel
     return should_claim_proactive(state_file_path, this_channel)
+
+
+def claims_unless_routed_elsewhere(name, state_file_path: Path, this_channel: str,
+                                   body=None, other_bridges_configured: bool = False) -> bool:
+    """A bridge's untagged claim. In order: a `.to-<channel>` tag names the bridge;
+    a body whose `[channel:]` address is this bridge's kind outranks activity
+    routing (Discord has the same override); a RECORDED owner activity on a
+    bridge channel routes there; with no record (or a non-bridge one) a lone
+    bridge claims, while on a multi-bridge install the deterministic default
+    (should_claim_proactive: discord) keeps the file."""
+    dest = proactive_destination(name)
+    if dest is not None:
+        return dest == this_channel
+    if body is not None and body_target_channel(body) == this_channel:
+        return True
+    try:
+        with open(state_file_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        last = data.get("channel") if isinstance(data, dict) else None
+    except (OSError, ValueError, AttributeError):
+        last = None
+    if isinstance(last, str) and last in BRIDGE_CHANNELS:
+        return last == this_channel
+    return not other_bridges_configured
+
+
+def other_bridges_configured(this_channel: str, channels_root) -> bool:
+    """Whether any OTHER bridge is installed under `channels_root` (a channel dir
+    carrying `.env` or `access.json`, health-check's own evidence)."""
+    root = Path(channels_root)
+    for channel in sorted(BRIDGE_CHANNELS - {this_channel}):
+        base = root / channel
+        if (base / ".env").exists() or (base / "access.json").exists():
+            return True
+    return False
 
 
 def fallback_claims_name(name, this_channel: str) -> bool:
@@ -207,6 +259,22 @@ def body_claimable_by(body, this_channel: str) -> bool:
     """
     kind = body_target_channel(body)
     return kind is None or kind == this_channel
+
+
+def should_claim_proactive_peeked(name, body, state_file_path: Path,
+                                  this_channel: str) -> bool:
+    """Pre-claim decision for an activity-routed bridge, given the peeked body.
+
+    A body addressed to ANOTHER bridge is never claimed, whatever the tag or
+    activity routing says: a claim renames it out of the glob that bridge polls,
+    so claim-then-release every pass starves it (#5368). Otherwise the filename
+    tag / activity routing decides, and a body addressed to this bridge claims.
+    """
+    if not body_claimable_by(body, this_channel):
+        return False
+    if should_claim_proactive_file(name, state_file_path, this_channel):
+        return True
+    return body_target_channel(body) == this_channel
 
 
 def redirect_target_is_foreign(target, this_channel: str) -> bool:
