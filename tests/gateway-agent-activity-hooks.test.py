@@ -3796,9 +3796,10 @@ class Hooks(unittest.TestCase):
         mock.patch.object(gw, "DELIVERY_PASS_WAIT_S", 0.5).start()
         workers, start_delivery = {}, gw._start_delivery
 
-        def start_and_track(tid, *args):
-            worker = start_delivery(tid, *args)
-            workers[tid] = worker
+        def start_and_track(items, *args):
+            worker = start_delivery(items, *args)
+            for tid, _path, _body, _generation in items:
+                workers[tid] = worker
             return worker
         mock.patch.object(gw, "_start_delivery", side_effect=start_and_track).start()
         drain = threading.Thread(target=gw._post_ready_results, args=(inflight,))

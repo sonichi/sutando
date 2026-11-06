@@ -239,7 +239,10 @@ class PublishClearsDelegation(unittest.TestCase):
 
     def test_an_invalid_id_clears_nothing(self):
         with mock.patch.object(self.td, "clear") as clear:
-            result_publish.publish_text(self.ws / "results" / "..txt", "x")
+            invalid = self.ws / "results" / "task-.txt"
+            with self.assertRaises(ValueError):
+                result_publish.publish_text(invalid, "x")
+            self.assertFalse(invalid.exists())
             result_publish.publish_text(self.ws / "results" / "task-a.md", "x")
         clear.assert_not_called()
 

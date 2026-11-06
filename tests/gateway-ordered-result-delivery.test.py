@@ -27,12 +27,13 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.paired_result import publish_result
 from _helpers.hermetic_env import isolated_child_env  # noqa: E402
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 
 gw, _READS = isolate_then_import(env={"REMOTE_TASK_LIFECYCLE_V2": "1", "REMOTE_TASK_TURN_CONTEXT": "1"})
 assert gw._ATTEMPTS.take_ownership()
+
+from _helpers.paired_result import publish_result  # noqa: E402
 
 BURST_ONLY = "--burst-only"
 ROOM_A, ROOM_B = "!room-a:example.org", "!room-b:example.org"

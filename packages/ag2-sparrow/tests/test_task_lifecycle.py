@@ -2012,7 +2012,7 @@ class SpyMixin:
 
     @staticmethod
     def shape(path):
-        path = re.sub(r"task-[A-Za-z0-9-]+", "<task>", path)
+        path = re.sub(r"task-(?!delegations/)[A-Za-z0-9-]+", "<task>", path)
         path = re.sub(r"\.\d+\.[0-9a-f]{6,8}\.tmp$|\.\d+\.tmp$", ".<tmp>", path)
         path = re.sub(r"\.probe-\d+-[0-9a-f]{8}", ".probe", path)
         return re.sub(r"[0-9a-f]{64}", "<key>", path)
@@ -2098,7 +2098,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                 self.assertEqual(ra.main(argv, {"CLAUDE_ROUTINE_TOKEN": "t"}, opener), 0)
         self.assertEqual(self.by_module(seen, os.path.join("claude_routine", "routine_adapter.py")) - LOCK_FILES,
                          {"state", "results", "tasks"})
-        self.assertEqual({p for p in self.by_module(seen, "relay_loop.py") if not p.startswith("state/result-pairing")},
+        self.assertEqual({p for p in self.by_module(seen, "relay_loop.py") if not p.startswith("state/result-pairing") and p != "state/task-delegations/<task>.json"},
                          {"results", "state", "results/<task>.txt", "results/.<task>.txt.staged",
                           "results/..<task>.txt.staged.<tmp>", "state/done", "state/.done.<tmp>",
                           "state/fires.json", "state/.fires.json.<tmp>"})
@@ -2112,7 +2112,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
             from ag2_sparrow.result_ready import read_ready_result
             self.assertIsNotNone(read_ready_result(work / "results" / "task-a.txt"))
         writes = self.by_module(seen, os.path.join("codex", "codex_connector.py")) - LOCK_FILES
-        self.assertEqual({p for p in writes if not p.startswith("state/result-pairing")},
+        self.assertEqual({p for p in writes if not p.startswith("state/result-pairing") and p != "state/task-delegations/<task>.json"},
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
