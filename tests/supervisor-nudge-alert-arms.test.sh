@@ -52,8 +52,10 @@ sleep 1
 
 MARK="$WORK/armed.marker"
 NUDGES="$WORK/nudges.log"; : > "$NUDGES"
+# The alert is the owner's opt-in (notifications.macos), set in the workspace config layer.
+printf '{"notifications": {"macos": true}}\n' > "$WORK/sutando.config.local.json"
 tmux -S "$SOCK" new-session -d -s supervisor -c "$REPO" \
-  "env -u SUTANDO_INSTANCE_ID PATH=$BIN:\$PATH \
+  "env -u SUTANDO_INSTANCE_ID PATH=$BIN:\$PATH SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE=$WORK \
      SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target SUTANDO_TMUX_WINDOW=0 \
      SUTANDO_WORKSPACE_DIR=$WORK SUTANDO_TASKS_DIR=$WORK/inbox \
      SUTANDO_NOTIFIER_SCRIPT=$STUB SUTANDO_STUB_MARKER=$MARK SUTANDO_STUB_NUDGE=$NUDGES \

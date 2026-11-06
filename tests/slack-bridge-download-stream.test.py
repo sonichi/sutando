@@ -14,6 +14,11 @@ Run: python3 tests/slack-bridge-download-stream.test.py   (exit 0 pass / 1 fail)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import io
 import os

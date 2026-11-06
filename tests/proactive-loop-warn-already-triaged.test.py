@@ -21,6 +21,9 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "s
 _s = importlib.util.spec_from_file_location("wat", str(SCRIPTS / "warn-already-triaged.py"))
 wat = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(wat)
+# The live source would run the core reader against the resolved workspace; this suite never
+# touches a room, so it reads as empty unless a test says otherwise.
+wat.live_pending_lines = lambda: []
 
 
 def _files(*texts):
@@ -256,6 +259,48 @@ class ParkingFiles(unittest.TestCase):
         files = wat.parking_files()
         self.assertIsInstance(files, list)
         self.assertTrue(all(p.exists() for p in files))
+
+
+class LivePendingQuestionsAreTheFirstSource(unittest.TestCase):
+    """The owner's open questions are read through core's reader over the declared store
+    (src/pending_questions_reader.py list --json) — this skill names no other skill — not
+    from a file; a failure there is an empty source, said once."""
+
+    def test_the_live_source_is_the_core_reader_not_another_skills_cli(self):
+        self.assertEqual(wat.PQ_CLI.name, "pending_questions_reader.py")
+        self.assertEqual(wat.PQ_CLI.parent.name, "src")
+        self.assertTrue(wat.PQ_CLI.is_file())
+        self.assertNotIn("skills", wat.PQ_CLI.parts[-3:])
+
+    def test_the_live_source_leads_the_corpus_and_is_labelled(self):
+        files = wat.parking_files()
+        self.assertIs(files[0], wat.PENDING_QUESTIONS)
+        self.assertTrue(files[0].exists())
+        self.assertEqual(wat.display(files[0]), "pending-questions")
+
+    def test_a_question_parked_live_is_found_through_its_title_and_body(self):
+        wat._LINES.clear()
+        with mock.patch.object(wat, "live_pending_lines",
+                               return_value=["## decide the `zzz-live` cache", "Approve -> drop it"]):
+            verdict, out = _report("", "the `zzz-live` thing again", [wat.PENDING_QUESTIONS])
+        wat._LINES.clear()
+        self.assertEqual(verdict, "parked")
+        self.assertIn("pending-questions:1", out)
+
+    def test_an_unreachable_source_reads_as_empty_and_says_so(self):
+        real = importlib.util.module_from_spec(_s)
+        _s.loader.exec_module(real)
+        with mock.patch.object(real, "PQ_CLI", Path("/nonexistent-xyz/pending_questions_reader.py")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(real.live_pending_lines(), [])
+        self.assertIn("pending-questions source unavailable", err.getvalue())
+
+    def test_a_good_listing_becomes_searchable_lines(self):
+        real = importlib.util.module_from_spec(_s)
+        _s.loader.exec_module(real)
+        fake = mock.Mock(returncode=0, stdout='[{"title": "Merge #9?", "snippet": "merge", "body": "a\\nb"}]', stderr="")
+        with mock.patch.object(real.subprocess, "run", return_value=fake):
+            self.assertEqual(real.live_pending_lines(), ["## Merge #9?", "merge", "a", "b"])
 
 
 class MemoryIsPartOfTheCorpus(unittest.TestCase):

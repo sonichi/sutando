@@ -33,6 +33,11 @@ Run: python3 tests/sutando-config-python-resolution.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import shutil
 import subprocess
@@ -132,7 +137,7 @@ class ResolvePython(unittest.TestCase):
             PROBE_SOURCE.replace("%FAKE_PY%", FAKE_PY), encoding="utf-8"
         )
         cls.probe = probe_dir / "probe"
-        env = os.environ.copy()
+        env = isolated_child_env()
         # Persistent, NOT under cls.tmp: a per-run cache is deleted in teardown, so
         # every run rebuilt Foundation's modules cold — measured 4.9x the warm cost.
         cache = Path(tempfile.gettempdir()) / "sutando-swift-module-cache"

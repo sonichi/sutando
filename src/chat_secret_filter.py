@@ -30,6 +30,9 @@ from typing import Iterable, Tuple
 SLACK_TOKEN_PATTERN = re.compile(
     r"(?:xoxe\.)?xox[abcdeoprs]-\d[A-Za-z0-9-]*|xapp-\d[A-Za-z0-9-]*"
 )
+PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+)
 
 _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("AWS Access Key", re.compile(r"AKIA[A-Z0-9]{16}")),
@@ -63,9 +66,7 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
         r"[MNO][A-Za-z\d_-]{23,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{27,}"
     )),
     ("Telegram Bot Token", re.compile(r"\d{8,10}:[A-Za-z0-9_-]{35}")),
-    ("Private Key", re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"
-    )),
+    ("Private Key", PRIVATE_KEY_PATTERN),
 )
 _ENTROPY_TYPES = {"Base64 High Entropy String", "Hex High Entropy String"}
 _TOKENISH_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")

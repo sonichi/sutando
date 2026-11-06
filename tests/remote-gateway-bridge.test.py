@@ -17,6 +17,11 @@ import runpy
 import sys
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 TARGET = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.test.py"
 
 try:

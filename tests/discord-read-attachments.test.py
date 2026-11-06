@@ -14,6 +14,12 @@ Two defects, one branch apart in `_render`:
 Fetch-side note for whoever consumes the url: the CDN refuses urllib's default
 User-Agent with 403 and serves 200 for a browser one.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import pathlib
 import sys

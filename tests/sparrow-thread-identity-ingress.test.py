@@ -23,6 +23,11 @@ import concurrent.futures
 import pathlib
 import sys
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "packages" / "ag2-sparrow"))
 

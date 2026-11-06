@@ -268,6 +268,78 @@ if '"remedy_timer"' in body:
 else:
     fail("spawn() does not report the timer outcome")
 
+# --- the Stop setting rides the job, so a relaunched worker keeps it ---------
+STOP = "SUTANDO_STOP_INTERRUPT"
+
+
+def with_stop(value, fn):
+    """Run fn with the launcher's Stop setting as `value` (None: unset)."""
+    saved = os.environ.pop(STOP, None)
+    try:
+        if value is not None:
+            os.environ[STOP] = value
+        return fn()
+    finally:
+        os.environ.pop(STOP, None)
+        if saved is not None:
+            os.environ[STOP] = saved
+
+
+def saved_stop(la):
+    plist = next(la.glob("com.sutando.pool-remedy.*.plist"))
+    with open(plist, "rb") as fh:
+        return (plistlib.load(fh).get("EnvironmentVariables") or {}).get(STOP)
+
+
+def host(installed_with):
+    """A host whose timer was installed (and loaded) with `installed_with` as the setting."""
+    tmp = tempfile.mkdtemp()
+    la = Path(tmp) / "LaunchAgents"
+    la.mkdir()
+    lc = Launchctl()
+    with_stop(installed_with, lambda: sw.prt.install(tmp, str(REPO), launch_agents=la, runner=lc,
+                                                     sleep=lambda *_: None))
+    return tmp, la, lc
+
+
+def ensure(tmp, la, lc, spawner):
+    lc.argv.clear()
+    return with_stop(spawner, lambda: sw.ensure_remedy_timer(tmp, str(REPO), runner=lc, launch_agents=la))
+
+
+if HAVE_HELPER:
+    for installed_with, spawner, want_saved, want_reinstall, what in (
+            ("1", "1", "1", False, "default on: saved, and left alone"),
+            ("0", "0", "0", False, "opt-out \"0\": saved, and left alone"),
+            (None, "1", "1", True, "a timer from before the setting is reinstalled once with it"),
+            ("1", "0", "0", True, "a changed setting reinstalls with the new value"),
+            ("1", None, "1", False, "a spawner without the setting keeps the saved value"),
+            ("0", None, "0", False, "a spawner without the setting keeps a saved opt-out"),
+            (None, None, None, False, "from source, with no setting anywhere: unchanged")):
+        tmp, la, lc = host(installed_with)
+        out = ensure(tmp, la, lc, spawner)
+        reinstalled = bool(lc.ran("bootstrap"))
+        if saved_stop(la) == want_saved and reinstalled == want_reinstall:
+            ok(what)
+        else:
+            fail(f"{what}: saved {saved_stop(la)!r}, reinstalled {reinstalled}: {out}")
+        again = ensure(tmp, la, lc, spawner)
+        if again.get("why") == "already installed" and not lc.ran("bootstrap"):
+            ok(f"{what}: the next spawn leaves it alone (no reinstall loop)")
+        else:
+            fail(f"{what}: reinstalled again on the next spawn: {again}")
+    tmp, la, lc = host("0")
+    with_stop(None, lambda: sw.prt.install(tmp, str(REPO), launch_agents=la, runner=lc, sleep=lambda *_: None))
+    if saved_stop(la) == "0":
+        ok("an explicit install without the setting keeps the saved opt-out")
+    else:
+        fail(f"an explicit install wiped the saved opt-out: {saved_stop(la)!r}")
+    job = with_stop("", lambda: sw.prt.render(tmp, REPO))
+    if STOP not in job["EnvironmentVariables"]:
+        ok("an empty setting is unset, not saved")
+    else:
+        fail(f"an empty setting was saved: {job['EnvironmentVariables']}")
+
 if fails:
     print(f"pool-remedy-timer-ensured-on-spawn: {fails} failure(s)")
     sys.exit(1)

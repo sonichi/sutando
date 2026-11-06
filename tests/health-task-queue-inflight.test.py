@@ -13,6 +13,11 @@ and starts meaning "wedged" — and that is precisely when an unbounded version
 of this probe would go quiet forever.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import re
