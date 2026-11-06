@@ -1555,17 +1555,17 @@ def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, st
         return None, str(e)
 
 
-def active_job_problem(shape: Shape) -> str:
-    """'' unless `shape`'s job runs or its state cannot be read: connect writes a seat only for a stopped
-    agent, so a credential rotation is stop, then connect."""
+def active_job_problem(shape: Shape, verb: str = "connect") -> str:
+    """'' unless `shape`'s job runs or its state cannot be read: `verb` (connect, or install --token-stdin)
+    writes a seat only for a stopped agent, so a credential rotation is stop, then `verb`."""
     state = manager_state(shape)
     if state == "unknown":
-        return (f"{job_name(shape)}'s state cannot be read; connect writes the seat only while it is stopped: "
-                f"stop it ({stop_command(shape)}), then connect again")
+        return (f"{job_name(shape)}'s state cannot be read; {verb} writes the seat only while it is stopped: "
+                f"stop it ({stop_command(shape)}), then {verb} again")
     if state != "active":
         return ""
     served = (owned_config(shape)[0] or {}).get("ROOT") or "an unrecorded root"
-    return f"{job_name(shape)} is running for {served}; stop it first ({stop_command(shape)}), then connect again"
+    return f"{job_name(shape)} is running for {served}; stop it first ({stop_command(shape)}), then {verb} again"
 
 
 def _free_root_problem(root: str) -> str:
@@ -2476,6 +2476,58 @@ def read_code(arg, stdin=None, prompt=None) -> "tuple[str, str]":
     print("warning: a code on the command line is kept by ps and shell history; next time use --code - or the "
           "prompt", file=sys.stderr)
     return arg.strip(), ""
+
+
+TOKEN_LINE_MAX = 8192
+TOKEN_PROMPT = "the agent's relay token (input hidden): "
+TOKEN_SHAPE = ("not a relay token: paste the agent's <relay_url>|<secret>, or its REMOTE_TASK_TOKEN= or "
+               "AG2_REMOTE_TOKEN= line")
+
+
+def read_token(stdin=None, prompt=None) -> "tuple[dict | None, str]":
+    """({relay_url, bearer}, '') or (None, why, never the value): one line, asked for without echo on a
+    terminal, else read from stdin, then parse_token. The value never reaches argv, a log or an exception."""
+    stdin = sys.stdin if stdin is None else stdin
+    try:
+        tty = bool(stdin is not None and stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        tty = False
+    try:
+        if tty:
+            line = (prompt or getpass.getpass)(TOKEN_PROMPT)
+        elif stdin is None:
+            line = ""
+        else:
+            line = stdin.readline(TOKEN_LINE_MAX + 1)
+    except (EOFError, OSError, ValueError, UnicodeDecodeError):
+        line = ""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    if len(line) > TOKEN_LINE_MAX:
+        return None, f"the token line is longer than {TOKEN_LINE_MAX} characters; {TOKEN_SHAPE}"
+    if not line.strip():
+        return None, "no token was given: paste it when asked, or pipe one line into --token-stdin"
+    return parse_token(line)
+
+
+def parse_token(line: str) -> "tuple[dict | None, str]":
+    """({relay_url, bearer}, '') from the bare `<relay_url>|<bearer>` token or a REMOTE_TASK_TOKEN= /
+    AG2_REMOTE_TOKEN= line (`export ` and quotes allowed); the relay https, the bearer one seat line."""
+    text = line.strip()
+    raw = text if text.lower().startswith(("http://", "https://")) else _sources.token_file_token(text)
+    for value in (text, raw):
+        if value:
+            diagnostics.register_secret(value)
+    url, bearer = _sources.contract.parse_onboarding_token(raw.strip())
+    if bearer:
+        diagnostics.register_secret(bearer)
+    if not url or not bearer or any(c.isspace() or c == "|" or ord(c) < 0x20 or ord(c) == 0x7F for c in bearer):
+        return None, TOKEN_SHAPE
+    why = endpoint_problem(url, "the token's relay URL")
+    if why:
+        return None, why
+    diagnostics.register_gateway_url(url)
+    return {"relay_url": url, "bearer": bearer}, ""
 
 
 def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":

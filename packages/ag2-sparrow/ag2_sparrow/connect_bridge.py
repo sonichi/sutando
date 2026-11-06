@@ -9,6 +9,7 @@ parametrised by the adapter's Shape: this module names no adapter and imports no
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -306,7 +307,7 @@ def agent_root(agent_id: str) -> "tuple[str, str]":
 
 
 _NOT_SESSION = ("help", "base", "code", "agent", "trust_relay_host", "work", "inbox", "token_env_file",
-                "bridge_state_dir", "experimental_connect")
+                "token_stdin", "bridge_state_dir", "experimental_connect")
 
 
 def session_flags(args) -> list:
@@ -329,8 +330,11 @@ def rerun_install(local: cm.Shape, token_file: str, flags=()) -> str:
                                                else " again")
 
 
-def spent_code_line(local: cm.Shape, seat_env: str, flags=()) -> str:
-    """After a connect whose install failed: the code is spent, but the seat it wrote recovers it."""
+def spent_code_line(local: cm.Shape, seat_env: str, flags=(), code: bool = True) -> str:
+    """After a connect (or install --token-stdin) whose install failed: the seat it wrote recovers it."""
+    if not code:
+        return (f"the token is in the seat {seat_env}; once the line above is fixed, run "
+                f"{rerun_install(local, seat_env, flags)} (no need to paste it again)")
     return (f"the code is spent and its credential is in the seat {seat_env}; once the line above is fixed, run "
             f"{rerun_install(local, seat_env, flags)} (no new code is needed)")
 
@@ -726,13 +730,30 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
+    return _seat_held(local, root, redeemed, CODE_WORDS)
+
+
+# What a refused or failed seat write says: connect's code is spent by then, a pasted token is not.
+CODE_WORDS = {"busy": "the code is spent and nothing was written: make a new code once it is done",
+              "held": "the code is spent and nothing was written ({home} is unchanged): make a new code in s.space "
+                      "once the root is free",
+              "failed": "the code is spent but the seat was not written: {problem}; make a new code",
+              "written": "connected: {agent}; credentials in {where} (mode 600)"}
+TOKEN_WORDS = {"busy": "nothing was written: run the same command once it is done",
+               "held": "nothing was written ({home} is unchanged)",
+               "failed": "the seat was not written: {problem}",
+               "written": "seat written: {agent}; credentials in {where} (mode 600)"}
+
+
+def _seat_held(local: cm.Shape, root: str, redeemed: dict, words: dict) -> "tuple[dict | None, str]":
+    """The seat written under the agent lock, taken here and held until finish_connect: (seat, '') or (None, why)."""
     lock = cm.agent_lock(root)
     try:
         lock.__enter__()
     except cm.Busy as e:
-        return None, f"{e}; the code is spent and nothing was written: make a new code once it is done"
+        return None, f"{e}; {words['busy']}"
     try:
-        seat, problem = _seat_under_lock(local, root, redeemed)
+        seat, problem = _seat_under_lock(local, root, redeemed, words)
     except BaseException:
         lock.release()
         raise
@@ -742,23 +763,78 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     return dict(seat, lock=lock, local=local), ""
 
 
-def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict, str]":
+def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict, words: dict = CODE_WORDS) -> "tuple[dict, str]":
     def act(owner):
         seat_env, why = cm.write_seat_held(owner, root, bridge_home(root), redeemed)
         return seat_env, cm.held_identity(owner), why
     written, held = cm.under_root(local, root, act, precheck=lambda: bridge_owner_problem(
         local, root, redeemed["agent_id"]) or cm.seat_problem(bridge_home(root)))
     if held:
-        return {}, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
-                    "make a new code in s.space once the root is free")
+        return {}, f"{held}; " + words["held"].format(home=bridge_home(root))
     seat, root_id, problem = written
     if problem:
-        return {}, f"the code is spent but the seat was not written: {problem}; make a new code"
-    print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat).parent} (mode 600)")
+        return {}, words["failed"].format(problem=problem)
+    print(words["written"].format(agent=redeemed["agent_id"], where=Path(seat).parent))
     return {"agent_id": redeemed["agent_id"], "root": root, "seat_env": seat, "root_id": root_id}, ""
 
 
-def finish_connect(seat: dict, install, command: str, flags) -> int:
+# ── install --token-stdin: a pasted relay token into the same seat ───────────
+
+def token_stdin_problem(args) -> str:
+    """'' unless install's --token-stdin comes with an option that names another credential or root."""
+    for dest, flag in (("token_env_file", "--token-env-file"), ("work", "--work"), ("inbox", "--inbox"),
+                       ("bridge_state_dir", "--bridge-state-dir")):
+        if getattr(args, dest, None):
+            return (f"--token-stdin writes the agent's own seat beside its own root, so it cannot be combined with "
+                    f"{flag}; nothing was read or written")
+    return ""
+
+
+def token_into_seat(local: cm.Shape, agent_id, preflight, read=None) -> "tuple[dict | None, str]":
+    """redeem_into_seat for a token pasted on stdin (cm.read_token) instead of a code: every refusal that needs
+    no token (the agent id, `preflight(job)`, a running job, another adapter's bridge for the agent, the root
+    and its seat) comes before the token is read; the seat is the one connect writes for this agent."""
+    agent_id = (agent_id or "").strip()
+    if not agent_id:
+        problem = "--token-stdin needs --agent <the agent's Matrix ID>"
+    elif not AGENT_ID_RE.fullmatch(agent_id):
+        problem = f"--agent {agent_id} is not a Matrix ID (@name:server)"
+    else:
+        job, problem = cm.agent_job(local, agent_id)
+        local = job or local
+    root = ""
+    if not problem:
+        root, problem = agent_root(agent_id)
+    problem = problem or (preflight(local) or cm.active_job_problem(local, "install --token-stdin")
+                          or agent_owner_problem(local, agent_id) or known_root_problem(local)
+                          or cm.seat_problem(bridge_home(root)))
+    if problem:
+        return None, f"{problem}; the token was not read"
+    token, problem = (read or cm.read_token)()
+    if problem:
+        return None, f"{problem}; nothing was written"
+    return _seat_held(local, root, dict(token, agent_id=agent_id), TOKEN_WORDS)
+
+
+def install_token_stdin(args, local: cm.Shape, preflight, install, command: str, **cleared) -> int:
+    """`install --agent <id> --token-stdin`, inside the agent's fence: token_into_seat, then the adapter's
+    `install` with that seat as its --token-env-file (`cleared`: its root options, unset), as connect does."""
+    def run() -> int:
+        problem = token_stdin_problem(args)
+        seat, problem = (None, problem) if problem else token_into_seat(
+            local, args.agent, lambda job: preflight() or cm.install_selector_problem(
+                job, getattr(args, "key", None), getattr(args, "single", False)))
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return cm.EXIT_UNUSABLE
+        session = dict(vars(args), **cleared, token_env_file=seat["seat_env"], token_stdin=False,
+                       root_identity=seat["root_id"])
+        return finish_connect(seat, lambda: install(argparse.Namespace(**session)), command, session_flags(args),
+                              code=False)
+    return fenced(args.agent, run)
+
+
+def finish_connect(seat: dict, install, command: str, flags, code: bool = True) -> int:
     """install() still under the agent lock connect took for the seat, then that lock released, and
     connect's closing line: what to verify, or how the spent code's seat is installed again."""
     try:
@@ -772,5 +848,5 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
     if rc == 0:
         print(f"next: {cm.job_command(seat['local'], 'verify')} (the bridge reports connected within a minute)")
     else:
-        print(f"error: {spent_code_line(seat['local'], seat['seat_env'], flags)}", file=sys.stderr)
+        print(f"error: {spent_code_line(seat['local'], seat['seat_env'], flags, code)}", file=sys.stderr)
     return rc

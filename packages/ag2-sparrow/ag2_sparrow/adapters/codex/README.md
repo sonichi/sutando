@@ -21,13 +21,26 @@ shares: the service manager (systemd `--user`, launchd) is the only supervisor; 
 occupancy and the holder record attribution, never readiness.
 
 ```bash
+ag2-sparrow-codex-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
     [--allow-non-owner] [--model <m>] [--codex <path>]
-ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]
+ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]   # the alternative to --token-stdin
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
 ag2-sparrow-codex-local list
 ```
+
+**Install with a pasted token.** `install --agent <the agent's Matrix ID> --token-stdin` asks for the
+agent's relay token without echoing it (on a terminal), or reads one line from stdin when it is piped. It
+takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_REMOTE_TOKEN='…'` line (quotes
+and `export ` stripped); anything else, or a relay that is not https, is refused with nothing written. The
+token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
+through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
+refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no
+token comes before it is read: the other adapter already serving the agent (with its `uninstall --agent`
+command), this agent's job still running (stop it first), and `--token-env-file`, `--work`
+given too. Install then runs as with `--token-env-file <that seat's .env>`. The token is never on a
+command line, so no shell history, `ps` or `set -x` trace holds it.
 
 **Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
 enabled in this release; use install --work / verify") before it reads or redeems a code or touches any

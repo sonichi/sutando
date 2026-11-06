@@ -145,6 +145,9 @@ RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBO
 
 
 def install(args) -> int:
+    if getattr(args, "token_stdin", False):
+        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
+                                      work=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -195,14 +198,15 @@ def install(args) -> int:
                                orphan=lambda: cb.orphan_bridge(dict(values, ROOT=root), COMMAND, bridge, local))
 
 
-def connect_preflight(args) -> str:
-    """'' when this host can run the agent, checked before the single-use code is spent; else why not."""
+def connect_preflight(args, login: bool = True) -> str:
+    """'' when this host can run the agent, checked before the single-use code is spent (`login`: and the
+    codex login is in place); else why not."""
     problem = cb.host_problem(COMMAND)
     if problem:
         return problem
     codex = os.path.abspath(shutil.which(args.codex) or args.codex)
-    login = {"CODEX": codex, "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""}
-    return version_problem(codex) or login_problem(login)
+    login_cfg = {"CODEX": codex, "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""}
+    return version_problem(codex) or (login_problem(login_cfg) if login else "")
 
 
 CONNECT_OFF = "Codex connect is not enabled in this release; use install --work / verify"
@@ -379,8 +383,13 @@ def main(argv=None) -> int:
                        "(a reinstall stops the old one first)")
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run: Sparrow's tasks/ and results/ must "
                    "be <work>/tasks and <work>/results")
-    p.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file (a seat .env, or one with "
-                   "REMOTE_TASK_TOKEN and AGENT_MXID); the root is the agent's own and install runs its bridge")
+    tok = p.add_mutually_exclusive_group()
+    tok.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file (a seat .env, or one with "
+                     "REMOTE_TASK_TOKEN and AGENT_MXID); the root is the agent's own and install runs its bridge")
+    tok.add_argument("--token-stdin", action="store_true", help="instead of --work, with --agent: read the agent's "
+                     "relay token (<relay_url>|<secret>, or its REMOTE_TASK_TOKEN= line) from stdin, asked for without "
+                     "echo on a terminal, and write it to the agent's seat (mode 600) as connect does; the agent's "
+                     "job must be stopped")
     p.add_argument("--agent", help="the agent's Matrix ID, checked against the one the token env file names")
     p.add_argument("--key", help="the agent key of the job this install must be (checked, never chosen by it)")
     p.add_argument("--single", action="store_true", help="checked: this install must be the fixed job")

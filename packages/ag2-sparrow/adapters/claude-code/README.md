@@ -353,7 +353,8 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks for the code; or, by hand:
+ag2-sparrow-claude-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
+ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # or with a code; or, by hand:
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
@@ -368,6 +369,18 @@ ag2-sparrow-claude-local list            # each job installed here, its agent, s
 The session loads the ag2space-inbox plugin this package ships;
 `--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
 working tree under edit, say).
+
+**Install with a pasted token.** `install --agent <the agent's Matrix ID> --token-stdin` asks for the
+agent's relay token without echoing it (on a terminal), or reads one line from stdin when it is piped. It
+takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_REMOTE_TOKEN='…'` line (quotes
+and `export ` stripped); anything else, or a relay that is not https, is refused with nothing written. The
+token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
+through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
+refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no
+token comes before it is read: the other adapter already serving the agent (with its `uninstall --agent`
+command), this agent's job still running (stop it first), and `--token-env-file`, `--work` or `--inbox`
+given too. Install then runs as with `--token-env-file <that seat's .env>`. The token is never on a
+command line, so no shell history, `ps` or `set -x` trace holds it.
 
 **Connect with a code.** On a host with no core, the two steps s.space shows
 are the agent's whole setup:

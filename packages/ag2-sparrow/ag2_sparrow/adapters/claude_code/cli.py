@@ -175,6 +175,9 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
 
 
 def install(args) -> int:
+    if getattr(args, "token_stdin", False):
+        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
+                                      work=None, inbox=None, bridge_state_dir=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -288,8 +291,9 @@ def plugin_dir(args) -> Path:
     return Path(args.plugin_dir).expanduser().resolve() if args.plugin_dir else PLUGIN
 
 
-def connect_preflight(args) -> str:
-    """'' when this host can run the agent, checked before the single-use code is spent; else why not."""
+def connect_preflight(args, login: bool = True) -> str:
+    """'' when this host can run the agent, checked before the single-use code is spent (`login`: and the
+    claude login is in place); else why not."""
     problem = cb.host_problem(COMMAND)
     if problem:
         return problem
@@ -297,11 +301,11 @@ def connect_preflight(args) -> str:
     plugin = plugin_dir(args)
     if not (plugin / ".claude-plugin" / "plugin.json").is_file():
         return f"{plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)"
-    login = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser()
-                                                                         .resolve()) if args.claude_config_dir else ""}
+    config_dir_ = str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else ""
+    login_cfg = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": config_dir_}
     local = cm.agent_job(LOCAL, args.agent)[0] or LOCAL     # redeem_into_seat checked the id and the job
     return (version_problem(claude) or resolve_tmux(args, local)[1] or launcher.socket_problem(config_dir(local))
-            or auth_problem(login) or hmac_settings(args)[2])
+            or (auth_problem(login_cfg) if login else "") or hmac_settings(args)[2])
 
 
 def connect(args) -> int:
@@ -643,8 +647,13 @@ def main(argv=None) -> int:
                    "root, <agents dir>/<agent id>, whose bridge install wires)")
     p.add_argument("--inbox", help="an explicit work root by its <work>/tasks, as your bridge's task dir; the "
                    "result dir is <work>/results")
-    p.add_argument("--token-env-file", help="the agent's 0600 env file with REMOTE_TASK_TOKEN (and AGENT_MXID) for "
-                   "the bridge install runs (default: Sparrow's device env)")
+    tok = p.add_mutually_exclusive_group()
+    tok.add_argument("--token-env-file", help="the agent's 0600 env file with REMOTE_TASK_TOKEN (and AGENT_MXID) for "
+                     "the bridge install runs (default: Sparrow's device env)")
+    tok.add_argument("--token-stdin", action="store_true", help="with --agent: read the agent's relay token "
+                     "(<relay_url>|<secret>, or its REMOTE_TASK_TOKEN= line) from stdin, asked for without echo on "
+                     "a terminal, and write it to the agent's seat (mode 600) as connect does; the agent's job must "
+                     "be stopped")
     p.add_argument("--bridge-state-dir", help="with an explicit root: the AGENT_CONNECT_STATE_DIR of the bridge you "
                    "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
     p.add_argument("--agent", help="the agent's Matrix ID, checked against the one the token env file names")
