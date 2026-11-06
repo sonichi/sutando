@@ -17,9 +17,14 @@ import stat
 import sys
 import tempfile
 import unittest
-from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
+from collections import namedtuple  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
