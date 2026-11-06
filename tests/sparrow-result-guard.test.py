@@ -313,7 +313,7 @@ src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
        / "remote_gateway_bridge.py").read_text()
 # Line-bounded: a deeper-indented loop contains the bare literal, and an
 # absent anchor slices src[-1:] — both misreport a guard-ordering violation.
-anchor = "\n    for tid in list(inflight):\n"
+anchor = "\n    for tid in _intake_ordered(list(inflight), rooms):\n"
 i = src.find(anchor)
 check(i != -1, "the drain anchor is still present in remote_gateway_bridge.py")
 if i != -1:

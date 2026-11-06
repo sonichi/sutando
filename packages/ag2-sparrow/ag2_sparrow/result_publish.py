@@ -13,6 +13,8 @@ two publishers of one name never rename each other's bytes. Shell writers use
 the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
 `--title`/`--outcome` publish the result's Activity labels first, bound to this body
 (`result_labels`); a `[no-send]` reason is the outcome when none is given.
+Publishing a task's live `results/` body clears that task's delegation marker
+(`task_delegation`), best effort: the hand-off it recorded has ended.
 
 The CLI refuses a `source: cron` task's result that names no destination and
 carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
@@ -114,7 +116,28 @@ def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_repla
             os.fsync(dfd)
         finally:
             os.close(dfd)
+    _clear_delegation(target)
     return target
+
+
+def _clear_delegation(target: Path) -> None:
+    """Drop the task's delegation marker once its live result exists; never fails the publish."""
+    if target.parent.name != "results":
+        return
+    if not target.name.endswith(".txt"):
+        return
+    # The exact id: a claim/assignment suffix is also legal inside a real id, so none is stripped.
+    task_id = target.name[:-len(".txt")]
+    try:
+        try:
+            from . import local_task_protocol, task_delegation
+        except ImportError:
+            import local_task_protocol
+            import task_delegation
+        if local_task_protocol.valid_archive_lookup_id(task_id):
+            task_delegation.clear(target.parent.parent, task_id)
+    except Exception:  # noqa: BLE001 — a stale marker only expires later; the result already stands
+        pass
 
 
 def publish_text(path: str | Path, text: str, mode: int = 0o666, *, _paired=False, pair_result=False) -> Path:
