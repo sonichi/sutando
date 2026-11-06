@@ -383,6 +383,22 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
+# Re-points hooks a moved install left on its old path at this checkout. Adds no hook,
+# so an opt-in one (the transcript archiver) stays as it was.
+repair_claude_hook_paths() {
+  [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_hooks_settings.py" ] || return 0
+  local _dirs=("$REPO") _wd _d _args=()
+  if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+    _wd="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
+    [ -d "$_wd" ] && _dirs+=("$(cd "$_wd" && pwd -P)")
+  fi
+  for _d in "${_dirs[@]}"; do
+    _args+=(--settings "$_d/.claude/settings.json" --settings "$_d/.claude/settings.local.json")
+  done
+  "$PY" "$REPO/src/claude_hooks_settings.py" repair-paths --repo "$REPO" "${_args[@]}" \
+    || echo "session-launch: hook path repair failed (rc=$?) — a moved install's hooks may still fail" >&2
+}
+
 # Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
 # and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {

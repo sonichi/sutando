@@ -12,7 +12,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 
 ## Modules (`scripts/`)
 
-- `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher; refuses before any side effect, rolls back on a launcher failure.
+- `pool_beat.py` — refresh liveness; worker writers watch the tmux CLI PID each second and check PID reuse before each refresh. Unreadable process metadata is nonfatal.
+- `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher, detached worker beat; refuses before any side effect, rolls back on a launcher failure.
 - `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale.
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
