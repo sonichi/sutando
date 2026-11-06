@@ -369,8 +369,8 @@ The session loads the ag2space-inbox plugin this package ships;
 `--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
 working tree under edit, say).
 
-**Connect with a code.** On a host with no core, the two steps s.space shows
-are the agent's whole setup:
+**Connect with a code.** On a host with no core, run the connect command with the one-time acp. code
+that s.space issues for the agent; that is the agent's whole setup:
 
 ```bash
 ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent's Matrix ID>
@@ -421,7 +421,7 @@ or the `ai.ag2.sparrow.claude-local-bridge` agent): `ag2-sparrow` with
 Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
-one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
+one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (the agent's Matrix ID, as s.space gives it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
 
 **Several agents on one host.** Each agent installed on its own root (no
 `--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`

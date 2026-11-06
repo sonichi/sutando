@@ -321,7 +321,7 @@ since the copy), `agent_mismatch` (another agent or owner), `unverified` (a serv
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
 s.space). Then fall back to a code:
 
-1. Get a connect code for this agent at s.space's agent portal.
+1. Get a connect code for this agent from the connect flow your s.space client offers.
 2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
    server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
 3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
