@@ -2450,7 +2450,7 @@ def relay_problem(base: str, relay_url: str, trusted_host: str = "") -> str:
     base_host = urllib.parse.urlsplit(base).hostname or ""
     if not _relay_host_ok(host, base_host) and host != trusted_host.lower():
         return (f"the relay URL s.space returned is on {host}, not {base_host} or a host under it; if that relay "
-                f"is expected, connect again with a new code and --trust-relay-host {host}")
+                f"is expected, rerun with --trust-relay-host {host}")
     return ""
 
 
@@ -2460,8 +2460,8 @@ def code_problem(base: str, code: str) -> str:
     if why:
         return why
     if not (code or "").startswith(CODE_PREFIX) or len(code) <= len(CODE_PREFIX) or any(c.isspace() for c in code):
-        return (f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from s.space again, or "
-                "put a relay token in install --token-env-file instead")
+        return (f"the code is not an agent code (it starts with {CODE_PREFIX}); to connect with "
+                "the agent's relay token, use install --token-env-file")
     return ""
 
 
@@ -2531,8 +2531,8 @@ def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | 
             return None, "s.space is busy (HTTP 503 on every try); the code is still valid, try again in a minute"
         if status == 404:
             reason = next((answer[k] for k in ("error", "reason", "state") if isinstance(answer.get(k), str)), "")
-            return None, GONE.get(reason, "the code was already used or has expired; get a new one from s.space, "
-                                   "or use install --token-env-file with the agent's relay token")
+            return None, GONE.get(reason, "the code was already used or has expired; to connect, use "
+                                   "install --token-env-file with the agent's relay token")
         if status != 200:
             return None, f"s.space refused the code (HTTP {status})"
         fields = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}

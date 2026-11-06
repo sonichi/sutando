@@ -29,34 +29,18 @@ ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
 ag2-sparrow-codex-local list
 ```
 
-**Connect with a relay token (the main path).** The owner takes the agent's relay token from the
-agent's page in the s.space app (Get token), puts it in a mode-600 env file as `REMOTE_TASK_TOKEN=<token>`
+**Connect with a relay token (the main path).** For an agent this Mac's Sutando core is not bound to,
+the owner takes its relay token from the agent's page in the s.space app (Get token), puts it in a mode-600 env file as `REMOTE_TASK_TOKEN=<token>`
 with `AGENT_MXID=<the agent's Matrix ID>` (under Sutando, `vault set <KEY> "<token>"` instead, the key
-install prints) and runs `install --token-env-file <that file>`. The one-time `acp.` code below is the
-secondary path.
-
-**Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
-enabled in this release; use install --work / verify") before it reads or redeems a code or touches any
-root, seat, unit or lock. Use `install --work` and `verify`. What follows is the experimental path.
-On a host with no core, `connect --experimental-connect --base <url> --agent <the agent's Matrix ID>` is the
-agent's whole setup, with
-claude-local's `connect` behaviour, from the same package code (`connect_bridge`): it checks the
-machine before the code is spent (no host supervisor, no `AGENT_CONNECT_TASK_DIR`, the Codex pin, and
-`codex login status` under `--codex-home`), reads the code (the one-time `acp.` code, issued today only by s.space's API route
-`POST /api/connect/agent-code` with the owner's web session; no app screen issues it yet) from a prompt or `--code -` (a code on the
-command line works with a warning), requires https for `--base` and the relay URL (plain http only on
-a loopback host) and a relay on `--base`'s host or under it unless `--trust-relay-host` names it,
-retries a 202 or 503 on a 1, 2, 4, 8, 16 s backoff, and says why a 404'd code is gone. The credential
-owner writes the seat beside the agent's root (`<root>.bridge/channels/ag2space/{.env,token}`, 0600,
-`GATEWAY_INSTANCE` minted once and kept across reconnects), then `install --token-env-file <seat>/.env`
-runs. The bearer is only ever in the seat's `token`.
+install prints) and runs `install --token-env-file <that file>`; the token is read from that file, never
+from the command line.
 
 **The agent's bridge.** `--work` is a root a bridge you run feeds, as before. `--token-env-file` alone
 makes the root the agent's own (`<agents dir>/<segment of its id>`) and has install wire that agent's
 bridge, exactly as claude-local's install does: one launch environment (the root's `tasks/` and
 `results/`, the bridge's state at `<root>.bridge/state`, a seat's exports with every inherited token
 cleared) in a marked unit or launchd agent of its own, `ag2-sparrow-codex-local-bridge`. `verify` adds
-the bridge's connected status and its unit; `uninstall` stops and removes that unit too. One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID (as s.space gives it) as `--agent`, so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
+the bridge's connected status and its unit; `uninstall` stops and removes that unit too. One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first.
 
 Several agents run side by side as claude-local's do: an agent installed with `--token-env-file` gets
 a job of its own, `ai.ag2.sparrow.codex-local.<agent key>` (systemd:

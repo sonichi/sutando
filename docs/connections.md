@@ -321,8 +321,11 @@ since the copy), `agent_mismatch` (another agent or owner), `unverified` (a serv
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
 s.space). Then fall back to a code:
 
-1. Get a new relay token for this agent from its page in the s.space app (Get token).
-2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
+1. Get a new relay token for this agent on this machine. It is the core's own agent, so the s.space
+   app offers no token for it and points back here. A desktop sign-in to s.space writes the token to
+   the s.space channel env file, and `list` or the next startup adopts it as a row (see "Startup"), so
+   step 2 is only for a token you already hold.
+2. `python3 scripts/connections.py add '<code>'` with that relay token, quoted (it holds a `|`); it previews the
    server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
 3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
    — starts the s.space bridge as primary, waits for it to connect, then stops and parks the

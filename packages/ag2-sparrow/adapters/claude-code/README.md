@@ -356,7 +356,6 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]   # the agent's relay token (below)
-ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # or a one-time acp. code
 ag2-sparrow-claude-local verify [<selector>]
 ag2-sparrow-claude-local attach [<selector>]   # the live pane; detach with the tmux prefix + d
 ag2-sparrow-claude-local stop --confirm [<selector>]  # confirm an open stall card's Stop here
@@ -369,46 +368,16 @@ The session loads the ag2space-inbox plugin this package ships;
 `--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
 working tree under edit, say).
 
-**Connect with a relay token (the main path).** The owner takes the agent's relay token from the
-agent's page in the s.space app (Get token). On a host with no core, put it in a mode-600 env file as
-`REMOTE_TASK_TOKEN=<token>` with `AGENT_MXID=<the agent's Matrix ID>` and run
-`install --token-env-file <that file>`. Under Sutando, store it with `vault set <KEY> "<token>"` (the
-key install prints; see below), or, for the core's own connection, `python3 scripts/connections.py add -`
-with the token on stdin.
+**Connect with a relay token (the main path).** For an agent this Mac's Sutando core is not bound
+to, the owner takes its relay token from the agent's page in the s.space app (Get token). On a host
+with no core, put it in a mode-600 env file as `REMOTE_TASK_TOKEN=<token>` with
+`AGENT_MXID=<the agent's Matrix ID>` and run `install --token-env-file <that file>`; the token is read
+from that file, never from the command line. Under Sutando,
+store it with `vault set <KEY> "<token>"` (the key install prints; see below).
 
-**Or connect with a one-time code.** Today the `acp.` code is issued only by s.space's API route
-`POST /api/connect/agent-code`, called with the owner's logged-in web session; no app screen issues it
-yet. On a host with no core, the connect command with that code is the agent's whole setup:
-
-```bash
-ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent's Matrix ID>
-# asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
-```
-
-The code is never needed on the command line, where ps and shell history
-would keep it: `connect` asks for it, or reads it from stdin with `--code -`.
-`--code <code>` still works and says so with a warning. `--base` and the relay
-URL the backend returns must be https (plain http only on a loopback host, for
-tests), and a relay that is not on `--base`'s host or a host under it is
-refused unless you name its host with `--trust-relay-host`; a refused relay URL is never written.
-
-`connect` first checks the CLI version, tmux, the plugin and the Claude login,
-then what would refuse later: a config or unit it may not change, and for the
-root an earlier install recorded, a held root, a busy agent lock or a seat that
-cannot be written (with no recorded root, any agent operation in progress). A
-machine that cannot run the agent never reads or spends the single-use code. It
-then redeems the code (`POST <base>/connect/poll`; a 503, or a 202 "still
-redeeming" with its `retry_after`, retried with backoff; a used, expired or
-revoked code refused with one line) for the agent's id and relay
-credential. The credential owner writes it to the agent's seat beside its root,
-`<root>.bridge/channels/ag2space/`: a `.env` (`AGENT_MXID`, a
-`GATEWAY_INSTANCE` minted once and kept across reconnects,
-`REMOTE_TASK_TOKEN_FILE`, `REMOTE_TASK_TIER=owner`) and a `token` file, both
-mode 600. The bearer is never printed and never on a command line. `connect`
-then runs install with `--token-env-file` set to that `.env`, so the bridge runs
-as that seat alone. A new code (s.space's Reconnect) rewrites `token` in place.
-On a host whose bridges a supervisor runs (Sutando's), `connect` refuses: the
-worker pool owns the seats there.
+The Sutando core's own agent has no Get token in the app: its token is managed on its machine (a
+desktop sign-in writes it; `scripts/connections.py update-token` stores one you already hold; see the
+repo's `docs/connections.md`).
 
 **The agent's root and its bridge.** One bridge serves one agent (its relay
 token), so each agent gets its own root and its own bridge. With no `--work`,
@@ -429,7 +398,7 @@ or the `ai.ag2.sparrow.claude-local-bridge` agent): `ag2-sparrow` with
 Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
-one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID (as s.space gives it) as `--agent`, so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
+one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first.
 
 **Several agents on one host.** Each agent installed on its own root (no
 `--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`

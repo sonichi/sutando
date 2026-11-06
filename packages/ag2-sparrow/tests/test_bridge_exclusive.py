@@ -291,7 +291,7 @@ class Exclusive(fx.AgentRootBase):
                     before = self.snapshot()
                     rc, out, err = self.connect(name, jobs, backend, agent=agent, stdin=stdin)
                     self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
-                    self.assertIn("get a fresh code for the agent from s.space", err)
+                    self.assertIn("use install --token-env-file with the agent's relay token", err)
                     self.assertIn("the code was not used", err)
                     self.assertEqual(stdin.tell(), 0, "the code is never read")
                     self.assertEqual(backend.calls, [])

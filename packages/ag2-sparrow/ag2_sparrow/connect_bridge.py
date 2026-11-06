@@ -234,12 +234,11 @@ def connect_agent_problem(agent_id) -> str:
     """'' when connect names its agent (--agent, the agent's Matrix ID), else why: the code names its
     agent only once redeemed, which spends it."""
     if not agent_id:
-        return ("connect needs --agent <the agent's Matrix ID>; get a fresh code for the agent from s.space, or "
-                "use install --token-env-file with the agent's relay token")
+        return ("connect needs --agent <the agent's Matrix ID>; to connect, use install --token-env-file "
+                "with the agent's relay token")
     if not AGENT_ID_RE.fullmatch(agent_id):
-        return (f"--agent {agent_id} is not a Matrix ID (@name:server); pass --agent <Matrix ID>; "
-                "get a fresh code for the agent from s.space, or use install --token-env-file with the "
-                "agent's relay token")
+        return (f"--agent {agent_id} is not a Matrix ID (@name:server); to connect, use "
+                "install --token-env-file with the agent's relay token")
     return ""
 
 
@@ -722,17 +721,19 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
         return None, problem
     if redeemed["agent_id"] != agent_id:
         return None, (f"the code is for {redeemed['agent_id']}, not {agent_id}; the code is spent and nothing was "
-                      "written: make a new code for the agent you meant")
+                      "written: connect the agent you meant with its relay token (install --token-env-file)")
     problem = cm.relay_problem(base, redeemed["relay_url"], trust_relay_host or "")
     root, problem = ("", problem) if problem else cm.canonical_root(
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
     if problem:
-        return None, f"the code is spent but the seat was not written: {problem}; make a new code"
+        return None, (f"the code is spent but the seat was not written: {problem}; "
+                      "connect with the agent's relay token (install --token-env-file)")
     lock = cm.agent_lock(root)
     try:
         lock.__enter__()
     except cm.Busy as e:
-        return None, f"{e}; the code is spent and nothing was written: make a new code once it is done"
+        return None, (f"{e}; the code is spent and nothing was written: "
+                      "connect with the agent's relay token (install --token-env-file) once it is done")
     try:
         seat, problem = _seat_under_lock(local, root, redeemed)
     except BaseException:
@@ -752,10 +753,11 @@ def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict,
         local, root, redeemed["agent_id"]) or cm.seat_problem(bridge_home(root)))
     if held:
         return {}, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
-                    "make a new code in s.space once the root is free")
+                    "connect with the agent's relay token (install --token-env-file) once the root is free")
     seat, root_id, problem = written
     if problem:
-        return {}, f"the code is spent but the seat was not written: {problem}; make a new code"
+        return {}, (f"the code is spent but the seat was not written: {problem}; "
+                    "connect with the agent's relay token (install --token-env-file)")
     print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat).parent} (mode 600)")
     return {"agent_id": redeemed["agent_id"], "root": root, "seat_env": seat, "root_id": root_id}, ""
 
