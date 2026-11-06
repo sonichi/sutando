@@ -93,14 +93,11 @@ def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
 
 
 def receipt_verifier(receipts_dir, task_id: str):
-    """A readiness predicate for delivery: enforce the digest once a receipt
-    exists, and only then.
+    """Verify existing receipts. Missing receipts remain accepted for legacy
+    compatibility, including current producers that bypass this writer.
 
-    A MISSING receipt is a pre-upgrade result, not a forgery. Requiring one
-    unconditionally would strand every reply written before this shipped — an
-    outage, in the name of a check. That makes this a transition window, not a
-    permanent exemption: once no unreceipted results remain, the caller can
-    drop straight to `receipt_attests`.
+    This is not a finite migration or universal integrity gate. Callers that
+    require pairing must use receipt_attests and handle unpaired backlog.
     """
     bare = str(task_id).removeprefix("task-")
 

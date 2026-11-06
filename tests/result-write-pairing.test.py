@@ -514,9 +514,14 @@ class AttestsCliAndCrossTaskReceipt(unittest.TestCase):
 
     def test_crlf_published_bytes_pass_cli_and_readiness(self):
         from delivery.readiness import read_ready_result
-        result_write.write_paired_result(self.results, "abc", "task: abc\r\nanswer\r\n",
-                                         receipts_dir=self.receipts)
-        self.assertEqual(self._cli("abc"), 0)
+        flags = ["--results-dir", str(self.results), "--receipts-dir", str(self.receipts)]
+        command = [sys.executable, result_write.__file__]
+        written = subprocess.run(command + ["write", "abc"] + flags,
+                                 input=b"task: abc\r\nanswer\r\n", capture_output=True)
+        self.assertEqual(written.returncode, 0, written.stderr)
+        self.assertEqual((self.results / "task-abc.txt").read_bytes(), b"answer\r\n")
+        verified = subprocess.run(command + ["attests", "abc"] + flags, capture_output=True)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
         self.assertEqual(read_ready_result(self.results / "task-abc.txt",
                          attests=result_write.receipt_verifier(self.receipts, "abc")), "answer")
 
