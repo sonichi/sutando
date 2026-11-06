@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # A pull_request run reads this file from the HEAD branch but matches any
+  # `branches:` filter against the BASE, so a filter here excludes non-main bases.
   pull_request:
-    branches: [main, staging-interaction-planes]
   push:
     branches: [main, staging-interaction-planes]
 
