@@ -123,7 +123,8 @@ def probe_with_sink(sink) -> dict:
             hc._pid_parent = lambda pid, ps=None: None
             hc._pid_instance_id = lambda pid: ""
             hc._pid_actor_id = lambda pid: ""
-            with mock.patch.object(hc.watcher_identity, "output_sink", lambda p: sink):
+            with mock.patch.object(hc.watcher_identity, "output_sink", lambda p: sink), \
+                    mock.patch.object(hc, "_proc_argv_vector", lambda p: INBOX_ARGV.split()):
                 return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees, hc._ps_snapshot,
