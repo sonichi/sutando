@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills/worker-pool/scripts"
 sys.path.insert(0, str(REPO / "tests"))
 from _helpers.hermetic_env import hermetic_env  # noqa: E402
+from _helpers.process_group import has_exited  # noqa: E402
 
 socket_setting = os.environ.get("SUTANDO_RUNTIME_SOCKET")
 environment_file = Path(socket_setting).parent / "environment.json" if socket_setting else None
@@ -342,11 +343,8 @@ class WorkerConfigDirectoryTests(unittest.TestCase):
 
     @staticmethod
     def pid_exists(pid):
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
+        # The fixture tmux server can miss a pane's SIGCHLD under load; an unreaped zombie has exited.
+        return not has_exited(pid)
 
     def descendants(self, pid):
         result = self.run_command(["pgrep", "-P", str(pid)], expected=None)

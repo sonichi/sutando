@@ -33,7 +33,11 @@ DATA_FILES = ("ag2_sparrow/tmux-pane-keys.sh",
               "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
               "ag2_sparrow/adapters/claude_routine/README.md",
               "ag2_sparrow/adapters/claude_cloud_session/session-prompt.md",
-              "ag2_sparrow/adapters/claude_cloud_session/README.md")
+              "ag2_sparrow/adapters/claude_cloud_session/README.md",
+              # the plugin claude-local loads when no --plugin-dir is given
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/.claude-plugin/plugin.json",
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/hooks.json",
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/register.ts")
 
 
 def _expected_packages():
@@ -97,6 +101,11 @@ def main():
                            text=True, cwd=d, env=env, timeout=60)
         assert r.returncode == 0 and "install" in r.stdout, f"{r.stdout}\n{r.stderr}"
         print("PASS installed ag2-sparrow-hatch runs the Hatch adapter")
+        r = subprocess.run([str(bindir / "ag2-sparrow-mcp"), "headers"], capture_output=True,
+                           text=True, cwd=d, env=env, timeout=60)
+        assert r.returncode == 1 and r.stdout == "", f"{r.stdout}\n{r.stderr}"
+        assert "REMOTE_TASK_TOKEN" in r.stderr, f"expected the missing-token message:\n{r.stderr}"
+        print("PASS installed ag2-sparrow-mcp fails cleanly without a token")
         # install runs with a PATH that lacks the venv's bin, as a Hatch worker's may.
         home = d / "home"
         home.mkdir()
@@ -120,6 +129,47 @@ def main():
         assert r.returncode == 0 and "Follow the worker_note exactly" in r.stdout, \
             f"{r.stdout}\n{r.stderr}"
         print(f"PASS installed hook prompt names the reply command by absolute path: {named.pop()}")
+        _claude_local_tmux_off_path(d, bindir, py, env)
+
+
+def _claude_local_tmux_off_path(d, bindir, py, env):
+    """The installed claude-local on an empty PATH: a missing or old --tmux refuses before redemption, and
+    a recorded tmux behind a link under a path with spaces is what attach runs."""
+    home, empty = d / "cl home", d / "empty-path"
+    empty.mkdir()
+    store = d / "tmux store" / "tmux"
+    store.parent.mkdir()
+    link = home.joinpath("Library", "Application Support", "space.ag2.app", "engine", "bin", "tmux")
+    link.parent.mkdir(parents=True)
+    claude = d / "claude"
+    claude.write_text('#!/bin/sh\necho "2.1.300 (Claude Code)"\n')
+    claude.chmod(0o755)
+    cenv = dict(env, HOME=str(home), PATH=str(empty))
+    cmd = str(bindir / "ag2-sparrow-claude-local")
+    for version, tmux, why in (("3.1", str(link), "tmux 3.1 is older than the 3.2"),
+                               ("3.1", str(d / "no-tmux"), "is not an executable file")):
+        store.write_text('#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s.log"\necho "tmux %s"\n' % (store, version))
+        store.chmod(0o755)
+        if not link.is_symlink():
+            link.symlink_to(store)
+        r = subprocess.run([cmd, "connect", "--base", "https://127.0.0.1:9", "--agent", "@probe:ag2.space", "--code", "-",
+                            "--claude", str(claude), "--tmux", tmux], input="acp.never-redeemed\n", capture_output=True, text=True, cwd=d,
+                           env=cenv, timeout=60)
+        assert r.returncode == 2 and why in r.stderr and "the code was not used" in r.stderr, r.stderr
+        assert "could not reach" not in r.stderr, r.stderr
+    _run([py, "-c", "import sys; from ag2_sparrow import connect_common as cm\n"
+                    "from ag2_sparrow.adapters.claude_code import cli\n"
+                    "root = sys.argv[1]\n"
+                    "cm._write(cli.config_path(), cli.render_config({'CLAUDE': sys.argv[2],"
+                    " 'PLUGIN_DIR': str(cli.PLUGIN), 'INBOX_DIR': root + '/tasks', 'RESULTS_DIR': root + '/results',"
+                    " 'HITL_STORE': root + '/hitl', 'SESSION_ID': '0f3c5a9e-5b1d-4c2e-9a7b-1234567890ab',"
+                    " 'TMUX': sys.argv[3], 'ROOT': root}), 0o600)",
+          str(d / "root"), str(claude), str(link)], cwd=d, env=cenv)
+    r = subprocess.run([cmd, "attach"], capture_output=True, text=True, cwd=d, env=cenv, timeout=60)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    calls = (store.parent / "tmux.log").read_text().splitlines()
+    assert calls[-1].startswith("-u -S ") and calls[-1].endswith(" attach -t =claude-local"), calls
+    print(f"PASS installed claude-local refuses a missing or old tmux unspent and attaches through {link}")
 
 if __name__ == "__main__":
     main()

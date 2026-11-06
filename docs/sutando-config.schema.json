@@ -30,6 +30,30 @@
           "minimum": 1,
           "default": 10,
           "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current \u2014 a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
+        },
+        "dotspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The DotSpaces (agent-native Matrix homeservers AG2 operates) this install may connect to. Omit the block to keep the built-in list (ag2.space, dev.ag2.space, s.space, dev.s.space); see docs/dotspace.md.",
+          "properties": {
+            "instances": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["server"],
+                "properties": {
+                  "server": {"type": "string", "minLength": 1, "description": "The homeserver name (the part of an mxid after the first colon)."},
+                  "gateway_host": {"type": "string", "description": "The sparrow gateway / relay host, e.g. chat.ag2.space."},
+                  "cloud_origin": {"type": "string", "description": "This instance's Sutando Cloud origin, e.g. https://sutando.ag2.space; empty when it has none."},
+                  "link_via": {"type": "string", "description": "matrix.to ?via= server; defaults to server."},
+                  "prefer_ipv4": {"type": "boolean", "default": true},
+                  "mcp_url": {"type": "string", "description": "This instance's hosted MCP endpoint, e.g. https://mcp.s.space/mcp."},
+                  "allow_local": {"type": "boolean", "default": false, "description": "A self-hosted homeserver on this machine or the owner's own network. For this entry's gateway_host (its server when it names no gateway_host; a gateway_host with a port covers that port only), a connect code may name a single-label host such as localhost and must resolve to a loopback, private (RFC 1918, IPv6 ULA) or shared (100.64/10) address, never link-local or public; plain http only when the gateway host itself names loopback (localhost, *.localhost, a 127/8 or ::1 literal), https otherwise. A configured instances list replaces the built-in one, so restate the built-ins beside this entry. Only this entry turns that on; nothing a token or a server says can."}
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -174,6 +198,18 @@
           "type": "boolean",
           "default": false,
           "description": "Link developer-only skills (manifest `audience`: `developer`, or an unknown value) into the core's skills dirs. Only JSON true opts in; any other value is false. Read by resolve_skills_developer() in src/sutando_config.py, through src/skill_audience.py, the decision every installer calls."
+        }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "description": "Desktop notifications Sutando may post on this host. See docs/workspace-config.md.",
+      "additionalProperties": false,
+      "properties": {
+        "macos": {
+          "type": "boolean",
+          "default": false,
+          "description": "Post macOS desktop notifications (osascript banners from alerts, pending questions, bridge restarts, health checks, context drop, screen recording). Off by default; only JSON true opts in, and any other value or an unreadable config is off. Read by resolve_macos_notifications() in src/sutando_config.py (TS twin resolveMacosNotifications(); shell: scripts/sutando-config.sh macos-notifications, used by src/macos-notify.sh). Every macOS sender checks it."
         }
       }
     },

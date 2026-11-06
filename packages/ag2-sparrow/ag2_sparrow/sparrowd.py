@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from .control_socket import control_socket_path
+
 
 def _log(msg: str) -> None:
     print(f"[sparrowd] {msg}", flush=True)
@@ -369,9 +371,17 @@ def run(specs: List[WorkerSpec], state_dir: Path,
                 return 0
         _log("lock acquired")
     sup = Supervisor(specs, backoff_initial_s=backoff_initial_s, remove_grace_s=grace_s)
-    ctl = ControlServer(state_dir / "sparrowd.sock", sup, stop_evt.set)
     _log(f"starting {len(specs)} worker(s): {', '.join(s.name for s in specs)}")
-    ctl.start()
+    ctl: Optional[ControlServer] = None
+    try:
+        ctl = ControlServer(control_socket_path(state_dir, create=True), sup, stop_evt.set)
+        ctl.start()
+    except OSError as e:
+        # Exiting here is a relaunch loop under any supervisor; the workers run, signals still stop us.
+        _log(f"control socket unavailable ({e}) — supervising without it; stop with SIGTERM")
+        if ctl is not None:
+            ctl.close()
+        ctl = None
     sup.start()
     unavailable = False
     while not stop_evt.wait(rescan_s if rescan is not None else None):
@@ -388,6 +398,7 @@ def run(specs: List[WorkerSpec], state_dir: Path,
         sup.sync(want)
     _log("shutdown requested")
     sup.stop(grace_s)
-    ctl.close()
+    if ctl is not None:
+        ctl.close()
     inst.release()
     return 0

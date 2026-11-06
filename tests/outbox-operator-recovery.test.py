@@ -6,6 +6,7 @@ Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
 import contextlib
 import hashlib
+import io
 import json
 import os
 import sys
@@ -33,9 +34,10 @@ ITEM = "task-abc"
 OTHER = "task-def"
 
 
-def _parked(root: Path, item_id: str = ITEM, attempts: int = 5) -> None:
+def _parked(root: Path, item_id: str = ITEM, attempts: int = 5, payload: str = "the reply") -> None:
+    # A gateway record stores its result as the payload; payload="" is a body-external lane.
     outbox._write_item(root, item_id, {"item_id": item_id, "attempts": attempts,
-                                       "status": "QUEUED", "reason": None})
+                                       "status": "QUEUED", "reason": None, "payload": payload})
     outbox.park_item(root, item_id, "max-attempts")
 
 
@@ -224,6 +226,82 @@ class IdempotencyKeyChanges(unittest.TestCase):
         """Pre-existing behaviour for any backend that tracks no re-sends."""
         from ag2_sparrow.delivery_core.core import _resend_epoch
         self.assertEqual(_resend_epoch(object(), ITEM), 0)
+
+
+class BodyExternalLane(unittest.TestCase):
+    """The Slack and Discord reply legs publish an empty payload and keep the body in
+    results/. On a terminal park the bridge archives that body and drops the reply's
+    target, so a requeue that reports success leaves the item QUEUED with nothing to
+    send, forever. It must refuse before changing anything, and say where the body is."""
+
+    def _lane(self, td):
+        results = Path(td) / "results"
+        root = results / ".outbox-slack-results"
+        _parked(root, ITEM, payload="")
+        return results, root
+
+    def test_a_parked_reply_whose_body_was_archived_is_refused_and_left_parked(self):
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            archived = results / "archive" / "2026-10" / f"{ITEM}.txt"
+            archived.parent.mkdir(parents=True)
+            archived.write_text("the reply", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = outbox_cli.main(["--root", str(root), "--json", "requeue", ITEM])
+            self.assertEqual(rc, 5)
+            rec = json.loads(out.getvalue())
+            self.assertEqual(rec["result"], "refused")
+            self.assertIn(str(archived), rec["error"])
+            self.assertIn("re-send it manually", rec["error"])
+            self.assertEqual(outbox.read_item(root, ITEM)["status"], "PARKED", "nothing changed")
+
+    def test_the_archived_copy_named_is_this_tasks_never_a_prefix_match(self):
+        # task-abcd's body is another conversation's: naming it would have the operator re-send it.
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            month = results / "archive" / "2026-10"
+            month.mkdir(parents=True)
+            (month / f"{ITEM}d.txt").write_text("someone else's reply", encoding="utf-8")
+            gone = outbox_cli.body_gone(root, ITEM)
+            self.assertIn("no archived copy was found", gone)
+            self.assertNotIn(f"{ITEM}d.txt", gone)
+            (month / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
+            self.assertIn(str(month / f"{ITEM}.txt"), outbox_cli.body_gone(root, ITEM))
+
+    def test_an_archived_copy_in_the_gateways_flat_layout_is_named(self):
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            (results / "archive").mkdir(parents=True)
+            flat = results / "archive" / f"{ITEM}-1730000000.txt"
+            flat.write_text("the reply", encoding="utf-8")
+            self.assertIn(str(flat), outbox_cli.body_gone(root, ITEM))
+
+    def test_a_live_or_quarantined_body_still_requeues(self):
+        for where in ("live", "quarantined"):
+            with self.subTest(where=where), TemporaryDirectory() as td:
+                results, root = self._lane(td)
+                live = results / f"{ITEM}.txt"
+                live.write_text("the reply", encoding="utf-8")
+                if where == "quarantined":
+                    uq.place(live, results, ITEM, when=1700000000)
+                self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 0)
+                self.assertEqual(outbox.read_item(root, ITEM)["status"], "QUEUED")
+
+    def test_an_id_that_is_not_a_task_id_is_not_judged(self):
+        # A proactive file's id is `name#mtime`; its body is filed under the name alone.
+        with TemporaryDirectory() as td:
+            root = Path(td) / "results" / ".outbox-discord-proactive"
+            item = "proactive-1.txt#1700000000000000000"
+            _parked(root, item, payload="")
+            self.assertIsNone(outbox_cli.body_gone(root, item))
+            self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", item]), 0)
+
+    def test_control_a_gateway_record_with_its_payload_is_never_judged_gone(self):
+        with TemporaryDirectory() as td:
+            root = Path(td) / "results" / ".outbox"
+            _parked(root, ITEM)
+            self.assertIsNone(outbox_cli.body_gone(root, ITEM))
 
 
 class CliSurface(unittest.TestCase):
@@ -626,6 +704,51 @@ class DeliveredBodyDiffers(unittest.TestCase):
         self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())
 
 
+class WithdrawUnsent(unittest.TestCase):
+    """A publication taken back before it left; never one that may be sending or is out."""
+    def item(self, root, status="READY", **extra):
+        outbox._write_item(root, ITEM, {"item_id": ITEM, "attempts": 0, "status": status,
+                                        "payload": '{"id": "x"}', **extra})
+
+    def test_an_unsent_matching_item_is_withdrawn(self):
+        for status in ("READY", "QUEUED"):
+            with self.subTest(status=status), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, status)
+                self.assertTrue(outbox.withdraw_unsent(root, ITEM, lambda p: '"x"' in p))
+                self.assertIsNone(outbox.read_item(root, ITEM))
+
+    def test_another_payload_absent_refused_or_delivered_is_left_and_nothing_remains_to_send(self):
+        for status, matches in (("READY", False), ("PARKED", True), ("DELIVERED", True)):
+            with self.subTest(status=status, matches=matches), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, status)
+                self.assertTrue(outbox.withdraw_unsent(root, ITEM, lambda p, m=matches: m))
+                self.assertEqual(outbox.read_item(root, ITEM)["status"], status)
+        with TemporaryDirectory() as td:
+            self.assertTrue(outbox.withdraw_unsent(Path(td), ITEM, lambda p: True))
+
+    def test_one_that_may_be_sending_is_kept_and_reported(self):
+        cases = {"claimed": {}, "dispatching": {"dispatching": {"incarnation": "w", "at": 1}},
+                 "receipt": {"provider_ref": "r1"}}
+        for case, extra in cases.items():
+            with self.subTest(case=case), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, **extra)
+                if case == "claimed":
+                    self.assertTrue(outbox.acquire_delivery_claim(root, ITEM, "w"))
+                self.assertFalse(outbox.withdraw_unsent(root, ITEM, lambda p: True))
+                self.assertIsNotNone(outbox.read_item(root, ITEM))
+
+    def test_an_unreadable_record_is_never_judged(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            self.item(root)
+            outbox._item_path(root, ITEM).write_text("{torn")
+            self.assertFalse(outbox.withdraw_unsent(root, ITEM, lambda p: True))
+            self.assertTrue(outbox._item_path(root, ITEM).exists())
+
+
 class CliRenderingAndErrorPaths(unittest.TestCase):
     """The CLI's own output and refusal paths. Calling outbox directly, as the
     other tests do, leaves every line of `_emit` and both readers unrun."""
@@ -714,14 +837,15 @@ class OutboxReaderEdges(unittest.TestCase):
             self.assertIsNone(outbox.read_item(root, "ghost"))
             self.assertEqual(outbox.list_items(root), [])
 
-    def test_a_corrupt_record_is_skipped_not_fatal(self):
+    def test_a_corrupt_record_is_listed_parked_not_skipped_or_fatal(self):
         with TemporaryDirectory() as td:
             root = Path(td)
             _parked(root)
             (outbox._items_dir(root) / "torn.json").write_text("{not json",
                                                               encoding="utf-8")
             got = outbox.list_items(root)
-            self.assertEqual([r["item_id"] for r in got], [ITEM])
+            self.assertEqual([(r.get("item_id"), r.get("file"), r["reason"]) for r in got],
+                             [(ITEM, None, "max-attempts"), (None, "torn.json", outbox.UNREADABLE_ITEM)])
 
     def test_a_non_integer_epoch_reads_as_zero(self):
         with TemporaryDirectory() as td:

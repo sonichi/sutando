@@ -49,6 +49,8 @@ with tempfile.TemporaryDirectory() as td:
         if (method, path) == ("GET", "/v1/agents"):
             return {"agents": [{"id": "@agent:ag2.space", "owner": "@owner:ag2.space",
                                 "owner_dm_room": "!owner-dm:ag2.space"}]}
+        if path == "/v1/room" and payload.get("op") == "members":
+            return {"members": [{"user_id": "@agent:ag2.space"}, {"user_id": "@owner:ag2.space"}]}
         if path == "/v1/room" and payload.get("op") == "create":
             return {"ok": True, "room_id": "!owner-dm:ag2.space"}
         if path == "/v1/room" and payload.get("op") == "message":
@@ -81,7 +83,7 @@ with tempfile.TemporaryDirectory() as td:
     check(record["status"] == "awaiting_owner" and record["dm_event_id"] == "$review-2",
           "review must bind to the delivered DM event")
     dm_posts = [p for m, u, p in calls
-                if u == "/v1/room" and p.get("room_id") == "!owner-dm:ag2.space"]
+                if u == "/v1/room" and p.get("op") == "message" and p.get("room_id") == "!owner-dm:ag2.space"]
     candidate_dm, decision_dm = dm_posts
     check("sensitive candidate" in candidate_dm["body"]
           and candidate_dm["mentions"] == [],
@@ -319,10 +321,10 @@ with tempfile.TemporaryDirectory() as td:
     starvation.mkdir(parents=True)
     for index in range(512):
         (starvation / f"wr_{index:016x}.json").write_text(json.dumps({
-            "review_id": f"wr_{index:016x}", "status": "published"}))
+            "review_id": f"wr_{index:016x}", "status": "published", "withheld_body": "resolved"}))
     target_id = "wr_ffffffffffffffff"
     (starvation / f"{target_id}.json").write_text(json.dumps({
-        "review_id": target_id, "status": "awaiting_owner"}))
+        "review_id": target_id, "status": "awaiting_owner", "withheld_body": "live"}))
     bridge._STATE = root / "starvation"
     check(any(record.get("review_id") == target_id
               for _path, record in bridge._pending_review_records()),

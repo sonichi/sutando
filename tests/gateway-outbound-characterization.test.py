@@ -62,6 +62,8 @@ class _Base(unittest.TestCase):
                     "owner": "@owner:example.test",
                     "owner_dm_room": "!owner:example.test",
                 }]}
+            if (method, path) == ("POST", "/v1/room") and (payload or {}).get("op") == "members":
+                return {"members": [{"user_id": "@agent-test:example.test"}, {"user_id": "@owner:example.test"}]}
             if (method, path) == ("POST", "/v1/room"):
                 self.room_posts.append(payload)
                 return {"ok": True, "event_id": "$owner-review"}

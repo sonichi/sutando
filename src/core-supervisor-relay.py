@@ -123,7 +123,7 @@ def _is_refused_limit(signal: dict) -> bool:
             and bool(_REFUSED_LIMIT.search(signal.get("prompt") or "")))
 
 
-_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
+_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
 def _limit_remedy(signal: dict) -> str:
@@ -243,7 +243,7 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
-    if kind == "session-limit" or _is_refused_limit(signal):
+    if kind in ("session-limit", "usage-limit") or _is_refused_limit(signal):
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
@@ -301,6 +301,15 @@ def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osa
         return r.returncode == 0
     except Exception:
         return False
+
+
+def _macos_notifications_on() -> bool:
+    """The owner's notifications.macos opt-in; off by default."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+    return resolve_macos_notifications()
 
 
 ALERT_FIELD = "space.ag2.agent_alert"
@@ -374,14 +383,15 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
-    macos_ok = bool(_macos_notify(msg)) if macos else False
-    # Debounce only on a confirmed delivery: the selected channel when there is
-    # one (macOS alone must not suppress it), else the macOS notification.
+    # The app pops its own notification for a channel message the gateway accepted (2xx), so
+    # macOS is the fallback only. Debounce on that send; macOS alone must not suppress it.
     if source and channel:
         delivered = _channel_notify(msg, source, channel, extra=alert_content(signal))
+        if not delivered and macos:
+            _macos_notify(msg)
         reason = "channel send failed"
     else:
-        delivered = macos_ok
+        delivered = bool(_macos_notify(msg)) if macos else False
         reason = "no route and macOS " + ("notification failed" if macos else "disabled")
     if delivered:
         _save_last_hash(state_file, new_hash)
@@ -498,8 +508,27 @@ def resolve_active_target(activity_path):
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
     if _is_deliverable(source, channel):
+        # Activity says where she was; bindings say whose room it is. A room
+        # bound to a live worker is not the core's to post in.
+        if not _core_may_speak(activity_path, channel):
+            return "", ""
         return source, channel
     return "", ""
+
+
+def _core_may_speak(activity_path, channel) -> bool:
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from owner_channel import may_core_speak  # noqa: E402
+    workspace = Path(activity_path).resolve().parent.parent
+    try:
+        allowed, why = may_core_speak(workspace, channel)
+    except (OSError, ValueError) as exc:
+        print(f"core-supervisor-relay: bindings unreadable ({exc}); staying silent", file=sys.stderr)
+        return False
+    if not allowed:
+        print(f"core-supervisor-relay: not posting to {channel}: {why}", file=sys.stderr)
+    return allowed
 
 
 def relay_seat_notices(core_signal, state_file, **kw):
@@ -538,13 +567,14 @@ def main(argv=None):
     ap.add_argument("--no-seats", action="store_true",
                     help="skip the pool seats' core-supervisor.<seat>.json beside --signal")
     a = ap.parse_args(argv)
+    macos = not a.no_macos and _macos_notifications_on()
 
     # Explicit --notify-* wins; else auto-resolve the owner's active channel.
     source, channel = a.notify_source, a.notify_channel
     if not (source and channel) and a.active_from:
         source, channel = resolve_active_target(a.active_from)
     if source and channel and _delivery_route(source, channel) is None:
-        fallback = "macOS disabled, nothing to escalate to" if a.no_macos \
+        fallback = "macOS disabled, nothing to escalate to" if not macos \
             else "escalating by macOS notification only"
         print(f"--notify-source {source!r} / --notify-channel {channel!r} has no delivery "
               f"path; {fallback}", file=sys.stderr)
@@ -561,11 +591,11 @@ def main(argv=None):
         signal = dict(UNREADABLE_SIGNAL)
 
     if not a.no_seats:
-        for line in relay_seat_notices(a.signal, a.state_file, macos=not a.no_macos,
+        for line in relay_seat_notices(a.signal, a.state_file, macos=macos,
                                        source=source, channel=channel, dry_run=a.dry_run):
             print(line)
     outcome = {}
-    msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
+    msg = run_cycle(signal, a.state_file, macos=macos,
                     source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
     if msg and outcome.get("undelivered"):
         if _should_log_undelivered(a.state_file, outcome.get("hash")):

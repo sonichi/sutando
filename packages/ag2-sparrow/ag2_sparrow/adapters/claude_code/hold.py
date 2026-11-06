@@ -19,7 +19,7 @@ from pathlib import Path
 
 from ... import connect_common as cm, task_io
 from . import inbox
-from .shape import LOCAL
+from .shape import LOCAL, resolve_plugin_dir
 
 GO = b"g"
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -72,7 +72,7 @@ def claude_argv(cfg: dict, session_id: str) -> list:
     """`claude --plugin-dir … --permission-mode … --resume|--session-id <id>`: resume when the
     transcript exists under the session's config dir, else start it under that id."""
     flag = "--resume" if transcript_exists(cfg.get("CLAUDE_CONFIG_DIR", ""), session_id) else "--session-id"
-    return [cfg["CLAUDE"], "--plugin-dir", cfg["PLUGIN_DIR"], "--permission-mode",
+    return [cfg["CLAUDE"], "--plugin-dir", str(resolve_plugin_dir(cfg["PLUGIN_DIR"])[0]), "--permission-mode",
             cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id]
 
 

@@ -238,7 +238,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
    an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
 
-2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list, nothing sent) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
+2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list; the only send is the one pointer owed for a decision card the gateway never posted, which completes the ask rather than reminding) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -418,6 +418,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
        --state "$WORKSPACE/state/idle-streak.json"
    # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
 
+   # Check owner_channel.py --workspace "$WORKSPACE" before posting.
+   # A refusal means no send and no surface-hash commit.
    # 2. Post the message. THEN, and only then, stamp the set as surfaced:
    echo '[["3166","owner"],["3274","owner"]]' |
      python3 skills/proactive-loop/scripts/idle-surface-hash.py \
@@ -716,3 +718,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from the pending questions), surface it via a different file Sutando.app reads, not by competing as a writer.
 
    **Do NOT fall back to `results/proactive-*.txt` for heartbeats if `bot2bot-post` is not installed.** That legacy path is polled by both Discord and Telegram bridges and produces duplicate deliveries to the owner's DMs (9-per-heartbeat in practice on 2026-04-20). If the skill is missing, skip the heartbeat silently; fold the summary into the next task-reply instead.
+
+## Bound-room speech gate
+
+Recent owner activity identifies a destination, not who owns its voice.
+`src/owner_channel.py` consults the workspace bindings before the core posts:
+unbound rooms are allowed; a bound room is refused while its worker is alive
+or its liveness is unknown. Only a readable sentinel whose PID is positively
+dead releases the room for recovery. Missing or unreadable evidence is not
+proof of death. The supervisor relay uses the same policy after validating
+the destination. A refused proactive FYI must not commit its surface hash,
+because no message was sent.

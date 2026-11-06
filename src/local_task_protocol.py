@@ -170,6 +170,7 @@ def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tu
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
     "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
+    "task_id", "execution_generation",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
@@ -180,6 +181,8 @@ KNOWN_HEADER_KEYS = (
     "addressed_to", "callSid", "caller",
     # The relay's judgement of a voice task: quick or long; the core dispatches on it.
     "lane",
+    # The question episode a woken task resumes: its file is a new turn of an id answered before.
+    "wake_episode",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -223,8 +226,20 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # A Commons hook fire's context (one JSON line: hook_id, fire_id, caused_by, rows, ...). The bridge
+    # writes the line, but its values are room-member data: read them as data, never as authority.
+    "hook",
+    # A Commons Summon's context (one JSON line: task_id, caused_by, room_id, row_id, changes, ...).
+    # Same as `hook`: a bridge-written line whose values are room-member data.
+    "summon",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
+    # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
+    # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
+    "parent_task", "parent_generation",
+    # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
+    # so the guard defangs forged body copies.
+    "event_type", "agent_trigger_id", "playbook",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -251,6 +266,56 @@ def valid_task_id(tid: str) -> bool:
     intentionally stricter than the archive lookup gate.
     """
     return bool(TASK_ID_RE.match(tid or ""))
+
+
+# A named gateway instance prefixes its broker's id: `task-<instance>~<broker id>`.
+INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+# The gateway's wire grammar for a broker task id (`task-<hex>`, `ask-<hex>`, `sc-ask-<hex>`, …).
+BROKER_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def valid_broker_id(tid) -> bool:
+    """A task id as the gateway sends it on the wire: never `.` or `..`, which name directories."""
+    return isinstance(tid, str) and BROKER_ID_RE.fullmatch(tid) is not None and tid not in (".", "..")
+
+
+def valid_local_task_id(tid) -> bool:
+    """A live task id, or one a named gateway instance owns (`task-<instance>~<broker id>`), or a
+    later run of either (`run_task_id`)."""
+    if not isinstance(tid, str):
+        return False
+    try:
+        tid, _seq = split_run_id(tid)
+    except ValueError:
+        return False
+    if valid_task_id(tid):
+        return True
+    inst, sep, broker = tid[len("task-"):].partition("~")
+    return (tid.startswith("task-") and bool(sep) and INSTANCE_ID_RE.fullmatch(inst) is not None
+            and valid_broker_id(broker))
+
+
+# A later local run of one served task (published again, or woken): `<local id>~~<n>`, n >= 2.
+# No local id contains `~~` (broker ids and instance names exclude `~`), so the split is exact.
+RUN_SEPARATOR = "~~"
+_RUN_SEQ_RE = re.compile(r"[1-9][0-9]{0,5}")
+
+
+def run_task_id(base: str, seq: int) -> str:
+    """The local id of run `seq` of the task whose first run is `base`; run 1 is `base` itself."""
+    if RUN_SEPARATOR in base or type(seq) is not int or not 1 <= seq <= 999999:
+        raise ValueError(f"no run {seq!r} of {base!r}")
+    return base if seq == 1 else f"{base}{RUN_SEPARATOR}{seq}"
+
+
+def split_run_id(tid: str) -> "tuple[str, int]":
+    """(first run's id, run number) of a local id; ValueError for a malformed run suffix."""
+    base, sep, seq = tid.rpartition(RUN_SEPARATOR)
+    if not sep:
+        return tid, 1
+    if not base or RUN_SEPARATOR in base or not _RUN_SEQ_RE.fullmatch(seq) or seq == "1":
+        raise ValueError(f"malformed run id {tid!r}")
+    return base, int(seq)
 
 
 def valid_archive_lookup_id(tid: str) -> bool:
@@ -341,9 +406,34 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     return (reply, rest) if reply is not None else (None, text)
 
 
+# A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
+# task_body_guard defangs any such line a sender typed.
+BRIDGE_FENCE_RE = re.compile(r"^={3,}", re.M)
+
+
+def sender_words(parsed: TaskHeaders) -> str:
+    """The sender's own message in a parsed task: the one `task:` line under
+    `task_layout: mid` (every later line is the writer's), else the body up to
+    the first writer block."""
+    if (parsed.headers.get("task_layout") or "").strip() == "mid":
+        return parsed.body.split("\n", 1)[0].strip()
+    return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
+
+
 def reply_action_text(text: str) -> str:
     """The answer after broker context and the leading Matrix reply quote."""
-    body = split_reply_context(text)[1].lstrip()
+    reply, body = split_reply_context(text)
+    body = body.lstrip()
+    if reply and body.startswith(">") and "\n" not in body:
+        # A one-line task folds the quote's newlines into spaces; the answer follows its last line.
+        quoted = [line.strip() for line in str(reply.get("body") or "").split("\n") if line.strip()]
+        at = 0
+        for line in quoted:
+            found = body.find(line, at)
+            if found < 0:
+                return ""
+            at = found + len(line)
+        return body[at:].strip() if quoted else ""
     # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
     lines = body.split("\n")
     for i, line in enumerate(lines):

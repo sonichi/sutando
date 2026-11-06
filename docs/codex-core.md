@@ -12,8 +12,8 @@ this gitignored per-clone override:
 
 Save it as `sutando.config.local.json`, then run:
 
-> **Never run `--restart` from inside the sutando-core session** — it kills the canonical
-> session, which is the agent running the command. Run it from a terminal outside the core,
+> **Never run `--restart` from inside the sutando-core session** — it kills the core's
+> window, which is the agent running the command. Run it from a terminal outside the core,
 > or have the owner type `restart core` in a **Discord** DM — that is the only adapter wired
 > to it (`src/discord-bridge.py:3032`; slack and telegram do not import
 > `core_restart_intent`), and it needs Sutando.app running to consume the intent.
@@ -33,6 +33,12 @@ codex login status
 bash skills/install.sh
 bash src/agent/start-cli.sh --restart
 ```
+
+That command starts the core and the local agent API (`127.0.0.1:7843`) when
+nothing serves it yet; the s.space desktop hands its connect code to that API,
+so a core moved to s.space from the desktop needs it running. It does not start
+the other local services (voice, web client, dashboard, bridges): for those, start
+everything with `bash src/startup.sh`, which then launches the same core.
 
 With `core.runtime: codex`, `skills/install.sh` links every repo skill and every
 `<workspace>/skills/` skill into `$CODEX_HOME/skills/` (resolved by
@@ -58,8 +64,13 @@ The Codex implementation:
   not copy Claude login state or run the Claude-only preflight for a Codex core;
 - exports the configured `CODEX_HOME` and requires `codex login status` to pass
   before any background service launches;
-- forwards `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into the core session, so skills
-  that read the engine's channel state (such as `ag2space/access.json`) find it;
+- resolves `CLAUDE_CONFIG_DIR` the same way the Claude launcher does (the
+  configured `core_config_dirs[type=claude]`, else `<workspace>/.claude-sutando`),
+  refusing to start when that configuration is invalid, and forwards it with
+  `CODEX_HOME` into the core session, so skills that read the engine's channel
+  state (such as `ag2space/access.json`) find it whichever CLI is the core;
+- starts the local agent API on port 7843 when nothing listens there (skipped with
+  `--external-helpers`, whose embedder owns its services);
 - owns the same `sutando-core` tmux session used by the menu bar, health checks,
   and terminal attachment;
 - validates `codex` availability and authentication before changing the live
@@ -77,7 +88,85 @@ The Codex implementation:
 - runs a separate `sutando-core-observer` tmux session (`cli/codex-observer.mjs`)
   that follows the core's rollout file and writes its HealthStatus runtime
   observation record (`docs/health-snapshot.md`, "Runtime observation");
-- restarts the core and notifier together, preventing duplicate task consumers.
+- restarts the core and notifier together, preventing duplicate task consumers;
+- replaces only the core's own window on `--restart` (the window started as
+  `codex`, or `claude` when switching runtimes), so sibling windows in the
+  session, such as the desktop's `gateway-<instance>` lanes, keep running. When
+  the session outlives its core window (the core exited), the next launch heals
+  it the same way: it recreates the core as the session's lowest-index window,
+  where the task notifier types, and leaves every sibling untouched. A session
+  with no other window still ends with its core, as before. A live window that is neither a
+  known sibling (`gateway-*`, `monitor`) nor started as `codex` could be a core the
+  launcher cannot identify, so it refuses to heal (exit 3) rather than start a second core.
+
+### Pickup while delegated work continues
+
+The managed core notifier keeps reading task announcements while a previously
+submitted task awaits its final result. Every new submission, including the first
+one after notifier restart, requires a fresh, healthy, idle observer record bound
+to the same core process incarnation. Missing, unknown, stale or moving runtime
+state blocks submission even if the terminal looks idle. The launcher gives a genuinely new CLI process a fixed managed liveness prompt:
+reply READY without tools, files, or external messages. Existing processes are never
+sent this bootstrap on adoption or notifier restart. The normal observer must see
+the resulting successful turn before task admission; there is no pane-only fallback. The observer must be restarted to emit incarnation data.
+It admits another task only when the
+terminal is positively idle and empty, and the observer has witnessed the exact
+submitted prompt in a successfully completed **parent** turn. The receipt binds
+the prompt digest, its acceptance/completion times and the core process incarnation.
+Subagent completions, aborted/failed turns, stale observations and an idle-looking
+composer alone cannot release the next prompt. Pool-worker notifiers keep their
+existing serial behavior; this does not enable `codex queue` or interrupt a busy turn.
+
+The shared in-flight writer records intent before Enter. A confirmed parent-turn
+receipt is remembered separately until the actual task result arrives, so notifier
+restarts and later observer turns do not replay delegated work. Related workstream
+context remains available until the result is found or the task payload disappears.
+Startup and shutdown reconcile retained artifacts, including tasks completed while
+the notifier was down and therefore omitted from the watcher’s pending sweep.
+Without an explicit `SUTANDO_NOTIFIER_RETRY_INTERVAL`, matching healthy turns are
+checked every second; empty, refused, uncertain or held queues wait 30 seconds.
+An explicit interval must be an integer from 1 to 3600 seconds; invalid values
+refuse notifier startup with a diagnostic. Watcher task announcements wake either wait
+immediately; these intervals do not change admission or recovery eligibility.
+A new core incarnation invalidates the prior incarnation's markers, as in the
+existing shared marker contract; restarting the core is not a duplicate-free retry
+for work that might have completed externally.
+
+Missing proof falls back to waiting for the task's result. After the existing
+completion deadline, an uncertain submission is retained **without automatic
+replay**, and `codex-task-notifier` health reports a warning. A crash between the
+intent record and Enter can therefore require operator inspection. No automatic
+restart or unsafe keystroke recovery is performed. A fully observed failed root turn carries a separate terminal receipt; it never
+acknowledges a task. For `server_overloaded` only, the notifier can send the same
+liveness prompt after a fixed 30-second backoff when no in-flight or yielded task
+markers remain and the positively empty pane and process incarnation still match.
+A durable claim is written before typing. At most one probe is allowed until a
+later successfully completed correlated turn, including across notifier restarts and uncertain
+keystroke outcomes. A failed probe therefore cannot loop requests. Login, quota,
+unclassified API errors, aborted turns, incomplete history and unresolved submitted
+tasks require explicit recovery or disposition. They remain queued without replay.
+Pre-admission refusals are deduplicated in local diagnostics and reported by health.
+The fixed tool-free READY check fits a normal 80-column pane. Recovery requires
+one fully visible composer row and a recognized footer; wrapped or ambiguous drafts
+are refused without folding whitespace. After one paste, recovery polls for up to
+2 seconds on a monotonic clock for the exact probe, accepting only empty or exact
+byte-prefix renderings while waiting. Each check refreshes the candidate receipt
+and process incarnation; unknown or foreign composer content fails closed. Existing
+subprocess timeouts still apply, so this is not a hard 2-second wall-clock limit.
+Recovery never pastes again, and a timeout or refusal leaves the claim spent.
+If a recovery paste leaves a READY check draft or the staged text does not match,
+the claim remains spent. Inspect the pane and manually clear only the draft you
+recognize; automation never clears an unknown human composer to retry recovery.
+For task pickup, a typing failure before Enter is still retried; this change does not establish its underlying cause.
+
+For a trial, restart the managed notifier and observer to load the new code. The
+local `state/codex-pickup.json` records startup code hashes, fixed event counters,
+and the latest 64 timing events. Task keys are hashed; prompt text, pane contents,
+account identifiers and helper stderr are not copied into this evidence. These
+records stay local; publication requires a separate audience/privacy check.
+A useful live witness has a parent return while its worker remains outstanding,
+then a second task answered before the first result. Unit tests alone are not
+that live witness.
 
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F
@@ -131,30 +220,52 @@ also defers after the configured confirmation retries. An unobservable successfu
 send keeps the existing advisory behavior. A race with scrolling can leave the
 attached terminal's jump prompt visible; Escape dismisses that client prompt.
 
-## AG2 Space MCP without the desktop app
+## s.space MCP without the desktop app
 
-The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
-A Codex core set up without the app has no such entry, so it has no AG2 Space
-Actions (`room.commons.*` included) until you add the hosted server yourself. Find
-the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
-then add this to its `config.toml`:
+The s.space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
+A Codex core set up without the app has no such entry, so it has no s.space
+Actions (`room.commons.*` included) until you add the hosted server yourself.
+
+The MCP endpoint belongs to the homeserver your agent is on, so take it from your
+primary connection rather than from a fixed URL. Each DotSpace in the registry
+(`DEFAULT_INSTANCES` in `src/dotspace.py`, or `core.dotspace.instances` in your
+config) names its `mcp_url`:
+
+```bash
+server="${AG2_SERVER:-$(python3 scripts/connections.py list --json \
+  | python3 -c 'import json,sys; print(next((r["server"] for r in json.load(sys.stdin) if r["primary"]), ""))')}"
+mcp_url=""
+if [ -z "$server" ]; then
+  echo "no primary connection: set AG2_SERVER=<your homeserver, e.g. ag2.space> and rerun" >&2
+else
+  mcp_url=$(python3 src/dotspace.py "$server" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mcp_url"])')
+  [ -n "$mcp_url" ] && echo "$mcp_url" || echo "no mcp_url registered for $server: add it under core.dotspace.instances" >&2
+fi
+```
+
+With no connections record (a Codex core set up without the app) the first check prints the fix
+and leaves `$mcp_url` empty: export `AG2_SERVER` with your homeserver and rerun. Do not continue
+with an empty URL.
+
+Find the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
+then add that URL to its `config.toml`:
 
 ```toml
 [mcp_servers.ag2-space]
-url = "https://mcp.ag2.space/mcp"
+url = "<the mcp_url printed above>"
 ```
 
-`codex mcp add ag2-space --url https://mcp.ag2.space/mcp` writes the same entry
+`codex mcp add ag2-space --url "$mcp_url"` writes the same entry
 and starts the sign-in. The server uses OAuth, so no token goes in the file:
 
 ```bash
-codex mcp login ag2-space   # sign in to AG2 Space in the browser
+codex mcp login ag2-space   # sign in to s.space in the browser
 codex mcp list              # ag2-space: enabled, Auth no longer "Not logged in"
 ```
 
 That connection acts as you. To act as your agent, call the server's `agent_link`
 tool once from a Codex session with the one-time link code on the agent's
-settings page in AG2 Space. Restart the core afterwards
+settings page in s.space. Restart the core afterwards
 (`bash src/agent/start-cli.sh --restart`, from outside the core session).
 
 ## Externally managed monitor and heartbeat
@@ -272,7 +383,7 @@ bash src/agent/start-cli.sh --runtime codex --restart
 ```
 
 The leading `--runtime` flag wins over `SUTANDO_CORE_RUNTIME`, which otherwise
-wins over the AG2 Space desktop's selection, which wins over `core.runtime`. The
+wins over the s.space desktop's selection, which wins over `core.runtime`. The
 desktop selection is `coreRuntime` in the desktop's `runtime.json`
 (`$SUTANDO_APP_SUPPORT/runtime.json`, or the directory above a bundled
 `engine/<checkout>`), so launchd jobs started without the desktop's environment

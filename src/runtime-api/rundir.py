@@ -83,14 +83,29 @@ def instance_id() -> str:
 
 
 def enrolled_agent_id(state_dir) -> str | None:
-    """The agent id this install enrolled as, or None. Absent, unreadable and
-    malformed records are all "not enrolled" — never a hard failure."""
+    """The agent id this install enrolled as, or None: the primary connection
+    row's agent, else the enrollment record. Absent, unreadable and malformed
+    records are all "not enrolled" — never a hard failure."""
     if not state_dir:
         return None
+    primary = _primary_agent_mxid(state_dir)
+    if primary:
+        return primary
     try:
         rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
         return (rec.get("agent_id") or "").strip() or None
     except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _primary_agent_mxid(state_dir) -> str | None:
+    """The primary connection's agent mxid from the record under `state_dir`, or None."""
+    try:
+        sys.path.insert(0, str(_HERE.parent))  # src/
+        import connections  # noqa: PLC0415
+        row = connections.primary_row(Path(state_dir).parent)
+        return ((row or {}).get("agent_mxid") or "").strip() or None
+    except Exception:  # noqa: BLE001 — an unreadable record is "not enrolled", as below
         return None
 
 

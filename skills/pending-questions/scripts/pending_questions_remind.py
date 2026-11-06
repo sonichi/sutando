@@ -3,9 +3,10 @@
 replay, local closes, legacy ingest) through the sibling adapter and lists this host's open
 rows plus held questions; `--notify` (what `pq.py remind` passes) raises the due set over
 macOS, voice and the owner's DM, and `--force` with it skips the cooldown, presenter mode and
-the sent-quiet window. Without `--notify` NOTHING is sent — an installed schedule running the
-core entry with no flag is that silent pass. An unreachable room is reported as UNKNOWN,
-never as zero, and nothing is reminded from a count that could not be measured.
+the sent-quiet window. Without `--notify` no reminder is sent — an installed schedule running the
+core entry with no flag is that pass; the one thing every pass (outside presenter mode) may send
+is the single text pointer for a decision card the gateway never posted (`send_card_pointers`).
+An unreachable room is reported as UNKNOWN, never as zero, and nothing is reminded from a count that could not be measured.
 `--store-adapter <path>` injects another adapter file; the pass is the manifest contract's
 two entry points on whichever adapter it reads through — `reconcile_pass(ws)`, its errors kept
 in the notes, then the read-only `gather(ws)` (skills/MANIFEST.md).
@@ -24,9 +25,10 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 from workspace_default import resolve_workspace
+from sutando_config import resolve_macos_notifications
 from result_publish import publish_text
 from presenter_mode import presenter_mode_active
-from pending_questions_ask import SENT_QUIET_SEC, asked_recently
+from pending_questions_ask import SENT_QUIET_SEC, asked_recently, card_live, send_card_pointers
 
 WORKSPACE = resolve_workspace(migrate=False)
 RESULTS_DIR = WORKSPACE / "results"
@@ -133,7 +135,10 @@ BODY_MAX = 160
 
 
 def notify_macos(count, titles):
-    """Returns True only if osascript actually accepted the notification."""
+    """Returns True only if osascript actually accepted the notification; None when
+    notifications.macos is off, so nothing was attempted."""
+    if not resolve_macos_notifications():
+        return None
     # macOS truncates the body: the [:40] cap is the bound, since a title need
     # not contain a comma; blanks are dropped so the join cannot emit a bare `, ,`.
     names = [n for n in (t.split(",", 1)[0].strip()[:40] for t in titles[:3]) if n]
@@ -258,7 +263,7 @@ def notify_summary(count, macos_ok, voice_ok, stale):
     Pure so the claim itself is testable: the summary must not assert delivery
     that did not occur."""
     paths = [
-        "macos=ok" if macos_ok else "macos=FAILED",
+        "macos=off" if macos_ok is None else "macos=ok" if macos_ok else "macos=FAILED",
         "voice=ok" if voice_ok else "voice=skipped(not connected)",
     ]
     if stale:
@@ -271,7 +276,8 @@ def notify_summary(count, macos_ok, voice_ok, stale):
         warning = (
             "  WARNING: no consumer is draining results/proactive-*.txt on this host "
             f"(oldest undrained: {stale[0]}). The DM path is NOT reaching the owner; "
-            "only the macOS notification is real here."
+            + ("and macOS notifications are off, so nothing here is." if macos_ok is None
+               else "only the macOS notification is real here.")
         )
     return summary, warning
 
@@ -318,8 +324,13 @@ def main(argv=None, workspace=None, adapter=None):
         for q in questions:
             print(f"- [{q.get('ask_id') or 'no ask id'}] {q['title']} (not yet in the room)")
         return 0
-    if "--notify" not in argv:  # the scheduled or flagless run: reconcile and list, send nothing
-        print(f"{len(questions)} pending questions; nothing sent (reminders are on demand: --notify)")
+    # The pointer completes an ask whose card never posted, so it rides every pass, flagless included.
+    pointers = send_card_pointers(questions, WORKSPACE) if force or not presenter_mode_active(WORKSPACE) else []
+    for ask_id, sent in pointers:
+        print(f"card pointer: [{ask_id}] {sent} (its card was never posted; the card stays the only answer)")
+    if "--notify" not in argv:  # the scheduled or flagless run: reconcile and list, no reminder
+        print(f"{len(questions)} pending questions; {'no reminder' if pointers else 'nothing'} sent "
+              "(reminders are on demand: --notify)")
         for q in questions:
             print(f"- [{q.get('ask_id') or 'no ask id'}] {q['title']}"
                   + ("" if q.get("in_room", True) else " (not yet in the room)"))
@@ -330,6 +341,12 @@ def main(argv=None, workspace=None, adapter=None):
 
     if not force and presenter_mode_active(WORKSPACE):
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
+        return 0
+
+    carded = [q for q in questions if card_live(q.get("body", ""), WORKSPACE)]
+    questions = [q for q in questions if q not in carded]  # a live card is the ask, --force or not
+    if carded and not questions:
+        print(f"(cards) {len(carded)} pending questions wait as live decision cards; no text sent")
         return 0
 
     if not force:

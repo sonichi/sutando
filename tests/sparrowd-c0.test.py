@@ -25,6 +25,7 @@ isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
+from ag2_sparrow.control_socket import control_socket_path  # noqa: E402
 from ag2_sparrow.sparrowd import (  # noqa: E402
     ControlServer, SingleInstance, Supervisor, WorkerSpec)
 
@@ -190,7 +191,7 @@ with tempfile.TemporaryDirectory() as td6:
     from ag2_sparrow.sparrowd import run as _run
     t6 = Path(td6)
     w6 = t6 / "w.py"; w6.write_text("import time\nwhile True: time.sleep(0.2)\n")
-    sock6 = t6 / "state" / "sparrowd.sock"
+    sock6 = control_socket_path(t6 / "state")
 
     def stop_when_up():
         if not wait_for(sock6.exists, 8):
@@ -267,7 +268,7 @@ raise SystemExit(run([WorkerSpec("w", [sys.executable, {str(w)!r}])], {str(t2 / 
 """)
     proc = subprocess.Popen([sys.executable, str(runner)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    sock = t2 / "state" / "sparrowd.sock"
+    sock = control_socket_path(t2 / "state")
     check(wait_for(sock.exists, 8), "run(): control socket appears")
 
     def ask2(payload):

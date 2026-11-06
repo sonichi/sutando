@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -42,7 +43,47 @@ TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
 
 
 def socket_path(config_dir) -> Path:
-    return Path(config_dir) / SOCKET_NAME
+    """The job's tmux socket: in its config dir, or for an agent's own job in its short run dir."""
+    return cm.run_dir(config_dir) / SOCKET_NAME
+
+
+def run_dir_problem(config_dir) -> str:
+    """'' once an agent's own run dir exists as this user's own 0700 dir (a single job's socket stays in its
+    config dir, as before), else why not."""
+    path = cm.run_dir(config_dir)
+    if path == Path(config_dir):
+        return ""
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        st = os.lstat(path)
+    except OSError as e:
+        return "the socket dir %s cannot be made (%s)" % (path, e.strerror or e)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return "the socket dir %s is not this user's own 0700 dir; remove it by hand" % path
+    return ""
+
+
+def remove_run_dir(config_dir) -> str:
+    """After uninstall: an agent's own run dir, once it holds only its socket and that socket's pane-keys guard
+    with nothing but its mutex (a pending send or an uncertain fence keeps it)."""
+    path = cm.run_dir(config_dir)
+    if path == Path(config_dir):
+        return ""
+    guard = SOCKET_NAME + ".pane-keys-lock"
+
+    def ours(e) -> bool:
+        if e.name == SOCKET_NAME:
+            return not e.is_dir(follow_symlinks=False)
+        if e.name == guard:
+            return e.is_symlink() and os.path.realpath(os.path.dirname(os.readlink(e.path)) or path) == \
+                os.path.realpath(path)
+        if e.name.startswith(guard + ".") and e.is_dir(follow_symlinks=False):
+            return sorted(os.listdir(e.path)) in ([], ["mutex"])
+        return False
+    line = cm.remove_if_only(path, ours)
+    if line.startswith("removed: "):
+        cm.remove_empty_parent(path)
+    return line
 
 
 def socket_problem(config_dir) -> str:
@@ -53,29 +94,107 @@ def socket_problem(config_dir) -> str:
     return ""
 
 
-def tmux_version(tmux="tmux", run=subprocess.run) -> "tuple[int, int] | None":
+# The desktop app's bundled engine, then the usual package-manager dirs: a manager's PATH has neither.
+APP_TMUX_DIR = ("Library", "Application Support", "space.ag2.app", "engine", "bin")
+TMUX_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def tmux_candidates(recorded: str = "", environ=None) -> list:
+    """The absolute tmux executables there are, in lookup order: the recorded one, PATH's, the desktop
+    app's bundled engine/bin, then TMUX_DIRS. A link is kept as named, so an upgrade behind it still holds."""
+    env = os.environ if environ is None else environ
+    on_path = shutil.which("tmux", path=env.get("PATH", ""))
+    home = env.get("HOME") or os.path.expanduser("~")
+    out, app = [], os.path.join(home, *APP_TMUX_DIR, "tmux")
+    for cand in (recorded, on_path, app, *(os.path.join(d, "tmux") for d in TMUX_DIRS)):
+        if cand and os.path.isabs(cand) and _executable(cand) and cand not in out:
+            out.append(cand)
+    return out
+
+
+def tmux_version(tmux: str, run=subprocess.run) -> "tuple[int, int] | None":
+    """The version `tmux -V` reports, None when it does not run or reports none; a timeout raises."""
     try:
         r = run([tmux, "-u", "-V"], capture_output=True, text=True, timeout=cm.RUN_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        raise
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
     m = TMUX_VERSION_RE.search((r.stdout or "") + (r.stderr or "")) if r.returncode == 0 else None
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def tmux_problem(tmux="tmux", run=subprocess.run) -> str:
-    found = tmux_version(tmux, run)
+def tmux_check(tmux: str, run=subprocess.run) -> "tuple[tuple[int, int] | None, str]":
+    """(version, '') when `tmux` is MIN_TMUX or newer, else (version or None, why): a timeout, no answer
+    and too old are each their own line."""
+    try:
+        found = tmux_version(tmux, run)
+    except subprocess.TimeoutExpired:
+        return None, "%s -V did not answer within %d s; check that tmux runs, or pass --tmux <path>" % (
+            tmux, cm.RUN_TIMEOUT_S)
     if found is None:
-        return "tmux -V did not answer; install tmux %d.%d or newer" % MIN_TMUX
+        return None, "%s: tmux -V did not answer with a version; install tmux %d.%d or newer" % ((tmux,) + MIN_TMUX)
     if found < MIN_TMUX:
-        return "tmux %d.%d is older than the %d.%d this adapter needs (new-session -e)" % (found + MIN_TMUX)
-    return ""
+        return found, "tmux %d.%d is older than the %d.%d this adapter needs (new-session -e): %s" % (
+            found + MIN_TMUX + (tmux,))
+    return found, ""
+
+
+def tmux_problem(tmux: str, run=subprocess.run) -> str:
+    return tmux_check(tmux, run)[1]
+
+
+def resolve_tmux(explicit: str = "", recorded: str = "", environ=None, run=subprocess.run) -> "tuple[str, str]":
+    """(the absolute tmux to record, '') or ('', why): `explicit` (--tmux) alone when given, else the first
+    of tmux_candidates that is MIN_TMUX or newer; the first refusal is the one said."""
+    if explicit:
+        found = os.path.abspath(os.path.expanduser(explicit)) if os.sep in explicit else \
+            shutil.which(explicit, path=(os.environ if environ is None else environ).get("PATH", ""))
+        if not found or not _executable(found):
+            return "", "--tmux %s is not an executable file" % explicit
+        candidates = [os.path.abspath(found)]
+    else:
+        candidates = tmux_candidates(recorded, environ)
+    if not candidates:
+        where = ", ".join((os.path.join("~", *APP_TMUX_DIR),) + TMUX_DIRS)
+        return "", "tmux was not found on PATH or in %s; install tmux %d.%d or newer, or pass --tmux <path>" % (
+            (where,) + MIN_TMUX)
+    first = ""
+    for cand in candidates:
+        problem = tmux_problem(cand, run)
+        if not problem:
+            return cand, ""
+        first = first or problem
+    return "", first
+
+
+def job_of(config_dir) -> cm.Shape:
+    """The job whose config dir is `config_dir`: an agent's own under the agents dir, else the fixed one."""
+    d = Path(config_dir)
+    return cm.for_key(LOCAL, d.name) if d.parent.name == cm.AGENTS_DIR else LOCAL
+
+
+def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "tuple[str, str]":
+    """(the tmux the config records, '') with no lookup; a config from before TMUX gets the first
+    candidate there is (never a bare name), or ('', why) to reinstall `job`."""
+    install = cm.job_command(job or LOCAL, "install")
+    recorded = cfg.get("TMUX") or ""
+    if recorded:
+        return (recorded, "") if os.path.isabs(recorded) else ("", "the config records a relative TMUX %r; run %s"
+                                                                    % (recorded, install))
+    found = tmux_candidates("", environ)
+    return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
 class Tmux:
     """The adapter's own server on its own socket; every probe bounded, every outcome explicit."""
 
-    def __init__(self, sock, tmux=None, run=subprocess.run):
-        self.sock, self.tmux, self._run = str(sock), tmux or shutil.which("tmux") or "tmux", run
+    def __init__(self, sock, tmux, run=subprocess.run):
+        self.sock, self.tmux, self._run = str(sock), tmux, run
 
     def run(self, *args, timeout=PROBE_TIMEOUT_S, env=None):
         try:
@@ -235,7 +354,9 @@ class Launcher:
         self.cfg, self.config_dir, self.root = cfg, Path(config_dir), cm.work_root(cfg)
         self.log = log or (lambda line: print("claude-local: %s" % line, file=sys.stderr, flush=True))
         self.run, self.sleep, self.clock, self.environ = run, sleep, clock, environ
-        self.tm = Tmux(socket_path(config_dir), tmux=tmux, run=run)
+        self.job = job_of(config_dir)
+        found, self.tmux_missing = (tmux, "") if tmux else configured_tmux(cfg, environ, self.job)
+        self.tm = Tmux(socket_path(config_dir), tmux=found, run=run)
         self.state = cm.stop_state()
         self.observation: dict = {}
         self.created: "str | None" = None
@@ -262,10 +383,9 @@ class Launcher:
     def record(self) -> dict:
         return self._with_record(lambda rec: None)
 
-    @staticmethod
-    def attach_command() -> str:
-        """What the card shows: the adapter's own command, never a host path."""
-        return "%s attach" % LOCAL.command
+    def attach_command(self) -> str:
+        """What the card shows: the adapter's own command naming this job, never a host path."""
+        return cm.job_command(self.job, "attach", no_path=True)
 
     # ── create / adopt ───────────────────────────────────────────────────────
 
@@ -514,7 +634,8 @@ class Launcher:
                 self.log("cannot create a session: %s" % problem)
                 if self.refused:
                     # A layout refusal holds until the owner fixes the root: terminal, so the manager stops.
-                    self.log("stopping: the work root needs attention, then run %s install again" % LOCAL.command)
+                    self.log("stopping: the work root needs attention, then run %s again"
+                             % cm.job_command(self.job, "install"))
                     return cm.EXIT_HELD, rec
                 return EXIT_RETRY, rec
             rec = self._with_record(lambda r: dict(r, deadline=None))
@@ -540,14 +661,15 @@ class Launcher:
         return None, self.apply_effects(rec)
 
     def serve(self) -> int:
-        problem = socket_problem(self.config_dir) or tmux_problem(self.tm.tmux, self.run)
+        problem = (socket_problem(self.config_dir) or run_dir_problem(self.config_dir) or self.tmux_missing
+                   or tmux_problem(self.tm.tmux, self.run))
         if problem:
             self.log("refusing to start: %s" % problem)
             return cm.EXIT_UNUSABLE
         before = cm.stop_handlers(self.state)    # over the inherited dispositions, before any lock
         try:
             with records.flocked(self.config_dir / LAUNCHER_LOCK, blocking=False):
-                return self._serve()
+                return cm.retired(self.state, self._serve(), retry=EXIT_RETRY)
         except BlockingIOError:
             self.log("another launcher of this install is alive; retrying later")
             return EXIT_RETRY

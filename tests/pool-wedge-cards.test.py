@@ -63,6 +63,7 @@ CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+UNDELIVERED = getattr(ps, "CARD_UNDELIVERED", "card_undelivered")
 PANES["logged-out"] = f"❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n{FOOTER}\n"
 
 
@@ -141,16 +142,33 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 st, d = ps.evaluate(st, {"w": o}, t)
                 seen.add(d["w"])
                 t += 300.0
-        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN}, set())
+        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED}, set())
         self.assertNotIn(ps.RECOVER, seen)
 
     def test_no_wedge_decision_reaches_kill_send_keys_or_spawn(self):
         self.assertIsNotNone(wc, "no wedge card module")
-        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN):
+        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED):
             for label, pane in PANES.items():
                 ws, t = pool(), Tmux(pane)
                 rem.apply(ws, REPO, {WID: which}, runner=t, spawn=never_spawn)
                 self.assertEqual(t.acted(), [], (which, label))
+
+
+class WedgeCardsUseTheHelper(unittest.TestCase):
+    def test_every_card_path_is_built_by_hitl_cards_and_stored_in_the_workspace_store(self):
+        from hitl import cards
+        paths = [(HUMAN, PANES["gate"]), (HUMAN, PANES["limit"]), (FROZEN, PANES["frozen"]),
+                 (CAUSE, PANES["abnormal"]), (LOGIN, PANES["logged-out"])]
+        for which, pane in paths:
+            with self.subTest(which=which, pane=pane[:20]):
+                ws = pool()
+                with patch.object(cards, "choice_request", wraps=cards.choice_request) as cr:
+                    out = wc.raise_card(ws, WID, which, runner=Tmux(pane), routed=lambda *a: False)
+                self.assertEqual(out["outcome"], "carded")
+                cr.assert_called_once()
+                stored = cards.manager_for(ws).get(out["hitl_id"])
+                self.assertIsNotNone(stored, "stored through the workspace's own store handle")
+                self.assertEqual(stored.guard, cr.call_args.args[2])
 
 
 class HumanCard(unittest.TestCase):

@@ -73,7 +73,7 @@ def _run(query, payload=None, *, raises=None, room=ROOM, headers=None):
     saved_g, saved_h = rs.gateway, rs.http_json
     sent = {}
     try:
-        rs.gateway = lambda: ("https://example.invalid", dict(headers or {}))
+        rs.gateway = lambda *_a: ("https://example.invalid", dict(headers or {}))
         if raises is not None:
             def _boom(*a, **k):
                 raise raises
@@ -96,7 +96,7 @@ def _drive(handle, answers, roster):
     saved_g, saved_h = rs.gateway, rs.http_json
     asked = []
     try:
-        rs.gateway = lambda: ("https://example.invalid", {})
+        rs.gateway = lambda *_a: ("https://example.invalid", {})
 
         def _answer(method, url, headers, body):
             asked.append(body["query"])
@@ -234,11 +234,11 @@ print("8. refusals before the network")
 calls = []
 saved_g, saved_h = rs.gateway, rs.http_json
 try:
-    rs.gateway = lambda: ("", {})
+    rs.gateway = lambda *_a: ("", {})
     rs.http_json = lambda *a, **k: calls.append(a) or (200, {})
     check(rs.resolve_in_room("x", ROOM)["reason"] == "no gateway configured",
           "no gateway configured is named, not a crash")
-    rs.gateway = lambda: ("https://example.invalid", {})
+    rs.gateway = lambda *_a: ("https://example.invalid", {})
     check(rs.resolve_in_room("", ROOM)["reason"] == "empty query", "empty query is refused")
     check(rs.resolve_in_room("   ", ROOM)["reason"] == "empty query", "blank query is refused")
     check(rs.resolve_in_room("x", "")["reason"] == "room_id required", "missing room is refused")

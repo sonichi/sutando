@@ -52,7 +52,7 @@ unique base and display labels resolve to a worker ID where intent is captured.
 A human name shared by workers is refused. New broker display names equal to
 `core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
 Registration refuses a new ID already used as another worker's name. The
-optional `display_label` from AG2 Space also changes the name shown to people;
+optional `display_label` from s.space also changes the name shown to people;
 removing it restores the base label. Human status renders the effective name
 with the full ID, such as
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
@@ -61,7 +61,7 @@ with the full ID, such as
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
-| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
+| `display_label` | `kc-reviewer-ryan` | optional s.space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
@@ -113,7 +113,21 @@ tasks/task-123.txt                                              the payload: imm
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
 tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  a finished task's sentinel, moved; nothing reads it as owed
 ```
+
+**A spent task's sentinel moves to `archive/`, and nothing deletes one.** One rule,
+`pool_delivery.sentinel_retirable`, says when a sentinel may leave: its task is archived or gone
+from everywhere, or answered with its payload out of `tasks/` or this recipient's done flag
+written. Until then the bridge still reads it for whose reply it is delivering.
+`pool_delivery.archive_finished` is the only mover: it moves such sentinels into the recipient's
+`archive/` under the folder lock and re-checks the rule there, so a task re-queued meanwhile keeps
+its hold. `task_ids=` narrows it to some tasks; without it (the watcher's startup pass) a missing
+task's sentinel stays, because the inbox resolver still judges those. `prune_spent`, the boot
+`sweep` and the supervisor's retire name their ids and all go through it. A move that cannot happen (an unusable `archive/`) leaves
+the sentinel in the inbox. Every reader lists only the folder's top level, so an archived sentinel
+is no hold. `pool_delivery.py archive-finished <worker> --dry-run` prints the counts.
+`prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links. The clock counts from delivery: the hard-link move keeps the sentinel's mtime, so the first `prune_spent` pass after this deploys archives the old backlog and prunes everything older than 14 days at once.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from
@@ -269,10 +283,15 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 | `live` | the worker's beat | nothing |
 | `recovering` | the core | restart the runtime; deliveries keep arriving meanwhile |
 | `abandoned` | the core | release its `.accepted` sentinels back to `.txt` for the same worker |
-| `retired` | the core | remove it from the roster; the router then sends its traffic to the core |
+| `retired` | the owner (`pool_manage.py retire`) | not supervised or advertised; the router treats it as absent and sends its traffic to the core |
 
-The router never reads `state`. These rows are the health-check's, and whatever
-marks a worker `abandoned` is the same process that recovers it.
+The router reads `state` only to treat `retired` as absent from the roster, and delivery
+re-checks it under the recipient's folder lock, so retirement fences routing before the hand-off. The other rows
+are the health-check's, and whatever marks a worker `abandoned` is the same process that
+recovers it. `pool_manage.py` is the owner's command for a worker's lifecycle: `stop`
+(the per-worker `paused` marker, then its sessions are killed), `retire`, `enable` and `remove`.
+Retiring or removing a worker that owes deliveries is refused unless the owner passes
+`--hand-off`: the explicit handoff of the takeover rules below, moving each owed task to the core.
 
 **Stale is not dead.** A beat is an mtime, 30 s, considered stale at 90 s, and a
 future-dated beat counts as stale too. A host sleep expires every beat at once. That
@@ -313,7 +332,19 @@ owes work would read as stuck; a running Claude turn's timer keeps it changing.
 session meets the same network error, rate limit, API error or retry, and loses the
 turn in flight. With the same sustain and stale line, once per episode:
 
-- a gate or a limit escalates, as a gate always has;
+- a gate or a limit escalates, as a gate always has, only while the frame stays
+  unchanged across ticks with clocks, spinners, status glyphs and bare counts ("1
+  monitor still running") normalised away: on a held pane those tick without a turn
+  finishing, and a turn that finishes changes more than a number. Bare digits are
+  normalised out of the frame id, so two successive finished turns whose text differs
+  only by a number ("Delivered item 41", then "Delivered item 42") compare equal in
+  the wait rung. On a real pane turns accumulate, so this only bites a pane that
+  redraws a single line in place, and it fails toward one extra card on a progressing
+  worker, never toward a hidden block. A limit banner the
+  CLI leaves painted after a re-login sits under a session that keeps working: a turn
+  running above it reads as working, and a frame that moves clears the episode. The
+  seat's own input watcher does not page that banner, since it cannot read the
+  worker's queue; a refused limit turn, the limit menu or any dialog still pages there;
 - abnormal text raises a card that quotes the banner line and names the cause. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,

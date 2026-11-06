@@ -38,8 +38,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import connections  # noqa: E402 — the install's gateway rows and which one is primary
+import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
 import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
+import core_limit_hold  # noqa: E402 — the one decision that a provider limit holds the core
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
@@ -107,6 +110,7 @@ _SEVERITY = {
     "blocked": "warn",
     "degraded": "warn",
     "needs_login": "escalate",
+    "paused": "warn",        # held for a provider limit; it resumes by itself
     "unknown": "critical",   # status-stale wedge
     "offline": "critical",   # process/session gone
 }
@@ -227,25 +231,26 @@ def _core_running():
 
 
 def _gateway_configured():
-    """Whether the ag2.space mobile gateway is provisioned on THIS host.
+    """Whether a gateway is provisioned on THIS host.
 
-    The gateway bridge only runs where a remote task token is configured (env or
-    channels/ag2space/.env). Returns True (configured), False (config readable,
-    no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    The gateway bridge only runs where an enabled connection row exists or a remote task
+    token is configured (env, or any contained file under channels/ag2space/). Returns True
+    (configured), False (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR).
     Mirrors health-check.check_gateway_bridge's detection."""
+    if connections.enabled_rows():
+        return True
     if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
         return True
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return None
+    # Delegated so this surface agrees with startup and health-check; imported here because
+    # the resolver pulls in shared/, which a helper loading this file from a bare src copy lacks.
     try:
-        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
-            for ln in f:
-                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
-                    return True
-    except OSError:
+        from channel_env_resolve import channel_configured
+        return channel_configured(os.path.join(cfg, "channels"), "ag2space")
+    except (OSError, ImportError):
         return None
-    return False
 
 
 def _gateway_running():
@@ -275,12 +280,13 @@ def _gateway_running():
 
 # The AG2 Space desktop app runs its own engine runtime under
 # `space.ag2.app/engine`, and that engine is what serves the Station connector
-# gateway (sutando.ag2.space). Station connectors are therefore available only
+# gateway (the DotSpace's cloud origin). Station connectors are therefore available only
 # while AG2 Space is running; when it is not, Station calls fail with a bare
 # ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
 # attribute a Station failure to "AG2 Space not running" rather than guess.
 _AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
-_STATION_GATEWAY_HOST = "sutando.ag2.space"
+_STATION_GATEWAY_HOST = dotspace.server_of_gateway_url(
+    dotspace.default_cloud_origin(primary_server=connections.primary_server()))
 
 
 def _ag2space_app_running():
@@ -583,6 +589,13 @@ def _core_status(workspace):
     return data.get("status"), ts
 
 
+def _limit_hold(workspace):
+    try:
+        return core_limit_hold.active_hold(workspace)
+    except Exception:
+        return None  # a probe must degrade, never crash
+
+
 def _resolve_workspace(repo):
     rc, out = _run(["bash", os.path.join(repo, "scripts", "sutando-config.sh"), "workspace"])
     return out.strip() if rc == 0 and out.strip() else os.path.join(repo, "workspace")
@@ -681,6 +694,10 @@ def derive():
                               else f"Agent cannot take tasks — {what}")
             else:
                 health, detail = "unknown", "Agent is running (status unknown)"
+
+    hold = _limit_hold(workspace)
+    if hold:
+        health, authed, detail = "paused", None, core_limit_hold.status_line(hold)
 
     return {
         "health": health,

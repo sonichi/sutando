@@ -122,16 +122,25 @@ def token_from_env_file(var: str, env_file: Path) -> str:
     in a process tree whose credentials were handed in (see 3. above)."""
     if credentials_injected(os.environ):
         return ""
+    # Decode per line, strictly: an undecodable line is skipped so one bad byte
+    # cannot hide a valid token elsewhere, nor return mojibake as if it were one.
     try:
-        text = env_file.read_text()
+        raw = env_file.read_bytes()
     except OSError:
         return ""
-    for line in text.splitlines():
+    for chunk in raw.splitlines():
+        try:
+            line = chunk.decode()
+        except UnicodeDecodeError:
+            continue
         line = line.strip()
         if line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        if key.strip() == var:
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if key == var:
             return _clean_for(var, value)
     return ""
 

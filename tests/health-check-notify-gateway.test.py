@@ -238,6 +238,37 @@ class TestGatewayNotify(unittest.TestCase):
 
         notify.assert_called_once_with(checks)
 
+    def _main_with(self, gateway_ok):
+        checks = [self._fail()]
+        with (
+            mock.patch.object(self.hc, "run_all_checks", return_value=checks),
+            mock.patch.object(self.hc, "notify_gateway_for_failures", return_value=gateway_ok) as gw,
+            mock.patch.object(self.hc, "notify_for_failures") as macos,
+            mock.patch.object(sys, "argv",
+                              ["health-check.py", "--notify-gateway", "--notify-on-fail", "--json"]),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.hc.main()
+        gw.assert_called_once_with(checks)
+        return macos
+
+    def test_a_landed_gateway_dm_pops_no_macos_notification(self):
+        # The app notifies for the DM message itself; a second pop-up cannot open it.
+        self._main_with(gateway_ok=True).assert_not_called()
+
+    def test_a_failed_gateway_dm_falls_back_to_macos(self):
+        self._main_with(gateway_ok=False).assert_called_once()
+
+    def test_the_result_says_whether_the_set_is_in_the_dm(self):
+        st = self.root / "state" / "gw-result.json"
+        c = self._fail()
+        self.assertFalse(self.hc.notify_gateway_for_failures([c], state_file=st, sender=lambda t: False))
+        self.assertTrue(self.hc.notify_gateway_for_failures([c], state_file=st, sender=lambda t: True))
+        self.assertTrue(self.hc.notify_gateway_for_failures([c], state_file=st, sender=lambda t: False),
+                        "an unchanged set already in the DM is delivered")
+        self.assertFalse(self.hc.notify_gateway_for_failures(
+            [{"name": "x", "status": "ok", "detail": "fine"}], state_file=st, sender=lambda t: True))
+
 
 class TestLaunchdMinimalEnvWiring(unittest.TestCase):
     """P1 (qingyun #2487): the launchd fallback runs with a minimal env, so the
