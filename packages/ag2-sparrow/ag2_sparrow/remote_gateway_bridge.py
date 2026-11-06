@@ -5954,7 +5954,7 @@ def _observe_session(task: dict) -> _SessionObservation:
             _log(f"session ledger write failed for {task.get('id')} — context not kept")
         return out
     except Exception as exc:  # noqa: BLE001 — context is additive, never blocks a task
-        _log(f"session context skipped for {task.get('id')}: {type(exc).__name__}: {exc}")
+        _log(f"session context skipped for {task.get('id')}: {diagnostics.describe(exc)}")
         return _SessionObservation()
 
 
@@ -5963,7 +5963,7 @@ def _consume_session_mark(task: dict) -> bool:
     try:
         mark = _session_ledger().classify(task)
     except Exception as exc:  # noqa: BLE001 — an unreadable ledger makes it an ordinary task
-        _log(f"session mark check skipped for {task.get('id')}: {type(exc).__name__}: {exc}")
+        _log(f"session mark check skipped for {task.get('id')}: {diagnostics.describe(exc)}")
         return False
     if mark is None or mark.kind not in ("move", "member"):
         return False
