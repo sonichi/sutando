@@ -1517,7 +1517,7 @@ fi
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
         (workspace / "results" / "task-done.txt").replace(archive / "task-done.txt")
-        publish_result(workspace / "results" / "task-done.txt", "")
+        (workspace / "results" / "task-done.txt").write_text("")
         # The core session reports alive, so a replay would reach send-keys;
         # the default stub answers has-session with exit 1 and would hide one.
         self._write_exe("tmux", '''#!/bin/bash
@@ -1542,7 +1542,7 @@ exit 0
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
         (workspace / "results" / "task-done.txt").replace(archive / "task-done-1784690000.txt")
-        publish_result(workspace / "results" / "task-done.txt", "   \n\n")
+        (workspace / "results" / "task-done.txt").write_text("   \n\n")
         # The core session reports alive, so a replay would reach send-keys;
         # the default stub answers has-session with exit 1 and would hide one.
         self._write_exe("tmux", '''#!/bin/bash
