@@ -36,7 +36,8 @@ MIN_CODEX = (0, 160, 1)
 SANDBOXES = ("read-only", "workspace-write")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
-CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL") + cb.CONFIG_KEYS
+CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "ALLOW_COLLABORATOR",
+               "MODEL") + cb.CONFIG_KEYS
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
@@ -85,6 +86,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
             "--codex", cfg["CODEX"], "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only"]
     if cfg.get("ALLOW_NON_OWNER") == "1":
         argv.append("--allow-non-owner")
+    if cfg.get("ALLOW_COLLABORATOR") == "1":
+        argv.append("--allow-collaborator")
     if cfg.get("MODEL"):
         argv += ["--model", cfg["MODEL"]]
     return argv
@@ -141,7 +144,8 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
 RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
-            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str))
+            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"),
+            ("ALLOW_COLLABORATOR", "allow_collaborator", lambda v: v == "1"), ("MODEL", "model", str))
 
 
 def install(args) -> int:
@@ -176,6 +180,7 @@ def install(args) -> int:
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
               "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
+              "ALLOW_COLLABORATOR": "1" if args.allow_collaborator else "",
               "MODEL": args.model or "", "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
               "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
@@ -334,7 +339,9 @@ def verify(args) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     print(f"INFO sandbox: {cfg.get('SANDBOX') or 'read-only'} for owner turns; non-owner turns are always read-only")
-    print(f"INFO non-owner: {'served read-only (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
+    print(f"INFO non-owner: {'served read-only (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused'}")
+    print("INFO collaborator tasks: " + ("served read-only with the non-owner note (--allow-collaborator)"
+                                         if cfg.get("ALLOW_COLLABORATOR") == "1" else "refused (--allow-collaborator off)"))
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
         problem = cb.bridge_problem(cfg, COMMAND, bridge)
@@ -368,6 +375,10 @@ def session_options(p) -> None:
                    help="the owner threads' sandbox (default read-only; non-owner turns are always read-only)")
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
+    p.add_argument("--allow-collaborator", action="store_true",
+                   help="serve attested collaborators' (Team) tasks on an ephemeral read-only thread with the "
+                        "non-owner note; they act with this login and its tools, and the note is the only guard. "
+                        "Off by default, so they are refused; --allow-non-owner does not imply it")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
 
 

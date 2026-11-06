@@ -467,6 +467,8 @@ class Install(Base):
                          (str(self.codex), str(self.work), str(self.work / "tasks"), str(self.work / "results")))
         self.assertEqual((cfg["CODEX_HOME"], cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]),
                          (str(self.codex_home), "read-only", "", ""))
+        self.assertEqual(cfg["ALLOW_COLLABORATOR"], "", "collaborators are refused unless the owner opts in")
+        self.assertNotIn("--allow-collaborator", cli.connector_argv(cfg, str(self.work), 7))
         self.assertTrue((self.work / "tasks").is_dir() and (self.work / "results").is_dir())
         self.assertTrue(cm.service_path(L).read_text().startswith(cli.MARKER))
         self.assertNotIn(TOKEN, cfg_path.read_text())
@@ -477,13 +479,17 @@ class Install(Base):
         self.assertIsNone(self.server(), "install starts no connector itself; the manager does")
 
     def test_sandbox_and_non_owner_choices(self):
-        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1")
+        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--allow-non-owner",
+                                       "--allow-collaborator", "--model", "m1")
         self.assertEqual(rc, 0)
         self.assertIn("NOTE sandbox: workspace-write", out)
         cfg = cm.read_config(cli.config_path())
-        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "1", "m1"))
-        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
-                         ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
+        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["ALLOW_COLLABORATOR"], cfg["MODEL"]),
+                         ("workspace-write", "1", "1", "m1"))
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-6:],
+                         ["--sandbox", "workspace-write", "--allow-non-owner", "--allow-collaborator", "--model", "m1"])
+        self.assertIn(("ALLOW_COLLABORATOR", "allow_collaborator"), [r[:2] for r in cli.RECORDED],
+                      "a repair install keeps the owner's choice")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
 
@@ -957,7 +963,8 @@ class VerifyUninstall(Base):
         self.assertEqual(set(self.checks(out)), {"config", "codex", "login", "inbox", "results", "relay token", "supervisor"})
         self.assertEqual(set(self.checks(out).values()), {"PASS"})
         self.assertIn("INFO sandbox: read-only", out)
-        self.assertIn("INFO non-owner: refused unless", out)
+        self.assertIn("INFO non-owner: refused\n", out)
+        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", out)
         self.assertIn(f"INFO job: {L.service_name} active", out)
         self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}, no live connector attached "
                       "(manager active/running)", out)

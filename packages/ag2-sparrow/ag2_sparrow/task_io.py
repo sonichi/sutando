@@ -56,6 +56,22 @@ def admission(headers, allow_non_owner=False):
     return "non_owner" if allow_non_owner else None
 
 
+def gate(raw, headers, allow_non_owner=False, allow_collaborator=False):
+    """(admission, why refused), the one decision every adapter makes before a task reaches its session. `raw`
+    is attested_headers(text).headers: with no access_tier there the file is malformed (the bridge always writes
+    one). An attested collaborator is served only under allow_collaborator, which allow_non_owner does not
+    imply; any other non-owner only under allow_non_owner."""
+    if "access_tier" not in raw:
+        return None, "malformed: no access_tier header"
+    kind = admission(headers, allow_non_owner)
+    flag = "--allow-collaborator" if kind == "collaborator" else "--allow-non-owner"
+    if kind == "collaborator" and not allow_collaborator:
+        kind = None
+    why = "" if kind else "sender tier %s (collaborator %s) and %s is off" % (
+        headers["access_tier"], headers["collaborator"], flag)
+    return kind, why
+
+
 def non_owner_note():
     return NON_OWNER_NOTE
 

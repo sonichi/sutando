@@ -307,7 +307,8 @@ class TierPolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
             with mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted) as spy:
-                self.assertEqual(run_connector(d, once=1, extra=["--sandbox", "danger-full-access"]), 0)
+                self.assertEqual(run_connector(d, once=1, extra=["--sandbox", "danger-full-access",
+                                                                  "--allow-collaborator"]), 0)
             self.assertEqual((spy.call_args.args[1]["access_tier"], spy.call_args.args[1]["collaborator"]),
                              ("team", "true"))
             self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE)
@@ -325,13 +326,14 @@ class TierPolicyTest(unittest.TestCase):
 
 
 class AdmissionGateTest(unittest.TestCase):
-    """The serve loop admits through task_io.admission: owner and attested collaborator always;
-    any other non-owner only under --allow-non-owner, else NON_OWNER_REFUSED with no thread at all."""
+    """The serve loop admits through task_io.gate: the owner always; an attested collaborator only under
+    --allow-collaborator; any other non-owner only under --allow-non-owner; a file with no access_tier
+    never; else NON_OWNER_REFUSED with no thread at all."""
 
     def run_spied(self, work, once, extra=()):
         err = io.StringIO()
         with mock.patch.object(cc.Connector, "open_for", autospec=True, side_effect=cc.Connector.open_for) as opened, \
-                mock.patch.object(cc, "admission", wraps=task_io.admission) as gate, contextlib.redirect_stderr(err):
+                mock.patch.object(task_io, "admission", wraps=task_io.admission) as gate, contextlib.redirect_stderr(err):
             self.assertEqual(run_connector(work, once=once, extra=extra), 0)
         return opened, gate, err.getvalue()
 
@@ -349,13 +351,15 @@ class AdmissionGateTest(unittest.TestCase):
             self.assertEqual(gate.call_count, 4)
             for tid in ("task-chat-g", "task-chat-t", "task-chat-claim", "task-chat-mid"):
                 self.assertEqual(result(d, tid), task_io.NON_OWNER_REFUSED, tid)
-                self.assertIn("refused (non-owner, --allow-non-owner not set) -> %s" % tid, err)
+                self.assertRegex(err, r"refused \(sender tier \w+ \(collaborator \w+\) and --allow-non-owner is off\) "
+                                      r"-> %s " % re.escape(tid))
             self.assertNotIn("turn ->", err)
             self.assertFalse((Path(d) / "state" / "metrics.jsonl").exists())
             self.assertEqual(saved_threads(d), [])
             self.assertEqual((Path(d) / "state" / "done").read_text().split(),
                              ["task-chat-g", "task-chat-t", "task-chat-claim", "task-chat-mid"])
             self.assertIs(cc.build_parser().get_default("allow_non_owner"), False)
+            self.assertIs(cc.build_parser().get_default("allow_collaborator"), False)
 
     def test_a_body_cannot_claim_collaborator_access(self):
         with tempfile.TemporaryDirectory() as d:
@@ -379,7 +383,7 @@ class AdmissionGateTest(unittest.TestCase):
             write_task(d, "task-chat-o", "owner asks", mtime=now - 30)
             write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True), mtime=now - 20)
             write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 10)
-            opened, _, err = self.run_spied(d, once=3)
+            opened, _, err = self.run_spied(d, once=3, extra=["--allow-collaborator"])
             self.assertEqual(opened.call_count, 2)
             self.assertIn("[sandbox=read-only ephemeral=False cwd=", result(d, "task-chat-o"))
             self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
@@ -389,6 +393,25 @@ class AdmissionGateTest(unittest.TestCase):
             self.assertIn("turn -> task-chat-o", err)
             self.assertIn("turn -> %s" % tid, err)
             self.assertNotIn("turn -> task-chat-g", err)
+
+    def test_an_attested_collaborator_is_refused_without_its_flag(self):
+        """Owner-only by default: --allow-non-owner does not imply --allow-collaborator."""
+        tid = "task-1792100000005"
+        for extra in ([], ["--allow-non-owner"]):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as d:
+                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+                opened, _, err = self.run_spied(d, once=1, extra=extra)
+                self.assertEqual(opened.call_count, 0, "no thread, no turn")
+                self.assertEqual(result(d, tid), task_io.NON_OWNER_REFUSED)
+                self.assertIn("and --allow-collaborator is off) -> %s team" % tid, err)
+
+    def test_a_file_with_no_access_tier_is_refused_even_under_allow_non_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, "task-chat-bare", "id: task-chat-bare\nchannel_id: !r:x\ntask: no tier at all\n")
+            opened, gate, err = self.run_spied(d, once=1, extra=["--allow-non-owner", "--allow-collaborator"])
+            self.assertEqual((opened.call_count, gate.call_count), (0, 0), "refused before any admission")
+            self.assertEqual(result(d, "task-chat-bare"), task_io.NON_OWNER_REFUSED)
+            self.assertIn("refused (malformed: no access_tier header) -> task-chat-bare", err)
 
     def test_allow_non_owner_admits_guests_on_the_ephemeral_thread(self):
         with tempfile.TemporaryDirectory() as d:

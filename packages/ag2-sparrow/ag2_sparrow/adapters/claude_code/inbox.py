@@ -151,16 +151,9 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     path = os.path.join(root, "tasks", task_id + ".txt")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = task_io.attested_headers(f.read()).headers
-    if "access_tier" not in raw:
-        return None, {}, "malformed: no access_tier header"
     headers, _, _ = task_io.parse_task(path)
-    kind = task_io.admission(headers, allow)
-    flag = "--allow-collaborator" if kind == "collaborator" else "--allow-non-owner"
-    if kind == "collaborator" and not allow_collab:
-        kind = None
-    why = "" if kind else "sender tier %s (collaborator %s) and %s is off" % (
-        headers["access_tier"], headers["collaborator"], flag)
-    return kind, headers, why
+    kind, why = task_io.gate(raw, headers, allow, allow_collab)
+    return kind, (headers if "access_tier" in raw else {}), why
 
 
 # The lifecycle's answers about the claim itself: final, whatever raised them. An unreadable claim is not

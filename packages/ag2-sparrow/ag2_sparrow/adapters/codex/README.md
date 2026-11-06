@@ -23,7 +23,7 @@ occupancy and the holder record attribution, never readiness.
 ```bash
 ag2-sparrow-codex-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
-    [--allow-non-owner] [--model <m>] [--codex <path>]
+    [--allow-non-owner] [--allow-collaborator] [--model <m>] [--codex <path>]
 ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]   # the alternative to --token-stdin
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
@@ -108,7 +108,7 @@ launcher-side shape shares: take the work root's lock for the launcher's own lif
 `codex-local`; a root another session holds is exit 75, which the manager does not relaunch over),
 make `tasks`, `results`, `state` and `state/threads` under the held root inode, start the connector
 as the direct child, `python -m …codex_connector --work <dir> --held --root-fd <the held root's
-descriptor> --codex <the configured executable> --server stdio --sandbox <s> [--allow-non-owner]
+descriptor> --codex <the configured executable> --server stdio --sandbox <s> [--allow-non-owner] [--allow-collaborator]
 [--model <m>]`, with an environment of
 only `PATH` (the configured `codex` first), `HOME`, `USER`, `PYTHONPATH` (this package) and
 `CODEX_HOME` when one was recorded (the connector passes it on to its app-server), and attach it as
@@ -150,15 +150,17 @@ The tier comes from the attested headers (`task_io.attested_headers` over
 gateway-written `task_layout: mid` file takes `access_tier` from the writer's trailer below the
 body. Absent or unknown → `guest`. `collaborator` rides along.
 
-Admission is the shared `task_io.admission` gate: the owner and an attested collaborator (Team — the
-broker's `collaborator: true` on the team tier, from the parsed headers, never the message text) are
-served. A non-owner without collaborator access (Guest, and any collaborator claim the broker did not
-attest) gets "This agent only answers its owner here." as its result — no thread started, no turn, the
-log says `refused (non-owner, --allow-non-owner not set)` — unless `--allow-non-owner` is passed, which
-serves them exactly like a collaborator, on the ephemeral read-only thread in the right-hand column. The
-owner path is unchanged.
+Admission is the shared `task_io.gate`, the same decision claude-local's Mod makes before a submit: the
+owner is served. An attested collaborator (Team — the broker's `collaborator: true` on the team tier, from
+the parsed headers, never the message text) is served only under `--allow-collaborator` (persisted by
+install, shown by `verify`, off by default); `--allow-non-owner` does not imply it. Any other non-owner
+(Guest, and any collaborator claim the broker did not attest) is served only under `--allow-non-owner`. A
+file with no attested `access_tier` is malformed and never served. Everything refused gets "This agent
+only answers its owner here." as its result — no thread started, no turn, the log names the flag that is
+off. A served non-owner runs on the ephemeral read-only thread in the right-hand column; the note there is
+guidance, and it acts with this Codex login and its tools. The owner path is unchanged.
 
-| | owner | attested collaborator, or any non-owner under `--allow-non-owner` |
+| | owner | attested collaborator under `--allow-collaborator`, or any non-owner under `--allow-non-owner` |
 |---|---|---|
 | thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel | a fresh **ephemeral** thread per task, never reused, never saved |
 | cwd | `--cwd` (default `--work`) | an empty temp dir, removed after the turn, so no room's `tasks/` or `results/` is in reach |
