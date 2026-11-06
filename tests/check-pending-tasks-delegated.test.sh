@@ -65,5 +65,38 @@ OUT="$(run_hook)"
 case "$OUT" in *"$OTHER.txt"*) ;; *) OUT="" ;; esac
 case "$OUT" in ""|*"$TASK.txt"*) bad "a marker skips only its own task" "got: ${OUT:0:200}" ;; *) ok "a marker skips only its own task; an undelegated neighbour still blocks" ;; esac
 
+rm -f "$WS/tasks/$OTHER.txt"
+touch -t 202001010000 "$WS/tasks/$TASK.txt"
+marker_for "$TASK" -300 1800
+record_delivery
+OUT="$(run_hook)"
+[ "$OUT" = "{}" ] || bad "wake-turn setup: the marker is live" "got: ${OUT:0:160}"
+touch "$WS/tasks/$TASK.txt"
+OUT="$(run_hook)"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "a wake turn rewritten after the marker blocks (the marker covers one turn)" ;; *) bad "a wake turn rewritten after the marker blocks" "got: ${OUT:0:160}" ;; esac
+
+# Stub repo: the hook plus a config stub, so python or the marker script can be absent.
+STUB="$TMPWS/stub-repo"
+mkdir -p "$STUB/src" "$STUB/scripts"
+cp "$HOOK" "$STUB/src/"
+stub_config() {  # $1: what python-bin prints ("" = no usable interpreter)
+  printf '#!/bin/bash\ncase "$1" in workspace) echo %q ;; python-bin) [ -n %q ] && echo %q || exit 1 ;; *) exit 1 ;; esac\n' \
+    "$WS" "$1" "$1" > "$STUB/scripts/sutando-config.sh"
+}
+mark "$TASK" --ttl 1800
+record_delivery
+OUT="$(run_hook)"
+[ "$OUT" = "{}" ] || bad "stub control: the real hook skips the freshly marked task" "got: ${OUT:0:160}"
+stub_config ""
+OUT="$(printf '' | bash "$STUB/src/check-pending-tasks.sh" 2>"$TMPWS/err")"
+if [ "$OUT" = "{}" ] && grep -q "no usable interpreter; queue not reported" "$TMPWS/err"; then
+  ok "no python: a delegated task is still counted unprocessed (not skipped by the marker)"
+else
+  bad "no python: a delegated task is still counted unprocessed" "out: ${OUT:0:120} err: $(head -c 160 "$TMPWS/err")"
+fi
+stub_config "$PYBIN"
+OUT="$(printf '' | bash "$STUB/src/check-pending-tasks.sh" 2>/dev/null)"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "no task_delegation.py: a marked task still blocks (fails closed)" ;; *) bad "no task_delegation.py: a marked task still blocks" "got: ${OUT:0:160}" ;; esac
+
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"

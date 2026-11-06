@@ -27,6 +27,14 @@ class Marker(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.ws = Path(self.td.name)
+        self.task = self.task_file(TID)
+
+    def task_file(self, tid, ago=3600.0):
+        t = self.ws / "tasks" / f"{tid}.txt"
+        t.parent.mkdir(exist_ok=True)
+        t.write_text(f"id: {tid}\ntask: x\n")
+        os.utime(t, (time.time() - ago,) * 2)
+        return t
 
     def tearDown(self):
         self.td.cleanup()
@@ -41,6 +49,45 @@ class Marker(unittest.TestCase):
     def test_expired_is_not_delegated(self):
         m.mark(self.ws, TID, 60, now=time.time() - 61)
         self.assertFalse(m.is_delegated(self.ws, TID))
+
+    def test_expiry_boundary_age_equal_to_ttl_is_expired(self):
+        at = time.time() - 120
+        m.mark(self.ws, TID, 60, now=at)
+        self.assertTrue(m.is_delegated(self.ws, TID, now=at + 59.999))
+        self.assertFalse(m.is_delegated(self.ws, TID, now=at + 60))
+
+    def test_a_wake_turn_rewritten_after_the_marker_is_not_delegated(self):
+        m.mark(self.ws, TID, 1800)
+        self.assertTrue(m.is_delegated(self.ws, TID))
+        later = time.time() + 1
+        os.utime(self.task, (later, later))
+        self.assertFalse(m.is_delegated(self.ws, TID))
+        self.assertIsNone(m.holder(self.ws, TID))
+
+    def test_the_task_file_given_is_the_one_compared(self):
+        m.mark(self.ws, TID, 1800)
+        other = self.ws / "inbox" / f"{TID}.txt"
+        other.parent.mkdir()
+        other.write_text("x")
+        os.utime(other, (time.time() + 1,) * 2)
+        self.assertTrue(m.is_delegated(self.ws, TID))
+        self.assertFalse(m.is_delegated(self.ws, TID, task_file=other))
+
+    def test_no_task_file_is_not_delegated(self):
+        m.mark(self.ws, TID, 1800)
+        self.task.unlink()
+        self.assertFalse(m.is_delegated(self.ws, TID))
+
+    def test_huge_integers_fail_closed_without_overflow(self):
+        p = m.marker_path(self.ws, TID)
+        p.parent.mkdir(parents=True)
+        now = time.time()
+        for at, ttl in ((now, 10 ** 400), (10 ** 400, 600)):
+            p.write_text(json.dumps({"task_id": TID, "delegated_at": at, "ttl_s": ttl}))
+            self.assertFalse(m.is_delegated(self.ws, TID))
+        with self.assertRaises(ValueError):
+            m.mark(self.ws, TID, 10 ** 400)
+        self.assertEqual(self._main("mark", TID, "--ttl", "1" + "0" * 400)[0], 2)
 
     def test_future_dated_is_not_delegated(self):
         m.mark(self.ws, TID, 600, now=time.time() + 3600)
@@ -72,6 +119,19 @@ class Marker(unittest.TestCase):
                 m.mark(self.ws, bad, 60)
         self.assertFalse((self.ws / m.SUBDIR).exists())
 
+    def test_holder_worker_then_background_then_none(self):
+        self.assertIsNone(m.holder(self.ws, TID, worker_holder=lambda ws, t: None))
+        m.mark(self.ws, TID, 600)
+        self.assertEqual(m.holder(self.ws, TID), m.BACKGROUND_HOLDER)
+        self.assertEqual(m.holder(self.ws, TID, worker_holder=lambda ws, t: "w1"), "w1")
+        self.assertIsNone(m.holder(self.ws, TID, include_background=False))
+
+    def test_holder_propagates_an_unreadable_worker_store(self):
+        def unreadable(ws, t):
+            raise PermissionError("deliveries/")
+        with self.assertRaises(PermissionError):
+            m.holder(self.ws, TID, worker_holder=unreadable)
+
     def test_clear_removes_it(self):
         m.mark(self.ws, TID, 600)
         self.assertTrue(m.clear(self.ws, TID))
@@ -100,6 +160,12 @@ class Marker(unittest.TestCase):
         self.assertEqual(self._main("bogus")[0], 2)
         self.assertEqual(self._main("clear", TID)[0], 0)
         self.assertEqual(self._main("check", TID)[0], 1)
+
+    def test_cli_check_compares_the_given_task_file(self):
+        self.assertEqual(self._main("mark", TID)[0], 0)
+        self.assertEqual(self._main("check", TID, "--task-file", str(self.task))[0], 0)
+        os.utime(self.task, (time.time() + 1,) * 2)
+        self.assertEqual(self._main("check", TID, "--task-file", str(self.task))[0], 1)
 
     def test_cli_resolves_the_workspace_when_not_given(self):
         with mock.patch("workspace_default.resolve_workspace", return_value=self.ws):
@@ -138,6 +204,7 @@ class Marker(unittest.TestCase):
         with mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
             m.mark(self.ws, TID, 60)
         self.assertTrue(m.is_delegated(self.ws, TID))
+
 
 if __name__ == "__main__":
     unittest.main()
