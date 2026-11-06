@@ -6,12 +6,12 @@ remote-gateway bridge instance. The directory of connections lives at
 the CLI (`scripts/connections.py`), the runtime API (`connection.*` methods) and
 startup (`src/startup-runtime.sh`) all call that module and never touch the file.
 
-**Words used here.** A *connect code* is the one-time, opaque `acp.…` code the app's Add agent flow shows when
-it creates a **new** agent; `connect --code -` redeems it once and writes that agent's relay token to the seat's
-token file. A *relay token* is the long-lived credential `<relay_url>|<bearer>` (older text calls it the
-`url|secret` connect string: the same bytes). `add` and `update_token` take only a relay token, since the
-gateway URL inside it is what they preview. An **existing** agent's new relay token comes from that agent's
-settings in the app (Get token), never from Add agent, which creates another agent (`update_token` refuses its token: `token_agent_mismatch`).
+**Words used here.** A *relay token* is the agent's credential `<relay_url>|<bearer>` (older text calls
+it the `url|secret` connect string: the same bytes). `add` and `update_token` take only a relay token, since
+the gateway URL inside it is what they preview; give the CLI `-` and paste it on stdin, which keeps it out
+of shell history and the process list. This install's agent gets its relay token when it is signed in to s.space from the Sutando desktop app,
+which hands the token to the local agent API. Add agent in the app creates another agent, and that agent's
+token is not this one's (`update_token` refuses it: `token_agent_mismatch`).
 
 ## The model
 
@@ -150,7 +150,7 @@ key unchanged. A row keyed by identity is never demoted.
 ### Re-adopting the legacy row's server
 
 The legacy row (`instance: ""`) runs on `REMOTE_TASK_TOKEN` from the environment, and getting a
-new relay token from the agent's settings (Get token) rotates that credential. So a **verified** token that matches the legacy
+new relay token for the agent rotates that credential. So a **verified** token that matches the legacy
 row (by server, as above) and is not the secret that row already holds (its vault key, the
 environment or the channel env file) is not "already connected": `add` adopts it. Under one hold of
 the record lock it stores the secret under the new row's `token_ref`
@@ -167,7 +167,7 @@ primary is refused (`legacy_primary_in_use`), and a bridge that will not stop (`
 new secret back out; either way nothing changed. An unverified preview, or the token the legacy
 row already runs on, answers the legacy row with `created: false` as before.
 
-A client gates its "Reconnect with a code" action on `legacy_readopt` in the list's
+A client gates a reconnect with a fresh relay token on `legacy_readopt` in the list's
 `capabilities` (`connections.CAPABILITIES`); an engine without this answers no such field.
 
 A saved row is primary only when the install has no primary yet. `import-env` gives the
@@ -306,8 +306,8 @@ python3 scripts/connections.py move --dry-run
 python3 scripts/connections.py move --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
 ```
 
-s.space's registry started as a copy of ag2.space's, so an agent that neither server has re-coded
-since still has the same relay secret on both. `move` swaps only the gateway: it takes the ag2.space
+s.space's registry started as a copy of ag2.space's, so an agent that neither server has issued a new
+relay token for since still has the same relay secret on both. `move` swaps only the gateway: it takes the ag2.space
 row's secret (the primary, else the legacy row; name another instance to pick it), puts it behind
 s.space's registered gateway and asks that gateway who it is. Only when s.space verifies the same
 agent localpart does it save the `s-space` row (settling its backlog), promote it (the ag2.space
@@ -326,17 +326,12 @@ to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instan
 A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new token
 since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
-s.space). Then fall back to a new relay token:
+s.space). Then fall back to the desktop app:
 
-1. Get a new relay token for **this** agent on s.space: its settings in the app, Get token (not Add
-   agent, which creates another agent).
-2. `python3 scripts/connections.py add - --yes --expected-server s.space`, paste the token, then Ctrl-D.
-   With `-` the token is read from stdin, so it stays out of shell history and the process list; stdin
-   then cannot answer the save prompt, so `--yes` needs `--expected-server`. It saves the `s-space` row
-   (a secondary, its bridge not started) only when the gateway in the token answers as s.space and accepts
-   it; a token for another server ("token belongs to server …") or one the gateway rejects
-   (`token_rejected`) is refused and nothing is saved.
-3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
+1. Sign this agent in to s.space from the Sutando desktop app while the local agent API runs
+   (`bash src/startup.sh` starts it). The app hands the agent's relay token to that API, which saves the
+   `s-space` row as a secondary and starts its bridge.
+2. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
    — starts the s.space bridge as primary, waits for it to connect, then stops and parks the
    ag2.space bridge (the legacy one included). A failure rolls back and changes nothing.
 
@@ -402,7 +397,7 @@ still without a lease after `LEASE_TIMEOUT_S` is killed and the launch fails (`l
 running, learns the identity its token answers to now and launches it again; the other
 connections keep running. A plain `launch` of a disabled row is refused by name
 ("disconnected; reconnect it"). `update_token(instance, token)` is for a relay token that was
-rotated or revoked on the homeserver (Get new token, Revoke) or an agent moved away and
+rotated or revoked on the homeserver or an agent moved away and
 back. It is refused with the vault and the row untouched, in this order: on the legacy row
 (`legacy_row_unmanaged`); when the row's `token_ref` is **set in the environment**
 (`token_source_shadowed`) — `launch_env` and the bridge's own source order read the variable
@@ -436,7 +431,7 @@ vault write. After the stop it takes the lock again (bounded, below) and holds i
 prior-value snapshot through the new vault write, the record publication and any restore, so no
 other vault writer, in this process or another, can land in between. A narrow race remains: a
 writer that takes the lock between the probe and the re-take makes the re-take wait for it, with
-the bridge already stopped (and relaunched on the unchanged code if that wait runs out). The lock order is
+the bridge already stopped (and relaunched on the unchanged token if that wait runs out). The lock order is
 `connections.lock`, then the vault lock; nothing in the vault layer takes `connections.lock`. The
 lock is released when its holder raises or exits (a killed holder's lock is dropped by the
 kernel), and its file stays empty. A lock that cannot be taken fails the write.

@@ -88,7 +88,7 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("move", "--dry-run")
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("move refused: no_successor", proc.stderr)
-        self.assertIn("connections.py add - --yes --expected-server", proc.stdout)
+        self.assertIn("from the Sutando desktop app", proc.stdout)
         self.assertFalse((self.ws / "state" / "connections.json").exists(), "a refusal writes nothing")
 
     def test_add_previews_then_asks(self):
@@ -410,7 +410,7 @@ class InProcess(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2, "the token is a required argument, as for add")
 
         def boom(*a, **k):
-            raise self.cli.connections.TokenAgentMismatch("dev", "the code is for agent @b:s.space, not @a:s.space")
+            raise self.cli.connections.TokenAgentMismatch("dev", "the token is for agent @b:s.space, not @a:s.space")
         rc, out, err = self.run_main(args, update_token=boom)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("connections: token_agent_mismatch: ", err)
@@ -506,9 +506,9 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
         self.assertEqual(rc, 1)
         self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
-        self.assertEqual(out, "next: get a new relay token for this agent in its s.space settings (Get token, "
-                              "not Add agent), then run python3 scripts/connections.py add - --yes "
-                              "--expected-server s.space (paste the token on stdin)\n")
+        self.assertEqual(out, "next: sign this agent in to s.space from the Sutando desktop app while the local "
+                              "agent API runs; the app hands this install the agent's relay token "
+                              "(docs/connections.md)\n")
         half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",
                                    "added": True, "instance": "s-space"}
         rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=half)

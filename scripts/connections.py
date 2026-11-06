@@ -175,9 +175,8 @@ def cmd_move(args) -> int:
             print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
         elif out["reason"] != "successor_exists":
             server = out.get("server") or "<server>"
-            print(f"next: get a new relay token for this agent in its {server} settings (Get token, not Add "
-                  f"agent), then run python3 scripts/connections.py add - --yes --expected-server {server} "
-                  "(paste the token on stdin)")
+            print(f"next: sign this agent in to {server} from the Sutando desktop app while the local agent "
+                  "API runs; the app hands this install the agent's relay token (docs/connections.md)")
         return 1
     rooms = out.get("rooms") or []
     failed = [r for r in rooms if r.get("error")]

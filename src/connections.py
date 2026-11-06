@@ -163,7 +163,7 @@ class PrimaryProtected(ConnectionsError):
 
 
 class Refusal(ConnectionsError):
-    """Refused by the row's or the code's state, nothing written: `CODE` is the error code every
+    """Refused by the row's or the token's state, nothing written: `CODE` is the error code every
     surface returns as is (HTTP 409 `{"error": CODE}`, runtime-api CONFLICT, CLI exit 1)."""
 
     CODE = "refused"
@@ -323,14 +323,14 @@ class LegacyPrimaryRunning(Refusal):
 
 
 class LegacyPrimaryInUse(Refusal):
-    """A fresh code for the legacy row's server is not adopted underneath its running primary bridge."""
+    """A fresh relay token for the legacy row's server is not adopted underneath its running primary bridge."""
 
     CODE = "legacy_primary_in_use"
 
     def __init__(self, pid: int):
         super().__init__(
             f"{self.CODE}: the legacy unsuffixed bridge (pid {pid}) is running as the primary; make another "
-            "connection primary first (promote), then paste the code again; nothing changed")
+            "connection primary first (promote), then paste the token again; nothing changed")
         self.pid = pid
 
 
@@ -341,15 +341,15 @@ class VaultUnreadable(Refusal):
 
 
 class TokenRestoreFailed(Refusal):
-    """A write after the vault took the new code failed, and so did putting the previous secret back:
-    read back, the vault holds the NEW code while the row is unchanged."""
+    """A write after the vault took the new token failed, and so did putting the previous secret back:
+    read back, the vault holds the NEW token while the row is unchanged."""
 
     CODE = "token_restore_failed"
 
 
 class TokenStateUnknown(Refusal):
     """An update failed after the vault write began and reading the key back could not establish
-    whether it holds the previous secret or the new code; the bridge is not relaunched on a guess."""
+    whether it holds the previous secret or the new token; the bridge is not relaunched on a guess."""
 
     CODE = "token_state_unknown"
 
@@ -366,7 +366,7 @@ class TokenSourceShadowed(Refusal):
 
 
 class TokenMismatch(Refusal):
-    """The new code is not this row's: `update_token` refuses it, naming the code in CODE."""
+    """The new token is not this row's: `update_token` refuses it, naming the reason in CODE."""
 
     CODE = "token_mismatch"
 
@@ -375,7 +375,7 @@ class TokenMismatch(Refusal):
 
 
 class TokenServerMismatch(TokenMismatch):
-    """The previewed server is not the row's; a code for another server is a new connection."""
+    """The previewed server is not the row's; a token for another server is a new connection."""
 
     CODE = "token_server_mismatch"
 
@@ -388,7 +388,7 @@ class TokenAgentMismatch(TokenMismatch):
 
 class TokenUnverified(TokenMismatch):
     """The row names an agent but the preview could not confirm one (gateway unreachable, an error,
-    or a listing not naming exactly one agent): the code is not shown to be this connection's."""
+    or a listing not naming exactly one agent): the token is not shown to be this connection's."""
 
     CODE = "token_unverified"
 
@@ -408,7 +408,7 @@ class WorkerOwnerMismatch(Refusal):
 
 
 class WorkerIdentityShared(Refusal):
-    """The code is for an agent another row already runs as: a worker's identity is its own."""
+    """The token is for an agent another row already runs as: a worker's identity is its own."""
 
     CODE = "worker_identity_shared"
 
@@ -1257,8 +1257,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     primary yet (the first row ever saved); later rows never are. The secret goes to the vault
     under the row's token_ref before the row exists; a vault key no row owns is never overwritten.
 
-    A verified code for the legacy row's server that is not the secret that row runs on re-adopts
-    the server (`_readopts_legacy`): getting it rotated the environment's credential, so the code
+    A verified token for the legacy row's server that is not the secret that row runs on re-adopts
+    the server (`_readopts_legacy`): getting it rotated the environment's credential, so the token
     becomes a new named, app-managed row and the legacy row is retired the way `promote` leaves a
     legacy bridge a named row covers. Its row is dropped, its bridge stopped, the record marked
     `legacy_parked` and REMOTE_TASK_TOKEN remembered as removed, so no launcher starts it on the
@@ -1302,7 +1302,7 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
             if existing is not None and not worker and _readopts_legacy(existing, seen, token, vault, environ):
                 mine, theirs = existing.get("agent_mxid"), seen.get("agent_mxid")
                 if mine and theirs != mine:
-                    raise TokenAgentMismatch("", f"the code is for agent {theirs}, not {mine}")
+                    raise TokenAgentMismatch("", f"the token is for agent {theirs}, not {mine}")
                 pid = bridge_pid("", workspace)
                 if pid and (existing["primary"] or not any(r["primary"] for r in rows)):
                     raise LegacyPrimaryInUse(pid)
@@ -1367,8 +1367,8 @@ def _check_worker_identity(rows: list, seen: Mapping[str, object], worker: str) 
 
 def _readopts_legacy(row: Mapping[str, object], seen: Mapping[str, object], token: str, vault,
                      environ: Optional[Mapping[str, str]]) -> bool:
-    """Whether a code matched to `row` re-adopts its server: the row is the legacy one, the preview
-    is verified, and the code is not the secret the row's vault key or environment holds."""
+    """Whether a token matched to `row` re-adopts its server: the row is the legacy one, the preview
+    is verified, and the token is not the secret the row's vault key or environment holds."""
     if row["instance"] or not seen.get("verified"):
         return False
     environ = os.environ if environ is None else environ
@@ -3150,7 +3150,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                  vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
                  resolver=None, getaddrinfo=None) -> dict:
     """Replace the secret under `instance`'s token_ref with a new relay token for the same connection
-    (the homeserver's Get new token or Revoke, an agent moved away and back), then relaunch the
+    (rotated or revoked on the homeserver, an agent moved away and back), then relaunch the
     bridge the way `reconnect` does. The row keeps its instance, primary flag and added_at;
     `gateway_url` and the identity fields follow the preview (a row without an agent identity
     learns one, see `_rekey`) and `disabled` is cleared.
@@ -3158,7 +3158,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     Refused with nothing touched, in this order: the legacy unsuffixed row (`LegacyRowUnmanaged`:
     its token is the environment's); a row whose token_ref is set in `environ`
     (`TokenSourceShadowed`: the bridge reads that variable before the vault, so the new secret
-    would never be used); a code the gateway rejected (`TokenRejected`); a code whose preview is
+    would never be used); a token the gateway rejected (`TokenRejected`); a token whose preview is
     not this connection's, or whose verified server is already another row's
     (`TokenServerMismatch`); a row naming an agent whose preview did not confirm that same agent:
     unconfirmed (`TokenUnverified`) or another agent (`TokenAgentMismatch`); a bridge that will
@@ -3167,9 +3167,9 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     transaction, right before the stop and the vault write, so a concurrent update or a remove and
     re-add is never undone by a stale snapshot. Once the vault write has begun, a failure is
     reconciled under that same hold of the record lock by reading the key back (`_reconcile_vault`): the previous
-    secret is put back only while the key holds exactly the new code, all inside the vault's own writer
+    secret is put back only while the key holds exactly the new token, all inside the vault's own writer
     transaction (`_vault_writer`), so no other vault writer lands between the compare and the restore; read back as the previous secret, the stopped bridge is relaunched on it and the
-    error says whether that worked; read back as the new code, `TokenRestoreFailed`; anything else,
+    error says whether that worked; read back as the new token, `TokenRestoreFailed`; anything else,
     or a read that fails, `TokenStateUnknown`. Neither of those relaunches.
     Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
     is that record (and the row's state), not an exception."""
@@ -3221,22 +3221,22 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
             if found == "new":
                 raise TokenRestoreFailed(
                     f"{TokenRestoreFailed.CODE}: the update of {instance} failed after the vault write began "
-                    f"({cause}) and restoring the previous secret failed ({restore}); read back, {ref} holds the NEW code "
+                    f"({cause}) and restoring the previous secret failed ({restore}); read back, {ref} holds the NEW token "
                     "while the row is unchanged" + ("; the bridge was left stopped" if stopped else "")) from None
             if found != "previous":
                 raise TokenStateUnknown(
                     f"{TokenStateUnknown.CODE}: the update of {instance} failed after the vault write began ({cause}) "
                     f"and reading {ref} back {found}, so it is not known which secret it holds; the row is unchanged "
-                    "and the bridge was not relaunched; run update-token again with the code you want") from None
+                    "and the bridge was not relaunched; run update-token again with the token you want") from None
         if isinstance(e, BridgeStillRunning):
-            raise _with_note(e, f"the bridge was not confirmed stopped and may still be running on the old code; {ref} was not changed") from None
+            raise _with_note(e, f"the bridge was not confirmed stopped and may still be running on the old token; {ref} was not changed") from None
         if not stopped:
             raise e
         try:
             relaunched = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                                 vault=vault, spawn=spawn, python=python, fetch=fetch,
                                 getaddrinfo=getaddrinfo)
-            note = f"the bridge was relaunched on the unchanged code (pid {relaunched['pid']})"
+            note = f"the bridge was relaunched on the unchanged token (pid {relaunched['pid']})"
         except Exception as again:  # noqa: BLE001 - reported in the error below
             note = f"the bridge stays stopped: relaunching it failed ({type(again).__name__})"
         if isinstance(e, ConnectionsError):
@@ -3259,7 +3259,7 @@ def _digest(value: Optional[str]) -> Optional[str]:
 
 def _reconcile_vault(vault, ref: str, previous: Optional[str], new: str) -> "tuple[str, str]":
     """After a failed write under `ref`, a compare-and-swap on the stored value: the previous secret
-    goes back only while a read shows exactly the new code this update wrote. ('previous', ...) once a
+    goes back only while a read shows exactly the new token this update wrote. ('previous', ...) once a
     read shows the previous secret, ('new', ...) when the restore failed, else why it could not tell
     (a read that failed, or another writer's value, which is left as it is); the second item names the
     restore's own error. Values are compared by digest and never logged."""
@@ -3301,13 +3301,13 @@ def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str
     (same connection, same agent, unique server) and against the record schema; a refusal here
     precedes every external effect."""
     if _same_connection([row], seen, row.get("worker")) is None:
-        raise TokenServerMismatch(instance, f"the code is for server {seen['server']!r}, not {row['server']!r}")
+        raise TokenServerMismatch(instance, f"the token is for server {seen['server']!r}, not {row['server']!r}")
     mine, theirs = row.get("agent_mxid"), seen.get("agent_mxid")
     if mine and not theirs:
-        raise TokenUnverified(instance, f"the gateway did not confirm agent {mine} for this code"
+        raise TokenUnverified(instance, f"the gateway did not confirm agent {mine} for this token"
                               + (f" ({seen['error']})" if seen.get("error") else ""))
     if mine and theirs != mine:
-        raise TokenAgentMismatch(instance, f"the code is for agent {theirs}, not {mine}")
+        raise TokenAgentMismatch(instance, f"the token is for agent {theirs}, not {mine}")
     candidate = dict(row)
     candidate["gateway_url"] = str(seen["gateway_url"])
     _rekey(candidate, seen)
@@ -3315,7 +3315,7 @@ def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str
     taken = [r["instance"] for r in rec["rows"] if r is not row and r["server"] == candidate["server"]
              and r.get("worker") == row.get("worker")]
     if taken:
-        raise TokenServerMismatch(instance, f"the code's server {candidate['server']!r} is connection {taken[0]!r}")
+        raise TokenServerMismatch(instance, f"the token's server {candidate['server']!r} is connection {taken[0]!r}")
     trial = [candidate if r is row else r for r in rec["rows"]]
     _validate({"schema_version": SCHEMA_VERSION, "connections": trial, REMOVED_KEY: rec[REMOVED_KEY]})
     return candidate
@@ -3445,7 +3445,7 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
 def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: str,
                            env_file: Path, dry_run: bool = False, space_of=None) -> str:
     """Re-point the descriptor at `path` from `legacy` to its successor: mint and MCP URLs from the
-    successor's DotSpace, `relay` the code's gateway, `agent_id` the moved agent, `env_file` a 0600
+    successor's DotSpace, `relay` the gateway in `code` (the relay token), `agent_id` the moved agent, `env_file` a 0600
     file holding `code` under the descriptor's `env_key` (`bearer_digest` kept, the secret being the
     same); the old descriptor is kept beside it as `.bak-<legacy slug>`. Returns absent, unreadable,
     unchanged, no_successor_endpoints, would_repoint, repointed or write_failed."""
@@ -3543,7 +3543,7 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
                    added_by: str = "owner", dry_run: bool = False, channels_home: Optional[Path] = None,
                    mcp_config: Optional[Path] = None, room_bindings=None) -> dict:
     """Move a connection to its server's successor with the agent's existing secret (a registry
-    copied byte-for-byte keeps it valid until either side re-codes the agent).
+    copied byte-for-byte keeps it valid until either side issues the agent a new relay token).
 
     The successor token (`successor_code`) must preview verified for the old row's agent localpart on
     the successor server; then the row is added (`skip_backlog`), promoted, the MCP descriptor
@@ -3553,8 +3553,7 @@ def try_reuse_move(instance: Optional[str] = None, *, repo: Optional[Path] = Non
     refused. `resolver` (as `preview_connection`'s) also maps servers; None reads the registry offline.
     Returns {ok, instance, agent_mxid, mcp, rooms, dry_run}, or {ok: False, reason, detail} with a
     MOVE_REASONS reason (nothing written) or a Refusal code (`added` says whether the row exists),
-    and `server`, where a new relay token for this agent comes from (its settings there, Get token,
-    never Add agent, which creates another agent)."""
+    and `server`, the successor to sign this agent in to from the Sutando desktop app."""
     environ = os.environ if environ is None else environ
     probe = dict(fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, resolver=resolver)
     ds = _dotspace()
