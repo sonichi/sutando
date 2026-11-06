@@ -75,6 +75,16 @@ touch "$WS/tasks/$TASK.txt"
 OUT="$(run_hook)"
 case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "a wake turn rewritten after the marker blocks (the marker covers one turn)" ;; *) bad "a wake turn rewritten after the marker blocks" "got: ${OUT:0:160}" ;; esac
 
+# A real worker sentinel holds the task through the same predicate; an unreadable store holds too.
+rm -f "$WS/state/task-delegations/$TASK.json"
+mkdir -p "$WS/deliveries/w1" && : > "$WS/deliveries/w1/$TASK.accepted"
+OUT="$(run_hook)"
+[ "$OUT" = "{}" ] && ok "a worker sentinel holds the task (holder's injected lookup)" || bad "a worker sentinel holds the task" "got: ${OUT:0:160}"
+rm -rf "$WS/deliveries" && printf 'not a dir' > "$WS/deliveries"
+OUT="$(run_hook)"
+[ "$OUT" = "{}" ] && ok "an unreadable worker store reads as held (undecidable, not absent)" || bad "an unreadable worker store reads as held" "got: ${OUT:0:160}"
+rm -f "$WS/deliveries" && mkdir -p "$WS/deliveries"
+
 # Stub repo: the hook plus a config stub, so python or the marker script can be absent.
 STUB="$TMPWS/stub-repo"
 mkdir -p "$STUB/src" "$STUB/scripts"
@@ -97,6 +107,29 @@ fi
 stub_config "$PYBIN"
 OUT="$(printf '' | bash "$STUB/src/check-pending-tasks.sh" 2>/dev/null)"
 case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*"$TASK.txt"*) ok "no task_delegation.py: a marked task still blocks (fails closed)" ;; *) bad "no task_delegation.py: a marked task still blocks" "got: ${OUT:0:160}" ;; esac
+
+# The hook's only hold check is `task_delegation.py holder`: its rc decides, with this argv.
+cat > "$STUB/src/task_delegation.py" <<'PY'
+import os, sys
+open(os.environ["STUB_ARGV"], "w").write("\n".join(sys.argv[1:]))
+sys.exit(int(os.environ["STUB_RC"]))
+PY
+for rc in 0 1 2 3; do
+  OUT="$(printf '' | STUB_RC=$rc STUB_ARGV="$TMPWS/argv" bash "$STUB/src/check-pending-tasks.sh" 2>/dev/null)"
+  case "$rc:$OUT" in
+    0:"{}"|3:"{}") ok "holder rc $rc: the task is held" ;;
+    1:*"$TASK.txt"*|2:*"$TASK.txt"*) ok "holder rc $rc: the task blocks" ;;
+    *) bad "holder rc $rc decides the hold" "got: ${OUT:0:160}" ;;
+  esac
+done
+WANT="$(printf 'holder\n%s\n--task-file\n%s\n--deliveries\n%s\n--workspace\n%s' "$TASK" "$WS/tasks/$TASK.txt" "$WS/deliveries" "$WS")"
+[ "$(cat "$TMPWS/argv")" = "$WANT" ] && ok "the hook asks holder with the task file, deliveries root and workspace" \
+  || bad "the hook's holder argv" "got: $(tr '\n' ' ' < "$TMPWS/argv")"
+if grep -Eq 'worker-holds|task_delegation\.py" check' "$HOOK"; then
+  bad "no second hold predicate in the hook" "worker-holds or 'check' still called"
+else
+  ok "no second hold predicate in the hook"
+fi
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"

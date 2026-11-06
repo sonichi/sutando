@@ -51,7 +51,8 @@ choose a more expensive model.
   When the subagent will answer a queued task, first run
   `python3 src/task_delegation.py mark <task-file> --ttl <seconds>` so neither the Stop hook nor
   `scripts/unanswered-tasks.py` reports that task until the TTL expires (default 1800 s, max 4 h);
-  past it, or once the task file is rewritten for a new turn, the task blocks again.
+  past it, or once the task file is rewritten for a new turn, the task blocks again. Publishing the
+  task's result through `src/result_publish.py` clears the marker.
 - **Codex core** — Codex's built-in multi-agent tools: `spawn_agent`, then `wait_agent` with a short
   timeout at the checkpoint, and `close_agent` when done. They come from the `multi_agent` feature;
   `codex features list` shows whether it is enabled on a host. This was observed on one host, so a

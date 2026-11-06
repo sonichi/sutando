@@ -11,17 +11,21 @@ the turn it was written for: a task file rewritten after it (a wake turn) reads 
     python3 src/task_delegation.py mark <task-file-or-id> [--ttl SECONDS] [--workspace DIR]
     python3 src/task_delegation.py check <task-file-or-id> [--task-file PATH] [--workspace DIR]
     python3 src/task_delegation.py clear <task-file-or-id> [--workspace DIR]
+    python3 src/task_delegation.py holder <task-file-or-id> [--task-file PATH] [--deliveries DIR] [--workspace DIR]
 
 Writer contract (this module is the only writer): one JSON file per task under
 <workspace>/state/task-delegations/, written atomically (temp file + os.replace), TTL
 bounded to [1, MAX_TTL_S]. `mark` exits 0 on a durable write and 1 when it could not
 write (the task then keeps blocking, which is the safe side). `check` exits 0 only for a
 live marker; absent, unreadable, malformed, expired, future-dated, or older than the task
-file (or no task file) is 1. Usage error: 2.
+file (or no task file) is 1. Usage error: 2. `holder` prints the holder and exits 0, exits 1
+when none holds it, and 3 when the worker store cannot be read (held: undecidable, not absent).
 
 `holder()` is the one "is this task held" predicate for every reader of tasks/ (the Stop
-hook through `check`, scripts/unanswered-tasks.py, the orphan classifier): a worker named by
-the caller's injected lookup, else BACKGROUND_HOLDER for a live marker, else None.
+hook through the `holder` command, scripts/unanswered-tasks.py, the orphan classifier): a worker
+named by the caller's injected lookup, else BACKGROUND_HOLDER for a live marker, else None.
+The `holder` command injects the router sentinel lookup only when given `--deliveries`.
+A published result clears its task's marker (src/result_publish.py).
 
 This is distinct from a worker-pool delivery sentinel (src/delivery/task_dispatch.py):
 that hands a task to another runtime instance with no expiry, and notifiers route on it.
@@ -48,6 +52,7 @@ _FUTURE_SLACK_S = 5.0
 _MAX_MARKER_BYTES = 4096
 SUBDIR = Path("state") / "task-delegations"
 BACKGROUND_HOLDER = "background-agent"
+WORKER_HOLDER = "worker"
 
 
 def _finite(v) -> bool:
@@ -141,6 +146,15 @@ def clear(workspace, task_id: str) -> bool:
         return False
 
 
+def _sentinel_lookup(deliveries):
+    """The CLI's injected worker lookup: a router sentinel under `deliveries` (task_dispatch's contract)."""
+    try:
+        from delivery.task_dispatch import worker_holds
+    except ImportError:  # a bundle without the dispatcher has no router, so no worker holds
+        return None
+    return lambda _ws, task_id: WORKER_HOLDER if worker_holds(deliveries, f"{task_id}.txt") else None
+
+
 def _prune_expired(d: Path, now: float) -> None:
     # Keeps the store bounded: markers expired a day ago carry no signal; pruning is best effort.
     for p in d.glob("*.json"):
@@ -154,11 +168,13 @@ def _prune_expired(d: Path, now: float) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("mark", "check", "clear"):
+    for name in ("mark", "check", "clear", "holder"):
         p = sub.add_parser(name)
         p.add_argument("task", help="task file path or task id")
         p.add_argument("--workspace", help="workspace root (default: resolved workspace)")
-        if name == "check":
+        if name == "holder":
+            p.add_argument("--deliveries", help="router sentinel root to consult first (default: none)")
+        if name in ("check", "holder"):
             p.add_argument("--task-file", help="the task file the marker must postdate "
                                                "(default: <workspace>/tasks/<id>.txt)")
         if name == "mark":
@@ -177,6 +193,17 @@ def main(argv=None) -> int:
     try:
         if a.cmd == "check":
             return 0 if is_delegated(ws, tid, task_file=a.task_file) else 1
+        if a.cmd == "holder":
+            lookup = _sentinel_lookup(a.deliveries) if a.deliveries else None
+            try:
+                held = holder(ws, tid, task_file=a.task_file, worker_holder=lookup)
+            except OSError as e:
+                print(f"task_delegation: holder undecidable ({e}); treat the task as held", file=sys.stderr)
+                return 3
+            if held is None:
+                return 1
+            print(held)
+            return 0
         if a.cmd == "clear":
             clear(ws, tid)
             return 0

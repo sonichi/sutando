@@ -184,6 +184,52 @@ class PublisherFailurePaths(unittest.TestCase):
                     self.assertEqual(mod.main(["result_publish.py", "--help"]), 2)
 
 
+class PublishClearsDelegation(unittest.TestCase):
+    """A published live result ends its task's background hand-off (src/task_delegation.py)."""
+
+    def setUp(self):
+        import task_delegation
+        self.td = task_delegation
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self._tmp.name)
+        self.tid = "task-chat-1792841385408"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_publishing_the_result_clears_its_marker_only(self):
+        mine, other = self.td.mark(self.ws, self.tid, 60), self.td.mark(self.ws, "task-other-1", 60)
+        result_publish.publish_text(self.ws / "results" / f"{self.tid}.txt", "done")
+        self.assertFalse(mine.exists())
+        self.assertTrue(other.exists())
+
+    def test_a_staged_publish_clears_it_too(self):
+        marker = self.td.mark(self.ws, self.tid, 60)
+        target = self.ws / "results" / f"{self.tid}.txt"
+        result_publish.publish_staged(result_publish.stage_text(target, "done"), target)
+        self.assertFalse(marker.exists())
+
+    def test_a_file_outside_live_results_clears_nothing(self):
+        marker = self.td.mark(self.ws, self.tid, 60)
+        result_publish.publish_text(self.ws / "results" / "archive" / f"{self.tid}.txt", "done")
+        result_publish.publish_text(self.ws / "state" / f"{self.tid}.txt", "x")
+        self.assertTrue(marker.exists())
+
+    def test_a_failed_clear_still_publishes(self):
+        self.td.mark(self.ws, self.tid, 60)
+        target = self.ws / "results" / f"{self.tid}.txt"
+        with mock.patch.object(self.td, "clear", side_effect=OSError("busy")):
+            result_publish.publish_text(target, "done")
+        self.assertEqual(target.read_text(), "done")
+
+    def test_the_cli_clears_it(self):
+        marker = self.td.mark(self.ws, self.tid, 60)
+        subprocess.run([sys.executable, str(REPO / "src" / "result_publish.py"),
+                        str(self.ws / "results" / f"{self.tid}.txt")],
+                       input="[no-send] done", text=True, capture_output=True, check=True)
+        self.assertFalse(marker.exists())
+
+
 class ConcurrencyDrill(unittest.TestCase):
     """Forked writers through the production publisher; a polling reader sees whole bodies only."""
 
