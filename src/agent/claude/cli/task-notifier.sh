@@ -143,7 +143,7 @@ alert_composer_block() {
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
-    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume.\" with title \"Sutando\"" &
+    bash "$REPO/src/macos-notify.sh" "Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume." &
     op=$!
     (
       trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
@@ -385,13 +385,89 @@ composer_resume_offset() {
   return 1
 }
 
+# True only when $1 is an exact prefix of $2 through a verified chunk boundary,
+# plus a trailing SUFFIX of the next chunk -- never a match anywhere inside it.
+leftover_is_dropped_bytes() {
+  "$NOTIFIER_PY" -c '
+import sys
+leftover_raw, prompt_raw, cap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+MIN_TAIL = 8  # a fuzzy tail shorter than this matches almost any chunk by luck (measured: 1-3 chars do)
+
+def squeeze(s):
+    return "".join(c for c in s if not c.isspace())
+
+bounds = [0]
+cur = 0
+for ch in prompt_raw:
+    n = len(ch.encode("utf-8", "surrogateescape"))
+    if cur and cur + n > cap:
+        bounds.append(bounds[-1] + cur)
+        cur = 0
+    cur += n
+bounds.append(bounds[-1] + cur)
+
+leftover = squeeze(leftover_raw)
+ok = False
+for k in range(len(bounds) - 1):
+    a, b = bounds[k], bounds[k + 1]
+    exact_prefix = squeeze(prompt_raw[:a])
+    if not leftover.startswith(exact_prefix):
+        continue
+    rest = leftover[len(exact_prefix):]
+    if rest == "" or (len(rest) >= MIN_TAIL and squeeze(prompt_raw[a:b]).endswith(rest)):
+        ok = True
+        break
+sys.exit(0 if ok else 1)
+' "$1" "$2" "$3"
+}
+
+# $3 = composer text the caller already proved is ours (leftover_is_dropped_bytes);
+# never pass through unchecked composer text.
 note_partial_paste() {
-  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$PARTIAL_DIR" "$1" "$2" \
+  printf '%s' "${3-}" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-mark "$PARTIAL_DIR" "$1" "$2" \
     || log_notifier "could not record the cut-short paste of $1; the next attempt will not resume it"
 }
 
 clear_partial_paste() {
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$PARTIAL_DIR" "$1" || true
+}
+
+# True only when the composer's CURRENT content is, whitespace aside, exactly the text
+# note_partial_paste recorded for this filename and incarnation -- i.e. this garbled,
+# non-boundary leftover is provably this notifier's own failed chunk, not a human draft,
+# because nothing else is ever written under this key. A cut box never qualifies: a
+# capture that cannot show the whole composer cannot prove what the whole thing is.
+composer_matches_own_leftover() {
+  local filename="$1" incarnation="$2" raw="$3" c recorded
+  pane_frame_is_cut "$raw" && return 1
+  c="$(composer_text "$raw")"
+  [ -n "$c" ] || return 1
+  [ -n "$incarnation" ] || return 1
+  recorded="$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$PARTIAL_DIR" "$filename" "$incarnation")" || return 1
+  [ -n "$recorded" ] || return 1
+  [ "$(printf '%s' "$c" | squeeze)" = "$(printf '%s' "$recorded" | squeeze)" ]
+}
+
+# Delete exactly the composer's own current content, one character at a time (never a
+# line-kill or select-all: those are terminal-dependent and some would reach past the
+# composer). Verifies empty afterward; a caller that got here already proved via
+# composer_matches_own_leftover that every one of these characters is this notifier's.
+clear_own_leftover() {
+  local filename="$1" raw="$2" n text waited=0
+  text="$(composer_text "$raw")"
+  n="$(printf '%s' "$text" | "$NOTIFIER_PY" -c \
+    'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read().decode("utf-8", "surrogateescape"))))')"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  log_notifier "erasing $n char(s) recorded as $filename's own leftover, about to clear: $text"
+  bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$TARGET" -- -N "$n" BSpace 2>/dev/null || { log_notifier "clearing $filename failed (rc $?)"; return 1; }
+  # A real CLI renders N backspaces over several redraws, not instantly (measured
+  # live) -- polls instead of reading once; still fails closed past the budget.
+  while [ -n "$(composer_text "$(capture_raw)")" ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] || return 1
+    sleep "$POLL_INTERVAL"
+  done
 }
 
 # Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
@@ -405,7 +481,7 @@ type_prompt() {
     chunk="${prompt:$i:$n}"; i=$((i + n)); typed="$typed$chunk"
     # tmux reads a trailing ';' as its command separator; '\;' is how one sends it.
     arg="$chunk"; case "$arg" in *';') arg="${arg%;}\;" ;; esac
-    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$arg"
+    bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$TARGET" -- -l -- "$arg" || log_notifier "typing $filename failed (rc $?)"
     sleep "$POLL_INTERVAL"
     cap="$(capture_raw)" || cap=""
     if pane_frame_is_cut "$cap"; then
@@ -456,7 +532,7 @@ deliver_prompt() {
 
 deliver_prompt_grown() {
   local filename="$1" prompt="$2" type_tries=0 staged=0 resume=0
-  local baseline_esc baseline_raw staged_raw="" incarnation=""
+  local baseline_esc baseline_raw staged_raw="" incarnation="" leftover_now
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
     return 1
@@ -487,6 +563,9 @@ deliver_prompt_grown() {
     if ! pane_text_composer_is_empty "$baseline_esc"; then
       if resume="$(composer_resume_offset "$filename" "$prompt" "$incarnation" "$baseline_raw")"; then
         log_notifier "composer holds the first $resume bytes of $filename's prompt, a paste this notifier cut short; resuming it there"
+      elif composer_matches_own_leftover "$filename" "$incarnation" "$baseline_raw" \
+           && clear_own_leftover "$filename" "$baseline_raw"; then
+        log_notifier "composer held $filename's own garbled, non-boundary leftover from a failed chunk; cleared it, retyping from the start"
       else
         warn_if_capture_truncated "$baseline_raw" "$filename"
         log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
@@ -503,7 +582,15 @@ deliver_prompt_grown() {
     else
       staged_raw="$(capture_raw)"
       log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
-      note_partial_paste "$filename" "$incarnation"
+      # Record the leftover only when it's unreadable-whole (nothing to check) or every
+      # character in it is provably ours; otherwise record nothing (fails closed as before).
+      leftover_now="$(composer_text "$staged_raw")"
+      if pane_frame_is_cut "$staged_raw" || [ -z "$leftover_now" ] \
+         || ! leftover_is_dropped_bytes "$leftover_now" "$prompt" "$PASTE_CHUNK"; then
+        note_partial_paste "$filename" "$incarnation"
+      else
+        note_partial_paste "$filename" "$incarnation" "$leftover_now"
+      fi
     fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
@@ -545,7 +632,7 @@ press_enter_and_confirm() {
     log_notifier "could not record the in-flight marker for $filename; not pressing Enter (failing closed)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+  bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$TARGET" -- C-m || log_notifier "C-m failed (rc $?)"
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
@@ -575,7 +662,7 @@ press_enter_and_confirm() {
       return 1
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+    bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$TARGET" -- C-m || log_notifier "C-m failed (rc $?)"
   done
 }
 
@@ -654,7 +741,7 @@ nudge_deliver_grown() {
     log_notifier "nudge: composer changed since staged; not pressing Enter (failing closed)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+  bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$TARGET" -- C-m || log_notifier "C-m failed (rc $?)"
   while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
     if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
       log_notifier "nudge submitted for $TASKS_DIR"
@@ -738,6 +825,11 @@ submit_task_grown() {
   started="$(date +%s)"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
+    # A payload removed with no findable result can never be answered; the queue head drop releases it.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      SUBMIT_ABANDONED=1
+      return 0
+    fi
     if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
       log_notifier "timed out waiting for result: $filename"
       return 0
@@ -872,11 +964,20 @@ process_announced_queue() {
       tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || exit 1
       return 0
     fi
+    # Checked after the healthy wait so a file archived during that wait is never typed.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    SUBMIT_ABANDONED=0
     submit_task "$filename"
     if has_result "$filename"; then
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
+    [ "$SUBMIT_ABANDONED" = 1 ] && continue
     return 0
   done
 }

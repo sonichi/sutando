@@ -159,6 +159,53 @@ class Suspended(Base):
 
 
 class Resume(Base):
+    def test_renewed_suspension_preserves_only_the_skipped_workers_evidence(self):
+        self.roster(DEAD, ALIVE)
+        evidence = ps.WorkerEvidence(watcher_consecutive=3, wedge_consecutive=2,
+                                     wedge_first_detected_at=1.0, last_pane_id="old-pane")
+        rem.sup.save_state(self.ws, ps.SupervisionState(
+            last_sample_at=2.0, workers={DEAD: evidence, ALIVE: evidence}))
+        rem.suspend(self.ws, "initial-stop")
+        real_recover = rem.recover
+        renewed = []
+
+        def recover(ws, repo, wid, **kw):
+            if wid == DEAD:
+                rem.suspend(ws, "renewed-stop")
+                renewed.append(rem.suspended_path(ws).read_bytes())
+                return {"worker_id": wid, "outcome": rem.RECOVERED}
+            return real_recover(ws, repo, wid, **kw)
+
+        with mock.patch.object(rem.sup, "observe", return_value={DEAD: obs(False), ALIVE: obs(False)}), \
+                mock.patch.object(rem, "recover", side_effect=recover), \
+                mock.patch.object(rem.sup, "tick", return_value=tick_result()) as tick, \
+                mock.patch.object(rem, "ensure_supervisors") as supervisors, \
+                mock.patch.object(rem, "ensure_input_watches") as watches, \
+                mock.patch.object(rem.sw, "spawn", side_effect=AssertionError("launched skipped worker")):
+            rc, out = self.run_main("--resume")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["resume"]["restarted"], {
+            DEAD: {"worker_id": DEAD, "outcome": rem.RECOVERED},
+            ALIVE: {"worker_id": ALIVE, "outcome": rem.SUSPENDED}})
+        self.assertEqual(rem.suspended_path(self.ws).read_bytes(), renewed[0])
+        self.assertEqual(rem.sup.load_state(self.ws).workers, {ALIVE: evidence})
+        self.assertFalse(tick.call_args.kwargs["persist"])
+        supervisors.assert_not_called()
+        watches.assert_not_called()
+
+    def test_non_suspended_outcomes_keep_the_existing_evidence_reset(self):
+        for outcome in (rem.RECOVERED, rem.ALREADY_RUNNING, rem.PAUSED,
+                        rem.NO_SESSION, rem.INDETERMINATE, rem.FAILED):
+            with self.subTest(outcome=outcome):
+                self.roster(DEAD)
+                rem.sup.save_state(self.ws, ps.SupervisionState(workers={
+                    DEAD: ps.WorkerEvidence(wedge_consecutive=2)}))
+                rem.suspend(self.ws, "initial-stop")
+                with mock.patch.object(rem.sup, "observe", return_value={DEAD: obs(False)}), \
+                        mock.patch.object(rem, "recover", return_value={"outcome": outcome}):
+                    rem.resume(self.ws, REPO)
+                self.assertNotIn(DEAD, rem.sup.load_state(self.ws).workers)
+
     def test_resume_without_a_marker_is_just_a_sweep(self):
         with mock.patch.object(rem.sup, "observe") as observe, mock.patch.object(rem, "recover") as rec:
             self.assertEqual(rem.resume(self.ws, REPO), {"was_suspended": None, "restarted": {}})

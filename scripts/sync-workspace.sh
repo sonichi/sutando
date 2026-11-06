@@ -327,9 +327,11 @@ _host() {
     # Capture scutil ONCE and guard exit-0-but-empty output (parity with the
     # py side's non-empty `.strip()` check) — an empty LocalHostName must not
     # win over the hostname fallback.
-    local lhn=""
-    if command -v scutil >/dev/null 2>&1; then
-        lhn="$(scutil --get LocalHostName 2>/dev/null)"
+    local lhn="" _scutil="${SCUTIL_BIN:-/usr/sbin/scutil}"
+    # Absolute by default: a restrictive PATH can omit /usr/sbin. Overridable
+    # (SCUTIL_BIN) so a test can point this at a stub instead of a real binary.
+    if [ -x "$_scutil" ]; then
+        lhn="$("$_scutil" --get LocalHostName 2>/dev/null)"
     fi
     if [ -n "$lhn" ]; then
         printf '%s\n' "$lhn"
@@ -1632,11 +1634,13 @@ _report_unmerged_conflicts() {
     [ -f "$script" ] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     local out
-    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    # --daily: a full scan can outlast the 30-minute fire, so report at most once a day.
+    out="$(python3 "$script" --daily "$WORKSPACE_DIR" 2>&1)" || true
     # Only speak up when there is something to merge back; the clean case is
     # silent so a 30-minute cron does not grow a nag nobody reads.
     case "$out" in
         *"no unmerged peer content"*) log "_report_unmerged_conflicts: clean" ;;
+        "sync-conflicts: skipped"*) log "_report_unmerged_conflicts: $out" ;;
         "") : ;;
         *) log "_report_unmerged_conflicts: $out"; printf '%s\n' "$out" ;;
     esac

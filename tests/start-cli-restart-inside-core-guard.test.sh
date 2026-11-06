@@ -31,6 +31,7 @@ EOF
 cat > "$BIN/pgrep" <<EOF
 #!/bin/bash
 case "\$*" in *core-input-watch*) exit 0 ;; esac
+case "\$*" in *core_heartbeat*) exit 0 ;; esac   # the writer: pretend running so none spawns
 case "\$*" in
   *claude*) if [ -f "\$CORE_MARK" ]; then echo "$FAKEPID claude --name sutando-core"; exit 0; else exit 1; fi ;;
 esac

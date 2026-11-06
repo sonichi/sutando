@@ -92,7 +92,8 @@ class TestHasSession(unittest.TestCase):
             seen["argv"], seen["timeout"] = argv, k.get("timeout")
             return _R(0)
         self.assertIs(self._with_run(fake, timeout=8, tmux="/x/tmux"), True)
-        self.assertEqual(seen["argv"], ["/x/tmux", "-S", "s.sock", "has-session", "-t", "=core"])
+        self.assertEqual(seen["argv"], ["/x/tmux", "-u", "-S", "s.sock", "has-session", "-t", "=core"],
+                         "-u: a client without a UTF-8 locale escapes a TAB in its output to _")
         self.assertEqual(seen["timeout"], 8)
 
     def test_an_already_exact_target_is_not_prefixed_twice(self):
@@ -132,6 +133,49 @@ class TestHasSession(unittest.TestCase):
 
     def test_real_binary_missing_is_unknown(self):
         self.assertIsNone(tmux_probe.has_session("s.sock", "core", tmux="/nonexistent-tmux-xyz"))
+
+
+class TestTmuxBinary(unittest.TestCase):
+    """A launchd/app PATH without Homebrew must still find tmux (false 'unknown' health)."""
+
+    def test_path_hit_wins(self):
+        with mock.patch.object(tmux_probe.shutil, "which", return_value="/x/bin/tmux"):
+            self.assertEqual(tmux_probe.tmux_binary(), "/x/bin/tmux")
+
+    def test_first_existing_candidate_when_not_on_path(self):
+        with mock.patch.object(tmux_probe.shutil, "which", return_value=None), \
+                mock.patch.object(tmux_probe.os.path, "exists",
+                                  side_effect=lambda p: p == "/usr/local/bin/tmux"):
+            self.assertEqual(tmux_probe.tmux_binary(), "/usr/local/bin/tmux")
+
+    def test_bare_name_when_nothing_found(self):
+        with mock.patch.object(tmux_probe.shutil, "which", return_value=None), \
+                mock.patch.object(tmux_probe.os.path, "exists", return_value=False):
+            self.assertEqual(tmux_probe.tmux_binary(), "tmux")
+
+    def test_has_session_defaults_to_resolved_binary(self):
+        seen = {}
+
+        def fake(argv, **k):
+            seen["argv0"] = argv[0]
+            return _R(0)
+        with mock.patch.object(tmux_probe, "tmux_binary", return_value="/resolved/tmux"), \
+                mock.patch.object(tmux_probe.subprocess, "run", side_effect=fake):
+            self.assertIs(tmux_probe.has_session("s.sock", "core"), True)
+        self.assertEqual(seen["argv0"], "/resolved/tmux")
+
+    def test_has_session_finds_tmux_off_path_via_candidate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            fake_tmux = os.path.join(d, "tmux")
+            with open(fake_tmux, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake_tmux, 0o755)
+            empty = os.path.join(d, "empty")
+            os.mkdir(empty)
+            with mock.patch.dict(os.environ, {"PATH": empty}), \
+                    mock.patch.object(tmux_probe, "TMUX_CANDIDATES", (fake_tmux,)):
+                self.assertIs(tmux_probe.has_session("s.sock", "core"), True)
 
 
 class TestTmuxProbeCliMain(unittest.TestCase):

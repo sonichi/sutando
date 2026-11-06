@@ -3,6 +3,11 @@
 trace, which --stall needs, so a consumer must extract instead of taking the stream."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import subprocess
 import tempfile
@@ -47,7 +52,7 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
             "exit 0\n")
         for f in ("gh", "codex"):
             (bin_dir / f).chmod(0o755)
-        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        env = {**isolated_child_env(), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
         r = subprocess.run(["bash", str(SCRIPT), "1"], capture_output=True, text=True,
                            timeout=180, env=env)
         return r

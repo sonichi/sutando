@@ -117,13 +117,13 @@ def _host(url):
 
 
 def same_site(url, relay_base):
-    """https on the relay's host or its site (the host minus its first label, when that
-    still has a dot): chat.ag2.space admits mcp.ag2.space, never another domain."""
+    """HTTPS on the relay host or its descendants, with ag2.space siblings allowed."""
     relay = _host(relay_base)
-    parent = relay.split(".", 1)[1] if relay.count(".") >= 2 else relay
+    parent = "ag2.space" if relay == "ag2.space" or relay.endswith(".ag2.space") else relay
     host = _host(url)
-    return urllib.parse.urlsplit(url).scheme == "https" and bool(host) and \
-        (host == relay or host == parent or host.endswith("." + parent))
+    return urllib.parse.urlsplit(url).scheme == "https" and bool(parent) and bool(host) and \
+        (host == parent or host.endswith("." + parent))
+
 
 
 class Door:
@@ -490,30 +490,34 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
         stale = _take_due(led, now, window)
         d = decide(m, led.data, now, owner_dm, window)
         if d.kind == "skip":
-            out = {"ok": True, "navigated": False, "skipped": d.why}
-            return _with_held(out, stale, workspace, owner_dm, door_factory)
-        _remember(led.data, m.event_id, now)
-        if d.kind == "hold":
-            pending = led.data.get("pending")
-            live = isinstance(pending, dict) and float(pending.get("flush_at") or 0) >= now
-            folded = int(pending.get("folded", 0)) + 1 if isinstance(pending, dict) else 0
-            led.data["pending"] = {**m.as_dict(), "folded": folded, "flush_at": d.flush_at}
+            if stale:
+                led.data["last_nav_at"] = now
+                led.save()
+        else:
+            _remember(led.data, m.event_id, now)
+            if d.kind == "hold":
+                pending = led.data.get("pending")
+                live = isinstance(pending, dict) and float(pending.get("flush_at") or 0) >= now
+                folded = int(pending.get("folded", 0)) + 1 if isinstance(pending, dict) else 0
+                led.data["pending"] = {**m.as_dict(), "folded": folded, "flush_at": d.flush_at}
+                led.save()
+                if not live:  # no trailing flush is waiting for this window
+                    (spawn_flush or _spawn_flush)(d.flush_at)
+                return {"ok": True, "navigated": False, "held": True, "flush_at": d.flush_at}
+            led.data["last_nav_at"] = now
+            led.data["pending"] = None
             led.save()
-            if not live:  # no trailing flush is waiting for this window
-                (spawn_flush or _spawn_flush)(d.flush_at)
-            return {"ok": True, "navigated": False, "held": True, "flush_at": d.flush_at}
-        led.data["last_nav_at"] = now
-        led.data["pending"] = None
-        led.save()
-    held = _deliver_held(stale, workspace, owner_dm, door_factory) if stale else None
-    res = navigate(owner_dm, _arguments(m), door_factory)
+    if d.kind == "skip":
+        out = {"ok": True, "navigated": False, "skipped": d.why}
+        return _with_held(out, stale, workspace, owner_dm, door_factory)
+    extra = int(stale.get("folded", 0)) + 1 if stale else 0
+    res = navigate(owner_dm, _arguments(m, extra), door_factory)
     if not res["ok"]:
         _log(workspace, f"navigate refused for {m.event_id}: {res['reason']}")
         if is_dm_refusal(res):
             forget_owner_dm(workspace, owner_dm)
         res["dm_line"] = _fallback_line(m, res["reason"])
-    out = {**res, "navigated": res["ok"]}
-    return {**out, "held_delivered": held} if held else out
+    return {**res, "navigated": res["ok"]}
 
 
 def _take_due(led, now, window):

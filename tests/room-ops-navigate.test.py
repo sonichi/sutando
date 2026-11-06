@@ -9,6 +9,7 @@ The Action is stubbed; nothing reaches a network.
 
 Run: python3 tests/room-ops-navigate.test.py
 """
+import fcntl
 import json
 import os
 import sys
@@ -233,11 +234,12 @@ class AppliesTheRule(unittest.TestCase):
     def test_a_dead_flush_does_not_strand_later_bursts(self):
         self.mention("$a", 1000.0)
         self.mention("$b", 1010.0)          # flush spawned for 1120, then never runs
-        self.mention("$c", 1500.0)          # navigates; the stale hold is dropped
+        self.mention("$c", 1500.0)          # folds the stale hold into this navigate
         self.mention("$d", 1510.0)
         self.assertEqual(self.spawned, [1120.0, 1620.0])
-        self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$b", "$c"],
-                         "the stranded hold is shown before the next mention's navigate")
+        self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$c"],
+                         "the stranded hold is folded into the latest navigate")
+        self.assertIn("+1 more mention", self.door.calls[-1][2]["reason"])
 
     def test_a_stranded_hold_is_shown_even_when_the_next_mention_is_skipped(self):
         self.mention("$a", 1000.0)
@@ -247,6 +249,34 @@ class AppliesTheRule(unittest.TestCase):
         self.assertTrue(out["held_delivered"]["navigated"])
         self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$b"])
         self.assertEqual(self.flush(1600.0)["skipped"], "nothing held", "delivered exactly once")
+
+    def test_multiple_stranded_mentions_fold_into_one_fresh_pointer(self):
+        self.mention("$a", 1000.0)
+        self.mention("$b", 1010.0)
+        self.mention("$c", 1020.0)
+        out = self.mention("$d", 1500.0, sender="Dana")
+        self.assertTrue(out["navigated"])
+        self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$d"])
+        self.assertEqual(self.door.calls[-1][2]["reason"],
+                         "Dana mentioned you in G (+2 more mentions just before)")
+        self.assertEqual(self.flush(1600.0)["skipped"], "nothing held")
+
+    def test_skipped_mention_delivers_stale_hold_without_locking_other_writers(self):
+        self.mention("$a", 1000.0)
+        self.mention("$b", 1010.0)
+        execute = self.door.execute
+
+        def check_unlocked(*args):
+            with open(nav.Ledger(self.ws)._lock_path, "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            return execute(*args)
+
+        with patch.object(self.door, "execute", side_effect=check_unlocked):
+            out = self.mention("$a", 1500.0)
+        self.assertTrue(out["held_delivered"]["navigated"])
+        self.assertTrue(self.mention("$c", 1510.0)["held"])
+        self.assertEqual(len(self.door.calls), 2)
 
 
 AGENT, OWNER, GW = "@me.agent:hs", "@owner:hs", "https://hs.example/relay"
@@ -429,6 +459,14 @@ class SiteChecks(unittest.TestCase):
             self.assertEqual(nav.same_site(url, relay), want, url)
         self.assertTrue(nav.same_site("https://mcp.hs.example/", "https://hs.example/relay"))
         self.assertFalse(nav.same_site("https://other.example/", "https://hs.example/relay"))
+
+    def test_public_suffix_and_hosted_tenants_do_not_share_a_trust_boundary(self):
+        for relay, other in (("x.co.uk", "evil.co.uk"),
+                             ("owner.github.io", "other.github.io"),
+                             ("chat.example.com", "mcp.example.com")):
+            self.assertFalse(nav.same_site(f"https://{other}/mcp", f"https://{relay}/relay"))
+            self.assertTrue(nav.same_site(f"https://{relay}/mcp", f"https://{relay}/relay"))
+            self.assertTrue(nav.same_site(f"https://mcp.{relay}/mcp", f"https://{relay}/relay"))
 
     def test_an_mcp_url_off_the_relay_site_gets_no_token(self):
         sent = []

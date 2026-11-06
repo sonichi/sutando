@@ -1,0 +1,189 @@
+{
+  "concluded_at": "2026-10-07T13:30:49.186185+00:00",
+  "closure_reason": "Rui requested conclusion after a full day of satisfactory use; not a claim that the observer minimum-eight rubric was independently satisfied.",
+  "evaluated_source_commit": "32aa78011113f8616cd82fc244576dc12e0492cf",
+  "owner_ratings": {
+    "accuracy": 9,
+    "reliability": 8,
+    "scale": 10,
+    "capability": null,
+    "basis": "Direct owner testimony supplied in this conversation on2026-10-07; used yesterday for a whole day."
+  },
+  "numeric_reporting": {
+    "correct": 283,
+    "assessed": 290,
+    "percent": 97.58620689655173,
+    "natural_reports": 28,
+    "incremental_evidence": "numeric-1300-1301-assessment.json"
+  },
+  "collection": {
+    "admitted": 36,
+    "attempted": 43,
+    "percent": 83.72093023255815,
+    "unknown_or_coalesced_slots_excluded": "06-14 Oct06 have no separate completed collection attempt; queued06 later stale closed. Unknown is not failure/success.",
+    "latest_two": "12 and13 admitted;13 exits0/100valid97existing3new pending/0docs; semantic outcome unverified",
+    "scope": "Available-history collection admission, not task completion or learned facts",
+    "incremental_evidence": "people-1300-1301-outcome.json"
+  },
+  "observer_overall_scores": {
+    "capability": null,
+    "accuracy": null,
+    "reliability": null
+  },
+  "observer_minimum8_supported": false,
+  "partial_tasks": 32,
+  "fully_assessed_task_outcomes": 0,
+  "full_outcome_target": 30,
+  "pending_candidates": 511,
+  "regressions": {
+    "suites": 23,
+    "tests": 215,
+    "mutation_checks": 12,
+    "all_exit_codes": 0,
+    "commands": [
+      {
+        "command": "python3 tests/reliability-v2.test.py",
+        "exit_code": 0,
+        "tail": "ok\ntest_structured_read_and_unfiltered_logs_are_allowed (__main__.EffectiveHookAcceptance.test_structured_read_and_unfiltered_logs_are_allowed) ... ok\n\n----------------------------------------------------------------------\nRan 20 tests in 0.399s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/reliability-v3.test.py",
+        "exit_code": 0,
+        "tail": "k\ntest_wrapper_preserves_scope_and_redacts_without_mutations (__main__.HistoryTests.test_wrapper_preserves_scope_and_redacts_without_mutations) ... ok\n\n----------------------------------------------------------------------\nRan 37 tests in 0.085s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/reliability-v3-mutations.test.py",
+        "exit_code": 0,
+        "tail": "   {\n      \"mutation\": \"read-failure-is-quiet\",\n      \"killed\": true,\n      \"failing_tests\": [\n        \"test_timeout_is_unknown_not_quiet (acceptance.HistoryTests.test_timeout_is_unknown_not_quiet)\"\n      ]\n    }\n  ],\n  \"killed\": 12,\n  \"total\": 12\n}\n"
+      },
+      {
+        "command": "python3 tests/learning-window-state.test.py",
+        "exit_code": 0,
+        "tail": "............\n----------------------------------------------------------------------\nRan 12 tests in 0.016s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-collection-pass.test.py",
+        "exit_code": 0,
+        "tail": "..........\n----------------------------------------------------------------------\nRan 10 tests in 0.018s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-command-collection.test.py",
+        "exit_code": 0,
+        "tail": "........\n----------------------------------------------------------------------\nRan 8 tests in 0.008s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-consumer-return.test.py",
+        "exit_code": 0,
+        "tail": ".......\n----------------------------------------------------------------------\nRan 7 tests in 0.009s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-pending-candidates.test.py",
+        "exit_code": 0,
+        "tail": "............\n----------------------------------------------------------------------\nRan 12 tests in 0.026s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-dispatch.test.py",
+        "exit_code": 0,
+        "tail": "...............\n----------------------------------------------------------------------\nRan 15 tests in 0.240s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-consumer-cli.test.py",
+        "exit_code": 0,
+        "tail": ".............\n----------------------------------------------------------------------\nRan 13 tests in 3.859s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-proposal-preflight.test.py",
+        "exit_code": 0,
+        "tail": ".....\n----------------------------------------------------------------------\nRan 5 tests in 0.249s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-collection-claims.test.py",
+        "exit_code": 0,
+        "tail": ".......\n----------------------------------------------------------------------\nRan 7 tests in 0.007s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-document-effect.test.py",
+        "exit_code": 0,
+        "tail": "........\n----------------------------------------------------------------------\nRan 8 tests in 0.000s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-readback-adapter.test.py",
+        "exit_code": 0,
+        "tail": ".........\n----------------------------------------------------------------------\nRan 9 tests in 0.062s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/learning-cloud-read-cli.test.py",
+        "exit_code": 0,
+        "tail": "...\n----------------------------------------------------------------------\nRan 3 tests in 0.152s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/outcome-claims.test.py",
+        "exit_code": 0,
+        "tail": "...................\n----------------------------------------------------------------------\nRan 19 tests in 0.003s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/github-status-cli.test.py",
+        "exit_code": 0,
+        "tail": "......\n----------------------------------------------------------------------\nRan 6 tests in 1.964s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/github-status-authority.test.py",
+        "exit_code": 0,
+        "tail": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.016s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/github-status-runtime-cli.test.py",
+        "exit_code": 0,
+        "tail": "...\n----------------------------------------------------------------------\nRan 3 tests in 1.867s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/github-status-task-context-cli.test.py",
+        "exit_code": 0,
+        "tail": ".....\n----------------------------------------------------------------------\nRan 5 tests in 3.196s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/runtime-api-task-binding-cli.test.py",
+        "exit_code": 0,
+        "tail": "......\n----------------------------------------------------------------------\nRan 6 tests in 2.969s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/detached-consumer-stop-role.test.py",
+        "exit_code": 0,
+        "tail": "....\n----------------------------------------------------------------------\nRan 4 tests in 1.395s\n\nOK\n"
+      },
+      {
+        "command": "python3 tests/room-history-page-size.test.py",
+        "exit_code": 0,
+        "tail": "..\n----------------------------------------------------------------------\nRan 2 tests in 0.002s\n\nOK\n"
+      }
+    ]
+  },
+  "limits": [
+    "Component rates are not overall ratings.",
+    "Owner testimony is experiential evidence, not independently replayed task-level proof.",
+    "Historical errors, blocked attempts and unknowns remain retained.",
+    "Literal reference validation and physical hash retention do not establish semantic truth or authority.",
+    "The reported21second5169 witness remains correlated reported evidence; raw Discord/authenticated cron effects not independently verified.",
+    "No Muse/Dots parity baseline established.",
+    "Latest upstream integration and its CI are not established by the tested deployed version."
+  ],
+  "codex_compatibility_followup": {
+    "reviewed_heads": {
+      "5195": "5614b34d340f08357f3899bb2b63afcfcbb09329",
+      "5197": "c28773f3729da55e7f452383637a2cf68fa75ec9",
+      "5198": "3ce4f3c4b505a96bdb3303c865146884b8d511a7"
+    },
+    "reviewer_report": "Codex core recommended holding 5195 after reproducing timeout descendant survival and unresolved launcher Python; companion fixture checks passed within stated scope.",
+    "independent_local_before": {
+      "head": "5614b34d",
+      "tests": 2,
+      "failures": 2
+    },
+    "corrections": [
+      "supervise consumer process group before final readback and lock release",
+      "delegate launcher interpreter resolution to existing repository owner"
+    ],
+    "authenticated_codex_consumer_witness": "unverified",
+    "prior_5169_witness_applies": false
+  }
+}

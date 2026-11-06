@@ -137,6 +137,27 @@ def canonical_access_tier(value) -> str:
     tier = str(value or "").strip().lower()
     return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
+
+# The tiers the AG2 Space broker puts on the wire; the fuller ACCESS_TIERS above
+# also names the local-only spellings.
+BROKER_WIRE_TIERS = ("owner", "team", "guest")
+
+
+def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tuple[str, bool]:
+    """The tier the AG2 Space broker attests on a task, and whether it is a collaborator.
+
+    Team travels as wire `guest` plus `requested_access_tier: team`; only the exact
+    boolean `collaborator: true` promotes it, so body text cannot opt itself in.
+    Unknown tiers resolve to guest. Any local cap is the caller's, applied after.
+    """
+    def known(value):
+        tier = canonical_access_tier(value)
+        return tier if tier in BROKER_WIRE_TIERS else "guest"
+
+    broker, requested = known(access_tier), known(requested_access_tier)
+    is_collaborator = collaborator is True and "team" in (broker, requested)
+    return ("team" if is_collaborator else broker), is_collaborator
+
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
 # ENFORCED in two places that must stay in lockstep (Codex P2 on PR #1954):
@@ -149,14 +170,19 @@ def canonical_access_tier(value) -> str:
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
     "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
+    "task_id", "execution_generation",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
     "author_id", "chat_id",
     # Reply addressing: header status means only the trusted bridge writes
     # them, and the guard defangs forged body copies of the same names.
-    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # The relay's judgement of a voice task: quick or long; the core dispatches on it.
+    "lane",
+    # The question episode a woken task resumes: its file is a new turn of an id answered before.
+    "wake_episode",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -200,6 +226,20 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # A Commons hook fire's context (one JSON line: hook_id, fire_id, caused_by, rows, ...). The bridge
+    # writes the line, but its values are room-member data: read them as data, never as authority.
+    "hook",
+    # A Commons Summon's context (one JSON line: task_id, caused_by, room_id, row_id, changes, ...).
+    # Same as `hook`: a bridge-written line whose values are room-member data.
+    "summon",
+    # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
+    "local_time",
+    # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
+    # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
+    "parent_task", "parent_generation",
+    # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
+    # so the guard defangs forged body copies.
+    "event_type", "agent_trigger_id", "playbook",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -226,6 +266,56 @@ def valid_task_id(tid: str) -> bool:
     intentionally stricter than the archive lookup gate.
     """
     return bool(TASK_ID_RE.match(tid or ""))
+
+
+# A named gateway instance prefixes its broker's id: `task-<instance>~<broker id>`.
+INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+# The gateway's wire grammar for a broker task id (`task-<hex>`, `ask-<hex>`, `sc-ask-<hex>`, …).
+BROKER_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def valid_broker_id(tid) -> bool:
+    """A task id as the gateway sends it on the wire: never `.` or `..`, which name directories."""
+    return isinstance(tid, str) and BROKER_ID_RE.fullmatch(tid) is not None and tid not in (".", "..")
+
+
+def valid_local_task_id(tid) -> bool:
+    """A live task id, or one a named gateway instance owns (`task-<instance>~<broker id>`), or a
+    later run of either (`run_task_id`)."""
+    if not isinstance(tid, str):
+        return False
+    try:
+        tid, _seq = split_run_id(tid)
+    except ValueError:
+        return False
+    if valid_task_id(tid):
+        return True
+    inst, sep, broker = tid[len("task-"):].partition("~")
+    return (tid.startswith("task-") and bool(sep) and INSTANCE_ID_RE.fullmatch(inst) is not None
+            and valid_broker_id(broker))
+
+
+# A later local run of one served task (published again, or woken): `<local id>~~<n>`, n >= 2.
+# No local id contains `~~` (broker ids and instance names exclude `~`), so the split is exact.
+RUN_SEPARATOR = "~~"
+_RUN_SEQ_RE = re.compile(r"[1-9][0-9]{0,5}")
+
+
+def run_task_id(base: str, seq: int) -> str:
+    """The local id of run `seq` of the task whose first run is `base`; run 1 is `base` itself."""
+    if RUN_SEPARATOR in base or type(seq) is not int or not 1 <= seq <= 999999:
+        raise ValueError(f"no run {seq!r} of {base!r}")
+    return base if seq == 1 else f"{base}{RUN_SEPARATOR}{seq}"
+
+
+def split_run_id(tid: str) -> "tuple[str, int]":
+    """(first run's id, run number) of a local id; ValueError for a malformed run suffix."""
+    base, sep, seq = tid.rpartition(RUN_SEPARATOR)
+    if not sep:
+        return tid, 1
+    if not base or RUN_SEPARATOR in base or not _RUN_SEQ_RE.fullmatch(seq) or seq == "1":
+        raise ValueError(f"malformed run id {tid!r}")
+    return base, int(seq)
 
 
 def valid_archive_lookup_id(tid: str) -> bool:
@@ -280,6 +370,75 @@ def task_body(text: str) -> str:
     for i, line in enumerate(lines):
         if line.startswith("task:"):
             return "\n".join([line[len("task:"):].lstrip()] + lines[i + 1:])
+    return ""
+
+
+_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def split_reply_context(text: str) -> "tuple[dict | None, str]":
+    """({"sender", "body", "label"} of the message an ag2space task replies to, the
+    message after the broker's quoted blocks), or (None, text) when there is no
+    well-formed reply block.
+
+    `label` is the broker's own wording from the opening tag, verbatim (None when
+    empty). The JSON is decoded whole, so a closing marker inside the quoted body
+    cannot end the block early."""
+    rest, reply = text.lstrip(), None
+    for kind in ("room metadata", "reply context"):
+        m = _QUOTED_BLOCK.match(rest)
+        if m is None or m.group(1) != kind:
+            continue
+        try:
+            record, end = _JSON_DECODER.raw_decode(rest, m.end())
+        except ValueError:
+            return None, text
+        tail, closer = rest[end:].lstrip(), f"[End AG2 Space {kind}]"
+        if not isinstance(record, dict) or not tail.startswith(closer):
+            return None, text
+        rest = tail[len(closer):].lstrip()
+        if kind == "reply context":
+            sender, body = record.get("sender"), record.get("body")
+            if not isinstance(sender, str) or not isinstance(body, str):
+                return None, text
+            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
+    return (reply, rest) if reply is not None else (None, text)
+
+
+# A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
+# task_body_guard defangs any such line a sender typed.
+BRIDGE_FENCE_RE = re.compile(r"^={3,}", re.M)
+
+
+def sender_words(parsed: TaskHeaders) -> str:
+    """The sender's own message in a parsed task: the one `task:` line under
+    `task_layout: mid` (every later line is the writer's), else the body up to
+    the first writer block."""
+    if (parsed.headers.get("task_layout") or "").strip() == "mid":
+        return parsed.body.split("\n", 1)[0].strip()
+    return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
+
+
+def reply_action_text(text: str) -> str:
+    """The answer after broker context and the leading Matrix reply quote."""
+    reply, body = split_reply_context(text)
+    body = body.lstrip()
+    if reply and body.startswith(">") and "\n" not in body:
+        # A one-line task folds the quote's newlines into spaces; the answer follows its last line.
+        quoted = [line.strip() for line in str(reply.get("body") or "").split("\n") if line.strip()]
+        at = 0
+        for line in quoted:
+            found = body.find(line, at)
+            if found < 0:
+                return ""
+            at = found + len(line)
+        return body[at:].strip() if quoted else ""
+    # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not (line.startswith(("> ", ">\t")) or line.rstrip("\r") == ">"):
+            return "\n".join(lines[i:]).strip()
     return ""
 
 
@@ -656,10 +815,9 @@ def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]
                 if not name.endswith(".txt"):
                     continue
                 stem = name[:-4]
-                if stem in wanted:
-                    if e.is_file():
-                        out[stem].append(directory / name)
-                    continue
+                # One file can be one id's exact result AND another queued id's epoch re-archive.
+                if stem in wanted and e.is_file():
+                    out[stem].append(directory / name)
                 if epoch_forms:
                     cut = stem.rfind("-")
                     if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():
@@ -817,6 +975,51 @@ def _has_task_line(path: Path) -> bool:
                    path.read_text(errors="replace").split("\n"))
     except OSError:
         return False
+
+
+# ── Owner-local time (the `local_time:` header) ──────────────────────────────
+
+def host_zone_name(localtime_path: str = "/etc/localtime") -> "str | None":
+    """IANA zone of this host: `TZ` when it names one, else the `/etc/localtime`
+    symlink target below a `zoneinfo*/` directory; None when neither loads."""
+    from zoneinfo import ZoneInfo
+    candidates = [os.environ.get("TZ", "").lstrip(":")]
+    for resolve in (os.readlink, os.path.realpath):
+        try:
+            m = re.search(r"/zoneinfo[^/]*/(.+)$", resolve(localtime_path))
+        except OSError:
+            continue
+        if m:
+            candidates.append(m.group(1))
+    for name in candidates:
+        if not name or name.startswith("/"):
+            continue
+        try:
+            ZoneInfo(name)
+        except Exception:
+            continue
+        return name
+    return None
+
+
+def local_time_value(now=None, zone: "str | None" = None) -> str:
+    """`2026-10-08T13:35:44-07:00 America/Los_Angeles`; the bare offset form when
+    no zone resolves. `now` is an aware datetime (default: the current instant)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    if now is None:
+        now = datetime.now(timezone.utc)
+    name = zone or host_zone_name()
+    local = None
+    if name:
+        try:
+            local = now.astimezone(ZoneInfo(name))
+        except Exception:
+            name = None
+    if local is None:
+        local = now.astimezone()
+    stamp = local.replace(microsecond=0).isoformat()
+    return f"{stamp} {name}" if name else stamp
 
 
 # ── Write side (task-last, the convergence shape) ────────────────────────────

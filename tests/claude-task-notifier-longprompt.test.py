@@ -33,6 +33,9 @@ class LongPromptTests(FakeTmuxHarness):
     WRAP_COLS = 118
     WRAP_STYLE = "word"
     LONG = "task-" + "l" * 200 + ".txt"
+    # These ids are longer than the result lookup's 128-char id pattern, so the
+    # completion wait can never match; cap it instead of running out the default.
+    NO_PICKUP = {"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"}
 
     def _finish_on(self, name, predicate):
         import threading
@@ -47,7 +50,7 @@ class LongPromptTests(FakeTmuxHarness):
     def _run_long(self, name, env=None):
         self.write_task(name)
         t = self._finish_on(name, lambda log: "ENTER" in log)
-        r = self.run_event(name, env, timeout=40)
+        r = self.run_event(name, {**self.NO_PICKUP, **(env or {})}, timeout=40)
         t.join()
         return r
 
@@ -68,13 +71,16 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_a_chunk_that_lands_short_is_never_submitted_or_typed_over(self):
-        self.cut_paste_over_flag.write_text("100")  # a limit below even one chunk
+        # Every attempt lands the same garbled bytes; the retry clears its own leftover.
+        self.cut_paste_over_flag.write_text("100")
         self.write_task(self.LONG)
         r = self.run_event(self.LONG, timeout=40)
         log = self.sendkeys_log_text()
         self.assertNotIn("ENTER", log)
-        self.assertEqual(log.count("TYPE "), 1, "typed over what landed")
-        self.assertIn("composer not empty", r.stderr)
+        self.assertEqual(log.count("TYPE "), 2, "one clean attempt per retry, not typed over")
+        self.assertEqual(log.count("BSPACE "), 1, "the garbled leftover was cleared exactly once")
+        self.assertIn("own garbled, non-boundary leftover", r.stderr)
+        self.assertIn("never verifiably staged", r.stderr)
 
     def test_the_window_is_grown_for_the_paste_and_put_back_before_the_result_wait(self):
         self.composer_view_rows_flag.write_text("6")  # the 29-row box shows its last 6 rows
@@ -105,7 +111,7 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual(self.expected_prompt(name).encode()[255:257], "é".encode())
         self.write_task(name)
         t = self._finish_on(name, lambda log: "ENTER" in log)
-        r = self.run_event(name, timeout=40)
+        r = self.run_event(name, self.NO_PICKUP, timeout=40)
         t.join()
         chunks = [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
         self.assertEqual(len(chunks[0].encode()), 255, len(chunks[0].encode()))
@@ -173,7 +179,7 @@ class LongPromptTests(FakeTmuxHarness):
         self._pick_with_a_dropped_chunk()
         before = len(self._chunks())
         t = self._finish_on(self.LONG, lambda log: "ENTER" in log)
-        r = self.run_event(self.LONG, timeout=40)
+        r = self.run_event(self.LONG, self.NO_PICKUP, timeout=40)
         t.join()
         self.assertIn("resuming it there", r.stderr)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -296,13 +302,38 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual(self.expected_prompt(name)[255], ";")
         self.write_task(name)
         t = self._finish_on(name, lambda log: "ENTER" in log)
-        r = self.run_event(name, timeout=40)
+        r = self.run_event(name, self.NO_PICKUP, timeout=40)
         t.join()
         chunks = [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
         self.assertTrue(chunks[0].endswith(r"\;"), chunks[0][-10:])
         self.assertEqual("".join(c[:-2] + ";" if c.endswith(r"\;") else c for c in chunks), self.expected_prompt(name))
         self.assertIn("ENTER", self.sendkeys_log_text())
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_an_embedded_newline_is_typed_literally_and_submitted_whole(self):
+        # #4811: type_prompt()/chunk_lengths() must handle a real embedded newline
+        # byte-exact, for any future caller even though task_prompt() has none today.
+        import re
+        import subprocess
+        name = "task-multiline.txt"
+        prompt = "line one of the prompt\n" + ("x" * 300) + "\nline three, after a long middle line"
+        # Source only the function defs (never the live file's standby side effects);
+        # $0 stays the real path since the script derives REPO from `dirname "$0"`.
+        dispatch_line = next(i for i, l in enumerate(_h.NOTIFIER.read_text().splitlines(), 1)
+                              if l.startswith('if [ "${1:-}" = "--event" ]'))
+        script = f'sed -n "1,{dispatch_line - 1}p" "$0" > "$TMPDIR_SRC"; source "$TMPDIR_SRC"; deliver_prompt "$1" "$2"'
+        env = self._env({"TMPDIR_SRC": str(self.root / "notifier-funcs.sh")})
+        r = subprocess.run(["/bin/bash", "-c", script, str(_h.NOTIFIER), name, prompt],
+                            env=env, cwd=str(self.root), capture_output=True, text=True, timeout=40)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        # A chunk's own embedded newline defeats a naive splitlines() scan of the log;
+        # split on "TARGET " lines instead, which a chunk's content can't forge here.
+        records = re.split(r"(?m)^TARGET .*\n", self.sendkeys_log_text())[1:]
+        chunks = [m.group(1) for m in (re.match(r"CAPTURES@\d+\nTYPE (.*)\n\Z", p, re.S) for p in records) if m]
+        self.assertGreater(len(chunks), 1, chunks)
+        self.assertTrue(all(len(c.encode()) <= 256 for c in chunks), [len(c.encode()) for c in chunks])
+        self.assertEqual("".join(chunks), prompt, "the newline must survive chunking byte-for-byte")
 
 
 if __name__ == "__main__":
