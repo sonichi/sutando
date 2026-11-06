@@ -233,11 +233,8 @@ def _rewrite_in_place(text: str, changed: list[tuple[str, str, str]], settings: 
     for _event, old, new in changed:
         for ascii_only in (True, False):
             out = out.replace(json.dumps(old, ensure_ascii=ascii_only), json.dumps(new, ensure_ascii=ascii_only))
-    try:
-        if json.loads(out) == settings:
-            return out
-    except ValueError:
-        pass
+    if json.loads(out) == settings:
+        return out
     return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
 
 

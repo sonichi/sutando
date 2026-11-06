@@ -191,6 +191,41 @@ class RepairHookPaths(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("not an object", r.stderr)
 
+    def test_unparseable_and_shapeless_inputs_are_left_alone(self):
+        self.assertIsNone(chs.repoint_command(f'bash "{self.old}/src/turn-start.sh', str(self.new)))
+        self.assertEqual(chs.repoint_moved({"hooks": [1]}, str(self.new)), [])
+
+    def test_an_unusual_encoding_falls_back_to_a_full_dump(self):
+        old_cmd = owned(self.old)["Stop"]
+        self.settings.write_text('{"hooks": {"Stop": [{"hooks": [{"command": %s}]}]}}'
+                                 % json.dumps(old_cmd).replace("/", "\\/"))
+        self.assertEqual(len(chs.repair_paths(self.settings, self.new)), 1)
+        self.assertEqual(json.loads(self.settings.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"],
+                         owned(str(self.new))["Stop"])
+
+    def test_a_failed_write_leaves_the_file_and_no_temp_behind(self):
+        from unittest import mock
+        text = self.write(self.moved_settings(with_archiver=False))
+        with mock.patch.object(chs.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                chs.repair_paths(self.settings, self.new)
+        self.assertEqual(self.settings.read_text(), text)
+        self.assertEqual(sorted(p.name for p in self.settings.parent.iterdir()), ["settings.json"])
+
+    def test_main_in_process(self):
+        import contextlib
+        import io
+        self.write(self.moved_settings(with_archiver=False))
+        bad = self.tmp / "bad.json"
+        bad.write_text("{")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = chs.main(["repair-paths", "--repo", str(self.new),
+                           "--settings", str(bad), "--settings", str(self.settings)])
+        self.assertEqual(rc, 1)
+        self.assertIn("hook path repair", err.getvalue())
+        self.assertEqual(out.getvalue().count("re-pointed"), len(owned(self.old)))
+
 
 class LauncherWiring(unittest.TestCase):
     def test_start_cli_repairs_before_installing_and_after_the_pure_probe(self):
