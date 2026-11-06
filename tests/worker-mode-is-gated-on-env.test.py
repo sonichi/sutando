@@ -24,6 +24,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -180,9 +182,9 @@ def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:
         env.pop("SUTANDO_TASKS_DIR", None)
     # The --inbox tag names the same directory the env resolves to.
     inbox = env.get("SUTANDO_TASKS_DIR", str(ws / "tasks"))
-    p = subprocess.Popen(["bash", str(root / "src" / "watch-tasks-stream.sh"), "--role", "standby", "--inbox", inbox],
+    p = popen_bound(["bash", str(root / "src" / "watch-tasks-stream.sh"), "--role", "standby", "--inbox", inbox],
                          cwd=str(root), env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.time() + 6
         while time.time() < deadline and not ((ws / "tasks").is_dir() or (td / "deliveries").is_dir()) and p.poll() is None:
@@ -212,9 +214,9 @@ def _state_root(extra_env: dict, td: Path):
     env = {**os.environ, "SUTANDO_RESULTS_DIR": str(ws / "results"), "SUTANDO_TASKS_DIR": str(inbox),
            "SUTANDO_TASK_EVENT_HANDLER": str(handler), **extra_env}
     env.pop("SUTANDO_WORKSPACE_DIR", None) if "SUTANDO_WORKSPACE_DIR" not in extra_env else None
-    p = subprocess.Popen(["bash", str(root / "src" / "watch-tasks-stream.sh"), "--role", "standby", "--inbox", str(inbox)],
+    p = popen_bound(["bash", str(root / "src" / "watch-tasks-stream.sh"), "--role", "standby", "--inbox", str(inbox)],
                          cwd=str(root), env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     under_ws = ws / "state" / "task-event-handler-claims"
     under_inbox = td / "deliveries" / "state" / "task-event-handler-claims"
     try:

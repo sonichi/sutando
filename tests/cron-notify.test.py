@@ -4,6 +4,12 @@ half of the cron-room → owner-active-channel ping (Track 13a) plus the CLI's
 non-network paths (dry-run, suppression exits). Network delivery (_post_to_room)
 is deliberately NOT exercised here — it rides the same gateway op:message path
 every cron uses and is covered by live use."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys

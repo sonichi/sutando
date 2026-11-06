@@ -14,10 +14,15 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ag2_sparrow import remote_gateway_bridge as gw  # noqa: E402
 
@@ -456,7 +461,7 @@ class AbandonedHardening(_Base):
         t = d / f"{TID}.txt"
         t.write_text("id: x\n")                 # archived seconds ago
         self._saved_save = gw._save_inflight
-        gw._save_inflight = lambda s: None
+        gw._save_inflight = lambda s: True
         try:
             self.assertTrue(self._drop_probe(),
                             "completed-HERE minutes ago: the result may still come")
@@ -470,7 +475,7 @@ class AbandonedHardening(_Base):
         """Same two passes, with `name` pending in tasks/."""
         (gw.TASKS_DIR / name).write_text("id: x\n")
         self._saved_save = gw._save_inflight
-        gw._save_inflight = lambda s: None
+        gw._save_inflight = lambda s: True
         try:
             return self._drop_probe()
         finally:
@@ -492,7 +497,7 @@ class AbandonedHardening(_Base):
         # The control: without it the test above passes on a reconciler that
         # never drops anything at all.
         self._saved_save = gw._save_inflight
-        gw._save_inflight = lambda s: None
+        gw._save_inflight = lambda s: True
         try:
             self.assertFalse(self._drop_probe())
         finally:
@@ -740,6 +745,11 @@ class ReplacementBeforeTheRetire(ReplacementAtTheMove):
         self.assertEqual(canonical.read_text(), "BODY-B plain reply")
         self.assertEqual(self.posted, [])
         self._next_pass_posts_b(canonical)
+
+
+class BridgeImportIsHermetic(unittest.TestCase):
+    def test_the_bridge_import_reads_no_host_config_token_or_vault(self):
+        assert_hermetic(self, _IMPORT_READS)
 
 
 if __name__ == "__main__":

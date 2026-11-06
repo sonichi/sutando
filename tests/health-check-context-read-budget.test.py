@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """context-read-budget: warn when hosts/<host>/current-track.md outgrows the per-pass read budget."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile

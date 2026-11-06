@@ -70,6 +70,42 @@ class _Ws(rdb._Ws):
                            "**Ask id:** ask-archived\n**Sent:** x\n")
 
 
+class TestArchiveBoundary(_Ws):
+    def test_hidden_archive_divider_refuses_all_import_writes(self):
+        for suffix in ("", "\n# Resolved\n\n## Later archive\nold\n"):
+            with self.subTest(later_visible_divider=bool(suffix)):
+                text = ("# Open\n\n## Current question\n\n**Status:** open\n"
+                        "A `span crosses the archive boundary\n\n# Resolved\n\n"
+                        "## Archived question\n\nold content without status\nend of span`\n" + suffix)
+                self.pq.write_text(text)
+                db = self.db()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+                self.assertEqual(moved, [])
+                self.assertTrue(any("archive boundary" in e for e in errors), errors)
+                self.assertEqual(db.client.calls, [])
+                self.assertEqual(self.pq.read_text(), text)
+
+    def test_deliberately_quoted_divider_does_not_block_migration(self):
+        for example in ("Example `# Resolved`\n", "```\n# Resolved\n```\n"):
+            with self.subTest(example=example):
+                self.pq.write_text(example + "\n" + MAIN_PROSE + "# Resolved\n\n## Old\nold\n")
+                db = self.db()
+                moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(moved), 1)
+                self.assertEqual([r["title"] for r in db.open_entries()], ["Rename the repo before the launch?"])
+
+    def test_damage_after_visible_archive_does_not_block_active_entries(self):
+        self.pq.write_text(MAIN_PROSE + "# Resolved\n\nText `crosses\n# Resolved\n"
+                           "## Archived question\nold\nend`\n")
+        db = self.db()
+        moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(moved), 1)
+        self.assertEqual([r["title"] for r in db.open_entries()], ["Rename the repo before the launch?"])
+
+
 class TestIngest(_Ws):
     def test_an_old_head_entry_gets_its_row_and_is_marked_moved_once(self):
         self.file(legacy_entry("ask-old"))
@@ -217,6 +253,41 @@ class TestIngest(_Ws):
                 if re.search(r"(import|from) pending_questions_compat\b", p.read_text(errors="replace")):
                     callers.append(p.relative_to(REPO).as_posix())
         self.assertEqual(callers, ["skills/pending-questions/scripts/pending_questions_store.py"])
+
+    def test_a_title_that_says_resolved_without_brackets_or_a_status_line_is_not_imported(self):
+        """sonichi/sutando#5514: main sometimes closes a `## ` section by hand, overwriting its
+        leading timestamp with RESOLVED/SELF-RESOLVED instead of adding a **Status:** line — the
+        shape the old file-based reader's `_TITLE_RESOLVED` caught before it was dropped with that
+        reader (fc02ae4b4). Prose that merely contains the word, not leading, still imports."""
+        resolved_no_brackets = ("## RESOLVED 2026-09-08T09:04:41Z — owner said yes\n\n"
+                                 "Acted on it already; kept for the record.\n\n")
+        self_resolved = "## SELF-RESOLVED 2026-07-31 — no answer needed\n\nMeasured myself; moot.\n\n"
+        still_a_question = ("## #4358 — my diagnosis dispute RESOLVED in agreement; one gap remains\n\n"
+                             "Default: ship as-is.\n\n")
+        mixed_case_leading = "## Resolved by whom should X ship?\n\nStill open; nobody answered yet.\n\n"
+        self.file(resolved_no_brackets, self_resolved, still_a_question, mixed_case_leading)
+        db = self.db()
+        moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+        self.assertEqual(errors, [])
+        titles = [r["title"] for r in db.open_entries()]
+        self.assertEqual(titles, ["#4358 — my diagnosis dispute RESOLVED in agreement; one gap remains",
+                                   "Resolved by whom should X ship?"],
+                          "the all-caps hand-written marker closes a section; mixed-case leading "
+                          "'Resolved' is an ordinary open question and must still import (qingyun-wu)")
+        self.assertEqual(len(moved), 2, "both open questions became rows; the two closed sections never did")
+        text = self.pq.read_text()
+        self.assertIn("## RESOLVED 2026-09-08T09:04:41Z — owner said yes\n\n"
+                      "Acted on it already", text, "untouched: never a row, nothing to mark moved")
+        self.assertEqual(compat.ingest_legacy_file_entries(self.ws, HOST, db), ([], []), "idempotent")
+
+    def test_a_bracketed_bullet_label_that_says_resolved_is_not_imported(self):
+        resolved_bullet = "- **[RESOLVED 2026-08-18, the voice-agent restart fix]** shipped, no answer needed\n"
+        self.file(MAIN_BULLET, resolved_bullet)
+        db = self.db()
+        moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+        self.assertEqual(errors, [])
+        self.assertEqual([r["title"] for r in db.open_entries()], ["CLA check, 2026-09-20"])
+        self.assertEqual(len(moved), 1)
 
     def test_the_module_states_its_removal_condition(self):
         doc = compat.__doc__

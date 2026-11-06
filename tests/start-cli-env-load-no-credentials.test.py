@@ -50,7 +50,7 @@ export REMOTE_TASK_TOKEN_FILE="$REPO/channel.env"
 
 def _env_block() -> str:
     lines = SCRIPT.read_text().splitlines()
-    start = lines.index("unset _self_dir") + 1
+    start = lines.index("_sutando_withhold_relay_env() {")
     end = lines.index("_sutando_withhold_relay_env", start)
     return "\n".join(lines[start:end + 1])
 

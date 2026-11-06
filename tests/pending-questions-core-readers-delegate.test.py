@@ -141,7 +141,7 @@ class Obsidian(unittest.TestCase):
 class SessionHandoff(unittest.TestCase):
     def test_the_section_runs_the_reader_cli_and_names_a_failure(self):
         src = (SRC / "session-handoff.sh").read_text()
-        self.assertIn('pending_questions_reader.py" list --workspace "$WORKSPACE_DIR"', src)
+        self.assertIn('pending_questions_reader.py" summary --workspace "$WORKSPACE_DIR"', src)
         self.assertIn("pending-questions reader failed", src)
         self.assertEqual(_no_file_read(SRC / "session-handoff.sh"), [])
 

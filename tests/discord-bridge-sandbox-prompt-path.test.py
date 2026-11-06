@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # The non-owner sandbox prompt is never written to a file: it rides the launch command as a quoted heredoc.
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import inspect
 import json

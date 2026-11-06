@@ -397,7 +397,7 @@ class TestWeatherLatLonOverride(unittest.TestCase):
         self.assertIn("62°F", out)
         self.assertIn("mostly clear", out)
 
-    def test_no_override_uses_default(self):
+    def test_no_override_skips_weather(self):
         import os
         captured = {}
 
@@ -405,8 +405,7 @@ class TestWeatherLatLonOverride(unittest.TestCase):
             captured["url"] = url
             return self._FakeResp(self._WX)
 
-        # Neither env nor config set → default SF coords; config_get returns None
-        # so the override branch is skipped.
+        # Missing coordinates must not query weather for an assumed city.
         env_clear = {k: v for k, v in os.environ.items()
                      if k not in ("WEATHER_LAT", "WEATHER_LON")}
         with patch.dict(os.environ, env_clear, clear=True), \
@@ -414,8 +413,8 @@ class TestWeatherLatLonOverride(unittest.TestCase):
              patch.object(self.mod, "urlopen", side_effect=fake_urlopen):
             out = self.mod.get_weather()
 
-        self.assertIn("latitude=37.77", captured["url"])
-        self.assertIn("62°F", out)
+        self.assertEqual(captured, {})
+        self.assertIsNone(out)
 
 
 if __name__ == "__main__":

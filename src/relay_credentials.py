@@ -7,7 +7,8 @@ resolves them here, in one order:
   1. the process environment (an exported value still wins);
   2. the channel env file, selected the way `scripts/channel-env.sh` selects it
      (`channel_env_resolve.resolve_channel_env`: launcher-named device env,
-     then contained `channels/<source>/*.env` holding a non-empty token);
+     then contained `channels/<source>/*.env` holding a non-empty token),
+     followed by the desktop active lane when no explicit lane is selected;
   3. the Keychain vault;
   4. the repo `.env` (`sutando_config.resolve_dotenv`), read from file.
 
@@ -61,9 +62,26 @@ def channel_env_file(source: str = PRIMARY_SOURCE, channels_dir=None) -> Optiona
         if channels_dir is None:
             from util_paths import claude_home_path
             channels_dir = claude_home_path("channels")
-        return resolve_channel_env(channels_dir, source)
+        picked = resolve_channel_env(channels_dir, source)
+        if picked is not None:
+            return picked
+        fallback = Path(channels_dir) / source / ".env"
+        from channel_env_containment import channel_env_is_contained
+        return fallback if fallback.is_file() and channel_env_is_contained(
+            fallback, channels_dir, source) else None
     except Exception:
         return None
+
+
+def active_lane_credentials(source: str = PRIMARY_SOURCE) -> Mapping[str, str]:
+    """The desktop active lane's paired token and URL, or no values."""
+    try:
+        from channel_env_resolve import active_lane_values
+        from util_paths import claude_home_path
+        return active_lane_values(claude_home_path("channels"), source,
+                                  (*TOKEN_ALIAS_PRECEDENCE, *URL_ALIAS_PRECEDENCE))
+    except Exception:
+        return {}
 
 
 def repo_env_file() -> Optional[Path]:
@@ -133,6 +151,11 @@ def resolve_relay_credentials(source: str = PRIMARY_SOURCE, *,
     if not raw:
         raw = _first(channel, TOKEN_ALIAS_PRECEDENCE)
         origin = "channel-env" if raw else origin
+    lane_values = {}
+    if not raw and primary and not environ.get("REMOTE_TASK_CHANNEL_DIR"):
+        lane_values = active_lane_credentials(source)
+        raw = _first(lane_values, TOKEN_ALIAS_PRECEDENCE)
+        origin = "active-lane" if raw else origin
     if not raw and primary:
         raw = (vault or vault_token)() or ""
         origin = "vault" if raw else origin
@@ -144,6 +167,8 @@ def resolve_relay_credentials(source: str = PRIMARY_SOURCE, *,
     explicit_url = explicit_url.strip()
     if not explicit_url:
         explicit_url = _first(channel, URL_ALIAS_PRECEDENCE)
+    if origin == "active-lane":
+        explicit_url = _first(lane_values, URL_ALIAS_PRECEDENCE)
     # The repo URL only accompanies the repo token; it never re-points another tier's.
     fallback_url = _first(repo, URL_ALIAS_PRECEDENCE) if origin == "repo-env" else ""
     creds = normalize_credentials(raw, explicit_url=explicit_url,

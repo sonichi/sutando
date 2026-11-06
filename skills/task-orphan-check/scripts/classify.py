@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Step 2 of /task-orphan-check, as a script: classify every live task in
-`<workspace>/tasks/` as done / worker-held / fresh / orphan / import-resume, read-only.
+`<workspace>/tasks/` as done / held / worker-held / fresh / orphan / import-resume, read-only.
 
 The skill was prose-only ("marker-or-not + age-vs-5min"); its own note said to
 promote the classification to a script once the rules grew past that. They
@@ -20,6 +20,11 @@ Verdicts (first match wins):
                   (`done`, `staged`, `discarded`, `forgot`) — the run this
                   task started reached its end; a staged digest waits on an
                   owner reply, which arrives as a new task.
+  held            the core-limit hold took it in: it arrived while the core
+                  was paused for a provider limit (`held_tasks` in
+                  state/core-limit-hold.json, read through core_limit_hold).
+                  The owner was told it waits: left in tasks/ for the
+                  watcher's sweep, never archived, never DM'd.
   worker-held     a worker seat holds a router sentinel for it
                   (deliveries/<recipient>/<id>{.txt,.accepted,.claimed},
                   skills/worker-pool/scripts/worker_delivery.py): the task is that worker's to
@@ -67,8 +72,17 @@ case-insensitive). A path or a bare skill-name mention ("… touches
 skills/import-claude-context/SKILL.md") is NOT one — review 4177: the bare
 substring parked unrelated owner tasks forever.
 
-Age comes from the immutable `timestamp:` header, then the epoch-ms in the
-id, and only then the file mtime (mtime resets on rsync / checkout / sync).
+Age is how long the task has waited in THIS inbox: the `local_time:` header the
+local writer stamps at intake, then the immutable `timestamp:` header, then the
+epoch-ms in the id, and only then the file mtime (mtime resets on rsync /
+checkout / sync). `timestamp:` is when the sender sent it, so a message that
+waited at a broker while the app was down is not old on arrival. `local_time:`
+counts only above `task:` (the strict parse): a writer that never stamps it must
+not let a body line supply it. task-bridge.ts stamps it from the timestamp it has
+just taken; a requeued task (`build_requeued_task`) keeps the original's, so a
+requeue does not make a task look fresh. status-ack's deadline
+(`status_ack_policy.intake_at`) stays on the sender's `timestamp:` on purpose: it
+measures how long the sender has waited, not this inbox.
 
 Usage:
   python3 skills/task-orphan-check/scripts/classify.py [--workspace DIR] [--now EPOCH]
@@ -92,6 +106,7 @@ REPO = SCRIPT_DIR.parents[2]  # skills/task-orphan-check/scripts -> repo root
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
+import core_limit_hold  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 
 # The worker-pool skill is optional: without it there is no router, so nobody can
@@ -153,8 +168,13 @@ def parse_iso(value: str) -> float | None:
     return dt.timestamp()
 
 
-def task_queued_at(headers: dict, task_id: str, path: Path) -> tuple[float, str]:
-    """(epoch, how) — header timestamp, else id epoch-ms, else mtime."""
+def task_queued_at(headers: dict, task_id: str, path: Path, local_time: str = "") -> tuple[float, str]:
+    """(epoch, how) — local_time, else header timestamp, else id epoch-ms, else mtime.
+    `local_time` comes from the strict pre-`task:` headers only, never from `headers`."""
+    # `local_time:` is "<ISO with offset> <IANA zone>"; the zone name is display only.
+    written = parse_iso((local_time.split() or [""])[0])
+    if written is not None:
+        return written, "local_time"
     ts = parse_iso(headers.get("timestamp", ""))
     if ts is not None:
         return ts, "timestamp"
@@ -223,14 +243,15 @@ def channel_label(headers: dict) -> str:
     return f"{name} ({cid})" if name else (cid or "DM")
 
 
-def classify_task(path: Path, workspace: Path, now: float) -> dict:
+def classify_task(path: Path, workspace: Path, now: float, held: frozenset | None = None) -> dict:
     text = path.read_text(errors="replace")
     # Shape-union parser: this pass classifies files from every writer and
     # era (the desktop's import writer is task-mid, the bridges' are task-last).
     parsed = ltp.parse_task_headers_lenient(text)
     headers = parsed.headers
     task_id = (headers.get("id") or path.stem).strip()
-    queued_at, age_from = task_queued_at(headers, task_id, path)
+    queued_at, age_from = task_queued_at(headers, task_id, path,
+                                         ltp.parse_task_headers(text).headers.get("local_time", ""))
     age_s = max(0, int(now - queued_at))
     source = (headers.get("source") or "").strip()
     tier = ltp.canonical_access_tier(headers.get("access_tier") or "owner")
@@ -248,6 +269,12 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     marker = completion_marker(workspace / "results", task_id)
     if marker:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
+        return row
+    if held is not None and (task_id in held or path.stem in held):
+        row.update(verdict="held",
+                   reason="arrived while the core was paused for a provider limit (state/"
+                          "core-limit-hold.json); waits for the core — left in tasks/ for the "
+                          "watcher's sweep, never archived, never listed in the recovery DM")
         return row
 
     # holder_of raises on any stat failure but ENOENT; an unreadable deliveries/
@@ -345,9 +372,10 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
         return out
     # The watcher's glob is `*.txt` at the top level; whatever it would emit is
     # in scope here, and its `.deferred` suffix (skill step 3) falls outside.
+    held = core_limit_hold.held_task_ids(workspace)
     for path in sorted(p for p in tasks_dir.glob("*.txt") if p.is_file()):
         try:
-            row = classify_task(path, workspace, now)
+            row = classify_task(path, workspace, now, held)
         except OSError as exc:  # unreadable file: conservative, surface it
             row = {"file": path.name, "id": path.stem, "verdict": "orphan",
                    "reason": f"unreadable task file ({exc}); treated as orphan"}

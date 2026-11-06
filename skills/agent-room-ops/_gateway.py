@@ -145,21 +145,44 @@ def _credential_contract():
     return _gc
 
 
-def gateway():
-    """Return (base_url, headers). base is '' when no gateway is configured.
+class RoomConnectionError(RuntimeError):
+    """The room's server has no usable connection on this install; never another server's token."""
 
-    Tier order and parsing belong to src/relay_credentials.py (env, channel env,
-    vault, repo .env). The env chain stays GATEWAY_TOKEN > RELAY_TOKEN >
-    REMOTE_TASK_TOKEN: room-ops has never read AG2_REMOTE_TOKEN from env.
+
+def _room_credential(room_id):
+    """(gateway_url, token) the core's `connections.room_credential` names for `room_id`, or None
+    to keep the single-connection chain below. Raises RoomConnectionError on its refusal."""
+    try:
+        if not _core_src_on_path():
+            return None
+        import connections
+    except Exception:
+        return None
+    try:
+        return connections.room_credential(room_id)
+    except connections.ConnectionsError as e:
+        raise RoomConnectionError(str(e)) from None
+
+
+def gateway(room_id=None):
+    """Return (base_url, headers), routing rooms by their server when configured.
+
+    Single-connection tier order belongs to src/relay_credentials.py. Room-ops
+    keeps its historical env aliases, excluding AG2_REMOTE_TOKEN.
     """
+    gc = _credential_contract()
+    routed = _room_credential(room_id)
     rc = _relay_credentials()
-    if rc is not None:
+    if routed is not None:
+        url, raw = routed
+        creds = gc.normalize_credentials(raw, explicit_url=url,
+                                         source="resolved" if raw else "none")
+    elif rc is not None:
         creds = rc.resolve_relay_credentials(
             _lane(), env_token_names=("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"),
             channel=_channel_env_file(), vault=_token_from_vault)
     else:
         # No core src/ next to this skill: the env tier is all there is.
-        gc = _credential_contract()
         raw, _ = gc.resolve_alias_precedence(
             os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
         url, _ = gc.resolve_alias_precedence(

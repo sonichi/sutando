@@ -9,6 +9,12 @@ Raised by @sonichi reviewing #3632, which covered the bridge reply path and
 task-progress but not this sender. Suppression happens AT THE SEND: stripping
 URLs from the body would destroy the links the alert exists to deliver.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import pathlib
 import sys

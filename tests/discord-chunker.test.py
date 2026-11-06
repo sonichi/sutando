@@ -5,6 +5,11 @@ Both src/discord-bridge.py and src/dm-result.py carry copies of the chunker;
 test both. Loads via importlib because filenames contain hyphens.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import tempfile
 import importlib.util
 import os

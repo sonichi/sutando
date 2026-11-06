@@ -24,9 +24,10 @@ Usage:
   ensure-cron-room.py --crons-file <path> [--name <cron> | --all]
                       [--owner <mxid>] [--repo <repo-root>] [--dry-run]
 
-Token: src/relay_credentials.py (env, then the ag2space channel env, the vault,
-then <repo>/.env). Combined `https://<gateway>|<secret>` form is split; a bare
-secret needs a URL alias.
+Token: on an install with several connections, connections.room_credential
+selects the room's server (or the primary). Otherwise src/relay_credentials.py
+resolves env, channel env, vault, then <repo>/.env. Combined
+`https://<gateway>|<secret>` form is split; a bare secret needs a URL alias.
 Owner mxid: --owner, else $AG2_OWNER_MXID, else the token's own account is not
 discoverable here so we require one of those when creating.
 """
@@ -39,12 +40,37 @@ import urllib.request
 import urllib.error
 
 
-def resolve_token(repo=None):
-    """(url, secret) from src/relay_credentials.py, or (None, None) when unconfigured.
+class NoConnection(RuntimeError):
+    """The room's server has no usable connection; never answered with another server's token."""
 
-    `repo` names the repo whose `.env` is the last tier; None uses the resolver's own."""
+
+def _routed(repo, room):
+    """(url, secret) the core's connections.room_credential names for `room` (None: the
+    primary), or None to keep the env/.env chain. NoConnection on its refusal."""
+    src = os.path.join(repo, "src")
+    if not os.path.isfile(os.path.join(src, "connections.py")):
+        return None
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    import connections
+    try:
+        got = connections.room_credential(room)
+    except connections.ConnectionsError as e:
+        raise NoConnection(str(e)) from None
+    if got is None:
+        return None
+    url, token = got
+    return url.rstrip("/"), connections.secret_of(token) or token.strip()
+
+
+def resolve_token(repo=None, room=None):
+    """Resolve room routing first, then the shared relay credential tiers."""
     from pathlib import Path
-    src = str(Path(__file__).resolve().parents[2] / "src")
+    root = Path(__file__).resolve().parents[2]
+    routed = _routed(str(repo) if repo is not None else str(root), room)
+    if routed is not None:
+        return routed
+    src = str(root / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
     from relay_credentials import resolve_relay_credentials
@@ -114,7 +140,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    url, secret = resolve_token(a.repo)
+    try:
+        url, secret = resolve_token(a.repo)
+    except NoConnection as e:
+        print(f"ensure-cron-room: {e} — skipping, no rooms created.")
+        return 0
     if not (url and secret):
         print("ensure-cron-room: not connected to AG2 Space (no gateway token) — skipping, no rooms created.")
         return 0

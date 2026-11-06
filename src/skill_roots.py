@@ -1,6 +1,7 @@
 """Where installed skills live, and what their manifests declare — the one Python scan of the
 sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair
-`skills/install.sh` links (the TS loader `loadSkillManifestTools` scans the same two). Generic:
+`skills/install.sh` links (the TS loader `loadSkillManifestTools` scans these and more; consumers
+and their roots are listed in skills/MANIFEST.md). Generic:
 a caller names the manifest FIELD it wants, never a skill; a disabled manifest is skipped; the
 declared script must resolve inside its own skill, symlinks followed (a manifest may be a third
 party's). Two declarers, in one root or one per root, are a conflict nobody picks from —
@@ -13,10 +14,13 @@ script, or none and why. Core helpers receive that; they do not call this.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 from typing import NamedTuple, Optional
 
 REPO_SKILLS = Path(__file__).resolve().parent.parent / "skills"  # lint-workspace-resolution: allow-repo-root
+MANIFEST_MAX_BYTES = 1 << 20
 
 
 class DeclarationConflict(RuntimeError):
@@ -41,9 +45,24 @@ def skill_roots(workspace=None) -> list:
     return roots
 
 
-def declared_scripts(field: str, roots) -> list:
+def read_manifest(path: Path):
+    """A manifest's JSON, read without ever waiting: a FIFO, device or directory there, or one over
+    MANIFEST_MAX_BYTES, raises OSError or ValueError instead of blocking or reading on."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        data = f.read(MANIFEST_MAX_BYTES + 1)
+    if len(data) > MANIFEST_MAX_BYTES:
+        raise ValueError(f"{path} is over {MANIFEST_MAX_BYTES} bytes")
+    return json.loads(data.decode("utf-8"))
+
+
+def declared_scripts(field: str, roots, suffixes=None) -> list:
     """(skill name, script) per enabled manifest under `roots` declaring `field` with a script that
-    resolves inside its skill. `roots`: one directory or several."""
+    resolves inside its skill, and ends in one of `suffixes` when given. `roots`: one directory or
+    several. A manifest that cannot be read or resolved, whatever the error, is skipped; the others
+    still count."""
     dirs = [Path(roots)] if isinstance(roots, (str, Path)) else [Path(d) for d in roots]
     out: list = []
     seen: set = set()
@@ -54,17 +73,25 @@ def declared_scripts(field: str, roots) -> list:
                 continue
             seen.add(name)
             try:
-                data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+                found = _declaration(manifest, field, suffixes)
+            except Exception:  # noqa: BLE001 — one unreadable or unresolvable manifest skips only itself
                 continue
-            rel = data.get(field) if isinstance(data, dict) else None
-            if not isinstance(rel, str) or not rel or data.get("enabled") is False:
-                continue
-            skill = manifest.parent.resolve()
-            script = (skill / rel).resolve()
-            if script.is_relative_to(skill) and script.is_file():
-                out.append((name, script))
+            if found:
+                out.append((name, found))
     return out
+
+
+def _declaration(manifest: Path, field: str, suffixes) -> Optional[Path]:
+    """The script one manifest declares for `field`, when enabled, suffixed and contained; else None."""
+    data = read_manifest(manifest)
+    rel = data.get(field) if isinstance(data, dict) else None
+    if not isinstance(rel, str) or not rel or data.get("enabled") is False:
+        return None
+    if suffixes is not None and not rel.endswith(tuple(suffixes)):
+        return None
+    skill = manifest.parent.resolve()
+    script = (skill / rel).resolve()
+    return script if script.is_relative_to(skill) and script.is_file() else None
 
 
 def declared_script(field: str, roots) -> Optional[Path]:

@@ -86,7 +86,7 @@ class SpawnRetained(SpawnRefused):
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, **kw)
+    return subprocess.run(argv, **{"capture_output": True, "text": True, **kw})
 
 
 def per_instance_sentinel_supported(repo, runner=_run) -> bool:
@@ -130,7 +130,9 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
     """
     socket = socket or default_socket()
     try:
-        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
+        # Captured whatever the runner: absence is read from stderr, so a bare runner reads "unknown".
+        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"],
+                   capture_output=True, text=True)
     except Exception as e:                                   # noqa: BLE001
         return "unknown", f"tmux could not be run: {e}"
     rc = getattr(r, "returncode", None)
@@ -150,6 +152,58 @@ def session_state(name: str, socket=None, runner=_run) -> str:
     return session_probe(name, socket, runner)[0]
 
 
+def pane_pid(name: str, socket=None, runner=_run) -> int | None:
+    """The pid of the process tmux is running in this session's one pane.
+
+    The launchers exec the CLI entry point: native Claude, or the standard
+    Codex npm wrapper whose lifetime follows its native child. Isolated tmux
+    fixtures verify both lifecycles; custom wrappers that outlive their child
+    are not covered. `None`
+    when the session or its pane cannot be read; a caller treats that as
+    "no beat this time" rather than failing the whole spawn over it.
+    """
+    try:
+        r = runner(["tmux", "-S", socket or default_socket(), "list-panes",
+                    "-t", name, "-F", "#{pane_pid}"])
+    except Exception:                                        # noqa: BLE001
+        return None
+    out = ((getattr(r, "stdout", None) or "").strip().splitlines() or [""])[0]
+    return int(out) if out.isdigit() else None
+
+
+def start_worker_beat(workspace, worker_id: str, watch_pid: int, *,
+                      repo=None, popen=subprocess.Popen) -> bool:
+    """Fire-and-forget `state/workers/<id>.alive`, watching the CLI entry point pid by
+    signal rather than by parentage.
+
+    Why not `--parent-pid`: nothing this module can spawn is born (and STAYS)
+    a direct OS child of the tmux pane's process — the pid `popen` returns
+    here is a child of THIS process, spawn_worker.py, which exits once the
+    caller's CLI invocation is done; the beat writer is then reparented to
+    PID 1 within moments. `--watch-pid` doesn't care: it asks about
+    `watch_pid` by signal, not about its own ancestry, so that reparenting is
+    harmless — proven live in tests/skills/worker-pool/worker-writes-its-beat.test.sh (spawned
+    the same detached way, SIGKILL of the watched pid, beat writer exits
+    within ~2s; SIGKILL of the beat writer alone leaves the watched pid
+    untouched).
+
+    Never raises: a beat that fails to start is a `state: live, beat: absent`
+    worker, which the roster's own three-state design already tolerates —
+    not a reason to roll back an otherwise-successful spawn.
+    """
+    script = Path(repo or _REPO) / "skills" / "worker-pool" / "scripts" / "pool_beat.py"
+    if not script.is_file():
+        return False
+    try:
+        popen([sys.executable, str(script), "--workspace", str(workspace),
+              "--kind", "worker", "--id", worker_id, "--watch-pid", str(watch_pid)],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
 def session_exists(name: str, socket=None, runner=_run) -> bool:
     """Kept for callers that only ask the yes/no question; "unknown" is not a
     "no", so it answers True and they refuse rather than proceed."""
@@ -157,7 +211,7 @@ def session_exists(name: str, socket=None, runner=_run) -> bool:
 
 
 def core_runtime(repo, runner=_run) -> str:
-    """The runtime the core is configured for; a worker runs the same one."""
+    """The runtime the core is configured for; fresh workers default to it."""
     r = runner(["bash", str(Path(repo) / "scripts" / "sutando-config.sh"), "core-runtime"])
     return ((r.stdout or "").strip() if r.returncode == 0 else "") or "claude"
 
@@ -290,7 +344,8 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
                 return {"ensured": False, "conflict": True, "plist": legacy["plist"],
                         "why": "legacy timer is installed but not loaded; "
                                "run an explicit install to migrate it"}
-            if st.get("loaded"):
+            want = prt.stop_interrupt_setting()
+            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):
                 return {"ensured": False, "why": "already installed",
                         "plist": st["plist"], "label": st["label"]}
 
@@ -315,6 +370,20 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     the only part that starts reading.
     """
     socket = socket or default_socket()
+    # Rooms are bound to a worker's id and inbox, so re-minting either would
+    # leave every binding pointing at nothing. Only the run is new.
+    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
+    if resume and not resumed_id:
+        raise SpawnRefused(
+            f"no worker in this workspace has session {resume!r} in its lineage; "
+            "refusing rather than resuming a conversation into a stranger's record")
+    if resumed_id:
+        session = next((row for row in wi.sessions(workspace, resumed_id)
+                        if row.get("session_id") == resume), {})
+        if not runtime:
+            runtime = session.get("runtime")
+        if not cwd:
+            cwd = (session.get("transcript") or {}).get("cwd", "")
     runtime = resolve_runtime(repo, runtime, runner)
     if runtime == "codex" and resume:
         raise SpawnRefused("Codex cannot resume without a recorded CLI session id")
@@ -331,13 +400,6 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             "this checkout writes ONE watcher sentinel for every watcher, so a "
             "second watcher would erase the core's stamp — refusing to spawn")
 
-    # Rooms are bound to a worker's id and inbox, so re-minting either would
-    # leave every binding pointing at nothing. Only the run is new.
-    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
-    if resume and not resumed_id:
-        raise SpawnRefused(
-            f"no worker in this workspace has session {resume!r} in its lineage; "
-            "refusing rather than resuming a conversation into a stranger's record")
     session_id = resume or (None if runtime == "codex" else str(uuid.uuid4()))
 
     # Preconditions are answered BEFORE the first durable write: a refusal after
@@ -410,9 +472,16 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {why}")
 
+    # Best-effort: a beat that fails to start is `state: live, beat: absent`,
+    # which the roster's own three-state design already tolerates.
+    beat_started = False
+    watch_pid = pane_pid(name, socket, runner)
+    if watch_pid is not None:
+        beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
+
     remedy = ensure_remedy_timer(workspace, repo, runner=runner)
     return {**p, **rec, "runtime_session_id": session_id, "started": True,
-            "remedy_timer": remedy}
+            "beat_started": beat_started, "remedy_timer": remedy}
 
 
 def main(argv=None) -> int:
@@ -421,7 +490,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(_REPO))
     ap.add_argument("--folder", default="", help="the worker's working directory")
     ap.add_argument("--label", default="")
-    ap.add_argument("--runtime", default="", help="default: the core's configured runtime")
+    ap.add_argument("--runtime", default="",
+                    help="default: the core's configured runtime for fresh workers; "
+                         "the recorded session's runtime for --resume")
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (default)")
     ap.add_argument("--resume", default="", metavar="SESSION_ID",

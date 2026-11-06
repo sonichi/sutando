@@ -122,6 +122,31 @@ class ResolverOrder(_Hermetic):
         c = rc.resolve_relay_credentials()
         self.assertEqual((c.base_url, c.token, c.origin), (self.URL, tok, "channel-env"))
 
+    def test_active_lane_keeps_its_url_with_its_token(self):
+        self.channel_env("REMOTE_TASK_URL=https://other.example.invalid\n")
+        self.only_in_repo()
+        _VAULT["REMOTE_TASK_TOKEN"] = "fake-vault"
+        with mock.patch.object(rc, "active_lane_credentials", return_value={
+                "REMOTE_TASK_TOKEN": "fake-lane",
+                "REMOTE_TASK_URL": "https://lane.example.invalid"}):
+            c = rc.resolve_relay_credentials(environ={
+                "REMOTE_TASK_URL": "https://env.example.invalid"})
+        self.assertEqual((c.base_url, c.token, c.origin),
+                         ("https://lane.example.invalid", "fake-lane", "active-lane"))
+
+    def test_explicit_or_nonprimary_lane_never_uses_active_lane(self):
+        with mock.patch.object(rc, "active_lane_credentials") as active:
+            rc.resolve_relay_credentials(environ={"REMOTE_TASK_CHANNEL_DIR": "dev-ag2space"})
+            rc.resolve_relay_credentials("dev-ag2space", environ={})
+        active.assert_not_called()
+
+    def test_url_only_channel_pairs_with_vault_token(self):
+        self.channel_env(f"REMOTE_TASK_URL={self.URL}\n")
+        _VAULT["REMOTE_TASK_TOKEN"] = "fake-vault"
+        c = rc.resolve_relay_credentials()
+        self.assertEqual((c.base_url, c.token, c.origin),
+                         (self.URL, "fake-vault", "vault"))
+
     def test_repo_env_alone(self):
         tok = self.only_in_repo()
         c = rc.resolve_relay_credentials()

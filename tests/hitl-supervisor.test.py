@@ -67,7 +67,7 @@ class SupervisorTests(unittest.TestCase):
         # is ever sent (detect-then-project ordering); recovery is one new message.
         self.run_pass(LOGGED_OUT)
         self.run_pass(LOGGED_IN)
-        ops = [(p["op"], "extra_content" in p) for p in self.send.sent]
+        ops = [(p["op"], "space.ag2.hitl" in p.get("extra_content", {})) for p in self.send.sent]
         self.assertEqual(ops, [("message", True), ("edit", True), ("message", False)])
 
     def test_probe_unknown_projects_pending_state_unchanged(self):

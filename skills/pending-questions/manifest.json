@@ -6,6 +6,16 @@
   "stability": "experimental",
   "description": "Ask the owner, list what waits on him, resolve and remind; the store of owner pending questions (room database, outbox replay, legacy ingest, reminder) and the adapter core reaches it through.",
   "pending_questions_store": "scripts/pending_questions_room_db.py",
+  "hooks": [
+    {
+      "event": "PreCompact",
+      "command": "./hooks/compact-carry.py"
+    },
+    {
+      "event": "SessionStart",
+      "command": "./hooks/compact-carry.py"
+    }
+  ],
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },

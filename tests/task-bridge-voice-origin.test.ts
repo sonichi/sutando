@@ -94,7 +94,7 @@ describe('setVoiceSessionOrigin — one origin per live client, opaque to the br
 			assert.equal(voiceTaskOrigin(t.taskId)?.target, 'place-a');
 			assert.match(body, /^channel_id: place-a$/m);
 			assert.doesNotMatch(body, /words said in place b/, 'none of the new session\'s words reach the task');
-			assert.match(body, /words said in place a/, 'the context is the one the task was asked in');
+			assert.match(body, /assistant: On it\./, 'the context is the live conversation the task was asked in');
 			rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
 		} finally {
 			setVoiceTurnsProvider(null);

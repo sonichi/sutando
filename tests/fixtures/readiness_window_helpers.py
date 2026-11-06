@@ -13,6 +13,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from clean_watcher_env import clean_env  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 
 def watcher_env(tmp, ws, b, extra=None):
@@ -69,11 +71,11 @@ def write_task(ws, name):
 
 
 def start(ws, env, stderr=subprocess.DEVNULL):
-    return subprocess.Popen(
+    return popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=stderr,
-        text=True, start_new_session=True)
+        text=True)
 
 
 def pump(p, out, until, timeout=12, settle=1.5):
