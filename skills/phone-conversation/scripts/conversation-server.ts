@@ -1,5 +1,5 @@
-import { readVerifiedResult } from '../../../src/result-read.js';
 #!/usr/bin/env npx tsx
+import { readVerifiedResult } from '../../../src/result-read.js';
 /**
  * Phone Conversation Server — Twilio Media Streams + bodhi VoiceSession
  *

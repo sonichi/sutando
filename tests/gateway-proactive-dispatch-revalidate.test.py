@@ -16,6 +16,8 @@ Run: python3 tests/gateway-proactive-dispatch-revalidate.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import functools
 import json
 import sys
@@ -36,7 +38,7 @@ TID = "task-1761300000000"
 
 
 def land_result(lane):
-    (lane.results / f"{TID}.txt").write_text("the answer\n", encoding="utf-8")
+    publish_result(lane.results / f"{TID}.txt", "the answer\n", encoding="utf-8")
 
 
 def land_cancel(lane):

@@ -61,6 +61,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
+from delivery.readiness import read_ready_result
 from urllib.parse import parse_qs, urlparse, unquote
 
 
@@ -384,7 +385,9 @@ def _task_display_fields_for_id(task_id: str) -> tuple[str, str]:
 
 def _remember_done_result_file(result_file: Path) -> None:
     task_id = result_file.stem
-    result_content = result_file.read_text().strip()
+    result_content = read_ready_result(result_file)
+    if result_content is None:
+        return
     task_line, source_line = _task_display_fields_for_id(task_id)
     display_text = task_line or (result_content.split('\n')[0][:80] if result_content else task_id)
 
@@ -444,12 +447,7 @@ def get_status() -> dict:
 
 
 def _read_or_none(path) -> "str | None":
-    """Stripped file text, or None when it is absent — one call, no exists()
-    race between the check and the read."""
-    try:
-        return path.read_text().strip()
-    except FileNotFoundError:
-        return None
+    return read_ready_result(path)
 
 
 def _newest_first(paths) -> list:
@@ -539,9 +537,10 @@ def _active_task_rows() -> list[dict]:
             continue
         task_file = TASK_DIR / f"{task_id}.txt"
         result_file = RESULT_DIR / f"{task_id}.txt"
-        if result_file.exists():
+        body = read_ready_result(result_file)
+        if body is not None:
             task_data["status"] = "done"
-            task_data["result"] = result_file.read_text().strip()
+            task_data["result"] = body
         elif not task_file.exists() and _time.time() - task_data.get("time", 0) > 300:
             stale_ids.append(task_id)
     for task_id in stale_ids:
@@ -932,9 +931,10 @@ def _guard_result_by_tier(task_id: str, body: str) -> str:
 def get_task_result(task_id: str):
     """Check if a task result exists."""
     result_file = _safe_path(RESULT_DIR, task_id)
-    if result_file and result_file.exists():
+    body = read_ready_result(result_file) if result_file else None
+    if body is not None:
         return {"task_id": _safe_id(task_id), "status": "completed",
-                "result": _guard_result_by_tier(task_id, result_file.read_text())}
+                "result": _guard_result_by_tier(task_id, body)}
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
     # Delegated: the archive move above mints `<id>-<epoch>.txt` on collision, a
@@ -942,11 +942,12 @@ def get_task_result(task_id: str):
     safe_id = _safe_id(task_id)
     if safe_id:
         archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
-        if archived is not None:
+        body = read_ready_result(archived) if archived is not None else None
+        if body is not None:
             # Guarded like the live branch: archival is where room polls usually
             # land, so skipping it here would bypass the boundary in the common case.
             return {"task_id": safe_id, "status": "completed",
-                    "result": _guard_result_by_tier(task_id, archived.read_text())}
+                    "result": _guard_result_by_tier(task_id, body)}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}

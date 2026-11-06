@@ -7,6 +7,8 @@ None and the dedup is honoured — the holder is answered, the asker hears
 nothing, and every existence check passes. Measured: 74 such silences in one
 20-member room across 6 senders.
 """
+from _helpers.paired_result import publish_result
+
 import sys
 import tempfile
 import unittest
@@ -64,7 +66,7 @@ class PlanRefusesCrossSenderDedup(unittest.TestCase):
             victim = victim.replace("access_tier: team\n", f"access_tier: team\ndedup_requeue_count: {count}\n")
         (tasks / "task-victim.txt").write_text(victim)
         (tasks / "task-holder.txt").write_text(_task("task-holder", holder_user))
-        (results / "task-holder.txt").write_text(holder_result)
+        publish_result(results / "task-holder.txt", holder_result)
         return plan_dedup_recovery(
             results, tasks, "task-victim", "task-holder", ROOM, "task-new",
         )

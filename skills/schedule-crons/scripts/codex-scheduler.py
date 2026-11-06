@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_archive import find_task_file  # noqa: E402
 from result_publish import publish_text  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 from cron_loop_policy import is_core_main_loop, main_loop_problem  # noqa: E402
 from loop_completion import write_completion  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
@@ -289,12 +290,13 @@ def _find_result(workspace: Path, task_ids: list[str]) -> Path | None:
     archive = workspace / "results" / "archive"
     for task_id in task_ids:
         live = workspace / "results" / f"{task_id}.txt"
-        if live.exists():
+        if read_ready_result(live) is not None:
             return live
         legacy = archive / f"{task_id}.txt"
-        if legacy.exists():
+        if read_ready_result(legacy) is not None:
             return legacy
-        archived = sorted(archive.glob(f"*/{task_id}.txt"))
+        archived = sorted(p for p in archive.glob(f"*/{task_id}.txt")
+                          if read_ready_result(p) is not None)
         if archived:
             return archived[-1]
     return None

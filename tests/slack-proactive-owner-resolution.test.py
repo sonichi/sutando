@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for proactive Slack owner-recipient resolution."""
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -108,7 +110,7 @@ def main():
     bridge.ACCESS_FILE = access_file
     access_file.write_text(json.dumps(current_live_shape))
     proactive = bridge.RESULTS_DIR / "proactive-owner-resolution-test.txt"
-    proactive.write_text("owner-only live-path fixture")
+    publish_result(proactive, "owner-only live-path fixture")
     watcher = threading.Thread(target=bridge.result_watcher, daemon=True)
     watcher.start()
     time.sleep(0.3)
@@ -118,7 +120,7 @@ def main():
     # An unreadable/malformed access file must take the explicit no-owner skip
     # path, never guess a team recipient or crash the watcher.
     access_file.write_text("{not-json")
-    (bridge.RESULTS_DIR / "proactive-no-owner-test.txt").write_text("must not send")
+    publish_result(bridge.RESULTS_DIR / "proactive-no-owner-test.txt", "must not send")
     time.sleep(1.2)
     assert len(bridge.app.client.calls) == 1
     print("PASS: proactive Slack notifications resolve only to the configured owner")

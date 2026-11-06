@@ -7,6 +7,8 @@ has already failed.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import sys
 import tempfile
 import unittest
@@ -63,9 +65,9 @@ class _Harness:
         return False
 
     def seed(self, holder_body: str, orig_task: str, result_body: str):
-        (self.gw.ARCHIVE_RESULTS_DIR / f"{HOLDER}-1785976425.txt").write_text(holder_body)
+        publish_result(self.gw.ARCHIVE_RESULTS_DIR / f"{HOLDER}-1785976425.txt", holder_body)
         (self.gw.TASKS_DIR / f"{TID}.txt").write_text(orig_task)
-        (self.gw.RESULTS_DIR / f"{TID}.txt").write_text(result_body)
+        publish_result(self.gw.RESULTS_DIR / f"{TID}.txt", result_body)
         if holder_body.strip():
             from ag2_sparrow.delivery_core import DeliveryOutcome
             self.gw._delivery_core().backend.publish(
@@ -140,7 +142,7 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                 new_id = requeued[0].stem
                 self.assertIn(f"channel_id: {ROOM}", requeued[0].read_text())
                 self.assertEqual(h.rooms[new_id], ROOM)
-                (h.gw.RESULTS_DIR / f"{new_id}.txt").write_text("answer in asking room")
+                publish_result(h.gw.RESULTS_DIR / f"{new_id}.txt", "answer in asking room")
                 self.gw._post_ready_results(inflight)
                 self.assertEqual(len(h.posts), 1)
                 self.assertEqual(h.posts[0]["payload"]["id"], self.gw._broker_tid(TID))
@@ -200,7 +202,7 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                     "for the recovered answer")
 
                 # The core answers the re-asked task.
-                (h.gw.RESULTS_DIR / f"{new_id}.txt").write_text("the recovered answer")
+                publish_result(h.gw.RESULTS_DIR / f"{new_id}.txt", "the recovered answer")
                 self.gw._post_ready_results(inflight)          # pass 2: deliver
 
                 bodies = [p["payload"]["body"] for p in h.posts]
@@ -285,7 +287,7 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                 self.gw._post_ready_results(inflight)          # pass 1: re-ask
                 new_id = h.requeued_tasks()[0].stem
                 h.gw.DEDUP_ALIAS_FILE.write_text("{")           # corrupt it
-                (h.gw.RESULTS_DIR / f"{new_id}.txt").write_text("the recovered answer")
+                publish_result(h.gw.RESULTS_DIR / f"{new_id}.txt", "the recovered answer")
                 h.posts.clear()
                 self.gw._post_ready_results(inflight)          # pass 2
 
@@ -330,7 +332,7 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with _Harness(self.gw, Path(td)) as h:
                 (h.gw.TASKS_DIR / f"{TID}.txt").write_text(ORIG)
-                (h.gw.RESULTS_DIR / f"{TID}.txt").write_text(DEDUP)
+                publish_result(h.gw.RESULTS_DIR / f"{TID}.txt", DEDUP)
                 inflight = {TID}
                 self.gw._post_ready_results(inflight)
                 self.assertEqual(len(h.requeued_tasks()), 1)

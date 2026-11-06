@@ -12,6 +12,8 @@ consumer quietly grows a private copy back, and that is exactly how the drift
 started.
 """
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import sys
 import tempfile
@@ -41,7 +43,7 @@ def _ws(results=None, archive=None, tasks=None, task_archive=None) -> Path:
     for d, files in (("results", results), ("results/archive", archive),
                      ("tasks", tasks), ("tasks/archive", task_archive)):
         for n, b in (files or {}).items():
-            (ws / d / n).write_text(b)
+            publish_result(ws / d / n, b) if d.startswith("results") else (ws / d / n).write_text(b)
     return ws
 
 
@@ -57,7 +59,7 @@ class ResultPath(unittest.TestCase):
     def test_result_prefix_collision_does_not_count_as_a_reply(self):
         ws = _ws(archive={"task-b-extra.txt": "some other task's answer"})
         self.assertIsNone(ds.result_path(ws / "results", "task-b"))
-        (ws / "results/archive/task-b-1788000001.txt").write_text("actual holder")
+        publish_result(ws / "results/archive/task-b-1788000001.txt", "actual holder")
         self.assertEqual(ds.result_path(ws / "results", "task-b").read_text(), "actual holder")
 
     def test_the_real_archive_shape_IS_found(self):

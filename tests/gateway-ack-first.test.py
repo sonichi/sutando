@@ -18,6 +18,8 @@ Run: python3 tests/gateway-ack-first.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import io
 import json
@@ -480,9 +482,9 @@ class AcknowledgingFirst(_Bridge):
     def test_an_archived_task_or_its_result_proves_the_publish_after_a_crash(self):
         # The publish happened and the entry's removal did not: what the core did since proves it.
         moves = {"archived task": lambda t: t.rename(gw.TASKS_DIR / "archive" / t.name),
-                 "live result": lambda t: (t.unlink(), (gw.RESULTS_DIR / t.name).write_text("Clear.")),
-                 "archived result": lambda t: (t.unlink(), (gw.ARCHIVE_RESULTS_DIR
-                                                           / f"{t.stem}-1785976425.txt").write_text("Clear."))}
+                 "live result": lambda t: (t.unlink(), publish_result(gw.RESULTS_DIR / t.name, "Clear.")),
+                 "archived result": lambda t: (t.unlink(), publish_result(gw.ARCHIVE_RESULTS_DIR
+                                                           / f"{t.stem}-1785976425.txt", "Clear."))}
         (gw.TASKS_DIR / "archive").mkdir()
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
         for n, (name, move) in enumerate(moves.items()):
@@ -793,7 +795,7 @@ class TheMark(_Bridge):
             self.assertTrue(self.take(voice_ask(ask)))
         self.deliver(ASK_A)                                # archived: nothing of it is live
         self.deliver(ASK_B)
-        (gw.RESULTS_DIR / f"{ASK_B}.txt").write_text("Clear.")    # accepted, not yet archived
+        publish_result(gw.RESULTS_DIR / f"{ASK_B}.txt", "Clear.")    # accepted, not yet archived
         gw._retire_delivered_marks()
         self.assertEqual(self.marks(), {ASK_B: ASK_B, ASK_C: ASK_C})
 
@@ -802,7 +804,7 @@ class TheMark(_Bridge):
         reask = gw._reask_id(ASK_A)
         gw.DEDUP_ALIAS_FILE.write_text(json.dumps({reask: ASK_A}))
         self.deliver(ASK_A)
-        (gw.RESULTS_DIR / f"{reask}.txt").write_text("Clear.")
+        publish_result(gw.RESULTS_DIR / f"{reask}.txt", "Clear.")
         gw._retire_delivered_marks()
         self.assertEqual(self.marks(), {ASK_A: ASK_A})
 
@@ -1101,7 +1103,7 @@ class ThroughTheLoop(unittest.TestCase):
     def test_the_same_crash_with_the_task_answered_by_the_core_runs_it_once(self):
         def answer(task):
             task.unlink()
-            (self.ws / "results" / task.name).write_text("Your calendar is clear.")
+            publish_result(self.ws / "results" / task.name, "Your calendar is clear.")
         # The outbound worker posts it on its own cadence, not the poll loop's.
         self.crash_between_the_publish_and_the_entrys_removal(answer, settled=lambda: self.relay.results)
         self.assertEqual([r["id"] for r in self.relay.results], [ASK_A])
@@ -1143,7 +1145,7 @@ class ThroughTheLoop(unittest.TestCase):
         self.bridges.stop(first)
         self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: ASK_A})
         self.relay.refusing = True
-        (self.ws / "results" / f"{ASK_A}.txt").write_text("Your calendar is clear.")
+        publish_result(self.ws / "results" / f"{ASK_A}.txt", "Your calendar is clear.")
         second = self.bridges.start()
         self.bridges.refused_result_recorded(second, ASK_A)
         self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: ASK_A},

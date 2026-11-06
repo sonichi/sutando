@@ -43,6 +43,8 @@ from claude_code_fixtures import (  # noqa: E402
     unhold, verify_py, wait_for, wait_gone, write_fake_claude,
 )
 
+from ag2_sparrow.result_publish import publish_text
+
 
 class PluginShape(unittest.TestCase):
     def test_manifest_and_hooks_point_at_the_module(self):
@@ -325,10 +327,10 @@ class InboxCli(ConnectBase):
                 key.unlink()
             self.task(sc["task"], sc["tier"], sc.get("extra", ""))
             if "result" in sc:
-                (self.results / (sc["task"] + ".txt")).write_text(sc["result"])
+                publish_text(self.results / (sc["task"] + ".txt"), sc["result"])
             if "archived" in sc:
                 (self.results / "archive").mkdir(exist_ok=True)
-                (self.results / "archive" / (sc["task"] + ".txt")).write_text(sc["archived"])
+                publish_text(self.results / "archive" / (sc["task"] + ".txt"), sc["archived"])
             saved = {}
             for i, step in enumerate(sc["steps"]):
                 argv = [saved.get(a[1:-1], a) if a.startswith("{") else a for a in step["argv"]]
@@ -439,7 +441,7 @@ class InboxCli(ConnectBase):
         retires it, yet verify, the card and the next record write all drop the mark."""
         self.assertEqual(self.verb("progress", "--stuck", "task-gone", "--stuck-detail", "parked")[0], 0)
         self.assertIn("task-gone", records.load_plugin(self.root)["stuck"])
-        (self.results / "task-gone.txt").write_text("published by another route\n")
+        publish_text(self.results / "task-gone.txt", "published by another route\n")
         with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertNotIn("unanswered", self.main("verify")[1])
         lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
@@ -463,7 +465,7 @@ class InboxCli(ConnectBase):
             rc, out = self.verb("claim", t)
             self.assertEqual((rc, out.get("retry")), (1, True), "a claim of an unready result is a retry too: " + t)
             self.assertIn(t, records.load_plugin(self.root)["stuck"], "unresolved: the mark stays")
-            (self.results / (t + ".txt")).write_text("a real answer\n")
+            publish_text(self.results / (t + ".txt"), "a real answer\n")
         rc, out = self.verb("claim", "task-ws")
         self.assertEqual((rc, "retry" in out), (1, False), "a ready result: the claim refuses for good")
         self.assertNotIn("task-ws", records.load_plugin(self.root)["stuck"], "and the CLI cleared the mark")
@@ -488,7 +490,7 @@ class InboxCli(ConnectBase):
         for t, failing in cases:
             self.task(t)
             self.assertEqual(self.verb("progress", "--stuck", t)[0], 0)
-            (self.results / (t + ".txt")).write_text("answered out of band\n")
+            publish_text(self.results / (t + ".txt"), "answered out of band\n")
             with failing:
                 rc, out = self.verb("claim", t)
             self.assertEqual((rc, out.get("retry"), "cleanup pending" in out["refused"]), (1, True, True),

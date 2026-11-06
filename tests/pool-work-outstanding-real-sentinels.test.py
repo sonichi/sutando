@@ -9,6 +9,8 @@ and the fast resume. The worker's own question is task_dispatch's `owned-by`
 less the tasks with a ready result, live or archived: the same contract
 `check-pending-tasks.sh` uses for a worker session.
 """
+
+from _helpers.paired_result import publish_result
 import importlib.util
 import json
 import sys
@@ -59,7 +61,7 @@ archive.mkdir(parents=True)
 for i in range(148):
     tid = f"task-17{i:08d}"
     (inbox / f"{tid}.txt").write_bytes(b"")
-    (archive / f"{tid}.txt").write_text(f"reply {i}\n")
+    publish_result(archive / f"{tid}.txt", f"reply {i}\n")
 
 check("fixture: a delivered reply is ready to task_dispatch",
       td.has_ready_result(pd.results_dir(ws), "task-1700000000.txt"), True)
@@ -71,21 +73,21 @@ check("148 answered zero-byte sentinels owe nothing", worker_owes(ws, WID), Fals
 (ws / "tasks" / "task-1799999999.txt").write_text("task: hello\n")
 check("(a) zero-byte .txt, no .accepted, no result: owed", worker_owes(ws, WID), True)
 
-(pd.results_dir(ws) / "task-1799999999.txt").write_text("")
+publish_result(pd.results_dir(ws) / "task-1799999999.txt", "")
 check("(a) an EMPTY live result delivers nothing: still owed", worker_owes(ws, WID), True)
 
 # (b) the same task once answered, live in results/ or drained to results/archive/.
-(pd.results_dir(ws) / "task-1799999999.txt").write_text("answered\n")
+publish_result(pd.results_dir(ws) / "task-1799999999.txt", "answered\n")
 check("(b) its reply live in results/: not owed", worker_owes(ws, WID), False)
 (pd.results_dir(ws) / "task-1799999999.txt").unlink()
-(archive / "task-1799999999.txt").write_text("answered\n")
+publish_result(archive / "task-1799999999.txt", "answered\n")
 check("(b) its reply in results/archive/: not owed", worker_owes(ws, WID), False)
 
 # (c) a task the worker really accepted and has not answered: owed.
 (inbox / "task-1800000000.accepted").write_bytes(b"")
 (ws / "tasks" / "task-1800000000.txt").write_text("task: hello\n")
 check("(c) accepted, no result: owed", worker_owes(ws, WID), True)
-(archive / "task-1800000000.txt").write_text("answered\n")
+publish_result(archive / "task-1800000000.txt", "answered\n")
 check("(c) accepted, then answered: not owed", worker_owes(ws, WID), False)
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — worker work signal on real sentinels")

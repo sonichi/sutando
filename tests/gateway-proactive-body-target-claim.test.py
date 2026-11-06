@@ -19,6 +19,8 @@ Run: python3 tests/gateway-proactive-body-target-claim.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import json
 import os
@@ -91,7 +93,7 @@ def run(body: str, last_active: str, passes: int = 2):
     mod._reenroll_identity = lambda: AGENT
     mod._ROUTING.update(owner_dm=OWNER_DM, loaded=True, next=time.time() + 3600)
     queued = ws / "results" / "proactive-1.txt"
-    queued.write_text(body, encoding="utf-8")
+    publish_result(queued, body, encoding="utf-8")
     gate_is_production = mod.PROACTIVE_CLAIM_GATE is mod._ag2space_proactive_claim_gate
     for _ in range(passes):
         mod._post_proactive()

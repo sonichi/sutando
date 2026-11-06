@@ -6,6 +6,8 @@ Temporary state follows TMPDIR; no task consumer or external service is used.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -274,7 +276,7 @@ class TaskIdempotencyTests(unittest.TestCase):
             archive.mkdir()
             public.rename(archive / public.name)
         else:
-            (self.results / public.name).write_text("Synthetic summary complete")
+            publish_result(self.results / public.name, "Synthetic summary complete")
             public.unlink()
         before = self.snapshot()
         self.restart_daemon()

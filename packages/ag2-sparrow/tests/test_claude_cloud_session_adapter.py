@@ -55,6 +55,9 @@ sys.exit(r.get("rc", 0))
 '''
 
 
+from ag2_sparrow.result_publish import publish_text  # noqa: E402
+
+
 def ok(i=1):
     return {"stdout": json.dumps({"ok": True, "session_id": SID,
                                   "url": "https://claude.ai/code/%s?turn=%d" % (SID, i)}) + "\n"}
@@ -314,7 +317,7 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual((Path(d) / "state" / "settled-ids").read_text(), "task-a\n")
             self.assertEqual(len(charges(d)), 1)
             self.assertEqual(claim(d, "task-a")["phase"], "SETTLED")
-            self.assertEqual(sorted(os.listdir(Path(d) / "state")), ["claims", "rate.jsonl", "settled-ids"])
+            self.assertEqual(sorted(os.listdir(Path(d) / "state")), ["claims", "rate.jsonl", "result-pairing", "settled-ids"])
 
     def test_each_provider_call_carries_exactly_one_task_and_never_the_session_prompt(self):
         with tempfile.TemporaryDirectory() as d:
@@ -883,7 +886,7 @@ class QueueLoopTest(unittest.TestCase):
             (Path(d) / "state").mkdir(exist_ok=True)
             (Path(d) / "state" / "settled-ids").write_text("task-old\n")
             (Path(d) / "results").mkdir(exist_ok=True)
-            (Path(d) / "results" / "task-has.txt").write_text("done")
+            publish_text(Path(d) / "results" / "task-has.txt", "done", pair_result=True)
             run_adapter(d, fake)
             self.assertEqual(fake.calls(), [])
             self.assertEqual(result(d, "task-x"), ra.NO_ROOM)

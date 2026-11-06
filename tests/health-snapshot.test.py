@@ -2,6 +2,8 @@
 """health_snapshot: per-agent verdicts from state files, and the agent-api /health route."""
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import http.server
 import importlib.util
 import io
@@ -44,6 +46,15 @@ class Workspace:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("")
         os.utime(path, (NOW - age, NOW - age))
+
+    def result(self, rel: str):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tid = path.stem.rsplit("-", 1)[0] if path.stem.rsplit("-", 1)[-1].isdigit() else path.stem
+        live = self.root / "results" / f"{tid}.txt"
+        publish_result(live, "answered")
+        if path != live:
+            live.rename(path)
 
     def lines(self, rel: str, rows):
         path = self.root / rel
@@ -133,9 +144,11 @@ class CoreVerdicts(Base):
             {"ts": NOW - 10, "kind": "processing", "task": {"id": "task-a"}}])
         self.assertEqual(self.core()["motion"], "moving")
         self.ws.touch("results/task-a.txt")
+        self.assertEqual(self.core()["motion"], "moving")
+        self.ws.result("results/task-a.txt")
         self.assertEqual(self.core()["motion"], "idle")
         (self.ws.root / "results" / "task-a.txt").unlink()
-        self.ws.touch("results/archive/task-a-1790000000.txt")
+        self.ws.result("results/archive/task-a-1790000000.txt")
         self.assertEqual(self.core()["motion"], "idle")
 
     def test_every_archive_layout_ends_the_task_and_a_longer_id_does_not(self):
@@ -147,10 +160,10 @@ class CoreVerdicts(Base):
             {"ts": NOW - 10, "kind": "processing", "task": {"id": "task-a"}}])
         for rel in layouts:
             with self.subTest(layout=rel):
-                self.ws.touch(rel)
+                self.ws.result(rel)
                 self.assertEqual(self.core()["motion"], "idle")
                 (self.ws.root / rel).unlink()
-        self.ws.touch("results/archive/2026-09/task-ab-1790000000.txt")
+        self.ws.result("results/archive/2026-09/task-ab-1790000000.txt")
         self.assertEqual(self.core()["motion"], "moving")
 
     def test_finished_or_old_activity_is_not_moving(self):

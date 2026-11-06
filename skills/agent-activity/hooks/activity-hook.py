@@ -6,7 +6,7 @@ Reads the hook payload on stdin ({hook_event_name, session_id, transcript_path, 
   (state/agent-activity.sessions.json) and writes its `processing` row from the task's own headers;
   every later PreToolUse in this session becomes a `working` row for the task bound to it
   (Read/Glob/Grep/TodoWrite skipped). A PostToolUse whose input named results/task-….txt writes
-  `done` — only after the tool ran and only if the result file now exists (a denied or failed write
+  `done` — only after the tool ran and only if the result file is verified and ready (a denied or failed write
   closes nothing).
   The agent's own `activity.py append --kind processing` still binds (and is never a row).
 - Stop reads the last assistant text of THIS session's transcript (complete lines only) -> `thinking`.
@@ -26,7 +26,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from file_lock import locked_file  # noqa: E402
-from local_task_protocol import find_result, valid_local_task_id  # noqa: E402
+from local_task_protocol import valid_local_task_id  # noqa: E402
+from delivery.task_dispatch import find_ready_result  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -141,15 +143,18 @@ def cached_answered(p: dict, session_id: str, task_id: str, entry: dict) -> bool
         cache = load_json(path, {})
         hit = cache.get(task_id)
         if isinstance(hit, dict) and hit.get("key") == key:
-            return bool(hit.get("answered"))
-        result = find_result(results, task_id)
+            if not hit.get("answered"):
+                return False
+            if hit.get("result") and read_ready_result(hit["result"]) is not None:
+                return True
+        result = find_ready_result(results, task_id)
         answer = result is not None
         if answer and entry.get("reopened") and isinstance(entry.get("pickup"), (int, float)):
             modified = _mtime(result)
             answer = modified is not None and modified >= entry["pickup"] * 1_000_000_000
         binds = load_json(p["bind"], {})
         cache = {tid: value for tid, value in cache.items() if tid in binds}
-        cache[task_id] = {"key": key, "answered": answer}
+        cache[task_id] = {"key": key, "answered": answer, "result": str(result) if result else None}
         _atomic_json(path, cache)
         return answer
 
@@ -257,7 +262,7 @@ def pickup_line(task: dict) -> str:
 def answered(ws: Path, task_id: str) -> bool:
     """A result exists — live, or archived in any shape the delivery paths write (the shared lookup
     knows the epoch-suffixed, month-partitioned and retention layouts): the task is finished."""
-    return find_result(ws / "results", task_id) is not None
+    return find_ready_result(ws / "results", task_id) is not None
 
 
 # Tools that name a file and carry no description: their step line is the verb and the file.
@@ -331,9 +336,8 @@ def consolidated_into(ws: Path, task_id: str) -> str | None:
     """When the result is a `[deduped: task-X]` pointer, the event id of X's message (the one whose
     reply answered this task too), else None. The marker grammar is result_markers'; never re-read here."""
     path = ws / "results" / f"{task_id}.txt"
-    try:
-        body = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    body = read_ready_result(path)
+    if body is None:
         return None
     for a in parse_markers(body).actions:
         if a.kind == "skip" and a.value == "deduped":
@@ -531,7 +535,7 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
         # The result write closes the task only once the file exists: the tool ran, was not denied,
         # and produced the artifact. The text says what the result did (a marker body reached nobody).
         for tid in result_file_refs(blob):
-            if tid in opened and binds.get(tid) == sid and (p["ws"] / "results" / f"{tid}.txt").exists():
+            if tid in opened and binds.get(tid) == sid and read_ready_result(p["ws"] / "results" / f"{tid}.txt") is not None:
                 task, room = opened[tid]["task"], opened[tid]["room"]
                 into = consolidated_into(p["ws"], tid)
                 # A dedup pointer answered this message under another one: say so, and name it.

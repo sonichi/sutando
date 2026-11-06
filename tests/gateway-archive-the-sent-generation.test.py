@@ -12,6 +12,8 @@ Run: python3 tests/gateway-archive-the-sent-generation.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result, publish_staged_result
+
 import contextlib
 import json
 import os
@@ -104,13 +106,13 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         return self.results / f'{TID}.txt'
 
     def publish(self, body=SENT):
-        self.live().write_text(body)
+        publish_result(self.live(), body)
 
     def replace_atomically(self):
         """A producer publishing a newer reply: write aside, then rename over."""
         tmp = self.results / f'.{TID}.tmp'
-        tmp.write_text(NEWER)
-        os.replace(tmp, self.live())
+        publish_result(tmp, NEWER)
+        publish_staged_result(tmp, self.live())
 
     def rewrite_in_place(self):
         with open(self.live(), 'w') as f:
@@ -144,8 +146,8 @@ class ArchiveTheSentGeneration(unittest.TestCase):
             if not fired and Path(src) == self.live() and '.disposing-' in Path(dst).name:
                 fired.append(1)
                 tmp = self.results / f'.{TID}.tmp'
-                tmp.write_text(NEWER)
-                real(tmp, self.live())
+                publish_result(tmp, NEWER)
+                publish_staged_result(tmp, self.live())
             return out
         with patch('os.rename', rename):
             yield
@@ -267,7 +269,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
 
     def test_a_failed_dedup_archive_retried_reuses_one_tracked_reask(self):
         self.publish('[deduped: task-holder1]')
-        (self.results / 'archive').write_text('not a directory')
+        publish_result(self.results / 'archive', 'not a directory')
         inflight = self.drain()
         reask = self.reasks()
         self.assertEqual(len(reask), 1)
@@ -461,7 +463,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         with patch.object(gw, '_route_withheld_review',
                           side_effect=lambda p: routed.append(json.loads(p.read_text())['withheld_body']) or True):
             self.publish()
-            self.server.during = lambda: (self.live().write_text('[file: /tmp/b.txt]\nBODY-B'))
+            self.server.during = lambda: (publish_result(self.live(), '[file: /tmp/b.txt]\nBODY-B'))
             inflight = self.drain()
             self.server.during = None
             self.drain(inflight)                         # B: withheld for the owner's review
@@ -681,7 +683,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         inflight = self.drain()
         reask = gw._reask_id(TID)
         rfile = self.results / f'{reask}.txt'
-        rfile.write_text('BODY-R the re-asked answer')
+        publish_result(rfile, 'BODY-R the re-asked answer')
         self.server.during = lambda: rfile.unlink()     # the result is gone when it is archived
         with self.task_archive_fails(reask):
             self.drain(inflight)
@@ -715,7 +717,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         inflight = self.drain()
         reask = gw._reask_id(TID)
         rfile = self.results / f'{reask}.txt'
-        rfile.write_text('BODY-R the re-asked answer')
+        publish_result(rfile, 'BODY-R the re-asked answer')
         self.server.during = lambda: rfile.unlink()
         return reask, rfile, inflight
 
@@ -753,7 +755,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         restarted = self.restart()                           # the save never recovered before it
         self.drain(restarted)
         self.assertTrue((self.tasks / f'{reask}.txt').exists(), 'no evidence is left, so it waits')
-        rfile.write_text('BODY-R2 the core ran it again')    # the core re-runs the live task
+        publish_result(rfile, 'BODY-R2 the core ran it again')    # the core re-runs the live task
         self.drain(restarted)
         self.assertEqual(len(self.server.calls), 1, 'a second answer was posted under a delivered id')
         self.assertIn('BODY-R2 the core ran it again', self.kept(), 'the rerun was not kept for review')
@@ -860,8 +862,8 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         self.assertEqual(self.archived(), [SENT])
         self.assertIn(TID, self.durable_inflight(), 'the replacement is not tracked across a restart')
         tmp = self.results / f'.{TID}.tmp'
-        tmp.write_text(newest)
-        os.replace(tmp, self.live())
+        publish_result(tmp, newest)
+        publish_staged_result(tmp, self.live())
         restarted = self.restart()
         self.drain(restarted)
         self.assert_kept_for_a_person(newest)
@@ -927,7 +929,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
         inflight = self.drain()
         reask = gw._reask_id(TID)
         self.assertIn(reask, inflight)
-        (self.results / f'{reask}.txt').write_text('BODY-R the re-asked answer')
+        publish_result(self.results / f'{reask}.txt', 'BODY-R the re-asked answer')
         with self.task_archive_fails(reask):
             self.drain(inflight)
         self.assertEqual(self.sent_bodies(), ['BODY-R the re-asked answer'])
@@ -985,7 +987,7 @@ class ArchiveTheSentGeneration(unittest.TestCase):
 
     def test_an_archive_that_cannot_move_leaves_the_result_and_never_resends(self):
         self.publish()
-        (self.results / 'archive').write_text('not a directory')
+        publish_result(self.results / 'archive', 'not a directory')
         inflight = self.drain()
         self.drain(inflight)
         self.assertEqual(self.sent_bodies(), [SENT], 'a delivered result was sent twice')
@@ -1058,7 +1060,7 @@ class TheOwnerRetiresOnlyTheGenerationRead(unittest.TestCase):
 
     def test_a_matching_generation_moves_under_the_first_free_name(self):
         rfile = self.results / f'{TID}.txt'
-        rfile.write_text(SENT)
+        publish_result(rfile, SENT)
         (self.archive).mkdir()
         (self.archive / f'{TID}-1.txt').write_text('earlier evidence')
         _, gen = disposal.identity_of(rfile)
@@ -1073,10 +1075,10 @@ class TheOwnerRetiresOnlyTheGenerationRead(unittest.TestCase):
 
     def test_another_generation_is_left_live(self):
         rfile = self.results / f'{TID}.txt'
-        rfile.write_text(SENT)
+        publish_result(rfile, SENT)
         _, gen = disposal.identity_of(rfile)
         tmp = self.results / '.tmp'
-        tmp.write_text(NEWER)
+        publish_result(tmp, NEWER)
         os.replace(tmp, rfile)
         done = disposal.retire_generation(self.results, rfile, gen, self.lines.append,
                                           self.archive, [f'{TID}-1.txt'])

@@ -69,10 +69,11 @@ def is_staged_for(name: str, target_name: str) -> bool:
             and all(c in "0123456789abcdef" for c in token))
 
 
-def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_replace=False) -> Path:
+def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_replace=False, pair_result=False) -> Path:
     """Rename a staged file onto `path` and fsync the directory, so the name survives a crash."""
     target = Path(path)
-    if not _paired and target.suffix == ".txt" and any(p.name == "results" for p in target.absolute().parents):
+    if not _paired and target.suffix == ".txt" and (pair_result or any(
+            p.name == "results" for p in target.absolute().parents)):
         try:
             from .result_write import result_context, receipt_path, locked_file, record_pairing
         except ImportError:
@@ -85,7 +86,7 @@ def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_repla
             with locked_file(receipt.with_suffix(".lock")):
                 if no_replace and target.exists():
                     raise FileExistsError(str(target))
-                record_pairing(receipts, task_id, body, current=target.parent.name == "results")
+                record_pairing(receipts, task_id, body, current=not any(p.name == "archive" or p.name.startswith("archive-") for p in target.parents))
                 return publish_staged(tmp, target, _paired=True, no_replace=no_replace)
     if no_replace:
         os.link(tmp, target)
@@ -101,11 +102,11 @@ def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_repla
     return target
 
 
-def publish_text(path: str | Path, text: str, mode: int = 0o666, *, _paired=False) -> Path:
+def publish_text(path: str | Path, text: str, mode: int = 0o666, *, _paired=False, pair_result=False) -> Path:
     """Publish `text` at `path` whole: a reader sees the name absent or complete, never a prefix."""
     tmp = stage_text(path, text, mode)
     try:
-        return publish_staged(tmp, path, _paired=_paired)
+        return publish_staged(tmp, path, _paired=_paired, pair_result=pair_result)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -265,7 +266,7 @@ def main(argv: list[str]) -> int:
     dest = None if allow else retired_path(path, text)
     if dest is not None:
         # Nothing delivers a retired body, so it carries no Activity labels.
-        publish_text(dest, text)
+        publish_text(dest, text, pair_result=True)
         print(f"result_publish: published {Path(path).name} to {dest.parent} instead of results/: "
               "a cron task with no channel_id or chat_id has no bridge, so nothing would retire "
               "this skipped body from the live directory")
@@ -277,7 +278,7 @@ def main(argv: list[str]) -> int:
         if title is not None or outcome is not None:
             print("result_publish: warning: no result_labels module; published without "
                   "--title/--outcome", file=sys.stderr)
-        publish_text(path, text)
+        publish_text(path, text, pair_result=True)
         return 0
     labels, notes = result_labels_for(text, title, outcome)
     for note in notes:
@@ -287,7 +288,7 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001 — labels are optional; the result never waits on them
         print(f"result_publish: warning: published without --title/--outcome: {exc}",
               file=sys.stderr)
-    publish_text(path, text)
+    publish_text(path, text, pair_result=True)
     return 0
 
 

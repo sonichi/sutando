@@ -11,6 +11,8 @@ the outage arm so the floor is what recovers.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import os
 import select
@@ -101,7 +103,7 @@ check(lat < 2.0, f"create-to-drain {lat*1000:.0f}ms — doorbell, not the 30s sc
 # ── 2. temp file then os.replace (the real writers' pattern) ───────────────
 base = drain.count()
 tmpf = RD / ".staging.tmp"
-tmpf.write_text("payload")
+publish_result(tmpf, "payload")
 os.replace(tmpf, RD / "atomic-landed.txt")
 check(wait_for(lambda: drain.count() > base, 3.0),
       "temp-then-os.replace wakes a drain")

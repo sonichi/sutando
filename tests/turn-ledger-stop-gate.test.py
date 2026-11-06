@@ -32,6 +32,8 @@ Run: python3 tests/turn-ledger-stop-gate.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib
 import importlib.util
 import datetime
@@ -231,13 +233,13 @@ def test_an_archived_result_is_dated_not_dismissed() -> None:
 
         boundary = time.time() - 5
         fresh = archive / "task-this-turn.txt"
-        fresh.write_text("a delivered answer\n")
+        publish_result(fresh, "a delivered answer\n")
         check("an archived result newer than the boundary IS this turn's message",
               turn_ledger.delivery_after(boundary, ws) is not None,
               repr(turn_ledger.delivery_after(boundary, ws)))
 
         stale = archive / "task-last-turn.txt"
-        stale.write_text("an older answer\n")
+        publish_result(stale, "an older answer\n")
         os.utime(stale, (boundary - 60, boundary - 60))
         fresh.unlink()
         check("an archived result older than the boundary is not",
@@ -306,10 +308,10 @@ def test_the_result_file_surface() -> None:
         ws = _workspace(tmp)
         _arm(ws)
         _hook(ws)
-        (ws / "results" / "proactive-1.txt").write_text("   \n\t\n")
+        publish_result(ws / "results" / "proactive-1.txt", "   \n\t\n")
         decision = _hook(ws)
         check("a whitespace-only result is not a message", _blocked(decision), repr(decision))
-        (ws / "results" / "proactive-1.txt").write_text("here is the thing I found\n")
+        publish_result(ws / "results" / "proactive-1.txt", "here is the thing I found\n")
         check("a ready result ends the turn", _hook(ws) == {}, repr(_hook(ws)))
 
 
@@ -757,13 +759,13 @@ def test_a_result_older_than_the_boundary_is_not_this_turns() -> None:
         boundary = time.time() - 5
 
         stale = ws / "results" / "task-old.txt"
-        stale.write_text("an older answer\n")
+        publish_result(stale, "an older answer\n")
         os.utime(stale, (boundary - 60, boundary - 60))
         check("a result older than the boundary is skipped",
               turn_ledger.delivery_after(boundary, ws) is None,
               repr(turn_ledger.delivery_after(boundary, ws)))
 
-        (ws / "results" / "task-empty.txt").write_text("   \n")
+        publish_result(ws / "results" / "task-empty.txt", "   \n")
         check("a fresh but unready result is not a message",
               turn_ledger.delivery_after(boundary, ws) is None,
               repr(turn_ledger.delivery_after(boundary, ws)))
@@ -951,7 +953,7 @@ def test_a_delivered_result_archived_flat_is_still_a_message() -> None:
         archive.mkdir(parents=True, exist_ok=True)
         # The delivered name carries the -<epoch> suffix the bridge appends.
         delivered = archive / "task-abc123-1788843624.txt"
-        delivered.write_text("a real reply body\n", encoding="utf-8")
+        publish_result(delivered, "a real reply body\n", encoding="utf-8")
         check("setup: it is newer than the boundary",
               delivered.stat().st_mtime > since, "otherwise the scan is untested")
         found = turn_ledger._result_after(since, ws)
@@ -1050,7 +1052,7 @@ def test_the_reader_uses_the_writers_archive_calendar() -> None:
             partition = pathlib.Path(ws) / "results" / "archive" / writer_month
             partition.mkdir(parents=True, exist_ok=True)
             reply = partition / "task-reply.txt"
-            reply.write_text("a real reply\n", encoding="utf-8")
+            publish_result(reply, "a real reply\n", encoding="utf-8")
             os.utime(reply, (boundary + 30, boundary + 30))
             found = turn_ledger._result_after(boundary - 60, ws)
             check("a reply in the writer's partition is found",
@@ -1324,7 +1326,7 @@ def test_result_after_skips_an_entry_whose_stat_races_away() -> None:
         ws = _workspace(tmp)
         results = ws / "results"
         good = results / "task-good.txt"
-        good.write_text("a real reply body\n", encoding="utf-8")
+        publish_result(good, "a real reply body\n", encoding="utf-8")
         real_entries = list(os.scandir(results))
         raced = _RacedEntry()
 

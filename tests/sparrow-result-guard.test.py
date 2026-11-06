@@ -9,6 +9,8 @@ shared guard has to run first or a redirect/upload happens on unscanned text.
 
 Exercises the production `_guarded_result_body`, not a copy of its recipe.
 """
+
+from _helpers.paired_result import publish_result
 import importlib
 import json
 import pathlib
@@ -365,7 +367,7 @@ def drain_once(tids, provenance=()):
     m._REDELIVERED.clear()
     for tid in tids:
         write_task(tasks, tid, "team")
-        (results / f"{tid}.txt").write_text(m.GATEWAY_REDELIVERY_RESULT)
+        publish_result(results / f"{tid}.txt", m.GATEWAY_REDELIVERY_RESULT)
     for tid in provenance:
         m._REDELIVERED.add(tid)
 
@@ -417,7 +419,7 @@ def drain_two_pass():
     m._REDELIVERED.clear()
     tid = "task-retry"
     write_task(tasks, tid, "team")
-    (results / f"{tid}.txt").write_text(m.GATEWAY_REDELIVERY_RESULT)
+    publish_result(results / f"{tid}.txt", m.GATEWAY_REDELIVERY_RESULT)
     m._REDELIVERED.add(tid)
 
     posted = []

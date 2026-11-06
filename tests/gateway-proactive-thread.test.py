@@ -17,6 +17,8 @@ Run: python3 tests/gateway-proactive-thread.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import os
 import sys
 import tempfile
@@ -60,7 +62,7 @@ def drain(body: str):
     """One _post_proactive pass over one file; returns (sent payloads, log lines)."""
     tmp = Path(tempfile.mkdtemp(dir=_ISO, prefix="drain-"))
     (tmp / "archive").mkdir()
-    (tmp / "proactive-1.txt").write_text(body, encoding="utf-8")
+    publish_result(tmp / "proactive-1.txt", body, encoding="utf-8")
     posts: list[dict] = []
     logs: list[str] = []
 

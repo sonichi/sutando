@@ -25,6 +25,8 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import os
 import sys
 import tempfile
@@ -70,7 +72,7 @@ def drain(body: str, default_room: str):
     tmp = Path(tempfile.mkdtemp(prefix="gw-proactive-"))
     (tmp / "archive").mkdir()
     src = tmp / "proactive-1.txt"
-    src.write_text(body, encoding="utf-8")
+    publish_result(src, body, encoding="utf-8")
     posts: list[dict] = []
 
     def _fake_req(method, path, payload=None, timeout=None, **_kw):
@@ -132,7 +134,7 @@ def main() -> int:
     (tmp / "archive").mkdir()
     dead = _dead_pid()
     claim = tmp / f"proactive-9.sending.{dead}"
-    claim.write_text(f"[channel: {ROOM}]\nrecovered body\n", encoding="utf-8")
+    publish_result(claim, f"[channel: {ROOM}]\nrecovered body\n", encoding="utf-8")
     posts: list = []
 
     saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
@@ -161,7 +163,7 @@ def main() -> int:
     #    asserted here because f) is the first test to exercise this function at all.
     tmp2 = Path(tempfile.mkdtemp(prefix="gw-proactive-live-"))
     live = tmp2 / f"proactive-10.sending.{os.getpid()}"
-    live.write_text(f"[channel: {ROOM}]\nin flight\n", encoding="utf-8")
+    publish_result(live, f"[channel: {ROOM}]\nin flight\n", encoding="utf-8")
     saved_dir = gb.RESULTS_DIR
     gb.RESULTS_DIR = tmp2
     try:
@@ -175,7 +177,7 @@ def main() -> int:
     #    target can be present at peek and gone after. a-g never make them differ.
     tmp3 = Path(tempfile.mkdtemp(prefix="gw-proactive-vanish-"))
     (tmp3 / "archive").mkdir()
-    (tmp3 / "proactive-11.txt").write_text(
+    publish_result(tmp3 / "proactive-11.txt",
         f"[channel: {ROOM}]\nvanishing target\n", encoding="utf-8")
     posts3: list = []
     calls = {"n": 0}

@@ -29,6 +29,8 @@ claude-task-notifier-submit.test.py; they load the harness from this file.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import json
 import os
 import re
@@ -542,7 +544,7 @@ esac
         (self.tasks_dir / name).write_text(body)
 
     def write_result(self, name, body="OK\n"):
-        (self.results_dir / name).write_text(body)
+        publish_result(self.results_dir / name, body)
 
     def run_event(self, filename, env_extra=None, timeout=15):
         return subprocess.run(
@@ -621,7 +623,9 @@ class TargetTests(FakeTmuxHarness):
         self.write_task("task-t.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-t.txt")
                     return
@@ -677,7 +681,9 @@ class TallComposerScrollbackTests(FakeTmuxHarness):
         self.write_task("task-tall.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-tall.txt")
                     return
@@ -753,7 +759,9 @@ class BusyBeforePasteTests(FakeTmuxHarness):
         self.write_task("task-race.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-race.txt")
                     return
@@ -832,7 +840,9 @@ class TwoRowFooterTests(FakeTmuxHarness):
         self.write_task("task-tip.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-tip.txt")
                     return
@@ -865,7 +875,9 @@ class PlaceholderComposerTests(FakeTmuxHarness):
         self.write_task("task-hint.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-hint.txt")
                     return
@@ -895,7 +907,9 @@ class LiveWordWrapTests(FakeTmuxHarness):
         self.write_task("task-wrap.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-wrap.txt")
                     return

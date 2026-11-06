@@ -7,6 +7,8 @@ process would.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import tempfile
 from pathlib import Path
 
@@ -41,7 +43,7 @@ class Lane:
 
     def write(self, name: str, body: str) -> Path:
         p = self.results / name
-        p.write_text(body, encoding="utf-8")
+        publish_result(p, body, encoding="utf-8")
         return p
 
     def drain(self, gate=None, route_gate=None, ack_gate=None) -> None:

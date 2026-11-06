@@ -11,6 +11,8 @@ Run: python3 tests/runtime-cli-surface.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -159,7 +161,7 @@ def drive(daemon):
     check(p.returncode == 0, "task details exits 0")
     p = run_cli("task", "list")
     check(p.returncode == 0, "task list exits 0")
-    (Path(ENV["SUTANDO_RESULTS_DIR"]) / f"{tid}.txt").write_text("done body")
+    publish_result(Path(ENV["SUTANDO_RESULTS_DIR"]) / f"{tid}.txt", "done body")
     p = run_cli("task", "get-result", tid)
     check(p.returncode == 0 and "done body" in p.stdout,
           "get-result returns the written body")

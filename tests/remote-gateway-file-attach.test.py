@@ -17,6 +17,8 @@ Run: python3 tests/remote-gateway-file-attach.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import json
 import os
@@ -81,7 +83,7 @@ class FileAttachTests(unittest.TestCase):
         # fixture with no task file is a guarded one, not an owner one.
         (self.mod.TASKS_DIR / f"{tid}.txt").write_text(
             f"id: {tid}\naccess_tier: owner\ntask: fixture\n")
-        (self.mod.RESULTS_DIR / f"{tid}.txt").write_text(body)
+        publish_result(self.mod.RESULTS_DIR / f"{tid}.txt", body)
 
     # Skip markers still POST to close the lease; the server suppresses their
     # user-facing delivery.

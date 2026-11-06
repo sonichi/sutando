@@ -1,10 +1,11 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 // In meeting mode (bodhi transcription mode) the voice model must not speak. Text written
 // straight to the Gemini transport bypasses bodhi's own check, so those paths hold it, and a
 // task result that lands mid-meeting waits until the meeting ends.
 // Run: npx tsx --test --test-force-exit tests/meeting-input-hold.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -62,7 +63,7 @@ describe('meeting mode holds direct model input', () => {
 		const s = fakeSession(mode);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		wireDurableChannels(s as any, { relay: relay(), handoffConfirmMs: 100 });
-		writeFileSync(join(TMP, 'results', 'task-1.txt'), 'Health check: all services up.');
+		publishVerifiedResult(join(TMP, 'results', 'task-1.txt'), 'Health check: all services up.');
 		await tick(5_000);
 		assert.deepEqual(s.sent, [], 'nothing reaches the model during the meeting');
 		mode.value = 'agent';

@@ -10,6 +10,8 @@ the month-partitioned layout, id/name validation rejects traversal.
 
 Run: python3 tests/agent-api-delegation.test.py
 """
+
+from _helpers.paired_result import publish_result
 import http.server
 import importlib.util
 import json
@@ -112,8 +114,8 @@ for bad in ("../evil", "task-a/b", "", "task-" + "x" * 200):
     check(f"bad id rejected: {bad[:16]!r}", code == 400)
 
 # 4. Results list/read round-trip.
-(api.RESULT_DIR / "task-e2e-1.txt").write_text("the answer\n")
-(api.RESULT_DIR / "task-other.txt").write_text("not ours\n")
+publish_result(api.RESULT_DIR / "task-e2e-1.txt", "the answer\n")
+publish_result(api.RESULT_DIR / "task-other.txt", "not ours\n")
 code, data = req("GET", "/delegation/results")
 check("list results", code == 200 and set(data.get("files", [])) == {"task-e2e-1.txt", "task-other.txt"}, str(data))
 code, data = req("GET", "/delegation/results/task-e2e-1.txt")
@@ -318,7 +320,7 @@ try:
 finally:
     api.os.replace = real_replace
 check("missing temp during failed publish cleanup is harmless", publish_failed)
-(api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
+publish_result(api.RESULT_DIR / "task-direct-1.txt", "direct answer\n")
 code, data = api.delegation_list_results()
 check("direct list", code == 200 and "task-direct-1.txt" in data["files"])
 code, data = api.delegation_read_result("task-direct-1.txt")
@@ -341,14 +343,14 @@ check("direct archive already-gone", api.delegation_archive_result(
 check("direct archive bad tid", api.delegation_archive_result(
     {"name": "x.txt", "task_id": "../evil"})[0] == 400)
 # Cross-archive hijack (Codex P1): name must be exactly <task_id>.txt.
-(api.RESULT_DIR / "task-foreign.txt").write_text("someone else's\n")
+publish_result(api.RESULT_DIR / "task-foreign.txt", "someone else's\n")
 check("archive rejects name/tid mismatch", api.delegation_archive_result(
     {"name": "task-foreign.txt", "task_id": "task-direct-1"})[0] == 400)
 # Both archive paths are confined after resolving symlinks. A relay client
 # cannot make the archive endpoint inspect or move a result outside results/,
 # or replace a destination outside the month archive directory.
 outside_result = tmp / "outside-result.txt"
-outside_result.write_text("outside result\n")
+publish_result(outside_result, "outside result\n")
 source_escape = api.RESULT_DIR / "task-source-escape.txt"
 try:
     source_escape.symlink_to(outside_result)
@@ -361,7 +363,7 @@ else:
     check("archive rejects source symlink escape",
           code == 400 and outside_result.read_text() == "outside result\n")
 
-(api.RESULT_DIR / "task-dest-escape.txt").write_text("inside result\n")
+publish_result(api.RESULT_DIR / "task-dest-escape.txt", "inside result\n")
 archive_month = api.local_task_protocol.archive_month_dir(
     api.RESULT_DIR, api.datetime.now().isoformat())
 archive_month.mkdir(parents=True, exist_ok=True)
@@ -378,7 +380,7 @@ else:
           code == 400 and outside_result.read_text() == "outside result\n"
           and (api.RESULT_DIR / "task-dest-escape.txt").exists())
 # No-clobber (Codex P1): an occupied archive slot gets an epoch-suffixed name.
-(api.RESULT_DIR / "task-direct-1.txt").write_text("second result\n")
+publish_result(api.RESULT_DIR / "task-direct-1.txt", "second result\n")
 code, _ = api.delegation_archive_result({"name": "task-direct-1.txt", "task_id": "task-direct-1"})
 suffixed = list((api.RESULT_DIR / "archive").glob("*/task-direct-1-*.txt"))
 originals = list((api.RESULT_DIR / "archive").glob("*/task-direct-1.txt"))
@@ -390,7 +392,7 @@ check("archive no-clobber: suffixed slot, original intact",
 # OSError branch of delegation_list_results (unreadable results dir).
 _saved = api.RESULT_DIR
 api.RESULT_DIR = tmp / "not-a-dir-file"
-api.RESULT_DIR.write_text("plain file")
+publish_result(api.RESULT_DIR, "plain file")
 check("direct list handles unreadable dir", api.delegation_list_results()[0] == 500)
 api.RESULT_DIR = _saved
 

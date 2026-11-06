@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import http.server
 import importlib.util
 import json
@@ -65,7 +67,7 @@ def test_history_and_active_routes_expose_workstreams() -> None:
         "task-workstream-grouping-maintenance", "internal classifier", "2026-08-03T10:01:00Z",
     )
     (api.RESULT_DIR / "archive" / "2026-08").mkdir(parents=True)
-    (api.RESULT_DIR / "archive" / "2026-08" / "task-old.txt").write_text("done\n")
+    publish_result(api.RESULT_DIR / "archive" / "2026-08" / "task-old.txt", "done\n")
     data_dir = workspace / "data"
     data_dir.mkdir()
     data_dir.joinpath("task-workstreams.json").write_text(json.dumps({

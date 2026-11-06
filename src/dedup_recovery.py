@@ -33,6 +33,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
         parse_markers,
     )
     from .task_archive import find_task_file
+    from .result_ready import read_ready_result
 except ImportError:  # pragma: no cover - flat src/ import path
     from local_task_protocol import find_archived_task, find_result, valid_archive_lookup_id
     from result_markers import (
@@ -47,6 +48,7 @@ except ImportError:  # pragma: no cover - flat src/ import path
         parse_markers,
     )
     from task_archive import find_task_file
+    from result_ready import read_ready_result
 
 __all__ = [
     "plan_dedup_recovery",
@@ -151,7 +153,8 @@ def plan_dedup_recovery(
         return "report", MALFORMED_TEMPLATE
     orig_text = _read(find_task_file(Path(tasks_dir), task_id)
                       or find_archived_task(Path(tasks_dir), task_id))
-    holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
+    holder_path = find_result(Path(results_dir), holder) if holder else None
+    holder_text = read_ready_result(holder_path) if holder_path else None
 
     decision = dedup_decision(holder_text, orig_text)
     holder_task = (_read(find_task_file(Path(tasks_dir), holder)

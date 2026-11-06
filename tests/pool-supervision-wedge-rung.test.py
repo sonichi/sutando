@@ -9,6 +9,8 @@ once per episode for the owner — a gate or limit asks for a terminal card, abn
 a card naming its cause, a frozen turn for a card offering Escape. No wedge kind
 restarts a session. Every subprocess here is a stub answered by argv.
 """
+
+from _helpers.paired_result import publish_result
 import importlib.util
 import json
 import sys
@@ -212,7 +214,7 @@ check("a sentinel whose task is not in tasks/ is stale, not work", wo(ws, WID), 
 check("a sentinel handed to it with no reply yet is work", wo(ws, WID), True)
 (inbox / "task-a.txt").rename(inbox / "task-a.accepted")
 check("an accepted sentinel with no reply is work in flight", wo(ws, WID), True)
-(results / "task-a.txt").write_text("done\n")
+publish_result(results / "task-a.txt", "done\n")
 check("a sentinel whose reply is ready is spent, whatever its suffix", wo(ws, WID), False)
 
 # --- the observation: the pane, read by the core's readers ------------------------

@@ -6,6 +6,8 @@ Only disposable state and synthetic results are used; cancellation is a signal.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import hashlib
 import json
@@ -214,8 +216,8 @@ class UnfinishedTaskListTests(unittest.TestCase):
         ids = [self.submit(text, index) for index, text in enumerate(texts)]
         claimed = self.tasks / f"{ids[1]}.claimed-worker-1.txt"
         (self.tasks / f"{ids[1]}.txt").rename(claimed)
-        (self.results / f"{ids[1]}.txt").write_text("")
-        (self.results / f"{ids[2]}.txt").write_text(" \n\t\n")
+        publish_result(self.results / f"{ids[1]}.txt", "")
+        publish_result(self.results / f"{ids[2]}.txt", " \n\t\n")
         waiting = self.cli("elicitation", "request", "--task-id", ids[3],
                            "--question", "Which synthetic option?", "--type", "single_select",
                            "--options", '["First", "Second"]')
@@ -224,11 +226,11 @@ class UnfinishedTaskListTests(unittest.TestCase):
         completed = []
         for index in range(200):
             tid = self.submit(f"completed synthetic request {index}", 10 + index)
-            (self.results / f"{tid}.txt").write_text(f"completed synthetic result {index}\n")
+            publish_result(self.results / f"{tid}.txt", f"completed synthetic result {index}\n")
             completed.append(tid)
         for tid in ("task-foreign-pending", "task-foreign-done"):
             (self.tasks / f"{tid}.txt").write_text(f"id: {tid}\ntask: foreign private text\n")
-        (self.results / "task-foreign-done.txt").write_text("foreign private result")
+        publish_result(self.results / "task-foreign-done.txt", "foreign private result")
         before = self.snapshot()
         self.record("fixture-created", unfinished=ids, completed_count=len(completed),
                     records=len(before))

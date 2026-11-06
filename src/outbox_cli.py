@@ -177,6 +177,10 @@ def cmd_requeue(args) -> int:
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
         restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
+        if outcome is undelivered_quarantine.RestoreOutcome.UNPAIRED:
+            payload["error"] = "the quarantined body has no matching receipt; it remains quarantined"
+            _emit(payload, args.json)
+            return 4
         if outcome is undelivered_quarantine.RestoreOutcome.NO_SAFE_MOVE:
             # Left QUEUED, never parked again: a reply published under this id meanwhile
             # must still be sent, and the drain only acts on a live result.

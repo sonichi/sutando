@@ -68,8 +68,7 @@ def receipts_dir_for(workspace) -> Path:
 
 
 def receipt_path(receipts_dir, task_id: str) -> Path:
-    """Accepts `abc` or `task-abc`. Writers hold the bare id; delivery consumers
-    hold the prefixed one, and a lookup that misses fails OPEN — silently."""
+    """Use one receipt name for bare and task-prefixed identifiers."""
     return Path(receipts_dir) / f"task-{str(task_id).removeprefix('task-')}.ok"
 
 
@@ -113,14 +112,24 @@ def receipt_verifier(receipts_dir, task_id: str):
     return lambda raw_body: receipt_attests(receipts_dir, task_id, raw_body)
 
 
-def result_context(path):
-    """Resolve receipt storage and publication id for a result or delivery claim."""
+def result_root(path):
+    """Locate the result namespace, including archive and claim paths."""
     p = Path(path).absolute()
     root = next((parent for parent in p.parents if parent.name == "results"), None)
     if root is None:
-        return None
+        archive = next((parent for parent in p.parents
+                        if parent.name in {"archive", "undelivered", ".delivering"}
+                        or parent.name.startswith("archive-")), None)
+        root = archive.parent if archive else p.parent
+    return root
+
+
+def result_context(path):
+    p = Path(path).absolute()
+    root = result_root(p)
     name = p.name.split(".sending", 1)[0] if ".sending" in p.name else p.stem
-    return receipts_dir_for(root.parent), task_id_from(name)
+    receipts = receipts_dir_for(root.parent) if root.name == "results" else root / ".result-pairing"
+    return receipts, task_id_from(name)
 
 
 def path_verifier(path):
@@ -130,11 +139,11 @@ def path_verifier(path):
         return lambda body: False
     receipts, task_id = context
     ids = [task_id]
-    if Path(path).parent.name != "results":
-        match = re.fullmatch(r"(.+)-[0-9]+", task_id)
+    if Path(path).absolute().parent != result_root(path):
+        match = re.fullmatch(r"(.+)-[0-9]+(?:-late-duplicate)?(?:\.[0-9]+)?", task_id)
         if match:
             ids.append(match.group(1))
-    archived = Path(path).parent.name != "results"
+    archived = Path(path).absolute().parent != result_root(path)
     return lambda body: any(
         receipt_verifier(receipts, key)(body)
         or (archived and receipt_verifier(history_receipts(receipts, body), key)(body))
@@ -160,7 +169,7 @@ def write_paired_result(results_dir, task_id: str, body: str,
     rest = strip_pairing_echo(task_id, body)
     result = Path(results_dir) / f"task-{task_id}.txt"
     if receipts_dir is None:
-        receipts_dir = receipts_dir_for(Path(results_dir).parent)
+        receipts_dir = result_context(result)[0]
     receipt = receipt_path(receipts_dir, task_id)
     # Keep both publications inside one per-task transaction. A failed receipt
     # publication prevents a result from becoming visible without its evidence.

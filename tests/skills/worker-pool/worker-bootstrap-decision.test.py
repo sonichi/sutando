@@ -12,6 +12,11 @@ Run: python3 tests/skills/worker-pool/worker-bootstrap-decision.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import os
 import re
@@ -226,8 +231,8 @@ class TestMain(Base):
             pd.mark_done(self.ws, WORKER, tid, published=True)
         # task-gone: no payload at all (the common case, the drain took it).
         # task-result: payload present AND a ready result beside it.
-        (tasks / "task-result.txt").write_text("id: task-result\nsource: test\ntask: x\n")
-        pd.result_path(Path(self.ws), "task-result").write_text("done\n")
+        publish_result(tasks / "task-result.txt", "id: task-result\nsource: test\ntask: x\n")
+        publish_result(pd.result_path(Path(self.ws), "task-result"), "done\n")
         # task-arch: payload present, no live result, but the payload is archived.
         (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
         arch = pd.archived_payload(Path(self.ws), "task-arch")

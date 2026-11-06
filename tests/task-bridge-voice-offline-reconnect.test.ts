@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -30,7 +31,7 @@ describe('offline voice result with no origin, no bridge: spoken when the client
 		let connected = false;
 		const spoken: string[] = [];
 		writeFileSync(join(TASK_DIR, `${task}.txt`), header(task));
-		writeFileSync(join(RESULT_DIR, `${task}.txt`), 'Lima is the capital of Peru.');
+		publishVerifiedResult(join(RESULT_DIR, `${task}.txt`), 'Lima is the capital of Peru.');
 		startResultWatcher((result) => spoken.push(result), () => connected);
 
 		assert.ok(await until(() => proactiveFor(task).length > 0, 8000), `no offline forward: ${readdirSync(RESULT_DIR).join(', ')}`);
@@ -49,7 +50,7 @@ describe('offline voice result with no origin, no bridge: spoken when the client
 describe('_forwardOfflineThenArchive — the originating result outlives a failed forward', () => {
 	const stage = (task: string) => {
 		writeFileSync(join(TASK_DIR, `${task}.txt`), header(task));
-		writeFileSync(join(RESULT_DIR, `${task}.txt`), 'kept');
+		publishVerifiedResult(join(RESULT_DIR, `${task}.txt`), 'kept');
 	};
 
 	it('forward write fails: nothing is archived and the claim is released', async () => {

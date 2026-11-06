@@ -35,6 +35,9 @@ from ag2_sparrow.adapters.hatch import task_fields  # noqa: E402
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # noqa: E402
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 
+from ag2_sparrow.result_publish import publish_text  # noqa: E402
+
+
 def write_task(inbox, tid, priority, mtime, tier="owner"):
     p = Path(inbox) / (tid + ".txt")
     p.write_text("id: %s\nchannel_id: !r:x\naccess_tier: %s\npriority: %s\ntask: hi\n" % (tid, tier, priority))
@@ -74,8 +77,20 @@ class PriorityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             loop = Loop(d)
             write_task(loop.args.inbox, "task-a", "normal", 100)
-            (Path(loop.args.results) / "task-a.txt").write_text("done")
+            publish_text(Path(loop.args.results) / "task-a.txt", "done", pair_result=True)
             self.assertEqual(loop.pending(set()), [])
+
+    def test_missing_or_mismatched_pairing_does_not_settle_a_task(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = Loop(d)
+            write_task(loop.args.inbox, "task-a", "normal", 100)
+            result = Path(loop.args.results) / "task-a.txt"
+            result.write_text("unpaired answer")
+            self.assertEqual(loop.pending(set()), ["task-a.txt"])
+            publish_text(result, "paired answer", pair_result=True)
+            self.assertEqual(loop.pending(set()), [])
+            result.write_text("substituted answer")
+            self.assertEqual(loop.pending(set()), ["task-a.txt"])
 
     def test_the_ordering_is_the_vendored_task_priority_policy(self):
         self.assertIs(rl.task_priority, task_priority)
@@ -541,7 +556,7 @@ class WriterContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             loop = Loop(d)
             live = Path(loop.args.results) / "task-a.txt"
-            live.write_text("new-visible\n")
+            publish_text(live, "new-visible\n", pair_result=True)
             staged = self.stage(loop, "task-a.txt", "old-staged\n")
             self.recover(loop)
             self.assertEqual(live.read_text(), "new-visible\n")
@@ -567,7 +582,7 @@ class WriterContractTest(unittest.TestCase):
             t = threading.Thread(target=drain, daemon=True)
             t.start()
             staged = self.stage(loop, "task-b.txt", "first\n")
-            os.link(staged, live)           # a crash between the publish link and the stage's unlink
+            publish_text(live, "first\n", pair_result=True)  # publication succeeded; staged cleanup did not
             deadline = time.time() + 5
             while not retired and time.time() < deadline:
                 time.sleep(0.001)
@@ -596,9 +611,9 @@ class WriterContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             loop = Loop(d)
             results = Path(loop.args.results)
-            (results / "task-d.txt").write_text("theirs\n")
+            publish_text(results / "task-d.txt", "theirs\n", pair_result=True)
             (results / "archive").mkdir()
-            (results / "archive" / "task-e.txt").write_text("archived\n")
+            publish_text(results / "archive" / "task-e.txt", "archived\n", pair_result=True)
             seen = set()
             with contextlib.redirect_stderr(io.StringIO()):
                 loop.finish("task-d.txt", "ours\n", seen)

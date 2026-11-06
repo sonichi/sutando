@@ -22,6 +22,8 @@ Run: python3 tests/gateway-relay-result-no-ceiling.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import errno
 import glob
@@ -183,7 +185,7 @@ class _Bridge(unittest.TestCase):
         return tid
 
     def answer(self, tid: str, body: str = PRIVATE) -> None:
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text(body)
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", body)
 
     def drain(self) -> "set[str]":
         inflight = set(gw._load_inflight())
@@ -395,7 +397,7 @@ class TheRule(_Bridge):
     def test_a_re_asks_answer_outside_the_ledger_goes_back_in_flight(self):
         ask = self.serve(voice_ask())
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt").write_text("")
+        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt", "")
         self.answer(ask, f"[deduped: {EMPTY_HOLDER}]")
         self.drain()
         reask = gw._reask_id(ask)
@@ -701,7 +703,7 @@ class TheReclaim(_Bridge):
         [older] = self.quarantined()
         reask = gw._reask_id(ask)
         newer = gw.UNDELIVERABLE_RESULTS_DIR / f"{reask}-{time.time_ns() + 10**9}.txt"
-        newer.write_text("[dm-only]\nThe re-ask's answer.")
+        publish_result(newer, "[dm-only]\nThe re-ask's answer.")
         gw._reclaim_parked_relay_results(set())
         self.assertEqual((gw.RESULTS_DIR / f"{ask}.txt").read_text(), "[dm-only]\nThe re-ask's answer.")
         self.assertFalse((gw.RESULTS_DIR / f"{reask}.txt").exists())
@@ -748,7 +750,7 @@ class TheReclaim(_Bridge):
         gw._save_inflight(set())
         # Malformed entries beside the real one: an id the broker never issues, a local id not a string.
         gw.ACK_FIRST_FILE.write_text(json.dumps({ASK_A: ask, "../escape": "task-x", "ask-7d4e2f1a9b8c": 7}))
-        (gw.RESULTS_DIR / "task-x.txt").write_text("not a relay answer")
+        publish_result(gw.RESULTS_DIR / "task-x.txt", "not a relay answer")
         inflight: "set[str]" = set()
         gw._reclaim_parked_relay_results(inflight)
         self.assertEqual(inflight, {ask}, "only the valid mark is reclaimed")
@@ -1101,8 +1103,8 @@ class NoCeiling(_Loop):
     def test_a_relay_result_outlives_a_broker_outage_past_10_minutes_and_a_restart(self):
         self.relay.refusing = True
         first = self.serve(voice_ask(), typed_task())
-        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
-        (self.results / f"{TYPED_A}.txt").write_text("A collaborative workspace.")
+        publish_result(self.results / f"{ASK_A}.txt", PRIVATE)
+        publish_result(self.results / f"{TYPED_A}.txt", "A collaborative workspace.")
         self.bridges.refused_result_recorded(first, ASK_A)
         self.bridges.refused_result_recorded(first, TYPED_A)
         self.bridges.stop(first)
@@ -1132,8 +1134,8 @@ class NoCeiling(_Loop):
     def test_a_definite_refusal_swaps_in_a_failed_result_that_the_broker_accepts(self):
         self.relay.on_result = lambda p: None if p.get("status") == "failed" else (400, {"error": "bad"})
         bridge = self.serve(voice_ask(), typed_task())
-        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
-        (self.results / f"{TYPED_A}.txt").write_text("A collaborative workspace.")
+        publish_result(self.results / f"{ASK_A}.txt", PRIVATE)
+        publish_result(self.results / f"{TYPED_A}.txt", "A collaborative workspace.")
         self.bridges.wait_for(lambda: self.relay.results, bridge, "the failed result accepted")
         self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), bridge, "its mark retired")
         self.bridges.wait_for(lambda: self.quarantined(), bridge, "the typed result parked")
@@ -1149,7 +1151,7 @@ class NoCeiling(_Loop):
     def test_a_failed_refused_too_ends_and_a_restart_does_not_revive_it(self):
         self.relay.on_result = lambda p: (400, {"error": "unknown task"})
         first = self.serve(voice_ask())
-        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        publish_result(self.results / f"{ASK_A}.txt", PRIVATE)
         self.bridges.wait_for(lambda: self.quarantined() and not self.state("remote-task-ack-first")
                               and ASK_A not in self.state("remote-task-inflight"), first, "the result ended")
         self.bridges.stop(first)
@@ -1171,7 +1173,7 @@ class NoCeiling(_Loop):
             return None
         self.relay.on_result = refuse_then_go_down
         first = self.serve(voice_ask())
-        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        publish_result(self.results / f"{ASK_A}.txt", PRIVATE)
         self.bridges.wait_for(lambda: self.posted()[-1:] == [FAILED]
                               and self.logged(f"result POST not confirmed for {ASK_A}") >= 2,
                               first, "the failed result refused while the broker is down")
@@ -1195,7 +1197,7 @@ class NoCeiling(_Loop):
         self.relay.token = "hermetic-test-token"
         first = self.serve(voice_ask())
         self.relay.token, self.relay.auth_code = "rotated-secret", code   # revoked by the broker
-        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        publish_result(self.results / f"{ASK_A}.txt", PRIVATE)
         self.bridges.refused_result_recorded(first, ASK_A)
         self.bridges.stop(first)
         age_retry(self.outbox_root, ASK_A, 700)
@@ -1255,12 +1257,12 @@ class AfterADowngrade(_Loop):
         if reask:
             # A holder with no answer: the planner asks again rather than fold.
             (self.results / "archive").mkdir(parents=True, exist_ok=True)
-            (self.results / "archive" / f"{EMPTY_HOLDER}-1785976425.txt").write_text("")
+            publish_result(self.results / "archive" / f"{EMPTY_HOLDER}-1785976425.txt", "")
         bridge = self.serve(voice_ask())
         answered = self.local
         if reask:
             answered = gw._reask_id(self.local)
-            (self.results / f"{self.local}.txt").write_text(f"[deduped: {EMPTY_HOLDER}]")
+            publish_result(self.results / f"{self.local}.txt", f"[deduped: {EMPTY_HOLDER}]")
             self.bridges.wait_for(lambda: self.state("remote-task-inflight") == [answered], bridge,
                                   "the re-ask in flight in place of the ask")
         self.bridges.stop(bridge)
@@ -1270,7 +1272,7 @@ class AfterADowngrade(_Loop):
     def run_case(self, *, reask: bool = False, restart: bool = False, days_late: float = 0.0):
         answered = self.acknowledged_then_downgraded(reask)
         rfile = self.results / f"{answered}.txt"
-        rfile.write_text(PRIVATE)
+        publish_result(rfile, PRIVATE)
         if days_late:
             landed = time.time() - days_late * DAY
             os.utime(rfile, (landed, landed))
@@ -1329,7 +1331,7 @@ class EndCutShortThroughTheLoop(_Loop):
         self.relay.queue.append(voice_ask())
         first = self.bridges.start(crash=crash)
         self.bridges.wait_for((self.ws / "tasks" / f"{self.local}.txt").exists, first, "the relay ask published")
-        (self.results / f"{self.local}.txt").write_text(PRIVATE)
+        publish_result(self.results / f"{self.local}.txt", PRIVATE)
         self.bridges.crashed(first, crash)
         self.assertEqual(self.posted(), [ANSWER, FAILED])
         self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: self.local})
@@ -1435,7 +1437,7 @@ class OutsideTheInFlightSet(_Loop):
 
     def lands(self, days_late: float) -> None:
         rfile = self.results / f"{self.local}.txt"
-        rfile.write_text(PRIVATE)
+        publish_result(rfile, PRIVATE)
         if days_late:
             landed = time.time() - days_late * DAY
             os.utime(rfile, (landed, landed))

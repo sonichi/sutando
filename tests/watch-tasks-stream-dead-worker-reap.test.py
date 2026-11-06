@@ -15,6 +15,8 @@ task forever -- is what this file verifies now, against the real watcher.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import os
 import signal
 import subprocess
@@ -23,6 +25,7 @@ import time
 from pathlib import Path
 import sys  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import hermetic_env
 from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -109,7 +112,7 @@ class Harness:
         return p
 
     def start(self) -> None:
-        env = dict(os.environ)
+        env = hermetic_env(self.tmp / "home", SUTANDO_WORKSPACE_DIR=str(self.ws))
         env["PATH"] = f"{self.tmp/'bin'}:{env['PATH']}"
         env["TMPDIR"] = str(self.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
@@ -174,10 +177,10 @@ def scenario_watchdog_reap_respects_an_existing_answer() -> None:
     watchdog's terminal failure -- the fix is not "always publish"."""
     print("\nscenario: a watchdog reap does not overwrite an already-answered task")
     h = Harness(handler_timeout="2")
-    (h.ws / "results" / "archive" / "task-answered-999.txt").write_text("the real answer\n")
+    publish_result(h.ws / "results" / "archive" / "task-answered-999.txt", "the real answer\n")
     # `task-answered-1` must not satisfy `task-answered` (prefix collision) --
     # only the exact archived id above may suppress this task's failure.
-    (h.ws / "results" / "archive" / "task-answered-1-999.txt").write_text("a different task\n")
+    publish_result(h.ws / "results" / "archive" / "task-answered-1-999.txt", "a different task\n")
     h.start()
     h.deliver("task-answered.txt")
     try:

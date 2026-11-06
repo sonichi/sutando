@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for recreated proactive-result delivery IDs."""
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -126,12 +128,12 @@ def main():
     bridge.ACCESS_FILE = access_file
     access_file.write_text(json.dumps({"allowFrom": ["owner-id"]}))
     proactive = bridge.RESULTS_DIR / "proactive-same-slot.txt"
-    proactive.write_text("first body")
+    publish_result(proactive, "first body")
     watcher = threading.Thread(target=bridge.result_watcher, daemon=True)
     watcher.start()
     time.sleep(0.3)
     assert len(bridge.app.client.calls) == 1
-    proactive.write_text("recreated body")
+    publish_result(proactive, "recreated body")
     time.sleep(1.2)
     assert len(bridge.app.client.calls) == 1
     assert not proactive.exists()

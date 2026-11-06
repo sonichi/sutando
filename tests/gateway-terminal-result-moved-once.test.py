@@ -11,6 +11,8 @@ Run: python3 tests/gateway-terminal-result-moved-once.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result, publish_staged_result
+
 import contextlib
 import hashlib
 import inspect
@@ -126,7 +128,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
 
     def result(self, body='Existing answer', tid=TID):
         p = self.results / f'{tid}.txt'
-        p.write_text(body)
+        publish_result(p, body)
         return p
 
     def about(self):
@@ -401,7 +403,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
-        (self.results / 'undelivered').write_text('not a directory')
+        publish_result(self.results / 'undelivered', 'not a directory')
         result = self.result()
         body, gen = self.read(result)
         self.deliver(body, result, gen)                  # winner: setup fails
@@ -703,8 +705,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
 
     def _publish_b(self, result):
         tmp = result.with_name('.producer.tmp')
-        tmp.write_text('BODY-B newer reply')
-        os.replace(tmp, result)
+        publish_result(tmp, 'BODY-B newer reply')
+        publish_staged_result(tmp, result)
 
     def _drain_once_accepting(self):
         """One real drain pass against a relay that now accepts."""
@@ -787,7 +789,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         result = self.result('BODY-A parked answer')
         gw._post_ready_results({TID})                      # 400: parked, A quarantined
         self._requeue_as_main_writes_it()
-        result.write_text('BODY-A parked answer')          # main's restore put A back
+        publish_result(result, 'BODY-A parked answer')          # main's restore put A back
         held = []
 
         def take_then_lose_the_response(method, path, payload):
@@ -899,7 +901,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         if before_late:
             before_late()
         posts = len(self.server.calls)
-        result.write_text(late)
+        publish_result(result, late)
         os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
         gw._reconcile_orphan_results(set())
         return result, posts
@@ -1027,7 +1029,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
             with self.assertRaises(Crash):
                 gw._post_ready_results({TID})
         posts = len(self.server.calls)
-        result.write_text('BODY-A the reply\n')
+        publish_result(result, 'BODY-A the reply\n')
         self.bridge(self.core())
         gw._post_ready_results({TID})
         self.assertFalse(result.exists())
@@ -1064,7 +1066,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         gw._post_ready_results({TID})
         self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
         posts = len(self.server.calls)
-        result.write_text(late)
+        publish_result(result, late)
         os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
         gw._reconcile_orphan_results(set())
         return result, posts
@@ -1093,7 +1095,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertNotIn('by hand', said[0])
 
     def _late(self, result, body):
-        result.write_text(body)
+        publish_result(result, body)
         os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
         gw._last_orphan_sweep = 0.0
         gw._reconcile_orphan_results(set())
@@ -1158,8 +1160,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
             if out and not fired:
                 fired.append(1)
                 tmp = self.results / '.producer.tmp'
-                tmp.write_text('BODY-A the reply')
-                os.replace(tmp, self.results / f'{TID}.txt')
+                publish_result(tmp, 'BODY-A the reply')
+                publish_staged_result(tmp, self.results / f'{TID}.txt')
             return out
         with patch.object(gw, 'delivered_body_differs', rule_then_put_a_back):
             result, posts = self._delivered_then_late('BODY-C a different reply')
@@ -1188,7 +1190,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
                    resend_adopted_epoch=rec['resend_epoch'],
                    source_sha256=hashlib.sha256(b'BODY-B newer answer').hexdigest())
         outbox._write_item(self.outbox, TID, rec)                # what the earlier adopt wrote
-        result.write_text('BODY-B newer answer')
+        publish_result(result, 'BODY-B newer answer')
         self.server.accepting = True
         gw._post_ready_results({TID})
         self.assertEqual([c.get('body') for c in self.server.calls][-1], 'BODY-B newer answer')
@@ -1483,8 +1485,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
             if not fired and names and '-suppressed' in names[0]:
                 fired.append(1)
                 tmp = Path(rfile).with_name('.producer.tmp')
-                tmp.write_text('[file: /tmp/d.txt]\nBODY-D')
-                os.replace(tmp, rfile)
+                publish_result(tmp, '[file: /tmp/d.txt]\nBODY-D')
+                publish_staged_result(tmp, rfile)
             return real(results_dir, rfile, generation, log, directory, names)
         with patch.object(gw, '_route_withheld_review', return_value=True), \
                 patch.object(disposal, 'retire_generation', replace_then_retire):
@@ -1627,8 +1629,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
 
     def _publish_c(self, result):
         tmp = result.with_name('.producer.tmp')
-        tmp.write_text('BODY-C newest reply')
-        os.replace(tmp, result)
+        publish_result(tmp, 'BODY-C newest reply')
+        publish_staged_result(tmp, result)
 
     def test_an_unrestorable_body_leaves_an_inert_queued_record(self):
         """No live result, no send: the drain and the sweep act only on a
@@ -1694,7 +1696,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         self.task('task-other')
         self.result().rename(self.claim_name(self.dead_pid(), 1, '01d00005'))
-        (self.results / 'undelivered').write_text('not a directory')
+        publish_result(self.results / 'undelivered', 'not a directory')
         other = self.result('fresh answer', 'task-other')
         for _ in range(PASSES):
             gw._post_ready_results({TID, 'task-other'})
@@ -2021,7 +2023,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         result = self.result('OLD BODY')
         _, gen = self.read(result)
         os.unlink(result)
-        result.write_text('NEWER BODY')
+        publish_result(result, 'NEWER BODY')
         with patch.object(disposal.undelivered_quarantine, '_RENAME', None), \
                 patch.object(disposal.undelivered_quarantine, 'RENAME_PRIMITIVE', 'none'):
             gw._quarantine_undelivered(result, TID, 'terminal', generation=gen)

@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from delivery.readiness import read_ready_result
 from typing import Optional
 
 import local_task_protocol
@@ -286,7 +287,10 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
         result = ""
         if result_path is not None:
             try:
-                result = result_path.read_text(errors="replace")[:MAX_RESULT_CHARS].strip()
+                verified = read_ready_result(result_path)
+                result = (verified or "")[:MAX_RESULT_CHARS]
+                if verified is None:
+                    result_path = None
             except OSError:
                 result = ""
         live = path.parent == tasks_dir
@@ -534,8 +538,9 @@ def _exact_result(workspace: Path, task_id: str) -> str:
         candidates.extend(directory / filename for directory in directories)
     for path in candidates:
         try:
-            if path.is_file():
-                return path.read_text(errors="replace")[:MAX_RESULT_CHARS].strip()
+            body = read_ready_result(path)
+            if body is not None:
+                return body[:MAX_RESULT_CHARS]
         except OSError:
             continue
     return ""

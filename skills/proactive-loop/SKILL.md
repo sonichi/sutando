@@ -136,4 +136,4 @@ when a step surprises you, not each pass. Keep enforceable commands here and pro
 
 For task replies: `python3 src/result_write.py write <file> --workspace "$WORKSPACE"`;
 stdin starts with `task: <bare-id>`. This checks ids, not the prose's meaning.
-See [pairing limits](../../docs/delivery-protocol.md#task-result-pairing-partial-rollout).
+See [pairing limits](../../docs/delivery-protocol.md#task-result-pairing).

@@ -23,6 +23,7 @@ from unittest import mock
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import team_guardrail  # noqa: E402
+from ag2_sparrow.result_publish import publish_text  # noqa: E402
 
 from ag2_sparrow import collaborator_turn as ct, relay_loop as rl  # noqa: E402
 
@@ -664,7 +665,7 @@ class FireLoopTest(unittest.TestCase):
             (Path(d) / "state").mkdir(exist_ok=True)
             (Path(d) / "state" / "done").write_text("task-old\n")
             (Path(d) / "results").mkdir(exist_ok=True)
-            (Path(d) / "results" / "task-has.txt").write_text("done")
+            publish_text(Path(d) / "results" / "task-has.txt", "done")
             run_adapter(d, base)
             self.assertEqual(srv.requests, [])
 

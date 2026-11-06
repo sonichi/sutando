@@ -6,6 +6,8 @@ Run: python3 tests/stop-interrupt.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import importlib.util
 import io
@@ -220,7 +222,7 @@ class StopInterrupt(Base):
 
     def test_a_task_with_a_result_or_an_unreadable_one_is_never_escaped(self):
         self.turn()
-        (self.ws / "results" / f"{TARGET}.txt").write_text("done")
+        publish_result(self.ws / "results" / f"{TARGET}.txt", "done")
         tmux = FakeTmux()
         self.assert_no_key(tmux, "it already has its result")
         self.assertFalse([c for c in tmux.calls if "capture-pane" in c], "the pane is not even read")
@@ -289,7 +291,7 @@ class StopInterrupt(Base):
         self.turn()
         res = self.ws / "results" / f"{TARGET}.txt"
         for body in ("", "  \n"):
-            res.write_text(body)
+            publish_result(res, body)
             self.assertEqual(si._result_state(self.ws, TARGET), "pending")
             self.assert_no_key(FakeTmux(), "it already has its result, or one being written")
         res.unlink()
@@ -414,7 +416,7 @@ class Rulings(Base):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
         self.assertEqual(self.sweep(), {})
         self.assertEqual(self.pending(), [f"{TARGET}.ruling.json"])
-        (self.ws / "results" / "task-ctl-1.txt").write_text("[no-send] stopped it")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "[no-send] stopped it")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
         self.assertEqual((self.phase(), self.pending()), ("CANCELLED", []))
 
@@ -436,18 +438,18 @@ class Rulings(Base):
         for body in ("[no-send] handled in the thread", "DONE"):
             with self.subTest(body=body):
                 si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-                (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
-                (self.ws / "results" / f"{TARGET}.txt").write_text(body)
+                publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
+                publish_result(self.ws / "results" / f"{TARGET}.txt", body)
                 self.assertEqual(self.sweep(), {TARGET: "finished"})
                 self.assertEqual(self.phase(), "RUNNING")
 
     def test_a_result_that_is_blank_unreadable_or_still_being_written_waits(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
         res = self.ws / "results" / f"{TARGET}.txt"
-        res.write_text("  ")
+        publish_result(res, "  ")
         self.assertEqual(self.sweep(), {}, "blank: no delivery yet, and no ruling either")
-        res.write_text("the real answer")
+        publish_result(res, "the real answer")
         res.chmod(0)
         self.addCleanup(res.chmod, 0o644)
         self.assertEqual(self.sweep(), {}, "unreadable: an answer may be there")
@@ -457,31 +459,31 @@ class Rulings(Base):
 
     def test_a_blank_result_still_there_after_the_hour_is_ruled_a_stop(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
-        (self.ws / "results" / f"{TARGET}.txt").write_text("")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
+        publish_result(self.ws / "results" / f"{TARGET}.txt", "")
         self.assertEqual(self.sweep(si.CONFIRM_MAX_S), {TARGET: "cancelled"})
         self.assertEqual(self.phase(), "CANCELLED")
 
     def test_a_placeholder_control_answer_is_not_an_answer(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "")
         self.assertEqual(self.sweep(), {})
         self.assertEqual(self.phase(), "RUNNING")
 
     def test_a_wake_turn_is_ruled_on_its_own_result_not_an_earlier_turns(self):
         old = self.ws / "results" / "archive"
         old.mkdir()
-        (old / f"{TARGET}.txt").write_text("the first turn's answer")
+        publish_result(old / f"{TARGET}.txt", "the first turn's answer")
         os.utime(old / f"{TARGET}.txt", (self.now - 600, self.now - 600))
         (self.tasks / f"{TARGET}.txt").write_text(f"id: {TARGET}\nwake_episode: e1\ntask: go\n")
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"}, "the old answer is not this turn's")
 
     def test_a_ruling_record_not_as_written_is_left_alone_and_never_used(self):
         d = self.ws / "state" / "stop-interrupts"
         d.mkdir(parents=True, exist_ok=True)
-        (self.ws / "results" / "task-ctl.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl.txt", "ok")
         bad = {"x.ruling.json": {"target": "../../escaped", "control": "task-ctl", "at": 0},
                "task-a.ruling.json": {"target": "task-b", "control": "task-ctl", "at": 0},
                "task-c.ruling.json": {"target": "task-c", "control": "task-ctl", "at": "0"},
@@ -504,7 +506,7 @@ class Rulings(Base):
         held = self.ws / "deliveries" / "w1" / f"{TARGET}.claimed"
         held.write_text("")
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
         self.assertEqual(self.sweep(), {}, "the worker may still answer")
         held.unlink()
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
@@ -515,12 +517,12 @@ class Rulings(Base):
     def test_an_archived_control_answer_counts(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-2", now=self.now)
         (self.ws / "results" / "archive").mkdir()
-        (self.ws / "results" / "archive" / "task-ctl-2-1793057500.txt").write_text("[no-send]")
+        publish_result(self.ws / "results" / "archive" / "task-ctl-2-1793057500.txt", "[no-send]")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
 
     def test_the_hooks_turn_end_ruling_writes_nothing_to_stderr(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
         hook = load_hook()
         err = io.StringIO()
         with mock.patch.object(hook.turns, "stamp_pane"), contextlib.redirect_stderr(err):
@@ -531,7 +533,7 @@ class Rulings(Base):
 
     def test_after_a_restart_the_hooks_turn_end_rules_the_stop(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("Cancelled it")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "Cancelled it")
         hook = load_hook()
         with mock.patch.object(hook.turns, "stamp_pane"):
             hook.handle({"hook_event_name": "Stop", "session_id": "S1", "prompt_id": "P1"}, hook.paths(self.ws),
@@ -541,14 +543,14 @@ class Rulings(Base):
     def test_a_damaged_record_is_skipped_and_others_still_ruled(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
         (self.ws / "state" / "stop-interrupts" / "task-bad.ruling.json").write_text("{")
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
         self.assertEqual(self.pending(), ["task-bad.ruling.json"])
 
     def test_a_sweep_with_nothing_waiting_or_for_another_task_rules_nothing(self):
         self.assertEqual(si.sweep(self.ws / "nowhere"), {})
         si.open_ruling(self.ws, "task-other", "task-ctl-9", now=self.now)
-        (self.ws / "results" / "task-ctl-9.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-9.txt", "ok")
         self.assertEqual(si.sweep(self.ws, now=self.now, only=TARGET), {})
         self.assertEqual(self.pending(), ["task-other.ruling.json"])
 
@@ -557,7 +559,7 @@ class Rulings(Base):
         cancel.write_text(f"id: task-ctl-1\nsource: relay-control\naccess_tier: owner\n"
                           f"task: CANCEL_INSTRUCTION: stop processing {TARGET}\n")
         si.open_ruling(self.ws, TARGET, "task-ctl-1", now=self.now)
-        (self.ws / "results" / "task-ctl-1.txt").write_text("ok")
+        publish_result(self.ws / "results" / "task-ctl-1.txt", "ok")
         with mock.patch.object(si, "interrupt", side_effect=RuntimeError("tmux gone")):
             self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks), "--workspace", str(self.ws),
                                       "--control-file", str(cancel), "--work"]), 0)
@@ -585,7 +587,7 @@ class Rulings(Base):
                                       "--control-file", str(cancel)]), 0)
         self.assertIn("--work", popen.call_args[0][0])
         self.assertEqual(self.phase(voice), "RUNNING", "taking the stop does not cancel it")
-        (self.ws / "results" / f"{ctl}.txt").write_text("Cancelled task-1793057400000 (was in progress)")
+        publish_result(self.ws / "results" / f"{ctl}.txt", "Cancelled task-1793057400000 (was in progress)")
         with mock.patch.object(si, "interrupt"):
             self.assertEqual(si.main([voice, "--tasks-dir", str(self.tasks), "--workspace", str(self.ws),
                                       "--control-file", str(cancel), "--work"]), 0)
@@ -644,7 +646,7 @@ class Handler(Base):
         store = activity_bus.ActivityStore(self.ws)
         store.apply(activity_bus.LifecycleTransition(TARGET, "RUNNING"))
         si.open_ruling(self.ws, TARGET, ctl, now=self.now)
-        (self.ws / "results" / f"{ctl}.txt").write_text("[no-send] stopped")
+        publish_result(self.ws / "results" / f"{ctl}.txt", "[no-send] stopped")
         self.assertEqual(si.sweep(self.ws, now=self.now, log=lambda m: None), {TARGET: "cancelled"})
         self.assertFalse(list((self.ws / "state" / "stop-interrupts").glob("*.ruling.json")), "and its record removed")
         f = self.ws / "state" / "stop-interrupts" / f"{TARGET}.ruling.json"

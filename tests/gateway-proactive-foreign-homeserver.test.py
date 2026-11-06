@@ -23,6 +23,8 @@ Run: python3 tests/gateway-proactive-foreign-homeserver.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import os
 import sys
 import tempfile
@@ -93,7 +95,7 @@ def lane(identity: str, tmp: Path, posts: list, fail_post: bool = False):
 def fresh() -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="gw-foreign-hs-"))
     (tmp / "archive").mkdir()
-    (tmp / "proactive-1.txt").write_text(BODY, encoding="utf-8")
+    publish_result(tmp / "proactive-1.txt", BODY, encoding="utf-8")
     return tmp
 
 

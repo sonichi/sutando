@@ -2,6 +2,8 @@
 """Tests for skills/agent-activity: the row writer and the session-bound hook."""
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import importlib.util
 import io
@@ -374,9 +376,9 @@ class MessageEvent(unittest.TestCase):
         self.assertIsNone(hook.consolidated_into(self.ws, "task-none"), "no result file: not a dedup, not a crash")
         (self.ws / "results").mkdir()
         self._task("task-77", event="$ev77")
-        (self.ws / "results" / "task-x2.txt").write_text("[deduped: 77]\n")
+        publish_result(self.ws / "results" / "task-x2.txt", "[deduped: 77]\n")
         self.assertEqual(hook.consolidated_into(self.ws, "task-x2"), "$ev77", "a bare id resolves to its task file")
-        (self.ws / "results" / "task-x3.txt").write_text("[deduped: task-unknown]\n")
+        publish_result(self.ws / "results" / "task-x3.txt", "[deduped: task-unknown]\n")
         self.assertEqual(hook.consolidated_into(self.ws, "task-x3"), "", "a dedup whose holder is gone still reads as consolidated")
         del p
 
@@ -390,7 +392,7 @@ class MessageEvent(unittest.TestCase):
             card.append(f"noise {i}", kind="notice", room=None, workspace=self.ws, live_rows=2)
         self.assertNotIn("task-rot", hook.open_tasks(p["log"]), "precondition: gone from the live log")
         hook.bind(p, "task-rot", "S1")
-        (self.ws / "results").mkdir(exist_ok=True); (self.ws / "results" / "task-rot.txt").write_text("done.\n")
+        (self.ws / "results").mkdir(exist_ok=True); publish_result(self.ws / "results" / "task-rot.txt", "done.\n")
         out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
                            "tool_input": {"file_path": str(self.ws / "results" / "task-rot.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
         self.assertEqual(out, [("done", "replied")])
@@ -409,7 +411,7 @@ class MessageEvent(unittest.TestCase):
         card.append("picked up", kind="processing", room="!r:s", task={"id": "task-b2", "event": "$evb"}, workspace=self.ws, live_rows=2)
         hook.bind(p, "task-b2", "S2")
         self.assertEqual(hook.load_json(p["bind"], {}).get("task-a2"), "S1", "A's binding survived B's pickup")
-        (self.ws / "results").mkdir(exist_ok=True); (self.ws / "results" / "task-a2.txt").write_text("done.\n")
+        (self.ws / "results").mkdir(exist_ok=True); publish_result(self.ws / "results" / "task-a2.txt", "done.\n")
         out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
                            "tool_input": {"file_path": str(self.ws / "results" / "task-a2.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
         self.assertEqual(out, [("done", "replied")])
@@ -423,7 +425,7 @@ class MessageEvent(unittest.TestCase):
         p = hook.paths(self.ws); runs = []
         self._task("task-x1", event="$evx"); self._task("task-h1", event="$evh")
         (self.ws / "results").mkdir()
-        (self.ws / "results" / "task-x1.txt").write_text("[deduped: task-h1]\n")
+        publish_result(self.ws / "results" / "task-x1.txt", "[deduped: task-h1]\n")
         with open(p["log"], "a") as f:
             f.write(json.dumps({"ts": 1, "kind": "processing", "line": "picked up", "room": "!r:s",
                                 "task": {"id": "task-x1", "event": "$evx"}}) + "\n")
@@ -435,7 +437,7 @@ class MessageEvent(unittest.TestCase):
         self.assertEqual((cmd[2], cmd[cmd.index("--into") + 1], cmd[cmd.index("--event") + 1]), ("done", "$evh", "$evx"))
         # a real reply stays "replied" with no --into
         runs.clear()
-        (self.ws / "results" / "task-x1.txt").write_text("Here is the answer.\n")
+        publish_result(self.ws / "results" / "task-x1.txt", "Here is the answer.\n")
         out = hook.handle({"hook_event_name": "PostToolUse", "session_id": "S1", "tool_name": "Write",
                            "tool_input": {"file_path": str(self.ws / "results" / "task-x1.txt")}}, p, lambda cmd, **kw: runs.append(cmd))
         self.assertEqual(out, [("done", "replied")])
@@ -486,7 +488,8 @@ class Hook(unittest.TestCase):
                 if result:
                     archive = self.ws / "results" / "archive"
                     archive.mkdir(parents=True)
-                    (archive / f"{old}-1793524800.txt").write_text("answered")
+                    publish_result(self.ws / "results" / f"{old}.txt", "answered")
+                    (self.ws / "results" / f"{old}.txt").rename(archive / f"{old}-1793524800.txt")
                 hook.handle(self.pre("S1", "Bash", {"description": "Check status"}), self.p, self.run)
                 cmd = self.runs[-1]
                 self.assertEqual(cmd[cmd.index("--task-id") + 1], current)
@@ -498,12 +501,12 @@ class Hook(unittest.TestCase):
     def test_answer_cache_survives_hook_reload_and_is_session_scoped(self):
         self.log({"ts": 10, "kind": "processing", "task": {"id": "task-cache"}})
         hook.bind(self.p, "task-cache", "S1")
-        with mock.patch.object(hook, "find_result", wraps=hook.find_result) as lookup:
+        with mock.patch.object(hook, "find_ready_result", wraps=hook.find_ready_result) as lookup:
             self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], "task-cache")
             self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], "task-cache")
             self.assertEqual(lookup.call_count, 1)
         fresh = load_at(Path(hook.__file__))
-        with mock.patch.object(fresh, "find_result", wraps=fresh.find_result) as lookup:
+        with mock.patch.object(fresh, "find_ready_result", wraps=fresh.find_ready_result) as lookup:
             self.assertEqual(fresh.bound_task(fresh.paths(self.ws), "S1")[0]["id"], "task-cache")
             lookup.assert_not_called()
             fresh.bind(self.p, "task-cache", "S2")
@@ -532,13 +535,13 @@ class Hook(unittest.TestCase):
         results = self.ws / "results"
         results.mkdir()
         result = results / f"{tid}.txt"
-        result.write_text("answered")
+        publish_result(result, "answered")
         self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
         archive = results / "archive"
         archive.mkdir()
         result.rename(archive / f"{tid}-1234567890.txt")
         self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
-        with mock.patch.object(hook, "find_result", side_effect=AssertionError("repeat archive scan")):
+        with mock.patch.object(hook, "find_ready_result", side_effect=AssertionError("repeat archive scan")):
             self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
 
     def test_same_id_pickup_after_done_reopens_with_an_old_result(self):
@@ -548,7 +551,7 @@ class Hook(unittest.TestCase):
         results = self.ws / "results"
         results.mkdir()
         result = results / f"{tid}.txt"
-        result.write_text("old answer")
+        publish_result(result, "old answer")
         os.utime(result, (15, 15))
         self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
         self.log({"ts": 20, "kind": "done", "done": True, "task": {"id": tid}},
@@ -559,7 +562,7 @@ class Hook(unittest.TestCase):
         cmd = self.runs[-1]
         self.assertEqual(cmd[cmd.index("--task-id") + 1], tid)
         self.assertEqual(cmd[cmd.index("--room") + 1], "!resumed:s")
-        result.write_text("new answer")
+        publish_result(result, "new answer")
         self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
 
     def test_bound_task_excludes_live_result_without_done(self):
@@ -567,7 +570,7 @@ class Hook(unittest.TestCase):
         hook.bind(self.p, "task-finished", "S1")
         results = self.ws / "results"
         results.mkdir()
-        (results / "task-finished.txt").write_text("answer")
+        publish_result(results / "task-finished.txt", "answer")
         self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
 
     def test_processing_task_id_from_task_id_task_file_or_reference(self):
@@ -659,13 +662,24 @@ class Hook(unittest.TestCase):
         # The result exists (answered by a dedup or an earlier session): a re-read, a dedup check
         # naming the file, or another session's touch must not write a Processing row after the Done.
         (self.ws / "tasks" / "task-abc123.txt").write_text("id: task-abc123\nchannel_id: !dm:s\nuser_id: @q:s\ntask: hi\n")
-        (self.ws / "results").mkdir(exist_ok=True); (self.ws / "results" / "task-abc123.txt").write_text("[deduped: task-zzz]")
+        (self.ws / "results").mkdir(exist_ok=True); publish_result(self.ws / "results" / "task-abc123.txt", "[deduped: task-zzz]")
         self.assertEqual(hook.handle(self.pre("S2", "Read", {"file_path": str(self.ws / "tasks" / "task-abc123.txt")}), self.p, self.run), [])
         self.assertEqual(hook.load_json(self.p["bind"], {}), {})
         self.assertEqual(self.runs, [])
         self.assertEqual(hook.pickup_line({"from": "@q:s", "text": "x" * 30}), "Your agent is working on a task from @q:s: " + "x" * 20 + "…")
         with mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "air"}):
             self.assertTrue(hook.pickup_line({"sender": "qingyun", "text": "hi"}).startswith("air is working on a task from qingyun: hi"))
+
+    def test_cached_answer_rechecks_pairing_evidence(self):
+        tid = "task-proof"
+        self.log({"ts": 10, "kind": "processing", "task": {"id": tid}})
+        hook.bind(self.p, tid, "S1")
+        result = self.ws / "results" / f"{tid}.txt"
+        publish_result(result, "verified answer")
+        self.assertEqual(hook.bound_task(self.p, "S1"), (None, None))
+        receipt = self.ws / "state" / "result-pairing" / f"{tid}.ok"
+        receipt.unlink()
+        self.assertEqual(hook.bound_task(self.p, "S1")[0]["id"], tid)
 
     def test_answered_sees_every_archive_shape_the_delivery_paths_write(self):
         # Live, gateway (epoch suffix) and bridge (month dir) shapes; 0 of 400 live ids sat flat.
@@ -675,8 +689,12 @@ class Hook(unittest.TestCase):
             "task-22222222222222": r / "archive" / "task-22222222222222-1788657562.txt",
             "task-33333333333333": r / "archive" / "2026-06" / "task-33333333333333.txt",
         }
-        for path in shapes.values():
-            path.parent.mkdir(parents=True, exist_ok=True); path.write_text("reply")
+        for tid, path in shapes.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            live = r / f"{tid}.txt"
+            publish_result(live, "reply")
+            if live != path:
+                live.rename(path)
         for tid in shapes:
             self.assertTrue(hook.answered(ws, tid), tid)
         self.assertFalse(hook.answered(ws, "task-99999999999999"))
@@ -713,7 +731,7 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.handle(self.post("S1", "Write", write), self.p, self.run), [])
         self.assertEqual(self.runs, [])
         # the tool ran and produced the artifact: now the task closes
-        rpath.parent.mkdir(exist_ok=True); rpath.write_text("reply")
+        rpath.parent.mkdir(exist_ok=True); publish_result(rpath, "reply")
         # another session's PostToolUse on the same path closes nothing
         self.assertEqual(hook.handle(self.post("S-other", "Write", write), self.p, self.run), [])
         out = hook.handle(self.post("S1", "Bash", {"command": "cat > \"$WS/results/task-abc123.txt\" << EOF"}), self.p, self.run)

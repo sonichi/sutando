@@ -9,6 +9,8 @@ Run: python3 tests/gateway-disposal-delegation.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import ast
 import ctypes
 import errno
@@ -57,7 +59,7 @@ class CoreContract(unittest.TestCase):
 
     def result(self, body="answer", stem="task-a"):
         p = self.results / f"{stem}.txt"
-        p.write_text(body)
+        publish_result(p, body)
         return p
 
     def dead_pid(self):
@@ -117,7 +119,7 @@ class CoreContract(unittest.TestCase):
         r = self.result()
         _, gen = identity_of(r)
         other = self.results / "task-a.later"               # another inode, equal bytes
-        other.write_text("answer")
+        publish_result(other, "answer")
         _park_in_quarantine(other, self.results)
         self.assertFalse(disposal.disposed_copy_exists(self.results, "task-a", gen, self.lines.append))
 
@@ -193,7 +195,7 @@ class CoreContract(unittest.TestCase):
         def retake_then_unlink(path, *a, **kw):
             if Path(path) == c:
                 tmp = self.results / "task-a.newest"
-                tmp.write_text("NEWEST")
+                publish_result(tmp, "NEWEST")
                 os.replace(tmp, self.results / "task-a.txt")
             return real(path, *a, **kw)
         with unittest.mock.patch.object(os, "unlink", retake_then_unlink):
@@ -205,7 +207,7 @@ class CoreContract(unittest.TestCase):
         self.result("A", stem="task-a").rename(self.claim(stem="task-a", body="A"))
         self.result("B", stem="task-b").rename(self.claim(stem="task-b", nonce="b0000001", body="B"))
         q = undelivered_quarantine.quarantine_dir(self.results)
-        q.write_text("not a directory")
+        publish_result(q, "not a directory")
         disposal.recover_abandoned_claims(self.results, self.lines.append)
         disposal.recover_abandoned_claims(self.results, self.lines.append)
         self.assertEqual(len(self.lines), 2, "\n".join(self.lines))
@@ -302,7 +304,7 @@ class CoreContract(unittest.TestCase):
         def producer_first(src, dst, *a, **kw):
             if Path(src) == c:
                 tmp = self.results / "task-a.newest"
-                tmp.write_text("NEWEST")
+                publish_result(tmp, "NEWEST")
                 os.replace(tmp, self.results / "task-a.txt")
             return real(src, dst, *a, **kw)
         with unittest.mock.patch.object(disposal, "rename_noreplace", producer_first):
@@ -351,7 +353,7 @@ class CoreContract(unittest.TestCase):
 
         def retake_then_unlink(path, *a, **kw):
             tmp = self.results / "task-a.newest"
-            tmp.write_text("NEWEST")
+            publish_result(tmp, "NEWEST")
             os.replace(tmp, self.results / "task-a.txt")
             return real(path, *a, **kw)
 
@@ -460,7 +462,7 @@ class CoreContract(unittest.TestCase):
             with disposal.locked(self.results):
                 pass
         lock.rmdir()
-        target = self.results / "elsewhere"; target.write_text("")
+        target = self.results / "elsewhere"; publish_result(target, "")
         lock.symlink_to(target)
         with self.assertRaises(OSError):
             with disposal.locked(self.results):
@@ -494,7 +496,7 @@ class CoreContract(unittest.TestCase):
         def replace_then_stat(path, *a, **kw):
             if Path(path) == c:
                 tmp = self.results / "task-a.newest"
-                tmp.write_text("NEWEST")
+                publish_result(tmp, "NEWEST")
                 os.replace(tmp, self.results / "task-a.txt")
             return real(path, *a, **kw)
         with unittest.mock.patch.object(os, "stat", replace_then_stat):
@@ -687,7 +689,7 @@ class CoreContract(unittest.TestCase):
         d = self.results / undelivered_quarantine.DIRNAME
         d.mkdir(exist_ok=True)
         prior = d / undelivered_quarantine.quarantine_name(stem, when)
-        prior.write_text("PRIOR-EVIDENCE")
+        publish_result(prior, "PRIOR-EVIDENCE")
         return prior
 
     def test_terminal_quarantine_never_overwrites_an_earlier_copy(self):
@@ -792,7 +794,7 @@ class CoreContract(unittest.TestCase):
         def producer_first(src, dst, *a, **kw):
             if "undelivered" in str(src):                 # the undo's put-back finds the name taken
                 tmp = self.results / "task-a.newest"
-                tmp.write_text("NEWEST")
+                publish_result(tmp, "NEWEST")
                 os.replace(tmp, self.results / "task-a.txt")
             return real(src, dst, *a, **kw)
         with self.rewrite_at_the_final_move(gen), \
@@ -868,7 +870,7 @@ class CoreContract(unittest.TestCase):
             os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
             real_move(src, dst, log)
             tmp = self.results / "task-a.newest"
-            tmp.write_text("NEWEST")
+            publish_result(tmp, "NEWEST")
             os.replace(tmp, self.results / "task-a.txt")
 
         def lose(src, dst, *a, **kw):
@@ -944,7 +946,7 @@ class DeliveryPin(unittest.TestCase):
 
     def publish(self, body, stem="task-a"):
         tmp = self.results / f".{stem}.tmp"
-        tmp.write_text(body)
+        publish_result(tmp, body)
         os.replace(tmp, self.results / f"{stem}.txt")
 
     def test_a_reply_published_after_the_pin_never_changes_what_is_pinned(self):

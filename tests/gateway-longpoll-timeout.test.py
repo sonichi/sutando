@@ -2,6 +2,8 @@
 """Long-poll timeout grace preserves retry timing without inventing poll evidence."""
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import re
 import sys
 import json
@@ -942,7 +944,7 @@ class RelayResultsInTheLoopTest(unittest.TestCase):
 
             def lands_during_the_poll(method, path, *a, **k):
                 if path.startswith("/v1/tasks?"):
-                    (self.gw.RESULTS_DIR / f"{self.ASK}.txt").write_text("Your calendar is clear.")
+                    publish_result(self.gw.RESULTS_DIR / f"{self.ASK}.txt", "Your calendar is clear.")
                 return poll(method, path, *a, **k)
             self.gw._req = lands_during_the_poll
             with patch.object(self.gw, "wake_outbound", new=lambda: self.calls.append(

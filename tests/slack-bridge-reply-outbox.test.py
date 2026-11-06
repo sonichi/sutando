@@ -8,6 +8,8 @@ without send; refusal -> kept for retry; ambiguous send -> parked, no retry.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -80,7 +82,7 @@ class ReplyOutboxTest(unittest.TestCase):
         (tasks / "archive").mkdir(parents=True)
         (Path(td) / "state").mkdir()
         (tasks / f"{TID}.txt").write_text(f"id: {TID}\nsource: slack\ntask: hi\n")
-        (results / f"{TID}.txt").write_text("a reply body")
+        publish_result(results / f"{TID}.txt", "a reply body")
         if prepare:
             prepare(results)
 
@@ -173,7 +175,7 @@ class ReplyOutboxTest(unittest.TestCase):
                 status_code=200, data={"ok": False, "error": "msg_too_long"})
             raise e
         def prepare(results):
-            (results / f"{TID}.txt").write_text("x" * 4100)  # two 4000-char chunks
+            publish_result(results / f"{TID}.txt", "x" * 4100)  # two 4000-char chunks
         with tempfile.TemporaryDirectory() as td:
             r = self._one_pass(td, _second_refuses, prepare)
             self.assertEqual(n["calls"], 2, "second chunk was attempted")
@@ -197,8 +199,8 @@ class ReplyOutboxTest(unittest.TestCase):
             calls["post"] += 1
             return _Resp()
         def prepare(results):
-            f = results / "att.txt"; f.write_text("payload")
-            (results / f"{TID}.txt").write_text(f"a reply body\n[file: {f}]")
+            f = results / "att.txt"; publish_result(f, "payload")
+            publish_result(results / f"{TID}.txt", f"a reply body\n[file: {f}]")
         sb = sys.modules.get("slack_bridge")
         with tempfile.TemporaryDirectory() as td:
             def _one(td=td):
@@ -212,8 +214,8 @@ class ReplyOutboxTest(unittest.TestCase):
         # control: attachment fails with NO text posted -> nothing visible -> retry
         calls["post"] = 0
         def prepare_only_file(results):
-            f = results / "att.txt"; f.write_text("payload")
-            (results / f"{TID}.txt").write_text(f"[file: {f}]")
+            f = results / "att.txt"; publish_result(f, "payload")
+            publish_result(results / f"{TID}.txt", f"[file: {f}]")
         with tempfile.TemporaryDirectory() as td:
             r = self._one_pass(td, _ok, prepare_only_file,
                                patch={"_is_path_sendable": lambda p: True,

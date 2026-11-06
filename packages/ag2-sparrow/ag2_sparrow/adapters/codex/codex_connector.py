@@ -29,6 +29,7 @@ import time
 import uuid
 
 from ...relay_loop import count_arg
+from ...result_ready import read_ready_result
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
                         non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock, root_path,
@@ -384,7 +385,7 @@ class Connector:
     def pending_tasks(self, seen):
         names = [n for n in os.listdir(self.args.inbox)
                  if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
-                 and not os.path.exists(os.path.join(self.args.results, n))]
+                 and read_ready_result(os.path.join(self.args.results, n)) is None]
         names.sort(key=lambda n: (os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
         return names
 
@@ -418,7 +419,7 @@ class Connector:
             headers, message, operator_lines = parse_task(path)
             if admission(headers, self.args.allow_non_owner) is None:
                 log("refused (non-owner, --allow-non-owner not set) ->", task_id, headers["access_tier"])
-                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED, pair_result=True)
                 record_done(done_path, task_id)
                 done += 1
                 idle_since = time.time()
@@ -429,7 +430,7 @@ class Connector:
             status, text, err = self.run_task(headers, prompt)
             t_done = time.time()
             out = self.result_body(status, text, err)
-            t_result = write_atomic(os.path.join(self.args.results, name), out.rstrip("\n") + "\n")
+            t_result = write_atomic(os.path.join(self.args.results, name), out.rstrip("\n") + "\n", pair_result=True)
             record_done(done_path, task_id)
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
                    "detect_s": round(t_seen - t_mtime, 3), "turn_s": round(t_done - t_sent, 3),

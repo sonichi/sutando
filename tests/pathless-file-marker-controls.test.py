@@ -24,6 +24,8 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -113,7 +115,7 @@ def discord_case(body: str) -> list:
     # OWNER tier, or the Team guard withholds the marker before the sink runs.
     (db.TASKS_DIR / f"{tid}.txt").write_text(
         f"id: {tid}\naccess_tier: owner\ntask: fixture\n", encoding="utf-8")
-    (db.RESULTS_DIR / f"{tid}.txt").write_text(body, encoding="utf-8")
+    publish_result(db.RESULTS_DIR / f"{tid}.txt", body, encoding="utf-8")
 
     sent: list = []
 

@@ -183,7 +183,7 @@ def publish(staged, path):
     No replace: a result another writer published, or a drain is reading, is never overwritten."""
     try:
         from .result_publish import publish_staged
-        publish_staged(staged, path, no_replace=True)
+        publish_staged(staged, path, no_replace=True, pair_result=True)
     except FileExistsError:
         log("a result is already at", os.path.basename(path), "- the staged copy is discarded")
     Path(staged).unlink(missing_ok=True)

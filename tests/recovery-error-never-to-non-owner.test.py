@@ -18,6 +18,8 @@ member's Slack DM. Pins the three properties the fix owns:
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ
 
 isolate_os_environ()
@@ -103,14 +105,14 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
     def test_epoch_suffixed_month_archived_result_is_answered(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            (ws / "results/archive/2026-10" / f"{TID}-1792626046.txt").write_text("done")
+            publish_result(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt", "done")
             self.assertEqual(td_mod.task_disposition(ws, TID), "answered")
             self.assertIn(td_mod.task_disposition(ws, TID), td_mod.SETTLED)
 
     def test_empty_live_result_is_not_answered(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            (ws / "results" / f"{TID}.txt").write_text("  \n")
+            publish_result(ws / "results" / f"{TID}.txt", "  \n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "missing")
             (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "pending")
@@ -118,7 +120,7 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
     def test_empty_archived_result_is_not_answered(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            (ws / "results/archive/2026-10" / f"{TID}-1792626046.txt").write_text("")
+            publish_result(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt", "")
             self.assertEqual(td_mod.task_disposition(ws, TID), "missing")
             (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "pending")
@@ -127,8 +129,8 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
             (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
-            (ws / "results" / f"{TID}.txt").write_text("")
-            (ws / "results/archive/2026-10" / f"{TID}-1792626046.txt").write_text("done")
+            publish_result(ws / "results" / f"{TID}.txt", "")
+            publish_result(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt", "done")
             self.assertEqual(td_mod.task_disposition(ws, TID), "answered")
 
     def test_claimed_variant_is_claimed_and_absent_is_missing(self):
@@ -170,7 +172,7 @@ class ErrorNoticeNeverRoutedToNonOwner(unittest.TestCase):
         if task_file:
             (tasks / f"{TID}.txt").write_text(
                 f"id: {TID}\nsource: slack\naccess_tier: {tier}\ntask: hi\n")
-        (results / f"{TID}.txt").write_text(ERROR_BODY)
+        publish_result(results / f"{TID}.txt", ERROR_BODY)
         calls: list[dict] = []
 
         def _post(**kw):

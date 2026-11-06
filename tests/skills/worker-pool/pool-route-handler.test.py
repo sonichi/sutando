@@ -8,6 +8,11 @@ Run: python3 tests/skills/worker-pool/pool-route-handler.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.paired_result import publish_result
+
 import json
 import sys
 import tempfile
@@ -94,7 +99,7 @@ class TestPickerReplayAcrossRestart(Base):
         self.assertIsNone(self.bindings().get(self.ROOM), "the unpin never cleared it")
 
         for tid in ("task-old-pin", "task-new-unpin"):
-            (self.ws / "results" / "archive" / f"{tid}.txt").write_text("done\n")
+            publish_result(self.ws / "results" / "archive" / f"{tid}.txt", "done\n")
         Path(self.unpin).unlink()          # the newer task was archived away
         self.probe(self.pin)               # the startup sweep re-probes what is left
         self.assertIsNone(self.bindings().get(self.ROOM),
@@ -107,14 +112,14 @@ class TestPickerReplayAcrossRestart(Base):
         else, which is the situation the gateway's archive-first ordering makes
         ordinary rather than rare.
         """
-        (self.ws / "results" / "archive" / "task-old-pin.txt").write_text("done\n")
+        publish_result(self.ws / "results" / "archive" / "task-old-pin.txt", "done\n")
         self.assertFalse(wpc.applied_path(self.ws).exists(), "no record may exist here")
         self.probe(self.pin)
         self.assertIsNone(self.bindings().get(self.ROOM),
                           "an archived result did not block the replay")
 
     def test_a_live_result_alone_blocks_the_replay(self):
-        (self.ws / "results" / "task-old-pin.txt").write_text("done\n")
+        publish_result(self.ws / "results" / "task-old-pin.txt", "done\n")
         self.assertFalse(wpc.applied_path(self.ws).exists(), "no record may exist here")
         self.probe(self.pin)
         self.assertIsNone(self.bindings().get(self.ROOM),
@@ -125,7 +130,7 @@ class TestPickerReplayAcrossRestart(Base):
         default directory while the watcher had resolved another one."""
         alt = self.ws / "elsewhere"
         (alt / "archive").mkdir(parents=True, exist_ok=True)
-        (alt / "task-old-pin.txt").write_text("done\n")
+        publish_result(alt / "task-old-pin.txt", "done\n")
         h.main(["--task-file", self.pin, "--workspace", str(self.ws),
                 "--results-dir", str(alt), "--probe"])
         self.assertIsNone(self.bindings().get(self.ROOM),
@@ -153,7 +158,7 @@ class TestPickerReplayAcrossRestart(Base):
 
     def test_control_an_archived_result_for_another_task_does_not_block(self):
         # The gate must key on THIS task's id, not on any archived result.
-        (self.ws / "results" / "archive" / "task-unrelated.txt").write_text("done\n")
+        publish_result(self.ws / "results" / "archive" / "task-unrelated.txt", "done\n")
         self.probe(self.pin)
         self.assertEqual(self.bindings().get(self.ROOM), W)
 

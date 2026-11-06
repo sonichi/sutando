@@ -131,7 +131,7 @@ case "$OUT" in
 esac
 
 # 6. A ready result for that same task clears the worker's own block.
-printf 'done\n' > "$WS/results/$PROBE.txt"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/$PROBE.txt"
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in
   '{}') ok "worker's block clears once its result is ready" ;;
@@ -148,14 +148,16 @@ rm -f "$WS/results/$PROBE.txt"
 #    folder, must not be told the task is still open just because
 #    results/<id>.txt itself is gone.
 mkdir -p "$WS/results/archive"
-printf 'done\n' > "$WS/results/archive/$PROBE-1789600000.txt"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/$PROBE.txt"
+mv "$WS/results/$PROBE.txt" "$WS/results/archive/$PROBE-1789600000.txt"
 record_delivery
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in
   '{}') ok "worker's block clears once its result is archived (not just present)" ;;
   *) bad "worker's block clears once its result is archived (not just present)" "got: ${OUT:0:160}" ;;
 esac
-rm -f "$WS/results/archive/$PROBE-1789600000.txt"
+rm -f "$WS/results/$PROBE.txt"
+mv "$WS/results/$PROBE.txt" "$WS/results/archive/$PROBE-1789600000.txt"
 record_delivery
 
 # 8. THE MONTH-BUCKET ARCHIVE SHAPE (john-the-dev's #4339 review, 2026-09-17):
@@ -169,7 +171,7 @@ record_delivery
 #    caller) — same stale-sentinel setup as case 7, real archive shape.
 MONTH="$("$PYBIN" -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m'))")"
 mkdir -p "$WS/results/archive/$MONTH"
-printf 'done\n' > "$WS/results/archive/$MONTH/$PROBE.txt"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/archive/$MONTH/$PROBE.txt"
 record_delivery
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in
@@ -186,7 +188,7 @@ record_delivery
 #    hook must also recognize as delivered.
 TODAY="$("$PYBIN" -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d'))")"
 mkdir -p "$WS/results/archive-$TODAY"
-printf 'done\n' > "$WS/results/archive-$TODAY/$PROBE.txt"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/archive-$TODAY/$PROBE.txt"
 record_delivery
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in
@@ -203,7 +205,8 @@ record_delivery
 #     contain a literal "-<n>" segment, as several producers in this repo
 #     emit). Proves the fix delegates to id-aware matching, not substring glob.
 OTHER="${PROBE}-2"
-printf 'other tasks result, not mine\n' > "$WS/results/archive/$OTHER-1789600001.txt"
+printf 'other tasks result, not mine\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/$OTHER.txt"
+mv "$WS/results/$OTHER.txt" "$WS/results/archive/$OTHER-1789600001.txt"
 record_delivery
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in

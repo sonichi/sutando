@@ -41,6 +41,9 @@ SET_HOME = "from ag2_sparrow import holder_lock\nholder_lock._home = lambda: %r\
 PKG_ROOT = Path(__file__).resolve().parents[1]
 
 
+from ag2_sparrow.result_publish import publish_text  # noqa: E402
+
+
 def charges(work):
     return lc.RateJournal(Path(work) / "state" / "rate.jsonl").charges()
 
@@ -158,12 +161,12 @@ class AdapterLifecycleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok()])
             (Path(d) / "results" / "archive").mkdir(parents=True)
-            (Path(d) / "results" / "archive" / "task-a.txt").write_text("[no-send]\n")
+            publish_text(Path(d) / "results" / "archive" / "task-a.txt", "[no-send]\n", pair_result=True)
             write_task(d, "task-a", "x")
             run_adapter(d, fake, once=1)
             self.assertEqual(fake.calls(), [])
             self.assertFalse((Path(d) / "results" / "task-a.txt").exists())
-            self.assertEqual(claim(d, "task-a")["phase"], "SETTLED")
+            self.assertIsNone(claim(d, "task-a"), "verified archives are excluded before admission")
 
     def test_a_settled_id_is_never_called_again(self):
         with tempfile.TemporaryDirectory() as d:
@@ -336,7 +339,7 @@ class ProductionBridgeWitnessTest(unittest.TestCase):
         self.assertEqual(claim(cloud, fixture.TASK["id"])["phase"], "SETTLED")
         self.assertTrue(gateway.is_dir() and os.listdir(gateway), "the bridge's state lives under --gateway-state")
         self.assertEqual(sorted(n for n in os.listdir(cloud / "state") if not n.startswith(".")),
-                         ["claims", "format", "rate.jsonl", "settled-ids"])
+                         ["claims", "format", "rate.jsonl", "result-pairing", "settled-ids"])
 
 if __name__ == "__main__":
     unittest.main()

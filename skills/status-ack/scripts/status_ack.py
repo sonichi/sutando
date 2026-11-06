@@ -50,6 +50,7 @@ from outbox import list_items
 from proactive_dispatch_gate import dispatch_veto
 from result_markers import has_skip_action, parse_markers
 from result_publish import publish_text
+from result_ready import read_ready_result
 from task_archive import find_task_file
 from task_envelope import attested_task_headers, verify_text
 
@@ -142,10 +143,11 @@ def result_state(ws: Path, tid: str, probe_answered: bool = False) -> str:
     results = ws / "results"
     if find_task_file(ws / "tasks", tid) is None:
         return "archived"
-    body = _read(results / f"{tid}.txt")
+    body = read_ready_result(results / f"{tid}.txt")
     if body is not None:
         return "no-send" if has_skip_action(parse_markers(body).actions) else "answered"
-    if any(results.glob(f"{tid}.sending*")) or any(results.glob(f"{tid}.txt.sending*")):
+    if any(read_ready_result(p) is not None for pattern in (f"{tid}.sending*", f"{tid}.txt.sending*")
+           for p in results.glob(pattern)):
         return "sending"
     return "answered" if probe_answered else "none"
 
@@ -374,8 +376,9 @@ def _published(ws: Path, via) -> bool:
         return False
     results, stem = ws / "results", Path(via).stem
     archive = results / "archive"
-    return ((results / via).exists() or any(results.glob(f"{stem}.sending*"))
-            or (archive / via).exists() or any(archive.glob(f"{stem}-[0-9]*.txt"))
+    candidates = [results / via, archive / via, *results.glob(f"{stem}.sending*"),
+                  *archive.glob(f"{stem}-[0-9]*.txt")]
+    return (any(read_ready_result(p) is not None for p in candidates)
             or _receipt(ws, via) is not None)
 
 

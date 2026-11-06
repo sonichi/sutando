@@ -108,6 +108,8 @@ if str(REPO / "src") not in sys.path:
 
 import core_limit_hold  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
+from delivery.task_dispatch import find_ready_result  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 
 # The worker-pool skill is optional: without it there is no router, so nobody can
 # hold a task. Any stat failure but ENOENT propagates — unreadable is not absent.
@@ -228,11 +230,11 @@ def import_status(workspace: Path) -> tuple[str, float | None, str | None]:
 
 def completion_marker(results_dir: Path, task_id: str) -> str:
     """Path of the marker that proves the task completed, or ''."""
-    found = ltp.find_result(results_dir, task_id)
+    found = find_ready_result(results_dir, task_id)
     if found is not None:
         return str(found)
     for name in (f"proactive-{task_id}.txt", f"proactive-{task_id}.txt.sending"):
-        if (results_dir / name).is_file():
+        if read_ready_result(results_dir / name) is not None:
             return str(results_dir / name)
     return ""
 

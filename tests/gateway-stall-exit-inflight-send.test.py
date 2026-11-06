@@ -12,6 +12,8 @@ the message is archived, and the restarted process posts nothing: one POST.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import json
 import subprocess
 import sys
@@ -102,7 +104,7 @@ rdir.mkdir(parents=True)
 sdir.mkdir(parents=True)
 (sdir / "last-owner-activity.json").write_text(json.dumps(
     {"ts": int(time.time()), "channel": "ag2space", "summary": "t"}))
-(rdir / "proactive-200.txt").write_text(BODY)
+publish_result(rdir / "proactive-200.txt", BODY)
 
 env = hermetic_env()
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(tmp),

@@ -10,6 +10,8 @@ Run: python3 tests/runtime-api-server-branches.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
@@ -294,7 +296,7 @@ class EmitNewResults(unittest.TestCase):
         rdir = Path(tmp.name) / "results"
         rdir.mkdir()
         f = rdir / "task-race.txt"
-        f.write_text("race body")
+        publish_result(f, "race body")
 
         real_read = srv.read_ready_result
 
@@ -332,9 +334,9 @@ class EmitNewResults(unittest.TestCase):
         rdir = Path(tmp.name) / "results"
         rdir.mkdir()
         good = rdir / "task-ok.txt"
-        good.write_text("good body")
+        publish_result(good, "good body")
         bad = rdir / "task-bad.txt"
-        bad.write_text("hidden")
+        publish_result(bad, "hidden")
         bad.chmod(0o000)
 
         class _Tasks:

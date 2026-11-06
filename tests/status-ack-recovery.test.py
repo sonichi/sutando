@@ -19,6 +19,8 @@ Run: python3 tests/status-ack-recovery.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import json
 import subprocess
 import sys
@@ -119,7 +121,7 @@ def main() -> int:
         lane = pl.Lane(gb, ISO)
         sa.task(lane.ws, TID)
         dead_claim(lane.ws)
-        (lane.results / "archive" / archived).write_text("Received. Not picked up yet.\n", encoding="utf-8")
+        publish_result(lane.results / "archive" / archived, "Received. Not picked up yet.\n", encoding="utf-8")
         reports = restart(lane, DUE, n=2)
         check(ack_claim.state(lane.ws, KEY) == "claimed" and reports[0].get("recovered") == [] and lane.posts == [],
               f"c) delivered, only in {label}: left as it is, no line ({ack_claim.state(lane.ws, KEY)})")

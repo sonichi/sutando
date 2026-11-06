@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import os
 import sys
@@ -37,12 +39,12 @@ def test_payload_reconciles_files_history_and_questions() -> None:
         task.write_text("source: discord\ntask: preserve this title\n")
         os.utime(task, (2000, 2000))
         archived = api.RESULT_DIR / "archive" / "2026-08" / task.name
-        archived.write_text("archived result\n")
+        publish_result(archived, "archived result\n")
 
         live_task = api.TASK_DIR / "task-live-result.txt"
-        live_task.write_text("source: api\ntask: live result wins\n")
+        publish_result(live_task, "source: api\ntask: live result wins\n")
         os.utime(live_task, (2500, 2500))
-        (api.RESULT_DIR / live_task.name).write_text("live result\n")
+        publish_result(api.RESULT_DIR / live_task.name, "live result\n")
 
         remembered_task = api.TASK_DIR / "task-remembered.txt"
         remembered_task.write_text("source: voice\ntask: remembered result survives\n")
@@ -56,7 +58,7 @@ def test_payload_reconciles_files_history_and_questions() -> None:
         }
 
         result_only = api.RESULT_DIR / "task-result-only.txt"
-        result_only.write_text("result summary\n")
+        publish_result(result_only, "result summary\n")
         os.utime(result_only, (3000, 3000))
 
         api.task_history["task-stale"] = {
@@ -165,7 +167,7 @@ def test_rows_reconcile_result_after_result_scan() -> None:
             "result": "",
             "source": "api",
         }
-        (api.RESULT_DIR / "task-reconcile.txt").write_text("finished later\n")
+        publish_result(api.RESULT_DIR / "task-reconcile.txt", "finished later\n")
 
         try:
             # Isolate the final pass: the preceding result-file scan normally

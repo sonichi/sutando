@@ -9,6 +9,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src'))
+from _helpers.hermetic_env import isolated_child_env, isolate_os_environ
+isolate_os_environ()
 from delivery.readiness import read_ready_result
 from delivery.task_dispatch import has_ready_result
 from result_publish import publish_text
@@ -49,12 +51,46 @@ class ReceiptBoundary(unittest.TestCase):
             path.parent.mkdir()
             path.write_text('unpaired')
             argv = [sys.executable, str(REPO / 'src/result_write.py'), 'read', str(path)]
-            p = subprocess.run(argv, capture_output=True, text=True)
+            p = subprocess.run(argv, capture_output=True, text=True, env=isolated_child_env())
             self.assertNotEqual(p.returncode, 0)
             self.assertEqual(p.stdout, '')
             publish_text(path, 'paired')
-            p = subprocess.run(argv, capture_output=True, text=True)
+            p = subprocess.run(argv, capture_output=True, text=True, env=isolated_child_env())
             self.assertEqual((p.returncode, p.stdout), (0, 'paired'))
+
+    def test_renamed_tagged_archives_verify_the_original_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td) / "results"
+            live = results / "task-a.txt"
+            archive = results / "archive"
+            archive.mkdir(parents=True)
+            for suffix in ("-123", "-123-late-duplicate", "-123-late-duplicate.456", "-123.456"):
+                publish_text(live, "original answer")
+                target = archive / f"task-a{suffix}.txt"
+                live.rename(target)
+                publish_text(live, "new answer")
+                self.assertEqual(read_ready_result(target), "original answer")
+
+    def test_custom_result_root_pins_keep_their_receipt_namespace(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td) / "custom-output"
+            path = results / "task-a.txt"
+            publish_text(path, "answer\r\n", pair_result=True)
+            pin = results / ".delivering" / "task-a.pin"
+            pin.parent.mkdir()
+            path.rename(pin)
+            publish_text(path, "new answer", pair_result=True)
+            self.assertEqual(read_ready_result(pin), "answer")
+
+    def test_notifier_completion_delegates_to_shared_dispatch(self):
+        for provider in ("claude", "codex"):
+            source = (REPO / f"src/agent/{provider}/cli/task-notifier.sh").read_text()
+            self.assertIn("has_result()", source)
+            self.assertIn("task_dispatch", source)
+            self.assertNotRegex(source, r"cat [^\n]*(?:RESULTS_DIR|result_file)")
+        connector = (REPO / "packages/ag2-sparrow/ag2_sparrow/adapters/codex/codex_connector.py").read_text()
+        self.assertIn("read_ready_result(os.path.join(self.args.results, n))", connector)
+        self.assertNotIn("os.path.exists(os.path.join(self.args.results, n))", connector)
 
     def test_sparrow_verifier_is_the_same_owner(self):
         for source, target in [('result_write.py', 'result_write.py'),
@@ -74,16 +110,69 @@ class ReceiptBoundary(unittest.TestCase):
         self.assertIn('attests = path_verifier(p)', owner)
         self.assertIn('if not attests(', owner)
 
-    def test_raw_voice_reads_are_rejected_by_the_boundary_scan(self):
+    def test_completion_functions_delegate_to_receipt_verification(self):
+        inventory = {
+            "src/health_snapshot.py": {"_has_result": "has_ready_result"},
+            "src/task_workstreams.py": {"scan_task_history": "read_ready_result",
+                                         "_exact_result": "read_ready_result"},
+            "src/dedup_recovery.py": {"plan_dedup_recovery": "read_ready_result"},
+            "src/telegram-bridge.py": {"poll_progress": "read_ready_result"},
+            "src/discord-bridge.py": {"poll_progress": "read_ready_result"},
+            "skills/agent-activity/hooks/activity-hook.py": {
+                "cached_answered": "read_ready_result", "consolidated_into": "read_ready_result",
+                "handle": "read_ready_result"},
+            "skills/task-orphan-check/scripts/classify.py": {"completion_marker": "read_ready_result"},
+            "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": {
+                "task_settled": "read_ready_result", "_line_state": "_scan_line", "_scan_line": "read_ready_result"},
+            "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/task_fields.py": {
+                "list_open_tasks": "read_ready_result"},
+            "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": {
+                "_delivered_copy_exists": "read_ready_result", "_watch_dispatch": "read_ready_result",
+                "_resolve_stop": "read_ready_result", "_settle_as_handled": "read_ready_result",
+                "_proactive_dispatch_veto": "read_ready_result",
+                "_publish_task_steps_snapshot": "read_ready_result",
+                "_holder_delivery_state": "read_ready_result"},
+        }
+
+        def delegates(function, owner):
+            return any(isinstance(node, ast.Call) and
+                       ((isinstance(node.func, ast.Name) and node.func.id == owner) or
+                        (isinstance(node.func, ast.Attribute) and node.func.attr == owner))
+                       for node in ast.walk(function))
+
+        for name, expected in inventory.items():
+            functions = {node.name: node for node in ast.walk(ast.parse((REPO / name).read_text()))
+                         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            for function, owner in expected.items():
+                with self.subTest(file=name, function=function):
+                    self.assertIn(function, sorted(functions))
+                    self.assertTrue(delegates(functions[function], owner))
+        for raw in ("return path.read_text()", "return result.exists()"):
+            bypass = ast.parse("def completed(path, result):\n    " + raw).body[0]
+            self.assertFalse(delegates(bypass, "read_ready_result"))
+
+    def test_no_raw_result_reads_in_consumer_inventory(self):
         import re
-        pattern = re.compile(r"readFileSync\((?:path|p|resultPath|full|join\(this.resultDir,)\s*[,)]")
+        def python_bypasses(source):
+            found = []
+            for n in ast.walk(ast.parse(source)):
+                if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+                    continue
+                receiver = n.func.value
+                if (n.func.attr in {"read_text", "read_bytes"} and isinstance(receiver, ast.Name)
+                        and re.search(r"result|reply|rfile|archived", receiver.id, re.I)):
+                    found.append(n.lineno)
+            return found
+        for name in ['src/agent-api.py', 'src/discord-bridge.py', 'src/slack-bridge.py',
+                     'src/telegram-bridge.py', 'src/obsidian-mirror.py', 'src/task_workstreams.py',
+                     'packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py']:
+            self.assertEqual(python_bypasses((REPO / name).read_text()), [], name)
+        self.assertTrue(python_bypasses("body = result_file.read_text()"))
+        pattern = re.compile(r"readFileSync\((?:path|resultPath|full|join\(this.resultDir,)\s*[,)]")
         for name in ['src/task-bridge.ts', 'src/task-delegation.ts',
                      'skills/phone-conversation/scripts/conversation-server.ts']:
             source = (REPO / name).read_text()
             self.assertIn('readVerifiedResult', source)
-            # Task header p reads are unrelated to result consumption.
-            if name == 'src/task-bridge.ts':
-                source = source[:source.index('function _readTaskHeader')] + source[source.index('export function startResultWatcher'):] if 'function _readTaskHeader' in source and 'export function startResultWatcher' in source else source
             self.assertFalse(pattern.search(source), name)
         self.assertTrue(pattern.search("readFileSync(resultPath, 'utf8')"))
 

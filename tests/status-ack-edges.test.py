@@ -15,6 +15,8 @@ Run: python3 tests/status-ack-edges.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import importlib.util
 import io
@@ -71,7 +73,7 @@ def main() -> int:
           f"a) no probe -> nothing said ({r.skipped})")
 
     lane = fresh()
-    (lane.results / f"{TID}.txt.sending.1").write_text("x", encoding="utf-8")
+    publish_result(lane.results / f"{TID}.txt.sending.1", "x", encoding="utf-8")
     r = run(lane)
     check(not r.spoken and "sending" in r.skipped.get(TID, ""), f"b) a result being sent -> no line ({r.skipped})")
     lane = fresh()

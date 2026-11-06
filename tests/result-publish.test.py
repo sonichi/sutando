@@ -356,7 +356,7 @@ class DelegationTest(unittest.TestCase):
     def test_bridge_stage_and_publish_delegate(self):
         src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text(encoding="utf-8")
         self.assertIn("return _stage_text(path, text)", src)
-        self.assertIn("_publish_staged_whole(tmp, path)", src)
+        self.assertIn("_publish_staged_whole(tmp, path, pair_result=", src)
         self.assertNotIn("uuid.uuid4().hex}.tmp\")\n        with open(tmp", src)
 
     def test_ts_cancel_writes_no_result_body_directly(self):

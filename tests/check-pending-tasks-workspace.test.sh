@@ -135,7 +135,7 @@ case "$OUT" in
 esac
 
 # 3. A task with a matching result is already handled — must not block.
-printf 'done\n' > "$WS/results/$PROBE"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/$PROBE"
 OUT="$(bash "$HOOK" 2>&1)"
 case "$OUT" in
   '{}') ok "result present suppresses the block" ;;
@@ -146,7 +146,7 @@ rm -f "$WS/tasks/$PROBE" "$WS/results/$PROBE"
 # 3b. A wake rewrites the task file after the first turn's result was archived:
 # that older result answered the earlier turn, so the new one still blocks.
 mkdir -p "$WS/results/archive/2026-10"
-printf 'asked\n' > "$WS/results/archive/2026-10/$PROBE"
+printf 'asked\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/archive/2026-10/$PROBE"
 touch -t 202601010000 "$WS/results/archive/2026-10/$PROBE"
 printf 'id: probe\nwake_episode: e1\ntask: resumed\n' > "$WS/tasks/$PROBE"
 OUT="$(bash "$HOOK" 2>&1)"
@@ -288,7 +288,7 @@ rm -rf "$_pc_lab"
 rm -f "$REJ/workspace/tasks/$PROBE"
 RESULT_PROBE="task-zz-hooktest-readiness-$$.txt"
 printf 'id: probe\ntask: readiness-gap-probe\n' > "$REJ/workspace/tasks/$RESULT_PROBE"
-printf 'a real, well-formed reply\n' > "$REJ/workspace/results/$RESULT_PROBE"
+printf 'a real, well-formed reply\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$REJ/workspace/results/$RESULT_PROBE"
 RG_ERR="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>&1 >/dev/null)"
 RG_OUT="$(cd "$REJ_CWD" && OSTYPE=darwin25 PATH="$REJ:$PATH" bash "$REJ/src/$(basename "$HOOK")" 2>/dev/null)"
 case "$RG_ERR" in
@@ -446,7 +446,7 @@ esac
 
 # 8c. ...clears once that same worker's result is ready -- proves 8b is the
 # real delivery gate, not a stuck-open one.
-printf 'done\n' > "$WS/results/$WFR_PROBE.txt"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/$WFR_PROBE.txt"
 record_delivery
 WFR_CLEAR_OUT="$(cd "$GUEST_REPO" && env -u SUTANDO_CORE_SESSION SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
 case "$WFR_CLEAR_OUT" in

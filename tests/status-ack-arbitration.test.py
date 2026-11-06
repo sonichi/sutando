@@ -18,6 +18,8 @@ Run: python3 tests/status-ack-arbitration.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import sys
 from pathlib import Path
@@ -86,7 +88,7 @@ def main() -> int:
     check(rc == 0 and len(NOTIFY_POSTS) == 1 and NOTIFY_POSTS[0].get("body", "").startswith("Done with"),
           f"b) a later notify is progress and still goes out ({NOTIFY_POSTS})")
     result = lane.results / f"{tid}.txt"
-    result.write_text("Here is the answer.\n", encoding="utf-8")
+    publish_result(result, "Here is the answer.\n", encoding="utf-8")
     runner_pass(lane, sa.T0 + 400)
     lane.drain()
     check(result.read_text(encoding="utf-8") == "Here is the answer.\n" and len(lane.posts) == 1,

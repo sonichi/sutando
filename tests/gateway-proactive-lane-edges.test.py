@@ -6,6 +6,8 @@ Run: python3 tests/gateway-proactive-lane-edges.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import sys
 from pathlib import Path
 
@@ -112,8 +114,8 @@ def handback_and_reaper() -> None:
           "a handback never replaces a newer live file; the claim is kept and said")
     saved_dirs = gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = d, d / "archive"
-    (d / ".proactive-r.delivered-notanumber").write_text("x")
-    (d / ".proactive-r.delivered-5").write_text("kept\n")
+    publish_result(d / ".proactive-r.delivered-notanumber", "x")
+    publish_result(d / ".proactive-r.delivered-5", "kept\n")
     real = gb.undelivered_quarantine.place_as
     gb.undelivered_quarantine.place_as = lambda *a, **k: (_ for _ in ()).throw(OSError("archive down"))
     try:
@@ -152,8 +154,8 @@ def restore_by_generation() -> None:
     results = Path(tempfile.mkdtemp(dir=ISO))
     q = results / "undelivered"
     q.mkdir()
-    (q / "proactive-g-100.txt").write_text("A\n", encoding="utf-8")
-    (q / "proactive-g-200.txt").write_text("B\n", encoding="utf-8")
+    publish_result(q / "proactive-g-100.txt", "A\n", encoding="utf-8")
+    publish_result(q / "proactive-g-200.txt", "B\n", encoding="utf-8")
     want = hashlib.sha256(b"A\n").hexdigest()
     outcome, path = undelivered_quarantine.restore(results, "proactive-g", body_sha256=want)
     check(outcome is undelivered_quarantine.RestoreOutcome.RESTORED and path.read_text() == "A\n",
@@ -276,7 +278,7 @@ def bridge_edges() -> None:
     lane.write("proactive-torn.txt", "nudge\n")
     lane.drain()
     [torn] = lane.items()
-    src_outbox._item_path(lane.results / ".outbox-ag2space-proactive", torn["item_id"]).write_text('{"payl')
+    publish_result(src_outbox._item_path(lane.results / ".outbox-ag2space-proactive", torn["item_id"]), '{"payl')
     lane.drain()
     check(len(lane.posts) == 1 and lane.where("proactive-torn") == "undelivered",
           f"an item record corrupt before the pass is parked, not sent again ({len(lane.posts)} POSTs, "

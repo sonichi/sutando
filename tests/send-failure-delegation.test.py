@@ -13,6 +13,8 @@ Three things must stay true:
 The source scan is TOKEN-SPECIFIC — it flags inline status comparisons, not the
 words "transient" or "retry" — so renaming cannot satisfy it.
 """
+
+from _helpers.paired_result import publish_result
 import re
 import subprocess
 import sys
@@ -120,8 +122,9 @@ class TestSparrowDelegation(unittest.TestCase):
 _PARK_PROBE = """
 import time
 from ag2_sparrow import remote_gateway_bridge as gb
+from ag2_sparrow.result_publish import publish_text
 gb.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-(gb.RESULTS_DIR / "proactive-park.txt").write_text("[channel: !room:ag2.space]\\nbody\\n")
+publish_text(gb.RESULTS_DIR / "proactive-park.txt", "[channel: !room:ag2.space]\\nbody\\n")
 def slow(*a, **k):
     raise TimeoutError("no answer")
 gb._req, gb._log, gb.PROACTIVE_ROOM, gb.PROACTIVE_CLAIM_GATE = slow, lambda *a: None, "", None
@@ -137,7 +140,7 @@ class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):
     def test_sending_becomes_txt_and_is_visible_to_a_txt_poll(self):
         d = Path(tempfile.mkdtemp())
         claim = d / "proactive-x.sending"
-        claim.write_text("body")
+        publish_result(claim, "body")
         self.assertTrue(release_claim(claim))
         polled = [p.name for p in d.iterdir() if p.name.startswith("proactive-")
                   and p.suffix == ".txt"]
@@ -147,16 +150,16 @@ class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):
     def test_release_honors_an_explicit_target_for_pid_scoped_claims(self):
         d = Path(tempfile.mkdtemp())
         claim = d / "proactive-x.sending.4321"
-        claim.write_text("body")
+        publish_result(claim, "body")
         self.assertTrue(release_claim(claim, target=d / "proactive-x.txt"))
         self.assertTrue((d / "proactive-x.txt").exists(),
                         "explicit target restores the real polled name")
 
     def test_release_refuses_to_clobber_an_existing_txt(self):
         d = Path(tempfile.mkdtemp())
-        (d / "proactive-x.txt").write_text("newer body")
         claim = d / "proactive-x.sending"
-        claim.write_text("older body")
+        publish_result(claim, "older body")
+        publish_result(d / "proactive-x.txt", "newer body")
         self.assertFalse(release_claim(claim),
                          "must not overwrite a body written since the claim")
         self.assertEqual((d / "proactive-x.txt").read_text(), "newer body")

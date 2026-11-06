@@ -72,19 +72,13 @@ class ContractTest(unittest.TestCase):
             read_ready_result(self._write(td, None), attests=lambda raw: calls.append(raw))
         self.assertEqual(calls, [])
 
-    def test_every_delivery_consumer_passes_an_attestation(self):
-        """The digest is worthless if no live path consults it — the exact gap
-        this change closes. Each src/ bridge must bind `attests=` on the call
-        that decides delivery."""
+    def test_every_delivery_consumer_uses_default_verified_readiness(self):
         for name, path in CONSUMERS.items():
-            if "ag2-sparrow" in str(path):
-                continue  # vendored; carries no pairing digest yet
             with self.subTest(name):
-                src = path.read_text()
-                self.assertIn("receipt_verifier", src,
-                              f"{name}: does not bind the attestation predicate")
-                self.assertIn("attests=receipt_verifier(RECEIPTS_DIR", src,
-                               f"{name}: delivery read is not attested")
+                source = path.read_text()
+                self.assertIn("read_ready_result(", source)
+                self.assertNotIn("attests=lambda", source)
+        self.assertIn("attests = path_verifier(p)", (REPO / "src/delivery/readiness.py").read_text())
 
     def test_missing_file_is_not_ready(self):
         with tempfile.TemporaryDirectory() as td:

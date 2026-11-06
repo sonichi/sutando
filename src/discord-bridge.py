@@ -165,7 +165,6 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from result_write import receipt_verifier, receipts_dir_for  # noqa: E402
 from result_publish import publish_text  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
@@ -361,7 +360,6 @@ if not TOKEN:
 
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
-RECEIPTS_DIR = receipts_dir_for(REPO)
 STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
@@ -4988,9 +4986,7 @@ async def poll_results():
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 import re
-                reply_text = read_ready_result(
-                    result_file,
-                    attests=receipt_verifier(RECEIPTS_DIR, task_id))
+                reply_text = read_ready_result(result_file)
                 if reply_text is None:
                     await _note_empty_result(task_id, result_file)
                     continue
@@ -5368,7 +5364,7 @@ async def poll_progress():
             for task_id, channel in list(pending_replies.items()):
                 # "Done" = a result file exists (final reply pending/sent) or
                 # the delivery sentinel is set. Either way, stop narrating.
-                done = (RESULTS_DIR / f"{task_id}.txt").exists() or _is_delivered(task_id)
+                done = read_ready_result(RESULTS_DIR / f"{task_id}.txt") is not None or _is_delivered(task_id)
                 info = _progress_msgs.get(task_id)
                 if info is not None:
                     # Terminal marker: we already gave up on this task (it ran
@@ -5546,7 +5542,9 @@ async def poll_proactive():
                 # Peek before claiming: a claim hides the file from the bridge
                 # its body addresses (#5368). Policy: proactive_routing.
                 try:
-                    peek = f.read_text(errors="ignore")
+                    peek = read_ready_result(f)
+                    if peek is None:
+                        return False
                 except OSError:
                     return False
                 return should_claim_proactive_peeked(
@@ -5968,6 +5966,9 @@ async def poll_dm_fallback():
                     st = f.stat()
                 except FileNotFoundError:
                     continue
+                _peek = read_ready_result(f)
+                if _peek is None:
+                    continue
                 age = now - st.st_mtime
                 if age < GRACE_SECONDS:
                     continue
@@ -6001,10 +6002,6 @@ async def poll_dm_fallback():
                 # written specifically to suppress delivery (deduped /
                 # internally-handled / already-replied-elsewhere) get DM'd
                 # to the owner via this fallback when voice is offline.
-                try:
-                    _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
-                except OSError:
-                    _peek = ""
                 _parsed_fb = parse_markers(_peek)
                 if has_skip_action(_parsed_fb.actions):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
@@ -6157,7 +6154,7 @@ async def poll_dm_fallback():
                     # via fetch(); this keeps web UI status in sync without
                     # waiting for agent-api's next /tasks/active poll.
                     try:
-                        _result_text = f.read_text(encoding="utf-8", errors="replace")
+                        _result_text = read_ready_result(f)
                     except OSError:
                         _result_text = ""
                     archive_file(f, "results", _task_id)

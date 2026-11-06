@@ -16,6 +16,8 @@ must remain untouched on disk.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import json
 import os
 import subprocess
@@ -107,8 +109,8 @@ sdir.mkdir(parents=True)
 # for UNDESTINED files, so the positive control lands without the 180s grace.
 (sdir / "last-owner-activity.json").write_text(json.dumps(
     {"ts": int(time.time()), "channel": "ag2space", "summary": "t"}))
-(rdir / "proactive-100.txt").write_text("undestined control body")
-(rdir / "proactive-101.to-discord.txt").write_text("discord destined body")
+publish_result(rdir / "proactive-100.txt", "undestined control body")
+publish_result(rdir / "proactive-101.to-discord.txt", "discord destined body")
 
 env = hermetic_env()
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
@@ -130,7 +132,7 @@ def start_bridge():
 
 holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(90)"])
 live_claim = rdir / f"proactive-102.sending.{holder.pid}"
-live_claim.write_text("live owner's in-flight body", encoding="utf-8")
+publish_result(live_claim, "live owner's in-flight body", encoding="utf-8")
 proc = start_bridge()
 
 try:
@@ -168,7 +170,7 @@ try:
     lease["heartbeat_at"] = 0
     lock.write_text(json.dumps(lease), encoding="utf-8")
     orphan = rdir / f"proactive-103.sending.{proc.pid}"
-    orphan.write_text("recovered after restart", encoding="utf-8")
+    publish_result(orphan, "recovered after restart", encoding="utf-8")
     proc = start_bridge()
     deadline = time.monotonic() + 25
     recovered = []

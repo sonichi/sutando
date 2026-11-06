@@ -2,6 +2,8 @@
 """Persisted gateway retry and dependent lease completion, with controlled time."""
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import concurrent.futures
 import json
 import os
@@ -118,9 +120,9 @@ class RecoveryTest(unittest.TestCase):
     def seed_duplicates(self):
         for tid in (HOLDER, 'task-duplicate1', 'task-duplicate2'):
             self.task(tid)
-        (self.results / f'{HOLDER}.txt').write_text('Existing answer')
+        publish_result(self.results / f'{HOLDER}.txt', 'Existing answer')
         for tid in ('task-duplicate1', 'task-duplicate2'):
-            (self.results / f'{tid}.txt').write_text(f'[deduped: {HOLDER}]')
+            publish_result(self.results / f'{tid}.txt', f'[deduped: {HOLDER}]')
         return {HOLDER, 'task-duplicate1', 'task-duplicate2'}
 
     def test_parent_failure_five_passes_ten_requests_then_stranded(self):
@@ -187,7 +189,7 @@ class RecoveryTest(unittest.TestCase):
         core = self.bridge()
         self.task(HOLDER)
         result = self.results / f'{HOLDER}.txt'
-        result.write_text('Existing answer')
+        publish_result(result, 'Existing answer')
         self.server.available_at += 900
         inflight = {HOLDER}
         gw._post_ready_results(inflight)
@@ -336,7 +338,7 @@ class RecoveryTest(unittest.TestCase):
         core = self.bridge()
         self.task(HOLDER)
         result = self.results / f'{HOLDER}.txt'
-        result.write_text('Existing answer')
+        publish_result(result, 'Existing answer')
         gw._deliver_result_payload(HOLDER, HOLDER, 'Existing answer')
         record = outbox.read_item(self.outbox, HOLDER)
         self.assertEqual(record['status'], 'DELIVERED')
@@ -363,7 +365,7 @@ class RecoveryTest(unittest.TestCase):
         gw._deliver_result_payload(HOLDER, HOLDER, 'Existing answer')
         receipt = outbox.read_item(self.outbox, HOLDER)
         result = self.results / f'{HOLDER}.txt'
-        result.write_text('[no-send]')
+        publish_result(result, '[no-send]')
         self.server.code = 503
         self.assertFalse(gw._deliver_result_payload(HOLDER, HOLDER, '[no-send]', no_send=True))
         control = f'{HOLDER}.lease-close'

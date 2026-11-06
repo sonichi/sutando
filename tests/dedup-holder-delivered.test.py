@@ -8,6 +8,8 @@ happened, and every retry carrying the same marker is archived the same way.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import sys
 import tempfile
 import unittest
@@ -58,7 +60,7 @@ class ArchiveLookupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}-1785976425.txt").write_text("the answer")
+            publish_result(arc / f"{HOLDER}-1785976425.txt", "the answer")
             found = find_archived_result(Path(td), HOLDER)
             self.assertIsNotNone(found)
             self.assertEqual(found.read_text(), "the answer")
@@ -71,8 +73,8 @@ class ArchiveLookupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}-1785976425.txt").write_text("older")
-            (arc / f"{HOLDER}-1785999999.txt").write_text("newer")
+            publish_result(arc / f"{HOLDER}-1785976425.txt", "older")
+            publish_result(arc / f"{HOLDER}-1785999999.txt", "newer")
             self.assertEqual(find_archived_result(Path(td), HOLDER).read_text(), "newer")
 
     def test_unsafe_id_is_rejected(self):
@@ -85,15 +87,15 @@ class ArchiveLookupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}-longer-1785976425.txt").write_text("OTHER TASK")
+            publish_result(arc / f"{HOLDER}-longer-1785976425.txt", "OTHER TASK")
             self.assertIsNone(find_archived_result(Path(td), HOLDER))
 
     def test_genuine_epoch_suffix_is_still_this_tasks_result(self):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}-longer-1785976425.txt").write_text("OTHER TASK")
-            (arc / f"{HOLDER}-1785976425.txt").write_text("MINE")
+            publish_result(arc / f"{HOLDER}-longer-1785976425.txt", "OTHER TASK")
+            publish_result(arc / f"{HOLDER}-1785976425.txt", "MINE")
             self.assertEqual(
                 find_archived_result(Path(td), HOLDER).read_text(), "MINE")
 
@@ -101,7 +103,7 @@ class ArchiveLookupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}-draft.txt").write_text("NOT AN EPOCH")
+            publish_result(arc / f"{HOLDER}-draft.txt", "NOT AN EPOCH")
             self.assertIsNone(find_archived_result(Path(td), HOLDER))
 
 
@@ -113,7 +115,7 @@ class DeadEndTest(unittest.TestCase):
             arc = Path(td) / "archive"
             arc.mkdir()
             # What the live failure left behind: holder archived at 0 bytes.
-            (arc / f"{HOLDER}-1785976425.txt").write_text("")
+            publish_result(arc / f"{HOLDER}-1785976425.txt", "")
 
             retry = "[deduped: %s]" % HOLDER
             skip = next(a for a in parse_markers(retry).actions if a.kind == "skip")
@@ -132,7 +134,7 @@ class DeadEndTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}-1785976425.txt").write_text("the real answer")
+            publish_result(arc / f"{HOLDER}-1785976425.txt", "the real answer")
             archived = find_archived_result(Path(td), HOLDER)
             self.assertTrue(dedup_holder_delivered(archived.read_text()))
 

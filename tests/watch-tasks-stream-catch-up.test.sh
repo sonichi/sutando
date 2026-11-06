@@ -41,7 +41,7 @@ STALE=40
 OLD="$(date -v-1H +%Y%m%d%H%M.%S 2>/dev/null || date -d '1 hour ago' +%Y%m%d%H%M.%S)"
 for i in $(seq 1 "$STALE"); do
   printf 'id: task-stale%s\ntask: old\n' "$i" > "$WS/tasks/task-stale$i.txt"
-  printf 'done.\n' > "$WS/results/task-stale$i.txt"
+  printf 'done.\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/task-stale$i.txt"
   : > "$INBOX/task-stale$i.txt"
   touch -t "$OLD" "$INBOX/task-stale$i.txt"
 done
@@ -68,7 +68,7 @@ stale_refusals="$(grep -c 'already answered, not dispatching again: .*task-stale
 
 # An answered task: its result is live before its pointer lands.
 printf 'id: task-answered\naccess_tier: owner\ntask: already done\n' > "$WS/tasks/task-answered.txt"
-printf 'done.\n' > "$WS/results/task-answered.txt"
+printf 'done.\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/task-answered.txt"
 : > "$INBOX/task-answered.txt"
 # A live task: payload first, then the pointer, as the pool writer delivers.
 printf 'id: task-catch-up\naccess_tier: owner\ntask: recover me\n' > "$WS/tasks/task-catch-up.txt"

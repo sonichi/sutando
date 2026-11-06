@@ -10,6 +10,8 @@ closes with no_send.
 
 Run: python3 tests/gateway-owner-mention.test.py
 """
+
+from _helpers.paired_result import publish_result
 import os
 import shutil
 import sys
@@ -172,7 +174,7 @@ class _DeliveryHarness(_Base):
 
     def run_result(self, tid, body, **kw):
         self.write(tid, **kw)
-        (rgb.RESULTS_DIR / f"{tid}.txt").write_text(body)
+        publish_result(rgb.RESULTS_DIR / f"{tid}.txt", body)
         inflight = {tid}
         rgb._post_ready_results(inflight)
         return inflight
@@ -219,7 +221,7 @@ class DeliveryRefusesTheRoom(_DeliveryHarness):
 
     def test_retry_after_a_failed_lease_close_does_not_queue_a_second_dm(self):
         self.write("om-d6", owner_mentioned="true")
-        (rgb.RESULTS_DIR / "om-d6.txt").write_text("tell Chi")
+        publish_result(rgb.RESULTS_DIR / "om-d6.txt", "tell Chi")
         with patch.object(rgb, "_deliver_result_payload", return_value=False):
             rgb._post_ready_results({"om-d6"})
         first = self.dm_file("om-d6")
@@ -232,7 +234,7 @@ class DeliveryRefusesTheRoom(_DeliveryHarness):
 
     def test_unreadable_task_file_holds_the_result(self):
         self.write("om-d10", owner_mentioned="true")
-        (rgb.RESULTS_DIR / "om-d10.txt").write_text("tell Chi")
+        publish_result(rgb.RESULTS_DIR / "om-d10.txt", "tell Chi")
         with patch.object(rgb, "find_task_file", lambda d, tid: rgb.TASKS_DIR):  # a directory: read fails
             rgb._post_ready_results({"om-d10"})
         self.assertEqual(self.posts, [], "an unreadable task is never assumed to allow the room")
@@ -295,7 +297,7 @@ class OrphanSweepRefusesTheRoom(_DeliveryHarness):
     def sweep(self, tid, body, **kw):
         self.write(tid, **kw)
         rfile = rgb.RESULTS_DIR / f"{tid}.txt"
-        rfile.write_text(body)
+        publish_result(rfile, body)
         old = rfile.stat().st_mtime - 700
         os.utime(rfile, (old, old))
         with patch.object(rgb, "_last_orphan_sweep", 0.0):

@@ -12,6 +12,8 @@ A REAL HTTP server on an ephemeral port, the workspace a temp dir. Contract:
 
 Run: python3 tests/agent-api-cross-origin-reads.test.py
 """
+
+from _helpers.paired_result import publish_result
 from _helpers.hermetic_env import isolate_os_environ
 
 import http.client
@@ -50,7 +52,7 @@ api.API_TOKEN = ""
 (WS / "tasks" / "task-1.txt").write_text("task: private\n")
 (WS / "results" / "media").mkdir(parents=True, exist_ok=True)
 (WS / "results" / "media" / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n")
-(WS / "results" / "task-1.txt").write_text("private reply\n")
+publish_result(WS / "results" / "task-1.txt", "private reply\n")
 
 server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
 PORT = server.server_address[1]

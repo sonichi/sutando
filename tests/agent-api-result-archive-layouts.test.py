@@ -9,6 +9,8 @@ that did. The producer and the locator disagreed inside one file.
 
 Run: python3 tests/agent-api-result-archive-layouts.test.py
 """
+
+from _helpers.paired_result import publish_result
 import importlib.util
 import sys
 import tempfile
@@ -51,7 +53,7 @@ def fresh():
 fresh()
 month0 = api.RESULT_DIR / "archive" / "2026-08"
 month0.mkdir()
-(month0 / "task-collide-1785976425.txt").write_text("RE-ARCHIVED BODY")
+publish_result(month0 / "task-collide-1785976425.txt", "RE-ARCHIVED BODY")
 got = api.get_task_result("task-collide")
 check("month-dir re-archive archive/<YYYY-MM>/<id>-<epoch>.txt is found",
       got is not None and got.get("result") == "RE-ARCHIVED BODY", f"got {got!r}")
@@ -61,20 +63,20 @@ check("month-dir re-archive archive/<YYYY-MM>/<id>-<epoch>.txt is found",
 fresh()
 month1 = api.RESULT_DIR / "archive" / "2026-08"
 month1.mkdir()
-(month1 / "task-exact.txt").write_text("EXACT WINS")
-(month1 / "task-exact-1785976425.txt").write_text("SUFFIXED SIBLING")
+publish_result(month1 / "task-exact.txt", "EXACT WINS")
+publish_result(month1 / "task-exact-1785976425.txt", "SUFFIXED SIBLING")
 got = api.get_task_result("task-exact")
 check("exact <id>.txt still wins over its suffixed sibling",
       got is not None and got.get("result") == "EXACT WINS", f"got {got!r}")
 
 fresh()
-(api.RESULT_DIR / "archive" / "task-flat-1785976425.txt").write_text("FLAT BODY")
+publish_result(api.RESULT_DIR / "archive" / "task-flat-1785976425.txt", "FLAT BODY")
 got = api.get_task_result("task-flat")
 check("root-level flat archive/<id>-<epoch>.txt is found",
       got is not None and got.get("result") == "FLAT BODY", f"got {got!r}")
 
 fresh()
-(api.RESULT_DIR / "archive" / "task-direct.txt").write_text("DIRECT BODY")
+publish_result(api.RESULT_DIR / "archive" / "task-direct.txt", "DIRECT BODY")
 got = api.get_task_result("task-direct")
 check("direct archive/<id>.txt is found",
       got is not None and got.get("result") == "DIRECT BODY", f"got {got!r}")
@@ -83,13 +85,13 @@ check("direct archive/<id>.txt is found",
 fresh()
 month = api.RESULT_DIR / "archive" / "2026-08"
 month.mkdir()
-(month / "task-month.txt").write_text("MONTH BODY")
+publish_result(month / "task-month.txt", "MONTH BODY")
 got = api.get_task_result("task-month")
 check("month archive/<YYYY-MM>/<id>.txt still found",
       got is not None and got.get("result") == "MONTH BODY", f"got {got!r}")
 
 fresh()
-(api.RESULT_DIR / "task-live.txt").write_text("LIVE BODY")
+publish_result(api.RESULT_DIR / "task-live.txt", "LIVE BODY")
 got = api.get_task_result("task-live")
 check("live result still wins",
       got is not None and got.get("result") == "LIVE BODY", f"got {got!r}")
@@ -97,8 +99,8 @@ check("live result still wins",
 # Live must OUTRANK archive — archival trails delivery, so an archived copy can
 # be the stale one. A delegation that reordered these would pass every test above.
 fresh()
-(api.RESULT_DIR / "task-both.txt").write_text("LIVE WINS")
-(api.RESULT_DIR / "archive" / "task-both-1785976425.txt").write_text("STALE ARCHIVE")
+publish_result(api.RESULT_DIR / "task-both.txt", "LIVE WINS")
+publish_result(api.RESULT_DIR / "archive" / "task-both-1785976425.txt", "STALE ARCHIVE")
 got = api.get_task_result("task-both")
 check("live OUTRANKS archive when both exist",
       got is not None and got.get("result") == "LIVE WINS", f"got {got!r}")
@@ -115,7 +117,7 @@ check("an absent task is None", api.get_task_result("task-absent") is None)
 # --- a longer id must never be served under a shorter one ---------------------
 # `<id>-*` also matches a LONGER id, and sorted()[-1] returns it.
 fresh()
-(api.RESULT_DIR / "archive" / "task-ws-grouping-1787961646170-1756000001.txt").write_text("OTHER TASK")
+publish_result(api.RESULT_DIR / "archive" / "task-ws-grouping-1787961646170-1756000001.txt", "OTHER TASK")
 got = api.get_task_result("task-ws-grouping")
 check("a LONGER id's re-archive is not served under this id (root)",
       got is None or got.get("result") != "OTHER TASK", f"got {got!r}")
@@ -123,7 +125,7 @@ check("a LONGER id's re-archive is not served under this id (root)",
 fresh()
 mcol = api.RESULT_DIR / "archive" / "2026-08"
 mcol.mkdir()
-(mcol / "task-ws-grouping-1787961646170-1756000001.txt").write_text("OTHER TASK")
+publish_result(mcol / "task-ws-grouping-1787961646170-1756000001.txt", "OTHER TASK")
 got = api.get_task_result("task-ws-grouping")
 check("a LONGER id's re-archive is not served under this id (month dir)",
       got is None or got.get("result") != "OTHER TASK", f"got {got!r}")
@@ -132,8 +134,8 @@ check("a LONGER id's re-archive is not served under this id (month dir)",
 fresh()
 mown = api.RESULT_DIR / "archive" / "2026-08"
 mown.mkdir()
-(mown / "task-ws-grouping-1787961646170-1756000001.txt").write_text("OTHER TASK")
-(mown / "task-ws-grouping-1756000002.txt").write_text("MINE")
+publish_result(mown / "task-ws-grouping-1787961646170-1756000001.txt", "OTHER TASK")
+publish_result(mown / "task-ws-grouping-1756000002.txt", "MINE")
 got = api.get_task_result("task-ws-grouping")
 check("this id's own re-archive is still served alongside a longer sibling",
       got is not None and got.get("result") == "MINE", f"got {got!r}")
@@ -141,7 +143,7 @@ check("this id's own re-archive is still served alongside a longer sibling",
 # --- security: the id gate must still reject traversal ------------------------
 fresh()
 outside = api.RESULT_DIR.parent / "escaped.txt"
-outside.write_text("SHOULD NOT BE READABLE")
+publish_result(outside, "SHOULD NOT BE READABLE")
 got = api.get_task_result("../escaped")
 check("traversal id does not read outside the results dir",
       got is None or got.get("result") != "SHOULD NOT BE READABLE", f"got {got!r}")
