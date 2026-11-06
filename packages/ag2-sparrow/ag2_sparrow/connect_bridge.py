@@ -735,8 +735,8 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
 
 # What a refused or failed seat write says: connect's code is spent by then, a pasted token is not.
 CODE_WORDS = {"busy": "the code is spent and nothing was written: make a new code once it is done",
-              "held": "the code is spent and nothing was written ({home} is unchanged): make a new code in s.space "
-                      "once the root is free",
+              "held": "the code is spent and nothing was written ({home} is unchanged): make a new "
+                      "code in s.space once the root is free",
               "failed": "the code is spent but the seat was not written: {problem}; make a new code",
               "written": "connected: {agent}; credentials in {where} (mode 600)"}
 TOKEN_WORDS = {"busy": "nothing was written: run the same command once it is done",
