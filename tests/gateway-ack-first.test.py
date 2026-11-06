@@ -483,8 +483,9 @@ class AcknowledgingFirst(_Bridge):
         # The publish happened and the entry's removal did not: what the core did since proves it.
         moves = {"archived task": lambda t: t.rename(gw.TASKS_DIR / "archive" / t.name),
                  "live result": lambda t: (t.unlink(), publish_result(gw.RESULTS_DIR / t.name, "Clear.")),
-                 "archived result": lambda t: (t.unlink(), publish_result(gw.ARCHIVE_RESULTS_DIR
-                                                           / f"{t.stem}-1785976425.txt", "Clear."))}
+                 "archived result": lambda t: (t.unlink(), publish_result(gw.RESULTS_DIR / t.name, "Clear."),
+                                               (gw.RESULTS_DIR / t.name).rename(
+                                                   gw.ARCHIVE_RESULTS_DIR / f"{t.stem}-1785976425.txt"))}
         (gw.TASKS_DIR / "archive").mkdir()
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
         for n, (name, move) in enumerate(moves.items()):

@@ -517,7 +517,9 @@ class Rulings(Base):
     def test_an_archived_control_answer_counts(self):
         si.open_ruling(self.ws, TARGET, "task-ctl-2", now=self.now)
         (self.ws / "results" / "archive").mkdir()
-        publish_result(self.ws / "results" / "archive" / "task-ctl-2-1793057500.txt", "[no-send]")
+        result = self.ws / "results" / "task-ctl-2.txt"
+        publish_result(result, "[no-send]")
+        result.rename(result.parent / "archive" / "task-ctl-2-1793057500.txt")
         self.assertEqual(self.sweep(), {TARGET: "cancelled"})
 
     def test_the_hooks_turn_end_ruling_writes_nothing_to_stderr(self):

@@ -171,7 +171,10 @@ class ResolvedOncePerCall(unittest.TestCase):
         }
         for tid, path in layouts.items():
             self._sentinel(tid)
-            publish_result(path, "done\n")
+            live = r / f"{tid}.txt"
+            publish_result(live, "done\n")
+            if live != path:
+                live.rename(path)
         self._sentinel("task-placeholder")                      # live empty, archived ready
         (r / "task-placeholder.txt").write_text("  \n")
         publish_result(r / "archive" / "task-placeholder.txt", "done\n")
@@ -198,7 +201,9 @@ class ResolvedOncePerCall(unittest.TestCase):
     def test_directory_listings_do_not_grow_with_the_inbox(self):
         r = self.ws / "results"
         for i in range(400):                                    # a flat archive far larger than the inbox
-            publish_result(r / "archive" / f"task-spent-{i}-1790000000.txt", "done\n")
+            live = r / f"task-spent-{i}.txt"
+            publish_result(live, "done\n")
+            live.rename(r / "archive" / f"task-spent-{i}-1790000000.txt")
         for i in range(60):
             self._sentinel(f"task-spent-{i}")
         self._sentinel("task-open")

@@ -1295,7 +1295,8 @@ def main() -> int:
     check((rtc.RESULTS_DIR / "task-MONTH.txt").read_text().startswith("[no-send]"),
           "month-archive dedup drops a [no-send] result")
     rtc.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    publish_result(rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt", "sent")
+    publish_result(rtc.RESULTS_DIR / "task-DONE2.txt", "sent")
+    (rtc.RESULTS_DIR / "task-DONE2.txt").rename(rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt")
     check(rtc._write_task({**TASK, "id": "task-DONE2"}) == ("task-DONE2", True)
           and not (rtc.TASKS_DIR / "task-DONE2.txt").exists(),
           "redelivery of archived-result task not re-queued")

@@ -15,6 +15,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from result_write import path_verifier  # noqa: E402
 PWSH = shutil.which("pwsh") or shutil.which("powershell.exe")
 
 
@@ -74,7 +76,7 @@ function Add-Type {
             results = list((repo / "results").glob("proactive-*.txt"))
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0].read_bytes(), message.encode("utf-8"))
-            self.assertTrue((repo / "state" / "result-pairing" / f"{results[0].stem}.ok").is_file())
+            self.assertTrue(path_verifier(results[0])(message))
 
 
 if __name__ == '__main__':

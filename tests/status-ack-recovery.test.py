@@ -121,7 +121,9 @@ def main() -> int:
         lane = pl.Lane(gb, ISO)
         sa.task(lane.ws, TID)
         dead_claim(lane.ws)
-        publish_result(lane.results / "archive" / archived, "Received. Not picked up yet.\n", encoding="utf-8")
+        result = lane.results / VIA
+        publish_result(result, "Received. Not picked up yet.\n", encoding="utf-8")
+        result.rename(lane.results / "archive" / archived)
         reports = restart(lane, DUE, n=2)
         check(ack_claim.state(lane.ws, KEY) == "claimed" and reports[0].get("recovered") == [] and lane.posts == [],
               f"c) delivered, only in {label}: left as it is, no line ({ack_claim.state(lane.ws, KEY)})")

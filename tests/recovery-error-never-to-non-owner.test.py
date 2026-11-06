@@ -105,7 +105,9 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
     def test_epoch_suffixed_month_archived_result_is_answered(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            publish_result(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt", "done")
+            result = ws / "results" / f"{TID}.txt"
+            publish_result(result, "done")
+            result.rename(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt")
             self.assertEqual(td_mod.task_disposition(ws, TID), "answered")
             self.assertIn(td_mod.task_disposition(ws, TID), td_mod.SETTLED)
 
@@ -129,8 +131,10 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
             (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
-            publish_result(ws / "results" / f"{TID}.txt", "")
-            publish_result(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt", "done")
+            result = ws / "results" / f"{TID}.txt"
+            publish_result(result, "done")
+            result.rename(ws / "results/archive/2026-10" / f"{TID}-1792626046.txt")
+            result.write_text("")
             self.assertEqual(td_mod.task_disposition(ws, TID), "answered")
 
     def test_claimed_variant_is_claimed_and_absent_is_missing(self):

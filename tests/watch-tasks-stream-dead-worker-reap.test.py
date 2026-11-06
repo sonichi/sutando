@@ -177,10 +177,12 @@ def scenario_watchdog_reap_respects_an_existing_answer() -> None:
     watchdog's terminal failure -- the fix is not "always publish"."""
     print("\nscenario: a watchdog reap does not overwrite an already-answered task")
     h = Harness(handler_timeout="2")
-    publish_result(h.ws / "results" / "archive" / "task-answered-999.txt", "the real answer\n")
+    publish_result(h.ws / "results" / "task-answered.txt", "the real answer\n")
+    (h.ws / "results" / "task-answered.txt").rename(h.ws / "results" / "archive" / "task-answered-999.txt")
     # `task-answered-1` must not satisfy `task-answered` (prefix collision) --
     # only the exact archived id above may suppress this task's failure.
-    publish_result(h.ws / "results" / "archive" / "task-answered-1-999.txt", "a different task\n")
+    publish_result(h.ws / "results" / "task-answered-1.txt", "a different task\n")
+    (h.ws / "results" / "task-answered-1.txt").rename(h.ws / "results" / "archive" / "task-answered-1-999.txt")
     h.start()
     h.deliver("task-answered.txt")
     try:

@@ -58,7 +58,9 @@ class _Space:
             d.mkdir(exist_ok=True)
             publish_result(d / f"{HOLDER}.txt", body)
         else:
-            publish_result(self.results / "archive" / f"{HOLDER}-1785976425.txt", body)
+            result = self.results / f"{HOLDER}.txt"
+            publish_result(result, body)
+            result.rename(self.results / "archive" / f"{HOLDER}-1785976425.txt")
 
     def orig(self, text: str = ORIG):
         (self.tasks / f"{TID}.txt").write_text(text)
