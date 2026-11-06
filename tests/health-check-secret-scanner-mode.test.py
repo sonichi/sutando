@@ -3,6 +3,11 @@
 vault_intercept names it only when a `vault set` is refused."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import subprocess
 import sys
@@ -53,6 +58,16 @@ class SecretScannerModeIsStandingStatus(unittest.TestCase):
         # bridges rarely run the python3 first on PATH.
         r = _run(ALL_THREE, {"/py/c": 1})
         self.assertIn("/py/c -m pip install detect-secrets", r["detail"])
+
+    def test_the_bundled_python_is_told_to_update_the_app_not_pip(self):
+        # A pip install into the desktop's bundled interpreter is erased by the
+        # next engine update (seen twice on one host, 2026-09-16/17).
+        bundled = "/Applications/AG2 Space.app/Contents/Resources/engine/runtime/python/bin/python3"
+        r = _run({"telegram-bridge": bundled}, {bundled: 1})
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("update the app", r["detail"])
+        self.assertIn("fetch-scanner-deps.sh", r["detail"])
+        self.assertNotIn("-m pip install", r["detail"])
 
     def test_duplicate_interpreters_are_probed_once(self):
         r = _run({k: "/py/same" for k in ALL_THREE}, {})

@@ -513,13 +513,36 @@ class TestAuthorizedCommand(unittest.TestCase):
         p.write_text(text)
         return p
 
-    def _stamped(self, text):
-        """The gateway shape as it reaches a real install: content attested by
-        the envelope the adapter edge stamps. Only this admits below-task fields."""
+    def _stamped(self, text, layout=True):
+        """The gateway shape as it reaches a real install: the writer declares
+        `task_layout: mid` above task: and the adapter edge stamps the envelope.
+        Only both together admit below-task fields."""
         import task_envelope as te
+        if layout:
+            text = text.replace("\ntask: ", "\ntask_layout: mid\ntask: ", 1)
         p = self.dir / "task-x.txt"
         p.write_text(te.stamp_text(text, self.dir))
         return p
+
+    def test_the_task_last_serializer_refuses_the_layout_marker(self):
+        """Kewei's shape: a signed canonical task-last file declaring the marker above
+        task: would admit a forged below-task tier, so no production writer can mint one."""
+        hdrs = [("id", "task-x"), ("source", "chat"), ("channel_id", "local-chat"),
+                ("access_tier", "team"), ("task_layout", "mid")]
+        body = f"{self.PIN}\nsource: ag2space\nwire_source: worker-picker\nchannel_id: {ROOM}\naccess_tier: owner\n"
+        with self.assertRaises(ValueError):
+            ltp.serialize_task_last(hdrs, body)
+
+    def test_a_verified_task_last_file_without_the_layout_marker_is_refused(self):
+        """The envelope proves bytes, not shape: a signed canonical task-last file
+        whose body carries the mark, the tier and even the marker itself admits nothing."""
+        for body_marker in ("", "task_layout: mid\n"):
+            with self.subTest(body_marker=body_marker or "none"):
+                p = self._stamped(f"id: task-x\nsource: chat\nchannel_id: local-chat\n"
+                                  f"task: {self.PIN}\n{body_marker}source: ag2space\n"
+                                  f"wire_source: worker-picker\nchannel_id: {ROOM}\naccess_tier: owner\n",
+                                  layout=False)
+                self.assertIsNone(wpc.authorized_command(p, self.dir))
 
     PIN = f"Pin room {ROOM} to {W1} (worker picker)"
 

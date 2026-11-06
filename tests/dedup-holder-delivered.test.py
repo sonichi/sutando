@@ -34,9 +34,17 @@ class HolderDeliveredTest(unittest.TestCase):
 
     def test_holder_that_itself_skipped_is_not_a_delivery(self):
         """Chained skips: the holder delivered nothing either."""
-        for marker in ("[no-send]", "[REPLIED]", "[deduped: task-other]"):
+        for marker in ("[no-send]", "[deduped: task-other]"):
             with self.subTest(marker=marker):
                 self.assertFalse(dedup_holder_delivered(marker))
+
+    def test_replied_holder_is_an_out_of_band_delivery(self):
+        for body in ("[REPLIED]", " \n[REPLIED]\n", "[REPLIED]\nSent directly."):
+            with self.subTest(body=body):
+                self.assertTrue(dedup_holder_delivered(body))
+                for count in (0, 1):
+                    self.assertEqual(dedup_decision(
+                        body, f"id: task-1\ndedup_requeue_count: {count}\n"), "honour")
 
     def test_real_answer_is_a_delivery(self):
         self.assertTrue(dedup_holder_delivered("AG2Space is a chat workspace."))

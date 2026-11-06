@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -801,6 +802,19 @@ class AnAliasIsOneDestination(unittest.TestCase):
         self.anchor.write_text(pre + "".join(entries), encoding="utf-8")
         self.alias = Path(self.tmp.name) / "hosts" / "current-track.md"
         self.alias.symlink_to(self.anchor)                            # the collapsed spelling, as a link
+
+    def test_a_quoted_tilde_uses_the_expanded_destination(self):
+        target = Path("~/hosts/TestHost/current-track.md")
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name, "USERPROFILE": self.tmp.name}):
+            with ct.locked(target) as dest:
+                self.assertEqual(dest, self.anchor.resolve())
+            ct.append(target, "## 2026-09-20T00:00Z — tilde append\n")
+            self.assertIn("tilde append", self.anchor.read_text())
+            r = ct.rotate(target, keep_bytes=4096)
+            self.assertTrue(r.archived)
+            ct.replace(target, "# tilde replacement\n")
+        self.assertEqual(self.anchor.read_text(), "# tilde replacement\n")
+        self.assertTrue(self.anchor.with_name("current-track-archive.md").exists())
 
     def test_the_alias_and_the_anchor_take_the_same_lock(self):
         with ct.locked(self.alias) as via_alias:

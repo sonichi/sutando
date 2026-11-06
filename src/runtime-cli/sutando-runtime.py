@@ -19,7 +19,7 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime agent list
   sutando-runtime agent status <agentId>
   sutando-runtime sutando info|status|owner|allowlist
-  sutando-runtime task submit "do the thing" [--priority normal]
+  sutando-runtime task submit "do the thing" [--priority normal] [--idempotency-key KEY]
   sutando-runtime task results   # all results, newest first, with preview
   sutando-runtime task chat [--activity] [--raw]   # one-screen DM (+step feed / raw tmux)
   sutando-runtime task watch [--activity] [--raw]  # stream results (+step feed / raw tmux)
@@ -51,6 +51,10 @@ from pathlib import Path
 _RUNTIME_API_DIR = Path(__file__).resolve().parent.with_name("runtime-api")
 sys.path.insert(0, str(_RUNTIME_API_DIR))
 from rundir import socket_path as _socket_path  # noqa: E402
+
+
+class ServerUnreachable(OSError):
+    """No daemon behind the local socket (missing, or refusing connections)."""
 
 
 def _wss_url() -> str | None:
@@ -100,7 +104,10 @@ def _rpc(method: str, params: dict, timeout: float) -> dict:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(_socket_path())
+        try:
+            s.connect(_socket_path())
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise ServerUnreachable(e.errno, e.strerror) from e
         s.sendall(frame.encode("utf-8"))
         buf = b""
         while not buf.endswith(b"\n"):
@@ -114,6 +121,23 @@ def _rpc(method: str, params: dict, timeout: float) -> dict:
     if "error" in resp:
         raise RuntimeError(f"{resp['error'].get('code')}: {resp['error'].get('message')}")
     return resp["result"]
+
+
+def _stand_card(details: bool) -> dict:
+    # Without a daemon the card is built in-process from the same records;
+    # --details would expose credentials and paths, so it stays daemon-only.
+    params = {"details": True} if details else {}
+    try:
+        return _rpc("sutando.stand", params, timeout=15)
+    except ServerUnreachable:
+        if details:
+            raise RuntimeError("--details needs the running server "
+                               "(sutando serve); it is not reachable") from None
+    from identity_source import build_identity_view, host_label  # noqa: PLC0415
+    from rundir import agent_id, runtime_state_dir  # noqa: PLC0415
+    state_dir = runtime_state_dir()
+    return build_identity_view(state_dir, agent_id(state_dir),
+                               host_label()).stand_card()
 
 
 def _jarg(v):
@@ -855,7 +879,9 @@ def main(argv=None) -> int:
     iop.add_argument("--instance", default=None)
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
-    tsk.add_parser("list")
+    tlist = tsk.add_parser("list")
+    tlist.add_argument("--unfinished", action="store_true",
+                       help="exclude done tasks before the 200-task limit")
     tsk.add_parser("results")  # list all available results (newest first)
     tw = tsk.add_parser("watch")   # PUSH mode: stream results live as they land
     tw.add_argument("--activity", action="store_true",
@@ -875,6 +901,12 @@ def main(argv=None) -> int:
     tsub.add_argument("text")
     tsub.add_argument("--priority", default="normal",
                       choices=["urgent", "normal", "low"])
+    tsub.add_argument("--idempotency-key", metavar="KEY",
+                      help="reuse the same key, text and priority on an explicit "
+                           "retry to recover the original taskId without "
+                           "requeueing, even after completion or daemon restart; "
+                           "without a key each submission creates a new task "
+                           "(no automatic retries)")
     for name in ("status", "details", "cancel"):
         tsk.add_parser(name).add_argument("task_id")
     # get-result's id is OPTIONAL — no id means "the newest result".
@@ -949,20 +981,18 @@ def main(argv=None) -> int:
                       else _rpc("agent.status", {"agentId": args.agent_id},
                                 timeout=15))
         elif args.group == "sutando":
-            params = {}
-            method = f"sutando.{args.cmd}"
-            if args.cmd == "stand":
-                if getattr(args, "details", False):
-                    params["details"] = True
-                if args.sub == "resolve":
-                    if len(getattr(args, "extra", []) or []) != 2:
-                        print("usage: sutando stand resolve <provider> <subject>",
-                              file=sys.stderr)
-                        return 2
-                    method = "sutando.resolve"
-                    params = {"provider": args.extra[0],
-                              "subject": args.extra[1]}
-            result = _rpc(method, params, timeout=15)
+            if args.cmd == "stand" and args.sub == "resolve":
+                if len(getattr(args, "extra", []) or []) != 2:
+                    print("usage: sutando stand resolve <provider> <subject>",
+                          file=sys.stderr)
+                    return 2
+                result = _rpc("sutando.resolve", {"provider": args.extra[0],
+                                                  "subject": args.extra[1]},
+                              timeout=15)
+            elif args.cmd == "stand":
+                result = _stand_card(bool(getattr(args, "details", False)))
+            else:
+                result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
             if args.cmd == "stand" and not args.as_json:
                 if args.sub == "resolve":
                     return _print_resolve(result)
@@ -996,13 +1026,15 @@ def main(argv=None) -> int:
                 return _chat(activity=args.activity, verbose=args.verbose,
                              full=args.full)
             if args.cmd == "list":
-                result = _rpc("task.list", {}, timeout=15)
+                params = {"unfinishedOnly": True} if args.unfinished else {}
+                result = _rpc("task.list", params, timeout=15)
             elif args.cmd == "results":
                 result = _rpc("task.list_results", {}, timeout=15)
             elif args.cmd == "submit":
-                result = _rpc("task.submit", {"task": args.text,
-                                              "priority": args.priority},
-                              timeout=15)
+                params = {"task": args.text, "priority": args.priority}
+                if args.idempotency_key is not None:
+                    params["idempotencyKey"] = args.idempotency_key
+                result = _rpc("task.submit", params, timeout=15)
             else:
                 params = {}
                 if getattr(args, "task_id", None):

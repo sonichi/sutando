@@ -14,6 +14,9 @@ carrier rules do not cover (`!hosts/*/**` needs the directory level), so the ent
 that is ignored and never backed up — silently, since writing succeeds. The rule belongs to
 `current_track.require_host_anchor`, which every writer takes before creating anything; this script
 only turns its refusal into an exit code.
+A write that rotates says so on stderr. `append` rotates in its own lock when the entry crosses
+the read budget, and a silent rotation is how a later pass reads a head whose older entries moved
+without anyone deciding that; the pin-only `oversized` case is reported too, since nothing was cut.
 Exit 0 written; 1 empty stdin; 2 usage or a target that names no host.
 """
 from __future__ import annotations
@@ -22,7 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from current_track import NotAHostAnchor, append, replace, require_host_anchor  # noqa: E402
+from current_track import DEFAULT_KEEP, NotAHostAnchor, _size, append, replace, require_host_anchor  # noqa: E402
 
 OPS = {"append": append, "replace": replace}
 
@@ -41,10 +44,21 @@ def main(argv=None) -> int:
         if not text.strip():
             print(f"current-track-write: empty stdin, nothing written ({argv[0]})", file=sys.stderr)
             return 1
-        OPS[argv[0]](target, text)
+        rotated = OPS[argv[0]](target, text)
     except NotAHostAnchor as e:
         print(f"current-track-write: {e}", file=sys.stderr)
         return 2
+    if rotated is not None:
+        # A rotation is the caller's business: it decides which entries a later pass can still read.
+        # `oversized` fires with or without pins, so the pinned clause is only printed when it explains.
+        where = "still over budget" if rotated.oversized else "rotated"
+        why = ""
+        if rotated.pinned_count:
+            why = (f", {rotated.pinned_count} pinned entr"
+                   f"{'y' if rotated.pinned_count == 1 else 'ies'} holding {rotated.pinned_bytes} B")
+        # _size, not len: the budget and `oversized` are UTF-8 bytes, and these entries carry em-dashes.
+        print(f"current-track-write: {where} — archived {_size(rotated.archived)} B, head now "
+              f"{_size(rotated.head)} B of a {DEFAULT_KEEP} B budget{why}", file=sys.stderr)
     return 0
 
 

@@ -3,6 +3,12 @@
 NEW result to every subscriber, skips the boot-seeded backlog, and drops dead
 writers without wedging. Tests the extracted one-pass step (_emit_new_results)
 so it needs no live socket."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import json
 import os

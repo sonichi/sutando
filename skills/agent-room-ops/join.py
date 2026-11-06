@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · join — accept THIS agent's own pending room invite.
 
 Explicit, owner-directed invite acceptance (`join`) — the self-serve counterpart
@@ -29,7 +31,7 @@ def join_room(room_id, agent_mxid=None, *, gate=None):
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, room_id=room_id,
                        reason=f"client gate denied for {agent_mxid}")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, reason="no gateway configured")
     url = f"{base}/v1/rooms/{quote(room_id)}/join"
