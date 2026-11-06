@@ -113,6 +113,24 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
+**AgentTrigger events (`event_type`, `agent_trigger_id`, `playbook`).** A task the
+platform raises for an event, not a message, carries `"interaction_type":
+"system_event"` plus `"event_type"`, a key of `EVENT_PLAYBOOKS` in
+`src/agent_triggers.py` (`room.mention`, `room.joined`); any other value is
+dropped, not passed. Its optional `"agent_trigger_id"` (the event's idempotency
+id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
+most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
+matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
+trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
+allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
+`"playbook": true`), else the registry default for the event (`room.joined` →
+`room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
+as a message. A `room.joined` task names the room in `channel_id`/`source_room_id`,
+the inviter in `user_id` (its `access_tier` is the inviter's) and has no
+`source_message_id`, so its result posts top level. A broker that sends no
+`event_type` keeps today's task: the self-describing body still reads as a
+system event.
+
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
 declares (below). One agent's credential may be used by more than one bridge, so

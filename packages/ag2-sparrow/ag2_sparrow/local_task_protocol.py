@@ -237,6 +237,9 @@ KNOWN_HEADER_KEYS = (
     # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
     # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
     "parent_task", "parent_generation",
+    # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
+    # so the guard defangs forged body copies.
+    "event_type", "agent_trigger_id", "playbook",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
