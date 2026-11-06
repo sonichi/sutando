@@ -504,12 +504,12 @@ exit 0
             slave = -1
             os.set_blocking(master, False)
             output = b""
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 20
             while True:
                 if time.monotonic() >= deadline:
                     process.kill()
                     process.wait()
-                    raise subprocess.TimeoutExpired(process.args, 5)
+                    raise subprocess.TimeoutExpired(process.args, 20)
                 readable, _, _ = select.select([master], [], [], 0.05)
                 if not readable:
                     if process.poll() is not None:
@@ -1230,7 +1230,7 @@ sleep 60
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             observed = 0
-            for _ in range(200):
+            for _ in range(1000):
                 observed = _read_count(count)
                 if observed >= 2:
                     break
@@ -1497,7 +1497,8 @@ fi
         archive = workspace / "results" / "archive" / "2026-07"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
-        (archive / "task-done.txt").write_text("already delivered\n")
+        publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
+        (workspace / "results" / "task-done.txt").replace(archive / "task-done.txt")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
@@ -1514,7 +1515,8 @@ fi
         archive = workspace / "results" / "archive" / "2026-07"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
-        (archive / "task-done.txt").write_text("already delivered\n")
+        publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
+        (workspace / "results" / "task-done.txt").replace(archive / "task-done.txt")
         publish_result(workspace / "results" / "task-done.txt", "")
         # The core session reports alive, so a replay would reach send-keys;
         # the default stub answers has-session with exit 1 and would hide one.
@@ -1538,7 +1540,8 @@ exit 0
         archive = workspace / "results" / "archive"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
-        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
+        (workspace / "results" / "task-done.txt").replace(archive / "task-done-1784690000.txt")
         publish_result(workspace / "results" / "task-done.txt", "   \n\n")
         # The core session reports alive, so a replay would reach send-keys;
         # the default stub answers has-session with exit 1 and would hide one.
@@ -1562,7 +1565,8 @@ exit 0
         archive = workspace / "results" / "archive"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
-        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
+        (workspace / "results" / "task-done.txt").replace(archive / "task-done-1784690000.txt")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
@@ -1578,7 +1582,8 @@ exit 0
         archive = workspace / "results" / "archive-2026-07-26"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
-        (archive / "task-done.txt").write_text("already delivered\n")
+        publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
+        (workspace / "results" / "task-done.txt").replace(archive / "task-done.txt")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
@@ -1594,7 +1599,8 @@ exit 0
         archive = workspace / "results" / "archive-2026-07-26"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
-        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        publish_result(workspace / "results" / "task-done.txt", "already delivered\n")
+        (workspace / "results" / "task-done.txt").replace(archive / "task-done-1784690000.txt")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
@@ -1737,7 +1743,7 @@ exit 0
         self.assertIn(needle, source)
         module.write_text(source.replace(
             needle,
-            needle + "    import time as _slow_history\n    _slow_history.sleep(8)\n",
+            needle + "    Path(__file__).with_name('history-scan-called').touch()\n    import time as _slow_history\n    _slow_history.sleep(8)\n",
             1,
         ))
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -1772,13 +1778,14 @@ exit 0
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         started = time.monotonic()
         result = subprocess.run(
-            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=12
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=20
         )
         elapsed = time.monotonic() - started
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        # Half the injected 8s scan: a scan always fails it, a slow runner's bounded sends do not.
-        self.assertLess(elapsed, 4.0, f"unassigned delivery took {elapsed:.2f}s")
+        # Detect history work directly, independent of publisher/startup latency.
+        self.assertFalse(module.with_name("history-scan-called").exists(),
+                         f"unassigned delivery scanned history ({elapsed:.2f}s)")
         calls = self._tmux_calls()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)

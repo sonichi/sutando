@@ -12,7 +12,6 @@ the message is archived, and the restarted process posts nothing: one POST.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import json
 import subprocess
@@ -25,6 +24,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 isolate_os_environ()
 

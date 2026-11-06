@@ -11,7 +11,6 @@ Run: python3 tests/gateway-terminal-result-moved-once.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result, publish_staged_result
 
 import contextlib
 import hashlib
@@ -30,6 +29,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result, publish_staged_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()

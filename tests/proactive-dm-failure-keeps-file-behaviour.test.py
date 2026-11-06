@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from _helpers.hermetic_env import isolate_os_environ
 
+from _helpers.paired_result import publish_result
+
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
@@ -182,7 +184,7 @@ def main() -> int:
     box = Path(tempfile.mkdtemp(prefix="proactive-fail-"))
     msg = box / "proactive-pending-q-boom.txt"
     BODY = "⚠️ a body Discord refuses to accept"
-    msg.write_text(BODY)
+    publish_result(msg, BODY)
 
     def _raise(*_a, **_k):
         raise _Boom("413 Payload Too Large (error code: 40005): Request entity too large")
@@ -200,7 +202,7 @@ def main() -> int:
 
     # --- the success path still cleans up ----------------------------------
     box2 = Path(tempfile.mkdtemp(prefix="proactive-ok-"))
-    (box2 / "proactive-pending-q-fine.txt").write_text("a body that sends fine")
+    publish_result(box2 / "proactive-pending-q-fine.txt", "a body that sends fine")
     sent: list = []
 
     def _ok(*a, **_k):
@@ -224,7 +226,7 @@ def main() -> int:
     # CI found these two lines uncovered (diff coverage 77.8%, missing 5034 and
     # 5038): the successful-quarantine case does not reach the handler.
     box3 = Path(tempfile.mkdtemp(prefix="proactive-noquar-"))
-    (box3 / "proactive-pending-q-stuck.txt").write_text("must not vanish")
+    publish_result(box3 / "proactive-pending-q-stuck.txt", "must not vanish")
     (box3 / "undelivered").write_text("not a directory")
 
     _run_one_pass(box3, _raise)
@@ -240,7 +242,7 @@ def main() -> int:
     # An explicit body [channel:] target outranks routing alone -- the
     # defect-detecting coverage for this fix (see #4593's review history).
     box4 = Path(tempfile.mkdtemp(prefix="proactive-bodymarker-"))
-    (box4 / "proactive-bodymarker.txt").write_text(
+    publish_result(box4 / "proactive-bodymarker.txt",
         "[channel: 1530802402603700415]\nbriefing text")
     sent4: list = []
     _run_one_pass(box4, lambda *a, **_k: sent4.append(a), claims_by_routing=False)
@@ -251,7 +253,7 @@ def main() -> int:
     # Same branch, the OTHER outcome: read_text() raises, must not crash or claim.
     box5 = Path(tempfile.mkdtemp(prefix="proactive-unreadable-"))
     unreadable = box5 / "proactive-unreadable.txt"
-    unreadable.write_text("[channel: 1530802402603700415]\nbriefing text")
+    publish_result(unreadable, "[channel: 1530802402603700415]\nbriefing text")
     os.chmod(unreadable, 0)
     sent5: list = []
     try:

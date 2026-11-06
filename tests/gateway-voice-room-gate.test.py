@@ -9,7 +9,6 @@ gateway in `_req`, so every branch is driven without a network or a process.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import contextlib
 import importlib.util
@@ -23,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()

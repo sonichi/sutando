@@ -302,7 +302,7 @@ SUTANDO_INBOX_RESOLVER=enabled
 reconcile_finished_pickups
 [ -f "$INFLIGHT_DIR/task-a.txt" ]
 [ -f "$CONTEXT_DIR/task-a.txt" ]
-printf OK > "$RESULTS_DIR/task-a.txt"
+printf OK | "$NOTIFIER_PY" "$REPO/src/result_publish.py" --allow-undeliverable "$RESULTS_DIR/task-a.txt"
 reconcile_finished_pickups
 [ ! -e "$INFLIGHT_DIR/task-a.txt" ]
 [ ! -e "$CONTEXT_DIR/task-a.txt" ]
@@ -310,7 +310,7 @@ reconcile_finished_pickups
         self.assertEqual(sent, ["task-a.txt"])
 
     def test_actual_result_and_removed_payload_release_and_clear_receipts(self):
-        for action in ['printf OK > "$RESULTS_DIR/task-a.txt"', 'rm "$TASKS_DIR/task-a.txt"']:
+        for action in ['printf OK | "$NOTIFIER_PY" "$REPO/src/result_publish.py" --allow-undeliverable "$RESULTS_DIR/task-a.txt"', 'rm "$TASKS_DIR/task-a.txt"']:
             sent = self.run_scheduler('''process_announced_queue
 printf normal > "$queue_dir/task-b.txt"
 ''' + action + '''

@@ -15,7 +15,6 @@ task forever -- is what this file verifies now, against the real watcher.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import os
 import signal
@@ -26,6 +25,7 @@ from pathlib import Path
 import sys  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import hermetic_env
+from _helpers.paired_result import publish_result
 from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent

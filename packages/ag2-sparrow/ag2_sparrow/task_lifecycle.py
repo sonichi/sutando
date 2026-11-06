@@ -466,7 +466,7 @@ def classify(results_dir, task_id):
             if candidate == results / ("%s.txt" % task_id):
                 continue
             data = _read_strict(candidate)
-            found.add(ARCHIVED if data is not None and result_ready.read_ready_result(candidate) else UNKNOWN)
+            found.add(ARCHIVED if data is not None and result_ready.read_ready_result(candidate, task_id=task_id) else UNKNOWN)
         _list_strict(undelivered_quarantine.quarantine_dir(results))
         if undelivered_quarantine.find_quarantined(results, task_id):
             found.add(QUARANTINED)

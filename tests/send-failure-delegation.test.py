@@ -14,7 +14,6 @@ The source scan is TOKEN-SPECIFIC — it flags inline status comparisons, not th
 words "transient" or "retry" — so renaming cannot satisfy it.
 """
 
-from _helpers.paired_result import publish_result
 import re
 import subprocess
 import sys
@@ -23,6 +22,7 @@ import unittest
 from pathlib import Path
 
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+from _helpers.paired_result import publish_result
 # Before anything below reads the environment: the park probe imports the gateway bridge.
 isolate_os_environ()
 

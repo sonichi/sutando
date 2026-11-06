@@ -48,12 +48,22 @@ def fresh():
     return tmp
 
 
+def archived_result(path, task_id, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    live = api.RESULT_DIR / f"{task_id}.txt"
+    previous = live.read_text() if live.exists() else None
+    publish_result(live, body)
+    live.rename(path)
+    if previous is not None:
+        publish_result(live, previous)
+
+
 # The collision branch suffixes the epoch INSIDE the month dir, not at the archive
 # root; a root-level fixture tests a layout agent-api never writes.
 fresh()
 month0 = api.RESULT_DIR / "archive" / "2026-08"
 month0.mkdir()
-publish_result(month0 / "task-collide-1785976425.txt", "RE-ARCHIVED BODY")
+archived_result(month0 / "task-collide-1785976425.txt", "task-collide", "RE-ARCHIVED BODY")
 got = api.get_task_result("task-collide")
 check("month-dir re-archive archive/<YYYY-MM>/<id>-<epoch>.txt is found",
       got is not None and got.get("result") == "RE-ARCHIVED BODY", f"got {got!r}")
@@ -64,13 +74,13 @@ fresh()
 month1 = api.RESULT_DIR / "archive" / "2026-08"
 month1.mkdir()
 publish_result(month1 / "task-exact.txt", "EXACT WINS")
-publish_result(month1 / "task-exact-1785976425.txt", "SUFFIXED SIBLING")
+archived_result(month1 / "task-exact-1785976425.txt", "task-exact", "SUFFIXED SIBLING")
 got = api.get_task_result("task-exact")
 check("exact <id>.txt still wins over its suffixed sibling",
       got is not None and got.get("result") == "EXACT WINS", f"got {got!r}")
 
 fresh()
-publish_result(api.RESULT_DIR / "archive" / "task-flat-1785976425.txt", "FLAT BODY")
+archived_result(api.RESULT_DIR / "archive" / "task-flat-1785976425.txt", "task-flat", "FLAT BODY")
 got = api.get_task_result("task-flat")
 check("root-level flat archive/<id>-<epoch>.txt is found",
       got is not None and got.get("result") == "FLAT BODY", f"got {got!r}")
@@ -100,7 +110,7 @@ check("live result still wins",
 # be the stale one. A delegation that reordered these would pass every test above.
 fresh()
 publish_result(api.RESULT_DIR / "task-both.txt", "LIVE WINS")
-publish_result(api.RESULT_DIR / "archive" / "task-both-1785976425.txt", "STALE ARCHIVE")
+archived_result(api.RESULT_DIR / "archive" / "task-both-1785976425.txt", "task-both", "STALE ARCHIVE")
 got = api.get_task_result("task-both")
 check("live OUTRANKS archive when both exist",
       got is not None and got.get("result") == "LIVE WINS", f"got {got!r}")
@@ -117,7 +127,7 @@ check("an absent task is None", api.get_task_result("task-absent") is None)
 # --- a longer id must never be served under a shorter one ---------------------
 # `<id>-*` also matches a LONGER id, and sorted()[-1] returns it.
 fresh()
-publish_result(api.RESULT_DIR / "archive" / "task-ws-grouping-1787961646170-1756000001.txt", "OTHER TASK")
+archived_result(api.RESULT_DIR / "archive" / "task-ws-grouping-1787961646170-1756000001.txt", "task-ws-grouping-1787961646170", "OTHER TASK")
 got = api.get_task_result("task-ws-grouping")
 check("a LONGER id's re-archive is not served under this id (root)",
       got is None or got.get("result") != "OTHER TASK", f"got {got!r}")
@@ -125,7 +135,7 @@ check("a LONGER id's re-archive is not served under this id (root)",
 fresh()
 mcol = api.RESULT_DIR / "archive" / "2026-08"
 mcol.mkdir()
-publish_result(mcol / "task-ws-grouping-1787961646170-1756000001.txt", "OTHER TASK")
+archived_result(mcol / "task-ws-grouping-1787961646170-1756000001.txt", "task-ws-grouping-1787961646170", "OTHER TASK")
 got = api.get_task_result("task-ws-grouping")
 check("a LONGER id's re-archive is not served under this id (month dir)",
       got is None or got.get("result") != "OTHER TASK", f"got {got!r}")
@@ -134,8 +144,8 @@ check("a LONGER id's re-archive is not served under this id (month dir)",
 fresh()
 mown = api.RESULT_DIR / "archive" / "2026-08"
 mown.mkdir()
-publish_result(mown / "task-ws-grouping-1787961646170-1756000001.txt", "OTHER TASK")
-publish_result(mown / "task-ws-grouping-1756000002.txt", "MINE")
+archived_result(mown / "task-ws-grouping-1787961646170-1756000001.txt", "task-ws-grouping-1787961646170", "OTHER TASK")
+archived_result(mown / "task-ws-grouping-1756000002.txt", "task-ws-grouping", "MINE")
 got = api.get_task_result("task-ws-grouping")
 check("this id's own re-archive is still served alongside a longer sibling",
       got is not None and got.get("result") == "MINE", f"got {got!r}")

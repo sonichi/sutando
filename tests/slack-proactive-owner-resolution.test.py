@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for proactive Slack owner-recipient resolution."""
 
-from _helpers.paired_result import publish_result
 
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()

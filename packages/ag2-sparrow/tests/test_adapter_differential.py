@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PKG_ROOT))
 DRIVER = Path(__file__).resolve().parent / "adapter_differential_driver.py"
 
 # Recorded with this driver at the merge base named in the file (the previous head gives the same).

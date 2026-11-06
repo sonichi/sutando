@@ -7,7 +7,6 @@ has already failed.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import sys
 import tempfile
@@ -15,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 _REPO = Path(__file__).resolve().parent.parent

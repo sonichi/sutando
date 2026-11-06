@@ -17,6 +17,7 @@ import io
 import multiprocessing
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -65,6 +66,19 @@ def _poll_sizes(results: str, expected: int, stop_at: float, out) -> None:
 
 
 class PublisherContract(unittest.TestCase):
+    def test_prompt_command_quotes_paths_and_publishes_verified_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "space ' and $literal" / "results" / "task-1.txt"
+            command = result_publish.publication_command(path)
+            self.assertEqual(shlex.split(command)[-1], str(path))
+            run = subprocess.run(shlex.split(command), input="answer\n", text=True, capture_output=True,
+                                 env=isolated_child_env())
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(read_ready_result(path), "answer")
+            prompt = result_publish.publication_instruction(path)
+            self.assertIn(command, prompt)
+            self.assertIn("pairing receipts", prompt)
+
     def test_publishes_the_exact_body_and_nothing_else(self):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "results" / "task-1.txt"
@@ -322,6 +336,16 @@ _OLD_TS_CANCEL = "writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.
 
 
 class DelegationTest(unittest.TestCase):
+    def test_chat_prompts_delegate_all_result_publication(self):
+        for name in ("discord", "slack", "telegram"):
+            source = (REPO / "src" / f"{name}-bridge.py").read_text()
+            self.assertIn("publication_instruction(RESULTS_DIR", source)
+        discord = (REPO / "src" / "discord-bridge.py").read_text()
+        self.assertNotRegex(discord, r"Stage 2:.*: mv ")
+        self.assertIn("{result_command} < {staging_path}", discord)
+        self.assertIn("{proactive_command}", discord)
+        self.assertIn("only the shared publisher may update its own pairing receipts", discord)
+
     def test_every_writer_reaches_the_publisher(self):
         for rel, needle in {**WRITERS, **VIA_LOCAL_RECORD}.items():
             with self.subTest(writer=rel):
@@ -373,7 +397,7 @@ class DelegationTest(unittest.TestCase):
         src = (REPO / "src" / "result_publish.py").read_text(encoding="utf-8")
         for line in src.splitlines():
             if line.startswith(("import ", "from ")) and "__future__" not in line:
-                self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib"), line)
+                self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib", "shlex"), line)
 
 
 if __name__ == "__main__":

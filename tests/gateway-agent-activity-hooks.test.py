@@ -9,7 +9,6 @@ Run: python3 tests/gateway-agent-activity-hooks.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result, publish_staged_result
 
 import ast
 import io
@@ -29,6 +28,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result, publish_staged_result
 
 gw, _READS = isolate_then_import(env={"REMOTE_TASK_LIFECYCLE_V2": "1", "REMOTE_TASK_TURN_CONTEXT": "1"})
 assert gw._ATTEMPTS.take_ownership()
@@ -3794,6 +3794,13 @@ class Hooks(unittest.TestCase):
         self.core_writes(a, "A's answer")
         inflight = {a, b}
         mock.patch.object(gw, "DELIVERY_PASS_WAIT_S", 0.5).start()
+        workers, start_delivery = {}, gw._start_delivery
+
+        def start_and_track(tid, *args):
+            worker = start_delivery(tid, *args)
+            workers[tid] = worker
+            return worker
+        mock.patch.object(gw, "_start_delivery", side_effect=start_and_track).start()
         drain = threading.Thread(target=gw._post_ready_results, args=(inflight,))
         drain.start()
         self.assertTrue(stalled.wait(5))
@@ -3817,6 +3824,8 @@ class Hooks(unittest.TestCase):
         finally:
             release.set()
         drain.join(60)
+        workers[a].join(60)  # The bounded scan may return before its independent send finishes.
+        self.assertFalse(workers[a].is_alive())
         self.assertEqual(gw._ATTEMPTS.get(a), {}, "A settles once its send returns")
         del fakes
 

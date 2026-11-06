@@ -14,7 +14,6 @@ refused, the verified room is not.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import json
 import os
@@ -27,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()

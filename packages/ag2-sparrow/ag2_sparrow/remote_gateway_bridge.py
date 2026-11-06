@@ -5334,8 +5334,8 @@ def _resolve_stop(t) -> None:
     if not (read_ready_result(RESULTS_DIR / f"{ctl}.txt") is not None or _delivered_copy_exists(ctl)):
         return                                  # the core has not reached the control task yet
     tid = _run_tid(t.wire, rec)
-    if read_ready_result(RESULTS_DIR / f"{tid}.txt") is not None:
-        return                                  # delivery rules: a reply posts, nothing to send stops
+    if _on_disk(RESULTS_DIR / f"{tid}.txt") is not False:
+        return                                  # occupied: delivery decides; do not rule an unreadable reply stopped
     t.stop_outcome(stopped=not _own_copy_exists(tid))
 
 
@@ -6954,7 +6954,7 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
             continue
         try:
             with disposal.locked(RESULTS_DIR):
-                if not undelivered_quarantine.restore_verified(
+                if not undelivered_quarantine.rebind_verified(
                         copy, target, lambda src, dst: undelivered_quarantine.rename_noreplace(src, dst, _log)):
                     _log(f"result {local}: its quarantined copy has no matching receipt; left in place")
                     continue
@@ -8633,7 +8633,7 @@ def _holder_delivery_state(holder_id: str) -> str:
     if body is None:
         for path in candidates:
             if path is not None:
-                body = read_ready_result(path)
+                body = read_ready_result(path, task_id=holder_id)
                 if body:
                     break
     return classify_holder_delivery(record, body,
@@ -10097,7 +10097,7 @@ def _delivered_copy_exists(tid: str) -> bool:
     for pattern in (f"{tid}-*.txt", f"*/{tid}-*.txt"):
         candidates.extend(p for p in ARCHIVE_RESULTS_DIR.glob(pattern)
                           if _ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):]))
-    return any(read_ready_result(path) is not None for path in candidates)
+    return any(read_ready_result(path, task_id=tid) is not None for path in candidates)
 
 
 def _names(base: str, tries: int = 64):

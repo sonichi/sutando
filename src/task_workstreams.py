@@ -287,7 +287,7 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
         result = ""
         if result_path is not None:
             try:
-                verified = read_ready_result(result_path)
+                verified = read_ready_result(result_path, task_id=task_id)
                 result = (verified or "")[:MAX_RESULT_CHARS]
                 if verified is None:
                     result_path = None
@@ -538,7 +538,7 @@ def _exact_result(workspace: Path, task_id: str) -> str:
         candidates.extend(directory / filename for directory in directories)
     for path in candidates:
         try:
-            body = read_ready_result(path)
+            body = read_ready_result(path, task_id=task_id)
             if body is not None:
                 return body[:MAX_RESULT_CHARS]
         except OSError:

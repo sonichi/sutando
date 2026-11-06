@@ -17,7 +17,6 @@ Run: python3 tests/status-ack-suppression.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import functools
 import json
@@ -26,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402

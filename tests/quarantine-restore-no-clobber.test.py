@@ -50,6 +50,17 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
         self.assertTrue(p.exists())
         self.assertFalse((self.results / "task-raw.txt").exists())
 
+    def test_rebinding_requires_the_source_generation_proof(self):
+        source = self._quarantine("reask", "verified answer", 1)
+        target = self.results / "task-original.txt"
+        self.assertTrue(uq.rebind_verified(source, target))
+        from result_ready import read_ready_result
+        self.assertEqual(read_ready_result(target), "verified answer")
+        source.write_text("unverified replacement")
+        target.unlink()
+        self.assertFalse(uq.rebind_verified(source, target))
+        self.assertFalse(target.exists())
+
     def test_restore_promotes_the_verified_older_generation(self):
         self._quarantine("old", "older result", 1)
         live = self.results / "task-old.txt"

@@ -132,15 +132,15 @@ def result_context(path):
     return receipts, task_id_from(name)
 
 
-def path_verifier(path):
+def path_verifier(path, task_id=None):
     """Fail closed when the result path has no resolvable receipt namespace."""
     context = result_context(path)
     if context is None:
         return lambda body: False
-    receipts, task_id = context
-    ids = [task_id]
-    if Path(path).absolute().parent != result_root(path):
-        match = re.fullmatch(r"(.+)-[0-9]+(?:-late-duplicate)?(?:\.[0-9]+)?", task_id)
+    receipts, inferred_id = context
+    ids = [task_id_from(task_id)] if task_id is not None else [inferred_id]
+    if task_id is None and Path(path).absolute().parent != result_root(path):
+        match = re.fullmatch(r"(.+)-[0-9]+(?:-late-duplicate)?(?:\.[0-9]+)?", inferred_id)
         if match:
             ids.append(match.group(1))
     archived = Path(path).absolute().parent != result_root(path)

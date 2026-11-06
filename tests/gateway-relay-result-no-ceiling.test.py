@@ -22,7 +22,6 @@ Run: python3 tests/gateway-relay-result-no-ceiling.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import contextlib
 import errno
@@ -40,6 +39,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 _REPO = Path(__file__).resolve().parent.parent

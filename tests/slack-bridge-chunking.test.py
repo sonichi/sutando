@@ -19,6 +19,7 @@ from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
+from _helpers.paired_result import publish_result
 
 import importlib.util
 import os
@@ -197,7 +198,7 @@ check("slack wiring: [deduped:] writes deduped audit line",
 # one iteration, then verify the audit line was written.
 _audit.write_text("")
 _ws_task = "task-rw-skip-test"
-(mod.RESULTS_DIR / f"{_ws_task}.txt").write_text("[no-send]\n")
+publish_result(mod.RESULTS_DIR / f"{_ws_task}.txt", "[no-send]\n")
 with mod.pending_replies_lock:
     mod.pending_replies[_ws_task] = {
         "channel": "C0FAKE", "thread_ts": None,

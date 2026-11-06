@@ -14,9 +14,9 @@ Run: python3 tests/bridge-dedup-report-retained.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()

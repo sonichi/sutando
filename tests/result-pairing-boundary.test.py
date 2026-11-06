@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / 'src'))
 from _helpers.hermetic_env import isolated_child_env, isolate_os_environ
 isolate_os_environ()
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / 'src'))
 from delivery.readiness import read_ready_result
 from delivery.task_dispatch import has_ready_result
 from result_publish import publish_text
@@ -71,6 +71,17 @@ class ReceiptBoundary(unittest.TestCase):
                 publish_text(live, "new answer")
                 self.assertEqual(read_ready_result(target), "original answer")
 
+    def test_archive_numeric_suffix_cannot_complete_a_shorter_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td) / "results"
+            longer = results / "task-a-123.txt"
+            publish_text(longer, "longer task answer")
+            archive = results / "archive"
+            archive.mkdir()
+            longer.rename(archive / longer.name)
+            self.assertFalse(has_ready_result(results, "task-a.txt"))
+            self.assertTrue(has_ready_result(results, "task-a-123.txt"))
+
     def test_custom_result_root_pins_keep_their_receipt_namespace(self):
         with tempfile.TemporaryDirectory() as td:
             results = Path(td) / "custom-output"
@@ -107,7 +118,7 @@ class ReceiptBoundary(unittest.TestCase):
             self.assertFalse(any(isinstance(f, ast.Name) and f.id == 'ready_body_of' for f in calls), consumer)
             self.assertTrue(any(isinstance(f, ast.Name) and f.id == 'read_ready_result' for f in calls), consumer)
         owner = (REPO / 'src/delivery/readiness.py').read_text()
-        self.assertIn('attests = path_verifier(p)', owner)
+        self.assertIn('attests = path_verifier(p, task_id=task_id)', owner)
         self.assertIn('if not attests(', owner)
 
     def test_completion_functions_delegate_to_receipt_verification(self):

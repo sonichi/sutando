@@ -1,6 +1,5 @@
 """Owner ledger step publication: rate, filtering, envelope correlation and real HTTP transport."""
 
-from _helpers.paired_result import publish_result
 import json
 import sys
 import tempfile
@@ -12,6 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import
+from _helpers.paired_result import publish_result
 from _helpers.gateway_relay import Bridges, Relay
 
 gw, _ = isolate_then_import()

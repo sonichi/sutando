@@ -7,7 +7,9 @@ ordinary failure and the message is unrecoverable.
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -127,7 +129,7 @@ def main() -> int:
     # --- REFUSAL: ok=False, no exception ---
     name = "proactive-tg-refusal.txt"
     body = "a proactive message telegram refuses"
-    (results / name).write_text(body)
+    publish_result(results / name, body)
     seen = _run_one_drain(mod, results, {"ok": False, "text_chunks": 1, "files_sent": 0})
 
     check("the refused send was attempted", seen["n"] > 0, "drain never called send_reply")
@@ -149,7 +151,7 @@ def main() -> int:
     (ws2 / "tasks").mkdir(exist_ok=True)
     mod2 = _load(ws2)
     name2 = "proactive-tg-delivered.txt"
-    (results2 / name2).write_text("a proactive message telegram accepts")
+    publish_result(results2 / name2, "a proactive message telegram accepts")
     seen2 = _run_one_drain(mod2, results2, {"ok": True, "text_chunks": 1, "files_sent": 0})
     check("the accepted send was attempted", seen2["n"] > 0)
     check("a DELIVERED proactive DM IS consumed (release is not unconditional)",

@@ -27,12 +27,27 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import shlex
 from pathlib import Path
 
 __all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "undeliverable_reason", "retired_path", "result_labels_for", "main"]
+           "undeliverable_reason", "retired_path", "result_labels_for", "main",
+           "publication_command", "publication_instruction"]
 
 STAGED_SUFFIX = ".tmp"
+
+
+def publication_command(path: str | Path) -> str:
+    """Shell command accepting a result body on stdin through the shared writer."""
+    return shlex.join([sys.executable, str(Path(__file__).resolve()), str(Path(path).absolute())])
+
+
+def publication_instruction(path: str | Path) -> str:
+    return ("\nRESULT PUBLICATION: pipe only the final body to `" + publication_command(path)
+            + "`. This applies to answers, fallback sentinels, and [no-send] markers. "
+            "Publish proactive bodies through the same command with their absolute result path. "
+            "The shared writer alone may update its pairing receipts under state/result-pairing; "
+            "this permits no other state access. Never publish a final result with raw redirection or mv.\n")
 
 
 def stage_text(path: str | Path, text: str, mode: int = 0o666) -> Path:

@@ -224,7 +224,8 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.start()
         result, body = self.results / f'{self.tid}.txt', '[dm-only]\n4\n'
         gw.result_labels.write(result, {'title': 'Add two and two'}, body)
-        result.write_text(body)
+        from ag2_sparrow.result_publish import publish_text
+        publish_text(result, body, pair_result=True)
         gw._post_ready_results({self.tid})
         self.assertEqual([(c['dm_only'], c.get('title')) for c in self.server.calls],
                          [(True, 'Add two and two')])

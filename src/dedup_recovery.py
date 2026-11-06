@@ -154,7 +154,7 @@ def plan_dedup_recovery(
     orig_text = _read(find_task_file(Path(tasks_dir), task_id)
                       or find_archived_task(Path(tasks_dir), task_id))
     holder_path = find_result(Path(results_dir), holder) if holder else None
-    holder_text = read_ready_result(holder_path) if holder_path else None
+    holder_text = read_ready_result(holder_path, task_id=holder) if holder_path else None
 
     decision = dedup_decision(holder_text, orig_text)
     holder_task = (_read(find_task_file(Path(tasks_dir), holder)

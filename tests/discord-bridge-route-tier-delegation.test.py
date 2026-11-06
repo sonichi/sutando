@@ -14,6 +14,7 @@ from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
+from _helpers.paired_result import publish_result
 
 import asyncio
 import importlib.util
@@ -115,7 +116,7 @@ async def _deliver(task_id: str, archived_tier: str) -> list:
     (month / f"{task_id}.txt").write_text(
         f"id: {task_id}\nsource: discord\naccess_tier: {archived_tier}\ntask: hi\n")
     bridge.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    (bridge.RESULTS_DIR / f"{task_id}.txt").write_text(ERROR_BODY)
+    publish_result(bridge.RESULTS_DIR / f"{task_id}.txt", ERROR_BODY)
     channel = _CapturingChannel()
     bridge.pending_replies.clear()
     bridge.pending_replies[task_id] = channel

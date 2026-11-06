@@ -18,9 +18,9 @@ member's Slack DM. Pins the three properties the fix owns:
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 isolate_os_environ()
 

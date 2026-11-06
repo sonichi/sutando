@@ -11,7 +11,6 @@ the outage arm so the floor is what recovers.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import importlib.util
 import os
@@ -24,6 +23,7 @@ import time
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()

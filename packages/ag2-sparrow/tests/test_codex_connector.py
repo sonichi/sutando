@@ -200,7 +200,7 @@ class WriteAtomicTest(unittest.TestCase):
     def test_mtime_is_read_before_the_rename(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "task-chat-1.txt")
-            with mock.patch.object(cc.os, "replace", side_effect=lambda s, t: os.rename(s, t + ".claimed")):
+            with mock.patch.object(cc.os, "replace", side_effect=lambda s, t: os.rename(s, str(t) + ".claimed")):
                 mtime = cc.write_atomic(out, "x\n")
             self.assertFalse(os.path.exists(out))
             self.assertAlmostEqual(mtime, os.stat(out + ".claimed").st_mtime, places=3)

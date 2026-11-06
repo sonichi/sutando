@@ -7,9 +7,9 @@ The pass must finish the archive; a claim merely HELD elsewhere must not.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()

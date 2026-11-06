@@ -156,8 +156,7 @@ case "$OUT" in
   '{}') ok "worker's block clears once its result is archived (not just present)" ;;
   *) bad "worker's block clears once its result is archived (not just present)" "got: ${OUT:0:160}" ;;
 esac
-rm -f "$WS/results/$PROBE.txt"
-mv "$WS/results/$PROBE.txt" "$WS/results/archive/$PROBE-1789600000.txt"
+rm -f "$WS/results/archive/$PROBE-1789600000.txt"
 record_delivery
 
 # 8. THE MONTH-BUCKET ARCHIVE SHAPE (john-the-dev's #4339 review, 2026-09-17):

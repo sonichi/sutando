@@ -66,7 +66,17 @@ F = f"{TASK}.txt"
 
 def _write(path: Path, text: str = "done\n") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    publish_text(path, text)
+    root = next((parent for parent in path.parents if parent.name == "results"), None)
+    if root is not None and path.parent != root:
+        tid = re.sub(r"^(task-probe|task-a|task-fx[0-9]+)-[0-9]+$", r"\1", path.stem)
+        live = root / f"{tid}.txt"
+        previous = live.read_text() if live.exists() else None
+        publish_text(live, text)
+        live.rename(path)
+        if previous is not None:
+            publish_text(live, previous)
+    else:
+        publish_text(path, text)
     return path
 
 
@@ -628,7 +638,7 @@ class PendingCandidatesBatchTest(unittest.TestCase):
                 self.assertEqual(has_ready_result(self.results_dir, name), ready)
                 self.assertEqual(name not in got, ready)
 
-    def test_one_archived_file_satisfies_an_exact_id_and_its_epoch_base_id(self):
+    def test_archived_file_satisfies_only_its_receipt_bound_id(self):
         names = ["task-a.txt", "task-a-1700000000.txt"]
         for layout in ("archive", "archive/2026-09", "archive-2026-09-20"):
             with self.subTest(layout=layout):
@@ -637,8 +647,8 @@ class PendingCandidatesBatchTest(unittest.TestCase):
                 for name in names:
                     (self.tasks_dir / name).write_text("priority: normal\ntask: fixture\n")
                 _write(self.results_dir / layout / names[1])
-                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, True])
-                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
+                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, False])
+                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [names[1]])
 
     def test_overlapping_ids_match_has_ready_result_in_every_layout(self):
         ids = ["task-o", "task-o-1700000000", "task-o-1700000000-1800000000", "task-o-x"]

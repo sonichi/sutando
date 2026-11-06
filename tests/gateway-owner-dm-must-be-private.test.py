@@ -26,9 +26,9 @@ fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ(SUTANDO_TEST_MODE="1", AG2_DEVICE_ENV="", REMOTE_TASK_URL="http://127.0.0.1:9",

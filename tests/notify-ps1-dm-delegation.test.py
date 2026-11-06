@@ -34,6 +34,9 @@ class NotifyDelegation(unittest.TestCase):
             (repo / "scripts").mkdir()
             shutil.copy(ROOT / "scripts/python-binary.ps1", repo / "scripts")
             shutil.copy(ROOT / "src/notify.ps1", src)
+            for name in ("result_publish.py", "result_write.py", "file_lock.py", "local_task_protocol.py", "result_identity.py"):
+                if (ROOT / "src" / name).exists():
+                    shutil.copy(ROOT / "src" / name, src)
             (src / "workspace_default.ps1").write_text(
                 "function Resolve-SutandoWorkspace { return $env:TEST_REPO }\n")
             (src / "dm-result.py").write_text(
@@ -68,7 +71,10 @@ function Add-Type {
             self.assertTrue((repo / "sent.txt").exists(), "shared send_dm was not called")
             self.assertEqual((repo / "sent.txt").read_bytes(), message.encode("utf-8"))
             self.assertTrue((repo / "desktop-reached").exists())
-            self.assertEqual(len(list((repo / "results").glob("proactive-*.txt"))), 1)
+            results = list((repo / "results").glob("proactive-*.txt"))
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].read_bytes(), message.encode("utf-8"))
+            self.assertTrue((repo / "state" / "result-pairing" / f"{results[0].stem}.ok").is_file())
 
 
 if __name__ == '__main__':

@@ -17,7 +17,6 @@ Run: python3 tests/core-limit-hold.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import importlib.util
 import json
@@ -31,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 isolate_os_environ()
 

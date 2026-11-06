@@ -6,7 +6,6 @@ Run: python3 tests/gateway-proactive-lane-edges.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import sys
 from pathlib import Path
@@ -14,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _helpers.hermetic_gateway import isolate_then_import
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 import dataclasses
@@ -154,8 +154,10 @@ def restore_by_generation() -> None:
     results = Path(tempfile.mkdtemp(dir=ISO))
     q = results / "undelivered"
     q.mkdir()
-    publish_result(q / "proactive-g-100.txt", "A\n", encoding="utf-8")
-    publish_result(q / "proactive-g-200.txt", "B\n", encoding="utf-8")
+    publish_result(results / "proactive-g.txt", "A\n")
+    (results / "proactive-g.txt").rename(q / "proactive-g-100.txt")
+    publish_result(results / "proactive-g.txt", "B\n")
+    (results / "proactive-g.txt").rename(q / "proactive-g-200.txt")
     want = hashlib.sha256(b"A\n").hexdigest()
     outcome, path = undelivered_quarantine.restore(results, "proactive-g", body_sha256=want)
     check(outcome is undelivered_quarantine.RestoreOutcome.RESTORED and path.read_text() == "A\n",

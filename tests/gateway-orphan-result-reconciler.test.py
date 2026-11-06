@@ -6,7 +6,6 @@ posting agent narration into the room, not losing a reply.
 Run: python3 tests/gateway-orphan-result-reconciler.test.py"""
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result, publish_staged_result
 
 import sys
 import tempfile
@@ -17,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result, publish_staged_result
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -71,6 +71,11 @@ class _Base(unittest.TestCase):
         _age(f, age)
         return f
 
+    def _archived_result(self, path, body, task_id):
+        live = gw.RESULTS_DIR / f"{task_id}.txt"
+        publish_result(live, body)
+        live.rename(path)
+
     def _sweep(self):
         gw._last_orphan_sweep = 0.0
         gw._reconcile_orphan_results(set())
@@ -124,7 +129,7 @@ class DoubleWrite(_Base):
         # REAL fixture: first result delivered + archived by the normal path's
         # naming, then the same session writes a completion note 13s later.
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply", TID)
         self._result("Replied in room ww — result was picked up and archived.")
         self._sweep()
         self.assertEqual(self.posted, [], "a duplicate must NEVER be re-delivered")
@@ -392,7 +397,7 @@ class PairingCompletion(_Base):
                     path = folder / name
                     path.write_text("unpaired reply")
                     self.assertFalse(gw._delivered_copy_exists(TID))
-                    publish_result(path, "paired reply")
+                    self._archived_result(path, "paired reply", TID)
                     self.assertTrue(gw._delivered_copy_exists(TID))
                     path.write_text("substituted reply")
                     self.assertFalse(gw._delivered_copy_exists(TID))
@@ -417,12 +422,19 @@ class PairingCompletion(_Base):
 
 
 class AdjacentIdBoundary(_Base):
+    def test_bare_numeric_longer_id_cannot_attest_another_tasks_archive(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        path = gw.ARCHIVE_RESULTS_DIR / "task-a-123.txt"
+        self._archived_result(path, "123's reply", "task-a-123")
+        self.assertTrue(gw._delivered_copy_exists("task-a-123"))
+        self.assertFalse(gw._delivered_copy_exists("task-a"))
+
     def test_a_longer_ids_archive_does_not_satisfy_a_shorter_id(self):
         """`{tid}-*` also matches a LONGER valid id's entry, so `task-a`
         reads as delivered because `task-a-b-<epoch>.txt` exists."""
         short, longer = "task-a", "task-a-b"
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{longer}-1786940000.txt", "b's reply")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{longer}-1786940000.txt", "b's reply", longer)
         self.assertTrue(gw._delivered_copy_exists(longer),
                         "the id that WAS delivered must read delivered")
         self.assertFalse(gw._delivered_copy_exists(short),
@@ -433,7 +445,7 @@ class AdjacentIdBoundary(_Base):
         longer id's extra segment is NUMERIC it looks like this writer's own
         epoch suffix, so a permissive grammar re-admits the alias."""
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / "task-a-123-1786940000.txt", "123's reply")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / "task-a-123-1786940000.txt", "123's reply", "task-a-123")
         self.assertTrue(gw._delivered_copy_exists("task-a-123"),
                         "the id that WAS delivered must read delivered")
         self.assertFalse(gw._delivered_copy_exists("task-a"),
@@ -442,13 +454,13 @@ class AdjacentIdBoundary(_Base):
     def test_numeric_adjacent_boundary_holds_month_partitioned(self):
         d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
         d.mkdir(parents=True, exist_ok=True)
-        publish_result(d / "task-a-123-1786940000.txt", "123's reply")
+        self._archived_result(d / "task-a-123-1786940000.txt", "123's reply", "task-a-123")
         self.assertTrue(gw._delivered_copy_exists("task-a-123"))
         self.assertFalse(gw._delivered_copy_exists("task-a"))
 
     def test_uniquified_and_tagged_names_still_count(self):
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000-late-duplicate.999.txt", "x")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000-late-duplicate.999.txt", "x", TID)
         self.assertTrue(gw._delivered_copy_exists(TID),
                         "the collision-uniquified name is this writer's own")
 
@@ -460,7 +472,7 @@ class AdjacentIdBoundary(_Base):
 
     def test_the_writers_own_suffixes_still_count(self):
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000-late-duplicate.txt", "x")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000-late-duplicate.txt", "x", TID)
         self.assertTrue(gw._delivered_copy_exists(TID),
                         "the boundary must not reject this writer's own names")
 
@@ -679,7 +691,7 @@ class ReplacementAtTheMove(_Base):
 
     def test_late_duplicate(self):
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply", TID)
         self._race("BODY-A duplicate")
         self.assertEqual(self._moved(gw.ARCHIVE_RESULTS_DIR, f"{TID}-*-late-duplicate*.txt"),
                          ["BODY-A duplicate"])
@@ -693,7 +705,7 @@ class FallbackIsNotTheRequestedDisposition(ReplacementAtTheMove):
     def test_late_duplicate_kept_in_undelivered_is_reported_as_such(self):
         import os
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply", TID)
         canonical = self._result("BODY-A duplicate")
         real = gw.disposal._move_into_quarantine
 
@@ -770,7 +782,7 @@ class ReplacementBeforeTheRetire(ReplacementAtTheMove):
 
     def test_late_duplicate(self):
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
-        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply")
+        self._archived_result(gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt", "the reply", TID)
         self._race_before("BODY-A duplicate")
 
     def test_too_old_b_is_young_and_waits_out_its_grace(self):

@@ -378,7 +378,7 @@ def _published(ws: Path, via) -> bool:
     archive = results / "archive"
     candidates = [results / via, archive / via, *results.glob(f"{stem}.sending*"),
                   *archive.glob(f"{stem}-[0-9]*.txt")]
-    return (any(read_ready_result(p) is not None for p in candidates)
+    return (any(read_ready_result(p, task_id=stem) is not None for p in candidates)
             or _receipt(ws, via) is not None)
 
 

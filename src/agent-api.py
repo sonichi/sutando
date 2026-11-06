@@ -61,7 +61,6 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
-from delivery.readiness import read_ready_result
 from urllib.parse import parse_qs, urlparse, unquote
 
 
@@ -117,6 +116,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+from delivery.readiness import read_ready_result  # noqa: E402
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import connections as _connections  # noqa: E402
@@ -446,8 +446,8 @@ def get_status() -> dict:
     }
 
 
-def _read_or_none(path) -> "str | None":
-    return read_ready_result(path)
+def _read_or_none(path, task_id=None) -> "str | None":
+    return read_ready_result(path, task_id=task_id)
 
 
 def _newest_first(paths) -> list:
@@ -504,13 +504,13 @@ def _active_task_rows() -> list[dict]:
             if candidate.exists():
                 archived_file = candidate
                 break
-        result_text = _read_or_none(result_file)
+        result_text = _read_or_none(result_file, task_id)
         if result_text is not None:
             status = "done"
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_file is not None and (_archived := _read_or_none(archived_file)) is not None:
+        elif archived_file is not None and (_archived := _read_or_none(archived_file, task_id)) is not None:
             status = "done"
             result_text = _archived
         else:
@@ -942,7 +942,7 @@ def get_task_result(task_id: str):
     safe_id = _safe_id(task_id)
     if safe_id:
         archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
-        body = read_ready_result(archived) if archived is not None else None
+        body = read_ready_result(archived, task_id=task_id) if archived is not None else None
         if body is not None:
             # Guarded like the live branch: archival is where room polls usually
             # land, so skipping it here would bypass the boundary in the common case.

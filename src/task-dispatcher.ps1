@@ -341,7 +341,12 @@ function Publish-TaskResult($taskId, $result) {
     $temporary = Join-Path $RESULTS ('.dispatcher-' + [guid]::NewGuid().ToString('N'))
     try {
         [IO.File]::WriteAllText($temporary, [string]$result, [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($temporary, $destination, $true)
+        . (Join-Path $REPO 'scripts/python-binary.ps1')
+        $publisherPython = Resolve-SutandoPython
+        $publisherArgs = @('-c', 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from result_publish import publish_text; publish_text(sys.argv[3], Path(sys.argv[2]).read_bytes().decode("utf-8"), pair_result=True)', $PSScriptRoot, $temporary, $destination)
+        if ($publisherPython -eq 'py') { $publisherArgs = @('-3') + $publisherArgs }
+        & $publisherPython @publisherArgs
+        if ($LASTEXITCODE -ne 0) { throw "Result publication failed for $taskId (exit $LASTEXITCODE)" }
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
     }

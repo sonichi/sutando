@@ -6,7 +6,6 @@ Only disposable state and synthetic results are used; cancellation is a signal.
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import contextlib
 import hashlib
@@ -22,6 +21,7 @@ import unittest
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env, runtime_harness
+from _helpers.paired_result import publish_result
 
 isolate_os_environ(**runtime_harness()[1])
 scratch_file, scratch = runtime_harness()

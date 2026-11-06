@@ -13,6 +13,7 @@ TRIALS="${ISOLATION_TRIALS:-4}"
 # means anything. B runs whole inside A's baseline-to-check window, so overlap is certain.
 ctrl_out="$(cd "$here" && A="$A" B="$B" python3 - 2>&1 <<'PY'
 import importlib.util, os, subprocess, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(os.environ["A"])))
 spec = importlib.util.spec_from_file_location("lane_ctrl_a", os.environ["A"])
 a = importlib.util.module_from_spec(spec); spec.loader.exec_module(a)
 check = a.test_no_writes_reach_the_live_workspace

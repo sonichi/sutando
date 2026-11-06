@@ -59,6 +59,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from result_publish import publication_instruction  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -1285,7 +1286,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                     f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
                 )
                 step += 1
-        hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
+        hints_lines.append(f"{step}. Then process and publish the result through the RESULT PUBLICATION command below")
         skill_hints = "\n" + "\n".join(hints_lines) + "\n"
 
     # interaction-model 4D, step 1.5: structured media headers alongside the
@@ -1319,6 +1320,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"priority: {priority}\n"
         f"task: {user_task_text}\n"
         f"{skill_hints}"
+        f"{publication_instruction(RESULTS_DIR / f'{task_id}.txt')}"
         f"{secret_notice}"
     )
     # If the bridge dies immediately after creation, the next process can still

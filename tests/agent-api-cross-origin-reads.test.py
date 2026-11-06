@@ -13,8 +13,8 @@ A REAL HTTP server on an ephemeral port, the workspace a temp dir. Contract:
 Run: python3 tests/agent-api-cross-origin-reads.test.py
 """
 
-from _helpers.paired_result import publish_result
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 import http.client
 import http.server

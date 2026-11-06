@@ -21,7 +21,6 @@ Run: python3 tests/gateway-proactive-crash-receipt.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import json
 import subprocess
@@ -30,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 HERE = Path(__file__).resolve().parent

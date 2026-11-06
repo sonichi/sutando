@@ -290,13 +290,13 @@ def _find_result(workspace: Path, task_ids: list[str]) -> Path | None:
     archive = workspace / "results" / "archive"
     for task_id in task_ids:
         live = workspace / "results" / f"{task_id}.txt"
-        if read_ready_result(live) is not None:
+        if read_ready_result(live, task_id=task_id) is not None:
             return live
         legacy = archive / f"{task_id}.txt"
-        if read_ready_result(legacy) is not None:
+        if read_ready_result(legacy, task_id=task_id) is not None:
             return legacy
         archived = sorted(p for p in archive.glob(f"*/{task_id}.txt")
-                          if read_ready_result(p) is not None)
+                          if read_ready_result(p, task_id=task_id) is not None)
         if archived:
             return archived[-1]
     return None

@@ -30,13 +30,13 @@ Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
 from __future__ import annotations
 
-from _helpers.paired_result import publish_result
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 import json

@@ -12,6 +12,11 @@ Run: python3 tests/skills/worker-pool/pool-manage.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import io
 import json
@@ -393,7 +398,7 @@ class OwedDeliveries(OwedBase):
 
         def late(ws, wid, runner):
             out = real(ws, wid, runner)
-            (self.ws / "results" / "task-a.txt").write_text("task: task-a\nthe worker's reply\n")
+            publish_result(self.ws / "results" / "task-a.txt", "task: task-a\nthe worker's reply\n")
             return out
         with mock.patch.object(pm, "_take_down", late):
             rc, out = self.main("retire", WID, "--hand-off")
@@ -405,7 +410,7 @@ class OwedDeliveries(OwedBase):
     def test_a_late_result_after_the_hand_off_is_delivered_once_not_rerun(self):
         self.main("retire", WID, "--hand-off")
         self.assertIn("task-a.txt", self.core_queue())
-        (self.ws / "results" / "task-a.txt").write_text("task: task-a\nthe worker's reply\n")
+        publish_result(self.ws / "results" / "task-a.txt", "task: task-a\nthe worker's reply\n")
         self.assertNotIn("task-a.txt", self.core_queue())
         self.assertTrue(td.has_ready_result(self.ws / "results", "task-a.txt"))
         self.assertEqual(self.replay("task-a")["code"], handler.DECLINE)

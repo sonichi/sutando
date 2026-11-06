@@ -10,7 +10,6 @@ shared guard has to run first or a redirect/upload happens on unscanned text.
 Exercises the production `_guarded_result_body`, not a copy of its recipe.
 """
 
-from _helpers.paired_result import publish_result
 import importlib
 import json
 import pathlib
@@ -19,6 +18,7 @@ import tempfile
 import urllib.error
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()

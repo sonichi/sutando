@@ -78,7 +78,7 @@ class ContractTest(unittest.TestCase):
                 source = path.read_text()
                 self.assertIn("read_ready_result(", source)
                 self.assertNotIn("attests=lambda", source)
-        self.assertIn("attests = path_verifier(p)", (REPO / "src/delivery/readiness.py").read_text())
+        self.assertIn("attests = path_verifier(p, task_id=task_id)", (REPO / "src/delivery/readiness.py").read_text())
 
     def test_missing_file_is_not_ready(self):
         with tempfile.TemporaryDirectory() as td:

@@ -15,6 +15,7 @@ from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
+from _helpers.paired_result import publish_result
 
 import atexit
 import contextlib
@@ -94,9 +95,10 @@ def _seed(mod, td: str, holder_body: str, orig: str = ORIG):
     results, tasks = Path(td) / "results", Path(td) / "tasks"
     (results / "archive").mkdir(parents=True)
     tasks.mkdir(parents=True)
-    (results / "archive" / f"{HOLDER}-1785976425.txt").write_text(holder_body)
+    publish_result(results / f"{HOLDER}.txt", holder_body)
+    (results / f"{HOLDER}.txt").rename(results / "archive" / f"{HOLDER}-1785976425.txt")
     (tasks / f"{TID}.txt").write_text(orig)
-    (results / f"{TID}.txt").write_text(DEDUP)
+    publish_result(results / f"{TID}.txt", DEDUP)
     mod.RESULTS_DIR, mod.TASKS_DIR = results, tasks
     mod.ARCHIVE_RESULTS_DIR = results / "archive"
     state = Path(td) / "state"

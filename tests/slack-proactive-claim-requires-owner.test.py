@@ -18,7 +18,9 @@ still deliverable.
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -107,7 +109,7 @@ def _one_pass(results: Path, access: dict | None, owner: str | None = None,
     if access is None:
         acc.unlink(missing_ok=True)          # the unconfigured-Slack case
     else:
-        acc.write_text(json.dumps(access))
+        publish_result(acc, json.dumps(access))
     sb.ACCESS_FILE = acc
     if hasattr(sb, "TASKS_DIR"):
         sb.TASKS_DIR = results
@@ -147,7 +149,7 @@ def main() -> int:
     box = Path(tempfile.mkdtemp(prefix="slack-noowner-"))
     msg = box / "proactive-pending-q-keepme.txt"
     BODY = "a notification routed to Discord"
-    msg.write_text(BODY)
+    publish_result(msg, BODY)
 
     _one_pass(box, access=None)                # Slack unconfigured
 
@@ -164,7 +166,7 @@ def main() -> int:
     # assertion above.
     box2 = Path(tempfile.mkdtemp(prefix="slack-owner-"))
     msg2 = box2 / "proactive-pending-q-deliverme.txt"
-    msg2.write_text("a notification Slack CAN deliver")
+    publish_result(msg2, "a notification Slack CAN deliver")
     sent: list = []
     _one_pass(box2, access={"allowFrom": ["UOWNER"]}, owner="UOWNER", sent=sent)
 

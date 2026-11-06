@@ -2109,7 +2109,10 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
             self.write_task(work, "task-a")
             with self.write_spy(work) as seen, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(cc.main(["--server", "stub", "--work", str(work), "--once", "1", "--poll", "0.01"]), 0)
-        self.assertEqual(self.by_module(seen, os.path.join("codex", "codex_connector.py")) - LOCK_FILES,
+            from ag2_sparrow.result_ready import read_ready_result
+            self.assertIsNotNone(read_ready_result(work / "results" / "task-a.txt"))
+        writes = self.by_module(seen, os.path.join("codex", "codex_connector.py")) - LOCK_FILES
+        self.assertEqual({p for p in writes if not p.startswith("state/result-pairing")},
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",

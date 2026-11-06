@@ -263,7 +263,7 @@ def restore(results_dir: Path, task_id: str,
         return RestoreOutcome.RESTORED, target
 
 
-def restore_verified(source: Path, target: Path, move=None) -> bool:
+def rebind_verified(source: Path, target: Path, move=None) -> bool:
     """Rebind an already verified quarantined reply to its caller-resolved delivery id."""
     receipts, key = result_context(target)
     with locked_file(receipt_path(receipts, key).with_suffix(".lock")):
