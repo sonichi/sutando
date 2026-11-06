@@ -2,7 +2,7 @@
 """A skill declares its own hook; core discovers, never names one."""
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -104,7 +104,7 @@ class SkillHookDiscovery(unittest.TestCase):
         cmd = discover(self.repo)[0][2]
         stub_dir = self.repo / "bin"; stub_dir.mkdir()
         (stub_dir / "python3").write_text("#!/bin/bash\nexit 79\n"); (stub_dir / "python3").chmod(0o755)
-        env = dict(os.environ, PATH=f"{stub_dir}:{os.environ.get('PATH', '')}",
+        env = isolated_child_env(PATH=f"{stub_dir}:{os.environ.get('PATH', '')}",
                    SUTANDO_PY=str(self.repo / "no" / "such" / "python3"))
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "HOOK_EXECUTED"), r.stderr)
@@ -116,7 +116,8 @@ class SkillHookDiscovery(unittest.TestCase):
         self._skill("demo", {"name": "demo", "hooks": [
             {"event": "PreToolUse", "command": "./hooks/g.py"}]}, hook_body="print('HOOK_EXECUTED')")
         cmd = discover(self.repo)[0][2]
-        env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+        env = isolated_child_env()
+        env.pop("SUTANDO_PY", None)
         env["PATH"] = str(self.repo / "empty-bin")  # no python3 anywhere
         (self.repo / "empty-bin").mkdir()
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
@@ -135,7 +136,7 @@ class SkillHookDiscovery(unittest.TestCase):
         log = self.repo / "stub.log"
         (stub_dir / "python3").write_text(f"#!/bin/bash\necho invoked >> '{log}'\nexit 79\n")
         (stub_dir / "python3").chmod(0o755)
-        env = dict(os.environ, PATH=f"{stub_dir}:{os.environ.get('PATH', '')}", SUTANDO_PY=sys.executable)
+        env = isolated_child_env(PATH=f"{stub_dir}:{os.environ.get('PATH', '')}", SUTANDO_PY=sys.executable)
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "HOOK_EXECUTED"), r.stderr)
         self.assertFalse(log.exists(), "the broken PATH python was invoked")
@@ -161,7 +162,8 @@ class SkillHookDiscovery(unittest.TestCase):
         cmd = discover(self.repo)[0][2]
         stub_dir = self.repo / "bin"; stub_dir.mkdir()
         (stub_dir / "python3").write_text("#!/bin/bash\nexit 79\n"); (stub_dir / "python3").chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+        env = isolated_child_env()
+        env.pop("SUTANDO_PY", None)
         env["PATH"] = f"{stub_dir}:{env.get('PATH', '')}"
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "HOOK_EXECUTED"), r.stderr)
