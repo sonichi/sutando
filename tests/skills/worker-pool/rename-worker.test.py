@@ -147,7 +147,7 @@ class Writer(Base):
         pr.register_worker(self.ws, W1, "twin")
         pr.register_worker(self.ws, W2, "twin")
         before = self.frozen()
-        with self.assertRaisesRegex(pr.RosterError, "is the label of 2 workers"):
+        with self.assertRaisesRegex(pr.AmbiguousWorkerName, "names more than one recipient"):
             pr.rename_worker(self.ws, "twin", "solo")
         self.assertEqual(self.frozen(), before)
 

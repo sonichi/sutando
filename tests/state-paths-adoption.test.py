@@ -136,6 +136,12 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # task_lifecycle names tasks/, results/ and state/ under a caller-given work
+    # dir and is vendored where src/ (the resolver) is not importable.
+    "src/task_lifecycle.py",
+    # holder_lock's only "state/" token is a legacy pidfile under a caller-given
+    # work root; the module is vendored where src/ (the resolver) is not importable.
+    "src/holder_lock.py",
     # cloud_auth never resolves the workspace — read_cloud_auth(ws) takes the
     # dir from its caller (report-feedback / marketplace resolve it).
     "src/cloud_auth.py",
@@ -145,6 +151,9 @@ ALLOWLIST = {
     # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
     # dir from its caller (marketplace / connect-apps resolve it).
     "src/station_stamp.py",
+    # owner_channel never resolves the workspace — bound_worker(workspace, …) and
+    # its `--workspace` CLI both take the root from the caller (the loop step).
+    "src/owner_channel.py",
     # runtime-api views + registry never resolve the workspace — server.py
     # (the composition root) imports the canonical resolver and injects dirs.
     "src/runtime-api/instance_registry.py",

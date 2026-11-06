@@ -39,6 +39,18 @@ import tmux_probe  # noqa: E402
 
 import worker_identity as wi  # noqa: E402
 
+
+# The core's own identity: inherited, these stamp a worker's direct posts as
+# "worker-<core id>" while pool delivery stamps the worker's real id.
+_CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
+
+
+def inherited_env(drop=()) -> dict:
+    """The spawner's environment minus the core-only identity, for a worker."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _CORE_ONLY_ENV and k not in drop}
+
+
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
 
 
@@ -54,7 +66,7 @@ LAUNCHER = "skills/worker-pool/scripts/launch-worker-session.sh"
 
 # Worker mode is a property of an ADAPTER, not of the pool: a runtime is
 # listed here once its launcher isolates a worker's session, cwd and state.
-WORKER_MODE_RUNTIMES = ("claude",)
+WORKER_MODE_RUNTIMES = ("claude", "codex")
 
 
 class SpawnRefused(Exception):
@@ -74,7 +86,7 @@ class SpawnRetained(SpawnRefused):
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, **kw)
+    return subprocess.run(argv, **{"capture_output": True, "text": True, **kw})
 
 
 def per_instance_sentinel_supported(repo, runner=_run) -> bool:
@@ -118,7 +130,9 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
     """
     socket = socket or default_socket()
     try:
-        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
+        # Captured whatever the runner: absence is read from stderr, so a bare runner reads "unknown".
+        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"],
+                   capture_output=True, text=True)
     except Exception as e:                                   # noqa: BLE001
         return "unknown", f"tmux could not be run: {e}"
     rc = getattr(r, "returncode", None)
@@ -138,6 +152,58 @@ def session_state(name: str, socket=None, runner=_run) -> str:
     return session_probe(name, socket, runner)[0]
 
 
+def pane_pid(name: str, socket=None, runner=_run) -> int | None:
+    """The pid of the process tmux is running in this session's one pane.
+
+    The launchers exec the CLI entry point: native Claude, or the standard
+    Codex npm wrapper whose lifetime follows its native child. Isolated tmux
+    fixtures verify both lifecycles; custom wrappers that outlive their child
+    are not covered. `None`
+    when the session or its pane cannot be read; a caller treats that as
+    "no beat this time" rather than failing the whole spawn over it.
+    """
+    try:
+        r = runner(["tmux", "-S", socket or default_socket(), "list-panes",
+                    "-t", name, "-F", "#{pane_pid}"])
+    except Exception:                                        # noqa: BLE001
+        return None
+    out = ((getattr(r, "stdout", None) or "").strip().splitlines() or [""])[0]
+    return int(out) if out.isdigit() else None
+
+
+def start_worker_beat(workspace, worker_id: str, watch_pid: int, *,
+                      repo=None, popen=subprocess.Popen) -> bool:
+    """Fire-and-forget `state/workers/<id>.alive`, watching the CLI entry point pid by
+    signal rather than by parentage.
+
+    Why not `--parent-pid`: nothing this module can spawn is born (and STAYS)
+    a direct OS child of the tmux pane's process — the pid `popen` returns
+    here is a child of THIS process, spawn_worker.py, which exits once the
+    caller's CLI invocation is done; the beat writer is then reparented to
+    PID 1 within moments. `--watch-pid` doesn't care: it asks about
+    `watch_pid` by signal, not about its own ancestry, so that reparenting is
+    harmless — proven live in tests/skills/worker-pool/worker-writes-its-beat.test.sh (spawned
+    the same detached way, SIGKILL of the watched pid, beat writer exits
+    within ~2s; SIGKILL of the beat writer alone leaves the watched pid
+    untouched).
+
+    Never raises: a beat that fails to start is a `state: live, beat: absent`
+    worker, which the roster's own three-state design already tolerates —
+    not a reason to roll back an otherwise-successful spawn.
+    """
+    script = Path(repo or _REPO) / "skills" / "worker-pool" / "scripts" / "pool_beat.py"
+    if not script.is_file():
+        return False
+    try:
+        popen([sys.executable, str(script), "--workspace", str(workspace),
+              "--kind", "worker", "--id", worker_id, "--watch-pid", str(watch_pid)],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
 def session_exists(name: str, socket=None, runner=_run) -> bool:
     """Kept for callers that only ask the yes/no question; "unknown" is not a
     "no", so it answers True and they refuse rather than proceed."""
@@ -145,7 +211,7 @@ def session_exists(name: str, socket=None, runner=_run) -> bool:
 
 
 def core_runtime(repo, runner=_run) -> str:
-    """The runtime the core is configured for; a worker runs the same one."""
+    """The runtime the core is configured for; fresh workers default to it."""
     r = runner(["bash", str(Path(repo) / "scripts" / "sutando-config.sh"), "core-runtime"])
     return ((r.stdout or "").strip() if r.returncode == 0 else "") or "claude"
 
@@ -177,12 +243,14 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
         "delivery_dir": delivery_dir,
         "tmux": {"socket": socket, "session_name": wi.tmux_session_name(worker_id)},
         # Absolute, from `repo`: relative, `cwd` would pick which code runs.
-        # No --runtime: only claude ever had a worker mode (WORKER_MODE_RUNTIMES),
-        # so this script needs no runtime selection at all.
         "launcher_argv": ["bash", str(Path(repo) / LAUNCHER)],
         "env": {"SUTANDO_TMUX_SOCKET": socket,
                 "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
                 "SUTANDO_INSTANCE_ID": worker_id,
+                # What say/mention/notify stamp as space.ag2.worker; pool delivery
+                # stamps the same bare id, so both paths name one worker.
+                "SUTANDO_WORKER_ID": worker_id,
+                "SUTANDO_WORKER_RUNTIME": runtime,
                 "SUTANDO_TASKS_DIR": delivery_dir,
                 # The inbox holds sentinels, not task bodies. The reader is TOLD
                 # that here; inferring it from the path is the reader deciding.
@@ -194,6 +262,7 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # bridges drain them, which is the workspace's own results/.
                 "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
+                "SUTANDO_CODEX_WORKING_DIR": str(cwd or repo),
                 # The worker's own gate, named by the skill that owns it: the
                 # core's `/startup --worker` runs what it is handed, not a path.
                 "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py"),
@@ -222,23 +291,77 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
     if sys.platform != "darwin":
         return {"ensured": False, "why": "launchd is macOS-only"}
     try:
-        st = prt.status(launch_agents=launch_agents, runner=runner)
-        # `pool_remedy` calls spawn() from inside this job, so re-installing
-        # a healthy timer would bootout the job currently running.
-        if st.get("installed") and st.get("loaded"):
-            return {"ensured": False, "why": "already installed",
-                    "plist": st.get("plist")}
-        out = prt.install(workspace, repo, launch_agents=launch_agents,
-                          runner=runner)
-        return {"ensured": True, "plist": out.get("plist"),
-                "interval_s": out.get("interval_s"), "loaded": out.get("loaded")}
+        with prt.timer_lock(launch_agents):
+            st = prt.status(workspace, launch_agents=launch_agents, runner=runner)
+            if st.get("installed"):
+                if (st.get("error") or not st.get("repo") or not st.get("workspace")
+                        or not st.get("script")):
+                    return {"ensured": False, "conflict": True, "plist": st["plist"],
+                            "why": f"refusing to replace unreadable timer: "
+                                   f"{st.get('error', 'missing target paths')}"}
+                if (Path(st["workspace"]).resolve() != Path(workspace).resolve()
+                        or Path(st["repo"]).resolve() != Path(repo).resolve()
+                        or Path(st["script"]).resolve() != Path(prt.remedy_script_path()).resolve()):
+                    return {"ensured": False, "conflict": True, "plist": st["plist"],
+                            "why": f"timer is bound to workspace {st['workspace']} and "
+                                   f"repo {st['repo']} via {st['script']}; refusing automatic "
+                                   f"rebind to {Path(workspace).resolve()}, "
+                                   f"{Path(repo).resolve()} via {prt.remedy_script_path()}"}
+            elif st.get("loaded"):
+                return {"ensured": False, "conflict": True, "plist": st["plist"],
+                        "why": "refusing to replace a loaded timer with no readable plist"}
+
+            legacy = prt.legacy_status(launch_agents=launch_agents, runner=runner)
+            if ((legacy.get("loaded") and not legacy.get("installed"))
+                    or (legacy.get("installed")
+                        and (legacy.get("error") or not legacy.get("workspace")))):
+                return {"ensured": False, "conflict": True, "plist": legacy["plist"],
+                        "why": "refusing to migrate a legacy timer with no readable target"}
+            if (legacy.get("installed") and legacy.get("workspace")
+                    and Path(legacy["workspace"]).resolve() == Path(workspace).resolve()
+                    and (not legacy.get("repo")
+                         or not legacy.get("script")
+                         or Path(legacy["repo"]).resolve() != Path(repo).resolve()
+                         or Path(legacy["script"]).resolve()
+                         != Path(prt.remedy_script_path()).resolve())):
+                return {"ensured": False, "conflict": True, "plist": legacy["plist"],
+                    "why": f"legacy timer for this workspace is bound to repo "
+                               f"{legacy.get('repo')} via {legacy.get('script')}; refusing "
+                               f"automatic rebind to {Path(repo).resolve()} via "
+                               f"{prt.remedy_script_path()}"}
+            if (legacy.get("installed") and legacy.get("workspace")
+                    and Path(legacy["workspace"]).resolve() == Path(workspace).resolve()):
+                if st.get("installed"):
+                    return {"ensured": False, "conflict": True, "plist": legacy["plist"],
+                            "why": "both legacy and workspace timers are installed; "
+                                   "run an explicit install to retire the legacy job"}
+                if legacy.get("loaded"):
+                    # pool_remedy can spawn a worker from inside this very job.
+                    # An automatic migration would bootout its own parent sweep.
+                    return {"ensured": False, "why": "already installed",
+                            "plist": legacy["plist"], "label": legacy["label"],
+                            "legacy_retained": True}
+                return {"ensured": False, "conflict": True, "plist": legacy["plist"],
+                        "why": "legacy timer is installed but not loaded; "
+                               "run an explicit install to migrate it"}
+            want = prt.stop_interrupt_setting()
+            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):
+                return {"ensured": False, "why": "already installed",
+                        "plist": st["plist"], "label": st["label"]}
+
+            out = prt.install(workspace, repo, launch_agents=launch_agents,
+                              runner=runner)
+            return {"ensured": True, "plist": out["plist"], "label": out["label"],
+                    "interval_s": out["interval_s"], "loaded": out["loaded"],
+                    "legacy_migrated": out["legacy_migrated"]}
     except (RuntimeError, OSError, ValueError) as e:
         return {"ensured": False, "why": f"{type(e).__name__}: {e}"}
 
 
 def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
-          require_sentinel: bool = True, resume: str = "") -> dict:
+          require_sentinel: bool = True, resume: str = "",
+          existing_worker_id: str = "") -> dict:
     """Create the four parts, in an order where a failure leaves less behind.
 
     Identity first (a record with no process is inert), then the delivery folder,
@@ -247,12 +370,6 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     the only part that starts reading.
     """
     socket = socket or default_socket()
-    runtime = resolve_runtime(repo, runtime, runner)
-    if require_sentinel and not per_instance_sentinel_supported(repo, runner):
-        raise SpawnRefused(
-            "this checkout writes ONE watcher sentinel for every watcher, so a "
-            "second watcher would erase the core's stamp — refusing to spawn")
-
     # Rooms are bound to a worker's id and inbox, so re-minting either would
     # leave every binding pointing at nothing. Only the run is new.
     resumed_id = wi.worker_for_session(workspace, resume) if resume else None
@@ -260,14 +377,37 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         raise SpawnRefused(
             f"no worker in this workspace has session {resume!r} in its lineage; "
             "refusing rather than resuming a conversation into a stranger's record")
-    session_id = resume or str(uuid.uuid4())   # the CLI wants a dashed UUID
+    if resumed_id:
+        session = next((row for row in wi.sessions(workspace, resumed_id)
+                        if row.get("session_id") == resume), {})
+        if not runtime:
+            runtime = session.get("runtime")
+        if not cwd:
+            cwd = (session.get("transcript") or {}).get("cwd", "")
+    runtime = resolve_runtime(repo, runtime, runner)
+    if runtime == "codex" and resume:
+        raise SpawnRefused("Codex cannot resume without a recorded CLI session id")
+    if existing_worker_id and runtime != "codex":
+        raise SpawnRefused("fresh recovery by worker id is only supported for Codex")
+    if existing_worker_id and not wi.worker_dir(workspace, existing_worker_id).is_dir():
+        raise SpawnRefused(f"worker {existing_worker_id!r} has no identity record")
+    if existing_worker_id:
+        row = ((pr.load_roster(workspace) or {}).get("workers") or {}).get(existing_worker_id)
+        if not isinstance(row, dict) or row.get("runtime") != "codex":
+            raise SpawnRefused(f"worker {existing_worker_id!r} is not a rostered Codex worker")
+    if require_sentinel and not per_instance_sentinel_supported(repo, runner):
+        raise SpawnRefused(
+            "this checkout writes ONE watcher sentinel for every watcher, so a "
+            "second watcher would erase the core's stamp — refusing to spawn")
+
+    session_id = resume or (None if runtime == "codex" else str(uuid.uuid4()))
 
     # Preconditions are answered BEFORE the first durable write: a refusal after
     # minting leaves a worker nothing in the roster knows about.
-    worker_id = resumed_id or wi.new_worker_id()
+    worker_id = existing_worker_id or resumed_id or wi.new_worker_id()
     # The ROSTER owns labels (worker_identity records lineage, not naming), so a
     # resume reads the owner's chosen name from there rather than re-deriving it.
-    if resumed_id and not label:
+    if (resumed_id or existing_worker_id) and not label:
         # load_roster answers None when no roster exists yet; a worker with no
         # roster row simply has no chosen name, which plan() handles.
         label = ((pr.load_roster(workspace) or {}).get("workers", {})
@@ -282,7 +422,12 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
                            f"({detail}); refusing rather than minting a worker over one")
     run = None
-    if resumed_id:
+    if existing_worker_id:
+        run = wi.start_incarnation(workspace, worker_id, None,
+                                   tmux_socket=socket, tmux_session=name,
+                                   runtime="codex", cwd=str(cwd or repo))
+        rec = {"worker_id": worker_id}
+    elif resumed_id:
         run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
                                    tmux_session=name)
         rec = {"worker_id": worker_id}
@@ -294,11 +439,11 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
 
     # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a
     # fresh spawn sets: drop both, then state the single intent.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID")}
+    env = inherited_env(drop=("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID"))
     env.update(p["env"])
-    env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
-               else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
+    if runtime == "claude":
+        env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
+                   else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
     r = runner(p["launcher_argv"], env=env)
     if r.returncode != 0:
         why = (r.stderr or "").strip()
@@ -322,14 +467,21 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         # not ours to remove, only the run we failed to start.
         if run is not None:
             wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
-        if not resumed_id:
+        if not resumed_id and not existing_worker_id:
             shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
             shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {why}")
 
+    # Best-effort: a beat that fails to start is `state: live, beat: absent`,
+    # which the roster's own three-state design already tolerates.
+    beat_started = False
+    watch_pid = pane_pid(name, socket, runner)
+    if watch_pid is not None:
+        beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
+
     remedy = ensure_remedy_timer(workspace, repo, runner=runner)
     return {**p, **rec, "runtime_session_id": session_id, "started": True,
-            "remedy_timer": remedy}
+            "beat_started": beat_started, "remedy_timer": remedy}
 
 
 def main(argv=None) -> int:
@@ -338,7 +490,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(_REPO))
     ap.add_argument("--folder", default="", help="the worker's working directory")
     ap.add_argument("--label", default="")
-    ap.add_argument("--runtime", default="", help="default: the core's configured runtime")
+    ap.add_argument("--runtime", default="",
+                    help="default: the core's configured runtime for fresh workers; "
+                         "the recorded session's runtime for --resume")
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (default)")
     ap.add_argument("--resume", default="", metavar="SESSION_ID",

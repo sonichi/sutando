@@ -17,7 +17,7 @@ Both polarities against the real launcher on a private tmux socket and a copied
 repo: the core's own launcher run leaves every core row and marker what it
 was; the worker's own launcher run writes none of them and boots its own mode.
 
-Run: python3 tests/start-cli-worker-bootstrap.test.py
+Run: python3 tests/skills/worker-pool/start-cli-worker-bootstrap.test.py
 """
 from __future__ import annotations
 
@@ -73,6 +73,8 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
             REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
             root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
         )
+        delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
+        delivery_script.write_text("# Readable pool writer fixture for launcher preflight.\n")
         ws = td / "ws"
         (ws / "state").mkdir(parents=True)
         (root / "scripts" / "sutando-config.sh").write_text(
@@ -97,7 +99,10 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
         session = extra_env.get("SUTANDO_TMUX_SESSION", "sutando-core")
         env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                "HOME": str(td / "home"), "SUTANDO_TMUX_SOCKET": str(sock),
-               "SUTANDO_TEST_MODE": "1", **extra_env}
+               "SUTANDO_TEST_MODE": "1",
+               **({"SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_script)}
+                  if extra_env.get("SUTANDO_INSTANCE_ID") else {}),
+               **extra_env}
 
         def tm(*a):
             return subprocess.run([TMUX, "-S", str(sock), *a],

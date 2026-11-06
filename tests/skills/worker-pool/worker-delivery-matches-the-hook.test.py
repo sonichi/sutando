@@ -7,7 +7,7 @@ Python callers. This suite pins the behaviour AND pins the two to the same
 sentinel suffix set, because the failure mode is silent: the copy nobody
 re-reads is the one that hands a worker's task back to the core.
 
-Run: python3 tests/worker-delivery-matches-the-hook.test.py
+Run: python3 tests/skills/worker-pool/worker-delivery-matches-the-hook.test.py
 Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations

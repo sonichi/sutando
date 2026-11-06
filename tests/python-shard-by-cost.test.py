@@ -5,9 +5,11 @@
 stdin and prints one leg. Across all legs every file must appear exactly once
 (a file assigned twice runs twice; one assigned nowhere never runs), the same
 input must give the same legs on every call (a leg must not depend on timing),
-a file missing from the table must still be assigned (it costs 1), and the
+a file missing from the table must still be assigned (it costs 1), the
 heaviest leg must not exceed the even share by more than one suite's cost — the
-bound longest-first-onto-lightest guarantees.
+bound longest-first-onto-lightest guarantees — a cost of 0 must count as 1 (a 0
+never moves the lightest-leg pointer, so every 0-cost file landed on one leg),
+and a leg is printed heaviest first so lane workers claim the long suites first.
 
 Run: python3 tests/python-shard-by-cost.test.py
 """
@@ -56,11 +58,25 @@ def main() -> int:
         if r.returncode == 0:
             fails.append("shard 4 of 3 was accepted")
 
+        zero = Path(td) / "zero.txt"
+        zfiles = [f"tests/z{i}.test.py" for i in range(4)]
+        zero.write_text("".join(f"0 {f}\n" for f in zfiles))
+        sizes = [len(leg) for leg in legs(2, zfiles, zero)]
+        if sorted(sizes) != [2, 2]:
+            fails.append(f"floor: four 0-cost files split {sizes} over 2 legs, not 2/2 — a 0 cost never moves the lightest leg")
+
+        order = Path(td) / "order.txt"
+        order.write_text("1 tests/a.test.py\n2 tests/b.test.py\n3 tests/c.test.py\n")
+        one = legs(1, ["tests/a.test.py", "tests/b.test.py", "tests/c.test.py"], order)[0]
+        if one != ["tests/c.test.py", "tests/b.test.py", "tests/a.test.py"]:
+            fails.append(f"order: one leg printed {one}, not heaviest first")
+
     for f in fails:
         print("  FAIL", f)
     if fails:
         return 1
-    print(f"PASS: cost-balanced legs partition the files, deterministically, within one suite of even ({loads})")
+    print(f"PASS: cost-balanced legs partition the files, deterministically, within one suite of even ({loads}); "
+          "0 costs as 1; a leg prints heaviest first")
     return 0
 
 

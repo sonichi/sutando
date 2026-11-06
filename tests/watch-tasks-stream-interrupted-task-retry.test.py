@@ -6,15 +6,16 @@ adds it: the watcher never removes a task from `tasks/` (every `TASKS_DIR` use i
 resolve/mkdir/glob/watch), so the initial sweep re-dispatches whatever is still
 there on the next start, re-probing rc=4 back to `must-handle`.
 
-What consumes that retry is the refusal the shutdown path publishes. A result
+The shutdown path used to publish a refusal for the interrupted task. A result
 makes the task deliverable, the delivering bridge archives the task after the
 result (`discord-bridge.py`, whose comment says the task would otherwise "sit in
-tasks/ forever"), and an archived task is out of the sweep's reach.
-
-These scenarios pin both halves as they behave TODAY, so that a change to the
-shutdown path shows up here as a deliberate behaviour flip rather than as a
-silent one. They assert the mechanism, not just the wording: `REFUSAL_MARK` is
-the shared prefix of every terminal-failure body, `INTERRUPTED` its reason word.
+tasks/ forever"), and an archived task is out of the sweep's reach -- so that
+refusal CONSUMED the retry, and for an optional handler the matching fallback
+announce ran the task twice (#4816). Now the shutdown publishes nothing and
+announces nothing: the claim stays behind, still naming the dead watcher's pid,
+and the next watcher retires it in prepare_handler_state() and re-dispatches the
+task from its sweep. These scenarios pin that flip: `REFUSAL_MARK` is the shared
+prefix of every terminal-failure body, and it must NOT appear.
 
 The async dispatch pipeline (`--handler-runner`/the old `fallback_outstanding_
 handlers`) that used to publish this on shutdown was retired -- run_handler_now()
@@ -35,7 +36,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 REFUSAL_MARK = "could not safely process"
-INTERRUPTED = "was interrupted"
 
 # Import the sibling suite's harness (import-safe) rather than restating it:
 # a copied harness drifts from the script it drives.
@@ -64,9 +64,9 @@ def worker_running(h) -> bool:
     return d.is_dir() and any(d.glob("task-*.txt"))
 
 
-def scenario_interrupted_task_is_refused_but_left_in_tasks() -> None:
-    """A restart with a required-Team handler outstanding publishes a refusal —
-    and leaves the task file exactly where the next sweep would find it."""
+def scenario_interrupted_task_is_left_in_tasks_unrefused() -> None:
+    """A restart with a required-Team handler outstanding publishes nothing —
+    and leaves the task file exactly where the next sweep will find it."""
     print("\nscenario: shutdown with an outstanding required handler")
     h = Harness()
     try:
@@ -80,16 +80,21 @@ def scenario_interrupted_task_is_refused_but_left_in_tasks() -> None:
         h.stop(graceful=True)  # SIGTERM -> settle_own_claims_on_shutdown()
 
         result = h.ws / "results" / "task-interrupted.txt"
-        check("the shutdown publishes a terminal refusal", wait_for(result.is_file, 20.0))
-        body = result.read_text() if result.is_file() else ""
-        check("and its reason word is the interrupted one, not the failed one",
-              REFUSAL_MARK in body and INTERRUPTED in body, repr(body[:120]))
+        time.sleep(2.0)  # long enough for the old path's refusal to have landed
+        check("the shutdown publishes NO terminal refusal", not result.is_file(),
+              result.read_text()[:120] if result.is_file() else "")
+        check("nothing at all was published for it",
+              not list((h.ws / "results").glob("*task-interrupted*")))
 
         # The half that matters for retry: nothing moved the task.
         task = h.ws / "tasks" / "task-interrupted.txt"
         check("the task file is STILL in tasks/ after the shutdown", task.is_file())
         check("the watcher archived nothing itself",
               not list((h.ws / "tasks").glob("archive/**/*.txt")))
+        claim = claims_dir(h) / "task-interrupted.txt"
+        check("the claim is left behind, naming the dead watcher's pid",
+              claim.is_file() and claim.read_text().splitlines()[0] == str(h.proc.pid),
+              claim.read_text()[:80] if claim.is_file() else "no claim")
     finally:
         h.stop()
 
@@ -107,9 +112,12 @@ def scenario_a_restarted_watcher_redispatches_what_is_left_in_tasks() -> None:
 
         task = h.ws / "tasks" / "task-survives.txt"
         check("task still queued on disk between the two watchers", task.is_file())
-        # Its claim is released by the shutdown, so a fresh watcher may take it.
-        check("the interrupted task's claim is not held by the dead watcher",
-              wait_for(lambda: not (claims_dir(h) / "task-survives.txt").exists(), 20.0))
+        # The shutdown leaves the claim; only its owner pid is dead, which is
+        # what the next watcher's prepare_handler_state() retires it on.
+        claim = claims_dir(h) / "task-survives.txt"
+        dead_pid = claim.read_text().splitlines()[0] if claim.is_file() else ""
+        check("the interrupted task's claim still names the dead watcher",
+              dead_pid == str(h.proc.pid), dead_pid)
 
         second = Harness.attach(h.ws, h.tmp)
         try:
@@ -117,8 +125,10 @@ def scenario_a_restarted_watcher_redispatches_what_is_left_in_tasks() -> None:
             # No delivery: the initial sweep alone must find it in tasks/.
             check("the restarted watcher re-dispatches it from the sweep alone",
                   wait_for(lambda: worker_running(second), 30.0))
-            check("and it is claimed again as required-Team work",
-                  wait_for(lambda: (claims_dir(h) / "task-survives.txt").exists(), 20.0))
+            check("and it is claimed again as required-Team work, by the NEW watcher",
+                  wait_for(lambda: claim.is_file()
+                           and claim.read_text().splitlines()[0] == str(second.proc.pid), 20.0),
+                  claim.read_text()[:80] if claim.is_file() else "no claim")
         finally:
             second.stop()
     finally:
@@ -126,13 +136,13 @@ def scenario_a_restarted_watcher_redispatches_what_is_left_in_tasks() -> None:
 
 
 def main() -> int:
-    scenario_interrupted_task_is_refused_but_left_in_tasks()
+    scenario_interrupted_task_is_left_in_tasks_unrefused()
     scenario_a_restarted_watcher_redispatches_what_is_left_in_tasks()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1
-    print("\nPASS — an interrupted required-Team task is refused, yet stays in tasks/ "
-          "and is re-dispatched by the next watcher")
+    print("\nPASS — an interrupted required-Team task is neither refused nor announced; "
+          "it stays in tasks/ and is re-dispatched by the next watcher")
     return 0
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -99,6 +100,14 @@ class TheSessionProbe(Base):
         t = Tmux(live={wi.tmux_session_name(wid)})
         self.assertIsNone(sup.probe_session(self.ws, wid, runner=t))
         self.assertEqual(t.calls, [], "probed tmux for a worker that has no open run")
+
+    def test_a_crashed_last_run_remains_probeable_after_failed_recovery(self):
+        wid = make_worker(self.ws)
+        for run in wi.incarnations(self.ws, wid):
+            wi.end_incarnation(self.ws, wid, run["incarnation_id"], "crashed")
+        t = Tmux()
+        self.assertIs(sup.probe_session(self.ws, wid, runner=t), False)
+        self.assertEqual(t.calls[-1][:3], ["tmux", "-S", SOCK])
 
     def test_an_open_run_with_no_recorded_socket_is_unknown(self):
         wid = make_worker(self.ws, socket="")
@@ -226,12 +235,52 @@ class TheLadderSurvivesBetweenTicks(Base):
                          "each tick is a separate process in production: the ladder "
                          "only advances if the state really persisted between them")
 
+    def test_failed_recovery_with_no_open_run_still_escalates(self):
+        wid = make_worker(self.ws)
+        for now in (1000.0, 1030.0, 1060.0, 1095.0):
+            out = sup.tick(self.ws, now, runner=Tmux())
+        self.assertEqual(out["decisions"][wid], ps.RECOVER)
+        for run in wi.incarnations(self.ws, wid):
+            wi.end_incarnation(self.ws, wid, run["incarnation_id"], "crashed")
+        out = sup.tick(self.ws, 1210.0, runner=Tmux())
+        self.assertEqual(out["observations"][wid]["session_alive"], False)
+        self.assertEqual(out["decisions"][wid], ps.ESCALATE)
+
     def test_no_persist_decides_without_advancing_the_ladder(self):
         wid = make_worker(self.ws)
         for t in (1000.0, 1030.0, 1060.0, 1095.0):
             out = sup.tick(self.ws, t, runner=Tmux(), persist=False)
         self.assertEqual(out["decisions"][wid], ps.NOTHING)
         self.assertFalse(sup.state_path(self.ws).exists())
+
+    def spent_sentinel(self, wid):
+        inbox = sup.pd.deliveries_dir(self.ws, wid)
+        inbox.mkdir(parents=True, exist_ok=True)
+        s = inbox / "task-spent.txt"
+        s.write_bytes(b"")
+        os.utime(s, (1.0, 1.0))
+        return s
+
+    def test_only_a_persisting_sweep_archives_spent_sentinels(self):
+        wid = make_worker(self.ws)
+        s = self.spent_sentinel(wid)
+        out = sup.tick(self.ws, 10000.0, worker_ids=[wid], runner=Tmux())
+        self.assertTrue(s.exists(), "a delivery-time check archived a sentinel; it must stay read-only")
+        self.assertEqual(out["sentinels_retired"], {})
+        out = sup.tick(self.ws, 10000.0, runner=Tmux(), persist=False)
+        self.assertTrue(s.exists(), "--no-persist archived a sentinel; a diagnostic must change nothing")
+        self.assertEqual(out["sentinels_retired"], {})
+        out = sup.tick(self.ws, 10000.0, runner=Tmux())
+        self.assertFalse(s.exists())
+        self.assertEqual(out["sentinels_retired"], {wid: 1})
+        self.assertTrue((sup.pd.deliveries_dir(self.ws, wid) / "archive" / "task-spent.txt").is_file())
+
+    def test_an_archive_failure_is_reported_not_swallowed(self):
+        wid = make_worker(self.ws)
+        self.spent_sentinel(wid)
+        with patch.object(sup, "retire_spent_sentinels", side_effect=OSError(18, "Cross-device link")):
+            out = sup.tick(self.ws, 10000.0, runner=Tmux())
+        self.assertIn("Cross-device link", out["sentinel_retire_errors"].get(wid, ""))
 
     def test_a_fast_check_right_after_a_sweep_is_not_a_resume(self):
         wid = make_worker(self.ws)
@@ -428,7 +477,9 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
-                         {"decisions", "observations", "resumed", "not_supervised", "routing", "wedged"})
+                         {"decisions", "observations", "resumed", "not_supervised", "routing",
+                          "wedged", "wedge_kinds", "auth_expired", "sentinels_retired",
+                          "sentinel_retire_errors", "delivery_blocks", "notifier_stalls"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)
@@ -436,10 +487,74 @@ class TheCommandLine(Base):
         _, out, _ = self._run("--sweep", "--no-persist")
         self.assertIn("discarded as evidence", out)
 
+    def test_the_sweep_names_a_logged_out_worker_and_what_to_run(self):
+        wid = make_worker(self.ws)
+        fake = {"decisions": {wid: ps.CARD_LOGIN}, "auth_expired": [wid], "wedged": [wid],
+                "not_supervised": [], "resumed": False, "routing": {"alarm": None},
+                "observations": {wid: {"beat": "absent", "session_alive": True, "paused": False,
+                                       "watcher_beat": "live", "watcher_held": None,
+                                       "work_outstanding": False, "pane": ps.PANE_LOGGED_OUT}}}
+        with patch.object(sup, "tick", return_value=fake):
+            rc, out, _ = self._run("--sweep", "--no-persist")
+        self.assertEqual(rc, 0)
+        self.assertIn("login expired", out)
+        self.assertIn(wi.tmux_session_name(wid), out)
+        self.assertIn("/login", out)
+
     def test_a_malformed_worker_id_is_refused_not_a_traceback(self):
         rc, _, err = self._run("--recipient", "../../etc", "--no-persist")
         self.assertEqual(rc, 2)
         self.assertIn("refused", err)
+
+
+LOGIN_PANE = ("❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n"
+              "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+
+class LoggedOutTmux(Tmux):
+    """Every session alive; the pane shows an expired login; nothing else answers."""
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        if "capture-pane" in argv:
+            return subprocess.CompletedProcess(argv, 0, LOGIN_PANE, "")
+        if "has-session" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+class ALoggedOutWorker(Base):
+    """A live session that printed "Login expired · Please run /login" can do no
+    work, so the sweep must say so instead of "nothing" (user feedback, 2026-09-29)."""
+
+    def test_the_pane_kind_is_logged_out_not_abnormal(self):
+        self.assertEqual(sup.classify_pane_text(LOGIN_PANE, "claude"), ps.PANE_LOGGED_OUT)
+        self.assertEqual(sup.classify_pane_text(
+            "  ⎿  OAuth access token has expired · Please run /login\n❯ \n", "claude"),
+            ps.PANE_LOGGED_OUT)
+
+    def test_a_limit_still_outranks_and_other_banners_stay_abnormal(self):
+        both = "  ⎿  You've hit your session limit · resets 12:10pm\n  ⎿  Login expired · Please run /login\n❯ \n"
+        self.assertEqual(sup.classify_pane_text(both, "claude"), ps.PANE_LIMIT)
+        self.assertEqual(sup.classify_pane_text("  ⎿  API Error: 500 internal server error\n❯ \n", "claude"),
+                         ps.PANE_ABNORMAL)
+
+    def test_the_first_tick_decides_the_login_card_and_names_the_worker(self):
+        wid = make_worker(self.ws)
+        out = sup.tick(self.ws, 1000.0, runner=LoggedOutTmux())
+        self.assertEqual(out["decisions"][wid], ps.CARD_LOGIN)
+        self.assertEqual(out["auth_expired"], [wid])
+        self.assertEqual(out["observations"][wid]["pane"], ps.PANE_LOGGED_OUT)
+        self.assertEqual(out["wedged"], [wid])
+        self.assertEqual(out["wedge_kinds"], {wid: "login"}, "what the stale-card sweep reads")
+
+    def test_the_finding_outlives_the_card_decision(self):
+        wid = make_worker(self.ws)
+        sup.tick(self.ws, 1000.0, runner=LoggedOutTmux())
+        sup.acknowledge_cards(self.ws, [wid])
+        out = sup.tick(self.ws, 1300.0, runner=LoggedOutTmux(), persist=False)
+        self.assertEqual(out["decisions"][wid], ps.NOTHING)
+        self.assertEqual(out["auth_expired"], [wid], "a dry run after the card must still show it")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 path, but it must not locate a concrete optional skill. A fallback such as
 `${SUTANDO_X:-$REPO/skills/worker-pool/...}` is exactly such a location.
 
-Run: python3 tests/core-never-names-the-worker-pool-skill.test.py
+Run: python3 tests/skills/worker-pool/core-never-names-the-worker-pool-skill.test.py
 """
 from __future__ import annotations
 

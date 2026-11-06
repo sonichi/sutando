@@ -14,7 +14,7 @@
  *  5. S3/R15 read side: opaque generations are REPORTED (managed `generation`
  *     field / SUTANDO_VOICE_CREDENTIAL_GENERATION), never minted; top-level
  *     `preferenceRevision`/`sessionRevision` are tolerated and ignored.
- *  6. 'gemini-image': slots text THEN voice per tier; a byok voice preference
+ *  6. 'gemini-image': env slots text THEN voice; the managed tier offers its TEXT slot only; a byok voice preference
  *     skips only the managed voice slot; a managed preference never blocks its
  *     env fallback; quarantine hides every managed entry.
  *
@@ -261,15 +261,22 @@ test('image: legacy env chain is TEXT key first, then VOICE key, then none', () 
 		{ key: '', source: 'none' });
 });
 
-test('image: managed TEXT beats managed VOICE and env; a voice-only managed install serves images', () => {
+test('image: managed TEXT beats env; the managed VOICE entry (a Live-only token) is never an image key', () => {
 	process.env.GEMINI_API_KEY = 'mk';
 	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS) }),
 		{ key: 'managed-t', source: 'managed' });
-	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }) }),
-		{ key: 'managed-v', source: 'managed' });
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } }) }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	process.env.GEMINI_VOICE_API_KEY = 'vk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } }) }),
+		{ key: 'vk', source: 'env' });
+	delete process.env.GEMINI_VOICE_API_KEY;
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } }) }),
+		{ key: '', source: 'none' });
 });
 
-test('image: byok voice preference skips only the managed VOICE slot', () => {
+test('image: a byok voice preference changes nothing for the image walk', () => {
 	process.env.GEMINI_API_KEY = 'mk';
 	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS, { voicePreference: 'byok' }) }),
 		{ key: 'managed-t', source: 'managed' });
@@ -302,6 +309,33 @@ test('image: managed generation reported verbatim; env never carries the VOICE g
 	process.env.SUTANDO_VOICE_CREDENTIAL_GENERATION = 'cg1-injected';
 	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
 		{ key: 'vk', source: 'env' });
+});
+
+// --- desktop: the supervisor injects the managed Live token as GEMINI_VOICE_API_KEY into every child ---
+
+test('image: never spends a Live token from env (by `auth_tokens/` shape or equality with the managed voice entry)', () => {
+	process.env.GEMINI_VOICE_API_KEY = 'auth_tokens/injected';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: '', source: 'none' });
+	assert.deepEqual(resolveCredential('gemini-voice', { managedPath: missing() }),
+		{ key: 'auth_tokens/injected', source: 'env' });
+	process.env.GEMINI_VOICE_API_KEY = 'auth_tokens/managed-v';
+	const desktop = writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } });
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: desktop }),
+		{ key: '', source: 'none' });
+	assert.deepEqual(resolveCredential('gemini-voice', { managedPath: desktop }),
+		{ key: 'auth_tokens/managed-v', source: 'managed' });
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: desktop }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	process.env.GEMINI_VOICE_API_KEY = 'managed-v';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }) }),
+		{ key: '', source: 'none' });
+	delete process.env.GEMINI_VOICE_API_KEY;
+	process.env.GEMINI_API_KEY = 'auth_tokens/misplaced';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: '', source: 'none' });
 });
 
 // --- credentialSourceLabel: the design's user-facing vocabulary -------------

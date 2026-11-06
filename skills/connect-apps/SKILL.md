@@ -22,6 +22,15 @@ The room sees nothing about connecting, only your reply once the request is done
 
 Every request gets exactly one answer: the steps below check for a wait before answering.
 
+**Calendar, contacts and reminders: the connector first, the native Mac apps never on your own.**
+Order: (1) the Station connector (`composio_find {"apps": ["google calendar"]}` → `composio_exec`,
+toolkit `googlecalendar`); (2) if it is not connected, the owner's own tools when they are in your
+tool list (`mcp__claude_ai_Google_Calendar__*`); (3) otherwise the Connect card below, or ask the
+owner. Never fall back to the macOS Calendar, Reminders or Contacts app by yourself — it raises a
+permission prompt on the owner's screen (the `native-pim-guard` hook denies the command). Only when
+the owner asked for the local app: `skills/macos-tools` scripts with `--owner-asked`. Once the owner
+denied that permission, never re-prompt.
+
 ## Tools
 
 - `mcp__sutando-station__composio_find` `{query?, apps?: [names], toolkit?, limit?}` returns JSON
@@ -79,14 +88,21 @@ yours, not the owner's: plain sentences, no quotes from their message.
 |---|---|
 | 0 | done: a match, all apps connected, a wait recorded (or `card` found every app connected), a wait claimed, the account verified |
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
-| 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+| 2 | a setup problem to relay, never retry: `not_signed_in`, `wrong_account`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+
+`card` and `await` exit 1 with `"reason": "account_changed"` (plus `cloud_user_id`,
+`stamp_cloud_user_id`, `base`) when this agent's AG2 Cloud credential is not the account the desktop
+started the core's station for: no wait and no card are made. Post no card; Step 4 says what to
+tell the owner and where.
 
 `card` prints everything `await` prints plus `mode` (`dm` or `private`), `apps` (each with
 `connected`), `all_connected`, and for `mode: dm` a `message` object (`body`, `extra_content`,
 `reply_to`, `operation_id`) to pass verbatim to `room.action.execute` / `room.message.send`. It is
-`null` for a private card and when no wait was made. `find`, `status` and `card` read the
-connections and the catalog through a 30-second cache; `claim`, `verify-account`, the switch
-baseline and the waiter always read the cloud.
+`null` for a private card and when no wait was made. For `mode: dm` it also prints `fallback`
+(`body`, `reply_to`, `operation_id`): plain text that gets the owner connected without the card
+(step 3a), and `card_problem`, non-null when the card would not pass the client's check. `find`,
+`status` and `card` read the connections and the catalog through a 30-second cache; `claim`,
+`verify-account`, the switch baseline and the waiter always read the cloud.
 
 `--switch` (step 3c) records which connections of the apps are active right now; the wait is ready
 only once each app has an active connection that wasn't, so the old account never answers. A switch
@@ -107,12 +123,12 @@ re-ask your task.
 A card and a wait only when **all** of these hold for the task:
 
 - `access_tier: owner`, and no `collaborator: true` header;
-- `source: ag2space` (a message in AG2 Space; its room is `channel_id` / `source_room_id`).
+- `source: ag2space` (a message in s.space; its room is `channel_id` / `source_room_id`).
 
 `card` and `await` check the same on the task file and refuse anything else with `not_owner_task`.
 Everything else (cron, a proactive-loop pass, voice, phone, Slack, Discord, Telegram, local chat, a
 collaborator or any non-owner) gets text only when an app isn't connected: "Google Calendar isn't
-connected yet; connect it in AG2 Space." No card, no wait. A non-owner never gets the owner's
+connected yet; connect it in s.space." No card, no wait. A non-owner never gets the owner's
 connected-app data either.
 
 ## Step 1: are the Station tools loaded?
@@ -178,6 +194,13 @@ It is read from the task's words and a 30-second cache of the owner's connection
 - Anything else (`mentions=` with `connected=unknown`, an app the request needs that the line does
   not name, a `needs_connect=none`, no line at all): call `composio_find` **once**, with `apps`
   naming every app the request needs and `query` set to the request.
+- `prefer_skill=<skill> for <app>`: a local skill owns that app's job end to end with the owner's own
+  API key from the vault (Smartlead → `campaign-runner`: attach mailboxes, upload leads, write the
+  sequence, preflight, launch). `installed`: invoke that skill and never `composio_exec` the bare
+  toolkit for campaign, sequence, mailbox or lead-upload work — the bare Smartlead connector only
+  creates, reads and deletes a campaign shell, which is what left the owner doing the rest by hand.
+  `not installed`: offer to install it (`marketplace` skill, `install <skill>`), then continue with
+  it; no Connect card for that app.
 
 For each app the request needs:
 
@@ -217,9 +240,26 @@ For a task whose room is the owner's DM (see "Which kind of room"). From a share
    above still works: tap Connect and I'll pick it up as soon as it's connected." A non-empty
    `superseded` means an earlier card for these apps is already in the room; the new message is
    still right (it lists everything the merged wait waits for).
-   If the action is not offered or fails, fall back to the text line from step 0; the wait stays
-   armed either way.
-3. Go to step 4.
+   If the action is not offered or fails, post the printed `fallback` object instead (plain text,
+   no card); the wait stays armed either way.
+3. **Check the card arrived.** The owner must never be left with text that points at a card they
+   cannot see. Read the posted message back (`room.context.read`, newest first, a small `limit`)
+   and pass the JSON to `card-check` with the event id the send returned:
+
+   ```bash
+   python3 "$C" card-check '<wait id>' --event-id '<event id>' --content-file - <<'SUTANDO_READBACK'
+   <the room.context.read result>
+   SUTANDO_READBACK
+   ```
+
+   Pass the whole `room.context.read` output; `--event-id` is required and must match exactly.
+   Exit 0 (`ok`, or `wait_closed`): nothing more. Exit 1 (`unverifiable`, `missing`, `malformed`,
+   `bad_*`, `wrong_owner`, `not_found`): post its `fallback` object verbatim with ONE
+   `room.message.send`; it names Settings → Integrations, and its `operation_id` makes a second post
+   a no-op. While the read-back carries no event content, the verdict is `unverifiable` and the
+   fallback goes out: one extra line beats a missing card. When `card` itself prints a non-null
+   `card_problem`, its `message` already is that text; post it and skip this check.
+4. Continue with Step 4 (the result).
 
 ## Step 3b: a private card, in a room with other people
 
@@ -260,8 +300,8 @@ unless the ask names another (then pass `account` to composio_exec, as in Rules)
 ## Step 3c: switch an app to another account
 
 For a request to sign an app that is already connected in with a different account. Step 0 applies:
-anything but the owner's own AG2 Space task gets text only, "You can switch your Linear account in
-AG2 Space: Settings → Integrations."
+anything but the owner's own s.space task gets text only, "You can switch your Linear account in
+s.space: Settings → Integrations."
 
 1. **The request.** When the owner asked something that needs the other account ("check my work Gmail
    instead"), that is the request to redo. When they only asked to switch, the request is their
@@ -348,10 +388,23 @@ The `card` call from step 3 already armed the wait; read its output:
   --room` lists them). Say: "I'll pick this up once <its apps> are connected; for <the other apps>,
   tell me once they're connected and I'll check." In the DM that is the result; from 3b put it on the
   waiting card with `note` and write the result `[no-send]`.
+- **Exit 2 with `"error": "wrong_account"`:** the only AG2 Cloud credentials this agent can find
+  belong to another account than the one your desktop app started it for, so it refuses to act as
+  them. Relay `detail` in plain words. In the DM that is the result; from 3b send it to the owner's
+  confirmed DM and write the result `[no-send]` (no confirmed DM: `[no-send]` alone). Never in the
+  shared room.
+- **Exit 2 with `"error": "cloud_error"`, `"code": "account_unverified"`:** AG2 Cloud could not be
+  reached to check which account the credentials belong to. It is temporary: say so and that you
+  can try again shortly; nothing to sign in to. Same destinations as the bullet above.
 - **Any other exit 2:** no automatic resume is possible. Say: "Once you've connected Google
   Calendar, tell me and I'll check." In the DM that is the result; from 3b there is no private card
   to carry it, so send it to the owner's confirmed DM and write the result `[no-send]` (no confirmed
   DM: `[no-send]` alone). Never in the shared room.
+- **Exit 1 with `"reason": "account_changed"`:** no card and no wait were made. Say: "I'm signed in
+  to a different AG2 Cloud account (`<cloud_user_id>`) than your desktop app (`<stamp_cloud_user_id>`),
+  so I can't see what Settings → Integrations shows as connected." In the DM that is the result; from
+  3b there is no private card to carry it, so send it to the owner's confirmed DM and write the
+  result `[no-send]` (no confirmed DM: `[no-send]` alone). Never in the shared room.
 
 ## Step 5: resume
 
@@ -426,13 +479,18 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 
 ## Rules
 
-- Never paste a sign-in or OAuth link. The card (or AG2 Space → Marketplace) is the only way to connect.
+- Never paste a sign-in or OAuth link. The card (or s.space → Marketplace) is the only way to connect.
 - The place to see, switch or disconnect the owner's connected apps is **Settings → Integrations**.
   Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
   connecting new apps.
 - Never disconnect an app, and never switch one without the owner's card tap. Change which of two
   accounts is the default only when the owner asks for that (`set-default`, Step 3b2); never on your
   own, and never to make one call easier (a call that means the other account passes `account`).
+- A Google Doc is edited in place, never rewritten from memory: read it first
+  (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`), then insert / replace-text actions for the change.
+  `GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the whole document and is denied without a read from
+  the last 15 minutes (`hooks/gdocs-write-guard.py`, which also keeps each read as a snapshot under
+  `<workspace>/data/gdocs-backups/`); it is for a full rewrite the owner asked for, and you say so.
 - One card per request, listing every app it needs.
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
@@ -443,7 +501,7 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes
   on the private card (`--private`, `note`).
 - Never restart the engine, and never ask for a restart except the one step 1 case.
-- No cards and no waits from cron, proactive passes, voice, phone, or any channel other than AG2 Space.
+- No cards and no waits from cron, proactive passes, voice, phone, or any channel other than s.space.
 - Only `connectors.py` writes a resume task. Never write one yourself.
 - Report only what an action's result shows. Whose name a message was sent under, who can see it, or
   whether it went out at all: say it only if the `composio_exec` result says so; otherwise say you don't know.

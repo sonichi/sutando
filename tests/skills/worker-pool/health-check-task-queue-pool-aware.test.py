@@ -2,12 +2,21 @@
 """The queue probe's subject is "is anything picking work up". A pool follower
 holds a task by RENAMING it, so argv-based holdings see nothing and the probe
 called a working pool stuck."""
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import tempfile
 import time
 import unittest
 import unittest.mock
-from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 

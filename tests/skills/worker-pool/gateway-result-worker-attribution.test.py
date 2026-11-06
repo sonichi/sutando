@@ -21,7 +21,7 @@ with no worker_id and the six tests here never caught it, because the old
 _flag() fixture reimplemented the SAME wrong "cores" path instead of calling
 the real writer).
 
-Run: python3 tests/gateway-result-worker-attribution.test.py
+Run: python3 tests/skills/worker-pool/gateway-result-worker-attribution.test.py
 """
 from __future__ import annotations
 
@@ -34,6 +34,12 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 _REPO = Path(__file__).resolve().parents[3]
 _SRC = _REPO / "src" / "remote-gateway-bridge.py"
@@ -72,6 +78,8 @@ class WorkerAttribution(unittest.TestCase):
         self.seen = {}
 
         class _Backend:
+            root = Path(self.workspace) / "results" / ".outbox"
+
             def publish(_s, tid, payload):
                 self.seen["payload"] = json.loads(payload.decode())
                 raise _Captured()

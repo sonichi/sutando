@@ -16,6 +16,12 @@ prove nothing.
 Keychain access is stubbed — these tests never touch the real keychain and never
 read a token. The production code compares keychain ITEM NAMES only.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import hashlib
 import json
 import importlib.util

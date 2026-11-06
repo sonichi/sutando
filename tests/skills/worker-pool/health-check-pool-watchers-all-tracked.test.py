@@ -11,13 +11,21 @@ The pre-fix reader took `watcher_sentinel_paths(...)[0]`, which is the historic
 name whenever one exists and otherwise the alphabetically-first instance --
 never a recency choice, despite the comment that said so.
 """
-import importlib.util
+
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
+import importlib.util
 import contextlib
 import os
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]

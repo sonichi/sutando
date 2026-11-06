@@ -2,16 +2,23 @@
 """The pool-advertisement probe compares two files by roster version: a roster
 the advertisement does not carry is a pin the broker was never told about.
 
-Run: python3 tests/health-check-pool-advertisement.test.py
+Run: python3 tests/skills/worker-pool/health-check-pool-advertisement.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
-import sys
 import tempfile
 import unittest
-from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))

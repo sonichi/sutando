@@ -99,7 +99,7 @@ check("codex: has clear call sites at all", bool(ccalls))
 for pos in ccalls:
     w = _window(codex, pos)
     check(f"codex: clear at line {codex[:pos].count(chr(10))+1} follows session creation or a binary check",
-          "new-session" in w or "command -v codex" in w)
+          "new-session" in w or "command -v codex" in w or "wait_core_up" in w)
 
 # 4. startup.sh cannot verify anything — it must delegate, not clear.
 startup = (REPO / "src" / "startup.sh").read_text(encoding="utf-8")

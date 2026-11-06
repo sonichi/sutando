@@ -21,7 +21,7 @@
 # (SUTANDO_TEST_MODE=1 + SUTANDO_WORKSPACE pinned to a temp dir, asserted
 # before any write) — see that file for why the assertion is not optional.
 #
-# Run: bash tests/check-pending-tasks-worker-pool.test.sh
+# Run: bash tests/skills/worker-pool/check-pending-tasks-worker-pool.test.sh
 set -u
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -31,6 +31,8 @@ PYBIN="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo p
 TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooktest-wp.XXXXXX")"
 export SUTANDO_TEST_MODE=1
 export SUTANDO_WORKSPACE="$TMPWS"
+# Core mode is the launcher's marked session; the worker cases override with an id.
+export SUTANDO_CORE_SESSION=1
 # This suite is about the queue gates; the watcher-coverage gate (a temp inbox
 # nobody watches would block every case) has its own suite.
 export SUTANDO_STOP_HOOK_WATCHER_GATE=0

@@ -7,7 +7,7 @@ delegate to it; a second private regex or open/lstat predicate in either is the
 drift this guard exists to catch (docs/architecture-boundaries.md, "Shared
 adapter policy").
 
-Run: python3 tests/pool-record-single-owner.test.py
+Run: python3 tests/skills/worker-pool/pool-record-single-owner.test.py
 """
 from __future__ import annotations
 
