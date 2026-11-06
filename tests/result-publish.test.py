@@ -237,6 +237,22 @@ class PublishClearsDelegation(unittest.TestCase):
             result_publish.publish_text(target, "done")
         self.assertEqual(target.read_text(), "done")
 
+    def test_vendored_copy_skips_a_non_txt_name_and_never_fails_on_a_clear_error(self):
+        # In the ag2-sparrow bundle task_delegation is not vendored, so the clear is a no-op there.
+        vendored = _load_vendored()
+        marker = self.td.mark(self.ws, self.tid, 60)
+        md = self.ws / "results" / f"{self.tid}.md"
+        vendored.publish_text(md, "x")
+        self.assertEqual(md.read_text(), "x")
+        self.assertTrue(marker.exists())
+        target = self.ws / "results" / f"{self.tid}.txt"
+        with mock.patch.dict(sys.modules, {"task_delegation": None, "ag2_sparrow.task_delegation": None}):
+            vendored.publish_text(target, "done")
+        self.assertEqual(target.read_text(), "done")
+        self.assertTrue(marker.exists())
+        vendored.publish_text(target, "done")  # importable here (src/ is on sys.path): it clears
+        self.assertFalse(marker.exists())
+
     def test_the_cli_clears_it(self):
         marker = self.td.mark(self.ws, self.tid, 60)
         subprocess.run([sys.executable, str(REPO / "src" / "result_publish.py"),
