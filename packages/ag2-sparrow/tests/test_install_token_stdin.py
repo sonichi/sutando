@@ -65,6 +65,11 @@ class Relay:
         return fx._Resp(200, json.dumps({"agent_mxid": self.agent} if self.agent else {}).encode())
 
 
+def relay_opener(relay):
+    """The fake relay as the opener a request with a bearer builds: urllib's own primitive, stood in for."""
+    return mock.patch.object(urllib.request, "build_opener", return_value=mock.Mock(open=mock.Mock(side_effect=relay)))
+
+
 class Tty(io.StringIO):
     readline = None     # a terminal's line is read through getpass, never echoed by a plain read
 
@@ -102,7 +107,7 @@ class TokenStdin(fx.AgentRootBase):
         out, err = io.StringIO(), io.StringIO()
         self.mac = mac
         self.relay_fake = Relay() if relay is None else relay
-        relayed = mock.patch.object(cm, "_open_with_bearer", side_effect=self.relay_fake) if self.relay_fake \
+        relayed = relay_opener(self.relay_fake) if self.relay_fake \
             else contextlib.nullcontext()     # False: the real no-redirect opener, against a real server
         with mock.patch.object(sm, "_run", side_effect=jobs), mock.patch.object(sys, "stdin", stdin), relayed, \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -480,7 +485,7 @@ def xtrace_driver(name: str, mac: str) -> int:
         jobs = bx.Jobs(case.root, case.runners)
         case.mac = mac == "1"
         with mock.patch.object(sm, "_run", side_effect=jobs), \
-                mock.patch.object(cm, "_open_with_bearer", side_effect=Relay()):
+                relay_opener(Relay()):
             rc = CLIS[name].main(case.argv(name))
         token = (case.seat() / "token").read_text() if (case.seat() / "token").exists() else ""
         print("SEAT-OK" if token == f"{fx.RELAY}|{BEARER}\n" else "SEAT-MISSING", file=sys.stderr)

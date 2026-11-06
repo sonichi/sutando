@@ -2530,10 +2530,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _open_with_bearer(req, timeout):
-    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
-
-
 def _request_json(url: str, body, opener, bearer: str = "", timeout: float = REDEEM_TIMEOUT_S) -> "tuple[int, bytes]":
     """(status, body) of a POST of `body`, or a GET when it is None, with `bearer` as its Authorization;
     a request with a bearer never follows a redirect (its 3xx is the status returned)."""
@@ -2546,7 +2542,8 @@ def _request_json(url: str, body, opener, bearer: str = "", timeout: float = RED
         req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode("utf-8"),
                                      method="GET" if body is None else "POST", headers=headers)
         try:
-            with (opener or (_open_with_bearer if bearer else urllib.request.urlopen))(req, timeout=timeout) as resp:
+            open_ = opener or (urllib.request.build_opener(_NoRedirect).open if bearer else urllib.request.urlopen)
+            with open_(req, timeout=timeout) as resp:
                 return resp.status, resp.read(64 * 1024)
         except urllib.error.HTTPError as e:
             try:
