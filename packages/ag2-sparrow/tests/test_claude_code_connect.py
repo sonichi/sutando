@@ -1536,7 +1536,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
     def test_a_used_or_expired_code_says_make_a_new_one_and_writes_nothing(self):
         rc, _out, err = self.connect(Backend(404))
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
-        self.assertIn("already used or has expired; make a new one in s.space", err)
+        self.assertIn("already used or has expired; to connect, use install --token-env-file", err)
         self.assertFalse(self.seat().exists())
         self.assertFalse(cli.config_path(LA).exists())
 
@@ -1615,7 +1615,7 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual((len(backend.calls), sleeps), (3, [3.0, 2]), "retry_after, then the backoff")
 
     def test_a_404_names_why_the_code_is_gone(self):
-        for body, why in (({"error": "gone"}, "already used or has expired; make a new one"),
+        for body, why in (({"error": "gone"}, "already used or has expired; to connect, use install"),
                           ({"error": "agent_revoked"}, "the agent was removed in s.space; add it again"),
                           ({}, "already used or has expired")):
             with self.subTest(body=body):

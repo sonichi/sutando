@@ -652,13 +652,13 @@ def main(argv=None) -> int:
     p.add_argument("--single", action="store_true", help="checked: this install must be the fixed job")
     session_options(p)
     p.set_defaults(func=install, parser=p)
-    c = sub.add_parser("connect", help="check this machine, redeem the one-time code from s.space for the agent's "
-                       "relay credential, write it to the agent's seat (mode 600), then install as install does")
-    c.add_argument("--base", required=True, help="the s.space backend URL the code was issued by")
-    c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
-                   "omitted, connect asks for it. A code given here is kept by ps and shell history")
-    c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for, as "
-                   "the app's connect command names it; without it connect refuses and the code is not used")
+    c = sub.add_parser("connect", help="not the documented path: connect an agent with install --token-env-file and "
+                       "the agent's relay token")
+    c.add_argument("--base", required=True, help="the s.space backend URL")
+    c.add_argument("--code", help="- reads the value connect redeems from stdin; omitted, connect asks for it. "
+                   "A value given here is kept by ps and shell history")
+    c.add_argument("--agent", help="required: the agent's Matrix ID (@name:server); without it connect refuses "
+                   "before reading anything. To connect, use install --token-env-file with the agent's relay token")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when s.space told you to)")
     session_options(c)

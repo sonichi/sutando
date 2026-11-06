@@ -388,11 +388,11 @@ def main(argv=None) -> int:
     p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="experimental, off in this release: refused unless enabled")
     c.add_argument("--experimental-connect", action="store_true", default=False, help=argparse.SUPPRESS)
-    c.add_argument("--base", help="the s.space backend URL the code was issued by")
-    c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
-                   "omitted, connect asks for it. A code given here is kept by ps and shell history")
-    c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for, as "
-                   "the app's connect command names it; without it connect refuses and the code is not used")
+    c.add_argument("--base", help="the s.space backend URL")
+    c.add_argument("--code", help="- reads the value connect redeems from stdin; omitted, connect asks for it. "
+                   "A value given here is kept by ps and shell history")
+    c.add_argument("--agent", help="required: the agent's Matrix ID (@name:server); without it connect refuses "
+                   "before reading anything. To connect, use install --token-env-file with the agent's relay token")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when s.space told you to)")
     session_options(c)

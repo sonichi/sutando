@@ -291,7 +291,7 @@ class Exclusive(fx.AgentRootBase):
                     before = self.snapshot()
                     rc, out, err = self.connect(name, jobs, backend, agent=agent, stdin=stdin)
                     self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
-                    self.assertIn("copy the connect command from the app again", err)
+                    self.assertIn("use install --token-env-file with the agent's relay token", err)
                     self.assertIn("the code was not used", err)
                     self.assertEqual(stdin.tell(), 0, "the code is never read")
                     self.assertEqual(backend.calls, [])
@@ -440,6 +440,24 @@ class Exclusive(fx.AgentRootBase):
                 got = cb._unit_environ(text)
                 self.assertEqual({k: got[k] for k in env}, env)
                 self.assertEqual(cb._writer(text), COMMANDS[CX.name])
+
+
+
+class BusyAgentLockAfterRedeem(unittest.TestCase):
+    def test_a_busy_agent_lock_after_the_code_is_spent_points_to_the_relay_token(self):
+        class Held:
+            def __enter__(self):
+                raise cm.Busy("another operation holds the agent")
+        redeemed = {"agent_id": fx.AGENT, "relay_url": "https://relay.example", "bearer": "b"}
+        with mock.patch.multiple(cm, agent_job=lambda *a: (None, ""), active_job_problem=lambda *a: "",
+                                 read_code=lambda *a: ("acp.x", ""), code_problem=lambda *a: "",
+                                 redeem_code=lambda *a: (redeemed, ""), relay_problem=lambda *a: "",
+                                 canonical_root=lambda *a: ("/nonexistent/root", ""), agent_lock=lambda *a: Held()), \
+                mock.patch.multiple(cb, agent_owner_problem=lambda *a: "", known_root_problem=lambda *a: ""):
+            seat, why = cb.redeem_into_seat("https://base.example", "-", "", lambda: "", CL, fx.AGENT)
+        self.assertIsNone(seat)
+        self.assertIn("the code is spent and nothing was written", why)
+        self.assertIn("install --token-env-file", why)
 
 
 if __name__ == "__main__":

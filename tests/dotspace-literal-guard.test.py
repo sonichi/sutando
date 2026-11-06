@@ -100,17 +100,12 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/keepalive.py": (
         "an s.space task",
     ),
-    "packages/ag2-sparrow/ag2_sparrow/connect_bridge.py": (
-        "code in s.space once",
-    ),
     "packages/ag2-sparrow/ag2_sparrow/connect_common.py": (
         "removed in s.space;",
         "the relay URL s.space returned",
-        "copy it from s.space again",
         "\"s.space code: \"",
         "s.space is still redeeming",
         "s.space is busy",
-        "new one in s.space\"",
         "s.space refused the code",
         "s.space's answer",
     ),
