@@ -350,7 +350,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
 - **`voice_bridge.py`** — voice_bridge.py — the boundary between SCP media framing and voice intelligence.
 - **`voice_host_bridge.py`** — voice_host_bridge.py — bridge SCP audio streams to a voice-host process.
-- **`ws_transport.py`** — ws_transport.py — LAN WSS transport for SCP (Sutando Client Protocol).
+- **`ws_transport.py`** — ws_transport.py — network transport for SCP (Sutando Client Protocol).
 
 ## `src/runtime-cli/`
 

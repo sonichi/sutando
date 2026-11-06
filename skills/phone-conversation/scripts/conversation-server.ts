@@ -58,6 +58,25 @@ import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_pro
 import { isAllowedAudioPath } from './audio_path_guard.js';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
+
+/** The bodhi VoiceSession members this server drives. bodhi exports none of
+ *  them, so the surface is named once rather than at 13 `as any` call sites. */
+interface SessionTransport {
+	sendContent(parts: Array<{ role: string; text: string }>, endOfTurn?: boolean): void;
+	updateSystemInstruction(text: string): void;
+	updateTools(tools: ToolDefinition[]): void;
+	config?: { tools?: ToolDefinition[] };
+}
+interface SessionInternals {
+	transport: SessionTransport;
+	handleAudioFromClient(data: unknown): void;
+	handleClientConnected(): void;
+	handleTransportClose: (code?: number, reason?: string) => void;
+	handleAudioOutput?: (data: string) => void;
+	sendGreeting?: (...args: unknown[]) => void;
+	notificationQueue?: { markAudioReceived?: () => void };
+	toolExecutor?: { register(tools: ToolDefinition[]): void };
+}
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
@@ -491,7 +510,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			// review — avoids redundant result-archive logic here.)
 			archivePhoneFile(taskPath, 'tasks', taskId);
 			try {
-				(callSession.voiceSession as any).transport.sendContent([
+				(callSession.voiceSession as SessionInternals).transport.sendContent([
 					{ role: 'user', text: `[Task "${taskDescription}" timed out — still being worked on. Let the caller know.]` },
 				], true);
 			} catch {}
@@ -799,11 +818,11 @@ async function createCallSession(params: {
 					setTimeout(() => {
 						try {
 							if (existsSync('/tmp/sutando-playback-pause')) {
-								(session as any).transport.sendContent([
+								(session as SessionInternals).transport.sendContent([
 									{ role: 'user', text: '[System: Video PAUSED. ONLY call resume_video when user says "resume"/"continue", or play_video when user says "play". Do NOT resume on other speech.]' },
 								], true);
 							} else {
-								(session as any).transport.sendContent([
+								(session as SessionInternals).transport.sendContent([
 									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]' },
 								], true);
 							}
@@ -829,7 +848,7 @@ async function createCallSession(params: {
 
 	// [Outbound audio chain] Override to send Gemini audio directly to Twilio
 	// Bypasses ClientTransport's internal WebSocket for lower latency
-	const sessionAny = session as any;
+	const sessionAny = session as SessionInternals;
 	let isReplaying = false; // suppress audio during reconnect replay
 	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
 	let _isRecordingMuted: (() => boolean) | null = null;
@@ -908,7 +927,7 @@ async function createCallSession(params: {
 			const queued = callSession.resultQueue.splice(0);
 			for (const item of queued) {
 				try {
-					(callSession.voiceSession as any).transport.sendContent([
+					(callSession.voiceSession as SessionInternals).transport.sendContent([
 						{ role: 'user', text: item.text },
 					], true);
 				} catch (e) {
@@ -924,7 +943,7 @@ async function createCallSession(params: {
 	let firstGreetingSent = false;
 	const origSendGreeting = sessionAny.sendGreeting?.bind(sessionAny);
 	if (origSendGreeting) {
-		sessionAny.sendGreeting = (...args: any[]) => {
+		sessionAny.sendGreeting = (...args: unknown[]) => {
 			if (firstGreetingSent) {
 				console.log(`${ts()} [Phone] suppressed reconnect greeting`);
 				return;
@@ -1025,7 +1044,7 @@ async function createCallSession(params: {
 			console.log(`${ts()} [ChannelScan] picked up ${name} for ${callSession.callSid} (${body.length}B)`);
 			callSession.recorder.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
 			try {
-				(callSession.voiceSession as any).transport.sendContent(
+				(callSession.voiceSession as SessionInternals).transport.sendContent(
 					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the caller now.` }],
 					true,
 				);
@@ -1182,7 +1201,7 @@ function cleanupCall(callSid: string): void {
 				: '(No conversation recorded.)';
 			console.log(`${ts()} [Concurrent] child ${callSid} ended — injecting into parent ${session.parentCallSid}`);
 			try {
-				(parent.voiceSession as any).transport.sendContent([
+				(parent.voiceSession as SessionInternals).transport.sendContent([
 					{ role: 'user', text: `[Concurrent call ended]\nThe call to ${session.callerNumber || 'the other person'} has ended:\n\n${transcriptText}\n\nReport the results directly. Say "they said..." not "I'll let the owner know...".` },
 				], true);
 			} catch (e) {
@@ -1366,7 +1385,7 @@ const server = createServer(async (req, res) => {
 			parent.childCallSids.push(childSid);
 			console.log(`${ts()} [Concurrent] child ${childSid} → ${body.to} (parent: ${body.parentCallSid})`);
 			try {
-				(parent.voiceSession as any).transport.sendContent([
+				(parent.voiceSession as SessionInternals).transport.sendContent([
 					{ role: 'user', text: `[System: A concurrent call to ${body.to} is being made. Tell the caller the call is in progress.]` },
 				], true);
 			} catch (e) { console.log(`${ts()} [Concurrent] notify parent failed: ${e}`); }
@@ -1409,7 +1428,7 @@ const server = createServer(async (req, res) => {
 
 			// Register the work tool in bodhi's tool executor (so execute() fires)
 			// and update Gemini's tool declarations via transport
-			const sessionAny = session.voiceSession as any;
+			const sessionAny = session.voiceSession as SessionInternals;
 			try {
 				if (sessionAny.toolExecutor) {
 					sessionAny.toolExecutor.register([workTool]);
@@ -1418,13 +1437,13 @@ const server = createServer(async (req, res) => {
 			} catch (e) { console.log(`${ts()} [Meeting] toolExecutor register failed: ${e}`); }
 
 			// Update system instructions + tools on the transport (applied on next Gemini reconnect)
-			const transport = (session.voiceSession as any).transport;
+			const transport = (session.voiceSession as SessionInternals).transport;
 			const newInstructions = 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, take screenshots, and perform tasks using the work tool. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/sonichi/sutando';
 			try {
 				transport.updateSystemInstruction(newInstructions);
 				// Also update tools on the transport for reconnect persistence
 				const currentTools = transport.config?.tools ?? [];
-				const hasWork = currentTools.some((t: any) => t.name === 'work');
+				const hasWork = currentTools.some((t) => t.name === 'work');
 				if (!hasWork) transport.updateTools([...currentTools, workTool]);
 				console.log(`${ts()} [Meeting] Updated transport instructions + tools`);
 			} catch (e) { console.log(`${ts()} [Meeting] transport update failed: ${e}`); }
@@ -1751,7 +1770,7 @@ wss.on('connection', (ws: WebSocket) => {
 							const parent = activeCalls.get(cp.parentCallSid);
 							if (parent) {
 								try {
-									(parent.voiceSession as any).transport.sendContent([
+									(parent.voiceSession as SessionInternals).transport.sendContent([
 										{ role: 'user', text: `[Concurrent call connected to ${recipientNumber || 'the other person'}. Transcript will follow when it ends.]` },
 									], true);
 								} catch (e) { console.log(`${ts()} [Concurrent] notify parent failed: ${e}`); }
@@ -1777,7 +1796,7 @@ wss.on('connection', (ws: WebSocket) => {
 
 
 					try {
-						(callSession.voiceSession as any).handleAudioFromClient(pcm16k);
+						(callSession.voiceSession as SessionInternals).handleAudioFromClient(pcm16k);
 					} catch (e) {
 						if (mediaEventCount % 100 === 0) {
 							console.error(`${ts()} [WS] handleAudioFromClient error:`, e);
