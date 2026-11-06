@@ -13,7 +13,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
 from _helpers.paired_result import publish_result, publish_staged_result
@@ -79,6 +79,17 @@ class _Base(unittest.TestCase):
     def _sweep(self):
         gw._last_orphan_sweep = 0.0
         gw._reconcile_orphan_results(set())
+
+
+class ClosedRunReadiness(_Base):
+    def test_closed_run_with_unpaired_body_is_left_for_retry(self):
+        path = gw.RESULTS_DIR / f"{TID}.txt"
+        path.write_text("unattested late result")
+        with patch.object(gw, "_ATTEMPTS", Mock(run_of=Mock(return_value=(TID, "run", False)))), \
+                patch.object(gw, "_quarantine_orphan") as quarantine:
+            self.assertIsNone(gw._run_holds_result(TID, path))
+        quarantine.assert_not_called()
+        self.assertEqual(path.read_text(), "unattested late result")
 
 
 class LocalCron(_Base):

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Missing proofs must never complete, deliver, or recover a task result."""
 import ast
+import contextlib
+import io
+from unittest import mock
 import subprocess
 import sys
 import tempfile
@@ -18,6 +21,74 @@ from result_write import receipt_verifier, receipts_dir_for
 
 
 class ReceiptBoundary(unittest.TestCase):
+    def test_staged_no_replace_preserves_first_published_answer(self):
+        from result_publish import publish_staged
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "results" / "task-conflict.txt"
+            path.parent.mkdir()
+            staged = path.parent / "answer.tmp"
+            staged.write_text("first answer")
+            publish_staged(staged, path, no_replace=True)
+            self.assertFalse(staged.exists())
+            self.assertEqual(read_ready_result(path), "first answer")
+            staged.write_text("second answer")
+            with self.assertRaises(FileExistsError):
+                publish_staged(staged, path, no_replace=True)
+            self.assertEqual(read_ready_result(path), "first answer")
+            self.assertEqual(staged.read_text(), "second answer")
+
+    def test_read_cli_returns_only_verified_body_and_handles_read_failure(self):
+        from result_write import _read_cli
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "results" / "task-read.txt"
+            path.parent.mkdir()
+            path.write_text("unpaired")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(_read_cli(path), 1)
+                self.assertEqual(output.getvalue(), "")
+                publish_text(path, "verified answer")
+                self.assertEqual(_read_cli(path), 0)
+            self.assertEqual(output.getvalue(), "verified answer")
+            with mock.patch("delivery.readiness.read_ready_result", side_effect=OSError("unreadable")):
+                self.assertEqual(_read_cli(path), 1)
+
+    def test_unresolvable_receipt_namespace_fails_closed(self):
+        import result_write
+        with mock.patch.object(result_write, "result_context", return_value=None):
+            self.assertFalse(result_write.path_verifier("task-a.txt")("answer"))
+
+    def test_adapter_refuses_non_directory_pairing_state(self):
+        from task_lifecycle import prepare_work_dir
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td) / "adapter"
+            work.mkdir()
+            self.assertIsNone(prepare_work_dir(str(work)))
+            (work / "state" / "result-pairing").write_text("unexpected file")
+            self.assertIn("result-pairing is not a plain directory",
+                          prepare_work_dir(str(work), check_only=True))
+
+    def test_history_keeps_task_working_when_result_is_unpaired(self):
+        from task_workstreams import scan_task_history
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            tasks = workspace / "tasks"
+            results = workspace / "results"
+            tasks.mkdir()
+            results.mkdir()
+            (tasks / "task-history.txt").write_text(
+                "id: task-history\nsource: discord\naccess_tier: owner\ntask: Explain the result\n")
+            path = results / "task-history.txt"
+            path.write_text("unverified answer")
+            rows = scan_task_history(workspace)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].status, "working")
+            self.assertEqual(rows[0].result, "")
+            publish_text(path, "verified answer")
+            rows = scan_task_history(workspace)
+            self.assertEqual(rows[0].status, "done")
+            self.assertEqual(rows[0].result, "verified answer")
+
     def test_unpaired_live_and_archive_are_not_completion(self):
         with tempfile.TemporaryDirectory() as td:
             results = Path(td) / 'results'

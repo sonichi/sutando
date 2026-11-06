@@ -689,6 +689,16 @@ class TheReclaim(_Bridge):
         self.assertEqual((self.quarantined(), inflight), (kept, set()))
         self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
 
+    def test_unpaired_parked_body_stays_quarantined(self):
+        ask = self.parked_by_an_older_bridge()
+        [name] = self.quarantined()
+        copy = gw.UNDELIVERABLE_RESULTS_DIR / name
+        copy.write_text("body without its matching receipt")
+        gw._reclaim_parked_relay_results(set())
+        self.assertEqual(self.quarantined(), [name])
+        self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+        self.assertEqual(copy.read_text(), "body without its matching receipt")
+
     def test_a_live_result_at_its_name_is_never_replaced(self):
         ask = self.parked_by_an_older_bridge()
         kept = self.quarantined()

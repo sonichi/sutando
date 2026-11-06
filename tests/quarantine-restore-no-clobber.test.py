@@ -41,6 +41,32 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
         live.rename(p)
         return p
 
+    def test_unreadable_quarantined_bytes_stay_quarantined(self):
+        source = self._quarantine("invalid", "original", 1)
+        source.write_bytes(b"\xff")
+        outcome, path = uq.restore(self.results, "invalid")
+        self.assertIs(outcome, uq.RestoreOutcome.UNPAIRED)
+        self.assertEqual(path, source)
+        self.assertEqual(source.read_bytes(), b"\xff")
+        self.assertFalse((self.results / "task-invalid.txt").exists())
+
+    def test_rebinding_never_clobbers_a_live_target(self):
+        source = self._quarantine("source", "original", 1)
+        target = self.results / "task-target.txt"
+        publish_text(target, "new answer", pair_result=True)
+        with self.assertRaises(FileExistsError):
+            uq.rebind_verified(source, target)
+        self.assertEqual(target.read_text(), "new answer")
+        self.assertEqual(source.read_text(), "original")
+
+    def test_rebinding_unreadable_source_never_publishes(self):
+        source = self._quarantine("source", "original", 1)
+        source.write_bytes(b"\xff")
+        target = self.results / "task-target.txt"
+        self.assertFalse(uq.rebind_verified(source, target))
+        self.assertTrue(source.exists())
+        self.assertFalse(target.exists())
+
     def test_missing_receipt_is_not_backfilled(self):
         p = self.results / uq.DIRNAME / uq.quarantine_name("task-raw", 1)
         p.write_text("unverified legacy result")

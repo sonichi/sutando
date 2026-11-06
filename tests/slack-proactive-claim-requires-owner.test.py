@@ -161,6 +161,14 @@ def main() -> int:
           not list(box.glob("*.sending")),
           f"found {[p.name for p in box.glob('*.sending')]} — out of the poller's *.txt glob")
 
+    with tempfile.TemporaryDirectory(prefix="slack-unpaired-") as td:
+        raw = Path(td) / "proactive-raw.txt"
+        raw.write_text("unattested body")
+        refused_sends = []
+        _one_pass(Path(td), access={"allowFrom": ["UOWNER"]}, owner="UOWNER", sent=refused_sends)
+        check("unpaired body is not sent or consumed", raw.exists() and not refused_sends,
+              repr(refused_sends))
+
     # --- POSITIVE CONTROL: a CONFIGURED Slack must still claim and deliver ----
     # An over-broad gate would disable delivery entirely and still satisfy every
     # assertion above.

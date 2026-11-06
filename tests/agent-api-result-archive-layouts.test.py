@@ -58,6 +58,13 @@ def archived_result(path, task_id, body):
         publish_result(live, previous)
 
 
+fresh()
+raw = api.RESULT_DIR / "task-unpaired.txt"
+raw.write_text("raw answer")
+api._remember_done_result_file(raw)
+check("unpaired result is not remembered as completed", "task-unpaired" not in api.task_history)
+
+
 # The collision branch suffixes the epoch INSIDE the month dir, not at the archive
 # root; a root-level fixture tests a layout agent-api never writes.
 fresh()

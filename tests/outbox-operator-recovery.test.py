@@ -352,6 +352,23 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         uq.place(results / f"{ITEM}.txt", results, f"{ITEM}", when=1700000000)
         return root, results
 
+    def test_requeue_refuses_a_quarantined_body_without_pairing_proof(self):
+        with TemporaryDirectory() as td:
+            results = Path(td) / "results"
+            results.mkdir()
+            root = results / ".outbox-test"
+            _parked(root)
+            live = results / f"{ITEM}.txt"
+            live.write_text("the reply")
+            uq.place(live, results, ITEM, when=1700000000)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = outbox_cli.main(["--root", str(root), "--json", "requeue", ITEM])
+            self.assertEqual(code, 4)
+            self.assertIn("no matching receipt", json.loads(output.getvalue())["error"])
+            self.assertFalse(live.exists())
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+
     def test_the_DEFAULT_requeue_restores_the_body(self):
         """The common path must not be the broken one. `--root` is required and
         every lane puts the outbox at RESULTS_DIR/.outbox-*, so root.parent IS
