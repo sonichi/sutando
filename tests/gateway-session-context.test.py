@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "remote-gateway-bridge.py"
@@ -64,10 +67,10 @@ FAKE_GHP = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
 
 def _load(ws: Path):
     """Load the hyphenated bridge module against a scratch workspace."""
-    isolate_os_environ(ws / "home", SUTANDO_TEST_WORKSPACE=str(ws),
-                       CLAUDE_CONFIG_DIR=str(ws / "claude-config"),
-                       REMOTE_TASK_TOKEN="test-token-0123456789abcdef",
-                       REMOTE_TASK_URL="https://gw.invalid/relay", GATEWAY_INSTANCE="")
+    os.environ.update({"SUTANDO_TEST_WORKSPACE": str(ws),
+                       "CLAUDE_CONFIG_DIR": str(ws / "claude-config"),
+                       "REMOTE_TASK_TOKEN": "test-token-0123456789abcdef",
+                       "REMOTE_TASK_URL": "https://gw.invalid/relay", "GATEWAY_INSTANCE": ""})
     sys.path.insert(0, str(REPO / "src"))
     spec = importlib.util.spec_from_file_location("rgb_session_ctx", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
