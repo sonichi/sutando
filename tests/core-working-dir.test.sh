@@ -34,12 +34,20 @@ ok "relative: refused (rc 1)" "$([ $RC = 1 ] && echo 0 || echo 1)"
 ok "relative: nothing created" "$([ ! -e "$PWD/relative" ] && echo 0 || echo 1)"
 
 # --- 2. delegation: every deciding site sources the resolver, none keeps a private copy -------
-SITES=(src/agent/claude/cli/session-launch.sh src/install-claude-hooks.sh scripts/install-personal-claude-hook.sh scripts/install-session-start-hook.sh)
+SITES=(src/agent/claude/cli/session-launch.sh src/install-claude-hooks.sh scripts/install-personal-claude-hook.sh scripts/install-session-start-hook.sh scripts/install-watcher-rearm-hook.sh)
 for s in "${SITES[@]}"; do
   ok "$s sources scripts/core-working-dir.sh" "$(grep -q 'scripts/core-working-dir.sh' "$REPO/$s" && echo 0 || echo 1)"
   ok "$s calls sutando_core_working_dir" "$(grep -q 'sutando_core_working_dir' "$REPO/$s" && echo 0 || echo 1)"
   ok "$s keeps no private tilde expansion" "$(grep -q '/#\\~/' "$REPO/$s" && echo 1 || echo 0)"
 done
+# --- 2b. behaviour: an installer given a refused override writes nothing anywhere ------------
+# A SITES entry is a source grep; this runs the installer and checks the filesystem.
+RHOME="$ROOT/rhome"; mkdir -p "$RHOME"
+ROUT="$(HOME="$RHOME" SUTANDO_CLAUDE_WORKING_DIR='~nobodyx/core' bash "$REPO/scripts/install-watcher-rearm-hook.sh" 2>&1)"; RRC=$?
+ok "install-watcher-rearm-hook: refused override exits non-zero" "$([ $RRC != 0 ] && echo 0 || echo 1)"
+ok "install-watcher-rearm-hook: refused override creates no \$HOME+user sibling" "$([ ! -e "${RHOME}nobodyx" ] && [ ! -e "$RHOME/nobodyx" ] && echo 0 || echo 1)"
+ok "install-watcher-rearm-hook: refused override names the contract" "$(echo "$ROUT" | grep -q 'absolute path or start with ~/' && echo 0 || echo 1)"
+
 # --- 3. the python mirror AGREES with the bash resolver, shape for shape ---------------------
 # The probe cannot source bash, so _hook_settings_target is a second implementation. A comment
 # naming the resolver pins nothing; this runs both over one table. Agreement means: the same
