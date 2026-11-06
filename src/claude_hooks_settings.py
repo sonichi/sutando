@@ -174,7 +174,8 @@ def _stale_root(token: str, repo: str) -> Optional[str]:
         if parts[index] not in _REPO_TOP_DIRS:
             continue
         root = "/".join(parts[:index])
-        if root != repo and os.path.exists(os.path.join(repo, *parts[index:])):
+        # A root still on disk is a live checkout missing one script (mid-rebase, other branch).
+        if root != repo and not os.path.exists(root) and os.path.exists(os.path.join(repo, *parts[index:])):
             return root
     return None
 

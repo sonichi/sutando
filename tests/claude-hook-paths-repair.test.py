@@ -155,6 +155,24 @@ class RepairHookPaths(unittest.TestCase):
         self.assertEqual(chs.repair_paths(self.settings, self.new), [])
         self.assertEqual(self.settings.read_text(), text)
 
+    def test_a_live_checkout_missing_one_script_is_not_repointed(self):
+        live = self.tmp / "live-checkout"
+        (live / "src").mkdir(parents=True)
+        (live / "src" / "turn-start.sh").write_text("#!/bin/bash\n")
+        cmd = f"bash {sq(str(live / 'src' / 'check-pending-tasks.sh'))}"
+        text = self.write({"hooks": {"Stop": [group(cmd)]}})
+        self.assertIsNone(chs.repoint_command(cmd, str(self.new)))
+        self.assertEqual(chs.repair_paths(self.settings, self.new), [])
+        self.assertEqual(self.settings.read_text(), text)
+
+    def test_a_root_on_an_unmounted_volume_is_repaired(self):
+        root = str(self.tmp / "Volumes" / "external disk" / "sutando")
+        self.assertFalse(os.path.exists(root))
+        self.write({"hooks": {"Stop": [group(owned(root)["Stop"])]}})
+        self.assertEqual(len(chs.repair_paths(self.settings, self.new)), 1)
+        self.assertEqual(json.loads(self.settings.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"],
+                         owned(str(self.new))["Stop"])
+
     def test_an_unquoted_path_is_not_rewritten_into_a_broken_one(self):
         # The new root has a space; splicing it into an unquoted token would split it.
         self.assertNotIn(" ", str(self.tmp))
