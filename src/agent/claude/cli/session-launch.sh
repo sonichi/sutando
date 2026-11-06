@@ -410,11 +410,15 @@ claude_session_pane_tail() {
 }
 
 launch_claude_session() {
+  # One quoted string, not an argv vector: tmux execs a vector itself, and a
+  # shim-resolved `claude` only starts when a shell resolves it (exits 1 silently).
+  _claude_cmd="$(printf '%q ' claude --name "$SESSION" \
+    ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
+    -- "$BOOT_PROMPT")"
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "$BOOT_PROMPT" || true
+    "$_claude_cmd" || true
   for _ in $(seq 1 "$CORE_READY_TICKS"); do
     claude_named_session_running && return 0
     sleep 0.2
