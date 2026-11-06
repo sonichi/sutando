@@ -424,6 +424,20 @@ class FirstAttemptStamp(unittest.TestCase):
         self.assertIsNone(gw.note_first_attempt(root, "task-bad"), "an unreadable stamp is no time")
         self.assertEqual(stamp.read_text(), '{"at": "soon"}', "and is never overwritten")
 
+    def test_the_drain_falls_back_to_the_write_time_when_no_stamp_can_be_kept(self):
+        rfile = gw.RESULTS_DIR / "task-fallback.txt"
+        rfile.write_text("x")
+        os.utime(rfile, (50.0, 50.0))
+        with mock.patch.object(gw, "note_first_attempt", side_effect=OSError("no outbox")):
+            self.assertEqual(gw._first_send_attempt("task-fallback", rfile), 50.0)
+        with mock.patch.object(gw, "note_first_attempt", return_value=None):
+            self.assertEqual(gw._first_send_attempt("task-fallback", rfile), 50.0)
+            rfile.unlink()
+            self.assertIsNone(gw._first_send_attempt("task-fallback", rfile))
+            with mock.patch.object(gw, "_result_settled", return_value=False):
+                self.assertTrue(gw._holds_room("task-fallback", rfile, {"task-fallback"}),
+                                "with no time at all the reply keeps holding")
+
 
 class HashSeeds(unittest.TestCase):
     def test_the_burst_order_holds_under_several_hash_seeds(self):
