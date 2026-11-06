@@ -18,9 +18,9 @@ direction: it cleared writes the post-hoc check would later condemn.
      the marker grammar can see that.
 
 Dependency-light on purpose: paths come from the caller, so this imports no
-workspace resolver and no CLI. `result_markers` is the one import, and an
-unavailable one raises rather than degrading to a local rule — a guard that
-clears what the bridge rejects is worse than no guard.
+workspace resolver and no CLI. Marker policy, task records and headers come
+from their shared owners; an unavailable owner raises rather than degrading to
+a local rule — a guard that clears what the bridge rejects is worse than no guard.
 """
 from __future__ import annotations
 
@@ -31,12 +31,7 @@ _MARKERS = None
 
 
 def markers(src_dir: Path | None = None):
-    """`(dedup_holder_delivered, parse_markers)` from the repo's policy owner.
-
-    Raises ImportError rather than falling back: re-implementing the grammar is
-    how this drifted twice (a `[REPLIED]` holder read as delivered; chain-walking
-    that was more permissive than the bridge, which requeues instead of walking).
-    """
+    """Load the central marker policy; never fall back to a local interpretation."""
     global _MARKERS
     if _MARKERS is not None:
         return _MARKERS
@@ -53,10 +48,13 @@ def result_path(results: Path, task_id: str) -> Path | None:
 
     Missing a delivered shape yields a false alarm, which costs a re-check;
     admitting a non-delivered shape yields a false all-clear, which costs the
-    reply. So the `-` separator on the archive glob is load-bearing: a bare
-    `{id}*` prefix also matches `{id}.too-old.<epoch>`, i.e. quarantined.
-    `sorted` because filesystem order differs between APFS and the CI runner.
+    reply. The canonical archive locator admits exact IDs and epoch suffixes,
+    excluding quarantines and prefix collisions. Scoped/sending results remain
+    visible while their delivery owner is draining them.
     """
+    from local_task_protocol import find_result, valid_archive_lookup_id
+    if not valid_archive_lookup_id(task_id):
+        return None
     direct = results / f"{task_id}.txt"
     if direct.exists():
         return direct
@@ -66,32 +64,31 @@ def result_path(results: Path, task_id: str) -> Path | None:
         hits = sorted(results.glob(pat))
         if hits:
             return hits[0]
-    arch = results / "archive"
-    hits = sorted(list(arch.glob(f"**/{task_id}.txt")) + list(arch.glob(f"**/{task_id}-*.txt")))
-    return hits[0] if hits else None
+    return find_result(results, task_id)
+
+
+def task_path(tasks: Path, task_id: str) -> Path | None:
+    """Use production's validated live/claimed/processed/archive candidate set."""
+    from local_task_protocol import find_archived_task, valid_archive_lookup_id
+    from task_archive import find_task_file
+    if not valid_archive_lookup_id(task_id):
+        return None
+    return find_task_file(tasks, task_id) or find_archived_task(tasks, task_id)
 
 
 def task_exists(tasks: Path, task_id: str) -> bool:
-    """Did this id ever exist HERE? Task ids are minted per recipient, so a
-    peer's id is well-formed and still unresolvable — charset cannot tell."""
-    if (tasks / f"{task_id}.txt").exists():
-        return True
-    arch = tasks / "archive"
-    return bool(list(arch.glob(f"**/{task_id}.txt")) + list(arch.glob(f"**/{task_id}-*.txt")))
+    """Did this id ever exist HERE, according to the production locator?"""
+    return task_path(tasks, task_id) is not None
 
 
 def task_field(tasks: Path, task_id: str, key: str) -> str | None:
-    """One header field of a task, live or archived."""
-    for cand in [tasks / f"{task_id}.txt", *sorted((tasks / "archive").glob(f"**/{task_id}*.txt"))]:
-        try:
-            text = cand.read_text(errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            if line.startswith(f"{key}:"):
-                return line.split(":", 1)[1].strip()
+    """Read one field with the shared first-wins historical task parser."""
+    from local_task_protocol import parse_task_headers_lenient
+    text = read(task_path(tasks, task_id))
+    if text is None:
         return None
-    return None
+    value = parse_task_headers_lenient(text).get(key)
+    return value.strip() if value is not None else None
 
 
 def read(path: Path | None) -> str | None:
@@ -128,6 +125,10 @@ def dedup_problem(results: Path, task_id: str, tasks: Path | None = None,
     it asked for rather than a silent all-clear.
     """
     delivered, _ = markers(src_dir)
+    from result_markers import dedup_destination_mismatch
+    from local_task_protocol import valid_archive_lookup_id
+    if not valid_archive_lookup_id(task_id):
+        return "MALFORMED: invalid task id"
     if text is None:
         text = read(result_path(results, task_id))
     if text is None:
@@ -138,16 +139,24 @@ def dedup_problem(results: Path, task_id: str, tasks: Path | None = None,
     if not target:
         return "deduped into nothing (no target id)"
 
+    if not valid_archive_lookup_id(target):
+        return "MALFORMED: invalid dedup target id"
+
     if tasks is not None:
         # Sound only within one sender's thread, in one room — neither is
         # visible to the marker grammar, and a cross-room dedup is silent.
         who, to = task_field(tasks, task_id, "user_id"), task_field(tasks, target, "user_id")
         if who and to and who != to:
             return f"CROSS-SENDER: deduped into {target}, which answers {to}, not {who}"
-        room = task_field(tasks, task_id, "channel_id")
-        dest = task_field(tasks, target, "channel_id")
-        if room and dest and room != dest:
-            return f"CROSS-ROOM: deduped into {target}, whose reply goes to {dest}, not {room}"
+        room = (task_field(tasks, task_id, "channel_id")
+                or task_field(tasks, task_id, "chat_id"))
+        dest = (task_field(tasks, target, "channel_id")
+                or task_field(tasks, target, "chat_id"))
+        source = task_field(tasks, task_id, "source")
+        holder_source = task_field(tasks, target, "source")
+        if dedup_destination_mismatch(room, dest, source, holder_source):
+            return (f"CROSS-ROOM: deduped into {target}, whose reply goes to "
+                    f"{holder_source or '?'}:{dest}, not {source or '?'}:{room}")
 
     target_path = result_path(results, target)
     holder = read(target_path)

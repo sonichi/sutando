@@ -44,7 +44,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
-PERSONAL_RE = re.compile(r'^\s*bash "\$REPO/scripts/install-personal-claude-hook\.sh"')
+PERSONAL_RE = re.compile(r'^\s*install_claude_personal_hook\s*$')
 # The call spans two lines (`\` continuation): the env-prefixed bash line, then the `||` fallback.
 HOOKS_RE = re.compile(r'^\s*SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "\$REPO/src/install-claude-hooks\.sh"')
 
@@ -77,6 +77,10 @@ class _Fixture(unittest.TestCase):
         shutil.copy2(REPO / "scripts/python-binary.sh", self.root / "scripts/python-binary.sh")
         shutil.copy2(REPO / "scripts/core-working-dir.sh", self.root / "scripts/core-working-dir.sh")
         shutil.copy2(REPO / "src/agent/restart-guard.sh", self.root / "src/agent/restart-guard.sh")
+        for name in ("src/agent/claude/cli/session-launch.sh", "src/agent/core-runtime-record.sh",
+                     "src/agent/core-window.sh", "src/agent/launch-path.sh", "src/core_runtime_record.py",
+                     "src/result_publish.py", "src/agent/task-event-handler-lookup.sh"):
+            shutil.copy2(REPO / name, self.root / name)
         # The personal-claude installer precedes the call under test; stub it to a no-op.
         personal = self.root / "scripts/install-personal-claude-hook.sh"
         personal.write_text("#!/usr/bin/env bash\nexit 0\n")

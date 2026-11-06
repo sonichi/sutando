@@ -1,10 +1,23 @@
 {
   "name": "image-generation",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "enabled": true,
+  "access_tier": "owner",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Generate and edit images using Gemini Flash Image, and generate videos using Veo. Supports text-to-image, image editing, text-to-video, and image-to-video.",
+  "description": "Generate an image from a prompt (Gemini image model over REST, standard library only) or edit one, saved under <workspace>/results/media/ and attached to the reply; generate a video with Veo when the google-genai SDK is installed. The key is any Gemini key the credential resolver finds (managed voice key included).",
+  "documented_for_core": true,
+  "core_description": "Generate an image from a text description (a logo, a hero image, a mascot, a mockup) or edit an existing image, and send it back as a file; generate a short video from a prompt or an image. Delegate through work; the result arrives as an attachment.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": ["GEMINI_API_KEY", "GEMINI_VOICE_API_KEY"]
+  },
+  "config": {
+    "IMAGE_MODEL": "gemini-3.1-flash-image-preview",
+    "VIDEO_MODEL": "veo-3.1-generate-preview"
+  },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

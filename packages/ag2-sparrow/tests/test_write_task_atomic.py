@@ -14,6 +14,12 @@ import pathlib
 import tempfile
 
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 def _load(base):
     """Reload the bridge with task/result/state dirs pointed under `base`."""
     os.environ["AGENT_CONNECT_TASK_DIR"] = str(base / "tasks")
@@ -48,8 +54,8 @@ def test_write_task_publishes_atomically_and_completely():
         assert durable, "a committed queue write must be ackable as durable"
         assert dest.exists(), "task file must be published"
         # No temp sidecar left behind — the tmp+rename must have completed.
-        assert not list(m.TASKS_DIR.glob(f"{tid}.txt.*.tmp"))
-        # The watcher globs task-*.txt; the staged name (.txt.<pid>.<uuid>.tmp) must not match.
+        assert not list(m.TASKS_DIR.glob(f".{tid}.txt.*.tmp"))
+        # The watcher globs task-*.txt; the staged name (.<name>.<pid>.<hex>.tmp) must not match.
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")
@@ -60,9 +66,10 @@ def test_write_task_publishes_atomically_and_completely():
         assert len(tier_at) == 1
         tail = lines[tier_at[0] + 1:]
         assert any(ln.startswith("===SKILL INSTRUCTIONS") for ln in tail)
-        # Completeness: the block's final line (the result path) is the file tail —
+        # Completeness: the block's final line (the result step) is the file tail —
         # a truncated write cannot produce it.
-        assert lines[-1].endswith(f"results/{tid}.txt")
+        assert f"results/{tid}.txt;" in lines[-1]
+        assert lines[-1].endswith("Every task ends with a result.")
         assert "id: task-1784500000000" in body
         assert "source: ag2space" in body
         print("PASS test_write_task_publishes_atomically_and_completely")
@@ -172,10 +179,9 @@ def test_write_task_shell_quotes_channel_id_in_skill_instructions():
         context_cmd = context_line.split("`python3 ", 1)[1].split("`", 1)[0]
         context_args = shlex.split("python3 " + context_cmd)
         assert malicious_chan in context_args
-        notify_line = next(ln for ln in body.splitlines() if "--channel-id" in ln)
-        notify_cmd = notify_line.split("2. NOTIFY FIRST (if task takes >60s): ", 1)[1]
-        notify_args = shlex.split(notify_cmd)
-        assert malicious_chan in notify_args
+        # AG2 Space has no NOTIFY step; CONTEXT-FIRST is the only step
+        # embedding channel_id in a shell command.
+        assert not any("--channel-id" in ln for ln in body.splitlines())
         print("PASS test_write_task_shell_quotes_channel_id_in_skill_instructions")
 
 

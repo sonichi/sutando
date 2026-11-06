@@ -19,7 +19,7 @@ decisions: `workspace notes/observe-mvp-slice-design.md`.
    `{room_id, event_types[], mode, cost_cap?, created_by, source_text}`
    - `room_id`: the task's `channel_id` unless the text names another room.
    - `event_types`: map the intent to plane types (`message.created`,
-     `reaction.added`, `artifact.updated`, `member.joined`, …). Unknown intent →
+     `reaction.added`, `member.joined`, …). Unknown intent →
      ask, don't guess.
    - `mode`: `observe` (context only) | `record` (journal) | `notify` (ping the
      owner) | `taskify` (promote batches to ambient tasks — never

@@ -36,6 +36,7 @@ raise a modal system dialog on a machine that never asked for developer tools.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from typing import Callable, Optional
@@ -43,6 +44,30 @@ from typing import Callable, Optional
 # The Xcode-CLT shim path. Never invoke this without confirming the tools are
 # actually installed.
 SYSTEM_GIT = "/usr/bin/git"
+
+
+def _same_file(path_a: str, path_b: str, stat: Callable[[str], object] = os.stat) -> bool:
+    """True when both paths name the same inode, never by spelling.
+
+    `os.path.realpath` does not case-fold on a case-insensitive volume, so a
+    string compare against `SYSTEM_GIT` misses an alternate-case alias of the
+    shim (e.g. `/USR/BIN/GIT`). A stat-identity check is unaffected by case.
+
+    Only genuine absence (`FileNotFoundError`) proves `path_b` cannot be
+    matched; a `PermissionError`/EIO/etc. leaves its identity unknown, so
+    both stats fail toward "could be the stub" -- never toward "verified safe".
+    """
+    try:
+        stat_a = stat(path_a)
+    except OSError:
+        return True
+    try:
+        stat_b = stat(path_b)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return (stat_a.st_dev, stat_a.st_ino) == (stat_b.st_dev, stat_b.st_ino)
 
 
 def developer_tools_installed(run: Callable = subprocess.run) -> bool:
@@ -64,6 +89,7 @@ def path_candidates(
     name: str = "git",
     path_env: Optional[str] = None,
     is_exec: Optional[Callable[[str], bool]] = None,
+    which: Callable = shutil.which,
 ) -> list:
     """Every executable `name` on PATH, in PATH order.
 
@@ -71,18 +97,19 @@ def path_candidates(
     stub-first PATH puts /usr/bin ahead of a real install, `which` hands back
     the stub and a later runnable git is never considered — contradicting this
     module's own stated order (@john-the-dev, reviewing #2469). Service PATHs
-    routinely look like that.
+    routinely look like that. Resolving each directory separately also honors
+    Windows PATHEXT (`git.EXE`) without losing later candidates.
     """
     env = os.environ.get("PATH", "") if path_env is None else path_env
-    if is_exec is None:
-        def is_exec(p: str) -> bool:  # noqa: E306
-            return os.path.isfile(p) and os.access(p, os.X_OK)
     out = []
     for directory in env.split(os.pathsep):
         if not directory:
             continue
-        candidate = os.path.join(directory, name)
-        if is_exec(candidate):
+        if is_exec is not None:
+            candidate = os.path.join(directory, name)
+        else:
+            candidate = which(name, path=directory)
+        if candidate and (is_exec is None or is_exec(candidate)):
             out.append(candidate)
     return out
 
@@ -93,6 +120,7 @@ def select_git(
     is_darwin: bool,
     clt_installed: Callable[[], bool],
     realpath: Callable[[str], str] = os.path.realpath,
+    same_file: Callable[[str, str], bool] = _same_file,
 ) -> Optional[str]:
     """First runnable non-stub git in PATH order; the stub only as a fallback.
 
@@ -106,11 +134,13 @@ def select_git(
 
     `clt_installed` is a callable rather than a bool so the `xcode-select`
     probe is only spawned when it can change the answer — i.e. never on a host
-    where a real git was found first.
+    where a real git was found first. `same_file` is injected for the same
+    reason `realpath` is: identity must be checkable without touching a real
+    filesystem alias.
     """
     stub = None
     for candidate in candidates:
-        if not is_darwin or realpath(candidate) != SYSTEM_GIT:
+        if not is_darwin or not same_file(realpath(candidate), SYSTEM_GIT):
             return candidate
         if stub is None:
             stub = candidate

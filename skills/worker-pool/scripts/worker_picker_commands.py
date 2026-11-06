@@ -165,7 +165,7 @@ _WRITER_BELOW_TASK = frozenset((
     "addressed_to", "thread_root", "source_room_id", "room_members", "room_member_count",
     "source_message_id", "user_id", "interaction_type", "platform_card", "collaborator",
     "sensitive_data_filter", "access_tier", "session_scope", "requested_worker", "priority",
-    "hitl_click",
+    "hitl_click", "channel_kind",
 ))
 _BELOW_TASK_FIELD = re.compile(r"^([a-z_]+): ")
 
@@ -261,9 +261,9 @@ def authorized_command(path, workspace=None) -> "dict | None":
     A task-last writer puts every header above `task:`; everything below is the
     sender's text and may promote nothing. The gateway instead writes the picker
     mark and the tier BELOW `task:`, so reading its tier needs the last-wins
-    parse -- which is only safe on a file whose whole content is attested.
-    The envelope HMAC is that attestation and the only thing consulted here:
-    fail closed on unsigned/invalid/unverifiable, per task_envelope's contract.
+    parse -- which is only safe on a file whose writer declared the one-line
+    task-mid layout above `task:` AND whose envelope HMAC verifies; either
+    missing falls back to the strict parse (task_envelope.attested_task_headers).
     """
     import task_envelope as te
     text = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -271,10 +271,7 @@ def authorized_command(path, workspace=None) -> "dict | None":
     above = strict.headers
     if above.get("source") is not None and (above.get("source") or "").strip() != SOURCE:
         return None
-    # Attested content, never a writer guessed from an optional header: only a
-    # verified envelope admits the region below `task:` to the tier decision.
-    verified = te.verify_text(text, workspace).get("verdict") == "verified"
-    parsed = ltp.parse_task_headers_trusted(text) if verified else strict
+    parsed = te.attested_task_headers(text, workspace)
     if (parsed.headers.get("access_tier") or "").strip() != "owner":
         return None
     sentence = (parsed.body or "").split("\n", 1)[0]
@@ -355,8 +352,8 @@ def _record_applied(workspace, cmd: dict, task_id) -> int:
 
 
 def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | None":
-    """Apply a parsed pin or unpin AND publish it: binding, roster and the
-    advertisement in one call, so the new binding is on the wire without
+    """Apply a parsed pin or unpin: binding, roster and (through the roster's
+    own writer) the advertisement, so the new binding is on the wire without
     waiting for another task. `add` is create_worker's and returns None.
 
     `task_id` is required for a pin or unpin: without it the call cannot be
@@ -381,9 +378,9 @@ def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | No
             roster = pr.bind_room(workspace, cmd["room"], workers[0])
         else:
             roster = pr.unbind_room(workspace, cmd["room"])
-        path = pa.write_advertisement(workspace)
-        # Recorded only once the mutation and its publication both landed, so a
-        # failure leaves no ledger entry to suppress the retry.
+        # bind/unbind end in a compile, and the compile publishes; a publish
+        # failure raises out of them, so nothing below records a half-applied pin.
+        path = pa.advertisement_path(workspace)
         _record_applied(workspace, cmd, task_id)
     return {"action": action, "room": cmd["room"], "roster_version": roster.get("version"),
             "advertisement": str(path)}

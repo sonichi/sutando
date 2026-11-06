@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
 spec = importlib.util.spec_from_file_location("pr", REPO / "src" / "proactive_recovery.py")
 pr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pr)
@@ -83,11 +84,11 @@ def run_permission_case():
     with _tf.TemporaryDirectory() as tmp:
         d = Path(tmp)
         (d / "proactive-perm.sending.recover-4242-0").write_text(BODY)
-        # A pid owned by another user answers signal 0 with EPERM: it is alive.
-        with mock.patch.object(os, "kill", side_effect=PermissionError):
+        opaque = mock.Mock(state=pr.OwnerState.UNKNOWN)
+        with mock.patch.object(pr, "process_identity", return_value=opaque):
             recovered = pr.recover_orphan_sending_files(d)
         ok, detail = check_permission_holder(d, recovered)
-        print(f"{'PASS' if ok else 'FAIL'}  C4 EPERM holder is treated as live\n      {detail}")
+        print(f"{'PASS' if ok else 'FAIL'}  C4 opaque holder is treated as live\n      {detail}")
         return ok
 
 

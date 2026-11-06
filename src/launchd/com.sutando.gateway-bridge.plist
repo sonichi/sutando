@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Sutando — ag2.space gateway-bridge launchd job (template).
+  Sutando — gateway-bridge launchd job (template).
 
-  Role: keeps src/remote-gateway-bridge.py alive. That bridge carries ag2.space
-  MOBILE-app messages from the cloud gateway (chat.ag2.space/relay) down to the
+  Role: keeps src/remote-gateway-bridge.py alive. That bridge carries
+  MOBILE-app messages from the homeserver's cloud gateway (its /relay) down to the
   local core, and pushes results back up. Without supervision it's a single
   unmonitored process: on 2026-07-10 it was found DEAD since Jul 7 (it stopped
   after a run of gateway 502s and nothing restarted it), so mobile messages
@@ -15,14 +15,19 @@
 
   Design:
     - RunAtLoad=true so it starts at login/boot.
-    - KeepAlive { Crashed: true, SuccessfulExit: false } → restart on crash,
-      OOM, or kill (any non-zero/signal exit), but NOT on a clean exit. The
-      wrapper exits 0 when no token is configured, so a de-configured install
-      stops cleanly instead of crash-looping.
+    - KeepAlive { Crashed: true, SuccessfulExit: false } → launchd restarts the
+      wrapper on crash, OOM, or kill (any non-zero/signal exit), but NOT on a
+      clean exit. The wrapper supervises the bridge itself, so a bridge that
+      exits (pkill, crash, clean stop) is relaunched by the wrapper. The wrapper
+      exits 0 only when no token is configured, so a de-configured install stops
+      cleanly instead of crash-looping; startup.sh kickstarts that idle job once
+      a token exists.
     - ThrottleInterval=10: ≤ one restart per 10s, so a genuine crash-loop
       (e.g. a persistently-502ing gateway) doesn't burn CPU.
     - Wrapper (gateway-bridge-wrapper.sh) loads the ag2space channel .env for
       REMOTE_TASK_TOKEN — launchd doesn't source .env itself.
+    - The wrapper also keeps src/sparrowd.py alive in its agent-bridges mode, the one
+      supervisor of the agent bridges declared under <workspace>/agents here.
     - StandardOut/Err → workspace logs so postmortems + the health-check log
       probe keep working.
 
@@ -81,6 +86,11 @@
         <string>__REPO__</string>
         <key>CLAUDE_CONFIG_DIR</key>
         <string>__CLAUDE_CONFIG_DIR__</string>
+        <!-- Arms the poll-stall exit. KeepAlive above is the restart owner; the
+             bridge refuses to exit on a stall unless one is declared, because
+             startup-runtime.sh launches bare `&` lanes that nothing restarts. -->
+        <key>SUTANDO_BRIDGE_RESTART_OWNER</key>
+        <string>launchd</string>
     </dict>
 
     <key>StandardOutPath</key>

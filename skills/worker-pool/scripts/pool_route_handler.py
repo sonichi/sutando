@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # local_task_protocol lives in the core; repo root is parents[3] from here
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
+import activity_bus  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
@@ -34,6 +35,7 @@ import worker_picker_commands as wpc  # noqa: E402
 
 import pool_router as rt  # noqa: E402
 import pool_advertise as pa
+import pool_routing_receipt as prr  # noqa: E402
 
 DECLINE = 3
 MUST_HANDLE = 4
@@ -43,17 +45,22 @@ PICKER_WIRE = "worker-picker"
 def read_task(task_file: str) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
-    `requested_worker` is read only from ABOVE `task:`, so a body cannot forge
-    it. `channel_id`/`source` are read leniently: the gateway stamps them
+    `requested_worker` (and its legacy alias) is read only from ABOVE `task:`,
+    so a body cannot forge it. `channel_id`/`source` are read leniently: the gateway stamps them
     below `task:`, where the strict parse never looks.
     """
     text = Path(task_file).read_text(encoding="utf-8", errors="replace")
     task: dict = {"id": Path(task_file).stem}
+    # A stop from a trusted source must reach whoever holds the task it names; anything else is a task.
+    stop_of = activity_bus.trusted_cancel_target(text, task_file)
+    if stop_of:
+        task["stop_of"] = stop_of
     for line in text.splitlines():
         if line.startswith("task:"):
             break
         key, _, value = line.partition(":")
-        if _ and key.strip() in ("id", "channel_id", "source", "requested_worker"):
+        if _ and key.strip() in ("id", "channel_id", "source", "requested_worker",
+                                 pr.LEGACY_WORKER_FIELD):
             task[key.strip()] = value.strip()
     if not task.get("channel_id") or not task.get("source") or "wire_source" not in task:
         lenient = ltp.parse_task_headers_lenient(text).headers
@@ -77,17 +84,39 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
+    # A replay follows the committed delivery, whatever the bindings say now; one roster
+    # read serves the replay check and the route, and decides for a task nobody holds yet.
     try:
-        raw = pr._load_existing_roster_strict(workspace)
+        raw, unreadable = pr._load_existing_roster_strict(workspace), False
     except pr.RosterError:
+        raw, unreadable = None, True
+    roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
+    try:
+        committed = rt.committed_recipient(workspace, task.get("id") or "", roster=roster)
+    except rt.RouterRefused as e:      # a conflict, or evidence that cannot be read
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], None
+    if committed is not None and committed != pr.CORE:
+        return 0, [committed], roster
+    try:
+        holder = rt.stop_holder(workspace, task, roster=roster)
+    except rt.RouterRefused as e:      # whose the stopped task is cannot be told
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], None
+    if holder is not None:
+        return 0, [holder], roster
+    if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
         return MUST_HANDLE, [], None
-    roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
     if roster is None:
         return DECLINE, [], None
-    targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
-                             task.get("requested_worker"))
+    try:
+        targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
+                                 pr.requested_worker_of(task))
+    except pr.AmbiguousWorkerName as e:
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], roster
     # One question only: is every target on the roster? Anything else -- no
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
@@ -134,6 +163,11 @@ def main(argv=None) -> int:
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    # First, before anything can fail: the receipt is the only proof outside this
+    # process that the watcher routes at all, and a write failure changes nothing.
+    if ws and not prr.record(ws, mode="probe" if args.probe else "run",
+                             task_id=Path(args.task_file).stem):
+        print("pool_route_handler: routing receipt not written", file=sys.stderr)
     # An inherited roster has no advertisement until something publishes it;
     # the edge is here, and a failure to publish must never stop routing.
     try:
@@ -154,6 +188,8 @@ def main(argv=None) -> int:
         return MUST_HANDLE
     if args.probe:
         return code
+    if code == MUST_HANDLE:
+        return MUST_HANDLE
     if code == DECLINE:
         return DECLINE
 
@@ -168,8 +204,14 @@ def main(argv=None) -> int:
         # as an optional decline and hand the task to the unrestricted core.
         print(f"pool_route_handler: delivery failed: {e}", file=sys.stderr)
         return MUST_HANDLE
+    if out.get("fenced") and not (out.get("delivered") or out.get("already")):
+        # Retired after this pass read the roster: nothing was written, so the core takes it.
+        return DECLINE
     settled = set(out.get("delivered") or []) | set(out.get("already") or [])
-    unsettled = [t for t in targets if t not in settled] + list(out.get("skipped") or [])
+    # Judge settlement by the targets the route COMMITTED to, not the probe's
+    # snapshot: a commit that landed between the two is not a missing delivery.
+    routed = list(out.get("targets") or targets)
+    unsettled = [t for t in routed if t not in settled] + list(out.get("skipped") or [])
     if unsettled:
         # 0 here releases the watcher's claim on a task no worker holds.
         print(json.dumps({**out, "unsettled": unsettled}), file=sys.stderr)

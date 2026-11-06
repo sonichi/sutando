@@ -34,7 +34,7 @@ ok "relative: refused (rc 1)" "$([ $RC = 1 ] && echo 0 || echo 1)"
 ok "relative: nothing created" "$([ ! -e "$PWD/relative" ] && echo 0 || echo 1)"
 
 # --- 2. delegation: every deciding site sources the resolver, none keeps a private copy -------
-SITES=(src/agent/claude/cli/start-cli.sh src/install-claude-hooks.sh scripts/install-personal-claude-hook.sh scripts/install-session-start-hook.sh)
+SITES=(src/agent/claude/cli/session-launch.sh src/install-claude-hooks.sh scripts/install-personal-claude-hook.sh scripts/install-session-start-hook.sh)
 for s in "${SITES[@]}"; do
   ok "$s sources scripts/core-working-dir.sh" "$(grep -q 'scripts/core-working-dir.sh' "$REPO/$s" && echo 0 || echo 1)"
   ok "$s calls sutando_core_working_dir" "$(grep -q 'sutando_core_working_dir' "$REPO/$s" && echo 0 || echo 1)"

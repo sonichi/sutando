@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """A source in neither source set has no consumer, so skipping its result loses
 the reply permanently. Rationale and evidence live in the PR."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

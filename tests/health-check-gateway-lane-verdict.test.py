@@ -5,6 +5,12 @@ The lane selector runs exactly ONE lane and parks the others, so on a lane-only
 host `state/gateway-status.json` is never written. An absent primary sidecar is
 not evidence of health, and the running lane's own sidecar is the signal.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import shutil
@@ -102,6 +108,7 @@ class GatewayBridgeVerdictUsesLanes(unittest.TestCase):
     def _run(self, lanes):
         with patch.object(hc, "_gateway_configured", return_value=True), \
              patch.object(hc, "subprocess") as sp, \
+             patch.object(hc, "probe_pids", return_value=(["4242"], True)), \
              patch.object(hc, "_gateway_lock_pids", return_value={}), \
              patch.object(hc, "_gateway_serving", return_value=None), \
              patch.object(hc, "_gateway_status_stale_age_s", return_value=None), \
