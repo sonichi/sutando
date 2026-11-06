@@ -726,8 +726,10 @@ A live pane classified as `limit` with outstanding deliveries uses a separate
 persisted wait, instead of the watcher-loss or human-card ladder. A printed reset
 time (including its named timezone) sets the first due time, parsed once per
 banner: an unchanged banner keeps that deadline across midnight, and a yearless
-date more than half a year past names the next year; unreadable or absent
-reset text uses a 15-minute probe interval. A due tick requests one fresh turn
+date more than half a year past names the next year. A time without a date names
+its next occurrence, rolling to tomorrow if it is not in the future; an explicit
+`today` or dated past reset stays past. Month/day dates accept an optional comma.
+Unreadable or absent reset text uses a 15-minute probe interval. A due tick requests one fresh turn
 through `pool_ask` and the normal recipient routing path, asking the worker to
 re-arm its session watcher and process its existing inbox. For Claude, a fresh limit capture and empty composer permit a wake-up line
 through the existing guarded line sender, pointing at that routed payload.

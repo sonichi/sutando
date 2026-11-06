@@ -38,10 +38,11 @@ def _parse(value, now):
     value = re.sub(r"\s*\([^)]+\)", "", value).strip()
     today = datetime.fromtimestamp(now, tz)
     tomorrow = value.lower().startswith("tomorrow ")
+    explicit_today = value.lower().startswith("today ")
     value = re.sub(r"^(?:today|tomorrow)\s+", "", value, flags=re.I)
     value = re.sub(r"\s+at\s+", " ", value, flags=re.I)
     value = re.sub(r"\s+(am|pm)$", r"\1", value, flags=re.I)
-    for pattern in ("%b %d %I:%M%p", "%b %d %I%p", "%I:%M%p", "%I%p", "%H:%M",
+    for pattern in ("%b %d %I:%M%p", "%b %d %I%p", "%b %d, %I:%M%p", "%b %d, %I%p", "%I:%M%p", "%I%p", "%H:%M",
                     "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z"):
         try:
             parsed = datetime.strptime(f"{today.year} {value}", f"%Y {pattern}") if "%Y" not in pattern else datetime.strptime(value, pattern)
@@ -56,9 +57,11 @@ def _parse(value, now):
                 parsed = parsed.replace(year=parsed.year + step)
             except ValueError:
                 return None
-        if "%b" not in pattern and "%Y" not in pattern:
+        time_only = "%b" not in pattern and "%Y" not in pattern
+        if time_only:
             parsed = parsed.replace(month=today.month, day=today.day)
-        if tomorrow:
+        parsed = parsed.replace(tzinfo=parsed.tzinfo or tz)
+        if tomorrow or (time_only and not explicit_today and parsed.timestamp() <= now):
             parsed += timedelta(days=1)
-        return parsed.replace(tzinfo=parsed.tzinfo or tz).timestamp()
+        return parsed.timestamp()
     return None

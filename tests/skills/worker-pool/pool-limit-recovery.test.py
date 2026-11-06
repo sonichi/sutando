@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tests"))
@@ -39,6 +40,42 @@ class LimitRecovery(unittest.TestCase):
         self.assertIsNone(sup.pl.reset_at("resets someday", NOW))
         self.assertEqual(sup.pl.reset_at("resets tomorrow 2pm (UTC)", NOW), NOW + 26 * 3600)
         self.assertEqual(sup.pl.reset_at("resets 2026-11-05 14:00 (UTC)", NOW), NOW + 7200)
+
+    def test_time_only_reset_uses_next_occurrence(self):
+        la = ZoneInfo("America/Los_Angeles")
+        now = datetime(2026, 11, 5, 23, tzinfo=la).timestamp()
+        for words, day, hour, minute in (("3am", 6, 3, 0), ("3:30am", 6, 3, 30),
+                                         ("03:00", 6, 3, 0), ("10pm", 6, 22, 0),
+                                         ("11pm", 6, 23, 0), ("11:30pm", 5, 23, 30),
+                                         ("today 10pm", 5, 22, 0), ("tomorrow 3am", 6, 3, 0)):
+            with self.subTest(words=words):
+                self.assertEqual(sup.pl.reset_at(f"resets {words} (America/Los_Angeles)", now),
+                                 datetime(2026, 11, day, hour, minute, tzinfo=la).timestamp())
+        local_now = datetime(2026, 11, 5, 23).timestamp()
+        self.assertEqual(sup.pl.reset_at("resets 3am", local_now),
+                         datetime(2026, 11, 6, 3).timestamp())
+
+    def test_time_only_evening_limit_waits_and_retries_after_midnight(self):
+        la = ZoneInfo("America/Los_Angeles")
+        start = datetime(2026, 11, 5, 23, tzinfo=la).timestamp()
+        due = datetime(2026, 11, 6, 3, tzinfo=la).timestamp()
+        text = "You've hit your limit · resets 3am (America/Los_Angeles)"
+        state, actions = ps.SupervisionState(), []
+        for now in range(int(start), int(due + 1), 300):
+            reset = sup.pl.reset(text, now)
+            obs = ps.Observation(ps.STALE, True, watcher_beat=ps.ABSENT, watcher_held=False,
+                                 work_outstanding=True, pane=ps.PANE_LIMIT,
+                                 limit_reset_at=reset.at, limit_banner=reset.banner)
+            state, action = self.tick(state, obs, now)
+            if action != ps.NOTHING:
+                actions.append((now, action))
+            self.assertEqual(state.workers["worker"].limit_reset_at, due)
+        self.assertEqual(actions, [(due, ps.RETRY_LIMIT)])
+        self.assertEqual(state.workers["worker"].limit_attempts, 1)
+
+    def test_comma_dated_reset_keeps_its_deadline(self):
+        self.assertEqual(sup.pl.reset_at("resets Nov 6, 3am (UTC)", NOW), NOW + 15 * 3600)
+        self.assertEqual(sup.pl.reset_at("resets Nov 5, 11:30am (UTC)", NOW), NOW - 1800)
 
     def test_future_reset_waits_even_without_a_watcher(self):
         obs = self.observation(" · resets Nov 5 at 2pm (UTC)")
