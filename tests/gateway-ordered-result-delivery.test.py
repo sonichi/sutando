@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolated_child_env  # noqa: E402
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 
 gw, _READS = isolate_then_import(env={"REMOTE_TASK_LIFECYCLE_V2": "1", "REMOTE_TASK_TURN_CONTEXT": "1"})
@@ -121,6 +122,9 @@ class Ordered(unittest.TestCase):
             self.assertFalse(second.is_alive(), "a pass never waits on room A's send")
             self.assertEqual(self.fake.calls, [b1], "room B is answered while room A is sending")
             self.assertIn(a2, inflight, "room A's second reply waits for its first")
+            gw._record_task_room("task-slow-nofile", ROOM_A)
+            self.assertFalse(gw._waits_for_room("task-slow-nofile", gw.RESULTS_DIR / "task-slow-nofile.txt",
+                                                gw._load_task_rooms()), "no result yet: the ordinary path")
         finally:
             release.set()
         self.assertTrue(_until(lambda: not gw._room_busy(ROOM_A)))
@@ -175,7 +179,7 @@ class Ordered(unittest.TestCase):
 class HashSeeds(unittest.TestCase):
     def test_the_burst_order_holds_under_several_hash_seeds(self):
         for seed in ("1", "2", "3", "4"):
-            env = {**os.environ, "PYTHONHASHSEED": seed}
+            env = isolated_child_env(PYTHONHASHSEED=seed)
             proc = subprocess.run([sys.executable, __file__, BURST_ONLY], env=env, capture_output=True, text=True,
                                   timeout=300)
             self.assertEqual(proc.returncode, 0, f"seed {seed}:\n{proc.stdout}\n{proc.stderr}")

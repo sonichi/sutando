@@ -328,7 +328,8 @@ from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_i
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
-from .result_markers import has_skip_action, parse_markers, render_skill_prelude
+from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from . import result_labels
@@ -9771,11 +9772,8 @@ def _intake_ordered(tids, rooms: "dict[str, str]") -> list:
 
 def _ordered_room(tid: str, raw: str, rooms: "dict[str, str]") -> "str | None":
     """The room whose reply order this result takes a place in; None for one that posts nothing."""
-    try:
-        if has_skip_action(parse_markers(raw).actions):
-            return None
-    except Exception:  # noqa: BLE001 — an unparsable body is ordered like any reply
-        pass
+    if has_skip_action(parse_markers(raw).actions):
+        return None
     return rooms.get(tid) or None
 
 
