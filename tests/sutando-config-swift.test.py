@@ -51,7 +51,6 @@ class TestSutandoConfigSwift(unittest.TestCase):
             env=env,
             check=True,
             text=True,
-            capture_output=True,
         )
 
     def tearDown(self) -> None:
@@ -128,7 +127,7 @@ class TestPersonalAssetPathSwift(unittest.TestCase):
         env["CLANG_MODULE_CACHE_PATH"] = str(_MODULE_CACHE)
         subprocess.run(
             ["swiftc", str(SWIFT_CONFIG), str(self.probe_dir / "main.swift"), "-o", str(self.probe)],
-            env=env, check=True, text=True, capture_output=True,
+            env=env, check=True, text=True,
         )
 
     def tearDown(self) -> None:

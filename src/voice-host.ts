@@ -25,8 +25,9 @@ import { VoiceSession, type MainAgent, type ToolDefinition } from 'bodhi-realtim
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { confineUserContent } from './task_body_guard.js';
@@ -69,7 +70,7 @@ async function submitViaGateway(route: TenantRoute, id: string, body: string): P
 	if (!res.ok) throw new Error(`gateway submit ${res.status}`);
 }
 
-function buildWorkTool(device: { deviceId?: string; label?: string },
+export function buildWorkTool(device: { deviceId?: string; label?: string },
 		route: TenantRoute = { kind: 'dir' }): ToolDefinition {
 	return {
 		name: 'work',
@@ -79,6 +80,7 @@ function buildWorkTool(device: { deviceId?: string; label?: string },
 		parameters: z.object({
 			task: z.string().describe('What to do, self-contained and specific'),
 		}),
+		execution: 'inline',
 		execute: async ({ task }: { task: string }) => {
 			const id = `task-wearable-${Date.now()}`;
 			const body = [
@@ -163,6 +165,36 @@ function buildWearableAgent(device: { deviceId?: string; label?: string },
 	} as MainAgent;
 }
 
+/** The bodhi VoiceSession members this host drives. bodhi exports none of
+ *  them, so the surface is named once rather than at 13 `as any` call sites. */
+interface SessionInternals {
+	start(): Promise<void>;
+	stop?(): void;
+	close?(): void;
+	sendGreeting?(): void;
+	handleInterrupted?(): void;
+	handleAudioFromClient(data: unknown): void;
+	handleAudioOutput?: (data: string) => void;
+	handleTransportClose?: (code?: number, reason?: string) => void;
+	notifyBackground(text: string, opts?: { priority?: string }): void;
+	sessionManager?: { state?: string };
+	eventBus?: { subscribe?: (event: string, fn: () => void) => void };
+	transcriptManager?: {
+		sink?: { sendToClient?: (msg: Record<string, unknown>) => void };
+	};
+}
+
+/** Only the generateContent fields this tool loop reads or sends. */
+interface GeminiPart {
+	text?: string;
+	functionCall?: { name: string; args?: Record<string, unknown> };
+	functionResponse?: { name: string; response: unknown };
+}
+interface GeminiContent { role: string; parts: GeminiPart[] }
+
+const inner = (s: VoiceSession): SessionInternals =>
+	s as unknown as SessionInternals;
+
 async function handleSession(ws: WebSocket): Promise<void> {
 	const n = nextSessionN++;
 	const bodhiPort = nextBodhiPort++;
@@ -171,7 +203,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 	let resultsPoll: ReturnType<typeof setInterval> | null = null;
 
 	const teardown = () => {
-		const s = session as any;
+		const s = session === null ? null : inner(session);
 		session = null;
 		if (resultsPoll) { clearInterval(resultsPoll); resultsPoll = null; }
 		try { s?.stop?.(); s?.close?.(); } catch { /* best-effort */ }
@@ -186,7 +218,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 		const spoken = new Set<string>();
 		resultsPoll = setInterval(() => {
 			if (!session) return;
-			let names: string[] = [];
+			let names: string[];
 			try { names = readdirSync(dir); } catch { return; }
 			for (const f of names) {
 				if (!/^task-wearable-.*\.txt$/.test(f) || spoken.has(f)) continue;
@@ -196,7 +228,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 					spoken.add(f);
 					if (!body) continue;
 					console.log(`${ts()} [session ${n}] speaking result ${f}`);
-					(session as any).notifyBackground(
+					inner(session).notifyBackground(
 						`A delegated task just finished. Relay the result to the user in one or two spoken sentences: ${body}`,
 						{ priority: 'high' });
 				} catch { /* unreadable file — retry next pass is pointless; skip */ }
@@ -226,7 +258,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 				geminiModel: NATIVE_AUDIO_MODEL,
 				inputAudioTranscription: true,
 				speechConfig: { voiceName: params.voice || 'Aoede' },
-			} as any);
+			} as unknown as ConstructorParameters<typeof VoiceSession>[0]);
 			// voice.state — UI metadata, never transport sync: the device plays
 			// audio the moment frames arrive; these only drive its tiny screen.
 			// Mapping: turn.start → thinking, first audio of the turn → speaking,
@@ -244,7 +276,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			// drops the connection on frames over its RX buffer. 1600B ≈ 33ms
 			// @24kHz — small enough for any client, smooth for the device ring.
 			const CHUNK = 1600;
-			(session as any).handleAudioOutput = (data: string) => {
+			inner(session).handleAudioOutput = (data: string) => {
 				const buf = Buffer.from(data, 'base64');
 				bytesOut += buf.length;
 				if (ws.readyState === WebSocket.OPEN) {
@@ -260,11 +292,11 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			// "Listening" while streaming into a dead link (2026-08-12 hotel test).
 			// Tell the device the truth, then drop the stream so its own
 			// connection-lost cleanup runs and the next YELLOW opens fresh.
-			const origTransportClose = (session as any).handleTransportClose?.bind(session);
+			const origTransportClose = inner(session).handleTransportClose?.bind(session);
 			if (origTransportClose) {
-				(session as any).handleTransportClose = (code?: number, reason?: string) => {
+				inner(session).handleTransportClose = (code?: number, reason?: string) => {
 					origTransportClose(code, reason);
-					if ((session as any).sessionManager?.state === 'CLOSED'
+					if (inner(session!).sessionManager?.state === 'CLOSED'
 						&& ws.readyState === WebSocket.OPEN) {
 						console.log(`${ts()} [session ${n}] LLM died mid-session (code=${code}) — closing device stream`);
 						sendState('offline');
@@ -272,7 +304,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 					}
 				};
 			}
-			const bus = (session as any).eventBus;
+			const bus = inner(session).eventBus;
 			bus?.subscribe?.('turn.start', () => { spokeThisTurn = false; sendState('thinking'); });
 			bus?.subscribe?.('turn.end', () => { spokeThisTurn = false; sendState('listening'); });
 			bus?.subscribe?.('turn.interrupted', () => { spokeThisTurn = false; sendState('interrupted'); });
@@ -280,7 +312,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			// transcription + Gemini's always-on output transcription), tapped at
 			// the TranscriptManager sink. UI metadata like voice.state: partials
 			// replace the current line per role, finals append.
-			const tm = (session as any).transcriptManager;
+			const tm = inner(session).transcriptManager;
 			if (tm?.sink?.sendToClient) {
 				const orig = tm.sink.sendToClient.bind(tm.sink);
 				tm.sink.sendToClient = (msg: Record<string, unknown>) => {
@@ -298,14 +330,14 @@ async function handleSession(ws: WebSocket): Promise<void> {
 					}
 				};
 			}
-			await (session as any).start();
+			await inner(session).start();
 			console.log(`${ts()} [session ${n}] open (bodhi :${bodhiPort}, `
 				+ `device ${device.label || '?'}${device.deviceId ? '/' + device.deviceId : ''})`);
 			// The {"ok"} ack MUST be the first text frame — the bridge handshake
 			// reads it before anything else; state comes after.
 			ws.send(JSON.stringify({ ok: true }));
 			sendState('listening');
-			try { (session as any).sendGreeting?.(); } catch { /* greeting is best-effort */ }
+			try { inner(session).sendGreeting?.(); } catch { /* greeting is best-effort */ }
 			// ISOLATION: the local results dir belongs to THIS machine's core.
 			// Cloud (gateway-routed) sessions never touch it — their results
 			// arrive via the relay (follow-up); polling here would read another
@@ -327,7 +359,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			if (!isBin) {
 				try {
 					if (JSON.parse(data.toString()).interrupt) {
-						(session as any).handleInterrupted?.();
+						inner(session).handleInterrupted?.();
 						console.log(`${ts()} [session ${n}] interrupted by device`);
 					}
 				} catch { /* ignore malformed control frames */ }
@@ -335,7 +367,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			}
 			if (bytesIn === 0) console.log(`${ts()} [session ${n}] first mic frame (${data.length}B)`);
 			bytesIn += data.length;
-			try { (session as any).handleAudioFromClient(data); } catch (e) {
+			try { inner(session).handleAudioFromClient(data); } catch (e) {
 				console.error(`${ts()} [session ${n}] audio-in error:`, e);
 			}
 		});
@@ -375,7 +407,7 @@ function handleTextSession(ws: WebSocket): void {
 					const seen = new Set<string>();
 					const since = Date.now();
 					poll = setInterval(() => {
-						let names: string[] = [];
+						let names: string[];
 						try { names = readdirSync(dir); } catch { return; }
 						for (const f of names) {
 							if (!/^task-wearable-.*\.txt$/.test(f) || seen.has(f)) continue;
@@ -392,17 +424,17 @@ function handleTextSession(ws: WebSocket): void {
 					return;
 				}
 				if (typeof msg.user === 'string' && msg.user.trim()) {
-					const agent = buildWearableAgent(device) as any;
-					const workTool = (agent.tools as ToolDefinition[])[0] as any;
+					const agent = buildWearableAgent(device);
+					const workTool = (agent.tools as ToolDefinition[])[0];
 					history.push({ role: 'user', content: msg.user });
 					// Direct Gemini REST (generateContent + function calling): the
 					// repo's ai/@ai-sdk versions disagree on model spec, and this
 					// plane needs only a plain tool loop.
 					const url = 'https://generativelanguage.googleapis.com/v1beta/models/'
 						+ `${TEXT_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-					const contents: any[] = history.slice(-20).map((m) => (
+					const contents: GeminiContent[] = history.slice(-20).map((m) => (
 						{ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
-					const body: any = {
+					const body = {
 						systemInstruction: { parts: [{ text: agent.instructions }] },
 						contents,
 						tools: [{ functionDeclarations: [{
@@ -417,16 +449,23 @@ function handleTextSession(ws: WebSocket): void {
 							headers: { 'content-type': 'application/json' },
 							body: JSON.stringify(body) });
 						if (!res.ok) throw new Error(`gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
-						const parts = (await res.json())?.candidates?.[0]?.content?.parts ?? [];
-						const call = parts.find((p: any) => p.functionCall);
-						if (call) {
-							const result = await workTool.execute(call.functionCall.args ?? {});
+						const json = await res.json() as
+							{ candidates?: { content?: { parts?: GeminiPart[] } }[] };
+						const parts: GeminiPart[] = json?.candidates?.[0]?.content?.parts ?? [];
+						const call = parts.find((p) => p.functionCall);
+						if (call?.functionCall) {
+							const fc = call.functionCall;
+							// This hand-rolled loop has no ToolContext to pass, and the
+							// local tool's implementation takes args only. Call the shape.
+							const run = workTool.execute as
+								(a: Record<string, unknown>) => Promise<unknown>;
+							const result = await run.call(workTool, fc.args ?? {});
 							body.contents.push({ role: 'model', parts: [call] });
 							body.contents.push({ role: 'user', parts: [{ functionResponse: {
-								name: call.functionCall.name, response: result } }] });
+								name: fc.name, response: result } }] });
 							continue;
 						}
-						reply = parts.map((p: any) => p.text ?? '').join('').trim();
+						reply = parts.map((p) => p.text ?? '').join('').trim();
 					}
 					if (!reply) reply = 'On it.';
 					history.push({ role: 'assistant', content: reply });
@@ -468,7 +507,7 @@ function startContextSync(): void {
 	const ctxPath = join(resolveWorkspace(), 'state', 'voice-session-context.json');
 	let lastScan = Date.now();
 	setInterval(() => {
-		let fresh: { task_id: string; subject: string; ts: string }[] = [];
+		const fresh: { task_id: string; subject: string; ts: string }[] = [];
 		try {
 			for (const f of readdirSync(resultsDir)) {
 				if (!f.startsWith('task-') || !f.endsWith('.txt')) continue;
@@ -486,7 +525,7 @@ function startContextSync(): void {
 		if (!fresh.length) { lastScan = Date.now(); return; }
 		lastScan = Date.now();
 		try {
-			let ctx: any = {};
+			let ctx: { last_results?: unknown[]; [k: string]: unknown } = {};
 			try { ctx = JSON.parse(readFileSync(ctxPath, 'utf8')); } catch { /* fresh */ }
 			ctx.updated_at = new Date().toISOString();
 			ctx.last_results = [...fresh.reverse(), ...(ctx.last_results ?? [])].slice(0, 3);
@@ -497,4 +536,5 @@ function startContextSync(): void {
 	}, 15000).unref();
 }
 
-main();
+if (process.argv[1] && existsSync(process.argv[1])
+	&& import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main();
