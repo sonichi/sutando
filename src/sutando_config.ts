@@ -50,6 +50,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'health_check',
 	'bridges',
 	'stand',
+	'skills',
+	'notifications',
 ]);
 
 /**
@@ -66,6 +68,8 @@ const OBJECT_TOP_LEVEL_KEYS = new Set([
 	'env',
 	'health_check',
 	'bridges',
+	'skills',
+	'notifications',
 ]);
 
 /**
@@ -478,6 +482,20 @@ export function resolveVault(repoRoot?: string): VaultConfig {
 		},
 		interval_seconds: typeof vault.interval_seconds === 'number' ? vault.interval_seconds : 1800,
 	};
+}
+
+/**
+ * `notifications.macos`: whether Sutando may post macOS desktop notifications.
+ * Off unless it is JSON true; an unreadable config is off. Twin of resolve_macos_notifications().
+ */
+export function resolveMacosNotifications(repoRoot?: string): boolean {
+	try {
+		const block = loadConfig(repoRoot).notifications as { [k: string]: Json } | null | undefined;
+		return (block ?? {}).macos === true;
+	} catch (e) {
+		console.error(`sutando config: cannot read notifications.macos (${(e as Error)?.message ?? e}); treated as false`);
+		return false;
+	}
 }
 
 export type CoreRuntime = 'claude' | 'codex';

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """check_live_tree_drift: a live checkout far behind its upstream, or carrying
 day-old dirty files, must WARN; a current clean tree stays ok."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import subprocess
@@ -21,7 +27,7 @@ except SystemExit:
 def _git(cwd, *args):
     subprocess.run(["git", "-C", str(cwd), *args], check=True,
                    capture_output=True,
-                   env={**os.environ,
+                   env={**isolated_child_env(),
                         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 

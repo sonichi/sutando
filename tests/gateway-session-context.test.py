@@ -29,7 +29,7 @@ Covers:
      the broker's own body block) never reaches another member's task;
   7. both header keys are registered, so the parser promotes them and the body
      guard defangs a forged body copy; the ledger survives a reload and a
-     redelivered mark is not recorded twice; the poll loop's own branch runs.
+     redelivered mark is not recorded twice; the served-round branch runs.
 
 Run: python3 tests/gateway-session-context.test.py
 """
@@ -37,12 +37,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from _helpers.hermetic_env import isolate_os_environ
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "remote-gateway-bridge.py"
@@ -63,10 +64,10 @@ FAKE_GHP = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
 
 def _load(ws: Path):
     """Load the hyphenated bridge module against a scratch workspace."""
-    os.environ["SUTANDO_TEST_WORKSPACE"] = str(ws)
-    os.environ.setdefault("REMOTE_TASK_TOKEN", "test-token-0123456789abcdef")
-    os.environ.setdefault("REMOTE_TASK_URL", "https://gw.invalid/relay")
-    os.environ["GATEWAY_INSTANCE"] = ""
+    isolate_os_environ(ws / "home", SUTANDO_TEST_WORKSPACE=str(ws),
+                       CLAUDE_CONFIG_DIR=str(ws / "claude-config"),
+                       REMOTE_TASK_TOKEN="test-token-0123456789abcdef",
+                       REMOTE_TASK_URL="https://gw.invalid/relay", GATEWAY_INSTANCE="")
     sys.path.insert(0, str(REPO / "src"))
     spec = importlib.util.spec_from_file_location("rgb_session_ctx", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
@@ -188,16 +189,19 @@ class SessionContext(unittest.TestCase):
         self.calls.append((method, path, payload))
         return {}
 
-    # The poll loop's decision for one served task, as main() makes it.
+    # Use the production control/queue branch shared by every ordinary served task.
     def _serve(self, task: dict) -> "str | None":
         mod = self.mod
-        if mod._consume_session_mark(task):
-            mod._queue_review_control_result(task)
-            mod._retry_review_control_results()
+        inflight, pending_ack, fates = set(), [], {task["id"]: None}
+        added = mod._take_served_task(task, inflight, pending_ack, fates)
+        if fates[task["id"]] == "consumed":
+            self.assertFalse(added)
+            self.assertEqual(pending_ack, [])
+            self.assertEqual(inflight, set())
             return None
-        written = mod._write_task(task)
-        self.assertIsNotNone(written, "an ordinary task is queued")
-        return (mod.TASKS_DIR / f"{written[0]}.txt").read_text()
+        self.assertTrue(added, "an ordinary task is queued")
+        self.assertEqual(len(pending_ack), 1)
+        return (mod.TASKS_DIR / f"{pending_ack[0][0]}.txt").read_text()
 
     def _ledger(self) -> dict:
         return json.loads(self.mod.SESSION_LEDGER_FILE.read_text())
@@ -217,7 +221,8 @@ class SessionContext(unittest.TestCase):
         self.assertEqual(sess["events"][-1]["kind"], "move")
         self.assertEqual(sess["title"], "", "a member's mark never titles the session")
         self.assertEqual([c for c in self.calls if c[1] == "/v1/results"],
-                         [("POST", "/v1/results", {"id": "task-move-c1", "body": "[no-send]"})])
+                         [("POST", "/v1/results", {"id": "task-move-c1", "body": "[no-send]",
+                            "capabilities": [self.mod.VOICE_OUTCOME_CONTRACT], "dm_only": False})])
 
     def test_move_body_in_a_known_session_creates_no_task(self):
         self._seed()
@@ -501,48 +506,37 @@ class SessionContext(unittest.TestCase):
         self.assertIsNone(self._serve(move_mark()))
         self.assertEqual(len(self._ledger()["rooms"][ROOM][CARD]["events"]), 1)
 
-    def test_the_poll_loop_records_a_mark_and_never_calls_write_task(self):
+    def test_served_round_consumes_mark_and_acks_ordinary_sibling(self):
         mod = self.mod
-        saved = {n: getattr(mod, n) for n in (
-            "TOKEN", "URL", "_acquire_singleton", "_load_inflight", "_recover_orphan_proactive",
-            "_maybe_start_event_channel", "_heartbeat_singleton", "_post_heartbeat",
-            "_post_task_ack", "_post_ready_results", "_post_proactive", "_reconcile_abandoned",
-            "_emit_gateway_status", "_save_inflight", "_write_task", "_req", "_log",
-            "_push_pool_advertisement", "_start_results_watcher", "_start_outbound_worker")}
-        alive, served, logs, posted = [True, False], [move_mark("task-loop-move")], [], []
-
-        def poll(method, path, payload=None, **kw):
-            if path.startswith("/v1/tasks?wait="):
-                return {"tasks": [served.pop(0)] if served else []}
-            posted.append((path, payload))
-            return {}
-
-        class _Thread:
-            def join(self, timeout=None):
-                return None
-        try:
-            mod.TOKEN, mod.URL = "secret", "http://relay.invalid"
-            mod._acquire_singleton = lambda *a, **k: True
-            mod._load_inflight = lambda *a, **k: set()
-            mod._heartbeat_singleton = lambda *a, **k: alive.pop(0) if alive else False
-            for noop in ("_recover_orphan_proactive", "_maybe_start_event_channel", "_post_heartbeat",
-                         "_post_task_ack", "_post_ready_results", "_post_proactive",
-                         "_push_pool_advertisement", "_save_inflight"):
-                setattr(mod, noop, lambda *a, **k: None)
-            mod._start_results_watcher = lambda *a, **k: None
-            mod._start_outbound_worker = lambda *a, **k: _Thread()
-            mod._reconcile_abandoned = lambda inflight, s, *a, **k: s
-            mod._emit_gateway_status = lambda connected, **k: None
-            mod._log = lambda m: logs.append(str(m))
-            mod._write_task = lambda *a, **k: self.fail("a move mark must never reach _write_task")
-            mod._req = poll
-            mod.main()
-        finally:
-            for n, v in saved.items():
-                setattr(mod, n, v)
-        self.assertIn("session mark task-loop-move recorded, not queued", logs)
-        self.assertIn(("/v1/results", {"id": "task-loop-move", "body": "[no-send]"}), posted)
+        mark = move_mark("task-round-move")
+        sibling = _event("task-round-message", "please check it")
+        tasks, fates = mod._receive_round([mark, sibling])
+        inflight, pending_ack = set(), []
+        with patch.object(mod, "_write_task", wraps=mod._write_task) as write, \
+             patch.object(mod, "_post_task_ack", return_value=True) as ack:
+            self.assertTrue(mod._take_served_round(tasks, inflight, pending_ack, fates, []))
+        write.assert_called_once_with(sibling)
+        self.assertEqual(fates, {mark["id"]: "consumed", sibling["id"]: "acked"})
+        ack.assert_called_once_with(sibling["id"], True, None, dropped=[])
+        self.assertEqual(inflight, {sibling["id"]})
+        self.assertFalse((mod.TASKS_DIR / f"{mark['id']}.txt").exists())
+        self.assertIn(("POST", "/v1/results", {"id": mark["id"], "body": "[no-send]",
+                                              "capabilities": [mod.VOICE_OUTCOME_CONTRACT],
+                                              "dm_only": False}), self.calls)
         self.assertEqual(self._ledger()["rooms"][ROOM][CARD]["positions"][OWNER]["title"], "Testing")
+        text = (mod.TASKS_DIR / f"{sibling['id']}.txt").read_text()
+        self.assertIn("session_ctx", _headers_above_task(text))
+
+    def test_served_round_does_not_consume_ack_first_task(self):
+        mod = self.mod
+        task = dict(move_mark("task-ack-first"), ack_first=True)
+        tasks, fates = mod._receive_round([task])
+        with patch.object(mod, "_consume_session_mark") as consume, \
+             patch.object(mod, "_write_task") as write:
+            self.assertFalse(mod._take_served_round(tasks, set(), [], fates, []))
+        consume.assert_not_called()
+        write.assert_not_called()
+        self.assertIsNone(fates[task["id"]])
 
     def test_a_broken_ledger_never_blocks_the_task(self):
         mod = self.mod

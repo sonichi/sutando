@@ -20,6 +20,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ(**{k: os.environ[k] for k in ("PQ_SEND_PROBE",) if k in os.environ})
+
 REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "ask-owner.py"
 
@@ -138,6 +143,10 @@ class _Workspace(unittest.TestCase):
         patcher = mock.patch.object(skill_roots, "declared_script", return_value=ADAPTER)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The macOS cases below are the owner's opt-in (notifications.macos); default is off.
+        self.macos_opt_in = mock.patch.object(pqa, "resolve_macos_notifications", return_value=True)
+        self.macos_opt_in.start()
+        self.addCleanup(self.macos_opt_in.stop)
 
     def _osascript(self, rc):
         p = self.bin / "osascript"
@@ -479,6 +488,15 @@ class TestFailOpen(_Workspace):
         r = self._run("q?", path=empty)
         self.assertIn("osascript not found", r.stdout)
         self.assertIn("System Settings > Notifications", r.stdout)
+
+    def test_notifications_off_runs_no_osascript_and_reports_no_macos_line(self):
+        self.macos_opt_in.stop()
+        with mock.patch.object(pqa, "resolve_macos_notifications", return_value=False):
+            r = self._run("q?")
+        self.macos_opt_in.start()
+        self.assertNotIn("macos:", r.stdout)
+        self.assertFalse(self.calls.exists(), "osascript ran with macOS notifications off")
+        self.assertEqual(len(self._proactive()), 1, "the question still goes to the owner's DM")
 
     def test_live_notifies_and_durable_does_not(self):
         r = self._run("q?")

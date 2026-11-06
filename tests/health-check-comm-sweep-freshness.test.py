@@ -12,6 +12,12 @@ Run: python3 tests/health-check-comm-sweep-freshness.test.py
 Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
