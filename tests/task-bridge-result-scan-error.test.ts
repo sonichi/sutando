@@ -10,7 +10,7 @@ import { join } from 'node:path';
 // The try still wraps the whole for-loop (abort-the-pass); continuing to
 // the next file is out of scope for #3026.
 
-const SRC = readFileSync(join(import.meta.dirname ?? fileURLToPath(new URL('.', import.meta.url)), '..', 'src', 'task-bridge.ts'), 'utf-8');
+const SRC = readFileSync(join(import.meta.dirname ?? fileURLToPath(new URL('.', import.meta.url)), '..', 'src', 'task-bridge.ts'), 'utf-8').replace(/\r\n/g, '\n');
 
 const LOG = '[TaskBridge] result-scan threw (non-fatal):';
 

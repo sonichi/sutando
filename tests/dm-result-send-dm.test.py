@@ -22,6 +22,11 @@ Three real bugs are covered as regression guards:
     to /messages (Discord 400, error code 50006).
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import json

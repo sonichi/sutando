@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """Shared gateway plumbing for the room-ops capabilities (read / media / react / …).
 
 Every room-ops module is a thin **gateway-only** client: it speaks the stable
@@ -90,13 +92,20 @@ def _channel_env_file():
     boundary the way they already shadow the vault.
 
     The dir is REMOTE_TASK_CHANNEL_DIR, the same expression the gateway bridge
-    uses; hardcoding "ag2space" made every lane read PROD's credential.
+    uses; hardcoding "ag2space" made every lane read PROD's credential. Which
+    file in it is the shared resolver's pick (`channel_env_resolve`), so an
+    install signed in only on a secondary homeserver reads that lane's token.
     """
     try:
         if not _core_src_on_path():
             return None
         from util_paths import claude_home_path
+        from channel_env_resolve import resolve_channel_env
         channel_dir = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+        picked = resolve_channel_env(claude_home_path("channels"), channel_dir)
+        if picked is not None:
+            return str(picked)
+        # No file holds a token: a `.env` with only the URL still answers the URL tier.
         p = claude_home_path("channels", channel_dir, ".env")
         return p if os.path.isfile(p) else None
     except Exception:
@@ -130,6 +139,20 @@ def _from_channel_env(names, env_file=None):
         if got:
             return got
     return ""
+
+
+def _active_lane_value(names):
+    """First of `names` the desktop's active lane sets (`channel_env_resolve.active_lane_values`):
+    a host signed in only on a secondary homeserver has no primary token. '' for a lane bridge."""
+    try:
+        if os.environ.get("REMOTE_TASK_CHANNEL_DIR") or not _core_src_on_path():
+            return ""
+        from channel_env_resolve import active_lane_values
+        from util_paths import claude_home_path
+        found = active_lane_values(claude_home_path("channels"), "ag2space", names)
+    except Exception:
+        return ""
+    return next((found[n] for n in names if n in found), "")
 
 
 def _token_from_vault(vault_get=None):
@@ -182,8 +205,30 @@ def _credential_contract():
     return _gc
 
 
-def gateway():
+class RoomConnectionError(RuntimeError):
+    """The room's server has no usable connection on this install; never another server's token."""
+
+
+def _room_credential(room_id):
+    """(gateway_url, token) the core's `connections.room_credential` names for `room_id`, or None
+    to keep the single-connection chain below. Raises RoomConnectionError on its refusal."""
+    try:
+        if not _core_src_on_path():
+            return None
+        import connections
+    except Exception:
+        return None
+    try:
+        return connections.room_credential(room_id)
+    except connections.ConnectionsError as e:
+        raise RoomConnectionError(str(e)) from None
+
+
+def gateway(room_id=None):
     """Return (base_url, headers). base is '' when no gateway is configured.
+
+    On an install with several connections the connection is chosen by the
+    room's server (`connections.room_credential`); no room means the primary.
 
     PR2 of the credential-contract migration (#2668): parsing/precedence now
     delegates to the vendored shared contract; this facade keeps only the
@@ -200,17 +245,26 @@ def gateway():
     never shadows a fresher env token.
     """
     gc = _credential_contract()
-    raw, _name = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
-    if not raw:
-        raw = _from_channel_env(
-            ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"))
-    if not raw:
-        raw = _token_from_vault()
-    explicit_url, _ = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-    if not explicit_url:
-        explicit_url = _from_channel_env(("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+    routed = _room_credential(room_id)
+    if routed is not None:
+        explicit_url, raw = routed
+    else:
+        raw, _name = gc.resolve_alias_precedence(
+            os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+        token_names = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+        url_names = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL")
+        lane_raw = ""
+        if not raw:
+            raw = _from_channel_env(token_names) or (lane_raw := _active_lane_value(token_names))
+        if not raw:
+            raw = _token_from_vault()
+        if lane_raw:
+            # The lane's bearer only ever goes to the lane's own relay: its URL key, else the token's.
+            explicit_url = _active_lane_value(url_names)
+        else:
+            explicit_url, _ = gc.resolve_alias_precedence(os.environ, url_names)
+            if not explicit_url:
+                explicit_url = _from_channel_env(url_names)
     creds = gc.normalize_credentials(raw, explicit_url=explicit_url,
                                      source="resolved" if raw else "none")
     headers = {"User-Agent": "sutando-room-ops/1"}

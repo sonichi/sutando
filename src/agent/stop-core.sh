@@ -59,5 +59,6 @@ python3 "$SCRIPT_DIR/../core_heartbeat.py" --mark-stopped \
   || echo "stop-core: warning — could not write stop tombstone (recover-core may treat this as a crash)" >&2
 
 tmux -S "$TMUX_SOCKET" kill-session -t "=${SESSION}-watcher" 2>/dev/null || true
+tmux -S "$TMUX_SOCKET" kill-session -t "=${SESSION}-observer" 2>/dev/null || true
 tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION"
 echo "stop-core: $SESSION stopped (socket $TMUX_SOCKET)"

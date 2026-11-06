@@ -13,16 +13,25 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | field  | meaning |
 |--------|---------|
 | `ts`   | epoch seconds |
-| `room` | room id the row belongs to; the drawer in that room shows it. Absent → dock only |
-| `kind` | `processing` (picked the message up) · `thinking` (narration while deciding) · `working` (the tool in use, one line) · `notice` (PR heartbeats and the like) · `done` |
+| `room` | room id the row belongs to; the drawer in that room shows it. Absent → dock only for ordinary activity; only a roomless `wedge` is global |
+| `kind` | `processing` (picked the message up) · `thinking` (narration while deciding) · `working` (the tool in use, one line) · `notice` (PR heartbeats and the like) · `wedge` (**stopped: the owner has to act** — always written roomless, and it shows through a drawer the owner dismissed, because a blocker is not activity, it is why activity stopped) · `done` |
 | `line` | the text, plain |
 | `task` | `{id, from, text}` — the user message this row belongs to (`from` an mxid, `text` ≤160 chars) |
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |
 | `task.event` | event id of the user message (`source_message_id`); the client mounts the per-message card under it |
 | `task.into` | on a consolidated `done`: event id of the message whose reply answered this one too |
+| `queue` | on the `queued` row only: `{depth, position}` — how many tasks are pending and this one's 1-based place in the order the core takes them (`src/task_queue.py`) |
 
 A `notice` row reading `queued` is written by the task watcher when the file lands, before any turn
-has it (`activity.py queued --task-file …`; only for files that name a room and a message).
+has it (the activity bus's QUEUED transition; `activity.py queued --task-file …` is the same row by
+hand, only for files that name a room and a message). With at least one task ahead the line reads
+`queued · N ahead` and carries `queue`.
+
+`python3 $S/activity.py queue --task-file <workspace>/tasks/task-….txt` prints that task's
+`{"depth": N, "position": K}` now. When more than one task is pending, the first line to the task's
+own conversation names the position ("Got it, right after the one I'm on." for one ahead, "Got it,
+N in line before this one." for more); nothing else narrates the queue. When `tasks/` cannot be read
+it prints nothing, says why on stderr and exits 1: the position is unknown then, not zero.
 
 A task's rows are **live** until its `done` row; a task-less row is live 15 minutes. The drawer
 shows only live rows and hides itself when none is live. Rows are flat: the client marks the first
@@ -40,14 +49,14 @@ python3 $S/activity.py done "the drawer is one rolling line" --task-id task-…
 
 Prefer `--task-file <workspace>/tasks/task-….txt`: it fills the task id, `from`, `text` and the room
 from the task's own headers, so a row is always tagged with the room the message came from. Without
-it, `--room` defaults to the room of the owner's latest AG2 Space message (`state/last-owner-activity.json`).
+it, `--room` defaults to the room of the owner's latest s.space message (`state/last-owner-activity.json`).
 With the hook installed, `processing` and `done` are written for you (see below); hand-written rows
 are for anything extra the owner asks to see.
 
 ## Working and Thinking rows, automatically (hooks)
 
-The skill declares three Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
-`PreToolUse`, `PostToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
+The skill declares Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
+`PreToolUse`, `PostToolUse`, `Stop`, `UserPromptSubmit` and `PermissionRequest`); `bash src/install-claude-hooks.sh` registers them like every other
 skill hook. The hook never depends on the agent remembering anything:
 
 - **Processing, automatically.** The first `PreToolUse` in a session whose input names a task file
@@ -57,17 +66,33 @@ skill hook. The hook never depends on the agent remembering anything:
 - **Done, automatically.** A `PostToolUse` whose input wrote `results/task-….txt` (Write, or a shell
   redirect) writes the task's `done` row, only from the session the task is bound to and only if the
   result file exists once the tool has run: a denied or failed write closes nothing.
-- **Working.** Every later `PreToolUse` in that session (Read/Glob/Grep/TodoWrite skipped) becomes a
-  `working` row for the open task bound to it: the description's first sentence, 100 characters.
+- **Working.** Every later `PreToolUse` in that session writes at most one `working` row for the open
+  task bound to it, in the task's room (the client shows a room's newest working row):
+  - a call with a `description` writes its first sentence (100 characters), and never a phase; the step
+    line wins;
+  - a call without one writes its rules phase word (`scripts/phase_line.py`, e.g. "Running tests"), when
+    the room does not show that phase already.
+
+  The phase model's refinement feeds the published task status only, never a room row.
 - **Thinking.** `Stop` reads the last assistant text of *this session's* `transcript_path`
   (complete lines only, so a row mid-write is never split) and writes it as `thinking`.
+- **Turns.** Every event also folds into `state/agent-activity.turns.json`, keyed by the turn's
+  `prompt_id`: the tasks its prompt named (the watcher's `TASK_FILE:` lines), the dialog it is parked
+  on (`PermissionRequest`), and its end (`Stop`). The hook stamps its tmux pane with the open turn
+  (`@sutando_turn`), cleared by that turn's own `Stop`.
+- **Stop interrupt** (`SUTANDO_STOP_INTERRUPT=1`, off by default). The skill's `on_stop_requested`
+  handler (`scripts/stop_interrupt.py`) takes each Stop the watcher reads. It sends one Escape, fenced
+  on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog); a turn on no task never gets one. It then rules the stop from
+  `state/stop-interrupts/<task>.ruling.json`, which the hook re-checks at every turn end: no result once
+  the control task is answered, CANCELLED; a ready result, left to delivery; one being written, wait; unanswered for an hour,
+  CANCELLED. A stop for a task a pool worker holds is routed to that worker's inbox (`pool_router.stop_holder`), so the worker's own watcher runs this. Off, the handler declines and the watcher cancels the task at once.
 - **Scope of task ids.** `task-<hex>` and `task-chat-…` files are tasks; `task-cron-*`, `task-bench-*`,
   `task-workstream-*` and `task-project-grouping-*` are the core's own bookkeeping and produce no rows.
   A result whose body starts with `[no-send]` or `[REPLIED]` closes the task with
   "closed, no message sent from here", never "replied"; a `[deduped: task-X]` pointer closes it as
   "consolidated" with `task.into` = X's message event id (the reply lives under that message).
 - **Bounded, one writer at a time.** Every append and the rotation that follows it run under one
-  `flock` on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
+  cross-platform advisory lock on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
   sessions write at once. The live log keeps the newest 400 rows (older rows move to
   `agent-activity.archive.<YYYY-MM-DD>.jsonl` by the row's own UTC day), and the session bindings
   file drops a task once its done row exists, so the per-tool-call reads stay small.
@@ -75,6 +100,9 @@ skill hook. The hook never depends on the agent remembering anything:
   `agent-activity.summaries.jsonl` — `{ts, started, rows, days, line, room, task}` — so the client can
   fold the card of an old message from it after the rows have rotated out, and expand it from the
   `days` archive files. Served like the log, at `/media/state/agent-activity.summaries.jsonl`.
+- **A sibling feed: private Connect cards.** `connect-apps` writes `state/connect-cards.json` (served at
+  `/media/state/connect-cards.json`); the client draws each card inside this activity card under the
+  message in its `event`, so a Connect card asked from a shared room is only visible to the owner.
 - **Fail closed.** A session with no bound open task writes nothing; a task another session claimed
   is never written to, so narration cannot cross rooms. The writer's own calls never become rows.
 - The hook exits 0 on every path; it must not block the tool it observed.
@@ -82,3 +110,7 @@ skill hook. The hook never depends on the agent remembering anything:
 The private thinking blocks in the transcript hold a signature and no text; narration is the
 nearest available signal. The agent writes nothing it can forget: `processing` and `done` come from the hook. Hand-written
 `thinking`/`notice` rows remain the personalisation surface.
+
+Room scope comes only from explicit `--room` or the task file's `channel_id`.
+Taskless background activity never borrows the owner's last-used room. A wedge
+remains roomless even with a task file, and refuses an explicit `--room`.

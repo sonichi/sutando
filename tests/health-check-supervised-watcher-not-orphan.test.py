@@ -4,6 +4,11 @@ init; a known live parent means supervised, so the remedy must not say to stop i
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys
@@ -109,7 +114,7 @@ if ps_available():
     check("_ps_snapshot lists this process", _snap is not None and str(os.getpid()) in _snap)
 else:
     skip("_ps_snapshot live-OS probes")
-with patch.object(hc.subprocess, "run", side_effect=OSError("boom")):
+with patch.object(hc, "_platform_process_snapshot", return_value=None):
     check("_ps_snapshot returns None when ps cannot run", hc._ps_snapshot() is None)
 
 if ps_available():

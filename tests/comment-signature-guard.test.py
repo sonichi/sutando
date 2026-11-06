@@ -8,6 +8,7 @@ Run:  python3 tests/comment-signature-guard.test.py
 import importlib.util
 import json
 import os
+import shlex
 import sys
 import subprocess
 import tempfile
@@ -34,6 +35,8 @@ class SignatureGuard(unittest.TestCase):
         env = dict(os.environ)
         env.pop("SUTANDO_AGENT_MXID", None)
         env.pop("SUTANDO_ALLOW_UNSIGNED_COMMENT", None)
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         r = subprocess.run([sys.executable, str(HOOK)],
                            input=json.dumps({"tool_name": "Bash", "tool_input": {
                                "command": 'gh pr comment 1 --body "unsigned"'}}),
@@ -45,6 +48,8 @@ class SignatureGuard(unittest.TestCase):
         env = dict(os.environ)
         env["SUTANDO_AGENT_MXID"] = "some-other.agent"
         env.pop("SUTANDO_ALLOW_UNSIGNED_COMMENT", None)
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         r = subprocess.run([sys.executable, str(HOOK)],
                            input=json.dumps({"tool_name": "Bash", "tool_input": {
                                "command": 'gh pr comment 1 --body "unsigned"'}}),
@@ -76,12 +81,14 @@ class SignatureGuard(unittest.TestCase):
 
     def test_body_file_is_read_from_disk(self):
         with tempfile.TemporaryDirectory() as td:
-            unsigned = os.path.join(td, "a.md")
-            signed = os.path.join(td, "b.md")
-            open(unsigned, "w").write("findings below\n")
-            open(signed, "w").write(f"findings below\n\n{NEW}\n")
-            self.assertIsNotNone(G.unsigned_body(f'gh pr comment 1 --body-file {unsigned}'))
-            self.assertIsNone(G.unsigned_body(f'gh pr comment 1 --body-file {signed}'))
+            unsigned = Path(td) / "a.md"
+            signed = Path(td) / "b.md"
+            unsigned.write_text("findings below\n")
+            signed.write_text(f"findings below\n\n{NEW}\n")
+            self.assertIsNotNone(G.unsigned_body(
+                f"gh pr comment 1 --body-file {shlex.quote(str(unsigned))}"))
+            self.assertIsNone(G.unsigned_body(
+                f"gh pr comment 1 --body-file {shlex.quote(str(signed))}"))
 
     def test_an_unreadable_body_file_does_not_deny(self):
         """A gate that cannot read the body cannot answer, and denying on that

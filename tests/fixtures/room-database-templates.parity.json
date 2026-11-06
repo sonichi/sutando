@@ -1,0 +1,278 @@
+{
+  "tasks": {
+    "name": "Tasks",
+    "props": [
+      {
+        "id": "name",
+        "name": "Name",
+        "type": "title"
+      },
+      {
+        "id": "status",
+        "name": "Status",
+        "type": "status",
+        "options": [
+          {
+            "id": "o0",
+            "name": "Not started",
+            "color": "gray",
+            "group": "todo"
+          },
+          {
+            "id": "o1",
+            "name": "In progress",
+            "color": "blue",
+            "group": "doing"
+          },
+          {
+            "id": "o2",
+            "name": "Done",
+            "color": "green",
+            "group": "done"
+          }
+        ]
+      },
+      {
+        "id": "assignee",
+        "name": "Assignee",
+        "type": "person"
+      },
+      {
+        "id": "due",
+        "name": "Due",
+        "type": "date"
+      },
+      {
+        "id": "priority",
+        "name": "Priority",
+        "type": "select",
+        "options": [
+          {
+            "id": "o0",
+            "name": "High",
+            "color": "red"
+          },
+          {
+            "id": "o1",
+            "name": "Medium",
+            "color": "yellow"
+          },
+          {
+            "id": "o2",
+            "name": "Low",
+            "color": "gray"
+          }
+        ]
+      }
+    ],
+    "views": [
+      {
+        "name": "Board",
+        "layout": "board",
+        "groupBy": "status"
+      },
+      {
+        "name": "Table",
+        "layout": "table"
+      },
+      {
+        "name": "Calendar",
+        "layout": "calendar",
+        "dateProp": "due"
+      }
+    ]
+  },
+  "meetings": {
+    "name": "Meeting notes",
+    "props": [
+      {
+        "id": "name",
+        "name": "Meeting",
+        "type": "title"
+      },
+      {
+        "id": "date",
+        "name": "Date",
+        "type": "date"
+      },
+      {
+        "id": "attendees",
+        "name": "Attendees",
+        "type": "person"
+      },
+      {
+        "id": "type",
+        "name": "Type",
+        "type": "select",
+        "options": [
+          {
+            "id": "o0",
+            "name": "Standup",
+            "color": "blue"
+          },
+          {
+            "id": "o1",
+            "name": "Planning",
+            "color": "purple"
+          },
+          {
+            "id": "o2",
+            "name": "Review",
+            "color": "orange"
+          },
+          {
+            "id": "o3",
+            "name": "1:1",
+            "color": "pink"
+          }
+        ]
+      }
+    ],
+    "views": [
+      {
+        "name": "List",
+        "layout": "list",
+        "sort": [
+          {
+            "prop": "date",
+            "dir": "desc"
+          }
+        ]
+      },
+      {
+        "name": "Calendar",
+        "layout": "calendar",
+        "dateProp": "date"
+      }
+    ]
+  },
+  "demo_day": {
+    "name": "Demo day",
+    "props": [
+      {
+        "id": "name",
+        "name": "Use case",
+        "type": "title"
+      },
+      {
+        "id": "presenter",
+        "name": "Presenter",
+        "type": "text"
+      },
+      {
+        "id": "date",
+        "name": "Demo date",
+        "type": "date"
+      },
+      {
+        "id": "minutes",
+        "name": "Minutes",
+        "type": "number"
+      },
+      {
+        "id": "video",
+        "name": "Demo video",
+        "type": "url"
+      },
+      {
+        "id": "status",
+        "name": "Killer use case",
+        "type": "status",
+        "options": [
+          {
+            "id": "o0",
+            "name": "Proposed",
+            "color": "gray",
+            "group": "todo"
+          },
+          {
+            "id": "o1",
+            "name": "Tried by others",
+            "color": "yellow",
+            "group": "doing"
+          },
+          {
+            "id": "o2",
+            "name": "Confirmed",
+            "color": "green",
+            "group": "done"
+          }
+        ]
+      }
+    ],
+    "views": [
+      {
+        "name": "By date",
+        "layout": "table",
+        "sort": [
+          {
+            "prop": "date",
+            "dir": "asc"
+          }
+        ]
+      },
+      {
+        "name": "By status",
+        "layout": "board",
+        "groupBy": "status"
+      },
+      {
+        "name": "Calendar",
+        "layout": "calendar",
+        "dateProp": "date"
+      }
+    ]
+  },
+  "wiki": {
+    "name": "Docs",
+    "props": [
+      {
+        "id": "name",
+        "name": "Title",
+        "type": "title"
+      },
+      {
+        "id": "tags",
+        "name": "Tags",
+        "type": "multi_select",
+        "options": [
+          {
+            "id": "o0",
+            "name": "Guide",
+            "color": "blue"
+          },
+          {
+            "id": "o1",
+            "name": "Reference",
+            "color": "green"
+          },
+          {
+            "id": "o2",
+            "name": "Decision",
+            "color": "purple"
+          },
+          {
+            "id": "o3",
+            "name": "How-to",
+            "color": "orange"
+          }
+        ]
+      },
+      {
+        "id": "owner",
+        "name": "Owner",
+        "type": "person"
+      }
+    ],
+    "views": [
+      {
+        "name": "Gallery",
+        "layout": "gallery"
+      },
+      {
+        "name": "Table",
+        "layout": "table"
+      }
+    ]
+  }
+}

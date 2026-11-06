@@ -1,0 +1,5 @@
+{
+  "name": "ag2space-inbox",
+  "version": "0.1.0",
+  "description": "Feeds a Claude Code session from a Sparrow task inbox and writes its replies as Sparrow result files"
+}

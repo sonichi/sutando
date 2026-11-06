@@ -15,7 +15,7 @@ choosing it is visible in the invocation, not a silent default.
 
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env or env var.
 
---jsonl prints one JSON object per message (id, ts, author, text, reply, url) instead of the
+--jsonl prints one JSON object per message (id, ts, author, text, reply, reply_to_id, url) instead of the
 text lines, for a consumer that needs to link back to the message (the owner's triage card).
 """
 import argparse
@@ -58,13 +58,40 @@ def _parse_args(argv):
                         help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
     parser.add_argument("--jsonl", action="store_true",
-                        help="One JSON object per message (id, ts, author, text, reply, url) instead of the text lines. url is the message's jump link; it costs one channel lookup for the guild id.")
+                        help="One JSON object per message (id, ts, author, text, reply, reply_to_id, url) instead of the text lines. url is the message's jump link; it costs one channel lookup for the guild id.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--serving", default=None,
                       help="Origin channel_id of the task being served. Runs the contextNotFrom gate BEFORE any fetch; exit 2 on block.")
     mode.add_argument("--operator", action="store_true",
                       help="Explicit operator mode: no serving context (core monitoring). Mutually exclusive with --serving.")
     return parser.parse_args(argv)
+
+
+REPLY_MESSAGE_TYPE = 19   # Discord message type: an inline reply
+
+
+def _reply_to_id(msg):
+    """The parent's id, for a REPLY only.
+
+    Two independent facts are needed and neither alone is enough. The enclosing
+    message TYPE says this is a reply (19); `message_reference` says what it
+    points at. `reference.type` 0 is DEFAULT, which Discord also uses for
+    crossposts and pins -- both carry `{type: 0, message_id: ...}` with no
+    embedded parent, so keying on it invents a reply edge for a syndicated post
+    or a pin notification. And `referenced_message` is optional: omitted when
+    unfetched, null when the parent was deleted, which is when a key matters.
+
+    Deliberately excluded, each referencing a message it is not replying to:
+    THREAD_STARTER_MESSAGE (21) points at the message a thread grew from, and
+    CONTEXT_MENU_COMMAND (23) at the command's target.
+    """
+    if msg.get("type") != REPLY_MESSAGE_TYPE:
+        return ""
+    ref = msg.get("message_reference") or {}
+    if ref.get("type", 0) != 0:          # 1 is FORWARD
+        return ""
+    mid = ref.get("message_id") or (msg.get("referenced_message") or {}).get("id") or ""
+    return str(mid)
 
 
 def main(argv=None):
@@ -126,6 +153,9 @@ def main(argv=None):
             print(json.dumps({
                 "id": str(msg.get("id", "")), "ts": ts, "author": author,
                 "text": _render(msg, clip), "reply": ctx or "",
+                # `reply` is clipped at REPLY_CLIP, so matching its text picks
+                # the wrong parent silently once a parent is longer. A key cannot.
+                "reply_to_id": _reply_to_id(msg),
                 "url": f"https://discord.com/channels/{guild or '@me'}/{args.channel_id}/{msg.get('id', '')}",
             }, ensure_ascii=False))
             continue

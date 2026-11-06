@@ -1,0 +1,8 @@
+✽ Spinning… (running PreToolUse hooks… 2/3 · 1m 43s · ↓ 7.1k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+                                                                                ✔ Update installed · Restart to update
+────────────────────────────────────────────────────────────────────── sutando-worker-17c6c3222a4a483b8c68652d58018ad7 ─
+❯ /scratchpad/witness-4795/ws/tasks"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 3 shells, 2 monitors · 1 feedback draft
+  ⧉  errand-deck

@@ -40,6 +40,11 @@ import types
 
 # health-check resolves workspace/channel config at import, so isolate before
 # exec_module or this reads the developer's real per-user config.
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-secret-scanner-")
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "health-check.py"
@@ -116,12 +121,10 @@ check("a -c decoy naming the script is not a bridge", hc._live_bridge_interprete
     "remote-gateway-bridge.py", DECOY, lambda pid: "/decoy/python3"), [])
 check("_proc_executable on an impossible PID -> None", hc._proc_executable(2**31 - 1), None)
 
-_run = hc.subprocess.run
-def _boom(*a, **k):
-    raise OSError("ps unavailable")
-hc.subprocess.run = _boom
+_platform_executable = hc._platform_process_executable
+hc._platform_process_executable = lambda pid: None
 check("_proc_executable when ps cannot run -> None", hc._proc_executable(os.getpid()), None)
-hc.subprocess.run = _run
+hc._platform_process_executable = _platform_executable
 
 # The gateway bridge must be IN the scanned population at all.
 if "remote-gateway-bridge" not in hc._VAULT_SCANNER_BRIDGES:

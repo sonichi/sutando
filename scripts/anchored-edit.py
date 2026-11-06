@@ -41,12 +41,14 @@ Usage:
 """
 import argparse
 import contextlib
-import fcntl
 import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # lint-workspace-resolution: allow-repo-root
+from file_lock import lock_fd, locked_file, unlock_fd  # noqa: E402
 
 
 def apply_edit(text: str, old: str, new: str, allow_multi: bool = False):
@@ -77,12 +79,8 @@ def _edit_lock(p: Path):
     writer holds no longer guards the file its successor sees.
     """
     lock = p.with_name(p.name + LOCK_SUFFIX)
-    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with locked_file(lock):
         yield
-    finally:
-        os.close(fd)
 
 
 def _atomic_write(p: Path, text: str, expect: str) -> None:

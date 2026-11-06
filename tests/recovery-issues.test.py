@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Recovery identity persistence, concurrency, recurrence, and failure contracts."""
 from concurrent.futures import ThreadPoolExecutor
+import ast
 import importlib
 import json
 from pathlib import Path
@@ -38,6 +39,78 @@ class Issues(unittest.TestCase):
         self.assertEqual(sum(e.endswith('_recovered') for e, _ in self.events), 1)
         self.health('down', True)
         self.assertNotEqual(self.events[-1][1]['issue_id'], first)
+
+    def test_cause_is_first_detection_reason_across_retries_and_reload(self):
+        for status, start in [('warn', True), ('down', True), ('ok', False)]:
+            importlib.reload(ri)
+            ri.track_health_issues(self.path, [{'name': 'disk-space', 'status': status,
+                                   'detail': 'private path and error'}], start=start, emit=self.emit)
+        self.assertEqual({p['issue_cause'] for _, p in self.events}, {'health:disk-space:warn'})
+        self.assertEqual(len({p['issue_id'] for _, p in self.events}), 1)
+        self.assertNotIn('private path', json.dumps(self.events))
+
+    def test_builtin_cause_inventory_matches_source(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'src/health-check.py').read_text())
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and key.value == 'name':
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            names.add(value.value)
+            if isinstance(node, ast.Assign):
+                if any(isinstance(t, ast.Name) and t.id == 'name' for t in node.targets):
+                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                        names.add(node.value.value)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in ('check_port', 'check_file', 'check_directory'):
+                    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                        names.add(node.args[1].value)
+            if isinstance(node, ast.For) and isinstance(node.target, ast.Tuple):
+                positions = [i for i, t in enumerate(node.target.elts)
+                             if isinstance(t, ast.Name) and t.id == 'name']
+                if positions and isinstance(node.iter, (ast.List, ast.Tuple)):
+                    for row in node.iter.elts:
+                        if isinstance(row, (ast.List, ast.Tuple)):
+                            for i in positions:
+                                value = row.elts[i]
+                                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                                    names.add(value.value)
+        self.assertGreater(len(names), 60)
+        self.assertFalse(names - ri.HEALTH_CAUSES,
+                         'Built-in checks missing telemetry causes: ' + str(sorted(names - ri.HEALTH_CAUSES)))
+        for name in names:
+            self.assertEqual(ri._health_cause({'name': name, 'status': 'down'}),
+                             'health:' + name + ':down')
+
+    def test_custom_dynamic_and_unknown_names_do_not_leave_host(self):
+        for name, expected in [('extra:private-name', 'custom-check'),
+                               ('dynamic-loop:private-name', 'dynamic-loop'),
+                               ('private-name', 'other-check')]:
+            ri.track_health_issues(self.path, [{'name': name, 'status': 'down'}],
+                                   start=True, emit=self.emit)
+            self.assertEqual(self.events[-1][1]['issue_cause'], 'health:' + expected + ':down')
+        self.assertNotIn('private-name', json.dumps(self.events))
+
+    def test_legacy_open_issue_remains_unknown_without_changing_identity(self):
+        self.path.write_text(json.dumps({'disk-space': {'issue_id': 'existing',
+                                                       'issue_type': 'health_check'}}))
+        ri.track_health_issues(self.path, [{'name': 'disk-space', 'status': 'down'}],
+                               start=True, emit=self.emit)
+        ri.track_health_issues(self.path, [{'name': 'disk-space', 'status': 'ok'}],
+                               start=False, emit=self.emit)
+        self.assertEqual({p['issue_cause'] for _, p in self.events}, {'unknown'})
+        self.assertEqual({p['issue_id'] for _, p in self.events}, {'existing'})
+        self.assertFalse(any(e.endswith('_detected') for e, _ in self.events))
+
+    def test_core_cause_survives_mode_change_and_recovery(self):
+        for alive, cause, status, start in [(False, 'dead', 10, True),
+                                           (True, 'wedged', 10, True),
+                                           (True, None, 11, False)]:
+            ri.track_core_issue(self.path, alive=alive, task='private-task',
+                                status_ts=status, start=start, cause=cause, emit=self.emit)
+        self.assertEqual({p['issue_cause'] for _, p in self.events}, {'core:dead'})
+        self.assertEqual(len({p['issue_id'] for _, p in self.events}), 1)
 
     def test_missing_check_and_warning_leave_issue_open(self):
         self.health('down', True)

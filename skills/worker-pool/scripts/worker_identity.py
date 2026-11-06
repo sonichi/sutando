@@ -132,6 +132,20 @@ def current(workspace, worker_id) -> dict:
                  {"session_id": None, "incarnation_id": None})
 
 
+def transcript_path_for(workspace, cwd: str, session_id: str) -> str:
+    """Where the runtime keeps this session's transcript, or "" if not there yet.
+
+    Empty means "no file", never "unknown": a path to a file nobody wrote turns
+    a not-yet-started session into a lost one.
+    """
+    if not (cwd and session_id):
+        return ""
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    f = (Path(workspace) / ".claude-sutando" / "projects" / slug
+         / f"{session_id}.jsonl")
+    return str(f) if f.is_file() else ""
+
+
 def record_session(workspace, worker_id: str, session_id: str, *, runtime: str,
                    relation: str, parent_session_id=None, host: str = "",
                    cwd: str = "", transcript_path: str = "") -> dict:
@@ -153,16 +167,35 @@ def record_session(workspace, worker_id: str, session_id: str, *, runtime: str,
             return next(r for r in rows if r["session_id"] == session_id)
         row = {"session_id": session_id, "runtime": runtime, "relation": relation,
                "parent_session_id": parent_session_id,
-               "transcript": {"host": host, "cwd": cwd, "path": transcript_path},
+               "transcript": {"host": host, "cwd": cwd,
+                              "path": transcript_path
+                              or transcript_path_for(workspace, cwd, session_id)},
                "first_seen": _now()}
         rows.append(row)
         _write(path, {"sessions": rows})
     return row
 
 
-def start_incarnation(workspace, worker_id: str, session_id: str,
+def worker_for_session(workspace, session_id: str) -> "str | None":
+    """Which worker owns this runtime session, or None.
+
+    Resume needs the worker id BEFORE it can touch that worker's records, and
+    the caller only has what the runtime knows — a session id. Scanning here
+    keeps lineage questions in the module that owns lineage.
+    """
+    root = Path(workspace) / "state" / "workers"
+    if not root.is_dir():
+        return None
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and any(r.get("session_id") == session_id
+                              for r in sessions(workspace, d.name)):
+            return d.name
+    return None
+
+
+def start_incarnation(workspace, worker_id: str, session_id,
                       incarnation_id=None, tmux_socket: str = "",
-                      tmux_session: str = "") -> dict:
+                      tmux_session: str = "", runtime: str = "", cwd: str = "") -> dict:
     """Begin one run. A watcher restart, a terminal reattach, or a delivered
     message is NOT a new run and must not call this.
 
@@ -171,12 +204,20 @@ def start_incarnation(workspace, worker_id: str, session_id: str,
     — tmux's own `$28`/`%28` ids are server-assigned counters, reassigned when
     the server restarts, so they point at nothing after one.
     """
-    if not any(r["session_id"] == session_id for r in sessions(workspace, worker_id)):
+    if session_id is None and runtime != "codex":
+        raise IdentityError("only a Codex incarnation may have an unknown session id")
+    if session_id is None and not worker_dir(workspace, worker_id).is_dir():
+        raise IdentityError(f"worker {worker_id!r} has no identity record")
+    if session_id is not None and not any(
+            r["session_id"] == session_id for r in sessions(workspace, worker_id)):
         raise IdentityError(f"session {session_id!r} is not in this worker's lineage")
     row = {"incarnation_id": incarnation_id or new_incarnation_id(),
            "session_id": session_id, "started_at": _now(),
            "tmux": {"socket": tmux_socket, "session_name": tmux_session},
            "ended_at": None, "end_reason": None}
+    if runtime == "codex":
+        row["runtime"] = runtime
+        row["cwd"] = cwd
     path = incarnations_path(workspace, worker_id)
     with _appending(path):
         rows = incarnations(workspace, worker_id)
@@ -226,6 +267,8 @@ def create_worker(workspace, *, runtime: str, host: str = "", cwd: str = "",
     """
     if resume and fork_from:
         raise IdentityError("resume and fork are different operations — pick one")
+    if runtime == "codex" and (resume or fork_from or session_id):
+        raise IdentityError("Codex does not accept a caller-assigned session id")
     if (resume or fork_from) and not session_id:
         raise IdentityError("resuming or forking needs the session id to act on")
 
@@ -235,13 +278,17 @@ def create_worker(workspace, *, runtime: str, host: str = "", cwd: str = "",
         worker_id = new_worker_id()
     elif worker_dir(workspace, worker_id).exists():
         raise IdentityError(f"worker {worker_id} already exists")
-    sid = session_id or uuid.uuid4().hex
+    sid = session_id or (None if runtime == "codex" else uuid.uuid4().hex)
     relation = RELATION_RESUMED if resume else (RELATION_FORKED if fork_from else RELATION_NEW)
-    record_session(workspace, worker_id, sid, runtime=runtime, relation=relation,
-                   parent_session_id=fork_from, host=host, cwd=cwd,
-                   transcript_path=transcript_path)
+    if sid is None:
+        worker_dir(workspace, worker_id).mkdir(parents=True, exist_ok=False)
+    else:
+        record_session(workspace, worker_id, sid, runtime=runtime, relation=relation,
+                       parent_session_id=fork_from, host=host, cwd=cwd,
+                       transcript_path=transcript_path)
     inc = start_incarnation(workspace, worker_id, sid, tmux_socket=tmux_socket,
-                            tmux_session=tmux_session_name(worker_id))
+                            tmux_session=tmux_session_name(worker_id), runtime=runtime,
+                            cwd=cwd)
     return {"worker_id": worker_id, "runtime_session_id": sid,
             "incarnation_id": inc["incarnation_id"], "relation": relation,
             "tmux_session": inc["tmux"]["session_name"]}

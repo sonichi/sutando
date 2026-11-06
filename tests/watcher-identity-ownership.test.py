@@ -13,6 +13,10 @@ are the reason this is derived from the script path instead.
 
 Run: python3 tests/watcher-identity-ownership.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import sys
 from pathlib import Path
 

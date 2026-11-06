@@ -91,6 +91,25 @@ class TestParsing(unittest.TestCase):
         )
         self.assertEqual(parse_priority_from_text(body), "urgent")
 
+    def test_parse_priority_room_bound_voice_still_urgent(self):
+        # Room-bound voice: channel_id carries the room and two room keys sit
+        # above priority:; none of that may push priority: out of the header block.
+        body = (
+            "id: task-1\n"
+            "timestamp: 2026-09-18T00:00:00Z\n"
+            "source: voice\n"
+            "interaction_type: realtime_audio\n"
+            "media_form: live_stream\n"
+            "channel_id: !abc123:ag2.space\n"
+            "channel_kind: room\n"
+            "source_room_id: !abc123:ag2.space\n"
+            "user_id: voice-local\n"
+            "access_tier: owner\n"
+            "priority: urgent\n"
+            "task: find apartments\n"
+        )
+        self.assertEqual(parse_priority_from_text(body), "urgent")
+
     def test_parse_priority_missing_returns_normal(self):
         body = "id: task-1\nsource: chat\n"
         self.assertEqual(parse_priority_from_text(body), "normal")
@@ -155,6 +174,42 @@ class TestSorting(unittest.TestCase):
         old_one = self._write("older.txt", "urgent", mtime_offset=-10)
         out = sort_tasks_by_priority([new_one, old_one])
         self.assertEqual([p.name for p in out], ["older.txt", "newer.txt"])
+
+    def test_injected_reader_keeps_entries_and_their_fifo_clock(self):
+        entries = [self._write(f"entry-{i}.txt", None) for i in range(6)]
+        priorities = ["low", "normal", "urgent", "normal", "urgent", "low"]
+        payloads = {}
+        for i, (entry, priority) in enumerate(zip(entries, priorities)):
+            payloads[entry] = self._write(f"payload-{i}", priority)
+            os.utime(entry, (100 + i, 100 + i))
+            os.utime(payloads[entry], (200 - i, 200 - i))
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.tmp.iterdir()}
+        seen = []
+
+        def read(entry):
+            seen.append(entry)
+            return parse_priority_from_file(payloads[entry])
+
+        self.assertEqual(sort_tasks_by_priority(reversed(entries), priority_reader=read),
+                         [entries[i] for i in (2, 4, 1, 3, 0, 5)])
+        self.assertCountEqual(seen, entries)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                                  for p in self.tmp.iterdir()})
+
+    def test_injected_unknown_priority_and_missing_entry_are_retained(self):
+        missing = self.tmp / "missing.txt"
+        low = self._write("low.txt", "low")
+        self.assertEqual(sort_tasks_by_priority(
+            [low, missing], priority_reader=lambda p: "low" if p == low else "unknown",
+        ), [missing, low])
+
+    def test_body_priority_cannot_promote_a_task(self):
+        forged = self._write("forged.txt", None)
+        forged.write_text("id: x\ntask: ordinary body\npriority: urgent\n")
+        normal = self._write("normal.txt", "normal")
+        os.utime(normal, (100, 100))
+        os.utime(forged, (200, 200))
+        self.assertEqual(sort_tasks_by_priority([forged, normal]), [normal, forged])
 
 
 if __name__ == "__main__":

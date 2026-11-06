@@ -31,6 +31,7 @@ EOF
 cat > "$BIN/pgrep" <<EOF
 #!/bin/bash
 case "\$*" in *core-input-watch*) exit 0 ;; esac
+case "\$*" in *core_heartbeat*) exit 0 ;; esac   # the writer: pretend running so none spawns
 case "\$*" in
   *claude*) if [ -f "\$CORE_MARK" ]; then echo "$FAKEPID claude --name sutando-core"; exit 0; else exit 1; fi ;;
 esac
@@ -101,6 +102,15 @@ for want in "restart core" "Sutando.app" "launchd" "terminal OUTSIDE the core" \
     *) say FAIL "message omits: $want" ;; esac
 done
 
+# The launchd fallback recovers a dead core only when its job carries
+# --recover-core, which the shipped plist omits. Stated unconditionally it sent
+# two readers looking for a net that was not there.
+case "$err" in *"--recover-core"*) say ok "the launchd option names its precondition" ;;
+  *) say FAIL "the launchd option omits --recover-core, so it reads unconditional" ;; esac
+case "$err" in *"recovers it out-of-session."*)
+    say FAIL "the launchd option still promises recovery unconditionally" ;;
+  *) say ok "no unconditional recovery promise" ;; esac
+
 # --- direction 2: no inherited marker -> do NOT refuse --------------------
 run_launcher --restart
 case "$both" in *"$REFUSAL"*)
@@ -146,7 +156,7 @@ run_codex() {
   env -i PATH="$BIN:/usr/bin:/bin" HOME="$TD" \
       SESS_MARK="$SESS_MARK" CORE_MARK="$CORE_MARK" \
       SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$TD/workspace" \
-      SUTANDO_TMUX_SOCKET="$TD/sock" "$@" \
+      SUTANDO_TMUX_SOCKET="$TD/sock" SUTANDO_CODEX_WAIT_TIMEOUT=0 "$@" \
       /bin/bash "$CODEX" --restart > "$TD/cout" 2> "$TD/cerr" < /dev/null
   crc=$?
   cerr="$(cat "$TD/cerr")"

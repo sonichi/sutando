@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -32,7 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import pending_questions_triage as triage  # noqa: E402
-from util_paths import _host_label  # noqa: E402 — needs the sys.path above
+import atomic_replace  # noqa: E402
 
 
 def _load(name: str, path: Path):
@@ -277,6 +278,42 @@ class Dismissal(unittest.TestCase):
         self.assertEqual([], list(self.store.parent.glob("*.tmp")))
         self.assertEqual({"Qkeep"}, triage.load_dismissed(self.store))
 
+    def test_windows_transient_reader_sharing_violation_recovers(self):
+        triage.dismiss(self.store, "seed")
+        real_replace = atomic_replace.os.replace
+        fake_os = mock.Mock(wraps=atomic_replace.os)
+        fake_os.name = "nt"
+        attempts = 0
+
+        def replace(source, target):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("reader holds target")
+            return real_replace(source, target)
+
+        with mock.patch.object(atomic_replace, "os", fake_os), \
+                mock.patch.object(fake_os, "replace", side_effect=replace), \
+                mock.patch.object(atomic_replace.time, "sleep") as sleep:
+            self.assertEqual(triage.dismiss(self.store, "new"), {"seed", "new"})
+        self.assertEqual(triage.load_dismissed(self.store), {"seed", "new"})
+        self.assertEqual([], list(self.store.parent.glob("*.tmp")))
+        sleep.assert_called_once_with(atomic_replace._WINDOWS_REPLACE_DELAY_S)
+
+    def test_windows_terminal_sharing_violation_retains_store_and_cleans_temp(self):
+        triage.dismiss(self.store, "seed")
+        fake_os = mock.Mock(wraps=atomic_replace.os)
+        fake_os.name = "nt"
+        with mock.patch.object(atomic_replace, "os", fake_os), \
+                mock.patch.object(fake_os, "replace", side_effect=PermissionError("reader holds target")) as replace, \
+                mock.patch.object(atomic_replace.time, "sleep") as sleep:
+            with self.assertRaises(PermissionError):
+                triage.dismiss(self.store, "new")
+        self.assertEqual(replace.call_count, atomic_replace._WINDOWS_REPLACE_ATTEMPTS)
+        self.assertEqual(sleep.call_count, atomic_replace._WINDOWS_REPLACE_ATTEMPTS - 1)
+        self.assertEqual(triage.load_dismissed(self.store), {"seed"})
+        self.assertEqual([], list(self.store.parent.glob("*.tmp")))
+
     def test_only_the_dismissed_row_is_removed(self):
         rows = [_row("Q1"), _row("Q2"), _row("Q3")]
         kept = triage.without_dismissed(rows, {"Q2"})
@@ -307,6 +344,70 @@ class Dismissal(unittest.TestCase):
             "a reader observed a store missing an already-committed dismissal",
         )
         self.assertEqual([], list(self.dir.glob("state/*.tmp")), "temp file left behind")
+
+    def test_posix_reader_does_not_acquire_writer_lock(self):
+        triage.dismiss(self.store, "seed")
+        fake_os = mock.Mock(wraps=triage.os)
+        fake_os.name = "posix"
+        with mock.patch.object(triage, "os", fake_os), \
+                mock.patch.object(triage, "_locked_for_dismiss", side_effect=AssertionError("unexpected lock")):
+            self.assertEqual(triage.load_dismissed(self.store), {"seed"})
+
+    def test_windows_unreadable_sidecar_preserves_empty_fallback(self):
+        fake_os = mock.Mock(wraps=triage.os)
+        fake_os.name = "nt"
+        with mock.patch.object(triage, "os", fake_os), \
+                mock.patch.object(triage, "_locked_for_dismiss", side_effect=PermissionError("denied")):
+            self.assertEqual(triage.load_dismissed(self.store), set())
+
+    def test_windows_reader_waits_for_writer_and_observes_committed_snapshot(self):
+        triage.dismiss(self.store, "seed")
+        writing = threading.Event()
+        release = threading.Event()
+        reading = threading.Event()
+        read_done = threading.Event()
+        observed = []
+        failures = []
+        original_save = triage.save_dismissed
+        fake_os = mock.Mock(wraps=triage.os)
+        fake_os.name = "nt"
+
+        def paused_save(path, ids):
+            writing.set()
+            if not release.wait(5):
+                raise TimeoutError("test writer was not released")
+            original_save(path, ids)
+
+        def writer():
+            try:
+                triage.dismiss(self.store, "new")
+            except BaseException as exc:
+                failures.append(exc)
+
+        def reader():
+            reading.set()
+            observed.append(triage.load_dismissed(self.store))
+            read_done.set()
+
+        with mock.patch.object(triage, "os", fake_os), \
+                mock.patch.object(triage, "save_dismissed", side_effect=paused_save):
+            w = threading.Thread(target=writer, daemon=True)
+            r = threading.Thread(target=reader, daemon=True)
+            w.start()
+            try:
+                self.assertTrue(writing.wait(3))
+                r.start()
+                self.assertTrue(reading.wait(3))
+                self.assertFalse(read_done.wait(0.1), "reader bypassed the writer lock")
+            finally:
+                release.set()
+                w.join(5)
+                if r.ident is not None:
+                    r.join(5)
+            self.assertFalse(w.is_alive(), "dismiss nested a non-reentrant lock")
+            self.assertFalse(r.is_alive(), "reader did not acquire released lock")
+        self.assertEqual(failures, [])
+        self.assertEqual(observed, [{"seed", "new"}])
 
     def test_two_concurrent_dismissals_do_not_clobber_each_other(self):
         """Reviewer-caught race: two callers both read {seed} before either writes,
@@ -347,22 +448,17 @@ class Dismissal(unittest.TestCase):
         self.assertEqual({"seed", "Q1", "Q2"}, triage.load_dismissed(self.store))
 
 
-PQ_FIXTURE = """# Pending Questions
+def _item(ask_id, title, snippet, asked_at):
+    return {"id": title[:40], "ask_id": ask_id, "title": title, "snippet": snippet, "body": snippet,
+            "asked_at": asked_at, "priority": "medium", "in_room": True}
 
-## 2026-08-01 — Old and unblocked
-Nothing references a PR here.
 
-## 2026-08-20 — Blocked on sonichi/sutando#4242
-This one is waiting on a pull request.
-
-## 2026-08-25 — Blocked on sonichi/sutando#4243
-So is this one.
-
-# Resolved
-
-## 2026-07-01 — Archived
-Must never be offered as open.
-"""
+# What the reader lists: this host's open rows (closed ones never reach it).
+PQ_ITEMS = [
+    _item("ask-old", "Old and unblocked", "Nothing references a PR here.", 1_754_006_400.0),
+    _item("ask-4242", "Blocked on sonichi/sutando#4242", "This one is waiting on a pull request.", 1_755_648_000.0),
+    _item("ask-4243", "Blocked on sonichi/sutando#4243", "So is this one.", 1_756_080_000.0),
+]
 
 
 class ReferenceProbe(unittest.TestCase):
@@ -412,48 +508,33 @@ class ReferenceProbe(unittest.TestCase):
 
 
 class AdapterRows(unittest.TestCase):
-    """The API adapter over a workspace that is provably not the operator's.
-
-    The class docstring's guarantee only holds while `hosts/<host>/` has the
-    file: personal_path() falls through past a MISSING one to the real
-    `$SUTANDO_MEMORY_DIR/machine-<host>/`, which on a host where that env var
-    is set for real (qingyun-wu's review, 2026-09-13) resolves to the
-    operator's own file instead of "nothing" — an unlink-then-resolve test
-    silently reading real, private data instead of failing closed. Neutralize
-    both memory-dir env vars for every test in this class, the same way
-    `tests/util-paths-hosts-resolution.test.py`'s `clear_env()` does.
-    """
+    """The API adapter over the reader's items, in a workspace that is provably not the operator's."""
 
     def setUp(self):
-        self._saved_env = {
-            k: os.environ.pop(k, None) for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR")
-        }
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-triage-ws-"))
-        host = _host_label()
-        # Per-host file FIRST so personal_path's first probe hits: a fresh tmp
-        # otherwise falls through to the operator's vault-synced memory tree.
-        self.pq = self.tmp / "hosts" / host / "pending-questions.md"
-        self.pq.parent.mkdir(parents=True, exist_ok=True)
-        self.pq.write_text(PQ_FIXTURE)
         self._saved_ws = api.WORKSPACE_DIR
         api.WORKSPACE_DIR = self.tmp
-        resolved = Path(api.personal_path("pending-questions.md", self.tmp))
-        assert resolved == self.pq, f"workspace escaped tmp: {resolved} != {self.pq}"
+        self.items = [dict(i) for i in PQ_ITEMS]
+        patcher = mock.patch.object(
+            api.pending_questions_reader, "gather",
+            side_effect=lambda ws, *a, **k: {"waiting": list(self.items), "done": 0, "unavailable": False,
+                                             "reason": None, "link": None, "notes": [], "store": "test"})
+        self.waiting = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         api.WORKSPACE_DIR = self._saved_ws
-        for k, v in self._saved_env.items():
-            if v is not None:
-                os.environ[k] = v
 
-    def test_no_questions_file_yields_no_rows_rather_than_an_error(self):
-        self.pq.unlink()
+    def test_no_items_yield_no_rows_rather_than_an_error(self):
+        self.items.clear()
         self.assertEqual([], api._pending_question_rows())
 
-    def test_rows_are_ranked_and_exclude_the_resolved_section(self):
+    def test_rows_are_the_readers_items_ranked_with_the_ask_id_as_the_id(self):
         rows = api._pending_question_rows()
         self.assertEqual(3, len(rows))
-        self.assertNotIn("Archived", " ".join(r["text"] for r in rows))
+        self.assertEqual({r["id"] for r in rows}, {"ask-old", "ask-4242", "ask-4243"})
+        self.assertEqual(rows[0]["asked"], "2025-08-01T00:00:00Z")
+        self.waiting.assert_called_with(self.tmp, api.skill_roots.declared(api.pending_questions_reader.DECLARATION, self.tmp))
 
     def test_a_dismissed_question_stops_being_offered(self):
         rows = api._pending_question_rows()
@@ -463,11 +544,6 @@ class AdapterRows(unittest.TestCase):
         remaining = api._pending_question_rows()
         self.assertEqual(len(rows) - 1, len(remaining))
         self.assertNotIn(target, [r["id"] for r in remaining])
-
-    def test_dismissing_does_not_write_to_the_questions_file(self):
-        before = self.pq.read_text()
-        api.dismiss_question(api._pending_question_rows()[0]["id"])
-        self.assertEqual(before, self.pq.read_text())
 
     def test_an_empty_id_is_rejected_rather_than_stored(self):
         status, _ = api.dismiss_question("")
@@ -499,6 +575,68 @@ class AdapterRows(unittest.TestCase):
             payload = api._questions_queue_payload()
         self.assertEqual(3, len(payload["questions"]))
         self.assertIn("age_days", payload["questions"][0])
+
+
+class PortableDismissal(unittest.TestCase):
+    def test_runtime_import_does_not_require_fcntl(self):
+        code = r"""
+import importlib.abc
+import importlib.util
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import file_lock
+class NoFcntl(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'fcntl':
+            raise ModuleNotFoundError('fcntl is unavailable on Windows')
+sys.modules.pop('fcntl', None)
+sys.meta_path.insert(0, NoFcntl())
+spec = importlib.util.spec_from_file_location('agent_api_portable', Path(sys.argv[1]) / 'agent-api.py')
+api = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api)
+import pending_questions_triage
+pending_questions_triage.dismiss(Path(sys.argv[2]), 'portable')
+assert pending_questions_triage.load_dismissed(Path(sys.argv[2])) == {'portable'}
+"""
+        with tempfile.TemporaryDirectory() as td:
+            result = subprocess.run([sys.executable, '-c', code, str(REPO / 'src'),
+                                     str(Path(td) / 'dismissed.json')],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dismiss_waits_for_shared_sidecar_lock_and_preserves_existing_ids(self):
+        from file_lock import locked_file
+        code = r"""
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pending_questions_triage as triage
+Path(sys.argv[3]).write_text('ready')
+triage.dismiss(Path(sys.argv[2]), 'child')
+"""
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / 'dismissed.json'
+            ready = Path(td) / 'ready'
+            triage.dismiss(store, 'seed')
+            with locked_file(store.with_suffix('.json.lock')):
+                child = subprocess.Popen([sys.executable, '-c', code, str(REPO / 'src'), str(store), str(ready)],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists(), 'child did not start')
+                    time.sleep(0.2)
+                    self.assertIsNone(child.poll(), 'dismiss did not wait for the sidecar lock')
+                    self.assertEqual(json.loads(store.read_text())['dismissed'], ['seed'])
+                except BaseException:
+                    child.terminate()
+                    child.communicate(timeout=10)
+                    raise
+            _, stderr = child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(triage.load_dismissed(store), {'seed', 'child'})
 
 
 if __name__ == "__main__":
