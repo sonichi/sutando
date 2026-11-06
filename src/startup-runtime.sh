@@ -338,29 +338,51 @@ reap_wedged_voice_agent() {
 # both the value in the sentinel and the `ps` argv check. Ownership is resolved by
 # src/watcher_sentinel.sh, which asks the OS whether the process is old enough to
 # have written the file. Nothing here decides ownership locally.
+
+# Echo the classifier's verdict when the answer is usable, rc 1 otherwise, so
+# noise and an unusable answer fail closed alike.
+_reaper_watcher_verdict() {
+  local _pid="$1" _py="$2" _repo="$3" _out _rc=0
+  # -S -I stops a sitecustomize or PYTHONPATH hook printing a verdict-shaped line;
+  # the exact two-line frame refuses any contamination that still arrives.
+  _out="$("$_py" -S -I "$_repo/src/watcher_identity.py" "$_pid" 2>/dev/null)" || _rc=$?
+  [ "$_rc" -eq 0 ] || return 1
+  [ "$(printf '%s\n' "$_out" | grep -c '')" -eq 2 ] || return 1
+  case "$(printf '%s' "$_out" | head -1)" in
+    watcher)     printf 'watcher' ;;
+    not-watcher) printf 'not-watcher' ;;
+    dead)        printf 'dead' ;;
+    *)           return 1 ;;
+  esac
+  return 0
+}
+
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid
   [ -f "$pid_file" ] || return 0
   stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
 
-  # `ps` failing is NOT "the pid is not a watcher". A denied or unavailable ps
-  # skipped the ownership check entirely and still fell through to the release
-  # below, deleting a live watcher's sentinel on a pid-byte match.
-  local ps_err ps_out ps_rc=0
-  ps_err="$(mktemp)"
-  ps_out="$(ps -p "$stale_pid" -o args= 2>"$ps_err")" || ps_rc=$?
-  if [ -s "$ps_err" ]; then
-    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher (ps: $(head -1 "$ps_err")); leaving the sentinel alone"
-    rm -f "$ps_err"
+  # Identity is src/watcher_identity.py's to decide, never a local argv test.
+  local _wi_repo _wi_py _wi_verdict _wi_rc=0
+  _wi_repo="$(sutando_repo_root)"
+  # shellcheck source=../scripts/python-binary.sh
+  source "$_wi_repo/scripts/python-binary.sh"
+  _wi_py="$(require_python "$_wi_repo" "classify the task watcher")" || _wi_py=""
+  if [ -z "$stale_pid" ] || [ -z "$_wi_py" ]; then
+    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher (no interpreter); leaving the sentinel alone"
     return 0
   fi
-  rm -f "$ps_err"
+  # Only a successful helper carrying one exact frame is a verdict; everything
+  # else, `unknown` included, leaves the record untouched.
+  _wi_verdict="$(_reaper_watcher_verdict "$stale_pid" "$_wi_py" "$_wi_repo")" || _wi_rc=$?
+  if [ "$_wi_rc" -ne 0 ] || [ -z "$_wi_verdict" ]; then
+    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher; leaving the sentinel alone"
+    return 0
+  fi
 
-  if [ -n "$stale_pid" ] && printf '%s' "$ps_out" | grep -q "watch-tasks-stream"; then
-    # A watcher younger than the sentinel did not write it, so it is a NEW
-    # watcher on a reissued pid — signalling it would kill a live drain.
-    # errexit-safe: a bare call here terminates startup.sh (set -e) on rc 1/2
-    # before either branch below can run.
+  if [ "$_wi_verdict" = "watcher" ]; then
+    # A watcher younger than the sentinel is on a reissued pid, not its owner.
+    # errexit-safe: a bare call here would terminate startup.sh (set -e) on rc 1/2.
     local owned_rc=0
     sentinel_pid_wrote_file "$stale_pid" "$pid_file" || owned_rc=$?
     if [ "$owned_rc" -eq 1 ]; then
@@ -372,7 +394,34 @@ reap_stale_task_watcher() {
       echo "  ⚠ pid $stale_pid is a watcher but its ownership of the sentinel is UNMEASURABLE; leaving both alone"
       return 0
     fi
-    kill "$stale_pid" 2>/dev/null || true
+    # Releasing the sentinel while the watcher still runs strands it untracked,
+    # so escalate like the voice takeover above and confirm death before release.
+    local _reap_rc=0 _reap_i
+    kill "$stale_pid" 2>/dev/null || _reap_rc=$?
+    for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$stale_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$stale_pid" 2>/dev/null; then
+      # `kill -0` proves A process exists, not the one inspected, and the wait above
+      # is long enough for an exited watcher's pid to be reused — re-prove before KILL.
+      local _re_verdict _re_owned=0
+      _re_verdict="$(_reaper_watcher_verdict "$stale_pid" "$_wi_py" "$_wi_repo")" || _re_verdict=""
+      sentinel_pid_wrote_file "$stale_pid" "$pid_file" || _re_owned=$?
+      if [ "$_re_verdict" != "watcher" ] || [ "$_re_owned" -ne 0 ]; then
+        echo "  ⚠ pid $stale_pid no longer proves to be this sentinel's watcher — not escalating to KILL; leaving both alone"
+        return 0
+      fi
+      kill -KILL "$stale_pid" 2>/dev/null || _reap_rc=$?
+      for _reap_i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$stale_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+    if kill -0 "$stale_pid" 2>/dev/null; then
+      echo "  ⚠ pid $stale_pid survived TERM and KILL (last signal rc $_reap_rc) — leaving its sentinel in place so the live watcher stays tracked"
+      return 0
+    fi
     echo "  ✓ reaped stale watch-tasks-stream watcher (pid $stale_pid)"
   fi
 
@@ -406,11 +455,26 @@ reap_stale_task_watcher() {
 # Requires REPO, PY (resolved via scripts/python-binary.sh) and LOGS_DIR set
 # by the caller — same contract as every other block in startup.sh.
 start_gateway_lanes() {
-  local _RELAY_ENV
-  if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-     { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
-     || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
-    [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  local _DOT_ENV _TOKEN_ENV="" _RELAY_ENV=""
+  _DOT_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"
+  if [ -n "${PY:-}" ]; then
+    # Which file defines the credential is content, not filename: where `.env`
+    # carries another channel's creds the token lives in a sibling.
+    _TOKEN_ENV="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || _TOKEN_ENV=""
+  else
+    # Resolver unrunnable — degrade to the legacy single-file gate rather than
+    # read a configured host as unconfigured, as startup.sh's bridges do.
+    { [ -f "$_DOT_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_DOT_ENV" 2>/dev/null; } \
+      && _TOKEN_ENV="$_DOT_ENV"
+  fi
+  if [ -n "$_TOKEN_ENV" ] || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+    # `.env` is sourced whatever holds the token: it may carry channel POLICY
+    # (tier, marker) and shell-form credentials a KEY=VALUE reader cannot see.
+    [ -f "$_DOT_ENV" ] && { set -a; . "$_DOT_ENV"; set +a; }
+    if [ -n "$_TOKEN_ENV" ] && [ "$_TOKEN_ENV" != "$_DOT_ENV" ] && [ -f "$_TOKEN_ENV" ]; then
+      set -a; . "$_TOKEN_ENV"; set +a
+    fi
+    _RELAY_ENV="${_TOKEN_ENV:-$_DOT_ENV}"
     # Tell the bridge where the durable token lives so auth-rejection recovery
     # (revoked/expired key) can re-read it after the connect flow rewrites it —
     # hot-swap instead of a supervisor crash-loop. Only when the file exists:
@@ -454,8 +518,8 @@ start_gateway_lanes() {
           echo "  ✓ gateway bridge (launchd-supervised)"
           _gw_supervised=1
         else
-          # Loaded is not the same as running: the wrapper exits 0 when the token
-          # is removed, leaving an idle job. Bring it back when credentials return.
+          # Loaded is not the same as running: the wrapper exits 0 only when no
+          # token is configured, leaving an idle job. Bring it back when one exists.
           launchctl kickstart -k "gui/$(id -u)/$_GW_LABEL" > /dev/null 2>&1 || true
           for _ in $(seq 1 12); do
             [ -n "$(_gw_job_pid)" ] && { _gw_supervised=1; break; }
@@ -488,55 +552,57 @@ start_gateway_lanes() {
     # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-    if [ -n "$PY" ]; then
-      SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    if [ -n "$PY" ] && "$PY" "$REPO/scripts/connections.py" legacy-parked > /dev/null 2>&1; then
+      echo "  ⊘ gateway bridge (legacy) parked by a primary move — scripts/connections.py unpark '' to resume"
+    elif [ -n "$PY" ]; then
+      # Once a named row holds the primary, the legacy bridge is a secondary: it must not
+      # inherit the proactive room, or two bridges post nudges. Otherwise the variable passes
+      # through as is, unset included: the bridge reads the device env only when unset.
+      if _gw_primary="$("$PY" "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_gw_primary" ]; then
+        SUTANDO_SUPERVISED=1 REMOTE_PROACTIVE_ROOM="" "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      else
+        SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      fi
       echo "  ✓ gateway bridge (self-defers if already running)"
     else
       echo "  ⊘ gateway bridge skipped — no runnable python3"
     fi
     fi
 
-    # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
-    # the environment launches one extra bridge for that gateway (e.g.
-    # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
-    # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
-    # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
-    # the primary (owner-DM) gateway only.
-    # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
-    # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
-    # launch self-defer and exit, so always-spawn is safe and simpler.
-    for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
-      _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
-      # The guard must wrap the WHOLE command. `VAR=1 [ -n "$PY" ] && cmd` applies
-      # the assignments to `[` and runs cmd with NONE of them — so the named
-      # gateway launched without GATEWAY_INSTANCE / its own REMOTE_TASK_TOKEN /
-      # the REMOTE_PROACTIVE_ROOM= scoping, collapsing onto the primary gateway's
-      # credentials (CR #2599, @qingyun-wu).
-      # The ✓ belongs INSIDE the branch too. Fixing the guard shape here while
-      # leaving the success line outside it still reported a launch that never
-      # happened — per named instance, on a configured remote-control surface.
-      if [ -n "$PY" ]; then
-        # REMOTE_TASK_CHANNEL_DIR isolates this instance's channel config
-        # (.env fallback + access.json). Without it the named instance defaults
-        # to channels/ag2space/ and inherits PROD's credentials and tier map —
-        # the exact failure #2701 exists to prevent (review P1, bassil).
-        # Convention: instance "dev" → channels/dev-ag2space/; anything else →
-        # channels/<inst>-ag2space/ unless the operator overrides via
-        # REMOTE_TASK_CHANNEL_DIR_<INST>.
-        _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
-        _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
-        _gw_token_file_var="REMOTE_TASK_TOKEN_FILE_${_gw_var#AG2_REMOTE_TOKEN_}"
-        _gw_token_file="${!_gw_token_file_var:-$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels "$_gw_chdir" .env)}"
-        [ -f "$_gw_token_file" ] || _gw_token_file=""
-        SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
-          REMOTE_TASK_URL= REMOTE_TASK_TOKEN_FILE="$_gw_token_file" \
-          REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
-          REMOTE_PROACTIVE_ROOM= \
-          "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
-        echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
-      else
-        echo "  ⊘ gateway bridge ($_gw_inst) skipped — no runnable python3"
+    # Named gateways (multi-gateway): one extra bridge per connection row with an
+    # instance (src/connections.py), each against its own homeserver. Env tokens
+    # become rows once (import-env); the plan also covers any AG2_REMOTE_TOKEN_<INST>
+    # the import could not record, so nothing is lost. Each instance gets its own
+    # lock role + state files via GATEWAY_INSTANCE; only the primary row inherits
+    # REMOTE_PROACTIVE_ROOM — proactive nudges stay with the primary gateway.
+    # No pgrep dedupe: the bridge's own per-instance singleton lock makes a
+    # duplicate launch self-defer and exit.
+    if [ -n "$PY" ]; then
+      "$PY" "$REPO/scripts/connections.py" import-env > /dev/null 2>> "$LOGS_DIR/remote-gateway-bridge.log" \
+        || echo "  ⚠ connections import-env failed — launching secondaries from the environment"
+      # One launch per plan line; the token, env shape and launch record are the module's.
+      # An unreadable record is said out loud and the environment's tokens launch on their own.
+      _gw_launch_flag=""
+      if ! _gw_plan="$("$PY" "$REPO/scripts/connections.py" launch-plan 2>> "$LOGS_DIR/remote-gateway-bridge.log")"; then
+        echo "  ⚠ connections launch-plan failed (see remote-gateway-bridge.log) — launching from the environment"
+        _gw_launch_flag="--env-only"
+        _gw_plan="$(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' \
+          | sed 's/^AG2_REMOTE_TOKEN_//' | tr '[:upper:]' '[:lower:]')"
       fi
-    done
+      while IFS="$(printf '\t')" read -r _gw_inst _gw_rest; do
+        [ -n "$_gw_inst" ] || continue
+        if "$PY" "$REPO/scripts/connections.py" launch "$_gw_inst" --repo "$REPO" --logs-dir "$LOGS_DIR" $_gw_launch_flag \
+             >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1; then
+          echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+        else
+          echo "  ⊘ gateway bridge ($_gw_inst) not launched — see remote-gateway-bridge.log"
+        fi
+      done <<< "$_gw_plan"
+    else
+      # Without python3 the plan cannot be read; name every instance the environment declares.
+      for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+        echo "  ⊘ gateway bridge ($(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')) skipped — no runnable python3"
+      done
+    fi
   fi
 }

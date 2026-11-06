@@ -12,6 +12,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
@@ -537,6 +538,15 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
   #dynamic-region .dr-questions .q-item { color: #ddd; padding: 10px 0; border-bottom: 1px solid #2e281844; }
   #dynamic-region .dr-questions .q-item:last-child { border-bottom: none; }
+  #dynamic-region .q-queue-meta { display: flex; gap: 10px; align-items: baseline; font-size: 11px; color: #8a8a99; margin-bottom: 6px; }
+  #dynamic-region .q-wait { color: #f0ad4e; font-weight: 600; }
+  #dynamic-region .q-blocks { color: #7c83ff; }
+  #dynamic-region .q-recheck { font-size: 11px; margin: 6px 0; padding: 5px 8px; border-radius: 6px; background: #2e281844; color: #f0ad4e; }
+  #dynamic-region .q-recheck.q-stale { background: #1d3a2a; color: #4ecca3; }
+  #dynamic-region .q-nav { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  #dynamic-region .q-nav .q-btn { flex: 0 0 auto; }
+  #dynamic-region .q-empty { color: #666; font-size: 12px; text-align: center; padding: 12px; }
+  #dynamic-region .q-unknown { font-size: 11px; margin-bottom: 6px; padding: 5px 8px; border-radius: 6px; background: #3a1d1d; color: #e8a0a0; }
   #dynamic-region .q-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #dynamic-region .q-btn {
     padding: 6px 16px; border-radius: 14px; font-size: 15px; cursor: pointer;
@@ -1906,6 +1916,7 @@ function startTaskPolling() {
       if (sysEl) sysEl.innerHTML = statusParts.length ? statusParts.join(' · ') : '';
       // Update dynamic region with latest data
       window._drQuestions = data.questions || [];
+      window._drQuestionsUnavailable = data.questions_unavailable || null;
       updateDynamicRegion();
     } catch {}
   }, 3000);
@@ -2934,10 +2945,7 @@ function answerQuestion(qid, answer) {
         if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim()) + '</span>';
       }
       // Remove after brief delay so user sees confirmation
-      setTimeout(function() {
-        window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
-        updateDynamicRegion();
-      }, 1500);
+      setTimeout(function() { dropQuestionFromQueue(qid); }, 1500);
       // Show in transcript too
       var el = document.createElement('div');
       el.className = 't-entry t-system';
@@ -3163,6 +3171,7 @@ try { resumePendingChatSends(); } catch {}
 // Priority: dynamic-content.json > pending questions > proactive status > chips
 // Supports: audio, image, video, document, html, and fallback chips
 window._drQuestions = [];
+window._drQuestionsUnavailable = null;
 window._drProactive = null;
 window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
@@ -3248,6 +3257,7 @@ window._drTaskCount = 0;
 window._drTabsRendered = false;
 
 function switchDRTab(tab) {
+  window._drQueueChecked = false;
   window._drActiveTab = tab;
   window._drLocalContent = true; // prevent poll from clearing content
   updateTabHighlights();
@@ -3386,25 +3396,15 @@ function renderTabContent() {
     });
 
   } else if (tab === 'questions') {
-    var questions = window._drQuestions || [];
-    if (questions.length === 0) {
-      container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No pending questions</div>';
-    } else {
-      container.innerHTML = '<div class="dr-questions">' +
-        questions.map(function(q) {
-          return '<div class="q-item"><b>' + esc(q.id) + '</b>: ' + esc(q.text) +
-            (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + esc(q.detail) + '</div>' : '') +
-            '<div class="q-actions">' +
-            (q.options ? q.options.map(function(opt) {
-              return '<button class="q-btn" data-qid="' + q.id + '" data-ans="' + esc(opt) + '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
-            }).join('') :
-            '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
-            '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>') +
-            '<input class="q-input" data-qid="' + q.id + '" placeholder="Or type a response...">' +
-            '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
-            '</div></div>';
-        }).join('') + '</div>';
+    // Re-check immediately before display, once per visit rather than per re-render.
+    // Renders directly on completion — updateDynamicRegion() would refuse while
+    // this tab is still the locally-set one, which is the entire time it's open.
+    if (!window._drQueueChecked) {
+      window._drQueueChecked = true;
+      refreshQuestionQueue().then(function() { updateTabHighlights(); renderTabContent(); });
     }
+    if (!window._drQueue) window._drQueue = window._drQuestions || [];
+    container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0, window._drQuestionsUnavailable);
 
   } else if (tab === 'activity') {
     fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
@@ -3553,12 +3553,163 @@ function updateDynamicRegion() {
   }
 }
 
+// ─── Pending-question triage queue helpers
+// Pure: they take rows and a cursor and return HTML. The queue shows ONE question,
+// so every fact the owner needs to rank it has to be on the card itself.
+function questionWaitLabel(q) {
+  var age = q && q.age_days;
+  if (age === null || age === undefined) return 'age unknown';
+  if (age === 0) return 'asked today';
+  return 'waiting ' + age + (age === 1 ? ' day' : ' days');
+}
+
+function questionBlocksLabel(q) {
+  var refs = (q && q.refs) || [];
+  var blocks = (q && q.blocks) || 0;
+  if (!refs.length) return '';
+  if (!blocks) return 'nothing still blocked';
+  return 'blocking ' + blocks + (blocks === 1 ? ' item' : ' items');
+}
+
+// A re-check that could not decide returns nothing rather than a reassuring note:
+// silence here means "not checked", never "checked and fine".
+function questionRecheckHtml(q) {
+  var rc = q && q.recheck;
+  if (!rc || !rc.note) return '';
+  var stale = rc.status === 'stale';
+  var lead = stale ? 'Re-checked just now: everything this blocks is done ('
+                   : 'Re-checked just now: partly resolved (';
+  return '<div class="q-recheck' + (stale ? ' q-stale' : '') + '">' +
+    esc(lead + rc.note + ')') + '</div>';
+}
+
+function questionQueueCursor(rows, index) {
+  var n = (rows || []).length;
+  if (!n) return 0;
+  return ((index % n) + n) % n;
+}
+
+// With the room unreachable the rows are only what is held locally: the remote queue
+// is unknown, so the banner stays and the counter never claims the rows are all there is.
+function questionUnknownHtml(rows, unavailable) {
+  if (!unavailable) return '';
+  var n = (rows || []).length;
+  return '<div class="q-unknown">Pending questions unknown — room unreachable (' + esc(unavailable) + ')' +
+    (n ? ': showing ' + n + ' held locally; the remote queue is unknown' : '') + '</div>';
+}
+
+function renderQuestionQueue(rows, index, unavailable) {
+  rows = rows || [];
+  // An unreachable room is not an empty queue: the count is unknown, say so.
+  if (!rows.length && unavailable) {
+    return '<div class="q-empty">' + questionUnknownHtml(rows, unavailable) + '</div>';
+  }
+  if (!rows.length) {
+    return '<div class="q-empty">No pending questions</div>';
+  }
+  var i = questionQueueCursor(rows, index);
+  var q = rows[i];
+  var blocks = questionBlocksLabel(q);
+  var position = (i + 1) + ' of ' + rows.length + (unavailable ? ' held locally' : '');
+  var answerBtns = q.options
+    ? q.options.map(function(opt) {
+        return '<button class="q-btn" data-qid="' + esc(q.id) + '" data-ans="' + esc(opt) +
+          '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
+      }).join('')
+    : '<button class="q-btn q-yes" data-qid="' + esc(q.id) + '" data-ans="Approved">Approve</button>' +
+      '<button class="q-btn q-no" data-qid="' + esc(q.id) + '" data-ans="Rejected">Reject</button>';
+  return '<div class="dr-questions">' + questionUnknownHtml(rows, unavailable) + '<div class="q-item">' +
+    '<div class="q-queue-meta">' +
+      '<span>' + esc(position) + '</span>' +
+      '<span class="q-wait">' + esc(questionWaitLabel(q)) + '</span>' +
+      (blocks ? '<span class="q-blocks">' + esc(blocks) + '</span>' : '') +
+    '</div>' +
+    '<b>' + esc(q.text) + '</b>' +
+    questionRecheckHtml(q) +
+    (q.detail && q.detail !== q.text
+      ? '<div style="color:#999;font-size:11px;margin-top:4px;white-space:pre-wrap">' + esc(q.detail) + '</div>'
+      : '') +
+    '<div class="q-actions">' + answerBtns +
+      '<input class="q-input" data-qid="' + esc(q.id) + '" placeholder="Or type a response...">' +
+      '<button class="q-btn q-send" data-qid="' + esc(q.id) + '">Send</button>' +
+    '</div>' +
+    '<div class="q-nav">' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="reply">Reply in chat</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="next">Next</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="dismiss" style="border-color:#66333366;color:#c77">Dismiss</button>' +
+    '</div>' +
+    '</div></div>';
+}
+// ─── End pending-question triage queue helpers
+
+// Re-check runs when the queue is shown or advanced — human cadence, not the 3s poll.
+function refreshQuestionQueue() {
+  return fetch(API_BASE + '/questions/queue')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data && data.questions) {
+        window._drQueue = data.questions;
+        window._drQuestions = data.questions;
+        window._drQuestionsUnavailable = data.questions_unavailable || null;
+      }
+      return window._drQueue;
+    })
+    .catch(function() { return window._drQueue; });
+}
+
+// Renders directly rather than via updateDynamicRegion(): that gate skips
+// rendering for as long as the questions tab is open (see PR body).
+function advanceQuestionQueue(step) {
+  window._drQueueIndex = questionQueueCursor(
+    window._drQueue || [], (window._drQueueIndex || 0) + step);
+  updateTabHighlights();
+  renderTabContent();
+}
+
+function dropQuestionFromQueue(qid) {
+  window._drQueue = (window._drQueue || []).filter(function(q) { return q.id !== qid; });
+  window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
+  window._drQueueIndex = questionQueueCursor(window._drQueue, window._drQueueIndex || 0);
+  updateTabHighlights();
+  renderTabContent();
+}
+
+function dismissQuestion(qid) {
+  fetch(API_BASE + '/question/dismiss', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: qid})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d && d.ok) dropQuestionFromQueue(qid);
+    else alert('Failed: ' + ((d && d.error) || 'unknown error'));
+  }).catch(function() { alert('Could not reach agent API'); });
+}
+
+function replyToQuestionInChat(qid) {
+  var rows = window._drQueue || [];
+  var q = null;
+  for (var i = 0; i < rows.length; i++) { if (rows[i].id === qid) { q = rows[i]; break; } }
+  var input = document.getElementById('textInput');
+  if (!input) return;
+  input.value = 'Re: ' + ((q && q.text) || qid) + ' — ';
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
 // Event delegation for question actions
 document.addEventListener('click', function(e) {
   var btn = e.target.closest && e.target.closest('[data-qid]');
   if (!btn) return;
   var qid = btn.dataset.qid;
-  if (btn.dataset.ans) {
+  var qact = btn.dataset.qact;
+  if (qact === 'next') {
+    // Free by construction: no request, no write. The row stays and comes back round.
+    advanceQuestionQueue(1);
+  } else if (qact === 'dismiss') {
+    dismissQuestion(qid);
+  } else if (qact === 'reply') {
+    replyToQuestionInChat(qid);
+  } else if (btn.dataset.ans) {
     answerQuestion(qid, btn.dataset.ans);
   } else if (btn.classList.contains('q-send')) {
     var inp = document.querySelector('.q-input[data-qid="' + qid + '"]');
@@ -4111,6 +4262,39 @@ function isLoopbackAddress(address: string | undefined): boolean {
 	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+/** /voice-tasks/view: the task table on one page, refreshed every second from /voice-tasks. */
+const VOICE_TASKS_VIEW_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice tasks</title>
+<style>
+body{font:14px/1.4 -apple-system,system-ui,sans-serif;margin:16px;background:#111;color:#eee}
+h1{font-size:18px;margin:0 0 4px}.sub{color:#999;margin-bottom:12px}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #333;vertical-align:top}
+th{color:#999;font-weight:normal}.pending td{color:#fff}.done td{color:#777}
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;background:#333}
+.tag.working{background:#1d4ed8}.tag.queued{background:#6d28d9}.tag.unheard{background:#b45309}.tag.heard{background:#166534}.tag.retired{background:#444}.tag.cancelled{background:#444}.tag.dm{background:#7c2d12}
+</style></head><body>
+<h1>Pending (the core is still working on): <span id="pending">…</span></h1>
+<div class="sub" id="sub"></div>
+<table><thead><tr><th>time</th><th>request</th><th>core</th><th>heard</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+const esc=(s)=>String(s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function tick(){
+  try{
+    const d=await (await fetch('/voice-tasks',{cache:'no-store'})).json();
+    document.getElementById('pending').textContent=d.pending==null?'?':d.pending;
+    document.getElementById('sub').textContent=d.pending==null?(d.note||''):('the core is working on '+d.working+' · done, waiting to be read: '+d.doneNotHeard+' · '+new Date(d.at).toLocaleTimeString());
+    document.getElementById('rows').innerHTML=(d.tasks||[]).map((t)=>{
+      const time=new Date(t.submittedAt).toLocaleTimeString();
+      const core=t.retired?'<span class="tag retired">ended, nothing to say</span>':t.state==='started'?'<span class="tag working">working</span>':t.state==='queued'?'<span class="tag queued">queued</span>':t.state==='cancelled'?'<span class="tag cancelled">cancelled</span>':'<span class="tag">done</span>';
+      const heard=t.heard?'<span class="tag heard">heard ('+esc(t.delivery)+')</span>':t.delivery==='dm'?'<span class="tag dm">DM copy, not heard</span>':t.retired||t.state==='cancelled'?'':'<span class="tag unheard">not heard</span>';
+      return '<tr class="'+(t.pending?'pending':'done')+'"><td>'+time+'</td><td>'+esc(t.text)+'</td><td>'+core+'</td><td>'+heard+'</td></tr>';
+    }).join('');
+  }catch(e){document.getElementById('sub').textContent='cannot reach /voice-tasks: '+e;}
+}
+tick();setInterval(tick,1000);
+</script></body></html>`;
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -4253,6 +4437,28 @@ const server = createServer((req, res) => {
 	// on switch_mode / zoom-auto-flip). Returns "active" or "meeting".
 	// Falls back to "active" if the file is missing. Combined with the
 	// presenter badge poll to render the composite 3-mode badge in the UI.
+	// The relay agent's task table, live: what the voice agent last wrote to state/voice-task-status.json
+	// (every row with where the core stands and whether the user heard the answer, plus the pending count
+	// get_task_status reports). /voice-tasks is the JSON; /voice-tasks/view is a page that refreshes itself.
+	// The rows are the owner's spoken requests: local-only, like /api/task-history (review of #5348, B2).
+	if ((url.pathname === '/voice-tasks' || url.pathname === '/voice-tasks/view') && !LAN_SHARE && !isLoopbackAddress(req.socket.remoteAddress)) {
+		res.writeHead(403, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ error: 'voice tasks are local-only' }));
+		return;
+	}
+	if (url.pathname === '/voice-tasks') {
+		let body = '{"at":0,"pending":null,"working":0,"doneNotHeard":0,"tasks":[],"note":"the voice agent has not written state/voice-task-status.json yet"}';
+		try { body = readFileSync(join(STATE_DIR, 'voice-task-status.json'), 'utf-8'); } catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+		res.end(body);
+		return;
+	}
+	if (url.pathname === '/voice-tasks/view') {
+		res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+		res.end(VOICE_TASKS_VIEW_HTML);
+		return;
+	}
+
 	if (url.pathname === '/voice-mode') {
 		let mode = 'active';
 		try {
@@ -4460,7 +4666,7 @@ const server = createServer((req, res) => {
 					return;
 				}
 				const event = { slug: body.slug, content: body.content, ts: new Date().toISOString() };
-				writeFileSync('/tmp/sutando-note-viewing.json', JSON.stringify(event));
+				writeFileSync(join(tmpdir(), 'sutando-note-viewing.json'), JSON.stringify(event));
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true }));
 			} catch (e) {

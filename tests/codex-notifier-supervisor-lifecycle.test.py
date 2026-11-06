@@ -11,6 +11,7 @@ rather than measured wall-clock gaps -- a sleep-timing assertion is flaky under
 CI load, and a flaky guard is worse than none.
 """
 import os
+import sys
 import time
 import subprocess
 import tempfile
@@ -27,6 +28,23 @@ def _write(path: Path, body: str, executable: bool = False) -> Path:
     if executable:
         path.chmod(0o755)
     return path
+
+
+def _fixture_env(directory):
+    tasks = directory / "workspace" / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    python = _write(directory / "fixture-python", f"""
+        #!/bin/bash
+        case "$1" in */watcher_identity.py) echo no; exit 0 ;; esac
+        exec "{sys.executable}" "$@"
+    """, executable=True)
+    return {
+        "SUTANDO_NOTIFIER_PY": str(python),
+        "SUTANDO_TASKS_DIR": str(tasks),
+        "SUTANDO_WORKSPACE_DIR": str(tasks.parent),
+        "SUTANDO_NOTIFIER_GRACE_PERIOD": "0",
+        "SUTANDO_NOTIFIER_TARGET_POLL": "0.05",
+    }
 
 
 class SupervisorLifecycleTest(unittest.TestCase):
@@ -74,6 +92,7 @@ class SupervisorLifecycleTest(unittest.TestCase):
             "SUTANDO_NOTIFIER_RESTART_DELAY_MAX": "4",
             "SUTANDO_NOTIFIER_STABLE_AFTER": "600",
         })
+        env.update(_fixture_env(self.d))
         env.update(env_extra or {})
         return subprocess.run(["bash", str(SUPERVISOR)], env=env,
                               capture_output=True, text=True, timeout=90)
@@ -134,7 +153,7 @@ class SupervisorLifecycleTest(unittest.TestCase):
         self.assertNotIn("none", owners, "reclaiming must take the lease")
 
     def test_lease_is_held_during_the_run_and_released_after(self):
-        self._run(alive_calls=1, exit_code=1)
+        self._run(alive_calls=2, exit_code=1)
         owners = self.lease_owners_seen()
         self.assertTrue(owners and "none" not in owners, f"lease never taken: {owners}")
         self.assertFalse(self.lock.exists(), "lease outlived the supervisor")
@@ -176,6 +195,7 @@ class LeaseOwnershipTest(unittest.TestCase):
             "SUTANDO_NOTIFIER_RESTART_DELAY_MAX": "2",
             "SUTANDO_NOTIFIER_STABLE_AFTER": "600",
         })
+        env.update(_fixture_env(self.d))
         env.pop("SUTANDO_NOTIFIER_LOCK_DIR", None)
         env.update(extra)
         return env
@@ -200,6 +220,7 @@ class LeaseOwnershipTest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+        proc.communicate()
 
     def _ran(self):
         return self.runs.read_text().split() if self.runs.exists() else []
@@ -364,19 +385,31 @@ class LeaseOwnershipTest(unittest.TestCase):
         self.assertEqual(self._ran(), ["A"])
 
     def _pause_shim(self, name, tools, pattern):
-        """PATH shim for ONE contender: the named tools pause on a go-file when
-        their arguments match `pattern`, then exec the real binary. Holding a
-        contender at its own filesystem action needs no seam in the script, so
-        the same control drives the pre-fix and post-fix supervisor alike."""
+        """Pause one contender before the production filesystem transition.
+        Operation names retain the shell protocol's rm/mv/ln terminology;
+        the helper now performs those actions under the kernel guard."""
         d = self.d / f"{name}-shim"
         d.mkdir(exist_ok=True)
         entered, go = self.d / f"{name}-shim-entered", self.d / f"{name}-shim-go"
-        for tool in tools:
-            _write(d / tool, f"""
-                #!/bin/bash
-                case "$*" in {pattern}) touch "{entered}"; while [ ! -f "{go}" ]; do sleep 0.05; done ;; esac
-                exec /bin/{tool} "$@"
-            """, executable=True)
+        actions = []
+        if "rm" in tools or "mv" in tools:
+            actions.append("remove")
+        if "ln" in tools:
+            actions.append("publish")
+        action_pattern = "|".join(actions)
+        path_pattern = "*.reclaim" if ".reclaim" in pattern else "*lease.lock"
+        _write(d / "python3", f"""
+            #!/bin/bash
+            if [[ "$1" = */notifier_lease.py ]]; then
+                case "$3" in {action_pattern})
+                    case "$4" in {path_pattern})
+                        touch "{entered}"
+                        while [ ! -f "{go}" ]; do sleep 0.05; done
+                    ;; esac
+                ;; esac
+            fi
+            exec "{sys.executable}" "$@"
+        """, executable=True)
         return d, entered, go
 
     def _settle(self, cond, timeout=20):
@@ -418,6 +451,121 @@ class LeaseOwnershipTest(unittest.TestCase):
         self.assertEqual((self.lock / "token").read_text().split(":")[0], str(a.pid),
                          "the lease is not A's")
         self.assertIsNotNone(b.poll(), "B neither launched nor withdrew")
+
+    def test_late_primary_publisher_leaves_successors_token_intact(self):
+        shim, entered, go = self._pause_shim("publisher", ("ln",), "*lease.lock/token*")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     PATH=f"{shim}:{self.d}:{os.environ['PATH']}")
+        self._wait_for(entered, "A did not pause before primary publication")
+        old = time.time() - 600
+        os.utime(self.lock, (old, old))
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("B")
+        token = (self.lock / "token").read_text()
+        go.touch()
+        _, err = a.communicate(timeout=20)
+        self.assertNotEqual(a.returncode, 0, err)
+        self.assertEqual((self.lock / "token").read_text(), token)
+        self.assertIsNone(b.poll())
+        self.assertEqual(self._ran(), ["B"])
+
+    def test_primary_publication_after_stale_verdict_fences_removal(self):
+        pub_shim, pub_entered, pub_go = self._pause_shim("publisher", ("ln",), "*lease.lock/token*")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     PATH=f"{pub_shim}:{self.d}:{os.environ['PATH']}")
+        self._wait_for(pub_entered, "A did not pause before primary publication")
+        old = time.time() - 600
+        os.utime(self.lock, (old, old))
+        rm_shim, rm_entered, rm_go = self._pause_shim("reclaimer", ("rm",), "*lease.lock/token*")
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     PATH=f"{rm_shim}:{self.d}:{os.environ['PATH']}")
+        self._wait_for(rm_entered, "B did not judge the empty primary stale")
+        pub_go.touch()
+        self._await_run("A")
+        token = (self.lock / "token").read_text()
+        rm_go.touch()
+        _, err = b.communicate(timeout=20)
+        self.assertEqual(b.returncode, 0, err)
+        self.assertEqual((self.lock / "token").read_text(), token)
+        self.assertIsNone(a.poll())
+        self.assertEqual(self._ran(), ["A"])
+
+    def test_reclaim_removal_cannot_delete_a_replacement_generation(self):
+        self._plant_stale()
+        reclaim = self._plant_reclaimer("999999:dead")
+        shim, entered, go = self._pause_shim("old-remover", ("rm", "mv"), "*.reclaim*")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     PATH=f"{shim}:{self.d}:{os.environ['PATH']}")
+        self._wait_for(entered, "A did not pause before stale reclaim removal")
+        hook, published, resume = self._hold_hook("replacement")
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_RECLAIM_PUBLISH_HOOK=str(hook))
+        self._wait_for(published, "B did not replace the dead reclaim generation")
+        generation = reclaim.stat().st_ino
+        go.touch()
+        _, err = a.communicate(timeout=20)
+        self.assertNotEqual(a.returncode, 0, err)
+        self.assertEqual(reclaim.stat().st_ino, generation)
+        self.assertEqual(self._ran(), [])
+        resume.touch()
+        self._await_run("B")
+        self.assertIsNone(b.poll())
+        self.assertEqual(self._ran(), ["B"])
+
+    def test_empty_reclaim_recovery_fences_its_late_publisher(self):
+        self._plant_stale()
+        hook, entered, go = self._hold_hook("late-reclaim")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_RECLAIM_PUBLISH_HOOK=str(hook))
+        self._wait_for(entered, "A did not pause before reclaim publication")
+        reclaim = Path(str(self.lock) + ".reclaim")
+        old = time.time() - 600
+        os.utime(reclaim, (old, old))
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("B")
+        token = (self.lock / "token").read_text()
+        go.touch()
+        a.communicate(timeout=20)
+        self.assertEqual((self.lock / "token").read_text(), token)
+        self.assertIsNone(b.poll())
+        self.assertEqual(self._ran(), ["B"])
+
+    def test_kernel_guard_releases_on_crash_and_keeps_its_inode(self):
+        guard = Path(str(self.lock) + ".guard")
+        entered = self.d / "kernel-guard-held"
+        locker = subprocess.Popen([sys.executable, "-c", """
+import fcntl, pathlib, sys, time
+with open(sys.argv[1], 'w') as guard:
+    fcntl.flock(guard, fcntl.LOCK_EX)
+    pathlib.Path(sys.argv[2]).touch()
+    time.sleep(60)
+""", str(guard), str(entered)])
+        self.addCleanup(self._reap, locker)
+        self._wait_for(entered, "fixture did not acquire kernel guard")
+        inode = guard.stat().st_ino
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._wait_for(self.lock, "A did not reach lease publication")
+        self.assertEqual(self._ran(), [])
+        locker.kill()
+        locker.wait(timeout=5)
+        self._await_run("A")
+        a.terminate()
+        a.communicate(timeout=10)
+        self.assertFalse(self.lock.exists())
+        self.assertEqual(guard.stat().st_ino, inode)
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("B")
+        self.assertEqual(guard.stat().st_ino, inode)
+        self.assertIsNone(b.poll())
+
+    def test_symlink_guard_refuses_without_touching_target(self):
+        target = self.d / "unrelated"
+        target.write_text("keep me")
+        Path(str(self.lock) + ".guard").symlink_to(target)
+        result = self._run("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target.read_text(), "keep me")
+        self.assertEqual(self._ran(), [])
 
     def test_published_reclaim_control_still_wins(self):
         """Control: with no contender in the window, the same reclaim runs."""

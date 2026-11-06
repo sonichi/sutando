@@ -14,6 +14,12 @@ is exercised end to end, not mocked.
 Run: python3 tests/runtime-tui-reference-client.test.py
 Exit: 0 on pass, 1 on fail.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import socket
@@ -71,7 +77,7 @@ class TuiReferenceClientTests(unittest.TestCase):
             state = Path(tmp) / "state"
             state.mkdir(parents=True)
             sock = run / "rt.sock"
-            env = {**os.environ,
+            env = {**isolated_child_env(),
                    "SUTANDO_RUN_DIR": str(run),  # hermetic: never the host's live instance.lock
                    "SUTANDO_RUNTIME_SOCKET": str(sock),
                    "SUTANDO_RUNTIME_DB": str(Path(tmp) / "rt.sqlite"),

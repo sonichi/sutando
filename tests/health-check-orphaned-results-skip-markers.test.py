@@ -5,6 +5,11 @@ Run: python3 tests/health-check-orphaned-results-skip-markers.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import shutil
@@ -32,7 +37,7 @@ def _load(workspace: Path):
 class OrphanSkipMarkerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="orphan-markers-"))
-        self._env = dict(os.environ)
+        self._env = isolated_child_env()
         (self.tmp / "results").mkdir(parents=True)
         (self.tmp / "tasks").mkdir(parents=True)
         self.mod = _load(self.tmp)
@@ -73,6 +78,21 @@ class OrphanSkipMarkerTest(unittest.TestCase):
         self._result("task-replied-1", "[REPLIED]\nalready sent via the other path")
         r = self._run()
         self.assertEqual(r["status"], "ok", r["detail"])
+
+    # --- not silently dropped either: a skip nobody retired is counted --------
+    def test_unretired_skips_are_counted_in_the_detail(self) -> None:
+        self._result("task-nosend-3", "[no-send]\nbookkeeping")
+        self._result("task-replied-3", "[REPLIED]\nposted")
+        self._result("task-nosend-young", "[no-send]\nfresh", age_s=10)
+        r = self._run()
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertIn("2 skip-marked result(s) still live past the threshold, unretired", r["detail"])
+        self.assertNotIn("task-nosend-3", r["detail"])
+
+    def test_no_skips_means_no_unretired_note(self) -> None:
+        self._result("task-plain-3", "a real undelivered reply")
+        r = self._run()
+        self.assertNotIn("unretired", r["detail"])
 
     # --- the deliberate NON-exemption ---------------------------------------
     def test_deduped_is_still_reported(self) -> None:

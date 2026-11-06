@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { _shouldFallthrough, _shouldRegisterTaskRow } from '../src/task-bridge.js';
+import { _shouldFallthrough, _shouldRegisterTaskRow, DESTINED_PROACTIVE_RE } from '../src/task-bridge.js';
 
 // Regression for issue #1035 (follow-up to PR #1033, per-channel pull path).
 //
@@ -57,6 +57,15 @@ describe('_shouldFallthrough — belt-suspenders guard for result-watcher fallth
 		assert.equal(_shouldFallthrough('proactive-1234567890.txt'), true);
 		assert.equal(_shouldFallthrough('proactive-result-task-abc-1234.txt'), true);
 		assert.equal(_shouldFallthrough('proactive-timeout-task-abc-1234.txt'), true);
+	});
+
+	it('REJECTS a .to-<bridge> proactive file: the named bridge claims it, voice must not retire it', () => {
+		assert.equal(_shouldFallthrough('proactive-ask-1800000000000-42-a1b2c3.to-ag2space.txt'), false);
+		assert.equal(_shouldFallthrough('proactive-ask-1800000000000-42-a1b2c3.to-discord.txt'), false);
+		assert.equal(_shouldFallthrough('proactive-result-task-abc-1234.to-slack.txt'), false);
+		assert.equal(DESTINED_PROACTIVE_RE.test('proactive-ask-1.to-telegram.txt'), true);
+		assert.equal(DESTINED_PROACTIVE_RE.test('proactive-ask-1.txt'), false, 'untagged stays voice-speakable');
+		assert.equal(DESTINED_PROACTIVE_RE.test('task-1.to-discord.txt'), false, 'only the proactive family carries the tag');
 	});
 
 	it('rejects unknown / unfamiliar prefixes', () => {

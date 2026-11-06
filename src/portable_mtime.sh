@@ -1,7 +1,6 @@
 #!/bin/bash
-# The ONE portable mtime probe. GNU `stat -f` means --file-system and SUCCEEDS
-# with prose, so a BSD-first `||` chain never falls through on Linux; validate
-# the RESULT. Prints epoch seconds; returns 2 when the mtime is unreadable.
+# Portable epoch mtime: GNU stat -f succeeds with prose, so validate the result.
+# Return 2 when neither platform form yields a readable numeric timestamp.
 portable_mtime() {
   local mt
   mt="$(stat -c %Y "$1" 2>/dev/null || true)"

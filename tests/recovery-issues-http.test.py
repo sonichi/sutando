@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """Exercise recovery entry points across processes with real local HTTP capture."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 from pathlib import Path
@@ -53,7 +59,7 @@ class LocalCapture(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, POSTHOG_HOST=f'http://127.0.0.1:{server.server_port}',
+            env = isolated_child_env(POSTHOG_HOST=f'http://127.0.0.1:{server.server_port}',
                        POSTHOG_API_KEY='local-test-only', DO_NOT_TRACK='0', SUTANDO_TELEMETRY='1',
                        SUTANDO_STATE_DIR=directory,
                        SUTANDO_TELEMETRY_ID_FILE=str(Path(directory)/'telemetry-id'),
@@ -71,7 +77,7 @@ class LocalCapture(unittest.TestCase):
             run('core', now=10123)
             run('core', now=10130, status_ts=11)
             run('core', now=10140, status_ts=12)
-            checks = [{'name': 'private-a', 'status': 'down'},
+            checks = [{'name': 'disk-space', 'status': 'down'},
                       {'name': 'private-b', 'status': 'down'}]
             run('health', now=10, start=True, checks=checks)
             checks[0]['status'] = 'ok'
@@ -91,6 +97,9 @@ class LocalCapture(unittest.TestCase):
             self.assertEqual(len({e['distinct_id'] for e in received}), 1)
             self.assertNotIn('private-', json.dumps(received))
             self.assertTrue(all(e['api_key'] == 'local-test-only' for e in received))
+            self.assertEqual({e['properties']['issue_cause'] for e in issues},
+                             {'core:wedged', 'health:disk-space:down', 'health:other-check:down'})
+            print('HTTP causes: core:wedged, health:disk-space:down, health:other-check:down')
             print('Local HTTP: 6 attempts, 3 unique issues, 3 recoveries (100%), 1 install')
 
             checks[0]['status'] = 'down'
@@ -101,7 +110,7 @@ class LocalCapture(unittest.TestCase):
             print('Recurrence: new issue ID confirmed')
             before = len(received)
             env['DO_NOT_TRACK'] = '1'
-            run('health', now=70, checks=[{'name': 'private-a', 'status': 'ok'}])
+            run('health', now=70, checks=[{'name': 'disk-space', 'status': 'ok'}])
             self.assertEqual(len(received), before)
             print('DO_NOT_TRACK=1: zero HTTP events')
 
