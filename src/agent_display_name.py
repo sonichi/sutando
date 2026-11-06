@@ -102,10 +102,7 @@ def connection_name(mxid: str, workspace: Optional[Path] = None) -> str:
 
 def configured_name(environ: Optional[Mapping[str, str]] = None) -> str:
     """SUTANDO_DISPLAY_NAME, else AGENT_DISPLAY_NAME, from the environment or the channel env file."""
-    try:
-        from channel_credentials import channel_value
-    except Exception:  # noqa: BLE001
-        return ""
+    from channel_credentials import channel_value
     for var in CONFIGURED_VARS:
         with contextlib.suppress(Exception):
             name = clean(channel_value(var, environ))

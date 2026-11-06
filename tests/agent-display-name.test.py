@@ -6,7 +6,9 @@ itself by the display name on every greeting path; with no display name the docu
 order applies (connection record, configured name, mxid localpart, "Sutando")."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -95,6 +97,34 @@ class ResolveTest(Fixture):
     def test_an_unreadable_connection_record_falls_through(self):
         with mock.patch("connections.read_rows", side_effect=RuntimeError("boom")):
             self.assertEqual(adn.resolve(MXID, fetch=profile(None))[1], "localpart")
+
+
+class EntryTest(Fixture):
+    """resolve() with no mxid finds this agent's own, and the CLI routes --room / --agent-mxid."""
+
+    def main(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(adn, "profile_name", return_value=""):
+            self.assertEqual(adn._main(list(argv)), 0)
+        return out.getvalue()
+
+    def test_resolve_reads_the_agent_mxid_and_survives_none(self):
+        with self.rows(), mock.patch.dict(os.environ, {"AGENT_MXID": MXID}):
+            self.assertEqual(adn.resolve(fetch=profile(DISPLAY)), (DISPLAY, "profile"))
+        with self.rows(), mock.patch.object(adn, "agent_mxid", side_effect=RuntimeError("no identity")):
+            self.assertEqual(adn.resolve(fetch=profile(DISPLAY)), ("Sutando", "fallback"))
+
+    def test_cli_uses_the_room_agent_then_the_given_mxid_then_its_own(self):
+        with self.rows({"agent_mxid": MXID, "agent_display_name": DISPLAY}):
+            with mock.patch("channel_credentials.room_agent_mxid", return_value=MXID):
+                got = json.loads(self.main("--room", "!r:example.invalid", "--json"))
+            self.assertEqual(got, {"name": DISPLAY, "source": "connection", "agent_mxid": MXID})
+            self.assertEqual(self.main("--agent-mxid", MXID).strip(), DISPLAY)
+            with mock.patch("channel_credentials.room_agent_mxid", side_effect=RuntimeError("no row")), \
+                    mock.patch.object(adn, "agent_mxid", return_value=MXID):
+                self.assertEqual(self.main("--room", "!r:example.invalid").strip(), DISPLAY)
+            with mock.patch.object(adn, "agent_mxid", side_effect=RuntimeError("no identity")):
+                self.assertEqual(json.loads(self.main("--json"))["name"], "Sutando")
 
 
 class GreetingPathsTest(Fixture):
