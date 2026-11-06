@@ -102,14 +102,18 @@ check("a list reads back", ds.read_crons(p) == [{"name": "x"}])
 with tempfile.TemporaryDirectory() as td:
     shell_path = Path(td) / "crons.json"
     shell_path.write_text(json.dumps([
-        {"name": "poll", "cron": "* * * * *", "shell_command": "echo <ready>"},
-        {"name": "named", "shell_command": "echo ready", "description": "Custom"},
+        {"name": "poll", "cron": "* * * * *", "launchd": True, "shell_command": "echo <ready>"},
+        {"name": "named", "launchd": True, "shell_command": "echo ready", "description": "Custom"},
+        {"name": "unowned", "shell_command": "echo ready", "description": "Custom"},
     ]))
-    shell, named = ds.list_schedules(shell_path, now=_now)
+    shell, named, unowned = ds.list_schedules(shell_path, now=_now)
     check("shell kind survives listing", shell["kind"] == "shell")
     check("shell description stays unescaped in the domain",
           shell["description"] == "Runs shell command: echo <ready>")
     check("explicit shell description wins", named["description"] == "Custom")
+    check("unowned shell is unrunnable rather than advertised as executable",
+          unowned["kind"] == "malformed" and unowned["prompt_or_skill"] == ""
+          and unowned["description"].startswith("WILL NOT RUN"))
 
 
 # ── write_crons atomicity + cleanup ──────────────────────────────────────────
