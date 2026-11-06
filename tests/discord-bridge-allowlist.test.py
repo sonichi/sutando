@@ -126,7 +126,12 @@ def main() -> int:
                 break
             start = prev
         window = src[start:match.end()]
-        if f"_is_path_sendable({arg})" not in window and f"_is_path_sendable( {arg}" not in window:
+        # `_classify_attachment` returns ATTACH_SEND only when is_path_sendable
+        # is true, so gating on that outcome is the same authorization decision.
+        gated = (f"_is_path_sendable({arg})" in window
+                 or f"_is_path_sendable( {arg}" in window
+                 or ("_ATTACH_SEND" in window and f"_classify_attachment({arg})" in window))
+        if not gated:
             return fail(
                 f"discord.File({arg}) sink found without preceding _is_path_sendable gate",
                 window,

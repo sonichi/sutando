@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · say — post a plain message into a room, addressed to nobody.
 
 `mention` already reaches `op:message`, but it welds a resolved mxid onto the
@@ -13,10 +15,12 @@ here too.
 """
 from __future__ import annotations
 
+import json
 import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
 import receipt as _receipt
+from relations import RelationError, relation_fields
 
 
 def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
@@ -24,8 +28,93 @@ def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
             "reason": reason, "state": state or (_receipt.CONFIRMED if ok else _receipt.FAILED)}
 
 
-def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) -> dict:
+# Fields of the message itself: in extra_content they mean a whole wrapper was passed.
+RESERVED_EXTRA_KEYS = ("body", "msgtype", "room", "extra_content", "formatted_body", "format")
+
+
+def extra_content_problem(extra) -> str | None:
+    """Why `extra` cannot ride as extra_content, or None when it can."""
+    if not isinstance(extra, dict):
+        return "extra_content must be a JSON object"
+    reserved = [k for k in RESERVED_EXTRA_KEYS if k in extra]
+    if reserved:
+        return (f"extra_content carries {', '.join(reserved)} at the top level; those belong to "
+                "the message, not its extra content. Pass only the extra_content object itself")
+    if "space.ag2." in extra:
+        return ('extra_content has the bare key "space.ag2."; a card key names its card, '
+                "like space.ag2.collab.doc.summon")
+    nested = _misplaced_card(extra)
+    if nested:
+        return (f"extra_content has a space.ag2.* key at {nested}, under a key that is not a "
+                "card; a card must sit at the top level of extra_content or no client renders it")
+    return None
+
+
+def is_card_key(key) -> bool:
+    """A space.ag2.* key that names something after the prefix."""
+    return isinstance(key, str) and key.startswith("space.ag2.") and len(key) > len("space.ag2.")
+
+
+def _misplaced_card(extra: dict) -> str | None:
+    """Path of a space.ag2.* key under a top-level key that is not a card. A card (a named
+    space.ag2.* key whose value is an object) is never inspected: its sub-keys are its own."""
+    for k, v in extra.items():
+        if is_card_key(k) and isinstance(v, dict):
+            continue
+        found = _first_card_key(v, f"extra_content[{json.dumps(k, ensure_ascii=False)}]")
+        if found:
+            return found
+    return None
+
+
+def _first_card_key(value, path: str) -> str | None:
+    items = value.items() if isinstance(value, dict) else \
+        enumerate(value) if isinstance(value, list) else ()
+    for k, v in items:
+        here = f"{path}[{json.dumps(k, ensure_ascii=False)}]"
+        if isinstance(k, str) and k.startswith("space.ag2."):
+            return here
+        found = _first_card_key(v, here)
+        if found:
+            return found
+    return None
+
+
+def _a2ui_card(raw):
+    """Validated buttons card from SUTANDO_WORKER_A2UI (JSON). The client
+    renders {type:"buttons"} and a tap sends the option's action as a message."""
+    if not raw:
+        return None
+    try:
+        card = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(card, dict) or card.get("type") != "buttons":
+        return None
+    opts = card.get("options")
+    if not (isinstance(opts, list) and opts and all(
+            isinstance(o, dict) and isinstance(o.get("label"), str)
+            and isinstance(o.get("action"), str) for o in opts)):
+        return None
+    return {"version": "0.9", "type": "buttons",
+            "prompt": str(card.get("prompt") or ""),
+            "options": [{"label": o["label"], "action": o["action"]} for o in opts]}
+
+
+def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
+        *, reply_to: str | None = None, worker: str | None = None,
+        extra_content: dict | None = None, thread_root: str | None = None) -> dict:
     """Post `message` into `room_id` verbatim, mentioning no one.
+
+    `reply_to` cites the message being replied to; the post stays in the main
+    timeline. `thread_root` puts it in that message's thread instead. See
+    relations.relation_fields.
+
+    `extra_content` rides on the event beside the body: a protocol payload a
+    client renders (a document comment's anchor, say). The gateway keeps only
+    `space.ag2.*` keys, so a reserved Matrix key cannot be smuggled through it.
+    A wrapper-shaped or nested payload is refused here (extra_content_problem):
+    the gateway would drop it silently and the post would land as plain prose.
 
     Returns {ok, room_id, event_id, reason}. Refuses before any network call when
     the room is missing, the body is empty, or the client gate denies the room.
@@ -37,6 +126,18 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) ->
     if not message or not message.strip():
         return _result(False, room_id=room_id, reason="message required")
 
+    if extra_content is not None:
+        problem = extra_content_problem(extra_content)
+        if problem:
+            return _result(False, room_id=room_id, reason=problem)
+
+    # Before the gate and the network: a bad event id is the caller's typo, and
+    # posting it unrelated would cite the wrong message silently.
+    try:
+        rel = relation_fields(reply_to=reply_to, thread_root=thread_root)
+    except RelationError as e:
+        return _result(False, room_id=room_id, reason=str(e))
+
     if agent_mxid is None:
         agent_mxid = os.environ.get("AGENT_MXID")
 
@@ -44,16 +145,41 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) ->
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
 
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, reason="no gateway configured")
 
     try:
         # No `mentions` key: `say` must not ping. A body carrying an mxid the
         # caller wrote is theirs; this function never prepends one.
+        if worker is None:
+            worker = os.environ.get("SUTANDO_WORKER_ID") or (
+                f"worker-{os.environ.get('SUTANDO_WORKER_SEAT') or os.environ['SUTANDO_CORE_ID']}"
+                if os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID") else None)
+        # The client renders attribution from this per-event stamp; a direct
+        # post self-declares its worker, and optionally its color.
+        _color = (os.environ.get("SUTANDO_WORKER_ACCENT")
+                  or os.environ.get("SUTANDO_WORKER_COLOR"))  # COLOR: one-release alias
+        _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
+        _attn = os.environ.get("SUTANDO_WORKER_ATTENTION") == "1"
+        _style = os.environ.get("SUTANDO_WORKER_STYLE")
+        _styles = ("stripe", "highlight", "none")
+        _w = ({"id": worker,
+               **({"color": _color} if _color else {}),
+               **({"stripe": _stripe != "0"} if _stripe in ("0", "1") else {}),
+               **({"style": _style} if _style in _styles else {}),
+               **({"attention": True} if _attn else {})}
+              if worker else None)
+        _extra = {"space.ag2.worker": _w} if _w else {}
+        _card = _a2ui_card(os.environ.get("SUTANDO_WORKER_A2UI"))
+        if _card:
+            _extra["space.ag2.a2ui"] = _card
+        if extra_content:
+            _extra.update(extra_content)
+        stamp = {"extra_content": _extra} if _extra else {}
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
-            {"op": "message", "room_id": room_id, "body": message},
+            {"op": "message", "room_id": room_id, "body": message, **rel, **stamp},
         )
     except HTTPError as e:
         return _result(False, room_id=room_id, reason=degrade_reason(e.code))

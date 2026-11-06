@@ -105,7 +105,6 @@ tests/bridge-restart-intercept.test.py
 tests/bridge-skill-path-resolution.test.py
 tests/bridges-allowlist-default-readonly.test.py
 tests/bridges-sending-orphan-recovery.test.py
-tests/discord-bridge-access-no-clobber.test.py
 tests/discord-bridge-attachment-filename-sanitize.test.py
 tests/discord-bridge-codex-subprocess-argv.test.py
 tests/discord-bridge-collaborator-tier.test.py

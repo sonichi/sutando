@@ -167,6 +167,17 @@ def _open_dm_channel(owner_id: str, token: str) -> str:
 
 def send_dm(text: str) -> bool:
     """Send text to the resolved owner's Discord DM."""
+    # This sender only ever opens the owner's DM, so a [channel:] redirect names a
+    # destination it cannot reach; refusing beats misrouting the body silently.
+    redirects = [a.value for a in parse_markers(text).actions if a.kind == "redirect"]
+    if redirects:
+        print(
+            f"dm-result: body carries a [channel: {redirects[0]}] redirect, "
+            "which this sender cannot honor (owner DM only). Not sending.",
+            file=sys.stderr,
+        )
+        return False
+
     token = _load_token()
     if not token:
         print("dm-result: DISCORD_BOT_TOKEN not found in .env", file=sys.stderr)

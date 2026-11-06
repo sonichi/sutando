@@ -17,11 +17,12 @@ Calling it again while push mode is already on just sends another frame
 
 import mimetypes
 import os
+from sutando_config import config_get
 import urllib.request
 import urllib.error
 
 
-VISION_PORT = int(os.environ.get("VISION_CONTROL_PORT", "7847"))
+VISION_PORT = int(config_get("VISION_CONTROL_PORT", "7847"))
 VISION_BASE = f"http://127.0.0.1:{VISION_PORT}"
 
 # Skip bytes below typical JPEG minimum to avoid forwarding corrupted or

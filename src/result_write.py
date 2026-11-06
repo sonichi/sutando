@@ -1,39 +1,21 @@
 #!/usr/bin/env python3
-"""Paired result write — the one validating writer for `results/task-<id>.txt`.
+"""Validate a task-id echo, then publish a result and content-bound receipt.
 
-A session holding two tasks at once can compose a reply for A and write it into
-B's result file; nothing downstream can tell, because a result file carries no
-statement of which task it answers. Both replies then reach the wrong user. The
-fix is to make the writer refuse a body that does not name its task: the body's
-FIRST line must be exactly `task: <id>`, matching the id the caller was told to
-answer. On mismatch nothing is written at all — not a partial file, not a temp
-file. On success the echo line is stripped (users never see it) and the result
-lands atomically under the canonical `task-<id>.txt` name.
-
-This is the protocol layer, shared by every runtime's completion step: the
-Claude entry (`skills/proactive-loop/SKILL.md`), the Codex entry
-(`src/agent/codex/cli/task-notifier.sh`), and the pool follower. Runtimes differ
-in how they learn about a task and what else completion entails (done-flags,
-archiving); the pairing rule and the atomic write do not, so they live here once.
-
-`write_paired_result` also drops a pairing receipt under
-`state/result-pairing/`. That receipt is what lets an EXTERNAL process — one
-holding the correct task id but not the body — distinguish "the agent completed
-this task through the sanctioned path" from "a file with the right name
-appeared". Without it, an after-the-fact reader cannot recover the pairing,
-because the echo line is stripped before the body is written.
-
-Task-file (read-side) schema lives in `src/local_task_protocol.py`; result-body
-markers live in `src/result_markers.py`. Stdlib only, no network, no daemon.
+The caller supplies both ids: this catches transposed ids, not prose that
+semantically answers another task. The receipt records bytes, not meaning.
+Publication uses result_publish under a per-task lock; readers must verify
+raw bytes before normalizing text. Missing-receipt rollout is not enforced
+by this module's compatibility predicate yet.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import os
-import secrets
 import sys
 from pathlib import Path
+
+from file_lock import locked_file
+from result_publish import publish_text
 
 RECEIPTS_SUBPATH = ("state", "result-pairing")
 
@@ -98,6 +80,7 @@ def receipt_body(task_id: str, body: str) -> str:
 def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
     """True only when the receipt names THIS task and THESE bytes. Presence is
     not attestation: an empty or stale receipt answers False."""
+    task_id = task_id_from(task_id)
     try:
         raw = receipt_path(receipts_dir, task_id).read_text()
         rec = json.loads(raw)
@@ -105,7 +88,8 @@ def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
         return False
     if not isinstance(rec, dict) or rec.get("task_id") != task_id:
         return False
-    return rec.get("sha256") == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return (rec.get("sha256") == hashlib.sha256(body.encode("utf-8")).hexdigest()
+            and rec.get("bytes") == len(body.encode("utf-8")))
 
 
 def receipt_verifier(receipts_dir, task_id: str):
@@ -136,35 +120,23 @@ def has_pairing_receipt(receipts_dir, task_id: str) -> bool:
 
 def write_paired_result(results_dir, task_id: str, body: str,
                         receipts_dir=None, tmp_tag: str = "") -> Path:
-    """Validate the pairing echo, then write `results/task-<id>.txt` atomically.
+    """Validate before any I/O, then serialize receipt and result publication.
 
-    Refuses with ValueError and ZERO writes when the echo does not match.
-    `tmp_tag` disambiguates the temp file when several writers share a results
-    directory; it defaults to a unique token, because a SHARED temp name lets
-    one writer's os.replace move the file the other is about to replace. The
-    receipt is best-effort: a result already durable on disk must never be
-    rolled back because a diagnostic sidecar could not be written.
+    `tmp_tag` remains accepted for callers from older versions; the shared
+    publisher always chooses a unique staging name. Receipt failure raises
+    before replacing the result, rather than reporting a paired write.
     """
     task_id = task_id_from(task_id)
     rest = strip_pairing_echo(task_id, body)
-
-    results = Path(results_dir)
-    results.mkdir(parents=True, exist_ok=True)
-    result = results / f"task-{task_id}.txt"
-    suffix = f"-{tmp_tag}" if tmp_tag else f"-{os.getpid()}-{secrets.token_hex(8)}"
-    tmp = results / f".task-{task_id}.txt.tmp{suffix}"
-    tmp.write_text(rest)
-    os.replace(tmp, result)
-
-    if receipts_dir is not None:
-        try:
-            d = Path(receipts_dir)
-            d.mkdir(parents=True, exist_ok=True)
-            receipt_path(d, task_id).write_text(receipt_body(task_id, rest))
-        except OSError as e:
-            print(f"result_write: pairing receipt not written: {e}",
-                  file=sys.stderr)
-    return result
+    result = Path(results_dir) / f"task-{task_id}.txt"
+    if receipts_dir is None:
+        return publish_text(result, rest)
+    receipt = receipt_path(receipts_dir, task_id)
+    # Keep both publications inside one per-task transaction. A failed receipt
+    # publication prevents a result from becoming visible without its evidence.
+    with locked_file(receipt.with_suffix(".lock")):
+        publish_text(receipt, receipt_body(task_id, rest))
+        return publish_text(result, rest)
 
 
 def _resolve_dirs(args):
@@ -239,7 +211,7 @@ def _attests_cli(argv) -> int:
         return 2
     try:
         results, receipts = _resolve_dirs(opts)
-        body = (Path(results) / f"task-{task_id}.txt").read_text()
+        body = (Path(results) / f"task-{task_id_from(task_id)}.txt").read_bytes().decode("utf-8")
     except (OSError, ValueError) as e:
         print(f"result unreadable: {e}", file=sys.stderr)
         return 1

@@ -51,7 +51,10 @@ case "$sub" in
   # killing the session normally kills its core → clear both markers. When
   # $WEDGED is set, model an unresponsive core: the session drops but the
   # `claude` process refuses to die (CORE_MARK stays) — so SIGTERM "doesn't take".
-  kill-session) rm -f "$SESS_MARK"; [ -n "$WEDGED" ] || rm -f "$CORE_MARK"; exit 0 ;;
+  kill-session) rm -f "$SESS_MARK"
+    if [ -n "$WEDGED" ]; then :;
+    elif [ -n "$SLOW_DEATH_S" ]; then ( sleep "$SLOW_DEATH_S"; rm -f "$CORE_MARK" ) & disown;
+    else rm -f "$CORE_MARK"; fi; exit 0 ;;
   *) exit 0 ;;  # start-server/set-option/bind/select-window/new-window/attach
 esac
 """
@@ -82,7 +85,10 @@ exit 0
 """ % FAKEPID
 
 
-def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False):
+def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False,
+         slow_death_s: float = 0, gr_rid: str = "", lock_rid: str = "", grace_s: str = "2",
+         private_socket: bool = True, with_claude: bool = True, restart_path=None,
+         app_claude: bool = False):
     """Run start-cli.sh in the stub env with the given initial state.
 
     force  → invoke --force-restart instead of --restart.
@@ -99,8 +105,20 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         if core:
             core_mark.write_text("")
 
-        for name, body in (("tmux", TMUX_STUB), ("pgrep", PGREP_STUB),
-                           ("ps", PS_STUB), ("claude", "#!/bin/bash\nexit 0\n")):
+        stubs = [("tmux", TMUX_STUB), ("pgrep", PGREP_STUB), ("ps", PS_STUB)]
+        if with_claude:
+            stubs.append(("claude", "#!/bin/bash\nexit 0\n"))
+        if restart_path is not None and not app_claude:
+            local = td / ".local" / "bin"
+            local.mkdir(parents=True)
+            (local / "claude").write_text("#!/bin/bash\nexit 0\n")
+            (local / "claude").chmod(0o755)
+        if app_claude:  # claude only in an env-named desktop root, as on a foreign checkout
+            app_bin = td / "app support" / "cli" / "claude" / "bin"
+            app_bin.mkdir(parents=True)
+            (app_bin / "claude").write_text("#!/bin/bash\nexit 0\n")
+            (app_bin / "claude").chmod(0o755)
+        for name, body in stubs:
             p = bind / name
             p.write_text(body)
             p.chmod(0o755)
@@ -117,14 +135,35 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
             "SUTANDO_TEST_MODE": "1",
             "SUTANDO_WORKSPACE": str(td / "workspace"),
         }
+        # The post-kill wait is bounded by SUTANDO_RESTART_GRACE_S (90s in production);
+        # 2s keeps the wedged cases fast while still exceeding a 1s slow death.
+        env["SUTANDO_RESTART_GRACE_S"] = grace_s
+        if app_claude:
+            env["SUTANDO_APP_SUPPORT"] = str(td / "app support")
+        if not private_socket:
+            del env["SUTANDO_TMUX_SOCKET"]
+        if restart_path is not None:
+            env["PATH"] = restart_path(env["PATH"])
         if wedged:
             env["WEDGED"] = "1"
+        if slow_death_s:
+            env["SLOW_DEATH_S"] = str(slow_death_s)
+        if gr_rid:
+            env["GR_RID"] = gr_rid
+        if lock_rid:
+            lock = td / "workspace" / "state" / "locks" / "graceful-restart.lock"
+            lock.mkdir(parents=True)
+            (lock / "rid").write_text(lock_rid)
         args = ["/bin/bash", str(SCRIPT)]
         if force:
             args.append("--force-restart")
         elif restart:
             args.append("--restart")
         r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
+        lock_left = (td / "workspace" / "state" / "locks" / "graceful-restart.lock").exists()
+        _run.last_lock_left = lock_left
+        attempts = td / "workspace" / "logs" / "restart-attempts.log"
+        _run.last_attempts = attempts.read_text() if attempts.exists() else ""
         return r.returncode, (r.stdout + r.stderr)
 
 
@@ -147,8 +186,9 @@ def case_restart_core_down_exits_nonzero():
 
 def case_non_restart_reuses_orphan_exits_zero():
     """(Guard against Fix 2 over-reach) NON-restart, orphan core alive, no
-    session → the reuse path must still fire (exit 0, 'reusing it')."""
-    rc, out = _run(restart=False, session=False, core=True)
+    session → the reuse path must still fire (exit 0, 'reusing it'). Default
+    socket only: a private socket never adopts a core outside its server."""
+    rc, out = _run(restart=False, session=False, core=True, private_socket=False)
     fails = []
     if rc != 0:
         fails.append(f"non-restart orphan-reuse should exit 0, got {rc}: out={out!r}")
@@ -195,6 +235,64 @@ def case_force_restart_wedged_escalates_to_sigkill():
     return fails
 
 
+def case_restart_waits_for_a_slow_death_instead_of_aborting():
+    """(#3816) The kill is already issued when the wait starts, so a core that
+    takes longer than ~3s to exit (SessionEnd handoff) must be waited for, not
+    abandoned: the old 3s abort left a dying core with no relaunch."""
+    # 4s exceeds the old fixed 3s poll (the control fails there) and sits inside a 6s grace.
+    rc, out = _run(restart=True, session=True, core=True, slow_death_s=4, grace_s="6")
+    fails = []
+    if "would not stop" in out or "force-restart" in out:
+        fails.append(f"a 4s slow death (within the grace window) was reported as an abort: out={out!r}")
+    if "kill-complete" not in out and "creating fresh core" not in out and "Killing existing" not in out:
+        fails.append(f"the wait never reached the create path: out={out!r}")
+    return fails
+
+
+def case_abort_releases_the_orchestrators_lock_only_for_its_own_rid():
+    """(#3816) An abort inside the exec'd launcher used to leave graceful-restart's
+    lock on disk for 15 minutes. It is released only when GR_RID matches the
+    lock's rid — a peer's lock is never touched."""
+    fails = []
+    rc, out = _run(restart=True, session=True, core=True, wedged=True, gr_rid="grp-1-1", lock_rid="grp-1-1")
+    if rc == 0:
+        fails.append("wedged core should still abort non-zero")
+    if _run.last_lock_left:
+        fails.append("abort left the orchestrator's own lock on disk")
+    rc, out = _run(restart=True, session=True, core=True, wedged=True, gr_rid="grp-1-1", lock_rid="grp-OTHER")
+    if not _run.last_lock_left:
+        fails.append("CONTROL: abort removed a lock held by a DIFFERENT rid")
+    return fails
+
+
+def case_force_restart_without_claude_says_why():
+    """A launch whose `claude` does not resolve must say so, on stderr and in
+    restart-attempts.log, instead of the generic 'did not come up' line."""
+    rc, out = _run(restart=True, session=True, core=True, force=True, with_claude=False)
+    fails = []
+    if rc == 0:
+        fails.append(f"--force-restart with no claude on PATH exited 0: out={out!r}")
+    if "claude not found on PATH=" not in out:
+        fails.append(f"stderr does not name the missing claude: out={out!r}")
+    if "FAILED: claude not found on PATH=" not in _run.last_attempts:
+        fails.append(f"restart-attempts.log does not name the missing claude: {_run.last_attempts!r}")
+    return fails
+
+
+def case_heal_without_claude_exits_127():
+    """The heal path (session up, core gone) must refuse with 127 and name the missing
+    claude, not create a window whose pane dies at once."""
+    rc, out = _run(restart=False, session=True, core=False, with_claude=False)
+    fails = []
+    if rc != 127:
+        fails.append(f"heal with no claude on PATH should exit 127, got {rc}: out={out!r}")
+    if "healing core window" not in out:
+        fails.append(f"the heal branch was not reached: out={out!r}")
+    if "claude not found on PATH=" not in out:
+        fails.append(f"stderr does not name the missing claude: out={out!r}")
+    return fails
+
+
 def _live_log_lines() -> "tuple[int, int]":
     """Line counts of the two logs start-cli.sh appends to in the LIVE workspace."""
     ws = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
@@ -225,6 +323,10 @@ def main() -> int:
         ("restart-does-not-reuse-orphan", case_restart_does_not_reuse_orphan),
         ("restart-wedged-aborts-not-kills", case_restart_wedged_aborts_not_kills),
         ("force-restart-wedged-escalates-to-sigkill", case_force_restart_wedged_escalates_to_sigkill),
+        ("slow-death waits", case_restart_waits_for_a_slow_death_instead_of_aborting),
+        ("abort releases own lock", case_abort_releases_the_orchestrators_lock_only_for_its_own_rid),
+        ("force-restart without claude says why", case_force_restart_without_claude_says_why),
+        ("heal without claude exits 127", case_heal_without_claude_exits_127),
         ("run-does-not-touch-the-live-workspace", case_run_does_not_touch_the_live_workspace),
     ]
     all_failures = []

@@ -120,6 +120,22 @@ unset _args _consume_next
 # Section 1 — Bootstrap (paths, env, config)                                   #
 # --------------------------------------------------------------------------- #
 
+# Rewrites every `scheme://user[:pass]@` in stdin, URLs embedded in free text included, to
+# `scheme://***@`. Display only; git operations keep the real value. scp-style `git@host:path` has no secret.
+_redact_url_text() {
+    LC_ALL=C sed -E "s|([A-Za-z][A-Za-z0-9+.-]*://)[^/?#[:space:]'\"]*@|\\1***@|g"
+}
+_redact_url() {
+    printf '%s\n' "$1" | _redact_url_text
+}
+# Appends the command's stdout+stderr to $LOG with credentials redacted; under pipefail the
+# pipeline's status is the command's own, so callers' `if`/`|| rc=$?` see git's exit code.
+_log_cmd() {
+    local _rc=0
+    "$@" 2>&1 | _redact_url_text >>"$LOG" || _rc=$?
+    return "$_rc"
+}
+
 _self="${BASH_SOURCE[0]:-$0}"
 if command -v realpath >/dev/null 2>&1; then _self="$(realpath "$_self")"; fi
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
@@ -213,11 +229,11 @@ if [ -z "$VAULT_URL" ] \
     if [ -n "$_origin_url" ] && [ -z "$_wsid" ]; then
         VAULT_URL_DECLINED="$_origin_url"
         VAULT_URL_DECLINED_REASON="workspace has no .sutando-vault/ws-id to identify its vault branch"
-        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($(_redact_url "$_origin_url"))." >&2
     elif [ -n "$_origin_url" ] && [ "$_wsid_ok" != "1" ]; then
         VAULT_URL_DECLINED="$_origin_url"
         VAULT_URL_DECLINED_REASON="workspace ws-id is not a valid workspace id (expected six lowercase hex characters), so it identifies no vault branch"
-        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($(_redact_url "$_origin_url"))." >&2
     elif [ -n "$_origin_url" ]; then
         # Unreachable is not the same answer as not-a-vault, and an operator
         # told the wrong one edits the wrong thing.
@@ -226,15 +242,15 @@ if [ -z "$VAULT_URL" ] \
         if [ "$_ls_rc" != "0" ]; then
             VAULT_URL_DECLINED="$_origin_url"
             VAULT_URL_DECLINED_REASON="unreachable this run, so it could not be confirmed either way"
-            echo "sync-workspace: could not reach the workspace repo's origin ($_origin_url) to confirm it is a vault; not recovering a URL from it this run." >&2
+            echo "sync-workspace: could not reach the workspace repo's origin ($(_redact_url "$_origin_url")) to confirm it is a vault; not recovering a URL from it this run." >&2
         elif [ -n "$_ls_out" ]; then
             VAULT_URL="$_origin_url"
             VAULT_URL_SOURCE="workspace repo origin, identity-verified (carries host/*/$_wsid)"
-            echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($VAULT_URL). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
+            echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($(_redact_url "$VAULT_URL")). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
         else
             VAULT_URL_DECLINED="$_origin_url"
             VAULT_URL_DECLINED_REASON="carries no host/*/$_wsid branch, so this workspace has never pushed to it"
-            echo "sync-workspace: the workspace repo's origin ($_origin_url) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
+            echo "sync-workspace: the workspace repo's origin ($(_redact_url "$_origin_url")) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
         fi
         unset _ls_rc _ls_out
     fi
@@ -272,6 +288,24 @@ die() {
 # (sutando-workspace.test.sh Test 23, Codex P1.3 reproducer). Not for
 # production use.
 _host() {
+    # The configured label FIRST, through the one helper that reads
+    # sutando.config*.json — a pin placed where the config lives is invisible to
+    # a reader that only consults the process environment, and this one names
+    # the vault branch.
+    # Guarded: the bash parity test evals this function ALONE under `set -u`,
+    # where the main body's $SCRIPT_PARENT does not exist.
+    local _root="${SCRIPT_PARENT:-}"
+    if [ -n "$_root" ] && [ -f "$_root/scripts/sutando-config.sh" ]; then
+        local _cfg
+        _cfg="$(bash "$_root/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
+        _cfg="${_cfg#"${_cfg%%[![:space:]]*}"}"
+        _cfg="${_cfg%"${_cfg##*[![:space:]]}"}"
+        if [ -n "$_cfg" ]; then
+            printf '%s\n' "$_cfg"
+            return
+        fi
+    fi
+    # Fallback when the helper is absent (the script guards for that elsewhere).
     # Lockstep with `_host_label()` in src/util_paths.py. Precedence:
     #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
     #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)
@@ -293,9 +327,11 @@ _host() {
     # Capture scutil ONCE and guard exit-0-but-empty output (parity with the
     # py side's non-empty `.strip()` check) — an empty LocalHostName must not
     # win over the hostname fallback.
-    local lhn=""
-    if command -v scutil >/dev/null 2>&1; then
-        lhn="$(scutil --get LocalHostName 2>/dev/null)"
+    local lhn="" _scutil="${SCUTIL_BIN:-/usr/sbin/scutil}"
+    # Absolute by default: a restrictive PATH can omit /usr/sbin. Overridable
+    # (SCUTIL_BIN) so a test can point this at a stub instead of a real binary.
+    if [ -x "$_scutil" ]; then
+        lhn="$("$_scutil" --get LocalHostName 2>/dev/null)"
     fi
     if [ -n "$lhn" ]; then
         printf '%s\n' "$lhn"
@@ -364,11 +400,41 @@ _host_ws_segment() {
 
 LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 
+# Holder identity = pid + process start time, so a pid recycled after a reboot
+# (/tmp survives reboots on macOS) fails the check instead of passing kill -0.
+_proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//'; }
+
 acquire_lock() {
-    # Stale lock cleanup: lock dir older than 10 min = assume crash, remove.
+    # Stale means the HOLDER IS GONE (or its identity does not match), not
+    # "older than N minutes": a run whose report step outlasts the cadence must
+    # not be overtaken by the next starter. The age bound below is a loud
+    # backstop for a holder that is alive but wedged, not the liveness test.
+    local max_min="${SUTANDO_SYNC_LOCK_MAX_MIN:-180}"
     if [ -d "$LOCK_DIR" ]; then
-        if find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
-            log "Stale lock removed (older than 10 min)"
+        local holder="" hstart="" now_start=""
+        [ -f "$LOCK_DIR/pid" ] && holder="$(head -1 "$LOCK_DIR/pid" 2>/dev/null)"
+        [ -f "$LOCK_DIR/start" ] && hstart="$(head -1 "$LOCK_DIR/start" 2>/dev/null)"
+        [ -n "$holder" ] && now_start="$(_proc_start "$holder")"
+        if [ -n "$holder" ] && [ -n "$now_start" ] && { [ -z "$hstart" ] || [ "$hstart" = "$now_start" ]; }; then
+            if find "$LOCK_DIR" -maxdepth 0 -mmin +"$max_min" 2>/dev/null | grep -q .; then
+                log "WARNING: lock holder pid $holder is alive but the lock is older than ${max_min} min — reclaiming (hung sync?)"
+                echo "sync-workspace: WARNING reclaiming a ${max_min}+ min lock from live pid $holder (hung sync?)" >&2
+                rm -rf "$LOCK_DIR"
+            else
+                log "Another sync (pid $holder) already in progress, exiting."
+                echo "sync-workspace: another instance is running (pid $holder), skipping."
+                exit 0
+            fi
+        elif [ -n "$holder" ]; then
+            if [ -n "$now_start" ]; then
+                log "Stale lock removed (pid $holder is alive but started at '$now_start', lock says '$hstart' — recycled pid)"
+            else
+                log "Stale lock removed (holder pid $holder is gone)"
+            fi
+            rm -rf "$LOCK_DIR"
+        elif find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
+            # A lock with no pid file predates this rule; age is all it can say.
+            log "Stale lock removed (no holder recorded, older than 10 min)"
             rm -rf "$LOCK_DIR"
         fi
     fi
@@ -377,6 +443,8 @@ acquire_lock() {
         echo "sync-workspace: another instance is running, skipping."
         exit 0
     fi
+    echo "$$" > "$LOCK_DIR/pid"
+    _proc_start "$$" > "$LOCK_DIR/start"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
@@ -903,7 +971,7 @@ _init_impl() {
 
     if [ "$DRY_RUN" = "1" ]; then
         echo "DRY-RUN: would init workspace as git repo at $WORKSPACE_DIR" >&2
-        echo "DRY-RUN: would set git remote origin = $VAULT_URL" >&2
+        echo "DRY-RUN: would set git remote origin = $(_redact_url "$VAULT_URL")" >&2
         echo "DRY-RUN: would (re)generate .git/info/exclude" >&2
         echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(_host_ws_segment)" >&2
         # Still call generate_exclude — its own dry-run logic will print the diff (no write)
@@ -943,14 +1011,14 @@ _init_impl() {
         local existing
         existing="$(git remote get-url origin)"
         if [ "$existing" != "$VAULT_URL" ]; then
-            log "_init_impl: changing remote origin from $existing to $VAULT_URL"
-            echo "sync-workspace: updating remote origin from $existing to $VAULT_URL" >&2
+            log "_init_impl: changing remote origin from $(_redact_url "$existing") to $(_redact_url "$VAULT_URL")"
+            echo "sync-workspace: updating remote origin from $(_redact_url "$existing") to $(_redact_url "$VAULT_URL")" >&2
             git remote set-url origin "$VAULT_URL"
         fi
     else
         git remote add origin "$VAULT_URL"
-        log "_init_impl: added remote origin $VAULT_URL"
-        echo "sync-workspace: added remote origin $VAULT_URL" >&2
+        log "_init_impl: added remote origin $(_redact_url "$VAULT_URL")"
+        echo "sync-workspace: added remote origin $(_redact_url "$VAULT_URL")" >&2
     fi
 
     # 3. Generate .git/info/exclude (refuses to overwrite an existing
@@ -998,7 +1066,7 @@ _init_impl() {
 
         local host_ws_seg
         host_ws_seg="$(_host_ws_segment)"
-        if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+        if _log_cmd git push origin "HEAD:refs/heads/host/${host_ws_seg}"; then
             log "_init_impl: pushed to origin host/${host_ws_seg}"
             echo "sync-workspace: initialized + pushed to host/${host_ws_seg}"
         else
@@ -1075,7 +1143,7 @@ _migrate_flat_branch() {
             # (ancestor check above), so the brief window where the vault has
             # neither ref is safe: the push below re-establishes it immediately,
             # and on failure the content stays local for the next sync to re-push.
-            git push origin --delete "$flat_branch" >>"$LOG" 2>&1 \
+            _log_cmd git push origin --delete "$flat_branch" \
                 || log "_migrate_flat_branch: remote delete of $flat_branch failed (already gone?)"
             # Drop the local remote-tracking ref so it neither D/F-conflicts with
             # the nested tracking ref on the next fetch nor gets merged as a bogus
@@ -1086,7 +1154,7 @@ _migrate_flat_branch() {
             # clean tree (nothing-to-commit gate), so on a no-change pass the
             # nested branch would never land.
             local _mp_rc=0
-            git push origin "refs/heads/${wsid_branch}:refs/heads/${wsid_branch}" >>"$LOG" 2>&1 || _mp_rc=$?
+            _log_cmd git push origin "refs/heads/${wsid_branch}:refs/heads/${wsid_branch}" || _mp_rc=$?
             if [ "$_mp_rc" -eq 0 ]; then
                 log "_migrate_flat_branch: retired remote flat $flat_branch, pushed $wsid_branch"
             else
@@ -1172,6 +1240,14 @@ _resolve_conflicts_keep_ours() {
         # best-effort: a backup failure must never block the merge.
         if git checkout --ours -- "$f" 2>/dev/null; then
             git add -- "$f"
+        elif [ -e "$f" ] || [ -L "$f" ]; then
+            # Carrier enforcement untracks while KEEPING bytes on disk, so a
+            # DD path can still hold live local state git no longer owns.
+            # `--cached` resolves the index; `-f` would delete that data.
+            # `-L` because `-e` FOLLOWS the link: a dangling symlink reads as
+            # absent and would take the deleting branch (the `workspace` link
+            # is exactly this shape while its target is unavailable).
+            git rm -q --cached -- "$f" 2>/dev/null || true
         else
             git rm -f -- "$f" 2>/dev/null || true
         fi
@@ -1226,6 +1302,17 @@ _migrate_flat_anchor() {
     echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
 }
 
+# Commit modified + new carrier files before a pull. Runs generate_exclude first
+# so an out-of-carrier path cannot ride into the vault on this commit.
+_commit_local_pre_pull() {
+    generate_exclude 2>/dev/null || true
+    git add --ignore-removal . 2>/dev/null || true
+    if ! git diff --cached --quiet 2>/dev/null; then
+        git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
+            && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"
+    fi
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
@@ -1244,9 +1331,9 @@ _pull_only_impl() {
     # --prune: without it, a peer's branch rename (e.g. the #1459 flat →
     # nested wsId migration) leaves a stale local remote-tracking ref that
     # D/F-conflicts every subsequent fetch ("cannot lock ref") — wedging
-    # this host permanently while the error is swallowed by the tee below.
+    # this host permanently while the error is swallowed into the log below.
     # Bit for 6 days on Qingyuns-MBP 2026-06-05..11.
-    git fetch --all --prune --quiet 2>&1 | tee -a "$LOG" >/dev/null
+    _log_cmd git fetch --all --prune --quiet
 
     # Retire any pre-#1459 flat `host/<host>` branch before the checkout below,
     # which would otherwise D/F-conflict with the nested wsId ref.
@@ -1273,6 +1360,10 @@ _pull_only_impl() {
         fi
         [ "$_co_rc" -eq 0 ] || die "pull-only: failed to switch to $current_branch (git checkout exit $_co_rc); see $LOG"
     fi
+
+    # A refused pull resets to pre_pull_sha, so local edits must already be IN
+    # it; deletions stay unstaged for the push-side tripwire to count.
+    _commit_local_pre_pull
 
     # Pro #1445 review fix #2: snapshot pre-pull state for the mass-deletion
     # tripwire on the pull side. The push-side tripwire only catches staged
@@ -1453,7 +1544,7 @@ _push_only_impl() {
         fi
         # ls-remote succeeded but the host branch is missing or behind HEAD →
         # the local commit was never (fully) pushed. Push it now.
-        if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+        if _log_cmd git push origin "HEAD:refs/heads/host/${host_ws_seg}"; then
             log "_push_only_impl: pushed previously-unpushed commit(s) to host/${host_ws_seg}"
             echo "sync-workspace: pushed previously-unpushed commit(s) to host/${host_ws_seg}"
             return 0
@@ -1496,7 +1587,7 @@ _push_only_impl() {
 
     local host_ws_seg
     host_ws_seg="$(_host_ws_segment)"
-    if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+    if _log_cmd git push origin "HEAD:refs/heads/host/${host_ws_seg}"; then
         log "_push_only_impl: pushed to origin host/${host_ws_seg}"
         echo "sync-workspace: pushed to host/${host_ws_seg}"
         return 0
@@ -1543,11 +1634,13 @@ _report_unmerged_conflicts() {
     [ -f "$script" ] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     local out
-    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    # --daily: a full scan can outlast the 30-minute fire, so report at most once a day.
+    out="$(python3 "$script" --daily "$WORKSPACE_DIR" 2>&1)" || true
     # Only speak up when there is something to merge back; the clean case is
     # silent so a 30-minute cron does not grow a nag nobody reads.
     case "$out" in
         *"no unmerged peer content"*) log "_report_unmerged_conflicts: clean" ;;
+        "sync-conflicts: skipped"*) log "_report_unmerged_conflicts: $out" ;;
         "") : ;;
         *) log "_report_unmerged_conflicts: $out"; printf '%s\n' "$out" ;;
     esac
@@ -1560,11 +1653,11 @@ cmd_status() {
     # A recovered URL and a configured one print identically without the source,
     # and a declined candidate reads as an <unset> naming nothing to go fix.
     if [ -n "$VAULT_URL" ]; then
-        echo "VAULT_URL:     $VAULT_URL${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
+        echo "VAULT_URL:     $(_redact_url "$VAULT_URL")${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
     else
         echo "VAULT_URL:     <unset>"
         if [ -n "$VAULT_URL_DECLINED" ]; then
-            echo "               candidate NOT adopted: $VAULT_URL_DECLINED"
+            echo "               candidate NOT adopted: $(_redact_url "$VAULT_URL_DECLINED")"
             echo "               reason: $VAULT_URL_DECLINED_REASON"
         fi
     fi
@@ -1689,9 +1782,24 @@ _migrate_from_legacy_impl() {
     fi
     if [ -d "$legacy_dir/notes" ]; then
         if [ "$DRY_RUN" = "1" ]; then
-            local n_notes
+            local n_notes excluded_size
             n_notes=$(find "$legacy_dir/notes" -type f -not -path "$legacy_dir/notes/generated/*" -not -path "$legacy_dir/notes/media/*" 2>/dev/null | wc -l | tr -d ' ')
-            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ~2.65 GB media left archived in legacy)" >&2
+            excluded_size=$(
+                {
+                    if [ -d "$legacy_dir/notes/generated" ]; then
+                        du -skL "$legacy_dir/notes/generated" 2>/dev/null || true
+                    fi
+                    if [ -d "$legacy_dir/notes/media" ]; then
+                        du -skL "$legacy_dir/notes/media" 2>/dev/null || true
+                    fi
+                } | awk '{kb += $1} END {
+                    if (kb >= 1048576) printf "%.2f GB", kb / 1048576
+                    else if (kb >= 1024) printf "%.1f MB", kb / 1024
+                    else if (kb > 0) printf "%d KB", kb
+                    else printf "0B"
+                }'
+            )
+            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ${excluded_size} generated/media left archived in legacy)" >&2
         else
             rsync -a --exclude='generated/' --exclude='media/' "$legacy_dir/notes"/ "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
             log "_migrate_from_legacy_impl: rsynced notes/ (excl generated,media) → workspace/notes/"
@@ -1836,7 +1944,7 @@ Next steps (operator-supervised):
        ls $WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory/ | head
        ls $WORKSPACE_DIR/skills/                   # shared canonical + salvaged host-only skills
        ls $WORKSPACE_DIR/hosts/                    # per-host: this host + peers (machine-<peer>/ minus skills/)
-  2. Confirm the first push landed in your $VAULT_URL repo (web UI).
+  2. Confirm the first push landed in your $(_redact_url "$VAULT_URL") repo (web UI).
   3. Run a normal sync to verify push + pull work end-to-end:
        bash scripts/sync-workspace.sh
   4. Once you're satisfied, you can delete the legacy clone:

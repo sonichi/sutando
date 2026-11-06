@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-Sutando's recurring prompts (morning briefing, daily insight, the loop-eng
+Sutando's recurring prompts (morning briefing, the loop-eng
 digest, etc.) were scheduled purely as in-session ``CronCreate`` jobs. Those
 are best-effort: they only fire while the Claude REPL is idle at the fire
 minute, they carry scheduler jitter, and they die with the session. On
@@ -14,8 +14,9 @@ This runner is the reliable path. It is invoked by launchd
 (``com.sutando.cron-runner``) every 60s, independent of any Claude session.
 Each tick it reads the per-host ``crons.json``, decides which entries are DUE
 since their last recorded fire, and emits a task file into ``tasks/`` for each.
-A ``shell_command`` entry runs directly from the repository root with output
-logged; a prompt-backed entry goes through the watcher pipeline. Same OS-level → emit-task → process
+A ``shell_command`` entry runs in a detached child from the repository root,
+outside both this tick and the core session, with output logged per job; a
+prompt-backed entry goes through the watcher pipeline. Same OS-level → emit-task → process
 pipeline the launchd health-check fallback already uses.
 
 Ownership / no double-fire
@@ -32,7 +33,8 @@ never a backlog storm.
 """
 from __future__ import annotations
 
-import fcntl
+import calendar
+import functools
 import json
 import os
 import re
@@ -57,6 +59,8 @@ sys.path.insert(0, str(SRC_DIR))
 # (same guard the channel bridges apply). Belt-and-suspenders with `task:` being
 # last: confine_user_content() neutralizes forged fields even in a multi-line body.
 from task_body_guard import confine_user_content  # noqa: E402
+from file_lock import lock_fd, unlock_fd  # noqa: E402
+import cron_task_id  # noqa: E402
 
 try:
     from workspace_default import resolve_workspace  # type: ignore
@@ -88,6 +92,8 @@ CRONS_FILE = WORKSPACE / "hosts" / host_slug() / "crons.json"
 TASKS_DIR = WORKSPACE / "tasks"
 STATE_FILE = WORKSPACE / "state" / "cron-runner-state.json"
 CORE_ALIVE_FILE = WORKSPACE / "state" / "cores" / f"{host_slug()}.alive"
+# Read by health-check: the record that due fires are being held for a dead heartbeat.
+HOLD_FILE = WORKSPACE / "state" / "cron-runner-hold.json"
 REPO_ROOT = SRC_DIR.parent
 
 # Look back at most this far when catching up a missed fire. Bounds work after
@@ -95,12 +101,24 @@ REPO_ROOT = SRC_DIR.parent
 MAX_CATCHUP_SECONDS = 24 * 3600
 # A short core restart may recover a recent slot, but a morning briefing or
 # other time-sensitive task must not execute hours after its intended time.
+# FLOOR: sub-hourly jobs keep exactly the old budget, so none gets stricter.
 MAX_EMIT_LATENESS_SECONDS = 15 * 60
+# CAP: honours the "never hours late" intent above, whatever the period is.
+MAX_EMIT_LATENESS_CAP_SECONDS = 60 * 60
+# Two fires of a weekly job can be ~13 days apart when today is midweek.
+PERIOD_SCAN_MAX_SECONDS = 15 * 24 * 3600
+# Widest UTC offset in the tz database, historical LMT included. Bounds where a
+# wall time's real epoch can land relative to its offset-free encoding.
+MAX_UTC_OFFSET_SECONDS = 16 * 3600
+# A rollback across midnight leaves ELAPSED epochs on a lexically LATER local
+# date, which a backward-only day walk would never visit.
+DATE_LOOKAHEAD_DAYS = 2
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
 # --- minimal 5-field cron matcher (no external deps) ------------------------
-def _parse_field(field: str, lo: int, hi: int) -> set[int]:
+@functools.lru_cache(maxsize=512)
+def _parse_field(field: str, lo: int, hi: int) -> frozenset[int]:
     """Expand one cron field into the set of matching integers.
 
     Supports ``*``, ``*/N``, ``A``, ``A,B``, ``A-B``, and ``A-B/N`` — the full
@@ -123,7 +141,8 @@ def _parse_field(field: str, lo: int, hi: int) -> set[int]:
         for v in range(start, end + 1, step):
             if lo <= v <= hi:
                 result.add(v)
-    return result
+    # Frozen: the lru_cache hands every caller the SAME object.
+    return frozenset(result)
 
 
 def cron_matches(expr: str, t: time.struct_time) -> bool:
@@ -136,6 +155,15 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
         return False
     if t.tm_hour not in _parse_field(hour, 0, 23):
         return False
+    return _day_matches(dom, month, dow, t)
+
+
+def _day_matches(dom: str, month: str, dow: str, t: time.struct_time) -> bool:
+    """True if the date part of ``t`` satisfies the dom/month/dow fields.
+
+    Split out so the period scan can reject a whole day with one test instead
+    of re-deriving DOM/DOW semantics — two copies of this would drift.
+    """
     if t.tm_mon not in _parse_field(month, 1, 12):
         return False
     # Standard cron DOM/DOW semantics: when both are restricted (not '*'), a
@@ -155,6 +183,164 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
     if dom_restricted and dow_restricted:
         return dom_ok or dow_ok
     return dom_ok and dow_ok
+
+
+def _day_offsets(y: int, mo: int, d: int) -> "tuple[int, ...]":
+    """Every UTC offset the zone can be at during this local date, with margin.
+
+    Enumerated from real offsets, never from DST polarity: Antarctica/Casey
+    rolls back three hours with tm_isdst=0 reported on BOTH sides.
+    """
+    naive = calendar.timegm((y, mo, d, 0, 0, 0, 0, 0, 0))
+    lo = naive - MAX_UTC_OFFSET_SECONDS
+    hi = naive + 86400 + MAX_UTC_OFFSET_SECONDS
+
+    def _off(e: int) -> "Optional[int]":
+        # A zone can make an instant unrepresentable on some libc; skip that
+        # probe rather than fail the tick.
+        try:
+            return time.localtime(e).tm_gmtoff
+        except (OverflowError, ValueError, OSError):
+            return None
+
+    # Seed coarsely, then bisect only between probes that disagree: an ordinary
+    # date costs 5 calls and only a transition date pays for the search.
+    seeds = [lo + (hi - lo) * i // 4 for i in range(5)]
+    probed = [(e, _off(e)) for e in seeds]
+    offsets = {o for _, o in probed if o is not None}
+    pending = [(probed[i], probed[i + 1]) for i in range(len(probed) - 1)
+               if probed[i][1] != probed[i + 1][1]]
+    while pending:
+        (a_e, a_v), (b_e, b_v) = pending.pop()
+        if b_e - a_e <= 60:
+            continue
+        m_e = (a_e + b_e) // 2
+        m_v = _off(m_e)
+        if m_v is not None:
+            offsets.add(m_v)
+        if m_v != a_v:
+            pending.append(((a_e, a_v), (m_e, m_v)))
+        if m_v != b_v:
+            pending.append(((m_e, m_v), (b_e, b_v)))
+    return tuple(sorted(offsets))
+
+
+def _local_epochs(y: int, mo: int, d: int, h: int, mi: int,
+                  offsets: "Optional[tuple[int, ...]]" = None) -> "list[int]":
+    """Every real epoch whose local wall-clock is this minute, newest first.
+
+    A rollback repeats a wall minute so an ambiguous one has TWO epochs and a
+    skipped one has none. ``offsets`` is hoisted per day by the caller.
+    """
+    if offsets is None:
+        offsets = _day_offsets(y, mo, d)
+    naive = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0))
+    out = []
+    for off in offsets:
+        e = naive - off
+        try:
+            lt = time.localtime(e)
+        except (OverflowError, ValueError, OSError):
+            continue
+        if (lt.tm_year, lt.tm_mon, lt.tm_mday,
+                lt.tm_hour, lt.tm_min) == (y, mo, d, h, mi) and e not in out:
+            out.append(e)
+    return sorted(out, reverse=True)
+
+
+def _offsets_on(day_utc: int) -> "tuple[int, ...]":
+    """``_day_offsets`` for the local date whose offset-free midnight is given."""
+    g = time.gmtime(day_utc)
+    return _day_offsets(g.tm_year, g.tm_mon, g.tm_mday)
+
+
+def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
+    """Seconds between the two most recent fire-minutes of ``expr``, or None.
+
+    Derived from the expression itself rather than declared, so it stays right
+    when a schedule is edited. Bounded by MAX_CATCHUP_SECONDS like the scan below.
+    """
+    # Walk by DAY, not by minute: a whole day is rejected with one date test,
+    # and only a matching day expands its hour x minute candidates.
+    fields = expr.split()
+    if len(fields) != 5:
+        raise ValueError(f"cron expression must have 5 fields: {expr!r}")
+    minute_f, hour_f, dom_f, month_f, dow_f = fields
+    hours = sorted(_parse_field(hour_f, 0, 23), reverse=True)
+    minutes = sorted(_parse_field(minute_f, 0, 59), reverse=True)
+    if not hours or not minutes:
+        return None
+
+    floor = now_epoch - PERIOD_SCAN_MAX_SECONDS
+    fires = []
+    window = []
+    cur = time.localtime(now_epoch)
+    # Start AHEAD of today's local date, then walk backward: a rollback across
+    # midnight puts already-elapsed epochs on a lexically later date.
+    day_utc = calendar.timegm((cur.tm_year, cur.tm_mon, cur.tm_mday,
+                               0, 0, 0, 0, 0, 0)) + DATE_LOOKAHEAD_DAYS * 86400
+    # Three dates bound the westmost offset any UNVISITED date can be at; two
+    # dates further back are already more than one offset-span in the past.
+    ring = [_offsets_on(day_utc - i * 86400) for i in range(3)]
+
+    def _drain(barrier: int) -> "Optional[int]":
+        """Emit buffered epochs above ``barrier``; period once two are found."""
+        while window and window[0] > barrier:
+            epoch = window.pop(0)
+            if epoch < floor:
+                return -1
+            fires.append(epoch)
+            if len(fires) == 2:
+                return fires[0] - fires[1]
+        return None
+
+    days = PERIOD_SCAN_MAX_SECONDS // 86400 + 4 + DATE_LOOKAHEAD_DAYS
+    for _ in range(days):
+        g = time.gmtime(day_utc)
+        y, mo, d = g.tm_year, g.tm_mon, g.tm_mday
+        offsets = ring[0]
+        seen = [o for t in ring for o in t]
+        west = min(seen) if seen else -MAX_UTC_OFFSET_SECONDS
+        if _day_matches(dom_f, month_f, dow_f, g):
+            east = max(offsets) if offsets else MAX_UTC_OFFSET_SECONDS
+            for h in hours:
+                base = calendar.timegm((y, mo, d, h, 0, 0, 0, 0, 0))
+                # Every real epoch of this wall hour is at least base - east,
+                # so an hour still wholly ahead cannot contribute.
+                if base - east > now_epoch:
+                    continue
+                for mi in minutes:
+                    window.extend(e for e in _local_epochs(y, mo, d, h, mi, offsets)
+                                  if e <= now_epoch)
+                window.sort(reverse=True)
+                # Nothing unexpanded (lower hours, older dates) can exceed this,
+                # so anything above it is final and safe to consume in order.
+                got = _drain(base - west)
+                if got is not None:
+                    return None if got == -1 else got
+        window.sort(reverse=True)
+        got = _drain(day_utc - west)
+        if got is not None:
+            return None if got == -1 else got
+        day_utc -= 86400
+        ring = [ring[1], ring[2], _offsets_on(day_utc - 2 * 86400)]
+    window.sort(reverse=True)
+    got = _drain(floor - 1)
+    return None if got in (None, -1) else got
+
+
+def emit_lateness_budget(expr: str, now_epoch: int) -> int:
+    """How late a slot of ``expr`` may be and still run.
+
+    A FLAT budget spends a half-period on a 30-minute job and 1/96th of one on a
+    daily job, so an equal delay costs the daily job an entire day. Scale with the
+    period, never below the old constant, never above the cap.
+    """
+    period = cron_period_seconds(expr, now_epoch)
+    if period is None:
+        return MAX_EMIT_LATENESS_SECONDS
+    return min(max(MAX_EMIT_LATENESS_SECONDS, period // 8),
+               MAX_EMIT_LATENESS_CAP_SECONDS)
 
 
 def latest_due_since(expr: str, last_epoch: int, now_epoch: int) -> Optional[int]:
@@ -191,6 +377,36 @@ def local_core_alive(now_epoch: Optional[int] = None) -> bool:
     return 0 <= age < CORE_ALIVE_MAX_AGE_SECONDS
 
 
+def _core_alive_reason(now_epoch: float) -> str:
+    """Why local_core_alive() said no, for the hold record and the log line."""
+    try:
+        age = now_epoch - CORE_ALIVE_FILE.stat().st_mtime
+    except OSError:
+        return f"core heartbeat missing ({CORE_ALIVE_FILE})"
+    return f"core heartbeat stale ({int(age)}s old, limit {CORE_ALIVE_MAX_AGE_SECONDS}s)"
+
+
+def _record_hold(held: list, now_epoch: int) -> None:
+    """Publish (or clear) the held-fires record; a hold left silent is how schedules vanished."""
+    hold_file = STATE_FILE.parent / HOLD_FILE.name
+    if not held:
+        hold_file.unlink(missing_ok=True)
+        return
+    prior = _load_json(hold_file, {})
+    since = prior.get("since") if isinstance(prior, dict) else None
+    reason = _core_alive_reason(now_epoch)
+    record = {
+        "since": since if isinstance(since, int) else now_epoch,
+        "updated_at": now_epoch,
+        "held": sorted(set(held) | set(prior.get("held", []) if isinstance(prior, dict) else [])),
+        "reason": reason,
+    }
+    _atomic_write_text(hold_file, json.dumps(record))
+    _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch))
+    print(f"{_ts} cron-runner: holding due fire(s) {', '.join(sorted(set(held)))}: {reason}",
+          file=sys.stderr)
+
+
 def _load_json(path: Path, default):
     try:
         return json.loads(path.read_text())
@@ -216,11 +432,11 @@ def _state_lock(state_file: Path) -> Iterator[None]:
     lock_path = state_file.parent / (state_file.name + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        lock_fd(handle.fileno())
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            unlock_fd(handle.fileno())
 
 
 def _atomic_write_text(path: Path, body: str) -> None:
@@ -242,23 +458,33 @@ def _atomic_write_text(path: Path, body: str) -> None:
 def _sanitize_name(name: str) -> str:
     """Slugify a cron name for use in a task ID and filename.
 
-    Replaces any character that is not alphanumeric, '-', or '_' with '-',
-    then collapses consecutive '-' and strips leading/trailing '-'.
+    Delegates so readers can bind the same contract instead of re-deriving it.
     """
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name)
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")
-    return slug or "unnamed"
+    return cron_task_id.sanitize_name(name)
 
 
-def _shell_log_path() -> Path:
-    """Return the durable log path for direct shell-command jobs."""
+def _shell_job_key(name: str) -> str:
+    """Readable slug plus a digest of the exact name; the slug alone is lossy
+    (`a b` and `a-b` collide, non-Latin names become `unnamed`)."""
+    import hashlib
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return f"{_sanitize_name(name)}-{digest}"
+
+
+def _shell_log_path(name: str) -> Path:
+    """Return the durable per-job log path for a direct shell-command job."""
     # Derive this from the state path so tests and callers that inject a
     # workspace by replacing STATE_FILE keep all runner state together.
-    return STATE_FILE.parent.parent / "logs" / "cron-runner.log"
+    return STATE_FILE.parent.parent / "logs" / "cron" / f"{_shell_job_key(name)}.log"
 
 
-# A hung or chatty job must not stall the tick that holds the state lock, nor
-# grow the log unboundedly. Per-entry override: `shell_timeout_s`.
+def _shell_lock_path(name: str) -> Path:
+    """Per-job lock held for the life of one run; a busy lock means skip the fire."""
+    return STATE_FILE.parent / "cron-shell-locks" / f"{_shell_job_key(name)}.lock"
+
+
+# A hung job would hold its own lock and skip every later fire; a chatty one
+# would grow the log unboundedly. Per-entry override: `shell_timeout_s`.
 SHELL_COMMAND_TIMEOUT_S = 300
 SHELL_OUTPUT_LIMIT = 64 * 1024
 
@@ -307,8 +533,8 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
     owned by the user and runs from the repository root, matching the cwd a
     task-backed cron receives when the core executes it.
 
-    Bounded in time and output: the caller holds the shared state lock for the
-    whole tick, so an unbounded command would suppress every later job.
+    Bounded in time and output: a run holds its job lock until it exits, so an
+    unbounded command would suppress every later fire of that job.
     """
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
@@ -350,10 +576,7 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
         f"stderr:\n{stderr}"
         "\n"
     )
-    log_path = _shell_log_path()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a") as handle:
-        handle.write(log)
+    _append_shell_log(name, log)
 
     if stdout:
         print(f"cron-runner: shell_command {name} stdout:\n{stdout}", end="")
@@ -367,7 +590,88 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
     return returncode
 
 
+def _append_shell_log(name: str, text: str) -> None:
+    log_path = _shell_log_path(name)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as handle:
+        handle.write(text)
+
+
+def _run_shell_job(name: str, command: str, timeout_s: int) -> Optional[int]:
+    """Run one fire under the job's non-blocking lock; None when a previous run
+    still holds it, so a slow job never stacks a second copy of itself."""
+    lock_path = _shell_lock_path(name)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            lock_fd(fd, blocking=False)
+        except OSError:
+            _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            msg = f"[{_ts}] shell_command job={name!r} skipped: previous run still in progress\n"
+            _append_shell_log(name, msg)
+            print(f"cron-runner: {msg.strip()}", file=sys.stderr)
+            return None
+        try:
+            return _run_shell_command(name, command, timeout_s)
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _launch_shell_job(name: str, command: str, timeout_s: int) -> "subprocess.Popen[bytes]":
+    """Start the job in its own session and return without waiting.
+
+    The tick holds the shared state lock, and launchd starts no new tick while
+    one runs, so an inline job would delay every other launchd cron.
+    """
+    argv = [
+        sys.executable, str(Path(__file__).resolve()), "--shell-job",
+        f"--name={name}", "--timeout", str(timeout_s),
+        "--state-file", str(STATE_FILE), "--cwd", str(REPO_ROOT),
+        "--", command,
+    ]
+    return subprocess.Popen(
+        argv, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+
+
+def _shell_job_main(argv: list) -> int:
+    """Entry point of the detached child started by :func:`_launch_shell_job`."""
+    global STATE_FILE, REPO_ROOT
+    import argparse
+    parser = argparse.ArgumentParser(prog="cron-runner.py --shell-job")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--timeout", type=int, required=True)
+    parser.add_argument("--state-file", required=True)
+    parser.add_argument("--cwd", required=True)
+    parser.add_argument("command")
+    args = parser.parse_args(argv)
+    STATE_FILE = Path(args.state_file)
+    REPO_ROOT = Path(args.cwd)
+    rc = _run_shell_job(args.name, args.command, args.timeout)
+    return 0 if rc is None else rc
+
+
 def emit_task(name: str, entry: dict) -> Path:
+    # A worker can claim between an ownership check and unlink: published
+    # payloads stay immutable until retired. Serialize emitters per job.
+    prefix = f"{cron_task_id.TASK_PREFIX}{_sanitize_name(name)}-"
+    with _state_lock(TASKS_DIR / f".{prefix}emit"):
+        pending = sorted(
+            (p for p in TASKS_DIR.glob(f"{prefix}*.txt")
+             if p.name[len(prefix):-4].isdigit()),
+            key=lambda p: int(p.name[len(prefix):-4]),
+        )
+        if pending:
+            print(f"cron-runner: coalesced {name!r} into outstanding {pending[0].stem}", file=sys.stderr)
+            return pending[0]
+        return _emit_new_task(name, entry)
+
+
+def _emit_new_task(name: str, entry: dict) -> Path:
     now_ms = int(time.time() * 1000)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # A launchd cron either carries a direct `prompt` or a `prompt_skill`
@@ -376,8 +680,7 @@ def emit_task(name: str, entry: dict) -> Path:
         body_task = f"/{entry['prompt_skill']}"
     else:
         body_task = entry.get("prompt", "")
-    safe_name = _sanitize_name(name)
-    task_id = f"task-cron-{safe_name}-{now_ms}"
+    task_id = cron_task_id.task_id(name, now_ms)
     # Defang forged header/fence lines in the (config-supplied) body, then place
     # `task:` last so a multi-line prompt body cannot forge the structured
     # header fields above it (source, user_id, access_tier, priority).
@@ -392,24 +695,6 @@ def emit_task(name: str, entry: dict) -> Path:
         f"task: {body_task}\n"
     )
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Coalesce pending fires: if a prior emission for this same entry is still
-    # unconsumed (the core was down or busy), remove it before writing the new
-    # one, so a long outage leaves exactly ONE task per entry — the newest —
-    # instead of one file per missed slot (a */30 entry over a 6h outage would
-    # otherwise queue 12). Design converged with Chi + Sutando-Pro in #dev
-    # 2026-07-18. We keep the per-fire timestamped id (rather than a literally
-    # stable filename) so the orphan-check completion-marker contract
-    # (results/<id>.txt) is untouched — a consumed+archived result can never
-    # collide with a future fire's unique id. The suffix.isdigit() guard keeps
-    # the sweep from matching a different entry whose slug shares this prefix
-    # (e.g. cleaning "sync" must not delete "sync-workspace"'s pending task).
-    prefix = f"task-cron-{safe_name}-"
-    for stale in TASKS_DIR.glob(f"{prefix}*.txt"):
-        if stale.name[len(prefix):-4].isdigit():
-            try:
-                stale.unlink()
-            except OSError:
-                pass
     path = TASKS_DIR / f"{task_id}.txt"
     # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
     # so a stamping error costs the stamp and never the fire.
@@ -418,7 +703,7 @@ def emit_task(name: str, entry: dict) -> Path:
         body = stamp_text(body, WORKSPACE)
     except Exception:
         pass
-    path.write_text(body)
+    _atomic_write_text(path, body)
     _emit_cron_telemetry()
     return path
 
@@ -454,7 +739,10 @@ def run(now_epoch: Optional[int] = None) -> list:
     # concurrent reconciler (Codex boot) can neither observe a half-written
     # state nor have its just-seeded migration boundary clobbered by our
     # write-back. See _state_lock for the race this closes.
+    held: list = []
     with _state_lock(STATE_FILE):
+        # A state file proves this runner has ticked here before.
+        ticked_before = STATE_FILE.exists()
         state = _load_json(STATE_FILE, {})
         for entry in crons:
             if not entry.get("launchd"):
@@ -474,29 +762,41 @@ def run(now_epoch: Optional[int] = None) -> list:
                 )
                 state[name] = now_epoch
                 continue
-            # When state is absent (first run or after reinstall), look back the
-            # full catch-up window so a daily cron missed during a restart or
-            # sleep cycle is still emitted on the next tick.
+            # No state file (first run, reinstall): look back the full catch-up
+            # window so a daily cron missed across a restart still fires.
             last = int(state.get(name, now_epoch - MAX_CATCHUP_SECONDS))
             try:
                 due_epoch = latest_due_since(expr, last, now_epoch)
             except ValueError as e:
                 print(f"cron-runner: skipping {name}: {e}", file=sys.stderr)
                 continue
+            if ticked_before and name not in state:
+                # Added since the last tick: no slot before now was ever owed.
+                state[name] = now_epoch
+                continue
             if due_epoch is not None:
                 # Direct shell jobs must stay claimable and idempotent like prompt jobs; only
                 # the execution differs.
                 if shell_command is not None:
-                    _run_shell_command(
-                        name, shell_command, _shell_timeout_for(entry))
-                    emitted.append(name)
+                    try:
+                        proc = _launch_shell_job(
+                            name, shell_command, _shell_timeout_for(entry))
+                        print(f"cron-runner: launched shell_command {name} (pid {proc.pid})")
+                        emitted.append(name)
+                    except OSError as exc:
+                        _append_shell_log(
+                            name, f"shell_command job={name!r} launch failed: {exc}\n")
+                        print(f"cron-runner: shell_command {name} launch failed: {exc}",
+                              file=sys.stderr)
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can
                     # recover this slot after the heartbeat returns.
+                    held.append(name)
                     continue
                 else:
                     lateness = now_epoch - due_epoch
-                    if lateness <= MAX_EMIT_LATENESS_SECONDS:
+                    budget = emit_lateness_budget(expr, now_epoch)
+                    if lateness <= budget:
                         emit_task(name, entry)
                         emitted.append(name)
                     else:
@@ -505,17 +805,21 @@ def run(now_epoch: Optional[int] = None) -> list:
                         _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         print(
                             f"{_ts} cron-runner: dropping stale slot for {name} "
-                            f"({lateness}s late)",
+                            f"({lateness}s late, budget {budget}s)",
                             file=sys.stderr,
                         )
             state[name] = now_epoch
 
         if crons:  # only persist once we've actually read a config
             _atomic_write_text(STATE_FILE, json.dumps(state))
+        if held or core_alive:
+            _record_hold(held, now_epoch)
     return emitted
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--shell-job"]:
+        sys.exit(_shell_job_main(sys.argv[2:]))
     names = run()
     if names:
         _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

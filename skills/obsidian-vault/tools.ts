@@ -20,6 +20,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { resolveWorkspace } from '../../src/workspace_default.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -173,7 +174,9 @@ const runDreamTool: ToolDefinition = {
     parameters: z.object({}),
     execute: async () => {
         try {
-            const scriptPath = `${process.env.SUTANDO_REPO_DIR || process.cwd()}/skills/obsidian-vault/scripts/dream.py`;
+            // Sibling of this module, so it resolves wherever the skill is loaded
+            // from. fileURLToPath, never .pathname: the latter stays percent-encoded.
+            const scriptPath = fileURLToPath(new URL('scripts/dream.py', import.meta.url));
             // Fire-and-forget: detach so the voice turn returns immediately.
             // `--force` bypasses the SUTANDO_OBSIDIAN_MIRROR opt-in gate
             // because this is an explicit user invocation (the user said

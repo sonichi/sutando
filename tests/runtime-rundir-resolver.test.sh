@@ -25,10 +25,18 @@ ok "run-dir OS default matches rundir.py chain" \
 ok "runtime-socket honors SUTANDO_RUNTIME_SOCKET override" \
    "$(SUTANDO_RUNTIME_SOCKET=/tmp/x.sock bash "$CFG" runtime-socket)" "/tmp/x.sock"
 
-# ── runtime-socket: else <run-dir>/sutando-runtime.sock (NOT runtime-api.sock) ─
-ok "runtime-socket derives <run-dir>/sutando-runtime.sock" \
+# ── runtime-socket: else EXACTLY what rundir.py resolves. Pinning the shell to
+# a literal is what let the shell keep publishing the pre-actor flat socket
+# while the daemon listened on the (actor, instance) scoped one (review P1) —
+# the expectation now comes from the resolver both other consumers use.
+RD="$REPO/src/runtime-api/rundir.py"
+ok "runtime-socket equals rundir.py socket_path (no shell copy of the chain)" \
    "$(env -u SUTANDO_RUNTIME_SOCKET SUTANDO_RUN_DIR=/r bash "$CFG" runtime-socket)" \
-   "/r/sutando-runtime.sock"
+   "$(env -u SUTANDO_RUNTIME_SOCKET SUTANDO_RUN_DIR=/r python3 "$RD" --socket)"
+ok "runtime-socket is (actor, instance) scoped, not the flat legacy path" \
+   "$(env -u SUTANDO_RUNTIME_SOCKET SUTANDO_RUN_DIR=/r bash "$CFG" runtime-socket)" \
+   "/r/$(env -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID -u SUTANDO_RUNTIME_STATE \
+         SUTANDO_RUN_DIR=/r python3 -c "import sys;sys.path.insert(0,'$REPO/src/runtime-api');import rundir;print(rundir.instance_key(rundir.agent_id()))")/runtime.sock"
 
 # ── drift guard: the descriptor's runtimeSocket (its own chain copy) must equal
 # the `runtime-socket` subcommand, so the two copies of the rundir.py chain can
@@ -49,8 +57,9 @@ def ok(name, cond):
     if not cond: fails += 1
 ok("descriptor: schemaVersion == 1", d.get("schemaVersion") == 1)
 ok("descriptor: runtimeId present", bool(d.get("runtimeId")))
-ok("descriptor: runtimeSocket ends with sutando-runtime.sock",
-   str(d.get("runtimeSocket","")).endswith("/sutando-runtime.sock"))
+ok("descriptor: runtimeSocket is a runtime.sock under the run dir",
+   str(d.get("runtimeSocket","")).endswith("/runtime.sock")
+   or str(d.get("runtimeSocket","")).endswith("/sutando-runtime.sock"))
 ok("descriptor: runtimeRoot present + is a prefix of runtimeSocket (OS-independent)",
    bool(d.get("runtimeRoot")) and str(d.get("runtimeSocket","")).startswith(str(d.get("runtimeRoot",""))))
 ok("descriptor: backend.type == tmux", (d.get("backend") or {}).get("type") == "tmux")

@@ -23,6 +23,10 @@ Guards:
      open-descriptor table rather than inspecting bytes
   5. when that check cannot be run, NOTHING is archived and the reason is
      printed — fail closed, loudly
+  6. producer-to-reader: a result this archiver moves is still findable by the
+     SHARED locator afterwards. The archiver writes `archive-<YYYY-MM-DD>/`, a
+     sibling of `archive/`; a locator that searches only `archive/` reports an
+     archived answer as never delivered.
 
 Several guards assert absence ("not archived"), which would also hold if the
 archiver had simply stopped working. Each is therefore paired with a positive
@@ -66,6 +70,42 @@ def _load_archiver(workspace: Path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _guard_producer_to_reader() -> None:
+    """The archiver's own output must remain readable by the shared locator."""
+    sys.path.insert(0, str(REPO / "src"))
+    from local_task_protocol import find_result  # noqa: E402
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        # Same pre-satisfaction main() does: keep resolve_workspace() from
+        # relocating this repo's notes/build_log into the throwaway workspace.
+        (ws / ".notes-migrated").touch()
+        (ws / ".build_log-migrated").touch()
+        results = ws / "results"
+        results.mkdir(parents=True)
+        f = results / "task-retention-lifecycle.txt"
+        f.write_text("DURABLE ANSWER")
+        stale = time.time() - 48 * 3600
+        os.utime(f, (stale, stale))
+
+        live = find_result(results, "task-retention-lifecycle")
+        check("calibration: findable BEFORE archiving", live is not None)
+
+        mod = _load_archiver(ws)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.main()
+        check("archiver moved it out of the live dir", not f.exists())
+        moved = list(results.glob("archive-*/task-retention-lifecycle.txt"))
+        check("archiver used the dated retention layout", len(moved) == 1,
+              f"found {moved}")
+
+        found = find_result(results, "task-retention-lifecycle")
+        check("locator still finds it AFTER archiving", found is not None,
+              "archived answer reads as never delivered")
+        if found is not None:
+            check("and it is the same answer",
+                  found.read_text() == "DURABLE ANSWER")
 
 
 def main() -> int:
@@ -260,6 +300,8 @@ def main() -> int:
           (arch2.RESULTS / "fresh.txt").exists())
 
     print()
+    _guard_producer_to_reader()
+
     if fails:
         print(f"FAIL — {len(fails)}: {fails}")
         return 1

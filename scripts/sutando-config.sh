@@ -9,6 +9,7 @@
 # Usage:
 #   bash scripts/sutando-config.sh workspace     # print resolved workspace path
 #   bash scripts/sutando-config.sh vault-enabled # print "true" or "false"
+#   bash scripts/sutando-config.sh macos-notifications # print "true" or "false" (notifications.macos)
 #   bash scripts/sutando-config.sh vault-url     # print vault remote_url (may be empty)
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
 #   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
@@ -48,9 +49,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$(resolve_python "$REPO_ROOT")"
 
 # Demand Python LAZILY, at the point of use. Requiring it up front was wrong:
-# 9 of this script's subcommands are pure shell (app-node-dir, node-bin,
-# tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir,
-# runtime-socket) and answering them needs no interpreter — yet an eager
+# 8 of this script's subcommands are pure shell (app-node-dir, node-bin,
+# tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir)
+# and answering them needs no interpreter — yet an eager
 # `require_python … || exit 1` failed them too. src/startup.sh:57 asks for
 # `app-node-dir` under `set -e`, so on a Darwin/no-CLT host that eager demand
 # terminated startup at the very first config lookup (CR #2599, @qingyun-wu).
@@ -104,6 +105,15 @@ import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
 print('true' if resolve_vault().get('enabled') else 'false', end='')
+"
+    ;;
+
+  macos-notifications)
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_macos_notifications
+print('true' if resolve_macos_notifications() else 'false', end='')
 "
     ;;
 
@@ -250,6 +260,29 @@ print(resolve_core_runtime(), end='')
 "
     ;;
 
+  desktop-runtime-select)
+    # Persist an explicit --runtime switch as the desktop's coreRuntime. Prints
+    # updated|unchanged|no-desktop (--check: would-update, writing nothing); nonzero when unwritable.
+    case "${2:-}" in
+      claude|codex) ;;
+      *) echo "sutando-config: desktop-runtime-select needs claude or codex" >&2; exit 2 ;;
+    esac
+    case "${3:-}" in
+      '') _check=False ;;
+      --check) _check=True ;;
+      *) echo "sutando-config: desktop-runtime-select takes only --check after the runtime" >&2; exit 2 ;;
+    esac
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import persist_desktop_runtime_selection
+try:
+    print(persist_desktop_runtime_selection('$2', check=$_check), end='')
+except (OSError, ValueError) as exc:
+    sys.exit(f'sutando-config: desktop runtime selection not written: {exc}')
+"
+    ;;
+
   core-config-dir-value)
     # v0.9 — print the resolved value (absolute path) of the matching
     # core_config_dirs entry. Selector semantics identical to
@@ -264,6 +297,25 @@ if entry is None:
     sys.exit(0)
 print(entry['value'], end='')
 "
+    ;;
+
+  codex-home-path)
+    # The core_config_dirs codex value the Codex launcher exports, else $CODEX_HOME, else
+    # Codex's own default. Extra args join as sub-path components, as in claude-home-path.
+    _cxh_base="$(py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import find_core_config_dir
+entry = find_core_config_dir(type_='codex')
+print(entry['value'] if entry else '', end='')
+")"
+    [ -n "$_cxh_base" ] || _cxh_base="${CODEX_HOME:-$HOME/.codex}"
+    _cxh_base="${_cxh_base/#\~/$HOME}"
+    shift
+    for _p in "$@"; do
+      _cxh_base="$_cxh_base/$_p"
+    done
+    printf '%s' "$_cxh_base"
     ;;
 
   core-config-dirs)
@@ -495,14 +547,16 @@ print(_host_label(), end='')
     ;;
 
   runtime-socket)
-    # The runtime-API daemon's Unix socket. MIRRORS #2325's rundir.py
-    # socket_path(): SUTANDO_RUNTIME_SOCKET override wins, else
-    # <run-dir>/sutando-runtime.sock. (Filename is sutando-runtime.sock — NOT
-    # runtime-api.sock; #2325 ships that default and both ends interpret it here.)
+    # The runtime-API daemon's Unix socket. The default is (actor, instance)
+    # scoped, so this EXECS rundir.py rather than mirroring it: a shell copy of
+    # the chain published the pre-actor flat socket while the daemon listened on
+    # the scoped one, and no client could reach a fresh daemon (review P1).
+    # No fallback on failure: a synthesized flat endpoint is a plausible WRONG
+    # answer, and rc=0 beside it is worse than no answer at all.
     if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
       printf '%s' "$SUTANDO_RUNTIME_SOCKET"
     else
-      printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"
+      py "$REPO_ROOT/src/runtime-api/rundir.py" --socket
     fi
     ;;
 
@@ -645,9 +699,11 @@ except Exception:
 # code: the source-version identity of the runtime — 'which Sutando is this,
 # behaviorally?' Prompts + skills + scripts in the repo determine behavior, so
 # the desktop app (and fleet tooling) wants this to reason about version-compat
-# and to spot a locally-modified core. All git-native + best-effort (None when
-# not a git checkout). tree_sha is the content hash of TRACKED files (version-
-# independent); dirty flags uncommitted edits. A stronger working-tree
+# and to spot a locally-modified core. Git is authoritative for checkouts;
+# packaged engines fall back to the build-authored ENGINE_MANIFEST beside the
+# copied repo. tree_sha is the content hash of TRACKED files (version-
+# independent); packaged consumers use tree_digest instead. dirty flags
+# uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
 # Resolve ONCE, before any spawn. Two gates, both required:
@@ -679,30 +735,56 @@ def _git(*a):
         return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None
+
+def _engine_manifest():
+    # Packaging authors the parent manifest; the in-repo path is compatibility-only.
+    for path in (os.path.join(os.path.dirname(repo), 'ENGINE_MANIFEST.json'),
+                 os.path.join(repo, 'ENGINE_MANIFEST.json')):
+        try:
+            with open(path) as f:
+                value = json.load(f)
+            if isinstance(value, dict):
+                return value
+        except (OSError, ValueError):
+            pass
+    return {}
+
+_git_revision = _git('rev-parse', 'HEAD')
+_manifest = {} if _git_revision else _engine_manifest()
+_manifest_revision = _manifest.get('sha')
+if not (isinstance(_manifest_revision, str) and len(_manifest_revision) >= 8
+        and all(c in '0123456789abcdefABCDEF' for c in _manifest_revision)):
+    _manifest_revision = None
+_revision = _git_revision or _manifest_revision
+_git_describe = _git('describe', '--tags', '--always', '--dirty')
+_manifest_branch = _manifest.get('branch')
+if not isinstance(_manifest_branch, str):
+    _manifest_branch = None
+_manifest_dirty = _manifest.get('dirty')
+if not isinstance(_manifest_dirty, bool):
+    _manifest_dirty = False
 code = {
-    'commit': _git('rev-parse', '--short', 'HEAD'),
-    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
-    'describe': _git('describe', '--tags', '--always', '--dirty'),
+    'commit': _revision[:7] if _revision else None,
+    'revision': _revision,
+    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD') or _manifest_branch,
+    'describe': _git_describe or (_revision[:7] if _revision else None),
     'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
-    'dirty': bool(_git('status', '--porcelain')),
+    'dirty': bool(_git('status', '--porcelain')) if _git_revision else _manifest_dirty,
+    'source': 'git' if _git_revision else ('engine-manifest' if _manifest_revision else None),
+    'built_at': _manifest.get('built_at') if isinstance(_manifest.get('built_at'), str) else None,
+    'tree_digest': (_manifest.get('post_build_tree_digest')
+                    if isinstance(_manifest.get('post_build_tree_digest'), str) else None),
 }
-# run-dir + runtime-api socket: mirror #2325 rundir.py (same policy as the
-# run-dir / runtime-socket subcommands). This is a second copy of the chain (the
-# bash subcommand is the other); the resolver test asserts the descriptor
-# runtimeSocket equals the runtime-socket subcommand, so the two cannot drift
-# silently (review nit). NOTE: no shell-active chars in this comment block -- the
-# python runs inside a bash double-quoted -c string, so a dollar-var or backtick
-# here would be bash-expanded and break the program.
-_run_dir_env = os.environ.get('SUTANDO_RUN_DIR')
-if _run_dir_env:
-    _rundir = _run_dir_env
-elif sys.platform == 'darwin':
-    _rundir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'space.ag2.app', 'run')
-elif os.environ.get('XDG_RUNTIME_DIR'):
-    _rundir = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'sutando')
-else:
-    _rundir = os.path.join(os.path.expanduser('~'), '.sutando', 'run')
-_runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
+# run-dir + runtime-api socket: IMPORT rundir.py instead of re-deriving it. The
+# socket default is (actor, instance) scoped, so a hand-mirrored copy of that
+# chain published a socket no daemon listens on (review P1). NOTE: no
+# shell-active chars in this comment block -- the python runs inside a bash
+# double-quoted -c string, so a dollar-var or backtick here would be
+# bash-expanded and break the program.
+sys.path.insert(0, os.path.join(repo, 'src', 'runtime-api'))
+import rundir as _rd
+_rundir = str(_rd.run_dir())
+_runtime_socket = _rd.socket_path()
 # runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
 # portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
 # the app dir (its parent is the shared XDG base), so use the run-dir itself.
@@ -759,7 +841,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|macos-notifications|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

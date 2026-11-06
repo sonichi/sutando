@@ -169,6 +169,30 @@ def test_nonempty_payload_no_usable_events_preserves_prior() -> None:
            rc != 0 and not cache.exists(), f"rc={rc} exists={cache.exists()}")
 
 
+def test_missing_start_warns_and_present_start_is_quiet() -> None:
+    """A payload with no `start` silently costs the briefing two lines, so the
+    producer says so; a payload that carries one must stay quiet."""
+    with tempfile.TemporaryDirectory() as td:
+        for label, events, want in (
+            ("no start", [{"raw": "09:00 Standup", "calendar": "primary"}], True),
+            ("with start", [{"raw": "09:00 Standup", "calendar": "primary",
+                             "start": "2026-08-25T09:00:00-07:00"}], False),
+        ):
+            err = io.StringIO()
+            with unittest.mock.patch("sys.stderr", err):
+                wcc.write_cache(events, path=Path(td) / f"{want}.json")
+            warned = "carry no" in err.getvalue()
+            ok(f"write_cache warns iff start missing ({label})", warned is want,
+               f"stderr={err.getvalue()!r}")
+        # The count must name the events that lack a start, not the whole list.
+        err = io.StringIO()
+        with unittest.mock.patch("sys.stderr", err):
+            wcc.write_cache([{"raw": "A", "calendar": "", "start": "2026-08-25T09:00:00-07:00"},
+                             {"raw": "B", "calendar": ""}], path=Path(td) / "mixed.json")
+        ok("warning counts only the events missing a start",
+           "1 of 2 event(s)" in err.getvalue(), err.getvalue())
+
+
 def test_cache_path_default_location() -> None:
     """The real (un-mocked) cache_path resolves under <workspace>/state/."""
     p = wcc.cache_path()
@@ -186,6 +210,7 @@ test_cli_events_json_flag()
 test_cli_stdin_events()
 test_cli_error_paths()
 test_nonempty_payload_no_usable_events_preserves_prior()
+test_missing_start_warns_and_present_start_is_quiet()
 test_cache_path_default_location()
 
 # --- `--from-gws`: the calendar is UNKNOWN on failure, never empty ------------

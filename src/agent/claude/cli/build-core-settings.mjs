@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>] [<abs-path-to-stale-head-post-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -25,8 +25,23 @@
 //                    emitted zero skill:* events in production (the obs blob is
 //                    only built when SUTANDO_OBS_ENDPOINT is set). The hook
 //                    script honors the telemetry opt-out on its own.
+//   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
+//                    PreToolUse for the Gmail MCP connector's write tools.
+//   arg5 (optional): path to hooks/gdocs-write-guard.py — registered under BOTH
+//                    PreToolUse and PostToolUse for the Station's composio_exec tool.
+//   arg6 (optional): path to hooks/native-pim-guard.py — registered under
+//                    PreToolUse[Bash]: denies commands that drive the native
+//                    macOS Calendar/Reminders/Contacts apps without consent.
+//   arg7 (optional): path to hooks/shell-trap-guard.py — registered under
+//                    PreToolUse[Bash] with --repo <checkout>: blocks or warns on
+//                    shell commands that misbehave on macOS/zsh.
+//   arg8 (optional): path to hooks/stale-head-post-guard.py — registered under
+//                    PreToolUse[Bash]: blocks a PR review or comment whose
+//                    commit_id or sha claim names a head the PR has moved past.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
+
+import path from 'node:path';
 
 const guardHook = process.argv[2];
 if (!guardHook) {
@@ -90,4 +105,74 @@ if (skillTelemetryHook.trim()) {
 	};
 }
 
-process.stdout.write(JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings)));
+// Always-on: the connector's write scopes are broken, so the deny must reach the
+// caller. The hook re-checks the tool name, so the matcher is belt-and-braces.
+const gmailWriteGuardHook = process.argv[5] || '';
+let gmailWriteGuardSettings = null;
+if (gmailWriteGuardHook.trim()) {
+	gmailWriteGuardSettings = {
+		hooks: {
+			PreToolUse: [{ matcher: 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', hooks: [{ type: 'command', command: `python3 ${shq(gmailWriteGuardHook)}` }] }],
+		},
+	};
+}
+
+// Both events point at one script: the read (PostToolUse) records the snapshot the
+// write (PreToolUse) requires. The hook re-checks toolkit/action itself.
+const gdocsWriteGuardHook = process.argv[6] || '';
+let gdocsWriteGuardSettings = null;
+if (gdocsWriteGuardHook.trim()) {
+	// The hook imports src/ from a CONFIGURED root, never a walk from __file__:
+	// the registration embeds this checkout (the hook file's grandparent).
+	const repoRoot = path.resolve(gdocsWriteGuardHook, '..', '..');
+	const command = `python3 ${shq(gdocsWriteGuardHook)} --repo ${shq(repoRoot)}`;
+	const entry = { matcher: 'mcp__.*__composio_exec', hooks: [{ type: 'command', command }] };
+	gdocsWriteGuardSettings = { hooks: { PreToolUse: [entry], PostToolUse: [entry] } };
+}
+
+// Always-on: a native Calendar/Reminders/Contacts command raises a macOS
+// permission prompt, so the deny must reach the model before the command runs;
+// the file tools are matched so the consent record cannot be written directly.
+const nativePimGuardHook = process.argv[7] || '';
+const NATIVE_PIM_GUARD_MATCHER = 'Bash|Write|Edit|MultiEdit|NotebookEdit';
+let nativePimGuardSettings = null;
+if (nativePimGuardHook.trim()) {
+	nativePimGuardSettings = {
+		hooks: {
+			PreToolUse: [{ matcher: NATIVE_PIM_GUARD_MATCHER, hooks: [{ type: 'command', command: `python3 ${shq(nativePimGuardHook)}` }] }],
+		},
+	};
+}
+
+// Always-on: the hook narrows its own rules to the host, so a GNU host is not blocked.
+// It resolves the workspace for its hit log from the CONFIGURED checkout.
+const shellTrapGuardHook = process.argv[8] || '';
+let shellTrapGuardSettings = null;
+if (shellTrapGuardHook.trim()) {
+	const repoRoot = path.resolve(shellTrapGuardHook, '..', '..');
+	const command = `python3 ${shq(shellTrapGuardHook)} --repo ${shq(repoRoot)}`;
+	shellTrapGuardSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
+}
+
+// Always-on: the hook only reads GitHub when a post names a sha, and fails open.
+const staleHeadPostGuardHook = process.argv[9] || '';
+let staleHeadPostGuardSettings = null;
+if (staleHeadPostGuardHook.trim()) {
+	const command = `python3 ${shq(staleHeadPostGuardHook)}`;
+	staleHeadPostGuardSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
+}
+
+process.stdout.write(
+	JSON.stringify(
+		mergeHookSettings(
+			guardSettings,
+			obsSettings,
+			skillTelemetrySettings,
+			gmailWriteGuardSettings,
+			gdocsWriteGuardSettings,
+			nativePimGuardSettings,
+			shellTrapGuardSettings,
+			staleHeadPostGuardSettings,
+		),
+	),
+);

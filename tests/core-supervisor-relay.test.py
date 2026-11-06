@@ -10,32 +10,71 @@ Run: python3 tests/core-supervisor-relay.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
+import io
 import json
 import os
+import shutil
+import sys
 import tempfile
 import contextlib
 import unittest
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-supervisor-relay.py")
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
 _spec = importlib.util.spec_from_file_location("core_supervisor_relay", _SRC)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+# These cases exercise the macOS path, which the owner turns on (notifications.macos); the
+# gate itself is pinned in macos-notifications-opt-in.test.py.
+_mod._macos_notifications_on = lambda: True
 should_escalate = _mod.should_escalate
 compose_message = _mod.compose_message
 run_cycle = _mod.run_cycle
 main = _mod.main
 resolve_active_target = _mod.resolve_active_target
 
+import channel_env_containment  # noqa: E402 — the shared module the probe delegates to
+import progress_route  # noqa: E402 — the shared route verdict the relay delegates to
+
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
+_LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
+          "prompt": "You've hit your session limit · resets 12:10pm\n"
+                    "/usage-credits to finish what you're working on.\n"
+                    "Continuing automatically at 12:10pm · esc to cancel",
+          "kind": "session-limit"}
 _LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
                "prompt": None, "kind": None}
+# The monitor's refused-turn signal (#4015): the core sits at its idle prompt and every turn
+# it is sent ends in this line. The prompt IS the line, so the remedy is chosen from it.
+_REFUSED_LINE = ("You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
+                 "or /model to switch models.")
+_REFUSED = {"state": "blocked-human", "detail": "awaiting user: turn-rejected",
+            "prompt": _REFUSED_LINE, "kind": "turn-rejected"}
 _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "kind": None}
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
 _HUNG = {"state": "hung", "detail": "core alive but stalled", "prompt": "…", "kind": "unknown"}
+# The monitor answered the Fable weekly-limit dialog itself (Enter = switch model);
+# the record rides along in the signal for AUTO_ANSWER_CARRY_S whatever the state.
+_FABLE_AUTO = {"state": "blocked-known", "detail": "at known gate: fable-limit",
+               "prompt": "You've reached your Fable limit\n❯ Switch to Opus 5 and continue",
+               "kind": "fable-limit",
+               "auto_answered": {"kind": "fable-limit", "key": "Enter", "at": 1788380000.0}}
+_FABLE_AUTO_LATER = dict(_IDLE, auto_answered=_FABLE_AUTO["auto_answered"])
+# A seat's monitor switched a turn refused at the Fable limit (typed `/model opus`).
+_FABLE_REFUSED_AUTO = dict(_IDLE, seat="Pro-fast",
+                           auto_answered={"kind": "fable-limit-refused", "key": ["/model opus", "Enter"],
+                                          "at": 1788400000.0})
+_PRESS_ENTER_AUTO = dict(_RUNNING, auto_answered={"kind": "press-enter", "key": "Enter", "at": 1.0})
 
 
 @contextlib.contextmanager
@@ -114,12 +153,97 @@ class TestShouldEscalate(unittest.TestCase):
         self.assertFalse(should_escalate(_LOGIN, h_mid)[0])
 
 
+    def test_fable_auto_answer_notifies_once_across_states(self):
+        esc, h = should_escalate(_FABLE_AUTO, None)
+        self.assertTrue(esc)
+        # The same record carried on a later idle tick must not fire again.
+        esc2, h2 = should_escalate(_FABLE_AUTO_LATER, h)
+        self.assertFalse(esc2)
+        self.assertEqual(h, h2)
+
+    def test_a_new_fable_answer_notifies_again(self):
+        _, h = should_escalate(_FABLE_AUTO, None)
+        again = dict(_FABLE_AUTO, auto_answered=dict(_FABLE_AUTO["auto_answered"], at=1788390000.0))
+        self.assertTrue(should_escalate(again, h)[0])
+
+    def test_a_plain_known_gate_still_never_escalates(self):
+        plain = {k: v for k, v in _FABLE_AUTO.items() if k != "auto_answered"}
+        self.assertFalse(should_escalate(plain, None)[0])
+
+    def test_press_enter_auto_answer_is_silent(self):
+        self.assertFalse(should_escalate(_PRESS_ENTER_AUTO, None)[0])
+
+
 class TestComposeMessage(unittest.TestCase):
+    def test_a_refused_turn_switch_names_the_worker_and_the_switch(self):
+        self.assertTrue(should_escalate(_FABLE_REFUSED_AUTO, None)[0])
+        msg = compose_message(dict(_FABLE_REFUSED_AUTO, seat="sutando-worker-d2571c90"))
+        self.assertIn("worker sutando-worker-d2571c90", msg)
+        self.assertIn("/model opus", msg)
+        self.assertNotIn("Agent needs you", msg)
+        self.assertIn("the core", compose_message({k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"}))
+
+    def test_a_refused_turn_switch_says_what_was_typed_not_that_it_took(self):
+        msg = compose_message(_FABLE_REFUSED_AUTO)
+        self.assertIn("not checked", msg)
+        self.assertNotIn("runs on Opus", msg)
+
+    def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
+        msg = compose_message(_FABLE_AUTO)
+        self.assertIn("Fable weekly limit", msg)
+        self.assertIn("pressed Enter", msg)
+        self.assertIn("fallback model", msg)
+        self.assertNotIn("Agent needs you", msg)
+        self.assertNotIn("/login", msg)
+        # Carried onto a later idle tick, the notice reads the same.
+        self.assertEqual(compose_message(_FABLE_AUTO_LATER), msg)
+
+    def test_fable_limit_with_the_caret_elsewhere_escalates_with_the_reason(self):
+        unfocused = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                     "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                     "kind": "fable-limit-unfocused"}
+        self.assertTrue(should_escalate(unfocused, None)[0])
+        msg = compose_message(unfocused)
+        self.assertIn("Agent needs you", msg)
+        self.assertIn("will not press Enter", msg)
+        self.assertNotIn("/login", msg)
+
     def test_includes_detail_and_prompt_excerpt(self):
         m = compose_message(_LOGIN)
         self.assertIn("awaiting user: login", m)
         self.assertIn("Login", m)  # first prompt line
         self.assertIn("resolve", m)
+
+    def test_login_pane_excerpt_is_the_prompt_not_the_chrome(self):
+        # The pane's first non-empty line is a box rule and the next an OAuth URL fragment; the
+        # one-line notice must quote the prompt (same filter as the escalation card).
+        pane = ("╭──────────────── sutando-core ─╮\n"
+                "https://claude.ai/oauth/authorize?code=true&code_challenge=ncifI5jOgzI138TpX&state=uv\n"
+                "Browser didn't open? Use the url below to sign in:\n"
+                "Paste code here if prompted >\n")
+        m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("Use the url below to sign in", m)
+        for noise in ("╭", "───", "https://", "code_challenge"):
+            self.assertNotIn(noise, m)
+
+    def test_the_excerpt_falls_back_to_the_first_line_when_the_filter_cannot_load(self):
+        # The notice is the owner's only channel: a missing filter module must not drop it.
+        pane = "╭─ rule ─╮\nBrowser didn't open? Use the url below to sign in:\n"
+        with patch.dict(sys.modules, {"prompt_excerpt": None}):
+            m = compose_message(dict(_LOGIN, prompt=pane))
+        self.assertIn("╭─ rule ─╮", m)  # the old first-non-empty line, degraded but delivered
+
+    def test_the_filter_is_found_from_the_relays_own_directory(self):
+        # Run as a script, sys.path[0] is not src/: the relay must add its own directory.
+        src_dir = os.path.dirname(_SRC)
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(src_dir)]
+            sys.modules.pop("prompt_excerpt", None)
+            m = compose_message(dict(_LOGIN, prompt="╭─ rule ─╮\nUse the url below to sign in:\n"))
+        finally:
+            sys.path[:] = saved
+        self.assertIn("Use the url below to sign in", m)
 
     def test_handles_no_prompt(self):
         m = compose_message(_LOGGED_OUT)
@@ -137,6 +261,126 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(_LOGIN)
         self.assertIn("GUI /login", m)
         self.assertNotIn("reply here or open the app", m)
+
+    def test_session_limit_escalates(self):
+        self.assertTrue(should_escalate(_LIMIT, None)[0])
+
+    def test_session_limit_names_the_reset_time_not_login(self):
+        m = compose_message(_LIMIT)
+        self.assertIn("resumes on its own at 12:10pm", m)
+        self.assertIn("/usage-credits", m)
+        # The owner named this third route (2026-09-02): the limit is per
+        # subscription, so signing in under another one is often the fastest.
+        self.assertIn("different subscription", m)
+        self.assertNotIn("/login", m)
+        self.assertNotIn("restart.sh", m)
+
+    def test_session_limit_without_a_reset_time_still_avoids_login(self):
+        sig = dict(_LIMIT, prompt="You've hit your session limit")
+        m = compose_message(sig)
+        self.assertIn("when the limit window resets", m)
+        self.assertNotIn("/login", m)
+
+    def test_usage_limit_banner_names_the_reset_date_not_login(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: usage-limit", "kind": "usage-limit",
+               "prompt": "⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                         "Continuing automatically at Oct 13 at 11pm · esc to cancel"}
+        self.assertTrue(should_escalate(sig, None)[0])
+        m = compose_message(sig)
+        self.assertIn("resumes on its own at Oct 13 at 11pm", m)
+        self.assertNotIn("/login", m)
+
+    def test_turn_rejected_escalates(self):
+        self.assertTrue(should_escalate(_REFUSED, None)[0])
+
+    def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
+        m = compose_message(_REFUSED)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("out of usage credits", m)
+        # A credit line gets the limit remedy, never the login one.
+        self.assertIn("/usage-credits", m)
+        self.assertIn("not a login problem", m)
+        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("restart.sh", m)
+
+    def test_turn_rejected_login_line_names_gui_login_remedy(self):
+        sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
+        m = compose_message(sig)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("OAuth access token has expired", m)
+        self.assertIn("GUI /login", m)
+        self.assertNotIn("usage limit", m)
+
+    def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
+        sig = dict(_REFUSED, prompt="Something else the CLI refused with")
+        with _no_backend():
+            m = compose_message(sig)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("where the core is running", m)
+
+    _PICKER = "Select model\n  1. Opus\n❯ 2. Sonnet\n  3. Haiku\n  Enter to confirm · Esc to cancel"
+    _YESNO = "Allow Bash(rm -rf build)?\n❯ 1. Yes\n  2. No\n  Esc to cancel"
+
+    def test_a_selection_or_permission_gate_names_the_choice_card_first_on_ag2space(self):
+        """A numbered picker or a permission dialog is projected to the owner's AG2 Space DM
+        as a HITL card whose buttons type the answer; the notice says so before the
+        terminal. A typed reply still cannot answer it."""
+        for kind, prompt in (("selection", self._PICKER), ("permission", self._YESNO)):
+            sig = {"state": "blocked-human", "detail": f"awaiting user: {kind}", "prompt": prompt, "kind": kind}
+            with _no_backend():
+                m = compose_message(sig, surface="ag2space")
+            self.assertIn("choice card in our DM", m, kind)
+            self.assertLess(m.index("choice card"), m.index("where the core is running"), kind)
+            self.assertIn("A typed chat reply can't answer it", m)
+        sig = {"state": "blocked-human", "detail": "awaiting user: unknown", "prompt": "??", "kind": "unknown"}
+        with _no_backend():
+            self.assertNotIn("choice card", compose_message(sig, surface="ag2space"))
+
+    def test_the_choice_card_is_named_only_where_a_card_with_buttons_exists(self):
+        """No card on discord/slack/telegram or macOS-only; a trust/bypass/limit dialog and an
+        unparseable prompt get the button-less card, so the notice names the terminal instead."""
+        base = {"state": "blocked-human", "detail": "awaiting user: selection", "kind": "selection"}
+        for surface in ("discord", "slack", "telegram", ""):
+            with _no_backend():
+                m = compose_message({**base, "prompt": self._PICKER}, surface=surface)
+            self.assertNotIn("choice card", m, surface or "macos-only")
+            self.assertIn("answer it where the core is running", m, surface or "macos-only")
+        never = ("Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit",
+                 "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No",
+                 "You've hit your weekly limit\n❯ 1. Switch to Opus and continue\n  2. Stop")
+        for prompt in never:
+            with _no_backend():
+                m = compose_message({**base, "prompt": prompt}, surface="ag2space")
+            self.assertNotIn("choice card", m, prompt.splitlines()[0])
+            self.assertIn("answer it where the core is running", m)
+        with _no_backend():
+            m = compose_message({**base, "prompt": "pick one"}, surface="ag2space")
+        self.assertNotIn("choice card", m, "no numbered options: no buttons")
+        # A permission gate keyed on a Yes/No pair is a card on a configured homeserver bridge too.
+        with _no_backend():
+            m = compose_message({**base, "kind": "permission", "prompt": self._YESNO}, surface="dev-ag2space")
+        self.assertIn("choice card", m)
+
+    def test_a_card_lookup_failure_falls_back_to_the_terminal_wording(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
+               "kind": "selection"}
+        with _no_backend(), patch.dict(sys.modules, {"hitl": None, "hitl.tui_gate": None}):
+            m = compose_message(sig, surface="ag2space")
+        self.assertNotIn("choice card", m)
+        self.assertIn("answer it where the core is running", m)
+        # Run as a script, src/ is not on sys.path yet: the lookup puts it there itself.
+        src = os.path.dirname(os.path.abspath(_SRC))
+        with patch.object(sys, "path", [p for p in sys.path if os.path.abspath(p) != src]):
+            self.assertTrue(_mod._card_projected(sig, "ag2space"))
+
+    def test_run_cycle_hands_the_delivery_surface_to_the_composer(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
+               "kind": "selection"}
+        with _no_backend():
+            on_space = run_cycle(sig, "", macos=False, source="ag2space", channel="!r:x", dry_run=True)
+            on_discord = run_cycle(sig, "", macos=False, source="discord", channel="1", dry_run=True)
+        self.assertIn("choice card", on_space)
+        self.assertNotIn("choice card", on_discord)
 
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
@@ -208,11 +452,12 @@ class TestRunCycleAndCli(unittest.TestCase):
     def test_real_cycle_persists_and_debounces(self):
         with tempfile.TemporaryDirectory() as td:
             sf = os.path.join(td, "state", "relay.state")
-            first = run_cycle(_LOGIN, sf, macos=False)  # no channel → macOS suppressed, still decides
-            self.assertIsNotNone(first)
-            self.assertTrue(os.path.exists(sf))
-            second = run_cycle(_LOGIN, sf, macos=False)  # same prompt → suppressed
-            self.assertIsNone(second)
+            with patch.object(_mod, "_macos_notify", lambda m: True):
+                first = run_cycle(_LOGIN, sf, macos=True)  # macOS delivered → debounce
+                self.assertIsNotNone(first)
+                self.assertTrue(os.path.exists(sf))
+                second = run_cycle(_LOGIN, sf, macos=True)  # same prompt → suppressed
+                self.assertIsNone(second)
 
     def test_relative_state_file_still_debounces(self):
         # Regression: a cwd-relative --state-file (e.g. "relay.state") has an empty
@@ -223,11 +468,12 @@ class TestRunCycleAndCli(unittest.TestCase):
             cwd = os.getcwd()
             os.chdir(td)
             try:
-                first = run_cycle(_LOGIN, "relay.state", macos=False)
-                self.assertIsNotNone(first)
-                self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
-                second = run_cycle(_LOGIN, "relay.state", macos=False)  # same prompt → suppressed
-                self.assertIsNone(second)
+                with patch.object(_mod, "_macos_notify", lambda m: True):
+                    first = run_cycle(_LOGIN, "relay.state", macos=True)
+                    self.assertIsNotNone(first)
+                    self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
+                    second = run_cycle(_LOGIN, "relay.state", macos=True)  # same prompt → suppressed
+                    self.assertIsNone(second)
             finally:
                 os.chdir(cwd)
 
@@ -250,34 +496,76 @@ class TestRunCycleAndCli(unittest.TestCase):
                 json.dump(_IDLE, f)
             self.assertEqual(main(["--signal", sig, "--no-macos"]), 0)
 
-    def test_cli_non_dict_signal_degrades(self):
+    def test_cli_non_dict_signal_escalates_as_unreadable(self):
         with tempfile.TemporaryDirectory() as td:
             sig = os.path.join(td, "core-supervisor.json")
             with open(sig, "w") as f:
                 json.dump([1, 2, 3], f)  # valid JSON, wrong shape
-            self.assertEqual(main(["--signal", sig, "--no-macos"]), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--signal", sig, "--no-macos", "--dry-run"]), 0)
+            self.assertIn("status file is unreadable", out.getvalue())
+
+    def test_cli_corrupt_signal_escalates_once_not_silently(self):
+        # 2026-09-11: a short write left core-supervisor.json corrupt from boot; the
+        # relay used to treat that exactly like "no signal yet" and escalate nothing.
+        with tempfile.TemporaryDirectory() as td:
+            sig = os.path.join(td, "core-supervisor.json")
+            state = os.path.join(td, "relay.state")
+            with open(sig, "w") as f:
+                f.write('{"state": "blocked-human", "prompt": "Log')  # truncated
+            sent = []
+            with patch.object(_mod, "_macos_notify", lambda m: sent.append(m) or True):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
+                    self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
+            self.assertEqual(len(sent), 1, "debounced like any blocker")
+            self.assertIn("Agent needs you", sent[0])
+            self.assertIn("restarting the engine rewrites the file", sent[0])
+
+    def test_cli_signal_that_cannot_be_opened_escalates(self):
+        # present but unopenable (a directory here; a permissions fault in the wild)
+        # is not "no signal yet" either — only a missing file is
+        with tempfile.TemporaryDirectory() as td:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--signal", td, "--no-macos", "--dry-run"]), 0)
+            self.assertIn("status file is unreadable", out.getvalue())
+
+    def test_unreadable_signal_decision_and_message(self):
+        esc, h = should_escalate(dict(_mod.UNREADABLE_SIGNAL), None)
+        self.assertTrue(esc)
+        self.assertFalse(should_escalate(dict(_mod.UNREADABLE_SIGNAL), h)[0])
 
     def test_cycle_without_state_file_still_emits(self):
         # No --state-file → no debounce persistence, but the escalation still fires.
         msg = run_cycle(_LOGIN, "", macos=False)
         self.assertIsNotNone(msg)
 
-    def test_run_cycle_dispatches_to_both_surfaces(self):
-        # Verify the dispatch call-sites (macOS + channel) fire without invoking the
-        # real external I/O — the adapters themselves are best-effort side effects.
+    def _dispatch(self, channel_ok):
         calls = []
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
-        _mod._macos_notify = lambda m: calls.append(("macos", m))
-        _mod._channel_notify = lambda m, s, c: calls.append(("chan", s, c))
+        _mod._macos_notify = lambda m: calls.append(("macos", m)) or True
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append(("chan", s, c, kw)) or channel_ok
         try:
             with tempfile.TemporaryDirectory() as td:
                 run_cycle(_LOGIN, os.path.join(td, "s.state"),
                           macos=True, source="discord", channel="123")
         finally:
             _mod._macos_notify, _mod._channel_notify = orig_m, orig_c
-        kinds = [c[0] for c in calls]
-        self.assertIn("macos", kinds)
-        self.assertIn("chan", kinds)
+        return calls
+
+    def test_a_landed_channel_send_pops_no_macos_notification(self):
+        # The app notifies for the DM message itself; a second pop-up cannot open it.
+        calls = self._dispatch(channel_ok=True)
+        self.assertEqual([c[0] for c in calls], ["chan"])
+        tag = calls[0][3]["extra"][_mod.ALERT_FIELD]
+        self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
+        self.assertEqual(tag["state"], _LOGIN.get("state"))
+
+    def test_a_failed_channel_send_falls_back_to_macos(self):
+        self.assertEqual([c[0] for c in self._dispatch(channel_ok=False)], ["chan", "macos"])
 
     def test_failed_channel_send_does_not_debounce(self):
         # #2101 review (High): when a channel is selected but its send FAILS, the
@@ -285,7 +573,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # instead of being silently marked as already-notified.
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: None
-        _mod._channel_notify = lambda m, s, c: False   # selected channel send fails
+        _mod._channel_notify = lambda m, s, c, **kw: False   # selected channel send fails
         try:
             with tempfile.TemporaryDirectory() as td:
                 sf = os.path.join(td, "s.state")
@@ -304,7 +592,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # Complement: a channel send that LANDS persists the hash → suppressed next cycle.
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: None
-        _mod._channel_notify = lambda m, s, c: True    # selected channel send lands
+        _mod._channel_notify = lambda m, s, c, **kw: True    # selected channel send lands
         try:
             with tempfile.TemporaryDirectory() as td:
                 sf = os.path.join(td, "s.state")
@@ -324,7 +612,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # escalation routes there.
         calls = []
         orig_c = _mod._channel_notify
-        _mod._channel_notify = lambda m, s, c: calls.append((s, c))
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append((s, c))
         try:
             with tempfile.TemporaryDirectory() as td:
                 sig = os.path.join(td, "core-supervisor.json")
@@ -462,6 +750,59 @@ class TestResolveActiveTarget(unittest.TestCase):
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
 
+    def _with_env(self, **values):
+        """Set/unset env vars for one test; None means unset."""
+        saved = {k: os.environ.get(k) for k in values}
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def _relocated_layout(self, source="ag2space"):
+        """$CLAUDE_CONFIG_DIR/channels/<source>/.env -> $APP/channels/<source>/.env,
+        the AG2 Space desktop-app layout (#3150/#3201). Returns (cfg, app)."""
+        cfg = tempfile.mkdtemp()
+        app = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+        real_dir = os.path.join(app, "channels", source)
+        os.makedirs(real_dir)
+        with open(os.path.join(real_dir, ".env"), "w") as f:
+            f.write("REMOTE_TASK_TOKEN=x\n")
+        link_dir = os.path.join(cfg, "channels", source)
+        os.makedirs(link_dir)
+        os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+        return cfg, app
+
+    def test_app_support_relocated_env_is_deliverable(self):
+        # notify.py accepts $SUTANDO_APP_SUPPORT/channels/<source>/.env as a
+        # second root (#3150/#3201); the probe must agree or the lane never routes.
+        with tempfile.TemporaryDirectory() as td:
+            cfg, app = self._relocated_layout("dev-ag2space")
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=app)
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:d"))
+
+    def test_same_shape_outside_app_support_is_not_deliverable(self):
+        # Containment, not a leaf-shape match: same layout with the var unset or
+        # pointed at another root is a symlink the sender refuses — so must the probe.
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
+            cfg, _app = self._relocated_layout("dev-ag2space")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=None)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+            self._with_env(SUTANDO_APP_SUPPORT=other)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
     def test_claude_home_tier_is_honored(self):
         # notify.py resolves CLAUDE_CONFIG_DIR -> CLAUDE_HOME -> ~/.claude; the
         # probe must walk the SAME tiers (a CLAUDE_HOME-only env previously
@@ -498,6 +839,89 @@ class TestResolveActiveTarget(unittest.TestCase):
             self.assertEqual(resolve_active_target(self._write(td, "{bad json")), ("", ""))
             self.assertEqual(resolve_active_target(self._write(td, [1, 2, 3])), ("", ""))
 
+
+
+class TestChannelEnvContainmentDelegation(unittest.TestCase):
+    """The probe (_is_deliverable) must call the shared
+    src/channel_env_containment.py function, not carry its own copy of the
+    containment rule — the exact duplication CLAUDE.md's architecture rules
+    call out as the defect."""
+
+    def _reload(self):
+        """A fresh module instance, separate from the shared `_mod` every
+        other test class depends on, so patching the shared function's
+        binding here can't affect them."""
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_fresh", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_binds_the_shared_function_by_identity(self):
+        self.assertIs(_mod._channel_env_is_contained,
+                      channel_env_containment.channel_env_is_contained)
+
+    def test_containment_delegates_to_shared_module_not_a_copy(self):
+        """Stub the shared function to always refuse, reload the probe, and
+        confirm even an otherwise-deliverable app-support relocation is now
+        refused. If _is_deliverable carried its own copy of the rule, this
+        module-level stub would have no effect."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = tempfile.mkdtemp()
+            app = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+            self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+            real_dir = os.path.join(app, "channels", "dev-ag2space")
+            os.makedirs(real_dir)
+            with open(os.path.join(real_dir, ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            link_dir = os.path.join(cfg, "channels", "dev-ag2space")
+            os.makedirs(link_dir)
+            os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "!r:d"}, f)
+
+            saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "SUTANDO_APP_SUPPORT")}
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            os.environ["SUTANDO_APP_SUPPORT"] = app
+            try:
+                with patch.object(channel_env_containment, "channel_env_is_contained",
+                                  return_value=False):
+                    fresh = self._reload()
+                    self.assertEqual(fresh.resolve_active_target(p), ("", ""))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    def test_load_channel_env_containment_fails_closed_when_import_fails(self):
+        """The fallback lambda itself, not just the already-bound result:
+        force the shared module's import to fail and confirm the returned
+        callable refuses even an otherwise-valid-looking containment case —
+        never silently widen the guard just because the import failed."""
+        import builtins
+        real_import = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "channel_env_containment":
+                raise ImportError("simulated: src/ not importable")
+            return real_import(name, *a, **kw)
+
+        fresh = self._reload()
+        with patch.object(builtins, "__import__", boom):
+            fallback = fresh._load_channel_env_containment()
+
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = os.path.join(td, "channels")
+            env_dir = os.path.join(channels_dir, "dev-ag2space")
+            os.makedirs(env_dir)
+            env_path = os.path.join(env_dir, ".env")
+            with open(env_path, "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            self.assertFalse(fallback(env_path, channels_dir, "dev-ag2space"))
 
 
 class TestBackendRecordContract(unittest.TestCase):
@@ -656,6 +1080,421 @@ class TestTargetIsRunnable(unittest.TestCase):
             msg = compose_message(_HUNG)
         self.assertIn("where the core is running", msg)
         self.assertNotIn("tmux -S", msg)
+
+
+class TestSeatNotices(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.core = os.path.join(self.d, "core-supervisor.json")
+        self.state = os.path.join(self.d, "relay.state")
+        with open(self.core, "w") as f:
+            json.dump(_IDLE, f)
+
+    def _seat(self, name, signal):
+        with open(os.path.join(self.d, f"core-supervisor.{name}.json"), "w") as f:
+            json.dump(signal, f)
+
+    def _run(self, *extra):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(["--signal", self.core, "--state-file", self.state, "--no-macos", *extra])
+        return out.getvalue()
+
+    def test_a_seat_soft_notice_is_relayed_once_under_its_own_state(self):
+        # Debounce saves only on a confirmed delivery, so --no-macos is dropped here.
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        sent = []
+        orig = _mod._macos_notify
+        _mod._macos_notify = lambda m: sent.append(m) or True
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main(["--signal", self.core, "--state-file", self.state])
+            first = out.getvalue()
+            second = self._run()
+        finally:
+            _mod._macos_notify = orig
+        self.assertIn("worker Pro-fast", first)
+        self.assertNotIn("worker Pro-fast", second)
+        self.assertTrue(os.path.exists(self.state + ".sutando-worker-ab"))
+
+    def test_a_failed_switch_retyped_each_cooldown_is_one_notice_per_episode(self):
+        aa = _FABLE_REFUSED_AUTO["auto_answered"]
+        t0 = aa["at"]
+        sent = []
+        orig = _mod._macos_notify
+        _mod._macos_notify = lambda m: sent.append(m) or True
+        try:
+            for at, episode in ((t0, t0), (t0 + 605, t0), (t0 + 1210, t0), (t0 + 90000, t0 + 90000)):
+                self._seat("sutando-worker-ab", dict(_FABLE_REFUSED_AUTO,
+                                                     auto_answered=dict(aa, at=at, episode=episode)))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["--signal", self.core, "--state-file", self.state])
+        finally:
+            _mod._macos_notify = orig
+        # Three re-types of one failed switch are one notice; a later episode is a new one.
+        self.assertEqual(len(sent), 2)
+
+    def test_a_seat_hard_gate_is_left_to_its_own_card(self):
+        self._seat("sutando-worker-ab", _LOGIN)
+        self.assertNotIn("sutando-worker-ab", self._run())
+
+    def test_no_seats_skips_them(self):
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        self.assertNotIn("Pro-fast", self._run("--no-seats"))
+
+    def test_a_sibling_that_names_no_seat_is_not_a_seat(self):
+        self._seat("sutando-worker-ab", {k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"})
+        self.assertEqual(_mod.relay_seat_notices(self.core, self.state, dry_run=True), [])
+
+    def test_a_seat_signal_given_as_signal_does_not_scan_siblings(self):
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        self._seat("sutando-worker-cd", _FABLE_REFUSED_AUTO)
+        self.assertEqual(_mod.relay_seat_notices(
+            os.path.join(self.d, "core-supervisor.sutando-worker-ab.json"), self.state, dry_run=True), [])
+
+    def test_an_unreadable_seat_signal_is_skipped_not_fatal(self):
+        # A seat's own file can be mid-write (truncated/invalid JSON) when a sibling
+        # scan lands on it; that seat is silently skipped, not a crash for every seat.
+        with open(os.path.join(self.d, "core-supervisor.sutando-worker-bad.json"), "w") as f:
+            f.write("{not json")
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        out = _mod.relay_seat_notices(self.core, self.state, dry_run=True)
+        self.assertEqual(len(out), 1)
+        self.assertIn("Pro-fast", out[0])
+
+    def test_an_unopenable_seat_signal_is_skipped_not_fatal(self):
+        # Permission denied on open() raises OSError, not ValueError -- the other
+        # half of the except tuple.
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        locked = os.path.join(self.d, "core-supervisor.sutando-worker-locked.json")
+        self._seat("sutando-worker-locked", _FABLE_REFUSED_AUTO)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o644)
+        out = _mod.relay_seat_notices(self.core, self.state, dry_run=True)
+        self.assertEqual(len(out), 1)
+        self.assertIn("Pro-fast", out[0])
+
+
+class TestProgressRouteDelegation(unittest.TestCase):
+    """Routability is src/progress_route.py's verdict, the one notify.py applies;
+    a private copy in the relay would drift from it."""
+
+    def _reload(self):
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_route", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _activity(self, td, obj):
+        p = os.path.join(td, "last-owner-activity.json")
+        with open(p, "w") as f:
+            json.dump(obj, f)
+        return p
+
+    def test_binds_the_shared_route_by_identity(self):
+        self.assertIs(_mod._delivery_route, progress_route.delivery_route)
+
+    def test_verdict_follows_the_shared_function(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._activity(td, {"channel": "discord", "channel_id": "42"})
+            with patch.object(progress_route, "delivery_route", return_value=None):
+                self.assertEqual(self._reload().resolve_active_target(p), ("", ""))
+            self.assertEqual(self._reload().resolve_active_target(p), ("discord", "42"))
+
+    def test_unimportable_route_fails_closed(self):
+        with patch.dict(sys.modules, {"progress_route": None}):
+            fn = _mod._load_progress_route()
+        self.assertIsNone(fn("discord", "42"))
+
+    def test_explicit_no_route_target_degrades_to_macos_only(self):
+        calls = []
+        orig_c = _mod._channel_notify
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append((s, c)) or True
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sig = os.path.join(td, "core-supervisor.json")
+                with open(sig, "w") as f:
+                    json.dump(_LOGIN, f)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = main(["--signal", sig, "--notify-source", "voice",
+                               "--notify-channel", "local-voice", "--no-macos",
+                               "--state-file", os.path.join(td, "s.state")])
+        finally:
+            _mod._channel_notify = orig_c
+        self.assertEqual((rc, calls), (0, []))
+        self.assertIn("no delivery path; macOS disabled, nothing to escalate to", err.getvalue())
+
+
+class TestNoRouteIsNeverDelivered(unittest.TestCase):
+    """A configured custom source whose channel is no room id: notify.py sends
+    nothing, so the relay must neither select it nor debounce on it."""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        os.makedirs(os.path.join(self.cfg, "channels", "dev-ag2space"))
+        with open(os.path.join(self.cfg, "channels", "dev-ag2space", ".env"), "w") as f:
+            f.write("REMOTE_TASK_URL=http://127.0.0.1:9\nREMOTE_TASK_TOKEN=x\n")
+        scripts = os.path.join(self.cfg, "skills", "task-progress", "scripts")
+        os.makedirs(scripts)
+        os.symlink(os.path.realpath(os.path.join(_HERE, "..", "skills", "task-progress",
+                                                 "scripts", "notify.py")),
+                   os.path.join(scripts, "notify.py"))
+        saved = {k: os.environ.get(k) for k in
+                 ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
+        for k in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+            os.environ.pop(k, None)
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def test_relay_does_not_select_a_no_route_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "C0123"}, f)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
+    def test_a_no_route_send_does_not_debounce(self):
+        orig_m = _mod._macos_notify
+        _mod._macos_notify = lambda m: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sf = os.path.join(td, "s.state")
+                self.assertFalse(_mod._channel_notify("x", "dev-ag2space", "C0123"))
+                run_cycle(_LOGIN, sf, macos=False, source="dev-ag2space", channel="C0123")
+                self.assertFalse(os.path.exists(sf), "a no-route send must not debounce")
+        finally:
+            _mod._macos_notify = orig_m
+
+
+class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
+    """The hash persists only after a delivery landed somewhere; a cycle that
+    reached no one must retry on the next tick."""
+
+    def _cycle(self, td, *, no_macos, macos_ok=True, channel_ok=None):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(_LOGIN, f)
+        state = os.path.join(td, "s.state")
+        argv = ["--signal", sig, "--state-file", state,
+                "--notify-source", "voice", "--notify-channel", "local-voice"]
+        if no_macos:
+            argv.append("--no-macos")
+        calls = []
+        with patch.object(_mod, "_macos_notify", lambda m: calls.append("macos") or macos_ok), \
+                patch.object(_mod, "_channel_notify", lambda m, s, c, **kw: calls.append("chan") or channel_ok), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = main(argv)
+        return rc, calls, os.path.exists(state), out.getvalue()
+
+    def test_no_route_with_no_macos_persists_nothing_and_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, calls, persisted, out = self._cycle(td, no_macos=True)
+            self.assertEqual((rc, calls, persisted), (0, [], False))
+            self.assertIn("not delivered: no route and macOS disabled (will retry)", out)
+            self.assertNotIn("escalated:", out)
+            rc, calls, persisted, out = self._cycle(td, no_macos=True)
+            self.assertNotIn("no escalation", out, "the next cycle must retry, not be suppressed")
+            self.assertFalse(persisted)
+
+    def test_no_route_with_a_failed_macos_notification_persists_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, calls, persisted, out = self._cycle(td, no_macos=False, macos_ok=False)
+            self.assertEqual((calls, persisted), (["macos"], False))
+            self.assertIn("not delivered: no route and macOS notification failed (will retry)", out)
+
+    def test_no_route_with_macos_delivered_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, calls, persisted, out = self._cycle(td, no_macos=False, macos_ok=True)
+            self.assertEqual((calls, persisted), (["macos"], True))
+            self.assertIn("escalated:", out)
+            _, _, _, out = self._cycle(td, no_macos=False, macos_ok=True)
+            self.assertIn("no escalation", out, "a delivered alert is debounced")
+
+    def test_a_failed_channel_is_not_rescued_by_macos(self):
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "s.state")
+            with patch.object(_mod, "_macos_notify", lambda m: True), \
+                    patch.object(_mod, "_channel_notify", lambda m, s, c, **kw: False):
+                run_cycle(_LOGIN, sf, macos=True, source="discord", channel="42")
+            self.assertFalse(os.path.exists(sf))
+
+
+class TestMacosNotifyAdapter(unittest.TestCase):
+    """The real _macos_notify against a fake `osascript` on PATH: only an exit 0
+    is a delivery, and only a delivery may persist the debounce."""
+
+    def setUp(self):
+        self.bin = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.bin, ignore_errors=True)
+        self.calls = os.path.join(self.bin, "calls")
+
+    def _fake(self, body, mode=0o755):
+        p = os.path.join(self.bin, "osascript")
+        with open(p, "w") as f:
+            f.write(f"#!/bin/sh\necho called >> {self.calls}\n{body}\n")
+        os.chmod(p, mode)
+
+    def _notify(self):
+        with patch.dict(os.environ, {"PATH": self.bin}):
+            return _mod._macos_notify("hello")
+
+    def _main_cycle(self, td):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(_LOGIN, f)
+        state = os.path.join(td, "s.state")
+        with patch.dict(os.environ, {"PATH": self.bin}), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            main(["--signal", sig, "--state-file", state,
+                  "--notify-source", "voice", "--notify-channel", "local-voice"])
+        return os.path.exists(state), out.getvalue()
+
+    def _assert_undelivered_and_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            persisted, out = self._main_cycle(td)
+            self.assertFalse(persisted)
+            self.assertIn("not delivered: no route and macOS notification failed", out)
+            persisted, out = self._main_cycle(td)
+            self.assertFalse(persisted)
+            self.assertNotIn("no escalation", out, "the next cycle must retry")
+
+    def test_exit_0_is_delivered_and_debounces(self):
+        self._fake("exit 0")
+        self.assertIs(self._notify(), True)
+        self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
+        with tempfile.TemporaryDirectory() as td:
+            persisted, out = self._main_cycle(td)
+            self.assertTrue(persisted)
+            self.assertIn("escalated:", out)
+            self.assertIn("no escalation", self._main_cycle(td)[1])
+
+    def test_exit_1_is_not_delivered(self):
+        self._fake("exit 1")
+        self.assertIs(self._notify(), False)
+        self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
+        self._assert_undelivered_and_retries()
+        with open(self.calls) as f:
+            self.assertEqual(len(f.readlines()), 3, "both cycles retried the notification")
+
+    def test_missing_binary_is_not_delivered(self):
+        self.assertIs(self._notify(), False)
+        self._assert_undelivered_and_retries()
+
+    def test_oserror_is_not_delivered(self):
+        self._fake("exit 0", mode=0o644)  # present but not executable: PermissionError
+        self.assertIs(self._notify(), False)
+        self._assert_undelivered_and_retries()
+
+    def test_timeout_is_not_delivered(self):
+        import subprocess as _sp
+        self._fake("exit 0")
+        with patch.object(_mod.subprocess, "run",
+                          side_effect=_sp.TimeoutExpired("osascript", 8)):
+            self.assertIs(self._notify(), False)
+            self._assert_undelivered_and_retries()
+
+
+class TestMacosNotifyScript(unittest.TestCase):
+    MESSAGES = (
+        "⚠️ Agent needs you — 確認",
+        '"quoted" \\path\nsecond line',
+        'end run\nerror "must remain data"\non run argv',
+        '-e -- controls\r\t\b\f',
+    )
+
+    def _command(self, message):
+        with patch.object(_mod.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertTrue(_mod._macos_notify(message))
+        return run.call_args.args[0]
+
+    def test_text_is_passed_as_arguments_to_one_static_script(self):
+        scripts = set()
+        for message in self.MESSAGES:
+            with self.subTest(message=message):
+                command = self._command(message)
+                scripts.add(command[2])
+                self.assertEqual(command[:2], ["osascript", "-e"])
+                self.assertEqual(command[3:], ["--", message, "Sutando · Agent Shepherd"])
+        self.assertEqual(len(scripts), 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS AppleScript")
+    def test_production_script_compiles_without_sending_a_notification(self):
+        import subprocess
+        command = self._command(self.MESSAGES[0])
+        with tempfile.TemporaryDirectory() as td:
+            result = subprocess.run(
+                ["/usr/bin/osacompile", "-o", os.path.join(td, "notify.scpt")],
+                input=command[2], text=True, capture_output=True, timeout=8,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS AppleScript")
+    def test_actual_handler_round_trips_arguments_without_notifying(self):
+        import re
+        import subprocess
+        for message in self.MESSAGES:
+            with self.subTest(message=message):
+                command = self._command(message)
+                script, count = re.subn(
+                    r"(?m)^\s*display notification [^\n]+$",
+                    "return item 1 of argv", command[2],
+                )
+                self.assertEqual(count, 1)
+                result = subprocess.run(
+                    ["/usr/bin/osascript", *command[1:2], script, *command[3:]],
+                    capture_output=True, timeout=8,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, message.encode("utf-8") + b"\n")
+
+
+class TestUndeliveredLogThrottle(unittest.TestCase):
+    """A cycle that reaches no one retries every tick but logs once per signal,
+    then at most every UNDELIVERED_LOG_INTERVAL_S; the debounce state stays empty."""
+
+    def _cycle(self, td, signal, now):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(signal, f)
+        state = os.path.join(td, "s.state")
+        with patch.object(_mod.time, "time", return_value=now), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            main(["--signal", sig, "--state-file", state, "--no-macos"])
+        return out.getvalue().count("not delivered:"), os.path.exists(state)
+
+    def test_logs_once_then_again_after_the_interval(self):
+        iv = _mod.UNDELIVERED_LOG_INTERVAL_S
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0), (1, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1030.0), (0, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv - 1), (0, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv + 1), (1, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv + 31), (0, False))
+
+    def test_a_new_signal_logs_at_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0), (1, False))
+            self.assertEqual(self._cycle(td, _LIMIT, 1030.0), (1, False))
+
+    def test_the_debounce_state_never_holds_the_throttle(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._cycle(td, _LOGIN, 1000.0)
+            self.assertFalse(os.path.exists(os.path.join(td, "s.state")))
+            self.assertTrue(os.path.exists(os.path.join(td, "s.state.undelivered")))
 
 
 if __name__ == "__main__":

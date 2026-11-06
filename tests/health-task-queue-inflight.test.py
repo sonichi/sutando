@@ -13,6 +13,11 @@ and starts meaning "wedged" — and that is precisely when an unbounded version
 of this probe would go quiet forever.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import re
@@ -67,7 +72,9 @@ check(hc._tasks_held_by_a_worker("garbage\n\n   \n") == set(), "junk ps output d
 # task is accounted for by a live worker.
 src = (REPO / "src" / "health-check.py").read_text()
 i = src.index("def check_task_queue")
-body = src[i:i + 2600]
+# The function itself, not a byte count: a fixed window turns "someone added a
+# line" into a false failure on an assertion about wording.
+body = src[i:src.index("\ndef ", i + 1)]
 check("held_note" in body, "the probe threads the in-flight count into its detail")
 check("held_is_progress" in body,
       "suppression is gated on a single named predicate, not an inline comparison")

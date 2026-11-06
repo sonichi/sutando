@@ -28,6 +28,13 @@
       core session is wedged but its heartbeat process still ticks). Each
       remote sender no-ops cleanly when its credentials or owner target are
       unavailable.
+    - FLAG-ENABLE GATE (#2160, Chi-authorized conversion 2026-08-28): re-adding
+      --recover-core here is what turns the dead-core relaunch ON. Before doing
+      so, a LIVE witness is REQUIRED: a real `start-cli.sh --restart` round trip
+      on this host proving the runtime comes back, a fresh local heartbeat is
+      written, and queued work resumes (CONTRIBUTING live-path rule). The merge
+      gate was converted to this enable gate on john-the-dev's argument; do not
+      flip the flag on unit tests alone.
     - NOTE (#2246): --recover-core was REMOVED from the default args. It decided
       "core wedged" almost entirely from core-status.json ts freshness — a
       best-effort *voluntary* signal — and false-positived when the core was

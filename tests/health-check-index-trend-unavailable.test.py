@@ -10,6 +10,12 @@ is simply not running and nothing says so.
 
 Same principle the prose-cap gate applies: never a bare PASS when nothing was read.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import subprocess
@@ -52,16 +58,21 @@ def index_in(dirpath, size, gitted, revisions=1):
     if not gitted:
         idx.write_text("- [x](x.md) — " + "y" * size + "\n")
         return idx
-    subprocess.run(["git", "init", "-q", str(d)], check=True)
-    subprocess.run(["git", "-C", str(d), "config", "user.email", "t@t"], check=True)
-    subprocess.run(["git", "-C", str(d), "config", "user.name", "t"], check=True)
+    # Bare `git` inherits the host's gc/maintenance settings and hooks, so ambient
+    # config decides whether a background writer touches .git/objects (#3542).
+    genv = isolated_child_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                GIT_CONFIG_NOSYSTEM="1")
+    git = ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.fsmonitor=false"]
+    subprocess.run(git + ["init", "-q", str(d)], env=genv, check=True)
+    subprocess.run(git + ["-C", str(d), "config", "user.email", "t@t"], env=genv, check=True)
+    subprocess.run(git + ["-C", str(d), "config", "user.name", "t"], env=genv, check=True)
     for i in range(revisions):
         idx.write_text("- [x](x.md) — " + "y" * (size - (revisions - 1 - i) * 4000) + "\n")
-        env = dict(os.environ,
+        env = dict(genv,
                    GIT_AUTHOR_DATE=str(int(time.time()) - (revisions - i) * 3600),
                    GIT_COMMITTER_DATE=str(int(time.time()) - (revisions - i) * 3600))
-        subprocess.run(["git", "-C", str(d), "add", "MEMORY.md"], check=True)
-        subprocess.run(["git", "-C", str(d), "commit", "-q", "-m", f"c{i}"], env=env, check=True)
+        subprocess.run(git + ["-C", str(d), "add", "MEMORY.md"], env=genv, check=True)
+        subprocess.run(git + ["-C", str(d), "commit", "-q", "-m", f"c{i}"], env=env, check=True)
     return idx
 
 

@@ -3,8 +3,8 @@
 
 Emits ONE anonymous ``feature_used {feature: "skill:<name>"}`` product-telemetry
 event every time the core invokes a skill (the `Skill` tool). This is the
-chokepoint that broadens feature-usage coverage from the two hand-instrumented
-scripts (morning-briefing, daily-insight) to the *entire* skill surface without
+chokepoint that broadens feature-usage coverage from hand-instrumented scripts
+(morning-briefing) to the *entire* skill surface without
 touching each skill — the loop already runs dozens of skills (proactive-loop,
 people-analysis, context-reconstruct, session-recap, task-orphan-check, …) and
 none of them reported until now.

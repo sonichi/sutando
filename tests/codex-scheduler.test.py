@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import os
 import plistlib
 import subprocess
 import sys
@@ -72,6 +73,111 @@ def test_codex_runtime_owns_legacy_main_loop_without_mutating_config():
         skipped = scheduler.tick(other_ws, "test-host", at(6, 10), include_main_loop=False)
         assert skipped["job_count"] == 0
         assert not (other_ws / "tasks").exists()
+
+
+def test_core_loop_completion_and_missing_loop_health():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+        scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        from loop_completion import read_completion
+        assert read_completion(ws, "test-host") is None
+        task = next((ws / "tasks").glob("*.txt"))
+        (ws / "results").mkdir()
+        (ws / "results" / task.name).write_text("[no-send]\n")
+        with mock.patch.object(scheduler, "write_completion", wraps=scheduler.write_completion) as writer:
+            completed = scheduler.tick(ws, "test-host", at(6, 11), include_main_loop=True)
+            writer.assert_called_once_with(ws, "test-host", now=at(6, 11).timestamp())
+        assert completed["events"] == [{"job": "main-loop", "event": "completed"}]
+        assert read_completion(ws, "test-host") == at(6, 11).timestamp()
+        assert read_completion(ws, "peer-host") is None
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=True):
+            assert scheduler.health(ws, "test-host", at(6, 11))[0] == 0
+            path = ws / "hosts" / "test-host" / "crons.json"
+            path.write_text(json.dumps([{"name": "hourly", "execution": "codex-task",
+                                         "cron": "0 * * * *", "prompt": "report"}]))
+            code, report = scheduler.health(ws, "test-host", at(6, 11))
+            assert code == 1 and any("main-loop" in p for p in report["problems"])
+
+
+def test_scheduler_health_delegates_required_loop_policy():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+        scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=True), \
+             mock.patch.object(scheduler, "main_loop_problem", return_value="missing main-loop") as policy:
+            code, report = scheduler.health(ws, "test-host", at(6, 10))
+            assert code == 1 and "missing main-loop" in report["problems"]
+            policy.assert_called_once()
+            assert policy.call_args.args[1] == "codex"
+
+
+def test_delayed_result_does_not_claim_a_fresh_pass():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+        scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        task = next((ws / "tasks").glob("*.txt"))
+        (ws / "results").mkdir()
+        result = ws / "results" / task.name
+        result.write_text("[no-send]\n")
+        finished = at(6, 11).timestamp()
+        os.utime(result, (finished, finished))
+        scheduler.tick(ws, "test-host", at(6, 11) + timedelta(days=1), include_main_loop=True)
+        from loop_completion import read_completion
+        assert read_completion(ws, "test-host") == finished
+
+
+def test_tick_does_not_convert_peer_result_into_local_completion():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+        scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        task = next((ws / "tasks").glob("*.txt"))
+        (ws / "results").mkdir()
+        (ws / "results" / task.name).write_text("[no-send]\n")
+        path = ws / "state/schedules/codex-scheduler.json"
+        state = json.loads(path.read_text())
+        state["host_label"] = "peer-host"
+        path.write_text(json.dumps(state))
+        result = scheduler.tick(ws, "test-host", at(6, 11), include_main_loop=True)
+        assert not any(e["event"] == "completed" for e in result["events"])
+        from loop_completion import read_completion
+        assert read_completion(ws, "test-host") is None
+
+
+def test_peer_or_future_scheduler_state_is_not_healthy():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+        scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        state_path = ws / "state/schedules/codex-scheduler.json"
+        state = json.loads(state_path.read_text())
+        state["host_label"] = "peer-host"
+        state_path.write_text(json.dumps(state))
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=True):
+            code, report = scheduler.health(ws, "test-host", at(6, 10))
+            assert code == 1 and any("this host" in p for p in report["problems"])
+            state["host_label"] = "test-host"
+            state["last_tick_at"] = scheduler.iso(at(6, 11))
+            state_path.write_text(json.dumps(state))
+            code, report = scheduler.health(ws, "test-host", at(6, 10))
+            assert code == 1 and any("future-dated" in p for p in report["problems"])
+
+
+def test_worker_loop_does_not_become_core_loop():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+        path = ws / "hosts" / "test-host" / "crons.json"
+        entries = json.loads(path.read_text())
+        entries[0]["owner"] = "worker-a"
+        path.write_text(json.dumps(entries))
+        assert scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)["job_count"] == 0
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=True):
+            code, report = scheduler.health(ws, "test-host", at(6, 10))
+            assert code == 1 and any("main-loop" in p for p in report["problems"])
 
 
 def test_cron_parser():
@@ -185,6 +291,29 @@ def test_enqueue_retry_complete_and_no_duplicate():
         assert state["jobs"]["daily-news"]["current"] is None
 
 
+def test_an_assigned_task_is_active_so_no_duplicate_retry_fires():
+    # `.assigned-<inst>` is the claimed rename's sibling state; a `.claimed-`
+    # glob cannot see it, so the retry fires while the original is still live.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        config(ws)
+        scheduler.tick(ws, "test-host", at(6, 0))
+        task = next((ws / "tasks").glob("*.txt"))
+
+        assigned = task.with_name(f"{task.stem}.assigned-core-2.txt")
+        task.rename(assigned)
+        assert scheduler._task_is_active(ws, [task.stem]) is True
+        assert scheduler.tick(ws, "test-host", at(6, 7))["events"] == []
+        assert [p.name for p in (ws / "tasks").iterdir()] == [assigned.name]
+
+        # Control: once it is genuinely gone, the retry the assigned state was
+        # suppressing does fire — so the assertion above is not vacuous.
+        assigned.unlink()
+        retry = scheduler.tick(ws, "test-host", at(6, 8))
+        assert retry["events"] == [
+            {"job": "daily-news", "event": "retried", "attempt": 2}]
+
+
 def test_failure_alert_and_health():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -194,8 +323,29 @@ def test_failure_alert_and_health():
         failed = scheduler.tick(ws, "test-host", at(6, 5))
         assert failed["events"] == [{"job": "daily-news", "event": "failed"}]
         assert len(list((ws / "results").glob("proactive-schedule-alert-*.txt"))) == 1
-        code, report = scheduler.health(ws, "test-host", at(6, 5))
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=False):
+            code, report = scheduler.health(ws, "test-host", at(6, 5))
         assert code == 1 and "latest run failed" in report["problems"][0]
+
+
+def test_an_assigned_task_counts_as_active_so_no_duplicate_retry() -> None:
+    """The lead renames to .assigned-<inst>; a .claimed-only check read that as
+    gone and retried, which the retry guard's own comment calls duplicating
+    irreversible side effects."""
+    import tempfile
+    for name, label in (("task-x.txt", "bare"),
+                        ("task-x.claimed-core-2.txt", "claimed"),
+                        ("task-x.assigned-core-2.txt", "assigned")):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "tasks" / "processed").mkdir(parents=True)
+        (ws / "tasks" / name).write_text("id: task-x\ntask: y\n")
+        assert scheduler._task_is_active(ws, ["task-x"]), f"{label} must read active"
+
+    ws = Path(tempfile.mkdtemp())
+    (ws / "tasks" / "processed").mkdir(parents=True)
+    assert not scheduler._task_is_active(ws, ["task-x"]), "absent must read inactive"
+    (ws / "tasks" / "processed" / "task-x.txt").write_text("x")
+    assert scheduler._task_is_active(ws, ["task-x"]), "processed check must be retained"
 
 
 def test_stale_active_task_fails_instead_of_stalling_or_duplicating():
@@ -261,18 +411,21 @@ def test_minute_slots_health_and_install_edges():
 
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
-        code, report = scheduler.health(ws, "test-host", at(6, 0))
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=False):
+            code, report = scheduler.health(ws, "test-host", at(6, 0))
         assert code == 1 and "no readable state" in report["problems"][0]
 
         state_path = ws / "state" / "schedules" / "codex-scheduler.json"
         state_path.parent.mkdir(parents=True)
         state_path.write_text(json.dumps({
+            "host_label": "test-host",
             "last_tick_at": scheduler.iso(at(5, 0)),
             "jobs": {
                 "removed": {"configured": False, "last_failure_at": scheduler.iso(at(5, 1))},
             },
         }))
-        code, report = scheduler.health(ws, "test-host", at(6, 0))
+        with mock.patch.object(scheduler, "codex_runtime_selected", return_value=False):
+            code, report = scheduler.health(ws, "test-host", at(6, 0))
         assert code == 1 and report["problems"] == ["scheduler heartbeat is older than 3 minutes"]
 
         config(ws)
@@ -282,11 +435,36 @@ def test_minute_slots_health_and_install_edges():
         assert [call.args[0][1] for call in run.call_args_list] == ["bootout", "enable", "bootstrap"]
 
         (ws / "hosts" / "test-host" / "crons.json").write_text("[]")
+        with mock.patch.object(Path, "home", return_value=Path(td) / "home2"):
+            assert scheduler.install(ws, "test-host", REPO, write_only=True) is None
+        assert not (Path(td) / "home2").exists(), "an empty schedule must write no plist"
+
+
+def test_missing_crons_json_means_no_jobs():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "workspace"
+        missing = ws / "hosts" / "test-host" / "crons.json"
+        for include_main_loop in (False, True):
+            assert scheduler.load_jobs(missing, include_main_loop=include_main_loop) == []
+        result = scheduler.tick(ws, "test-host", at(6, 0), include_main_loop=True)
+        assert result["events"] == []
+        home = Path(td) / "home"
+        with mock.patch.object(Path, "home", return_value=home), \
+             mock.patch.object(scheduler.subprocess, "run") as run:
+            assert scheduler.install(ws, "test-host", REPO, include_main_loop=True) is None
+        assert run.call_count == 0 and not home.exists()
+        with mock.patch.object(sys, "argv", [
+            "codex-scheduler.py", "install", "--workspace", str(ws), "--host-label", "test-host",
+        ]), mock.patch.object(Path, "home", return_value=home):
+            assert scheduler.main() == 0
+
+        missing.parent.mkdir(parents=True)
+        missing.write_text("{not json")
         try:
-            scheduler.install(ws, "test-host", REPO, write_only=True)
-            raise AssertionError("expected install to require an opted-in job")
-        except ValueError as exc:
-            assert "no crons.json entries" in str(exc)
+            scheduler.load_jobs(missing)
+            raise AssertionError("malformed crons.json must still raise")
+        except json.JSONDecodeError:
+            pass
 
 
 def test_main_dispatch_and_error_handling():
@@ -318,15 +496,24 @@ def test_main_dispatch_and_error_handling():
 def main():
     tests = [
         test_cron_parser,
+        test_core_loop_completion_and_missing_loop_health,
+        test_worker_loop_does_not_become_core_loop,
+        test_peer_or_future_scheduler_state_is_not_healthy,
+        test_delayed_result_does_not_claim_a_fresh_pass,
+        test_scheduler_health_delegates_required_loop_policy,
+        test_tick_does_not_convert_peer_result_into_local_completion,
         test_codex_runtime_owns_legacy_main_loop_without_mutating_config,
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
+        test_an_assigned_task_is_active_so_no_duplicate_retry_fires,
         test_failure_alert_and_health,
+        test_an_assigned_task_counts_as_active_so_no_duplicate_retry,
         test_stale_active_task_fails_instead_of_stalling_or_duplicating,
         test_wake_catchup_and_timezone,
         test_prompt_cannot_forge_task_headers,
         test_install_plist,
         test_minute_slots_health_and_install_edges,
+        test_missing_crons_json_means_no_jobs,
         test_main_dispatch_and_error_handling,
     ]
     for test in tests:

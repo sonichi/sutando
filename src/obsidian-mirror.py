@@ -7,7 +7,7 @@ cadence they want.
 Sources mirrored (decided 2026-05-24 with owner):
   tasks/task-<id>.txt        -> Agent/Tasks/task-<id>.md      (status: pending)
   results/task-<id>.txt      -> Agent/Tasks/task-<id>.md      (update: append Result, status: completed)
-  pending-questions.md       -> Agent/Asks.md                 (verbatim)
+  pending questions (reader) -> Agent/Asks.md                 (rendered list)
   notes/*.md                 -> Agent/Notes/<name>.md         (verbatim)
 
 One-way only (workspace -> vault). No reverse sync.
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from sutando_config import config_get
 import re
 import sys
 import time
@@ -40,10 +41,11 @@ from typing import Optional
 # reinvented-fallback bug class as core_heartbeat.py (fixed alongside).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
-from util_paths import personal_path  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
+import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 
 
-TASK_ID_RE = re.compile(r"^task-(.+)\.txt$")
 
 
 def _ensure_vault(vault: Path) -> None:
@@ -53,8 +55,9 @@ def _ensure_vault(vault: Path) -> None:
 
 
 def _task_id_from_path(path: Path) -> Optional[str]:
-    m = TASK_ID_RE.match(path.name)
-    return f"task-{m.group(1)}" if m else None
+    # Delegates so a CLAIMED file yields its real id: the old greedy
+    # `^task-(.+)\.txt$` returned `task-x.claimed-core-2` for one.
+    return task_id_from_filename(path.name)
 
 
 def _parse_task_file(path: Path) -> dict:
@@ -167,13 +170,26 @@ def _write_result_mirror(vault: Path, result_path: Path) -> bool:
 
 
 def _mirror_asks(vault: Path, workspace: Path) -> bool:
-    src = personal_path("pending-questions.md", workspace)
-    if not src.exists():
+    """Agent/Asks.md rendered from the one pending-questions reader; written only when changed,
+    and never from a partial read — an unreadable room leaves the mirror as it is."""
+    g = pending_questions_reader.gather(workspace, skill_roots.declared(pending_questions_reader.DECLARATION, workspace))
+    if g["unavailable"]:
+        print(f"obsidian-mirror: Asks.md left as is — room unreachable ({g['reason']})", file=sys.stderr)
         return False
+    items = g["waiting"]
     dest = vault / "Sutando" / "Agent" / "Asks.md"
-    content = src.read_text(encoding="utf-8", errors="replace")
+    if not items and not dest.exists():
+        return False
+    lines = ["# Pending questions", ""]
+    for it in items:
+        lines.append(f"## {it['title']}" + ("" if it.get("in_room", True) else " (not yet in the room)"))
+        if it.get("snippet") and it["snippet"] != it["title"]:
+            lines.append(it["snippet"])
+        lines += [f"Ask id: {it['ask_id']}", ""]
+    content = "\n".join(lines)
     if dest.exists() and dest.read_text(encoding="utf-8") == content:
         return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(content, encoding="utf-8")
     return True
 
@@ -233,10 +249,8 @@ def sweep(vault: Path, workspace: Path, since_seconds: Optional[int] = None) -> 
             if _mirror_note(vault, p):
                 counts["notes"] += 1
 
-    asks_src = personal_path("pending-questions.md", workspace)
-    if asks_src.exists() and (not cutoff or _within_window(asks_src, cutoff)):
-        if _mirror_asks(vault, workspace):
-            counts["asks"] = 1
+    if _mirror_asks(vault, workspace):
+        counts["asks"] = 1
 
     return counts
 
@@ -266,7 +280,7 @@ def main(argv) -> int:
     p.add_argument("--vault", help="Override vault path.")
     args = p.parse_args(argv)
 
-    if not args.force and os.environ.get("SUTANDO_OBSIDIAN_MIRROR", "").lower() not in ("1", "true", "yes", "on"):
+    if not args.force and (config_get("SUTANDO_OBSIDIAN_MIRROR", "") or "").lower() not in ("1", "true", "yes", "on"):
         print(
             "[obsidian-mirror] not enabled — set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in, "
             "or pass --force for an explicit one-shot run. Exiting.",

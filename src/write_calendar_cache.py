@@ -120,7 +120,14 @@ def write_cache(events: list[dict], path: Path | None = None,
     path = path or cache_path()
     today = today or datetime.now().strftime("%Y-%m-%d")
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"date": today, "events": normalize_events(events)}
+    normalized = normalize_events(events)
+    if missing := sum(1 for e in normalized if not e.get("start")):
+        # The briefing gates BOTH "Next up" and "Last event" on every event
+        # having a start, so a payload without one degrades it with no other tell.
+        print(f"write_calendar_cache: {missing} of {len(normalized)} event(s) carry no "
+              "`start` — the briefing will omit its 'Next up' and 'Last event' lines. "
+              "Include `start` in each piped event to keep them.", file=sys.stderr)
+    payload = {"date": today, "events": normalized}
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     os.replace(tmp, path)  # atomic — a concurrent briefing read never sees a partial file

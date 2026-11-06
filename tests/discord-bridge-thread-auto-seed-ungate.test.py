@@ -84,12 +84,18 @@ def test_seed_refreshes_require_mention_gate():
     still dropped at the `if require_mention and not bot_mentioned` gate —
     the ep013 first-message drop was only half-fixed by the ungate (thread
     seeded, triggering message lost). Guard: a require_mention reassignment
-    referencing thread_entry must appear between the atomic access.json
-    write and the requireMention skip gate.
+    referencing thread_entry must appear between the access.json write and
+    the requireMention skip gate.
+
+    #3318 moved the atomic write itself (os.replace) into
+    access_store._atomic_write_owner_only, called from inside the locked
+    mutate_access_file transaction — discord-bridge.py no longer performs
+    its own os.replace at this site. The write landmark here is the call
+    into that shared owner instead.
     """
     src = _src()
-    write_idx = src.find("os.replace(tmp_path, ACCESS_FILE)")
-    assert write_idx != -1, "atomic access.json write marker missing"
+    write_idx = src.find("seed_result = mutate_access_file(ACCESS_FILE, _thread_seed_mutator")
+    assert write_idx != -1, "access.json write call (mutate_access_file) marker missing"
     gate_idx = src.find("if require_mention and not bot_mentioned", write_idx)
     assert gate_idx != -1, "requireMention skip gate missing after seed block"
     refresh = re.compile(r"require_mention\s*=\s*require_mention\s+and\s+.*thread_entry")

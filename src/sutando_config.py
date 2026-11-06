@@ -7,9 +7,14 @@ go through `load_config()` so that the contract is enforced in one place
 rather than re-implemented per-service.
 
 Resolution order (highest layer wins):
-  1. `sutando.config.local.json` (per-clone override, gitignored)
-  2. `sutando.config.json` (tracked defaults at repo root)
-  3. Baked-in default (`{repo_root}/workspace`)
+  1. `<workspace>/sutando.config.local.json` (per-user, survives an engine
+     tree replaced on app update; may not set `workspace`, see below)
+  2. `sutando.config.local.json` (per-clone override, gitignored)
+  3. `sutando.config.json` (tracked defaults at repo root)
+  4. Baked-in default (`{repo_root}/workspace`)
+
+The workspace layer is read from the workspace that layers 2-4 resolve to, so
+it cannot move the workspace: a `workspace` key in it is dropped with a warning.
 
 `$SUTANDO_WORKSPACE` is no longer honored (removed in v0.8). If set, a
 one-time stderr warning fires pointing at `scripts/sutando-migrate.sh`
@@ -20,8 +25,8 @@ Dicts deep-merge; arrays REPLACE wholesale (not unioned). This matches the
 `.example` file pattern documented in the docstrings — users override only
 the keys they want.
 
-`${REPO_DIR}` in any string value expands to the directory containing the
-config file (== git toplevel for a sane checkout). Other ${VAR}s are not
+`${REPO_DIR}` in any string value expands to the repo root (the checkout
+holding `sutando.config.json`), in the workspace layer too. Other ${VAR}s are not
 expanded; this is config, not shell.
 
 Comment convention: any top- or nested-level key whose name starts with `_`
@@ -57,9 +62,27 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "env",
     "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
+    "skills",
+    "notifications",
+}
+
+# Blocks every consumer reads with `.get()`. A scalar here is what the schema's
+# `"type": "object"` already forbids; _load_json enforces it at read time.
+_OBJECT_TOP_LEVEL_KEYS = {
+    "core",
+    "workspace",
+    "claude_sutando_config_dir",
+    "vault",
+    "migrate",
+    "env",
+    "health_check",
+    "bridges",
+    "skills",
+    "notifications",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -75,6 +98,23 @@ def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
     configured = str(hc.get("down_bridge_action") or "alert").strip().lower()
     action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
     return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
+
+
+def resolve_suppressed_alerts(repo_root: Optional[Path] = None) -> frozenset:
+    """Check names this host has declared inapplicable (`health_check.suppress_alerts`).
+
+    Only a chronic WARN can be listed; the caller refuses to apply this to any
+    other status, so a list can never hide an outage. Fails OPEN (empty) on a
+    missing or malformed value: an unreadable config must alert, never silence.
+    """
+    try:
+        hc = load_config(repo_root).get("health_check") or {}
+        listed = hc.get("suppress_alerts")
+    except Exception:
+        return frozenset()
+    if not isinstance(listed, list):
+        return frozenset()
+    return frozenset(n for n in listed if isinstance(n, str) and n)
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -139,7 +179,10 @@ def _load_json(path: Path) -> Dict[str, Any]:
     """
     if not path.is_file():
         return {}
-    text = path.read_text(encoding="utf-8").strip()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        raise RuntimeError(f"sutando config: cannot read {path}: {e.strerror or e}") from e
     if not text:
         return {}
     try:
@@ -152,6 +195,17 @@ def _load_json(path: Path) -> Dict[str, Any]:
         raise RuntimeError(
             f"sutando config: {path} top-level must be a JSON object, got {type(data).__name__}"
         )
+    for key in sorted(_OBJECT_TOP_LEVEL_KEYS & set(data)):
+        # null is how every consumer already spells "absent" (`or {}`), so
+        # rejecting it would break configs that work on both loaders today.
+        if data[key] is None:
+            continue
+        if not isinstance(data[key], dict):
+            raise RuntimeError(
+                f"sutando config: {path} key {key!r} must be a JSON object, got "
+                f"{type(data[key]).__name__} {data[key]!r}. Did you mean "
+                f'{{"{key}": {{...}}}}?'
+            )
     return _strip_comments(data)
 
 
@@ -205,7 +259,9 @@ _CACHE_REPO_ROOT: Optional[Path] = None
 _LEGACY_ENV_WARN_PRINTED = False
 _DOTENV_DRIFT_WARN_PRINTED = False
 _UNKNOWN_KEYS_WARN_PRINTED = False
+_CONFIG_GET_WARNED: set = set()  # keys for which the env fallback warning was already printed
 _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
+_WS_LAYER_WORKSPACE_KEY_WARN_PRINTED = False
 
 
 def _color_warn(msg: str) -> str:
@@ -227,25 +283,26 @@ def _color_warn(msg: str) -> str:
     return msg
 
 
-def _warn_unknown_top_level_keys(cfg: Dict[str, Any], path: Path) -> None:
-    """Emit a one-time stderr warning if the resolved config has top-level
+def _warn_unknown_top_level_keys(sources: "list[tuple[Path, Dict[str, Any]]]") -> None:
+    """Emit a one-time stderr warning naming each config file that has top-level
     keys the loader doesn't recognize. Helps catch typos like `workspce`
     while leaving experimental keys harmlessly ignored. Per Mini's #8.
     """
     global _UNKNOWN_KEYS_WARN_PRINTED
     if _UNKNOWN_KEYS_WARN_PRINTED:
         return
-    extras = sorted(k for k in cfg if k not in _KNOWN_TOP_LEVEL_KEYS)
-    if not extras:
-        return
-    _UNKNOWN_KEYS_WARN_PRINTED = True
-    print(
-        f"sutando config: {path} has top-level keys the loader does not read: "
-        f"{', '.join(repr(k) for k in extras)}. Known keys: "
-        f"{sorted(_KNOWN_TOP_LEVEL_KEYS)!r}. Typo? Or experimental key — "
-        f"the loader will ignore it either way.",
-        file=sys.stderr,
-    )
+    for path, cfg in sources:
+        extras = sorted(k for k in cfg if k not in _KNOWN_TOP_LEVEL_KEYS)
+        if not extras:
+            continue
+        _UNKNOWN_KEYS_WARN_PRINTED = True
+        print(
+            f"sutando config: {path} has top-level keys the loader does not read: "
+            f"{', '.join(repr(k) for k in extras)}. Known keys: "
+            f"{sorted(_KNOWN_TOP_LEVEL_KEYS)!r}. Typo? Or experimental key — "
+            f"the loader will ignore it either way.",
+            file=sys.stderr,
+        )
 
 
 def _warn_progress_stream_type(val: Any) -> None:
@@ -272,13 +329,76 @@ def _reset_cache_for_tests() -> None:
     Production code never calls this. Importing in tests is intentional —
     keeps the public surface honest.
     """
-    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _PROGRESS_STREAM_TYPE_WARN_PRINTED
+    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _CONFIG_GET_WARNED, _PROGRESS_STREAM_TYPE_WARN_PRINTED, _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED
     _CACHE = None
     _CACHE_REPO_ROOT = None
     _LEGACY_ENV_WARN_PRINTED = False
     _DOTENV_DRIFT_WARN_PRINTED = False
     _UNKNOWN_KEYS_WARN_PRINTED = False
+    _CONFIG_GET_WARNED = set()
     _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
+    _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED = False
+
+
+def _test_mode_workspace() -> Optional[Path]:
+    """`$SUTANDO_WORKSPACE` under `SUTANDO_TEST_MODE=1` only; production ignores it."""
+    env_val = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+    if env_val and os.environ.get("SUTANDO_TEST_MODE") == "1":
+        return Path(env_val).expanduser().resolve()
+    return None
+
+
+def _workspace_from(cfg: Dict[str, Any], root: Optional[Path]) -> Path:
+    """The workspace a repo-merged config names. Pure: no warnings, no disk reads.
+
+    Shared by `resolve_workspace` and the workspace config layer, so the layer is
+    always read from the workspace every caller resolves.
+    """
+    test_ws = _test_mode_workspace()
+    if test_ws is not None:
+        return test_ws
+    cfg_path = (cfg.get("workspace") or {}).get("path")
+    # An embedder (e.g. a desktop app whose repo root is read-only) names the full
+    # workspace path; it fills the default slot only, below explicit config.
+    embedder_default = os.environ.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
+    if cfg_path:
+        return Path(cfg_path).expanduser().resolve()
+    if embedder_default:
+        return Path(embedder_default).expanduser().resolve()
+    if root is None:
+        # No repo root: last-ditch default outside a checkout, deliberately not the
+        # removed `.sutando/workspace/`. workspace_default.py mirrors this.
+        return Path.home().joinpath("sutando-workspace").resolve()
+    return (root / _HARDCODED_WORKSPACE_DEFAULT_REL).resolve()
+
+
+def _workspace_layer_path(repo_cfg: Dict[str, Any], root: Path) -> Path:
+    return _workspace_from(repo_cfg, root) / _LOCAL_FILENAME
+
+
+def _load_workspace_layer(repo_cfg: Dict[str, Any], root: Path) -> Dict[str, Any]:
+    """`<workspace>/sutando.config.local.json`, minus any `workspace` key.
+
+    Malformed JSON raises exactly as the repo-local file does. A workspace that
+    resolves to the repo root would name the repo-local file again: read it once.
+    """
+    global _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED
+    path = _workspace_layer_path(repo_cfg, root)
+    if path.resolve() == (root / _LOCAL_FILENAME).resolve():
+        return {}
+    layer = _load_json(path)
+    if "workspace" in layer:
+        layer = {k: v for k, v in layer.items() if k != "workspace"}
+        if not _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED:
+            _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED = True
+            # No path in the message: path-shaped stderr has been mkdir'd by callers.
+            print(
+                "sutando config: <workspace>/sutando.config.local.json sets 'workspace', "
+                "which it cannot change (that file is found BY the workspace). Ignoring "
+                "the key; set workspace.path in the repo's sutando.config.local.json.",
+                file=sys.stderr,
+            )
+    return layer
 
 
 def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
@@ -287,12 +407,13 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     `repo_root` is the directory holding `sutando.config.json`; defaults to
     the result of `_find_repo_root()`. Pass an explicit Path in tests.
 
-    Returns the deep-merged, ${REPO_DIR}-expanded config dict. Missing files
+    Returns the deep-merged, ${REPO_DIR}-expanded config dict, with the
+    `<workspace>/sutando.config.local.json` layer on top. Missing files
     are tolerated (defaults file optional too, in which case caller falls
     through to the hardcoded resolver default — see `resolve_workspace`).
 
-    Raises `RuntimeError` only for parse errors (malformed JSON) or
-    structurally-invalid top-level (non-object).
+    Raises `RuntimeError` for parse errors (malformed JSON), a non-object
+    top-level, or an object-typed block holding a scalar.
     """
     global _CACHE, _CACHE_REPO_ROOT
     if _CACHE is not None and (repo_root is None or repo_root == _CACHE_REPO_ROOT):
@@ -308,12 +429,17 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
 
     defaults = _load_json(root / _CONFIG_FILENAME)
     overrides = _load_json(root / _LOCAL_FILENAME)
-    merged = _deep_merge(defaults, overrides)
-    expanded = _expand_vars(merged, root)
+    repo_cfg = _expand_vars(_deep_merge(defaults, overrides), root)
+    workspace_layer = _expand_vars(_load_workspace_layer(repo_cfg, root), root)
+    expanded = _deep_merge(repo_cfg, workspace_layer)
 
     _CACHE = expanded
     _CACHE_REPO_ROOT = root
-    _warn_unknown_top_level_keys(expanded, root / _CONFIG_FILENAME)
+    _warn_unknown_top_level_keys([
+        (root / _CONFIG_FILENAME, defaults),
+        (root / _LOCAL_FILENAME, overrides),
+        (_workspace_layer_path(repo_cfg, root), workspace_layer),
+    ])
     return expanded
 
 
@@ -351,8 +477,9 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     # end users (no env override; warning + ignore) while letting the test
     # suite redirect workspace to per-test tmp dirs without rewriting every
     # test fixture. Production code MUST NOT set `SUTANDO_TEST_MODE`.
-    if env_val and os.environ.get("SUTANDO_TEST_MODE") == "1":
-        return Path(env_val).expanduser().resolve()
+    test_ws = _test_mode_workspace()
+    if test_ws is not None:
+        return test_ws
 
     if env_val and not _LEGACY_ENV_WARN_PRINTED:
         _LEGACY_ENV_WARN_PRINTED = True
@@ -379,25 +506,7 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
 
     cfg = load_config(repo_root)
     root = repo_root or _CACHE_REPO_ROOT
-    cfg_path = (cfg.get("workspace") or {}).get("path")
-    # Optional embedder-provided default workspace. An embedder (e.g. the AG2
-    # Space desktop app, whose `{repo_root}` is a read-only .app bundle) passes
-    # the FULL workspace path it wants; OSS stays agnostic to how it was derived.
-    # Fills the default slot only — an explicit `workspace.path` config wins.
-    embedder_default = os.environ.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
-    if cfg_path:
-        resolved = Path(cfg_path).expanduser().resolve()
-    elif embedder_default:
-        resolved = Path(embedder_default).expanduser().resolve()
-    elif root is None:
-        # No config and no repo root — last-ditch fallback for ad-hoc invocations
-        # outside a checkout. Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06),
-        # the legacy `.sutando/workspace/` namespace is gone; use the unhidden
-        # `~/sutando-workspace/` default instead so the deprecated `.sutando/`
-        # alias doesn't live on indefinitely. workspace_default.py mirrors this.
-        resolved = Path.home().joinpath("sutando-workspace").resolve()
-    else:
-        resolved = (root / _HARDCODED_WORKSPACE_DEFAULT_REL).resolve()
+    resolved = _workspace_from(cfg, root)
 
     # .env-drift warning: if `.env` still carries a stale SUTANDO_WORKSPACE
     # line, surface it once per process so the operator can clean it up.
@@ -498,6 +607,44 @@ def resolve_progress_stream(repo_root: Optional[Path] = None) -> Optional[bool]:
     return None
 
 
+def resolve_skills_developer(repo_root: Optional[Path] = None) -> bool:
+    """``skills.developer``: whether installers link developer-only skills here.
+
+    Only a real JSON ``true`` opts in; anything else, or an unreadable config, is
+    false with a stderr note, so a malformed opt-in keeps developer skills out.
+    """
+    try:
+        val = (load_config(repo_root).get("skills") or {}).get("developer")
+    except (RuntimeError, AttributeError) as exc:
+        print(f"sutando config: cannot read skills.developer ({exc}); treated as false",
+              file=sys.stderr)
+        return False
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: skills.developer must be a JSON boolean, got {val!r}; "
+              f"treated as false", file=sys.stderr)
+        return False
+    return val is True
+
+
+def resolve_macos_notifications(repo_root: Optional[Path] = None) -> bool:
+    """``notifications.macos``: whether Sutando may post macOS desktop notifications.
+
+    Off by default. Only a real JSON ``true`` opts in; any other value, or a config
+    that cannot be read, is off, so no sender can fire a banner the owner did not ask for.
+    """
+    try:
+        val = (load_config(repo_root).get("notifications") or {}).get("macos")
+    except Exception as exc:  # noqa: BLE001 — a notification gate must never raise
+        print(f"sutando config: cannot read notifications.macos ({exc}); treated as false",
+              file=sys.stderr)
+        return False
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: notifications.macos must be a JSON boolean, got {val!r}; "
+              f"treated as false", file=sys.stderr)
+        return False
+    return val is True
+
+
 def resolve_dotenv(repo_root: Optional[Path] = None,
                    workspace: Optional[Path] = None) -> Path:
     """Resolve the `.env` path through the canonical 2-tier fallback.
@@ -525,15 +672,98 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     return primary
 
 
+def desktop_runtime_selection_path(repo_root: Optional[Path] = None) -> Optional[Path]:
+    """The AG2 Space desktop's ``runtime.json``, when this engine is hosted by one.
+
+    The desktop owns that file. Its directory is ``$SUTANDO_APP_SUPPORT``, which the
+    desktop exports to engine processes, or the parent of the bundled engine tree
+    (``<app-support>/engine/<checkout>``) for jobs started without that environment.
+    """
+    app_support = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
+    if app_support:
+        return Path(app_support) / "runtime.json"
+    root = repo_root or _find_repo_root()
+    if root is None:
+        return None
+    root = Path(root).resolve()
+    if root.parent.name != "engine":
+        return None
+    return root.parent.parent / "runtime.json"
+
+
+def _desktop_selected_runtime(repo_root: Optional[Path]) -> str:
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None:
+        return ""
+    try:
+        selected = json.loads(path.read_text()).get("coreRuntime")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return selected.strip() if isinstance(selected, str) else ""
+
+
+def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = None,
+                                      check: bool = False) -> str:
+    """Make an explicit outside-core switch the desktop's durable selection too.
+
+    Returns ``"unchanged"`` when it already says ``runtime`` and ``"updated"`` after
+    writing it; ``"no-desktop"`` when no desktop hosts this engine. Otherwise the
+    desktop keeps relaunching and probing for the old runtime while the new one
+    owns the session (2026-10-22: the app read a live Claude core as absent).
+    ``check`` runs every validation but writes nothing, returning ``"would-update"``
+    where it would have written; the launcher writes only once the new core is confirmed.
+
+    Same contract as the desktop's own writer (``core_runtime.rs``
+    ``update_runtime_json``): every other key survives, and the file is replaced
+    atomically, because readers treat a partial or unparseable file as "never
+    chosen". A file that exists but is not a JSON object is refused rather than
+    replaced, which would drop the desktop's other keys.
+    """
+    if runtime not in _SUPPORTED_CORE_RUNTIMES:
+        raise ValueError(f"unsupported core runtime: {runtime!r}")
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None or not path.parent.is_dir():
+        return "no-desktop"
+    try:
+        body = json.loads(path.read_text())
+    except FileNotFoundError:
+        body = {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    if body.get("coreRuntime") == runtime:
+        return "unchanged"
+    if check:
+        return "would-update"
+    body["coreRuntime"] = runtime
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(body, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return "updated"
+
+
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
     """Return the selected persistent core CLI runtime.
 
-    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override.
-    Otherwise ``core.runtime`` is read from merged config. Claude remains the
-    default so upgrading does not change existing installations.
+    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override. Next is
+    the desktop's durable selection (``desktop_runtime_selection_path``), so
+    background jobs agree with the desktop launcher; a missing, unreadable or
+    unsupported selection is ignored. Then ``core.runtime`` from merged config.
+    Claude remains the default so upgrading does not change existing installations.
     """
     core = load_config(repo_root).get("core") or {}
     configured = str(core.get("runtime") or "claude").strip()
+    desktop = _desktop_selected_runtime(repo_root)
+    if desktop in _SUPPORTED_CORE_RUNTIMES:
+        configured = desktop
     runtime = os.environ.get("SUTANDO_CORE_RUNTIME", "").strip() or configured
     if runtime not in _SUPPORTED_CORE_RUNTIMES:
         supported = ", ".join(sorted(_SUPPORTED_CORE_RUNTIMES))
@@ -797,6 +1027,64 @@ def find_core_config_dir(
         if e.get("type") == type_:
             return e
     return None
+
+
+def config_get(
+    key: str,
+    default: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    """Read a non-secret config value, preferring the config file over the env.
+
+    Resolution order (issue #1724 — "split .env into secrets vs config"):
+      1. `sutando.config.{json,local.json}` → `env.<key>` (deep-merged).
+      2. `os.environ[key]` — legacy fallback for one release; prints a one-time
+         per-key stderr deprecation nag so operators know to migrate.
+      3. `default` — returned as-is if neither source has the key.
+
+    The `env` stanza in config mirrors the flat env-var namespace so migration
+    is mechanical: `config_get("MY_KEY")` in code, `env: {MY_KEY: value}` in
+    `sutando.config.local.json`. Secrets (`DISCORD_BOT_TOKEN` etc.) must stay
+    in `.env` / vault and MUST NOT be moved to the config file.
+
+    `repo_root` is passed through to `load_config()`; only needed in tests.
+    """
+    global _CONFIG_GET_WARNED
+    cfg = load_config(repo_root)
+    env_stanza = cfg.get("env") or {}
+    if key in env_stanza:
+        return str(env_stanza[key])
+    env_val = os.environ.get(key)
+    if env_val is not None:
+        if key not in _CONFIG_GET_WARNED:
+            _CONFIG_GET_WARNED.add(key)
+            print(
+                _color_warn(
+                    f"sutando config: {key!r} is read from os.environ (legacy). "
+                    f"Migrate: add `env: {{\"{key}\": \"<value>\"}}` to "
+                    f"sutando.config.local.json to silence this warning."
+                ),
+                file=sys.stderr,
+            )
+        return env_val
+    return default
+
+
+def config_get_env_first(
+    key: str,
+    default: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    """`config_get` with the precedence inverted — `os.environ` wins.
+
+    For documented escape hatches and bootstrap values only. An operator sets
+    these on the process to override a broken or stale config, so letting the
+    config file win would disable the very override they reached for.
+    """
+    val = os.environ.get(key)
+    if val is not None:
+        return val
+    return config_get(key, default, repo_root)
 
 
 def detect_env_workspace_in_dotenv(repo_root: Optional[Path] = None) -> Optional[str]:

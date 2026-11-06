@@ -8,7 +8,7 @@
 # context, not in unrelated sessions.
 #
 # Hooks installed (4):
-#   PreCompact  → cp $TRANSCRIPT_PATH ~/Desktop/sutando-conversations/...
+#   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
@@ -93,11 +93,30 @@ shq() {
 # ~/Desktop, so every hook installed by the old script pointed at a directory
 # that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|sutando-conversations/|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\""
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
+  # Without this the Stop gate spends its one reminder and never re-arms:
+  # begin_turn is the only reset and nothing else in the lifecycle calls it.
+  "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
 )
+
+# The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
+# The location is not what keeps transcripts out of the vault: sync is a whitelist
+# (see .git/info/exclude -- `*` then the include list), so a workspace path is
+# unsynced until vault.sync.include names it. Omitting it
+# drops it from HOOKS, which every phase iterates, so a registered one is untouched.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
+  _kept=()
+  for _h in "${HOOKS[@]}"; do
+    case "$_h" in
+      "PreCompact|sutando-conversations/|"*) ;;
+      *) _kept+=("$_h") ;;
+    esac
+  done
+  HOOKS=("${_kept[@]}")
+fi
 
 # Parallel to HOOKS by index, not another `|` field: CMD must stay last to hold a
 # `|`, and a second path-bearing field cannot also be last. Sized from HOOKS.
@@ -124,6 +143,16 @@ DEPRECATED_HOOKS=(
   # added in #1083 follow-up.
   "Stop|watch-tasks-stream.pid"
 )
+
+# This PR changed the archiver's command: phase 0 cannot migrate the old one (it
+# embeds no repo path) and phase 1 matches exactly, so both would fire.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
+  # SCOPE, not egress: the flag already dropped the archiver from HOOKS, so an
+  # ungated removal here would delete a registered hook and install no successor.
+  DEPRECATED_HOOKS+=(
+    "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  )
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for atomic settings.json edit" >&2
@@ -244,12 +273,22 @@ for i in "${!HOOKS[@]}"; do
   # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
   LEGACY_SHAPE=""
   [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  # A skill hook starts with the fail-open guard on ITS OWN path (`[ -f <path> ] || exit 0; `).
+  # Another revision of this installer spells the rest differently (the interpreter resolved at
+  # event time), and no operator writes that guard: an entry that opens with our guard for our
+  # path and carries the marker is ours whatever follows, so the two spellings never coexist.
+  GUARD_SHAPE=""
+  case "$CMD" in
+    "[ -f "*" ] || exit 0; "*)
+      _guard="${CMD%% ] || exit 0; *} ] || exit 0; "
+      GUARD_SHAPE="^$(re_escape "$_guard").*$(re_escape "$MARKER")" ;;
+  esac
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
+           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
        | map(contains($marker) and (. != $cmd)
-             and (test($shape) or ($legacy != "" and test($legacy))))
+             and (test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard))))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
@@ -257,14 +296,14 @@ for i in "${!HOOKS[@]}"; do
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
   jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
+     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
           and ((.command // "")
-               | test($shape) or ($legacy != "" and test($legacy)))
+               | test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard)))
           | not
         ))
       )
@@ -329,6 +368,14 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
   mv "$TMP" "$SETTINGS"
   REMOVED=$((REMOVED + 1))
 done
+
+# A bare `cp` archiver (legacy, or an operator's own) cannot create its destination;
+# the managed archive-transcript.sh makes its own, so only the bare form gets one.
+if jq -e '(.hooks // {}).PreCompact // [] | map(.hooks // []) | flatten
+          | map((.command // "") | test("^cp .*sutando-conversations/")) | any' \
+     "$SETTINGS" >/dev/null 2>&1; then
+  mkdir -p "$HOME/Desktop/sutando-conversations"
+fi
 
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
 

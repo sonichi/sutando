@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 
 # results/ is per-user runtime state — lives under the resolved workspace
 # (post-v0.8 default `<repo>/workspace/`; configurable via
@@ -46,11 +47,11 @@ from workspace_default import resolve_workspace  # noqa: E402
 WORKSPACE = resolve_workspace()
 RESULTS = WORKSPACE / "results"
 
-RETENTION_HOURS = int(os.environ.get("RETENTION_HOURS", "24"))
+RETENTION_HOURS = int(config_get("RETENTION_HOURS", "24"))
 # Case-insensitive compare — without `.lower()`, `DRY_RUN=No` or `DRY_RUN=FALSE`
 # would silently evaluate truthy (dry-run mode) because "No"/"FALSE" aren't in
 # the lowercase reject list. Found in cold-review of #354.
-DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() not in ("", "0", "false", "no")
+DRY_RUN = (config_get("DRY_RUN", "") or "").strip().lower() not in ("", "0", "false", "no")
 
 
 class OpenWriterCheckUnavailable(Exception):

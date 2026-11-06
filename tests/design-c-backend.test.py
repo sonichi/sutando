@@ -12,6 +12,7 @@ beyond the backend-agnostic contract suite:
 Run: python3 tests/design-c-backend.test.py"""
 # ruff: noqa: E402 — imports follow the sys.path insert below
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -37,21 +38,23 @@ def check(name, cond, detail=""):
         print(f"  FAIL: {name} {detail}", file=sys.stderr)
 
 
-def plant_dead_ghost(b, item):
+def known_dead_pid():
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
+        assert child.wait() == 0
+        assert backend_c.outbox.process_identity(child.pid).state == backend_c.outbox.OwnerState.DEAD
+        return child.pid
+
+
+def plant_dead_ghost(b, item, dead_pid):
     """A crashed prior incarnation's token: dead pid, epoch birth."""
     key = backend_c._safe_key(item)
-    ghost = b.root / "inflight" / SEP.join((key, "ghost", "99999", "1", "0"))
+    ghost = b.root / "inflight" / SEP.join((key, "ghost", str(dead_pid), "1", "0"))
     ghost.write_text("{}", encoding="utf-8")
     return ghost
 
 
 def main() -> int:
-    try:
-        os.kill(99999, 0)
-        print("SKIP-INVALID: pid 99999 alive on this host", file=sys.stderr)
-        return 1
-    except ProcessLookupError:
-        pass
+    dead_pid = known_dead_pid()
 
     # Assert-don't-perform (yixuan, #3104): constructing on an unfenced root
     # must refuse with the migration instruction, never write the fence.
@@ -114,7 +117,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         b = DesignCClaimBackend(Path(td), activate=True)
         b.publish(ITEM, b"x")
-        plant_dead_ghost(b, ITEM)
+        plant_dead_ghost(b, ITEM, dead_pid)
         try:
             t = b.claim(ITEM, "drainer-A")
             check("ghost: claim beside dead ghost succeeds, no raise",
@@ -132,7 +135,7 @@ def main() -> int:
     # GHOST-2: dead token with NO live holder re-arms to ready.
     with tempfile.TemporaryDirectory() as td:
         b = DesignCClaimBackend(Path(td), activate=True)
-        plant_dead_ghost(b, ITEM)
+        plant_dead_ghost(b, ITEM, dead_pid)
         rep = b.recover()
         check("ghost-2: lone dead token re-arms",
               backend_c._safe_key(ITEM) in rep.recovered)

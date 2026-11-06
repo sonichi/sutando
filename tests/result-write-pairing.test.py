@@ -92,22 +92,24 @@ class PairedResultWriteTests(unittest.TestCase):
         (self.results / "task-a1.txt").write_text(original)
 
         def spy(src, dst):
+            if Path(dst).parent != self.results:
+                return real_replace(src, dst)
             calls.append((str(src), str(dst)))
             self.assertEqual((self.results / "task-a1.txt").read_text(), original,
                              "destination changed before the atomic swap")
             return real_replace(src, dst)
 
-        result_write.os.replace = spy
+        os.replace = spy
         try:
             self.write("a1", "task: a1\nreplacement\n")
         finally:
-            result_write.os.replace = real_replace
+            os.replace = real_replace
         self.assertEqual(len(calls), 1)
         # Assert the PROPERTY, not the spelling — `.endswith(".tmp")` also
         # failed for any caller passing tmp_tag, so it never held generally.
         src = Path(calls[0][0])
         self.assertEqual(src.parent, self.results, calls[0][0])
-        self.assertTrue(src.name.startswith(".task-a1.txt.tmp"), calls[0][0])
+        self.assertTrue(src.name.startswith(".task-a1.txt."), calls[0][0])
         self.assertNotEqual(src, self.results / "task-a1.txt")
         self.assertEqual((self.results / "task-a1.txt").read_text(), "replacement\n")
 
@@ -278,14 +280,14 @@ class ReceiptFailuresDoNotLoseTheResult(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_unwritable_receipts_dir_still_returns_the_result(self):
-        """A durable result must never be rolled back for a diagnostic sidecar."""
+    def test_unwritable_receipt_refuses_publication(self):
         blocker = self.ws / "blocker"
         blocker.write_text("")
-        out = result_write.write_paired_result(
-            self.ws / "results", "c3", "task: c3\nbody\n",
-            receipts_dir=blocker / "under-a-file")
-        self.assertEqual(out.read_text(), "body\n")
+        with self.assertRaises(OSError):
+            result_write.write_paired_result(
+                self.ws / "results", "c3", "task: c3\nbody\n",
+                receipts_dir=blocker / "under-a-file")
+        self.assertFalse((self.ws / "results/task-c3.txt").exists())
 
     def test_has_pairing_receipt_is_false_when_the_path_raises(self):
         """pathlib swallows most of these, so raise at the seam the guard wraps."""
@@ -315,7 +317,7 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             results = Path(td)
             barrier = threading.Barrier(2)
-            real = result_write.os.replace
+            real = os.replace
 
             def synced(src, dst):
                 # Hold both writers until each has created its temp file, so
@@ -332,7 +334,7 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
                 except Exception as e:      # noqa: BLE001 — recorded, not raised
                     errs.append(type(e).__name__)
 
-            result_write.os.replace = synced
+            os.replace = synced
             try:
                 ts = [threading.Thread(target=go, args=(t,)) for t in tags]
                 for t in ts:
@@ -340,7 +342,7 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
                 for t in ts:
                     t.join(timeout=20)
             finally:
-                result_write.os.replace = real
+                os.replace = real
             return len(out), errs
 
     def test_default_tags_do_not_collide(self):
@@ -353,38 +355,49 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
         self.assertEqual(errs, [])
         self.assertEqual(returned, 2)
 
-    def test_the_race_harness_can_actually_fail(self):
-        """Control: force the pre-fix shared name and the collision appears."""
+    def test_distinct_concurrent_bodies_cannot_mix_receipt_generations(self):
         import threading
+        from unittest.mock import patch
         with tempfile.TemporaryDirectory() as td:
-            results = Path(td)
-            barrier = threading.Barrier(2)
-            real = result_write.os.replace
-            errs = []
+            results, receipts = Path(td) / "results", Path(td) / "receipts"
+            first_paused, release, second_done = (threading.Event() for _ in range(3))
+            real = result_write.publish_text
+            errors = []
 
-            def synced(src, dst):
-                barrier.wait(timeout=10)
-                return real(src, dst)
+            def paused(path, body):
+                if Path(path).parent == results and body == "A\n":
+                    first_paused.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test release timed out")
+                return real(path, body)
 
-            def go():
+            def go(body, done=None):
                 try:
-                    # the shared name the default used to produce
-                    result_write.write_paired_result(results, "race",
-                                           "task: race\nbody\n", tmp_tag="shared")
-                except Exception as e:      # noqa: BLE001
-                    errs.append(type(e).__name__)
+                    result_write.write_paired_result(results, "race", "task: race\n" + body,
+                                                     receipts_dir=receipts)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    if done:
+                        done.set()
 
-            result_write.os.replace = synced
-            try:
-                ts = [threading.Thread(target=go) for _ in range(2)]
-                for t in ts:
-                    t.start()
-                for t in ts:
-                    t.join(timeout=20)
-            finally:
-                result_write.os.replace = real
-        self.assertIn("FileNotFoundError", errs,
-                      "harness cannot produce the collision it claims to prevent")
+            with patch.object(result_write, "publish_text", paused):
+                first = threading.Thread(target=go, args=("A\n",))
+                second = threading.Thread(target=go, args=("B\n", second_done))
+                first.start()
+                self.assertTrue(first_paused.wait(5))
+                second.start()
+                try:
+                    self.assertFalse(second_done.wait(0.2), "second writer bypassed task lock")
+                finally:
+                    release.set()
+                    first.join(5)
+                    second.join(5)
+            self.assertEqual(errors, [])
+            body = (results / "task-race.txt").read_bytes().decode("utf-8")
+            self.assertEqual(body, "B\n")
+            self.assertTrue(result_write.receipt_attests(receipts, "race", body))
+
 
 
 class ReceiptAttestsTheBytesItPublished(unittest.TestCase):
@@ -498,6 +511,14 @@ class AttestsCliAndCrossTaskReceipt(unittest.TestCase):
         (self.results / "task-zzz.txt").write_text("the answer\n")
         self.assertFalse(
             result_write.receipt_attests(self.receipts, "zzz", "the answer\n"))
+
+    def test_crlf_published_bytes_pass_cli_and_readiness(self):
+        from delivery.readiness import read_ready_result
+        result_write.write_paired_result(self.results, "abc", "task: abc\r\nanswer\r\n",
+                                         receipts_dir=self.receipts)
+        self.assertEqual(self._cli("abc"), 0)
+        self.assertEqual(read_ready_result(self.results / "task-abc.txt",
+                         attests=result_write.receipt_verifier(self.receipts, "abc")), "answer")
 
     def test_cli_exits_0_when_the_receipt_attests_the_current_bytes(self):
         self.assertEqual(self._cli("abc"), 0)

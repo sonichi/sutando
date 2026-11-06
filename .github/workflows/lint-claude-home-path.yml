@@ -14,9 +14,12 @@ name: lint-claude-home-path
 
 on:
   pull_request:
-    branches: [main, staging-workspace-revamp]
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint-claude-home-path:

@@ -40,17 +40,36 @@ class DeliveryOutcome(str, Enum):
 
 
 class DrainStatus(str, Enum):
-    """Why a drain attempt ended, locally. NOT_CLAIMED means another worker
-    owns the item: no provider call was made, so nothing external is
-    ambiguous."""
+    """Why a drain attempt ended, locally. Neither non-ATTEMPTED status made
+    a provider call, so nothing external is ambiguous in either.
+
+    NOT_CLAIMED and TERMINAL are split because they differ in whether a later
+    pass can ever succeed: NOT_CLAIMED is contention (another worker owns it;
+    a reclaim recovers it), TERMINAL is the item's own final state. Collapsing
+    them makes a drainer retry a decided item forever.
+    """
     NOT_CLAIMED = "not_claimed"
+    TERMINAL = "terminal"
     ATTEMPTED = "attempted"
+    # The claim's revalidation refused the send: parked, no provider call.
+    WITHDRAWN = "withdrawn"
+    # The claim's revalidation could not decide yet: released as it was, no provider call.
+    DEFERRED = "deferred"
+
+
+class Defer(str):
+    """A `revalidate` answer that neither sends nor withdraws: the item is released unsent, with
+    no attempt recorded, for a later pass to check again."""
 
 
 @dataclass(frozen=True)
 class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
+    # The deciding call's own account: the receipt's provider_ref (how the
+    # provider vouched for it) and its detail, or the refusal's message.
+    provider_ref: Optional[str] = None
+    detail: str = ""
 
     def __post_init__(self):
         attempted = self.status is DrainStatus.ATTEMPTED
@@ -68,6 +87,10 @@ class ProviderIndeterminate(Exception):
 class ProviderRefused(Exception):
     """The provider definitely did not perform the side effect (validation
     rejection, refusal before dispatch). Maps to NOT_DELIVERED."""
+
+
+class ProviderPermanentRefused(ProviderRefused):
+    """A definitive refusal which another automatic send cannot repair."""
 
 
 @dataclass(frozen=True)
@@ -165,11 +188,44 @@ class ClaimBackend(Protocol):
     def capabilities(self) -> BackendCapabilities: ...
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        """True = newly published; False = this id is already live."""
+        """True = newly published; False = this id is already live.
+
+        Durable backends may expose payload_for_claim(token) so the core sends
+        the original published bytes rather than a rebuilt caller payload.
+        """
         ...
 
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
-        """Acquire exclusive local ownership, or None on a lost race."""
+        """Acquire exclusive local ownership, or None when it was not taken.
+
+        None does NOT mean "another worker owns it" — it also covers an item
+        that is already terminal, absent, or whose incarnation vanished. Ask
+        `is_terminal` to tell a decided item from a contended one.
+        """
+        ...
+
+    def is_terminal(self, item_id: str) -> bool:
+        """True when this item has reached its own final state (delivered or
+        parked) and no drain will ever claim it again.
+
+        Only meaningful after a failed `claim`, and read separately because a
+        terminal item and a contended one are indistinguishable from `claim`
+        alone. Terminal is absorbing except via the administrative requeue
+        path, which resets the attempt budget — so a `True` that goes stale
+        that way costs one extra pass, never a stuck item.
+        """
+        ...
+
+    def resend_epoch(self, item_id: str) -> int:
+        """The item's operator re-send generation; 0 until a requeue bumps it.
+
+        Declared, not duck-typed: the core derives the idempotency key from it,
+        so a backend that silently lacks it presents the SAME key the provider
+        already saw for the attempt that parked the item — the operator reads
+        `requeued`, and the provider dedupes the re-send away with no error on
+        any surface. Return 0 for a backend that does not track re-sends; that
+        is a decision the contract suite can see, not an absence it cannot.
+        """
         ...
 
     # False = complete() accepts provider/destination and DROPS them.
@@ -179,7 +235,8 @@ class ClaimBackend(Protocol):
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
-                 destination: Optional[str] = None) -> bool:
+                 destination: Optional[str] = None,
+                 terminal_reason: Optional[str] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
@@ -189,7 +246,14 @@ class ClaimBackend(Protocol):
         step: recording the attempt and parking at the ceiling must not be
         two transactions, or a successor can claim and confirm between them
         and the stale caller's park overwrites its DELIVERED state.
+        `terminal_reason` parks a definitive refusal in that same transaction,
+        regardless of any retry schedule or attempt ceiling.
         True = this incarnation owned the claim and it is now retired."""
+        ...
+
+    def release(self, token: ClaimToken) -> bool:
+        """Retire this incarnation's claim with no outcome and no attempt recorded: the item is
+        claimable again as it was. A stale token changes nothing. True = it owned the claim."""
         ...
 
     def attempts(self, item_id: str) -> int:

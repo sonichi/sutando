@@ -1,0 +1,8 @@
+# Stored unified diffs carry their own required syntax (a lone space marks an
+# unchanged blank line) that `git diff --check`'s trailing-whitespace rule
+# cannot distinguish from real hygiene issues — and that syntax cannot be
+# edited away without breaking `git apply`/`patch` on the file. Suppress the
+# check on the patch's own bytes rather than mangling content required for
+# the patch to remain applicable (#3318 review).
+*.patch -whitespace
+*.diff -whitespace

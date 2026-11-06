@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """Shared gateway plumbing for the room-ops capabilities (read / media / react / …).
 
 Every room-ops module is a thin **gateway-only** client: it speaks the stable
@@ -66,6 +68,93 @@ def gate_allows(agent_mxid, room_id, gate):
 # --------------------------------------------------------------------------- #
 # Gateway coordinates + HTTP
 # --------------------------------------------------------------------------- #
+def _core_src_on_path():
+    """Put the core `src/` on sys.path so shared helpers import. False if absent."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        cand = os.path.join(cur, "src")
+        if os.path.isfile(os.path.join(cand, "channel_token.py")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+
+
+def _channel_env_file():
+    """Path to the ag2space channel `.env`, or None when it cannot be located.
+
+    room-ops IS the ag2space transport, so its credential lives beside the other
+    providers' — `channel_token.py` states the rule: each bridge reads its own
+    `channels/<name>/.env`. Returned rather than inlined so tests can shadow this
+    boundary the way they already shadow the vault.
+
+    The dir is REMOTE_TASK_CHANNEL_DIR, the same expression the gateway bridge
+    uses; hardcoding "ag2space" made every lane read PROD's credential. Which
+    file in it is the shared resolver's pick (`channel_env_resolve`), so an
+    install signed in only on a secondary homeserver reads that lane's token.
+    """
+    try:
+        if not _core_src_on_path():
+            return None
+        from util_paths import claude_home_path
+        from channel_env_resolve import resolve_channel_env
+        channel_dir = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+        picked = resolve_channel_env(claude_home_path("channels"), channel_dir)
+        if picked is not None:
+            return str(picked)
+        # No file holds a token: a `.env` with only the URL still answers the URL tier.
+        p = claude_home_path("channels", channel_dir, ".env")
+        return p if os.path.isfile(p) else None
+    except Exception:
+        return None
+
+
+def _from_channel_env(names, env_file=None):
+    """First non-empty value among `names` in the channel `.env`; '' if none.
+
+    Sits between the process env and the vault, so an exported value still wins
+    and a stored one still loses. Alias set matches the VAULT tier (which
+    includes the legacy AG2_REMOTE_TOKEN), not the narrower env chain.
+    """
+    try:
+        env_file = _channel_env_file() if env_file is None else env_file
+        if env_file is None:
+            return ""
+        if not _core_src_on_path():
+            return ""
+        from channel_token import token_from_env_file
+        from pathlib import Path
+    except Exception:
+        return ""
+    for var in names:
+        # token_from_env_file is already total on OSError; UnicodeDecodeError is
+        # not an OSError, so decode failures would otherwise read as "no token".
+        try:
+            got = token_from_env_file(var, Path(env_file))
+        except (OSError, UnicodeDecodeError):
+            return ""
+        if got:
+            return got
+    return ""
+
+
+def _active_lane_value(names):
+    """First of `names` the desktop's active lane sets (`channel_env_resolve.active_lane_values`):
+    a host signed in only on a secondary homeserver has no primary token. '' for a lane bridge."""
+    try:
+        if os.environ.get("REMOTE_TASK_CHANNEL_DIR") or not _core_src_on_path():
+            return ""
+        from channel_env_resolve import active_lane_values
+        from util_paths import claude_home_path
+        found = active_lane_values(claude_home_path("channels"), "ag2space", names)
+    except Exception:
+        return ""
+    return next((found[n] for n in names if n in found), "")
+
+
 def _token_from_vault(vault_get=None):
     """Vault fallback for the gateway bearer — parity with the channel bridges
     (sonichi#2638) and the sparrow bridge.
@@ -88,20 +177,8 @@ def _token_from_vault(vault_get=None):
     obligation).
     """
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-        if not src:
+        if not _core_src_on_path():
             return ""
-        if src not in sys.path:
-            sys.path.insert(0, src)
         from channel_token import token_from_vault
     except Exception:
         return ""
@@ -128,8 +205,30 @@ def _credential_contract():
     return _gc
 
 
-def gateway():
+class RoomConnectionError(RuntimeError):
+    """The room's server has no usable connection on this install; never another server's token."""
+
+
+def _room_credential(room_id):
+    """(gateway_url, token) the core's `connections.room_credential` names for `room_id`, or None
+    to keep the single-connection chain below. Raises RoomConnectionError on its refusal."""
+    try:
+        if not _core_src_on_path():
+            return None
+        import connections
+    except Exception:
+        return None
+    try:
+        return connections.room_credential(room_id)
+    except connections.ConnectionsError as e:
+        raise RoomConnectionError(str(e)) from None
+
+
+def gateway(room_id=None):
     """Return (base_url, headers). base is '' when no gateway is configured.
+
+    On an install with several connections the connection is chosen by the
+    room's server (`connections.room_credential`); no room means the primary.
 
     PR2 of the credential-contract migration (#2668): parsing/precedence now
     delegates to the vendored shared contract; this facade keeps only the
@@ -146,12 +245,26 @@ def gateway():
     never shadows a fresher env token.
     """
     gc = _credential_contract()
-    raw, _name = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
-    if not raw:
-        raw = _token_from_vault()
-    explicit_url, _ = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+    routed = _room_credential(room_id)
+    if routed is not None:
+        explicit_url, raw = routed
+    else:
+        raw, _name = gc.resolve_alias_precedence(
+            os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+        token_names = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+        url_names = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL")
+        lane_raw = ""
+        if not raw:
+            raw = _from_channel_env(token_names) or (lane_raw := _active_lane_value(token_names))
+        if not raw:
+            raw = _token_from_vault()
+        if lane_raw:
+            # The lane's bearer only ever goes to the lane's own relay: its URL key, else the token's.
+            explicit_url = _active_lane_value(url_names)
+        else:
+            explicit_url, _ = gc.resolve_alias_precedence(os.environ, url_names)
+            if not explicit_url:
+                explicit_url = _from_channel_env(url_names)
     creds = gc.normalize_credentials(raw, explicit_url=explicit_url,
                                      source="resolved" if raw else "none")
     headers = {"User-Agent": "sutando-room-ops/1"}
@@ -206,6 +319,40 @@ def degrade_reason(code):
     if code == 403:
         return "denied — agent not a joined member (403)"
     return f"HTTP {code}"
+
+
+# Not "auth-ish codes": codes where a wrong reason sends someone to the wrong
+# subsystem (401 = the bearer, 403 = authorization), so the server's text is appended.
+AUTH_STATUSES = frozenset({401, 403})
+
+
+def degrade_reason_parsed(code, parsed):
+    """degrade_reason() plus the server's own `{"error": ...}` text, read from a
+    body the caller has ALREADY parsed. For the caller that must also inspect
+    that body itself — resolve.py tells a broker 404 miss from a missing op by
+    it — and so cannot let degrade_reason_from() consume it. Pure; the one
+    reading of the server's text, which degrade_reason_from() delegates to."""
+    reason = degrade_reason(code)
+    server_msg = str(parsed.get("error")) if isinstance(parsed, dict) and parsed.get("error") else ""
+    if not server_msg:
+        return reason
+    if code in AUTH_STATUSES:
+        return f"{reason} (server said: {server_msg})"
+    return server_msg
+
+
+def degrade_reason_from(err):
+    """degrade_reason() plus what the server actually said (`{"error": ...}`).
+
+    CONSUMES the response body: `err.read()` is single-shot, so a caller that
+    also wants the parsed body must read it first and use degrade_reason_parsed.
+    Measured 2026-09-02: a 403 that read "not a joined member" was really
+    "platform grant events.subscribe missing" — a different subsystem entirely."""
+    try:
+        parsed = json.loads(err.read().decode("utf-8") or "{}")
+    except Exception:
+        parsed = None
+    return degrade_reason_parsed(err.code, parsed)
 
 
 def quote(s):

@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from sutando_config import config_get, config_get_env_first
 from pathlib import Path
 from typing import Optional
 
@@ -94,7 +95,7 @@ def resolve_owner_id(
     See module docstring for the 6-step resolution chain.
     """
     # 1. Env-var override — operator escape hatch, wins over everything.
-    env_owner = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
+    env_owner = (config_get_env_first("SUTANDO_DM_OWNER_ID", "") or "").strip()
     if env_owner:
         return env_owner
 

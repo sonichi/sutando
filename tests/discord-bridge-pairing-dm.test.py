@@ -3,6 +3,11 @@
 channel on ANY branch — reachable owner, fresh install, or unreachable owner."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import importlib.util
 import os
@@ -36,6 +41,11 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "faketoken-for-tests")
 spec = importlib.util.spec_from_file_location("discordbridge_pair", REPO / "src" / "discord-bridge.py")
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
+
+
+# ACCESS_BACKUP_FILE resolves under the LIVE workspace at import, so the temp tree
+# above is not isolation: _backup_access_to_disk() overwrites the real durable file.
+mod.ACCESS_BACKUP_FILE = Path(tempfile.mkdtemp(prefix="acl-bk-")) / "discord-access-backup.json"
 
 # CLAUDE_CONFIG_DIR alone is not isolation: channel_access_path() falls back to
 # the real legacy access.json when the fresh canonical path does not exist.

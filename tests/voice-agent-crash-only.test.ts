@@ -210,7 +210,8 @@ function spawnAgent(
 	};
 	if (testMode) env.SUTANDO_TEST_MODE = '1';
 	else delete env.SUTANDO_TEST_MODE;
-	const child = spawn('npx', ['tsx', 'src/voice-agent.ts'], {
+	const tsxCli = join(REPO_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+	const child = spawn(process.execPath, [tsxCli, 'src/voice-agent.ts'], {
 		cwd: REPO_ROOT,
 		detached: true,
 		env,
@@ -239,7 +240,15 @@ async function waitFor(cond: () => boolean, ms: number, what: string): Promise<v
 async function killAndWait(child: ChildProcess): Promise<void> {
 	// Kill the whole detached process group — the tsx WORKER (not the npx
 	// parent we spawned) holds the lock and the port.
-	try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ }
+	try {
+		if (child.pid) {
+			if (process.platform === 'win32') {
+				execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+			} else {
+				process.kill(-child.pid, 'SIGKILL');
+			}
+		}
+	} catch { /* gone */ }
 	if (child.exitCode !== null || child.signalCode !== null) return;
 	await new Promise<void>((resolve) => {
 		const hard = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} resolve(); }, 2000);
@@ -248,13 +257,27 @@ async function killAndWait(child: ChildProcess): Promise<void> {
 	});
 }
 
+function processArgv(pid: number): string {
+	if (process.platform === 'win32') {
+		return execFileSync('powershell.exe', [
+			'-NoProfile',
+			'-NonInteractive',
+			'-Command',
+			`(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+		], { encoding: 'utf-8' });
+	}
+	return execFileSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf-8' });
+}
+
 describe('voice-agent duplicate-instance + fail-closed lock (integration)', () => {
 	after(async () => {
 		for (const c of children) await killAndWait(c);
 		for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
 	});
 
-	it('non-test launch still refuses non-macOS', { skip: process.platform === 'darwin' }, async () => {
+	it('non-test launch refuses unsupported platforms', {
+		skip: process.platform === 'darwin' || process.platform === 'win32',
+	}, async () => {
 		const ws = makeWorkspace('platform');
 		const agent = spawnAgent(ws, 19921, 19922, {}, false);
 		const code = await agent.exited;
@@ -283,7 +306,7 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 		// that ran acquirePidLock — dev tsx parent/worker topology, amendment
 		// Z1), which is a live descendant running the voice-agent entry.
 		assert.equal(typeof lock.pid, 'number');
-		const argv = execFileSync('ps', ['-p', String(lock.pid), '-o', 'args='], { encoding: 'utf-8' });
+		const argv = processArgv(lock.pid);
 		assert.match(argv, /voice-agent/, `lock pid ${lock.pid} runs the voice-agent entry`);
 		assert.match(String(lock.lockId), /^vl1-/, 'lock carries a lockId (amendment R3)');
 		assert.equal(typeof lock.startTimeMs, 'number');

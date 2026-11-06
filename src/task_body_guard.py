@@ -46,19 +46,29 @@ _ZWSP = "​"
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from local_task_protocol import BRIDGE_FENCE_RE as _FENCE_RE  # noqa: E402
 from local_task_protocol import KNOWN_HEADER_KEYS as _HEADER_KEYS  # noqa: E402
 
 # Case-insensitive: some readers lower-case the key before matching
 # (e.g. obsidian-mirror), so `Access_tier:` must be defanged too. (Preserved
 # from #1806 across the main merge — main's version dropped IGNORECASE.)
 _HEADER_RE = re.compile(r"^(?:%s)\s*:" % "|".join(_HEADER_KEYS), re.IGNORECASE)
-# A run of >=3 leading '=' opens our `===SUTANDO …===` / `===SKILL …===` fences.
-_FENCE_RE = re.compile(r"^={3,}")
 # Every separator Python's str.splitlines() / universal-newline mode treats as a
 # line boundary. Fold ALL of them to '\n' before splitting so the guard's notion
 # of a "line" is identical to the reader's (readers use str.splitlines()). '\r\n'
 # is matched first so CRLF collapses to a single '\n' rather than a blank line.
 _LINE_SEP_RE = re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def header_safe_value(value) -> str:
+    """Flatten a value so it cannot open a second line in a `key: value` header.
+
+    Derived from `str.splitlines()` rather than enumerated, so the folded set is
+    the reader's set by construction — a bridge that strips only `\\n` leaves
+    `\\r`, U+2028 and six others intact, and every task-file reader that scans
+    with `splitlines()` then sees a forged `access_tier: owner`.
+    """
+    return " ".join(str(value).splitlines()) if value is not None else ""
 
 
 def confine_user_content(text: str) -> str:

@@ -1,0 +1,11 @@
+{
+  "name": "claude-pi",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Use the local Pi CLI (pi.dev) from Claude Code with the user's existing Pi authentication (Kimi, Claude Pro/Max, or ChatGPT OAuth). Use for second-opinion analysis, implementation, or reviews from a Kimi-family model in the current workspace.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

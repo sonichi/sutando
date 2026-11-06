@@ -7,6 +7,12 @@ The helper is read by both the health-check (no warn) and --fix (no restart).
 
 Run: python3 tests/health-check-bridge-skip.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

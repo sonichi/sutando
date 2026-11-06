@@ -13,9 +13,12 @@ name: lint-src-map
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint-src-map:

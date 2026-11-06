@@ -23,6 +23,11 @@ Run: python3 tests/bridges-allowlist-default-readonly.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -448,8 +453,15 @@ if _have_discord:
     dmod.ACCESS_FILE = _df
 
     # 8. load_tier_map / seed swallow a read failure (except -> {} / return)
+    # _locked() touches path.parent/.with_suffix before any read, so this
+    # double delegates everything but read_text() to a real tmp Path.
     class _DReadRaises:
-        def read_text(self):
+        def __init__(self):
+            self._real = Path(tempfile.mkdtemp(prefix="dc-unreadable-")) / "access.json"
+            self._real.write_text("{}")
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+        def read_text(self, *a, **k):
             raise OSError("access.json unreadable")
     dmod.ACCESS_FILE = _DReadRaises()
     check("discord: load_tier_map swallows a read failure", dmod.load_tier_map() == {})

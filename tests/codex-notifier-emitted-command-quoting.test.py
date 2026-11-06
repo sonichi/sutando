@@ -25,7 +25,15 @@ class EmittedCommandQuotingTest(unittest.TestCase):
         binp.mkdir(exist_ok=True)
         log = ws.parent / "tmux.log"
         (binp / "tmux").write_text(
-            f'#!/bin/bash\nprintf "%s\\n" "$*" >> {log!s}\nexit 0\n')
+            f'''#!/bin/bash
+. "{REPO}/tests/lib/tmux-fake-unwrap.sh"
+for a in "$@"; do
+  [ "$a" = list-windows ] && {{ echo 0; exit 0; }}
+  [ "$a" = capture-pane ] && {{ printf '› \n← for agents\n'; exit 0; }}
+done
+printf '%s\n' "$*" >> "{log!s}"
+exit 0
+''' )
         os.chmod(binp / "tmux", 0o755)
 
         env = dict(os.environ)
@@ -35,6 +43,8 @@ class EmittedCommandQuotingTest(unittest.TestCase):
             "SUTANDO_RESULTS_DIR": str(ws / "results"),
             "SUTANDO_RESULT_PAIRING_DIR": str(ws / "state" / "result-pairing"),
             "SUTANDO_TMUX_SOCKET": str(ws.parent / "s.sock"),
+            "SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT": "1",
+            "SUTANDO_NOTIFIER_SUBMIT_RETRIES": "1",
         })
         script = repo_dir / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
         subprocess.run(["bash", str(script), "--event", "task-probe.txt"],
@@ -69,14 +79,10 @@ class EmittedCommandQuotingTest(unittest.TestCase):
         same command through a different variable."""
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo with spaces"
-            cli = repo / "src" / "agent" / "codex" / "cli"
-            cli.mkdir(parents=True)
-            shutil.copy2(NOTIFIER, cli / "task-notifier.sh")
-            shutil.copy2(REPO / "src" / "result_write.py",
-                         repo / "src" / "result_write.py")
-            (repo / "scripts").mkdir()
-            shutil.copy2(REPO / "scripts" / "sutando-config.sh",
-                         repo / "scripts" / "sutando-config.sh")
+            shutil.copytree(REPO / "src", repo / "src",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(REPO / "scripts", repo / "scripts",
+                            ignore=shutil.ignore_patterns("__pycache__"))
             rc, err, wrote = self._emit_and_run(repo, Path(td) / "ws")
         self.assertEqual(rc, 0, f"emitted command failed: {err.strip()[:120]}")
         self.assertTrue(wrote, "no result written")

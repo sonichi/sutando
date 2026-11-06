@@ -151,3 +151,27 @@ inside a root is a protocol violation**, not cleanup.
 
 When those merge, their sections above should be folded in as shipped behavior
 — this document tracks `main`, not intent.
+
+## Task-result pairing (partial rollout)
+
+`src/result_write.py write <task-filename> --workspace <workspace>` takes an
+answer on stdin whose first line is `task: <bare-id>`. It refuses a mismatching
+id before creating any files. This checks an explicit id echo, not the semantic
+relationship between the prose and the task: a caller controlling both ids can
+still submit the wrong answer with matching ids.
+
+The paired writer delegates atomic publication to `result_publish`. A per-task
+`file_lock` transaction installs a content-bound receipt before replacing the
+result. Concurrent writers use independent staging files and cannot leave the
+final result paired with another writer's receipt. Receipt failures propagate
+instead of reporting successful paired publication. Verification uses the exact
+UTF-8 bytes, including CRLF and trailing whitespace, before presentation strips
+them. A reader may temporarily defer while the two files are being replaced.
+
+This is not yet universal delivery enforcement. The three chat bridges verify
+existing receipts, but missing receipts remain accepted by the compatibility
+predicate. The responsive core/restart paths and all other producers and
+consumers still need a coordinated migration. No finite migration policy or
+historical backfill is enabled by this change. Do not describe this branch as
+preventing all crossed replies or as ready for deployment. A real post-restart
+notifier-to-bridge witness is also still required.

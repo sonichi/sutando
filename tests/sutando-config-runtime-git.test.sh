@@ -57,7 +57,33 @@ c=$(code_field "$TMP/nogit" commit)
 if [ -z "$c" ]; then ok "no .git marker -> empty commit, still valid JSON" yes
 else ok "no .git marker -> empty commit, still valid JSON" no "got '$c'"; fi
 
-# --- 2. linked worktree (.git is a FILE) keeps identity ----------------------
+# --- 2. packaged engine reads its build manifest without spawning git --------
+mkdir -p "$TMP/bundle/engine/sutando"
+rsync -a --exclude '.git' --exclude 'node_modules' --exclude 'workspace' \
+      "$REPO/" "$TMP/bundle/engine/sutando/" 2>/dev/null
+cat > "$TMP/bundle/engine/ENGINE_MANIFEST.json" <<'JSON'
+{"sha":"1234567890abcdef1234567890abcdef12345678","branch":"release/test","dirty":true,"built_at":"2026-08-24T00:00:00Z","post_build_tree_digest":"sha256:abcdef"}
+JSON
+: > "$GITLOG"
+bundle_json="$(cd "$TMP/bundle/engine/sutando" && PATH="$TMP/shim:$PATH" bash scripts/sutando-config.sh runtime 2>/dev/null)"
+n=$(grep -c "^git " "$GITLOG" 2>/dev/null; true); n=${n:-0}
+if [ "$n" -eq 0 ]; then ok "packaged manifest -> zero git spawns" yes
+else ok "packaged manifest -> zero git spawns" no "$n spawns"; fi
+bundle_check="$(printf '%s' "$bundle_json" | python3 -c '
+import json,sys
+c=json.load(sys.stdin)["code"]
+want={
+ "commit":"1234567", "revision":"1234567890abcdef1234567890abcdef12345678",
+ "branch":"release/test", "describe":"1234567", "dirty":True,
+ "source":"engine-manifest", "built_at":"2026-08-24T00:00:00Z",
+ "tree_digest":"sha256:abcdef", "tree_sha":None,
+}
+print("yes" if all(c.get(k)==v for k,v in want.items()) else json.dumps(c,sort_keys=True))
+')"
+if [ "$bundle_check" = "yes" ]; then ok "packaged manifest -> exact revision + provenance populated" yes
+else ok "packaged manifest -> exact revision + provenance populated" no "$bundle_check"; fi
+
+# --- 3. linked worktree (.git is a FILE) keeps identity ----------------------
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     if git -C "$REPO" worktree add -q --detach "$TMP/wt" HEAD 2>/dev/null; then
         # Exercise the WORKING-TREE script, not whatever HEAD happens to carry —
@@ -82,11 +108,14 @@ else
     echo "skip linked-worktree case (not a git checkout)"
 fi
 
-# --- 3. ordinary checkout unaffected ----------------------------------------
+# --- 4. ordinary checkout unaffected ----------------------------------------
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     c=$(code_field "$REPO" commit)
     if [ -n "$c" ]; then ok "ordinary checkout -> commit populated" yes
     else ok "ordinary checkout -> commit populated" no "empty"; fi
+    src=$(code_field "$REPO" source)
+    if [ "$src" = "git" ]; then ok "ordinary checkout -> git remains authoritative" yes
+    else ok "ordinary checkout -> git remains authoritative" no "source '$src'"; fi
 fi
 
 echo

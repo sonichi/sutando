@@ -111,7 +111,8 @@ Optional capability discovery also remains at the adapter edge. A generic
 core helper may run an injected script path and standardize timeout/failure
 semantics, but it must not name, locate, or import a concrete skill. This keeps
 the dependency direction adapter → helper while preserving the rule that core
-does not depend on installed skills.
+does not depend on installed skills. Add direct contract tests for the runner
+and wiring tests for every adapter that delegates to it.
 
 ### Shared adapter policy
 
@@ -135,7 +136,8 @@ before publishing the shared record it applies the sender-tier gate, excludes
 known fleet agents, strips gateway attribution, and redacts secrets. Those are
 gateway trust-boundary rules, not provider-neutral record-publication mechanics.
 Do not delegate that writer to `src/owner_activity.py` unless those controls and
-their tests move with it.
+their tests move with it. Any writer excepted from centralization must have its
+exception documented, as this one is.
 
 ### Shared result-file lifecycle
 
@@ -146,6 +148,23 @@ and retain only provider-specific delivery. For example,
 `src/proactive_recovery.py` restores proactive delivery claims stranded by a
 crash, while Discord, Slack, and Telegram decide how the recovered result is
 sent. Copying the filesystem state machine into each adapter is not permitted.
+
+### Outbound delivery ownership
+
+Outbound delivery of an already-published result has one implementation, and it
+is the outbox. `src/outbox.py` owns delivery claims (acquire/release/reclaim,
+per-item locking, crash recovery) and `src/outbox_adapter.py` owns the
+three-state delivery outcome (CONFIRMED / NOT_DELIVERED / OUTCOME_UNKNOWN);
+both are vendored verbatim into `packages/ag2-sparrow/`. Scope is the outbound
+leg only — an existing `OutboundItem` from claim through terminal disposition;
+other task/result lifecycle transitions keep their documented owners (e.g.
+`src/proactive_recovery.py` above). Consumers delivering outbound results bind
+these; do not re-implement claim, delivered-sentinel, or retry machinery in a
+bridge. Adapters bind their resolved directories and retain provider-specific
+delivery only. Pin both the shared contract and every adapter's delegation in
+tests. Pre-outbox private copies (e.g. discord-bridge's
+archive/delivered-sentinel/pending-replies machinery) are migration debt, not
+precedent.
 
 ### HTTP transport handlers
 
@@ -339,9 +358,9 @@ a route had rebuilt its own transaction.
 ## Decision guide for new code
 
 This section explains the architectural categories. The repository-specific
-placement checklist in `AGENTS.md` / `CLAUDE.md` remains authoritative for
-current file locations; update both documents together if the placement rules
-change.
+placement checklist in "Placement checklist and boundary rules" below remains
+authoritative for current file locations; update both sections together if the
+placement rules change.
 
 Walk this list top to bottom:
 
@@ -358,6 +377,30 @@ Walk this list top to bottom:
 If a module appears to fit two layers, split the provider-neutral contract from
 the provider/feature implementation. Prefer the more specific outer layer for
 the implementation.
+
+## Placement checklist and boundary rules
+
+Moved verbatim from CLAUDE.md "Architecture rules" (2026-10-16 context-budget diet):
+
+### Where does new code belong? (decision guide — issue #222)
+
+Walk this list top-to-bottom and stop at the first match:
+
+1. **Does it need an instant response from Gemini (< 1s round-trip)?** → inline tool in `src/inline-tools.ts` or `src/browser-tools.ts`. Keep it a thin wrapper around a system command. If it grows past ~50 lines or needs subprocess orchestration, push it back to a skill.
+2. **Is it a phone-call session concern (Twilio WS, audio routing, call lifecycle, hang_up/dtmf)?** → `skills/phone-conversation/scripts/conversation-server.ts`. Does NOT belong: recording, subtitling, observability dashboards, business logic.
+3. **Is it a voice-session concern (bodhi `VoiceSession` config, web client wiring, task-bridge plumbing)?** → `src/voice-agent.ts`. Does NOT belong: phone-specific logic, tool implementations.
+4. **Is it a self-contained feature (recording, image generation, skill discovery, etc.)?** → new skill under `skills/<name>/`. Each skill is optional — core must still boot if it's removed.
+5. **Is it core infrastructure shared by multiple skills (task bridge, health check, memory sync)?** → `src/`.
+
+If two layers seem to fit, prefer the more specific one (skill > core).
+
+**Destructive/legacy schema migrations live apart from the live writer** — in `conversation-store-migrations.ts` (idempotent, invoked before views/statements are prepared), never in a live record function. Enforced by `tests/conversation-store-migration-delegation.test.ts`. → "Schema migration vs live writer"
+
+**Transport does not own authorization or durable state.** `src/runtime-api/server.py` is transport + daemon composition only; dispatch, approval/authorization policy, idempotency and durable transitions live in `src/runtime-api/dispatcher.py`, with actor identity resolved daemon-side — never from a client parameter. → "Transport vs request domain"
+
+**Complex skill diagnostics separate analysis from IO and presentation.** Call-diagnostics detection/categorization/repair policy lives in `skills/call-diagnostics/scripts/analysis.py`; loaders and renderers consume it, and it stays inside the skill. Enforced by `tests/call-diagnostics-analysis.test.py`. → "Skill-internal boundaries"
+
+**Presentation modules don't own domain/storage policy.** Dashboard routes delegate schedule parsing, validation and atomic locked `crons.json` mutation to `src/dashboard_schedules.py` (the adapter resolves the path; the domain module receives it). Enforced by `tests/dashboard-schedule-delegation.test.py`. → "Presentation adapters vs domain/storage"
 
 ## Core change governance
 

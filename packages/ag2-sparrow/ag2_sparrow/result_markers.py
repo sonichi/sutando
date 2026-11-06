@@ -25,7 +25,9 @@ would stop recognizing the sanitizer and start flagging every upload site.
 
 Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
 
-  SKIP markers — at body start (must be the first non-whitespace chars):
+  SKIP markers — at body start, or directly after the leading markers below
+  ([thread:], [thread], [reply:], a standalone [dm-only]; after [channel:] only
+  with skip_after_channel=True, the delivery verdict on an already-guarded body):
     [no-send]
     [REPLIED]
     [deduped: <task-id>]
@@ -36,6 +38,22 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
     [channel: <channel-id>]
   When found, the bridge delivers the body to <channel-id> instead of the
   task's originating channel. The body is the text AFTER this line.
+
+  THREAD marker — a leading line, before or after [channel:]:
+    [thread: <root event id>]
+  Posts the body inside that thread. Only an id starting with `$` counts; any
+  other value emits a `thread-invalid` action (posted top level, consumer
+  logs it). Stripped either way; consumers without threads just post the body.
+  A root belongs to the room its [channel:] names (the default room without
+  one). Under [dm-only], or when the leading lines name two different rooms,
+  the destination may not be that room: `thread-foreign` replaces `thread`
+  and the body is posted top level.
+
+  THREAD-ASK marker — a leading line that is exactly this, in any order with the above:
+    [thread]
+  A task result only: the gateway asks the broker to answer in a new thread on
+  the task's own asking message (`"thread": "ask"`). It names no event, so it
+  cannot open a thread anywhere else. Stripped everywhere; ignored elsewhere.
 
   DM-ONLY marker — anywhere in the body:
     [dm-only]
@@ -67,6 +85,11 @@ Parse contract:
     .actions   list[Action] — what the bridge should do, in priority order:
                  ("skip", reason)         — archive, no delivery
                  ("redirect", channel_id) — deliver to alternate channel
+                 ("thread", root_event_id) — post inside that thread
+                 ("thread-invalid", raw)  — malformed [thread:]; post top level
+                 ("thread-foreign", root) — root may not be the destination's;
+                                            post top level (extra: why)
+                 ("thread-ask", "")       — task result: thread on the ask
                  ("attach", path)         — bridge runs its own allowlist
                                             check, then uploads
 
@@ -84,7 +107,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-ActionKind = Literal["skip", "redirect", "attach", "dm-only"]
+ActionKind = Literal["skip", "redirect", "attach", "dm-only", "reply", "thread",
+                     "thread-invalid", "thread-foreign", "thread-ask"]
 
 
 @dataclass
@@ -170,6 +194,18 @@ def _code_lines(text: str) -> set:
 # occurrences are DETECTED anywhere; only STANDALONE ones are stripped.
 _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 
+# [reply: <message-id>] — deliver this body as a reply to that message. 17-20
+# digits is a Discord snowflake; anything else is left in place, never eaten.
+_REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
+
+# [thread: <root event id>] — any value is consumed so the marker never leaks;
+# only a whitespace-free `$...` id is a thread target.
+_THREAD_RE = re.compile(r"^\s*\[thread:\s*([^\]]*)\]\s*\n?", re.IGNORECASE)
+_THREAD_ROOT_RE = re.compile(r"\$\S+")
+# Bare [thread] — a task result asks for a thread on its own ask; no id is read.
+# Only a line of its own: "[thread]ing ..." or "[thread] text" is prose.
+_THREAD_ASK_RE = re.compile(r"^\s*\[thread\][ \t]*(?:\r?\n|\Z)", re.IGNORECASE)
+
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
 #: `search()`-anywhere so the privacy guard cannot be defeated by marker
 #: ORDER (see the docstring). But removing every occurrence also removed
@@ -182,7 +218,7 @@ _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 _DMONLY_STRIP_RE = re.compile(r"^[ \t]*\[dm-only\][ \t]*\r?\n?", re.IGNORECASE | re.MULTILINE)
 
 
-def parse_markers(text: str) -> ParseResult:
+def parse_markers(text: str, skip_after_channel: bool = False) -> ParseResult:
     """Parse a result-body string and return body + action list.
 
     Order of evaluation:
@@ -196,6 +232,9 @@ def parse_markers(text: str) -> ParseResult:
          that line and add a redirect action — UNLESS dm-only suppressed it.
       4. ATTACH last. Scan the remaining body for `[file:|send:|attach:]`
          markers, collect paths in document order, strip from body.
+
+    skip_after_channel: a skip after [channel:] is a skip too. Delivery consumers
+    pass it on a guarded body; the guard itself must not, so it still sees the redirect.
 
     Returns:
       ParseResult(body=stripped_text, actions=[...])
@@ -247,22 +286,73 @@ def parse_markers(text: str) -> ParseResult:
     # A bridge that sees the dm-only action (or, equivalently, the ABSENCE of a
     # redirect action) delivers to the DM.
     dm_only = bool(_DMONLY_RE.search(body))
+    # Where a strip glued the rest of its line to a line start: no line boundary there.
+    glued: set[int] = set()
     if dm_only:
         actions.append(Action(kind="dm-only", value=""))
-        body = _DMONLY_STRIP_RE.sub("", body)
+        parts, last = [], 0
+        for m in _DMONLY_STRIP_RE.finditer(body):
+            parts.append(body[last:m.start()])
+            if not m.group(0).endswith("\n") and m.end() < len(body):
+                glued.add(sum(map(len, parts)))
+            last = m.end()
+        body = "".join(parts) + body[last:]
 
     # 3. REDIRECT — must be the first non-empty line (after any D7 header).
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
     # marker so it can't leak into the DM, but emit NO redirect action so the
     # private body stays in the owner's DM.
-    redirect_match = _REDIRECT_RE.match(body)
-    if redirect_match:
-        channel = redirect_match.group(1).strip()
-        if not dm_only and channel:
-            # Empty target = no action: value="" release-loops at the default
-            # sink (claimable yet foreign) and int("")s in Discord conversion.
-            actions.append(Action(kind="redirect", value=channel))
-        body = body[redirect_match.end():]
+    # 2. LEADING MARKERS — [channel:], [thread:] and [reply:] in any order; order
+    # independence keeps an unparsed marker from reaching the user as text.
+    named: set[str] = set()
+    lead = body
+    while True:
+        redirect_match = _REDIRECT_RE.match(body)
+        if redirect_match:
+            channel = redirect_match.group(1).strip()
+            if channel:
+                named.add(channel)
+            if not dm_only and channel:
+                # Empty target = no action: "" release-loops at the default
+                # sink and raises in Discord's int() conversion.
+                actions.append(Action(kind="redirect", value=channel))
+            body = body[redirect_match.end():]
+            continue
+        thread_match = _THREAD_RE.match(body)
+        if thread_match:
+            root = thread_match.group(1).strip()
+            ok = _THREAD_ROOT_RE.fullmatch(root) is not None
+            actions.append(Action(kind="thread" if ok else "thread-invalid", value=root))
+            body = body[thread_match.end():]
+            continue
+        ask_match = _THREAD_ASK_RE.match(body)
+        at = len(lead) - len(body) + (ask_match.group(0).index("[") if ask_match else 0)
+        start = len(lead[:at].rstrip(" \t"))  # indentation from the physical line start is allowed
+        if ask_match and (start == 0 or lead[start - 1] == "\n") and not glued & {at, start}:
+            if not any(a.kind == "thread-ask" for a in actions):
+                actions.append(Action(kind="thread-ask", value=""))
+            body = body[ask_match.end():]
+            continue
+        reply_match = _REPLY_RE.match(body)
+        if reply_match:
+            actions.append(Action(kind="reply", value=reply_match.group(1)))
+            body = body[reply_match.end():]
+            continue
+        break
+
+    # A skip right after the leading markers is a skip, as the broker reads the body it is sent.
+    # After [channel:] only on request: the guard withholds a redirect plus skip for owner review.
+    for pat, reason in (_SKIP_PATTERNS if skip_after_channel or not named else ()):
+        m = pat.match(body)
+        if m:
+            extra = m.group(1).strip() if reason == "deduped" else None
+            return ParseResult(body="", actions=[Action(kind="skip", value=reason, extra=extra)])
+
+    # A root posted outside its room is refused or misthreaded; ambiguity fails to top level.
+    foreign = "dm-only" if dm_only else ("rooms differ" if len(named) > 1 else None)
+    if foreign:
+        actions = [Action(kind="thread-foreign", value=a.value, extra=foreign)
+                   if a.kind == "thread" else a for a in actions]
 
     # Restore D7 header so it appears in the user-facing body. (It was only
     # peeled off so it didn't shadow the marker regexes.)
@@ -292,10 +382,37 @@ def parse_markers(text: str) -> ParseResult:
     return ParseResult(body=body, actions=actions)
 
 
-_TASK_CHANNEL_RE = re.compile(r"^channel_id:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)\s*$", re.MULTILINE)
+_TASK_SOURCE_RE = re.compile(r"^source:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_USER_RE = re.compile(r"^user_id:\s*(\S+)\s*$", re.MULTILINE)
 
 
-def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None) -> str | None:
+def task_channel_id(task_text: str | None) -> str | None:
+    """Read the task destination, including Telegram's chat_id spelling."""
+    match = _TASK_CHANNEL_RE.search(task_text or "")
+    return match.group(1).strip() if match else None
+
+
+def task_source(task_text: str | None) -> str | None:
+    """Provider namespace for task destinations; provider names are case-insensitive."""
+    match = _TASK_SOURCE_RE.search(task_text or "")
+    return match.group(1).casefold() if match else None
+
+
+def dedup_destination_mismatch(asking_channel, holder_channel,
+                               asking_source=None, holder_source=None) -> bool:
+    """Known destinations differ by room/chat ID OR by provider namespace.
+
+    Missing metadata keeps the existing unknown-route policy. Provider IDs
+    are not globally unique: Discord channel 4242 is not Telegram chat 4242.
+    """
+    if asking_source and holder_source and str(asking_source).casefold() != str(holder_source).casefold():
+        return True
+    return bool(asking_channel and holder_channel and str(asking_channel) != str(holder_channel))
+
+
+def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None,
+                               asking_source: str | None = None) -> str | None:
     """Channel-aware dedup support.
 
     A `[deduped: task-X]` result silently archives the deduped task and
@@ -305,42 +422,65 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     is left silent while the answer lands elsewhere (observed 2026-06-22: an
     owner question in #workspace-revamp folded into a #design holder).
 
-    Returns the holder's `channel_id` when it is known AND differs from the
-    deduped task's own channel — a cross-channel dedup, which is INVALID
-    (dedup is per-channel only). The bridge rejects it and re-queues the
-    original task to be re-answered in its own channel. Returns None (→ keep
-    the silent-archive behavior) when the holder text is missing, has no
-    channel_id, or is the SAME channel (the common, correct intra-channel
-    consolidation case).
+    Returns the holder's destination (or provider if its room is unknown)
+    when known room IDs or known provider names differ. The bridge rejects
+    the fold and re-queues the original task to its own destination. Missing
+    dimensions do not establish a mismatch; unknown-route policy is separate.
+    """
+    holder_channel = task_channel_id(holder_task_text)
+    if dedup_destination_mismatch(deduped_channel_id, holder_channel,
+                                  asking_source, task_source(holder_task_text)):
+        return holder_channel or task_source(holder_task_text)
+    return None
+
+
+def task_user_id(task_text: str | None) -> str | None:
+    """The `user_id:` a task carries, or None. Owned here so callers never
+    re-derive the header grammar (CLAUDE.md: marker parsing is centralised)."""
+    if not task_text:
+        return None
+    m = _TASK_USER_RE.search(task_text)
+    return m.group(1).strip() if m else None
+
+
+def dedup_cross_sender_target(deduped_user_id, holder_task_text: str | None) -> str | None:
+    """Sender-aware dedup support — the silence the channel check cannot see.
+
+    `dedup_cross_channel_target` asks whether the reply went to another ROOM.
+    In a shared multi-member room every sender carries the SAME channel_id, so
+    folding one member's task into another member's returns None there and the
+    dedup is honoured: the holder is answered and the asker hears nothing.
+
+    Returns the holder's `user_id` when known AND different from the deduped
+    task's own. `user_id` rather than `sender_name` because a display name is
+    not unique — one human on two homeservers has two ids but one name, so
+    keying on the name merges them and misses a real cross-sender silence.
+
+    Conversely a strict id compare SPLITS that same human, so a dev/prod pair
+    can report as cross-sender when nobody was silenced. That is bounded: the
+    requeue path re-asks at most once (`dedup_requeue_count >= 1` -> report),
+    and a spurious re-ask costs a message where a missed one costs the answer.
     """
     if not holder_task_text:
         return None
-    m = _TASK_CHANNEL_RE.search(holder_task_text)
+    m = _TASK_USER_RE.search(holder_task_text)
     if not m:
         return None
-    holder_channel = m.group(1).strip()
-    if holder_channel and str(holder_channel) != str(deduped_channel_id):
-        return holder_channel
+    holder_user = m.group(1).strip()
+    if holder_user and str(holder_user) != str(deduped_user_id):
+        return holder_user
     return None
 
 
 def dedup_holder_delivered(holder_result_text: str | None) -> bool:
-    """Whether a `[deduped: task-X]` holder actually produced a user-facing reply.
-
-    A dedup is only valid if the holder answered. When the holder's own result
-    was empty or was itself a skip marker, honouring the dedup archives the
-    asking task against a delivery that never happened, and every retry carrying
-    the same marker is archived the same way — the ask can never be answered.
-
-    Pure: the caller supplies the holder's archived result text (None when the
-    archive has no record of it).
-    """
+    """Accept reply bodies or REPLIED; empty and other skip results promise no answer."""
     if holder_result_text is None:
         return False
     body = holder_result_text.strip()
     if not body:
         return False
-    return not any(a.kind == "skip" for a in parse_markers(body).actions)
+    return not any(a.kind == "skip" and a.value != "REPLIED"
+                   for a in parse_markers(body).actions)
 
 
 _REQUEUE_COUNT_RE = re.compile(r"^dedup_requeue_count:\s*(\d+)\s*$", re.MULTILINE)
@@ -382,6 +522,12 @@ _REQUEUE_REASONS = {
         f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
         "Do NOT [deduped:] across channels.\n"
     ),
+    "cross-sender": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder task was asked by a "
+        f"DIFFERENT sender. Dedup folds one reply into another task's result, which is delivered "
+        f"to whoever asked THAT task — so across senders the person who asked this one hears "
+        f"nothing. Answer THIS task directly. Only use [deduped:] within one sender's thread.\n"
+    ),
     "holder-empty": lambda holder_id, asking_channel: (
         f"Your previous result used [deduped: {holder_id}], but that holder delivered nothing, "
         "so this question was never answered. Answer THIS task directly and in full. Only use "
@@ -390,15 +536,63 @@ _REQUEUE_REASONS = {
 }
 
 
+def render_skill_prelude(
+    channel_id: str, channel_dir: str, tid: str, addressed_to: str = "",
+) -> "list[str]":
+    """The ===SKILL INSTRUCTIONS=== prelude for an owner-tier task, rendered
+    from the task's OWN routing fields. Single owner of the template: the
+    gateway writes with its live lane values; a dedup requeue re-renders from
+    the requeuing adapter (channel_dir = that host's own lane dir, per-lane since the
+    lane-authoritative stamping change) so a requeue can never resurrect a
+    superseded prelude."""
+    import shlex as _shlex
+    _chan = channel_id or ""
+    _chan_q = _shlex.quote(_chan)
+    _cdir_q = _shlex.quote(channel_dir)
+    _step = 1
+    _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+    if addressed_to:
+        _skill.append(
+            f"{_step}. ADDRESSING: this message replies to {addressed_to}'s message and "
+            f"does not mention you — it is {addressed_to}'s to claim. Do not process it "
+            "unless a later message hands it to you explicitly; close your copy "
+            "with [no-send].")
+        _step += 1
+    if _chan:
+        _skill.append(
+            f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
+            f"message, reconstruct the room thread — `python3 "
+            f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
+            f"reports no gateway configured, load the channel env first: `set -a; . "
+            f"\"$(bash scripts/channel-env.sh {_cdir_q} --room {_chan_q})\"; set +a`) — and read it "
+            "back (everyone's messages including your own prior replies) until this "
+            "message stands on its own, then answer from the reconstructed thread, "
+            "NOT from memory. Do this every time; do NOT skip it because the message "
+            "looks self-contained or you feel you already understand it — felt "
+            "confidence is exactly the signal that fails. The only exception is a "
+            'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
+        _step += 1
+        # No notify step here: the broker's delivery status already shows
+        # pickup and working, so no notify message is sent.
+    _skill.append(f"{_step}. Process and write the result to results/{tid}.txt; to end it with "
+                  "no reply, write `[no-send]` as the result. Every task ends with a result.")
+    return _skill
+
+
 def build_requeued_task(
     orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str,
-    reason: str = "cross-channel",
+    reason: str = "cross-channel", channel_dir: str = "",
 ) -> str:
     """Rewrite an original task for re-processing after a REJECTED cross-channel
     dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
     so it routes + tiers identically, but:
       * sets `id:` to new_task_id (so the watcher re-fires),
       * sets `dedup_requeue_count: count` (loop guard),
+      * when the caller injects its lane via `channel_dir`, strips the stored
+        `===SKILL INSTRUCTIONS===` block and re-renders it fresh (gateway
+        template). Without an injected lane the stored prelude is carried
+        byte-verbatim: Slack/Discord write their own bridge-specific
+        templates, which the gateway renderer cannot represent,
       * appends a trusted `===SUTANDO SYSTEM INSTRUCTIONS===` block telling the
         core the prior dedup was cross-channel (invalid) and to answer THIS
         task directly in its own channel, not dedup across channels.
@@ -410,16 +604,33 @@ def build_requeued_task(
     """
     lines = []
     seen_count = False
+    had_prelude = False
+    hdr = {}
     for ln in (orig_text or "").rstrip("\n").split("\n"):
+        # A stale gateway prelude re-instructs handlers with superseded text;
+        # only the injecting caller's template is ours to rewrite, though.
+        if ln.startswith("===SKILL INSTRUCTIONS") and channel_dir:
+            had_prelude = True
+            break
         if ln.startswith("id:"):
             lines.append(f"id: {new_task_id}")
         elif ln.startswith("dedup_requeue_count:"):
             lines.append(f"dedup_requeue_count: {count}")
             seen_count = True
         else:
+            for k in ("channel_id", "source", "addressed_to"):
+                if ln.startswith(k + ":") and k not in hdr:
+                    hdr[k] = ln[len(k) + 1:].strip()
             lines.append(ln)
+    while lines and lines[-1] == "":
+        lines.pop()
     if not seen_count:
         lines.append(f"dedup_requeue_count: {count}")
+    if had_prelude:
+        # Re-render, never copy; the injected lane dir is the only lane source.
+        lines.extend(render_skill_prelude(
+            hdr.get("channel_id", ""), channel_dir,
+            new_task_id, hdr.get("addressed_to", "")))
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
         + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(
@@ -428,6 +639,23 @@ def build_requeued_task(
         + "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
     )
     return "\n".join(lines) + note
+
+
+# Every bracket word the patterns above act on; the inverse of the grammar lives
+# beside it so a new marker is added to both at once.
+_MARKER_OPEN_RE = re.compile(
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|reply:|dm-only|file:|send:|attach:))",
+    re.IGNORECASE)
+
+# A bare [thread] is a marker only as a line of its own, so only that shape is quoted.
+_THREAD_ASK_OPEN_RE = re.compile(r"^([ \t]*)\[(?=thread\][ \t]*\r?$)", re.IGNORECASE | re.MULTILINE)
+
+
+def neutralize_markers(text: str) -> str:
+    """Quoted form of `text` for a body that EMBEDS it: a space after each marker's
+    opening bracket keeps the words readable and takes the token out of every
+    pattern in this module, so parse_markers emits no action for it."""
+    return _THREAD_ASK_OPEN_RE.sub(r"\1[ ", _MARKER_OPEN_RE.sub("[ ", text or ""))
 
 
 def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
@@ -439,3 +667,9 @@ def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
         if a.kind == kind:
             return a
     return None
+
+
+def has_skip_action(actions) -> bool:
+    """True if `actions` (a ParseResult.actions list) carries a skip-kind
+    marker (`[no-send]`/`[REPLIED]`/`[deduped:...]`) — the body must never be sent."""
+    return any(a.kind == "skip" for a in actions)
