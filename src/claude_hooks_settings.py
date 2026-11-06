@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
+"""Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
 
 Two installers (``scripts/install-personal-claude-hook.sh``,
 ``scripts/install-session-start-hook.sh``) carried their own inline merge. Each
@@ -21,9 +21,14 @@ path carrying an unexpanded variable is skipped, because the installer would re-
 its own ABSOLUTE command, never the portable one, so that false prune is permanent
 rather than costing one launch.
 
+Re-pointing is a separate step from any installer: it rewrites only the old root
+of a hook whose script is gone and whose repo-relative remainder exists in this
+checkout, so it never adds a hook (the opt-in transcript archiver included).
+
     python3 src/claude_hooks_settings.py install --settings <path> \\
         --event SessionStart --command 'bash "<repo>/src/x.sh"' \\
         [--matcher compact] [--prepend] [--label "x hook"]
+    python3 src/claude_hooks_settings.py repair-paths --repo <repo> --settings <path> [...]
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -156,11 +162,126 @@ def install(
     return status, removed
 
 
+_REPO_TOP_DIRS = ("src", "scripts", "skills")
+
+
+def _stale_root(token: str, repo: str) -> Optional[str]:
+    """The old checkout root of a missing absolute path whose remainder exists under ``repo``."""
+    if not token.startswith("/") or not _judgeable(token) or os.path.exists(token):
+        return None
+    parts = token.split("/")
+    for index in range(2, len(parts)):
+        if parts[index] not in _REPO_TOP_DIRS:
+            continue
+        root = "/".join(parts[:index])
+        if root != repo and os.path.exists(os.path.join(repo, *parts[index:])):
+            return root
+    return None
+
+
+def _spellings(text: str) -> list[str]:
+    """How a path can appear in a stored command: bare, single-quoted (two escapes), double-quoted."""
+    return [text, text.replace("'", "'\\''"), text.replace("'", "'\"'\"'"),
+            re.sub(r'(["$`\\])', r"\\\1", text)]
+
+
+def repoint_command(command: str, repo: str) -> Optional[str]:
+    """``command`` with its one stale checkout root replaced by ``repo``, or None to leave it."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    roots = {r for r in (_stale_root(t, repo) for t in tokens) if r}
+    if len(roots) != 1:
+        return None
+    root = roots.pop()
+    want = [t.replace(root + "/", repo + "/") for t in tokens]
+    for old, new in zip(_spellings(root), _spellings(repo)):
+        candidate = command.replace(old + "/", new + "/")
+        if candidate == command:
+            continue
+        try:
+            if shlex.split(candidate) == want:
+                return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def repoint_moved(settings: dict, repo: str) -> list[tuple[str, str, str]]:
+    """Re-point, in place, every hook left on a moved checkout's path. Returns (event, old, new)."""
+    changed: list[tuple[str, str, str]] = []
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return changed
+    for event, entries in hooks.items():
+        for entry in entries if isinstance(entries, list) else []:
+            for hook in (entry.get("hooks") if isinstance(entry, dict) else None) or []:
+                command = hook.get("command") if isinstance(hook, dict) else None
+                if not isinstance(command, str):
+                    continue
+                new = repoint_command(command, repo)
+                if new is not None:
+                    hook["command"] = new
+                    changed.append((event, command, new))
+    return changed
+
+
+def _rewrite_in_place(text: str, changed: list[tuple[str, str, str]], settings: dict) -> str:
+    """The file text with only the changed command strings swapped, or a fresh dump if that fails."""
+    out = text
+    for _event, old, new in changed:
+        for ascii_only in (True, False):
+            out = out.replace(json.dumps(old, ensure_ascii=ascii_only), json.dumps(new, ensure_ascii=ascii_only))
+    try:
+        if json.loads(out) == settings:
+            return out
+    except ValueError:
+        pass
+    return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+
+
+def repair_paths(settings_path: Path, repo: Path) -> list[tuple[str, str, str]]:
+    """Re-point a moved install's hooks in ``settings_path`` at ``repo``; writes only on a change."""
+    if not settings_path.is_file():
+        return []
+    text = settings_path.read_text(encoding="utf-8")
+    settings = json.loads(text)
+    if not isinstance(settings, dict):
+        raise ValueError(f"{settings_path}: top level is not an object")
+    changed = repoint_moved(settings, str(repo))
+    if changed:
+        fd, tmp = tempfile.mkstemp(dir=str(settings_path.parent), prefix=settings_path.name + ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_rewrite_in_place(text, changed, settings))
+            os.chmod(tmp, settings_path.stat().st_mode & 0o7777)
+            os.replace(tmp, settings_path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    return changed
+
+
 def _describe_removed(removed: Iterable[str], family: str) -> str:
     items = list(removed)
     noun = "entry" if len(items) == 1 else "entries"
     paths = ", ".join(script_path_of(c) or c for c in items)
     return f"  ✂ removed {len(items)} dead {family} {noun}: {paths}"
+
+
+def _main_repair(args: argparse.Namespace) -> int:
+    rc = 0
+    for path in args.settings:
+        try:
+            changed = repair_paths(Path(path), Path(args.repo))
+        except (OSError, ValueError) as exc:
+            print(f"  ✗ hook path repair: {exc}", file=sys.stderr)
+            rc = 1
+            continue
+        for event, _old, new in changed:
+            print(f"  ✓ re-pointed {event} hook in {path}: {new}")
+    return rc
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -173,7 +294,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--matcher", default="")
     p.add_argument("--prepend", action="store_true")
     p.add_argument("--label", default=None)
+    r = sub.add_parser("repair-paths")
+    r.add_argument("--repo", required=True)
+    r.add_argument("--settings", action="append", required=True)
     args = parser.parse_args(argv)
+    if args.cmd == "repair-paths":
+        return _main_repair(args)
     label = args.label or f"{family_of(args.command)} {args.event} hook"
     try:
         status, removed = install(
