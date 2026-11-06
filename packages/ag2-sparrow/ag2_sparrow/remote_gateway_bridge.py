@@ -6746,20 +6746,26 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
         _log(f"task-rooms persist failed ({diagnostics.describe(e)}) — continuing")
 
 
+# The poll loop and the delivery workers both rewrite the task-room map, whose order the drain sends in.
+_TASK_ROOMS_MUTEX = threading.RLock()
+
+
 def _record_task_room(tid: str, room: str) -> None:
     if not room:
         return
-    rooms = _load_task_rooms()
-    if rooms.get(tid) != room:
-        rooms[tid] = room
-        _save_task_rooms(rooms)
+    with _TASK_ROOMS_MUTEX:
+        rooms = _load_task_rooms()
+        if rooms.get(tid) != room:
+            rooms[tid] = room
+            _save_task_rooms(rooms)
 
 
 def _forget_task_room(tid: str) -> None:
-    rooms = _load_task_rooms()
-    if tid in rooms:
-        rooms.pop(tid)
-        _save_task_rooms(rooms)
+    with _TASK_ROOMS_MUTEX:
+        rooms = _load_task_rooms()
+        if tid in rooms:
+            rooms.pop(tid)
+            _save_task_rooms(rooms)
 
 
 def _load_task_media() -> "dict | None":
@@ -8659,9 +8665,10 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
         aliases[new_id] = delivery
         if not _save_dedup_aliases(aliases):
             return False
-        rooms = _load_task_rooms()
-        rooms[new_id] = room
-        _save_task_rooms(rooms)
+        with _TASK_ROOMS_MUTEX:
+            rooms = _load_task_rooms()
+            rooms[new_id] = room
+            _save_task_rooms(rooms)
         if inflight is not None and new_id not in inflight:
             inflight.add(new_id)
             if not _save_inflight(inflight):
@@ -9718,6 +9725,7 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
 DELIVERY_PASS_WAIT_S = 5.0
 _DELIVERING: "set[str]" = set()
 _DELIVERING_ROOMS: "set[str]" = set()
+ROOM_ORDER_MAX_WAIT_S = 120.0
 _DELIVERING_MUTEX = threading.Lock()
 
 
@@ -9736,8 +9744,12 @@ def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None
 
     def run():
         try:
-            for tid, rfile, raw, generation in items:
+            for n, (tid, rfile, raw, generation) in enumerate(items):
                 _delivery_worker(tid, rfile, raw, generation, inflight)
+                if room and _holds_room(tid, rfile, inflight):
+                    _release_unsent(items[n + 1:])
+                    _log(f"room order: {tid} is still in flight — its room's later replies wait")
+                    break
         finally:
             if room:
                 with _DELIVERING_MUTEX:
@@ -9747,21 +9759,60 @@ def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None
     return th
 
 
+def _result_settled(tid: str, inflight: "set[str]") -> bool:
+    """Whether tid's result is done for ordering: its task left the in-flight set, or its outbox
+    item is terminal (delivered or parked). Anything else may still post later."""
+    if tid not in inflight:
+        return True
+    try:
+        core = _delivery_core()
+        return (read_item(core.backend.root, _broker_tid(tid)) or {}).get("status") in core.backend.TERMINAL
+    except Exception as e:  # noqa: BLE001 — an unreadable record is not proof it went out
+        _log(f"room order: {tid}'s outbox record unreadable ({diagnostics.describe(e)})")
+        return False
+
+
+def _release_unsent(items: list) -> None:
+    """Hand back a room's later replies unsent, so the next pass offers them again in order."""
+    for tid, _rfile, _raw, _generation in items:
+        try:
+            _end_unpublished_claims(_broker_tid(tid))
+        except Exception as e:  # noqa: BLE001 — a claim left open is ended by the next reconcile
+            _log(f"result {tid}: its claim could not be ended yet ({diagnostics.describe(e)})")
+        with _DELIVERING_MUTEX:
+            _DELIVERING.discard(tid)
+
+
 def _room_busy(room: str) -> bool:
     with _DELIVERING_MUTEX:
         return room in _DELIVERING_ROOMS
 
 
-def _waits_for_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> bool:
-    """A reply whose room is still sending an earlier one waits for the next pass."""
-    room = rooms.get(tid)
-    if not room or not _room_busy(room):
-        return False
+def _reply_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> "str | None":
+    """The room tid's written reply takes a place in; None with no reply yet or one that posts nothing."""
+    if not rooms.get(tid):
+        return None
     try:
         raw = rfile.read_text(errors="replace")
     except OSError:
-        return os.path.lexists(rfile)       # a missing result takes the ordinary not-ready path
-    return _ordered_room(tid, raw, rooms) is not None
+        return None
+    return _ordered_room(tid, raw, rooms)
+
+
+def _holds_room(tid: str, rfile: Path, inflight: "set[str]") -> bool:
+    """Whether tid's reply, not yet settled, still holds its room's later replies back; past
+    ROOM_ORDER_MAX_WAIT_S it stops holding them, so one stuck reply never silences a room."""
+    if _result_settled(tid, inflight):
+        return False
+    try:
+        waited = time.time() - rfile.stat().st_mtime
+    except OSError:
+        return True
+    if waited <= ROOM_ORDER_MAX_WAIT_S:
+        return True
+    _log_backoff((tid, "room-order"), f"room order: {tid} unsent after {int(waited)}s — "
+                 "its room's later replies go on without it")
+    return False
 
 
 def _intake_ordered(tids, rooms: "dict[str, str]") -> list:
@@ -9806,44 +9857,59 @@ def _post_ready_results(inflight: set[str]) -> None:
     changed, started = False, []
     rooms = _load_task_rooms()
     queued: "dict[str, list]" = {}
+    held: "set[str]" = set()                    # rooms with an earlier reply still unsent
     for tid in _intake_ordered(list(inflight), rooms):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if _ATTEMPTS is not None:
-            run = _run_holds_result(tid, rfile)
-            if run is None:
-                continue
-            if run is False:
-                inflight.discard(tid)
-                changed = True
-                continue
-        if _ATTEMPTS is not None and _delivering(tid):
-            continue                            # its delivery is still under way on its own worker
-        if _ATTEMPTS is not None and _waits_for_room(tid, rfile, rooms):
-            continue                            # an earlier reply in its room is still being sent
-        raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
-        if raw is None:
-            # A disposed-of id whose task could not be archived earlier is retried here.
-            if not os.path.lexists(rfile):
-                with _retiring(tid):  # the judgement and the settle are one step to a wake
-                    if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
-                        changed |= _settle_task(tid, inflight)
-                _SETTLE_SCANNED.add(tid)
-            continue
-        if _ATTEMPTS is None:
-            changed |= _deliver_ready(tid, rfile, raw, generation, inflight)
-            continue
-        room = _ordered_room(tid, raw, rooms)
-        if room is None:
-            started.append(_start_delivery([(tid, rfile, raw, generation)], inflight))
-        else:
-            queued.setdefault(room, []).append((tid, rfile, raw, generation))
+        reply_room = _reply_room(tid, rfile, rooms)
+        if reply_room and (reply_room in held or _room_busy(reply_room)):
+            held.add(reply_room)
+            continue                            # an earlier reply in its room is not out yet
+        try:
+            changed |= _offer_result(tid, rfile, inflight, rooms, queued, started)
+        finally:
+            if (reply_room and not any(i[0] == tid for i in queued.get(reply_room, ()))
+                    and _holds_room(tid, rfile, inflight)):
+                held.add(reply_room)
     started += [_start_delivery(items, inflight, room) for room, items in queued.items()]
     _await_deliveries(started)
     if changed:
         _save_inflight(inflight)
+
+
+def _offer_result(tid: str, rfile: Path, inflight: "set[str]", rooms: "dict[str, str]",
+                  queued: "dict[str, list]", started: list) -> bool:
+    """One in-flight task's turn in the drain: delivered now (ledger off), queued on its room's
+    worker, started on its own, or left; whether the in-flight set changed."""
+    changed = False
+    if _ATTEMPTS is not None:
+        run = _run_holds_result(tid, rfile)
+        if run is None:
+            return changed
+        if run is False:
+            inflight.discard(tid)
+            return True
+    if _ATTEMPTS is not None and _delivering(tid):
+        return changed                          # its delivery is still under way on its own worker
+    raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
+    if raw is None:
+        # A disposed-of id whose task could not be archived earlier is retried here.
+        if not os.path.lexists(rfile):
+            with _retiring(tid):  # the judgement and the settle are one step to a wake
+                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
+                    changed |= _settle_task(tid, inflight)
+            _SETTLE_SCANNED.add(tid)
+        return changed
+    if _ATTEMPTS is None:
+        return _deliver_ready(tid, rfile, raw, generation, inflight)
+    room = _ordered_room(tid, raw, rooms)
+    if room is None:
+        started.append(_start_delivery([(tid, rfile, raw, generation)], inflight))
+    else:
+        queued.setdefault(room, []).append((tid, rfile, raw, generation))
+    return changed
 
 
 def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> bool:

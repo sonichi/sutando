@@ -514,8 +514,14 @@ Sutando checkout around it sends neither field.
   not retired while its pin is held, so the results directory must support hard links. Results
   ready together go out in intake order (the insertion order of `remote-task-rooms*.json`), one
   at a time per room on that room's worker, and rooms run in parallel: a send that hangs holds
-  only its own room's later replies. A result that posts nothing (`[no-send]`, `[REPLIED]`,
-  `[deduped:]`) and one with no recorded room are delivered on a worker of their own.
+  only its own room's later replies, for at most its request timeout (35 s for the result post,
+  60 s per attachment upload). A reply that is still in flight after its turn (a deferred upload,
+  an unreadable alias ledger, a held result, an unconfirmed post) holds its room's later replies
+  until its outbox item is terminal (delivered or parked) or its task is settled; past
+  `ROOM_ORDER_MAX_WAIT_S` (120 s from the reply's write) it stops holding them, and a log line
+  says so. A result that posts nothing (`[no-send]`, `[REPLIED]`, `[deduped:]`) and one with no
+  recorded room are delivered on a worker of their own. Right after an upgrade the map was
+  written sorted, so the first pass may order the tasks already in flight by id.
 - Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
   upgraded; start logs that they are ignored, and attempts in flight across that upgrade are not
   resumed.
