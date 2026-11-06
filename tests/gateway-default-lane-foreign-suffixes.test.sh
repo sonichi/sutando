@@ -137,32 +137,51 @@ for _raw in '"@agent:localhost"' "'@agent:localhost'" '@agent:localhost # note' 
   fi
 done
 
-# --- wiring: BOTH launch paths carry the derived value ----------------------
-
-# Assert the claim, not a file-wide count: an `== 1` over the whole file is
-# stronger than the intent and fails on any second legitimate injection site.
-named_lane_block="$(awk '/GATEWAY_INSTANCE="\$_gw_inst"/,/remote-gateway-bridge\.py/' \
-  "$REPO/src/startup-runtime.sh")"
-if printf '%s' "$named_lane_block" | grep -q 'GATEWAY_FOREIGN_SUFFIXES'; then
-  bad "the named-lane spawn does not inject the foreign list" "found it in the lane block"
+# Execute shipped launchers in a disposable checkout; only the bridge and
+# config resolver are stubs, so no host service or credential is touched.
+launch_repo="$FIXTURES/launch"
+mkdir -p "$launch_repo/src/launchd" "$launch_repo/scripts" "$launch_repo/bin" "$launch_repo/logs"
+cp "$REPO/src/"{startup-runtime.sh,gateway-foreign-suffixes.sh,watcher_sentinel.sh,repo_root.sh} "$launch_repo/src/"
+cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$launch_repo/src/launchd/"
+cat > "$launch_repo/scripts/sutando-config.sh" <<'CONFIG'
+#!/bin/bash
+printf '%s/default.env\n' "$REPO"
+CONFIG
+printf 'REMOTE_TASK_TOKEN=fixture\nAG2_REMOTE_TOKEN_DEV=fixture\n' > "$launch_repo/default.env"
+cat > "$launch_repo/bin/python3" <<'BRIDGE'
+#!/bin/bash
+printf '%s\n' "${GATEWAY_FOREIGN_SUFFIXES-absent}" > "$CAPTURE/${GATEWAY_INSTANCE:-default}"
+BRIDGE
+chmod +x "$launch_repo/bin/python3"
+for launch in bare wrapper; do
+  capture="$FIXTURES/$launch"
+  mkdir -p "$capture"
+  if env -i HOME="$FIXTURES" PATH="$launch_repo/bin:$PATH" \
+      REPO="$launch_repo" PY="$launch_repo/bin/python3" LOGS_DIR="$launch_repo/logs" \
+      CAPTURE="$capture" GATEWAY_CHANNELS_DIR="$FIXTURES/port" LAUNCH="$launch" bash -c '
+        if [ "$LAUNCH" = bare ]; then
+          source "$REPO/src/startup-runtime.sh"
+          start_gateway_lanes
+          wait
+        else
+          bash "$REPO/src/launchd/gateway-bridge-wrapper.sh"
+        fi
+      ' > "$capture/output" 2>&1; then
+    got="$(cat "$capture/default" 2>/dev/null)"
+    if [ "$got" = ":localhost:8008" ]; then
+      ok "$launch default bridge receives the derived suffix"
+    else
+      bad "$launch default bridge receives the derived suffix" "got '$got'"
+    fi
+  else
+    bad "$launch executes successfully" "$(cat "$capture/output")"
+  fi
+done
+got="$(cat "$FIXTURES/bare/dev" 2>/dev/null)"
+if [ "$got" = absent ]; then
+  ok "named bridge receives no foreign suffix list"
 else
-  ok "the named-lane spawn does not inject the foreign list"
-fi
-
-if grep -q 'GATEWAY_FOREIGN_SUFFIXES="\$(derive_foreign_suffixes)"' "$REPO/src/startup-runtime.sh"; then
-  ok "the bare default-lane spawn injects the derived value"
-else
-  bad "the bare default-lane spawn injects the derived value" "no injection site found"
-fi
-
-# The supervised path is the PREFERRED one, so a fence only on the fallback
-# leaves the same host behaving two ways depending on launchd health.
-wrapper="$REPO/src/launchd/gateway-bridge-wrapper.sh"
-if grep -q 'GATEWAY_FOREIGN_SUFFIXES="\$(derive_foreign_suffixes)"' "$wrapper" \
-   && grep -q 'export GATEWAY_FOREIGN_SUFFIXES' "$wrapper"; then
-  ok "the launchd wrapper derives and exports the value (supervised path)"
-else
-  bad "the launchd wrapper derives and exports the value (supervised path)" "not wired"
+  bad "named bridge receives no foreign suffix list" "got '$got'"
 fi
 
 # One derivation, not two copies that can drift.
