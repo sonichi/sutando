@@ -1,27 +1,31 @@
-"""ws_transport.py — LAN WSS transport for SCP (Sutando Client Protocol).
+"""ws_transport.py — network transport for SCP (Sutando Client Protocol).
 
 A SECOND transport for the runtime-api daemon, alongside the Unix socket.
 Same SCP methods, same dispatcher — one dispatcher, N transports. This is the
-LAN-native leg: a phone-class client on the same network reaches the agent by
-dialing the Server's own WSS listener (no relay, no cloud).
+network leg: a phone-class client on the same network reaches the agent by
+dialing the Server's own listener (no relay, no cloud). The PRIMARY listener
+is plain ws:// (the SUTANDO_SCP_WSS_* env names predate that split); an
+OPTIONAL TLS sibling (SUTANDO_SCP_WSS_TLS, self-signed) exists for clients
+that require a secure context.
 
 Where the UDS transport is same-user local (0600, no auth needed), this
-transport is NETWORK-EXPOSED, so it adds two edge protections the socket does
-not need:
+transport is NETWORK-EXPOSED, so authorization is per-credential at the edge
+(_resolve_auth), not read-only across the board:
 
-  1. A bearer token on connect — Sutando's own credential. The socket's
-     filesystem permission has no analogue over the network; the token is the
-     precursor to per-device pairing credentials.
-  2. A read-only method allowlist. Network peers get the READ surface
-     (sutando.*, runtime.*, task.status/get_result, agent.*) only. Mutating
-     methods (task.submit/cancel, capability.execute, terminal.input, ...) are
-     refused at the transport edge until per-device authz lands in the
-     dispatcher. This is a coarse network-exposure stopgap — the fine-grained
-     per-device authorization stays a DISPATCHER concern (transport ≠ authz).
+  1. Shared bearer token — confined to READ_ONLY_METHODS plus task.subscribe.
+     Cannot mutate state.
+  2. Pairing token — pair.redeem only (plus the pre-auth client.hello
+     handshake, which every authenticated credential may call).
+  3. Paired device credential — authorized by its own per-device grants
+     (DEFAULT_DEVICE_GRANTS): the read surface PLUS task.submit/task.cancel
+     and voice.open/voice.close (voice.interrupt rides the voice.open grant).
+     A paired device can MUTATE owner-tier state by default; the credential,
+     not the transport, is the security boundary on the network leg.
 
-Binding defaults to loopback; exposing on the LAN is an explicit opt-in
-(SUTANDO_SCP_WSS_HOST). The transport itself is opt-in (off unless
-SUTANDO_SCP_WSS_ENABLE) so UDS-only deployments are unchanged.
+Binding defaults to loopback; exposing beyond loopback is an explicit opt-in
+(SUTANDO_SCP_WSS_HOST) with no source-address filtering. The transport itself
+is opt-in (off unless SUTANDO_SCP_WSS_ENABLE) so UDS-only deployments are
+unchanged.
 """
 from __future__ import annotations
 
@@ -35,10 +39,8 @@ import media_frame  # noqa: E402
 from protocol import (MAX_LINE_BYTES, ProtocolError, error_frame,  # noqa: E402
                       parse_line, result_frame)
 
-# The read surface a network peer may call before per-device authz exists.
-# Anything that mutates state or reaches a governed capability is excluded and
-# refused at the edge (see module docstring). Kept as a frozenset so it cannot
-# be mutated at runtime.
+# The SHARED bearer's grant set only — paired-device credentials carry their
+# own per-device grants (task.submit/cancel/voice), resolved per connection.
 READ_ONLY_METHODS = frozenset({
     "sutando.info", "sutando.status", "sutando.owner", "sutando.allowlist",
     "runtime.health", "runtime.details",
@@ -81,7 +83,9 @@ class WsWriterSink:
 
 
 class WsTransport:
-    """A WSS front-end that dispatches SCP frames through a shared dispatcher.
+    """A WebSocket front-end that dispatches SCP frames through a shared
+    dispatcher. The primary listener is cleartext ws:// — wss:// only when a
+    TLS context is supplied (the optional sibling listener).
 
     The dispatcher is the SAME object the UDS transport uses — this class owns
     only the websocket mechanics + the network-edge gates (auth, allowlist).
@@ -389,8 +393,9 @@ class WsTransport:
                            ssl_context=ssl_context)
         await site.start()
         scheme = "wss" if ssl_context else "ws"
+        label = "SCP WebSocket (TLS)" if ssl_context else "SCP WebSocket (cleartext)"
         self._log(
-            f"SCP WSS listening on {scheme}://{self.host}:{self.port}{self.route}")
+            f"{label} listening on {scheme}://{self.host}:{self.port}{self.route}")
 
     async def cleanup(self) -> None:
         if self._runner is not None:

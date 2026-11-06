@@ -24,20 +24,8 @@ import local_task_protocol as ltp  # noqa: E402
 
 
 def _grep_stamped_values(key: str, roots=None) -> set:
-    """Every literal value producers stamp for `key:` across live writer
-    code, Python AND TypeScript (the TS bridges are live stampers too).
-
-    Write signatures only — quoted-key assignment ("access_tier":
-    "ambient") and header-line writes inside string literals ("access_tier:
-    ambient\\n" or backtick-terminated `access_tier: owner`). Each carries a
-    syntactic marker that a task RECORD is being written. Prose in comments,
-    `key: Type` annotations, and `.key === 'x'` comparisons match none of
-    these, which is what keeps this a producer census rather than a word
-    search.
-
-    A bare object-literal key (`priority: 'high'`) is deliberately NOT a
-    signature: it matches any option bag in any subsystem, so it cannot tell
-    a task stamp from an unrelated argument that reuses the word."""
+    """Scan quoted assignments and task header strings across live writers.
+    Bare object keys also match unrelated option bags and are not task stamps."""
     pat = re.compile(
         rf"""["']{key}["']\s*[:=]\s*f?["']([a-z_]+)["']"""
         rf"""|{key}:\s*([a-z_]+)\\n"""

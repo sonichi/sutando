@@ -139,3 +139,9 @@ ag2-onboarding.txt
 coverage.xml
 diff-cover.md
 coverage-summary.md
+
+# per-clone local files (never committed)
+.env_openrouter.sh
+.vscode/
+*.bak-*
+* (1).*

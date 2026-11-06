@@ -54,7 +54,7 @@ export class ScpVoice {
 	}
 
 	_flush() {
-		for (const s of this.sources.splice(0)) { try { s.stop(); } catch (e) { /* */ } }
+		for (const s of this.sources.splice(0)) { try { s.stop(); } catch (_e) { /* */ } }
 		this.playCursor = 0;
 	}
 
@@ -120,7 +120,7 @@ export class ScpVoice {
 			}
 			return;
 		}
-		let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+		let m; try { m = JSON.parse(ev.data); } catch (_e) { return; }
 		if (m.id && this.pending.has(m.id)) {
 			const p = this.pending.get(m.id); this.pending.delete(m.id);
 			m.error ? p.rej(new Error(m.error.message || 'error')) : p.res(m.result);
@@ -138,13 +138,13 @@ export class ScpVoice {
 		try {
 			this.proc?.disconnect(); this.srcNode?.disconnect();
 			this.stream?.getTracks().forEach((t) => t.stop());
-		} catch (e) { /* */ }
+		} catch (_e) { /* */ }
 		this.proc = this.srcNode = this.stream = null;
 		if (this.sid != null && this.ws?.readyState === 1) {
-			try { await this._rpc('voice.close', { streamId: this.sid }); } catch (e) { /* */ }
+			try { await this._rpc('voice.close', { streamId: this.sid }); } catch (_e) { /* */ }
 		}
 		this.sid = null;
-		try { this.ws?.close(); } catch (e) { /* */ }
+		try { this.ws?.close(); } catch (_e) { /* */ }
 		this.ws = null;
 		this.opts.onState?.('');
 	}
