@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""A friction report must not be a second copy of pending-questions.md: past a
-threshold the section collapses to a count plus a sample, below it is unchanged."""
-from datetime import date, timedelta
+"""A friction report must not be a second copy of the pending-questions list: past a
+threshold the section collapses to a count plus a sample, below it is unchanged.
+Items come from the one reader (mocked here)."""
 from pathlib import Path
 import importlib.util
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "friction-detector.py"
 
@@ -18,24 +20,14 @@ def _load(workspace: Path):
     return m
 
 
-def _write(workspace: Path, body: str):
-    pq = Path(_load(workspace).personal_path("pending-questions.md", workspace))
-    pq.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_text(body)
-    return pq
-
-
 def _sections(n, dated_from=None):
-    """n open sections; if dated_from is set, each carries an **Asked:** date."""
+    """n open items; if dated_from is set, each carries an asked_at that many days back."""
     out = []
     for i in range(n):
-        out.append(f"## Question {i}")
-        if dated_from is not None:
-            d = date.today() - timedelta(days=dated_from + i)
-            out.append(f"**Asked:** {d.isoformat()}")
-        out.append("body text")
-        out.append("")
-    return "\n".join(out)
+        asked = time.time() - (dated_from + i) * 86400 if dated_from is not None else None
+        out.append({"id": f"q{i}", "ask_id": f"ask-{i}", "title": f"Question {i}", "snippet": "body text",
+                    "body": "body text", "asked_at": asked, "priority": "medium", "in_room": True})
+    return out
 
 
 class Collapse(unittest.TestCase):
@@ -46,9 +38,11 @@ class Collapse(unittest.TestCase):
     def tearDown(self):
         self._td.cleanup()
 
-    def _run(self, body):
-        _write(self.ws, body)
-        return _load(self.ws).check_pending_questions()
+    def _run(self, items):
+        m = _load(self.ws)
+        g = {"waiting": items, "done": 0, "unavailable": False, "reason": None, "notes": [], "link": None}
+        with mock.patch.object(m.pending_questions_reader, "gather", return_value=g):
+            return m.check_pending_questions()
 
     def test_short_lists_are_still_enumerated_in_full(self):
         """The change must not alter behaviour below the threshold."""
@@ -91,21 +85,20 @@ class Collapse(unittest.TestCase):
 
     def test_a_mixed_file_ranks_the_dated_ones(self):
         """Undated entries must not displace a genuinely old dated one."""
-        body = _sections(20) + "\n" + (
-            "## Ancient dated question\n"
-            f"**Asked:** {(date.today() - timedelta(days=400)).isoformat()}\n"
-            "body\n")
+        body = _sections(20) + [{"id": "anc", "ask_id": "ask-anc", "title": "Ancient dated question",
+                                 "snippet": "body", "body": "body", "asked_at": time.time() - 400 * 86400,
+                                 "priority": "medium", "in_room": True}]
         out = self._run(body)
         self.assertIn("oldest", out[0])
         self.assertIn("Ancient dated question", out[1])
 
-    def test_resolved_sections_are_still_excluded_from_the_count(self):
-        body = _sections(8) + "\n## Done one\n**Status:** resolved\nbody\n"
+    def test_a_fresh_question_is_not_stale_and_an_empty_list_returns_nothing(self):
+        body = _sections(8) + [{"id": "fresh", "ask_id": "ask-fresh", "title": "Fresh", "snippet": "body",
+                                "body": "body", "asked_at": time.time() - 3600, "priority": "medium",
+                                "in_room": True}]
         out = self._run(body)
         self.assertIn("8 pending questions", out[0])
-
-    def test_an_empty_file_still_returns_nothing(self):
-        self.assertEqual(self._run("(No pending questions)"), [])
+        self.assertEqual(self._run([]), [])
 
 
 if __name__ == "__main__":

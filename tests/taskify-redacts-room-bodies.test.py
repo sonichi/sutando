@@ -13,6 +13,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG = Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
 

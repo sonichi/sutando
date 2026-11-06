@@ -143,6 +143,40 @@ def main() -> int:
                         "access_tier": "owner", "enabled": True, "tools": "../shared/tools.ts"}))
     check(any("escape the skill dir" in x for x in e), "tools path with '..' rejected")
 
+    # 15. supervised_worker: sparrowd reads this to decide what to keep running,
+    #     so a malformed block is a daemon that silently never starts.
+    def _sw(name, worker, config=None, files=None):
+        m = {"name": name, "version": "1.0.0", "owner": "m", "stability": "stable",
+             "config": config if config is not None else {"SW_PYTHON": ""},
+             "supervised_worker": worker}
+        return _skill(tmp, name, m, files=files or {"loop.py": "# a worker\n"})
+
+    good = {"name": "sw-loop", "script": "loop.py",
+            "interpreter": {"config": "SW_PYTHON", "needs": "nothing"}}
+    e, w = errs(_sw("swok", good))
+    check(e == [] and w == [], "a well-formed supervised_worker is accepted")
+    e, _ = errs(_sw("swnotobj", "a string"))
+    check(any("must be an object" in x for x in e), "supervised_worker must be an object")
+    e, _ = errs(_sw("swpathname", {**good, "name": "../../etc/passwd"}))
+    check(any("plain name" in x for x in e), "a worker name that is a path is rejected")
+    e, _ = errs(_sw("swnoscript", {k: v for k, v in good.items() if k != "script"}))
+    check(any("script is required" in x for x in e), "a missing script is rejected")
+    e, _ = errs(_sw("swescape", {**good, "script": "../../src/sparrowd.py"}))
+    check(any("inside the skill" in x for x in e), "a script outside the skill is rejected")
+    e, _ = errs(_sw("swabsolute", {**good, "script": "/usr/bin/python3"}))
+    check(any("inside the skill" in x for x in e), "an absolute script path is rejected")
+    e, _ = errs(_sw("swmissingfile", {**good, "script": "gone.py"}))
+    check(any("does not exist" in x for x in e), "a script that does not exist is rejected")
+    e, _ = errs(_sw("swnointerp", {k: v for k, v in good.items() if k != "interpreter"}))
+    check(any("interpreter.config is required" in x for x in e),
+          "a missing interpreter.config is rejected")
+    _, w = errs(_sw("swundeclared", good, config={}))
+    check(any("not declared in the config block" in x for x in w),
+          "an interpreter key absent from the config block warns")
+    _, w = errs(_sw("swunknownfield", {**good, "flavour": "x"}))
+    check(any("unknown supervised_worker field" in x for x in w),
+          "an unknown supervised_worker field warns")
+
     print(f"\n{'PASS — all checks green' if not FAILS else f'FAIL — {len(FAILS)} failing'}")
     return 0 if not FAILS else 1
 

@@ -26,6 +26,9 @@ from typing import Callable
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from file_lock import locked_file
+from local_task_protocol import parse_task_headers, valid_local_task_id
+from safe_number import finite
+from task_queue import position as queue_position
 from workspace_default import resolve_workspace
 
 PHASES = ("RECEIVED", "QUEUED", "RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED")
@@ -86,11 +89,19 @@ class LifecycleTransition:
     text: str | None = None
     worker: str | None = None
     into: str | None = None
+    queue: dict | None = None  # {depth, position} at QUEUED, from the pending list
 
     def key(self, state: TaskActivityState) -> str:
         gen = self.generation if self.generation is not None else state.generation
         frm = self.from_phase or state.phase
         return f"{self.task_id}:{gen}:{frm}:{self.to_phase}"
+
+
+@dataclass(frozen=True)
+class StopRequest:
+    """A Stop the owner asked for: the room sees it at once, the phase waits for the confirmed stop."""
+    task_id: str
+    ts: float | None = None
 
 
 @dataclass(frozen=True)
@@ -119,12 +130,21 @@ def _task_dict(state: TaskActivityState) -> dict:
 
 
 def _row(state: TaskActivityState, kind: str, line: str, ts: float, done: bool = False,
-         audience: str | None = None, projection: str = "RUNTIME_DETAIL") -> dict:
+         audience: str | None = None, projection: str = "RUNTIME_DETAIL", queue: dict | None = None) -> dict:
     # The pid rides in the snapshot's pending list, so a replay projects the same identity again
     # and the row writer applies it once.
     state.emitted += 1
-    return {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done, "pid": f"{state.task_id}:{state.generation}:{state.emitted}",
-            "audience": audience or state.visibility.get("telemetry", TELEMETRY_AUDIENCE), "projection": projection}
+    row = {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done, "pid": f"{state.task_id}:{state.generation}:{state.emitted}",
+           "audience": audience or state.visibility.get("telemetry", TELEMETRY_AUDIENCE), "projection": projection}
+    if queue:
+        row["queue"] = queue
+    return row
+
+
+def queued_line(queue: dict | None) -> str:
+    """The queued row's text: "queued · N ahead" once at least one task is ahead of this one."""
+    pos = int((queue or {}).get("position") or 0)
+    return f"queued · {pos - 1} ahead" if pos > 1 else "queued"
 
 
 def shared_projection(state: TaskActivityState) -> dict:
@@ -152,11 +172,19 @@ _PHASE_ROW = {
 }
 
 
-def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -> tuple[TaskActivityState, list[dict]]:
+def reduce(state: TaskActivityState, item: "LifecycleTransition | RuntimeEvent | StopRequest"
+           ) -> tuple[TaskActivityState, list[dict]]:
     """Pure: returns the next state and the rows that project this step. Duplicates and
     out-of-order items change nothing; a terminal phase never regresses."""
     now = item.ts if item.ts is not None else time.time()
     rows: list[dict] = []
+    if isinstance(item, StopRequest):
+        if state.phase in TERMINAL or "stop_requested" in state.applied:
+            return state, rows
+        state.applied.append("stop_requested")
+        rows.append(_row(state, "notice", "stop requested", now,
+                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS"))
+        return state, rows
     if isinstance(item, LifecycleTransition):
         key = item.key(state)
         if key in state.applied:
@@ -167,8 +195,8 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
             # QUEUED and RUNNING are emitted by independent processes and can land out of order: an
             # earlier-stamped QUEUED is history — row written, phase kept, a replay of it a no-op.
             state.applied += ["queued", key]
-            rows.append(_row(state, "notice", "queued", now, audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE),
-                             projection="TASK_STATUS"))
+            rows.append(_row(state, "notice", queued_line(item.queue), now, audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE),
+                             projection="TASK_STATUS", queue=item.queue))
             return state, rows
         if frm != state.phase or state.phase in TERMINAL or item.to_phase not in TRANSITIONS.get(state.phase, frozenset()):
             # Not a valid move from where the task is: a stale or replayed transition. Telemetry only.
@@ -190,12 +218,15 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
         if item.reason:
             state.summary = item.reason
         kind, line = _PHASE_ROW[item.to_phase]
-        if item.to_phase == "COMPLETED" and state.into:
+        if item.to_phase == "QUEUED":
+            line = queued_line(item.queue)
+        elif item.to_phase == "COMPLETED" and state.into:
             line = "consolidated"
         elif item.reason and item.to_phase in TERMINAL:
             line = f"{line}: {item.reason}" if item.to_phase != "COMPLETED" else item.reason
         rows.append(_row(state, kind, line, now, done=item.to_phase in TERMINAL,
-                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS"))
+                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS",
+                         queue=item.queue if item.to_phase == "QUEUED" else None))
         return state, rows
     # a runtime observation
     last = state.sessions.get(item.activity_session_id, 0)
@@ -231,18 +262,50 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
     return state, rows
 
 
-CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-9._-]+)")
+# `~` joins a gateway instance to its broker id (task-<instance>~<broker id>).
+CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-9._~-]+)")
 
 
 def cancel_target(task_text: str | None) -> str | None:
-    """The task a CANCEL_INSTRUCTION names, else None: the scheduler marks it CANCELLED on arrival."""
+    """The task a CANCEL_INSTRUCTION names, else None: a stop is requested on arrival, and the task
+    is CANCELLED only once the core has handled the instruction without answering it."""
     m = CANCEL_RE.search(task_text or "")
-    return m.group(1) if m else None
+    tid = m.group(1) if m else None
+    return tid if tid and ("~" not in tid or valid_local_task_id(tid)) else None
+
+
+# Who may stop a task: the bridge's own control writer and the owner's local voice session; the
+# runtime API only through task.cancel, which alone writes `interaction_type: task_cancel`.
+STOP_SOURCES = frozenset({"relay-control", "voice", "runtime-api"})
+
+
+def trusted_cancel_target(text: str | None, filename: str | None = None) -> str | None:
+    """The task a stop instruction names, only when the file itself is one a stop may come from:
+    headers above `task:` (which no body can forge) at owner tier from a stop source, its id the
+    file's own, and its task line the instruction. None for anything else."""
+    parsed = parse_task_headers(text or "")
+    h = parsed.headers
+    source = (h.get("source") or "").strip()
+    if (h.get("access_tier") or "").strip() != "owner" or source not in STOP_SOURCES:
+        return None
+    if source == "runtime-api" and (h.get("interaction_type") or "").strip() != "task_cancel":
+        return None
+    if filename is not None and (h.get("id") or "").strip() != Path(filename).name.removesuffix(".txt"):
+        return None
+    task = (parsed.body or "").lstrip()
+    return cancel_target(task.split("\n", 1)[0]) if task.startswith("CANCEL_INSTRUCTION:") else None
 
 
 def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", into_task: str | None = None,
                          worker: str | None = None, ws: Path | None = None, ts: float | None = None) -> LifecycleTransition:
     task, room = task_from_file(task_file)
+    queue = None
+    if to_phase == "QUEUED":
+        # The file just landed: its place in the pending list is what the queued row shows.
+        try:
+            queue = queue_position(ws or Path(task_file).resolve().parent.parent, task["id"])
+        except Exception:  # noqa: BLE001 - a queue that cannot be counted is a plain "queued"
+            queue = None
     into = None
     if into_task:
         for d in ("tasks", os.path.join("tasks", "archive")):
@@ -251,13 +314,95 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
                 into = task_from_file(p)[0].get("event")
                 break
     return LifecycleTransition(task["id"], to_phase, reason=reason, message_event_id=task.get("event"),
-                               room=room, sender=task.get("from"), text=task.get("text"), worker=worker, into=into, ts=ts)
+                               room=room, sender=task.get("from"), text=task.get("text"), worker=worker, into=into, ts=ts,
+                               queue=queue)
+
+
+#: How long a RUNNING task counts as "being worked" without a newer activity stamp.
+IN_PROGRESS_MAX_AGE_S = 1800.0
+
+
+#: The row kind that is real work on a task: a tool call the session's own activity
+#: hook attributed to it. Reading the task (processing) or thinking about it is not.
+_ENGAGED_KINDS = frozenset({"working"})
+
+
+def engaged_at(workspace: Path, task_id: str) -> float | None:
+    """When the session last did real work on the task: the newest `working` row naming
+    it from the session's own hook (never the bus's TASK_STATUS rows, which mark delivery,
+    and never a read or a thought: a task read and then dropped is still owed). None when
+    no such row exists."""
+    newest = None
+    try:
+        with open(workspace / "state" / "agent-activity.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("projection") == "TASK_STATUS":
+                    continue
+                task = rec.get("task")
+                if not isinstance(task, dict) or task.get("id") != task_id:
+                    continue
+                if rec.get("kind") not in _ENGAGED_KINDS:
+                    continue
+                ts = finite(rec.get("ts"))
+                if ts is not None:
+                    newest = ts if newest is None else max(newest, ts)
+    except OSError:
+        return None
+    return newest
+
+
+def in_progress(workspace: Path, task_id: str, max_age: float = IN_PROGRESS_MAX_AGE_S,
+                now: float | None = None) -> bool:
+    """True when the snapshot says RUNNING and the session has ENGAGED with the task within
+    max_age: a runtime event applied to the snapshot (seq > 0) or an agent-activity row from
+    the session's own hook naming the task. RUNNING alone is delivery (the watcher marks it
+    at hand-off), and a delivered task nobody answered must still block. Queued, waiting on
+    a person, terminal, stale, a future or non-finite stamp, no or unreadable snapshot: False."""
+    try:
+        d = json.loads(ActivityStore(workspace).path(task_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(d, dict) or d.get("phase") != "RUNNING":
+        return False
+    seq = d.get("seq")
+    stamps = []
+    if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+        stamps.append(d.get("last_activity_at"))
+    row_ts = engaged_at(workspace, task_id)
+    if row_ts is not None:
+        stamps.append(row_ts)
+    stamps = [finite(x) for x in stamps if finite(x) is not None]
+    if not stamps:
+        return False
+    age = (time.time() if now is None else now) - float(max(stamps))
+    return 0 <= age <= max_age
+
+
+def _in_progress_cli(args: list[str]) -> int:
+    """`in-progress <task_id> [--workspace W] [--max-age S]`: rc 0 when in progress, 1 when not,
+    2 on a usage error. Unlike the emitting commands this one is a query, so it answers by rc."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="activity_bus.py in-progress")
+    ap.add_argument("task_id"); ap.add_argument("--workspace"); ap.add_argument("--max-age", type=float, default=IN_PROGRESS_MAX_AGE_S)
+    try:
+        a = ap.parse_args(args)
+    except SystemExit:
+        return 2
+    ws = Path(a.workspace) if a.workspace else resolve_workspace()
+    return 0 if in_progress(ws, a.task_id, a.max_age) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     """`transition <PHASE> (--task-file P | --task-id ID) [--reason R] [--into-task ID] [--worker W]`
     and `event <task_id> <kind> --session S --seq N [--text T]`. Exits 0 on every path: a caller in
     the delivery path must never fail because the card could not be updated."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "in-progress":
+        return _in_progress_cli(args[1:])
     import argparse
     ap = argparse.ArgumentParser(description="activity bus CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -265,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--task-file"); t.add_argument("--task-id"); t.add_argument("--reason", default="")
     t.add_argument("--into-task"); t.add_argument("--worker"); t.add_argument("--workspace")
     t.add_argument("--ts", type=float, default=None, help="when this transition happened (epoch); default now")
+    s = sub.add_parser("stop-requested"); s.add_argument("--task-id", required=True); s.add_argument("--workspace")
+    c = sub.add_parser("stop-target"); c.add_argument("--task-file", required=True); c.add_argument("--workspace")
     e = sub.add_parser("event"); e.add_argument("task_id"); e.add_argument("kind", choices=EVENT_KINDS)
     e.add_argument("--session", required=True); e.add_argument("--seq", type=int, required=True)
     e.add_argument("--text", default=""); e.add_argument("--workspace")
@@ -277,10 +424,27 @@ def main(argv: list[str] | None = None) -> int:
                 item = transition_from_file(a.to_phase, Path(a.task_file), reason=a.reason, into_task=a.into_task,
                                             worker=a.worker, ws=ws, ts=a.ts)
             elif a.task_id:
+                if "~" in a.task_id and not valid_local_task_id(a.task_id):
+                    print(f"not a task id: {a.task_id!r}", file=sys.stderr)
+                    return 2
                 item = LifecycleTransition(a.task_id, a.to_phase, reason=a.reason, worker=a.worker, ts=a.ts)
             else:
                 return 0
             state = store.apply(item)
+        elif a.cmd == "stop-target":
+            try:
+                text = Path(a.task_file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return 0
+            target = trusted_cancel_target(text, a.task_file)
+            if target:
+                print(target)
+            return 0
+        elif a.cmd == "stop-requested":
+            if "~" in a.task_id and not valid_local_task_id(a.task_id):
+                print(f"not a task id: {a.task_id!r}", file=sys.stderr)
+                return 2
+            state = store.apply(StopRequest(a.task_id))
         else:
             state = store.apply(RuntimeEvent(a.task_id, a.session, a.seq, a.kind, text=a.text))
         print(json.dumps({"task_id": state.task_id, "phase": state.phase, "generation": state.generation, "seq": state.seq}))
@@ -302,7 +466,8 @@ class ActivityStore:
 
     def _default_project(self, row: dict) -> None:
         append_row(row["line"], kind=row["kind"], room=row["room"], task=row["task"], done=row["done"],
-                   workspace=self.ws, audience=row.get("audience"), projection=row.get("projection"), pid=row.get("pid"), ts=row.get("ts"), replay=int(row.get("attempts", 0)) > 1)
+                   workspace=self.ws, audience=row.get("audience"), projection=row.get("projection"), pid=row.get("pid"), ts=row.get("ts"), replay=int(row.get("attempts", 0)) > 1,
+                   queue=row.get("queue"))
 
     def path(self, task_id: str) -> Path:
         return self.dir / f"{task_id}.json"
@@ -321,7 +486,7 @@ class ActivityStore:
         tmp.write_text(json.dumps(asdict(state), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
 
-    def apply(self, item: LifecycleTransition | RuntimeEvent) -> TaskActivityState:
+    def apply(self, item: "LifecycleTransition | RuntimeEvent | StopRequest") -> TaskActivityState:
         """Load → drain → reduce → save (rows pending) → project → save (drained), all under one lock
         per task, so two emitters serialize their rows as well as their transitions. A projection
         that fails leaves its rows pending in the snapshot; the next apply on that task drains them

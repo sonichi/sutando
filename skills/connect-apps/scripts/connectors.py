@@ -18,6 +18,10 @@ resume their request once the apps are connected.
                                     connected: catalog check, one connections read, one account
                                     read, then the wait; prints "mode" (dm | private) and, for dm,
                                     the exact room.message.send payload ("message") to post
+  card-check <wait-id> --event-id E --content-file PATH|-
+                                    after posting a DM card, check the read-back event carries a
+                                    card the client draws; exit 1 prints "fallback", the plain text
+                                    to post when it does not or cannot be confirmed
   note <wait-id> TEXT               add a line to the wait's private card
   claim <room> [--force]            claim the room's pending waits whose apps are connected, each
                                     with whether its AG2 Cloud account checks out
@@ -258,15 +262,28 @@ class Cloud:
         self.base: str | None = None
         self.token: str | None = None
         self.cache: ConnectCache | None = None
+        self.refused: Any = None
 
     def signed_in(self) -> bool:
         if not self.token:
-            self.base, self.token = self._read_auth(self.workspace)
+            auth = self._read_auth(self.workspace)
+            self.base, self.token = auth
+            self.refused = auth if getattr(auth, "refused", None) else None
         return bool(self.token)
+
+    def not_signed_in(self) -> Exception:
+        """What to raise when signed_in() is False: wrong_account for another account than the
+        desktop stamped, a retriable CloudError when /api/me was unreachable, else not_signed_in."""
+        r = self.refused
+        if r is None:
+            return Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        if r.refused == "account_changed":
+            return Setup("wrong_account", cloud_auth.refusal_message(r))
+        return cloud_auth.CloudError(0, "account_unverified", cloud_auth.refusal_message(r))
 
     def get(self, path: str) -> dict:
         if not self.signed_in():
-            raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+            raise self.not_signed_in()
         try:
             data = self._request(self.base or cloud_auth.DEFAULT_CLOUD_ORIGIN, self.token, "GET", path)
         except cloud_auth.CloudError as exc:
@@ -275,6 +292,20 @@ class Cloud:
             raise
         except (OSError, ValueError) as exc:
             # cloud_request leaves errors raised while reading a response (a reset, a read timeout) unwrapped.
+            raise cloud_auth.CloudError(0, "network", str(exc)) from None
+        return data if isinstance(data, dict) else {}
+
+    def post(self, path: str, body: dict | None = None) -> dict:
+        """One authenticated POST; the same error mapping as `get`."""
+        if not self.signed_in():
+            raise self.not_signed_in()
+        try:
+            data = self._request(self.base or cloud_auth.DEFAULT_CLOUD_ORIGIN, self.token, "POST", path, body or {})
+        except cloud_auth.CloudError as exc:
+            if exc.status == 401:
+                self.token = None
+            raise
+        except (OSError, ValueError) as exc:
             raise cloud_auth.CloudError(0, "network", str(exc)) from None
         return data if isinstance(data, dict) else {}
 
@@ -1010,7 +1041,10 @@ def cmd_status(
     rows = cloud.connection_rows(cached=True)
     connections = [
         {"id": r.get("id"), "toolkit": r.get("toolkit"), "name": r.get("name"), "status": r.get("status"),
-         "accountLabel": r.get("accountLabel")}
+         "accountLabel": r.get("accountLabel"),
+         # The account the agent uses for the app unless a call names another
+         # (agent-universe #279). None: the cloud predates the flag.
+         "isDefault": r.get("isDefault")}
         for r in rows
         if isinstance(r, dict)
     ]
@@ -1029,6 +1063,55 @@ def cmd_status(
     }
     emit(payload)
     return EXIT_OK if payload["all_connected"] else EXIT_NO
+
+
+def pick_account(rows: list, toolkit: str, account: str) -> tuple[dict | None, str, list]:
+    """The active connection of `toolkit` the owner means by `account`: its id, its label
+    (case-insensitive), or a substring of exactly one label. Returns (row, reason, candidates);
+    reason is '' on a match, else no_match / ambiguous / none (nothing connected) / no_id (the
+    account meant carries no id, so nothing can be posted for it)."""
+    active = [r for r in rows if isinstance(r, dict) and str(r.get("toolkit") or "").lower() == toolkit
+              and r.get("status") == "active"]
+    cands = [{"id": r.get("id"), "accountLabel": r.get("accountLabel"), "isDefault": r.get("isDefault")}
+             for r in active]
+    if not active:
+        return None, "none", cands
+    sel = (account or "").strip()
+    low = sel.lower()
+    match = next((r for r in active if sel and r.get("id") == sel), None)
+    if match is None:
+        exact = [r for r in active if str(r.get("accountLabel") or "").lower() == low]
+        partial = [r for r in active if low and low in str(r.get("accountLabel") or "").lower()]
+        if len(exact) == 1:
+            match = exact[0]
+        elif len(partial) == 1:
+            match = partial[0]
+        else:
+            return None, ("ambiguous" if len(exact) > 1 or len(partial) > 1 else "no_match"), cands
+    if not (isinstance(match.get("id"), str) and match["id"].strip()):
+        return None, "no_id", cands
+    return match, "", cands
+
+
+def cmd_set_default(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: Any) -> int:
+    """Make one of the app's connected accounts the one the agent uses unless told otherwise
+    (agent-universe #279, POST /api/connectors/<id>/default). Exit 1 with the candidates when the
+    account is unknown, the name fits several, or the row has no id, so the caller can ask the
+    owner which one. The cache is refreshed after the write, so `status` shows the new default."""
+    toolkit = _require(args.slug, SLUG_RE, "toolkit").lower()
+    rows = cloud.connection_rows()
+    row, reason, cands = pick_account(rows, toolkit, args.account)
+    if row is None:
+        emit({"toolkit": toolkit, "ok": False, "reason": reason, "candidates": cands})
+        return EXIT_NO
+    if row.get("isDefault") is None:
+        raise Setup("unsupported", "This AG2 Cloud has no default accounts yet; the newest account is used.")
+    cloud.post(f"/api/connectors/{row.get('id')}/default")
+    # The read cache would serve the old default to `status` until its TTL; the write refreshes it.
+    (cloud.cache or ConnectCache(ws)).put_connections(cloud.connection_rows())
+    emit({"toolkit": toolkit, "ok": True, "account": {"id": row.get("id"), "accountLabel": row.get("accountLabel")},
+          "candidates": cands})
+    return EXIT_OK
 
 
 def _require(value: str, pattern: re.Pattern, what: str) -> str:
@@ -1118,6 +1201,17 @@ def read_baseline(cloud: Cloud) -> dict[str, set[str]]:
         raise Setup("cloud_error", f"Could not read the current connections to switch from: {exc}") from None
 
 
+def station_account_changed(ws: Path, cloud: Cloud, cloud_user_id: str | None) -> dict | None:
+    """The account_changed payload when the agent's credential is not the account the desktop stamped
+    for the running core's station: a card then would ask the owner to connect what is already there."""
+    # An unknown agent id or no stamp keeps today's card: nothing to compare, and the wait records it.
+    stamp = read_station_stamp(ws)
+    if account_mismatch(stamp, cloud_user_id, lambda: cloud_user_id) != "account_changed":
+        return None
+    return {"wait_id": None, "reason": "account_changed", "cloud_user_id": cloud_user_id,
+            "stamp_cloud_user_id": (stamp or {}).get("cloud_user_id"), "base": cloud.base}
+
+
 def cmd_await(
     ws: Path,
     cloud: Cloud,
@@ -1133,8 +1227,12 @@ def cmd_await(
     if origin_owner(ws, a["task"]) != a["owner"]:
         raise Setup("not_owner_task", f"--owner is not the user of {a['task']}.")
     if not cloud.signed_in():
-        raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        raise cloud.not_signed_in()
     cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit(changed)
+        return EXIT_NO
     payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda slugs: resolve_toolkits(cloud, slugs),
                        baseline=lambda: read_baseline(cloud), spawn=spawn, now=now)
     emit(payload)
@@ -1281,6 +1379,46 @@ def card_message(wait: dict, owner: str, task: str, intro: str, switch: bool) ->
     }
 
 
+CONNECTOR_KEY = "space.ag2.connector"
+# The client draws a Connect card only on these message types.
+CARD_MSGTYPES = ("m.text", "m.notice")
+
+
+def connector_problem(content: Any, owner: str | None = None) -> str | None:
+    """Why the client would not draw a Connect card for this event content, or None when it would."""
+    if not isinstance(content, dict) or CONNECTOR_KEY not in content:
+        return "missing"
+    c = content[CONNECTOR_KEY]
+    if not isinstance(c, dict):
+        return "malformed"
+    version = c.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        return "bad_version"
+    who = c.get("for")
+    if not isinstance(who, str) or not MXID_RE.match(who):
+        return "bad_for"
+    if owner is not None and who != owner:
+        return "wrong_owner"
+    kits = c.get("toolkits")
+    if not isinstance(kits, list) or not 1 <= len(kits) <= MAX_TOOLKITS or not all(
+            isinstance(k, dict) and isinstance(k.get("slug"), str) and SLUG_RE.match(k["slug"]) for k in kits):
+        return "bad_toolkits"
+    return None
+
+
+def fallback_message(wait: dict, task: str, switch: bool) -> dict:
+    """Plain text that gets the owner connected when no card shows: it names no card to tap."""
+    toolkits = [x for x in wait.get("toolkits") or [] if isinstance(x, dict)]
+    apps = join_names([str(x.get("name") or x.get("slug")) for x in toolkits])
+    if switch:
+        body = (f"If you don't see a Switch account button for {apps} above, {INTEGRATIONS_HINT}, find {apps} "
+                "there and sign in with your other account. I'll carry on once that's done.")
+    else:
+        body = (f"If you don't see a Connect button for {apps} above, {INTEGRATIONS_HINT}, find {apps} there "
+                "and connect it. I'll carry on as soon as it's connected.")
+    return {"body": body, "reply_to": wait["reply_to"], "operation_id": f"{task}:connect-text"}
+
+
 def cmd_card(
     ws: Path,
     cloud: Cloud,
@@ -1316,8 +1454,12 @@ def cmd_card(
               "owner": a["owner"]})
         return EXIT_OK
     if not cloud.signed_in():
-        raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        raise cloud.not_signed_in()
     cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit({**changed, "all_connected": False, "apps": apps, "mode": mode, "message": None})
+        return EXIT_NO
     intro = a["lines"][0] if a["lines"] else card_intro(names, switch)
     if a["private"]:
         a["lines"] = a["lines"] or [intro, "Once that's done I'll carry on."]
@@ -1325,12 +1467,71 @@ def cmd_card(
         a["lines"] = []
     payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda _slugs: toolkits,
                        baseline=lambda: baseline, spawn=spawn, now=now)
-    message = None
+    message = fallback = problem = None
     if mode == "dm" and payload.get("wait_id"):
         # Printed only now, once the marker exists: a card without a wait would never be answered.
         message = card_message(payload, a["owner"], a["task"], intro, switch)
-    emit({**payload, "all_connected": False, "apps": apps, "mode": mode, "message": message})
+        fallback = fallback_message(payload, a["task"], switch)
+        problem = connector_problem(message["extra_content"], a["owner"])
+        if problem:
+            # A card the client would reject shows as bare text, so send the text that works without it.
+            message = {**fallback, "body": f"{intro}\n\n{fallback['body']}"}
+    emit({**payload, "all_connected": False, "apps": apps, "mode": mode, "message": message,
+          "fallback": fallback, "card_problem": problem})
     return EXIT_OK
+
+
+def _readback_entry(data: Any, event_id: str) -> dict | None:
+    """The posted event out of the read-back: the whole tool output, its `result`, or a list."""
+    if isinstance(data, dict) and isinstance(data.get("result"), (dict, list)):
+        data = data["result"]
+    if isinstance(data, dict):
+        data = data.get("messages") if isinstance(data.get("messages"), list) else [data]
+    if not isinstance(data, list):
+        return None
+    return next((e for e in data if isinstance(e, dict) and e.get("event_id") == event_id), None)
+
+
+def readback_verdict(entry: dict | None, owner: str) -> str:
+    """ok | missing | bad_msgtype | malformed reasons | not_found | unverifiable (no content keys)."""
+    if entry is None:
+        return "not_found"
+    content: dict = {}
+    for key in ("content", "extra_content"):
+        if isinstance(entry.get(key), dict):
+            content.update(entry[key])
+    content.update({k: v for k, v in entry.items() if k.startswith("space.ag2.")})
+    if not any(k in entry for k in ("content", "extra_content")) and not content:
+        return "unverifiable"
+    msgtype = content.get("msgtype", entry.get("msgtype"))
+    if msgtype is not None and msgtype not in CARD_MSGTYPES:
+        return "bad_msgtype"
+    return connector_problem(content, owner) or "ok"
+
+
+def cmd_card_check(ws: Path, cloud: Cloud | None, args: argparse.Namespace, **_: Any) -> int:
+    """After posting a DM card: did the event carry a card the client draws? Exit 1 prints the text to post."""
+    wait_id = _require(args.wait_id, WAIT_ID_RE, "wait id")
+    event_id = _require(args.event_id, TOKEN_RE, "--event-id")
+    try:
+        raw = sys.stdin.read() if args.content_file == "-" else Path(args.content_file).read_text()
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise Setup("invalid_arguments", f"--content-file is not readable JSON: {exc}") from None
+    try:
+        marker = read_marker(ws, wait_id)
+    except ValueError as exc:
+        raise Setup("invalid_arguments", str(exc)) from None
+    if marker is None:
+        # Claimed or gone: the request is answered (or told why not), so a fallback would only confuse.
+        emit({"wait_id": wait_id, "verdict": "wait_closed", "fallback": None})
+        return EXIT_OK
+    if marker.get("private"):
+        raise Setup("invalid_arguments", f"{wait_id} is a private card: there is no DM card to check.")
+    verdict = readback_verdict(_readback_entry(data, event_id), marker["owner"])
+    fallback = None if verdict == "ok" else fallback_message(marker, marker["task"], bool(marker.get("switch")))
+    emit({"wait_id": wait_id, "event_id": event_id, "verdict": verdict, "fallback": fallback})
+    return EXIT_OK if verdict == "ok" else EXIT_NO
 
 
 def cmd_claim(
@@ -1344,7 +1545,8 @@ def cmd_claim(
         ready = [m for m in pending if conns is None or wait_ready(m, conns)]
         current = (lambda: None) if args.force else functools.lru_cache(maxsize=None)(cloud.user_id)
         # Every verdict before any claim, so a cloud error leaves every wait armed.
-        verdicts = {m["wait_id"]: account_mismatch(ws, m.get("cloud_user_id"), current) for m in ready}
+        stamp = read_station_stamp(ws)
+        verdicts = {m["wait_id"]: account_mismatch(stamp, m.get("cloud_user_id"), current) for m in ready}
         for marker in pending:
             if marker["wait_id"] not in verdicts:
                 waiting.append(marker)
@@ -1363,12 +1565,13 @@ def cmd_claim(
     return EXIT_OK if claimed else EXIT_NO
 
 
-def account_mismatch(ws: Path, want: Any, current: Callable[[], str | None]) -> str | None:
+def account_mismatch(stamp: dict | None, want: Any, current: Callable[[], str | None]) -> str | None:
     """None when the wait's account is known, signed in, and the one the running core's station was
-    started for (when the desktop stamped one); else account_unknown or account_changed."""
+    started for (`stamp`, from read_station_stamp, when the desktop wrote one); else account_unknown
+    or account_changed."""
     if not want:
         return "account_unknown"
-    stamped = (read_station_stamp(ws) or {}).get("cloud_user_id")
+    stamped = (stamp or {}).get("cloud_user_id")
     if stamped and stamped != want:
         return "account_changed"
     found = current()
@@ -1382,7 +1585,7 @@ def cmd_verify_account(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: An
     wait_id = _require(args.wait_id, WAIT_ID_RE, "wait id")
     record = _read_json(claimed_path(ws, wait_id))
     if _valid_marker(record, wait_id):
-        reason = account_mismatch(ws, record.get("cloud_user_id"), cloud.user_id)
+        reason = account_mismatch(read_station_stamp(ws), record.get("cloud_user_id"), cloud.user_id)
     else:
         reason = "no_such_wait"
     emit({"wait_id": wait_id, "ok": reason is None, "reason": reason})
@@ -1458,6 +1661,9 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status")
     s.add_argument("slugs", nargs="*")
     s.add_argument("--room", help="only this room's waits")
+    d = sub.add_parser("set-default", help="make one of an app's accounts the one the agent uses")
+    d.add_argument("slug", help="the app, e.g. gmail")
+    d.add_argument("account", help="the account: its label (me@work.com), part of it (work), or its id")
     a = sub.add_parser("await")
     a.add_argument("slugs", nargs="+")
     a.add_argument("--room", required=True)
@@ -1488,6 +1694,11 @@ def parser() -> argparse.ArgumentParser:
     k.add_argument("--line", action="append",
                    help="the intro (first line) and, for --private, the further card lines (repeatable)")
     k.add_argument("--switch", action="store_true", help="a Switch account card instead of a Connect card")
+    cc = sub.add_parser("card-check", help="after posting a DM card: verify the posted event carries it")
+    cc.add_argument("wait_id")
+    cc.add_argument("--event-id", required=True, help="the event id room.message.send returned")
+    cc.add_argument("--content-file", required=True,
+                    help="the room.context.read output (whole, its result, or one entry); - reads stdin")
     n = sub.add_parser("note")
     n.add_argument("wait_id")
     n.add_argument("text", nargs="+")
@@ -1504,7 +1715,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "card": cmd_card, "claim": cmd_claim,
-            "verify-account": cmd_verify_account, "note": cmd_note}
+            "verify-account": cmd_verify_account, "note": cmd_note, "set-default": cmd_set_default}
 
 
 def main(
@@ -1520,6 +1731,8 @@ def main(
             return cmd_rearm(ws, spawn)
         if args.cmd == "note":
             return cmd_note(ws, None, args)
+        if args.cmd == "card-check":
+            return cmd_card_check(ws, None, args)
         cloud = cloud or Cloud(ws)
         # The cache exists only for the read commands; the waiter, claim and verify-account never see it.
         cloud.cache = ConnectCache(ws) if args.cmd in CACHED_COMMANDS else None

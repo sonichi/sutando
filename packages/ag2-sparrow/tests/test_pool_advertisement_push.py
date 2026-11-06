@@ -21,6 +21,12 @@ import tempfile
 import time
 import urllib.error
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 MXID = "@sutando-test:ag2.space"
 W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 
@@ -38,6 +44,8 @@ def _load(base):
     m = importlib.reload(mod)
     # hermetic: the channel .env fallback must not leak this host's identity
     m._config_from_channel_env = lambda *a, **k: ""
+    # health rides on the same POST; tests/gateway-health-push.test.py pins it
+    m._health_snapshot = lambda: None
     return m
 
 
@@ -91,6 +99,26 @@ def test_boot_pushes_workers_and_a_card_carrying_them():
         assert calls[1][2]["workers"] == _record()["profile_workers"]
         assert calls[1][2]["display"]["name"] == "Sutando", "card keeps identity"
         print("PASS test_boot_pushes_workers_and_a_card_carrying_them")
+
+
+def test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known():
+    """Only the report carries per-worker state; the legacy snapshot shows a
+    retired worker to the broker as just another labelled id."""
+    W2 = "b" * 32
+    rec = _record()
+    rec["report"] = {"ts": 1, "roster_version": 3,
+                     "workers": [{"id": W1, "state": "live"},
+                                 {"id": W2, "state": "retired"}],
+                     "applied": {"labels": {W1: "reviewer"}, "bindings": {}}}
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        _advertise(m, rec)
+        calls = _capture(m)
+        assert m._maybe_push_workers_snapshot(m._advertisement_or_none()) is True
+        assert calls[0][1] == "/v1/workers"
+        assert calls[0][2] == rec["report"], calls[0][2]
+        print("PASS test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known")
 
 
 def test_a_missing_file_pushes_nothing_at_all():
@@ -457,8 +485,13 @@ def test_the_production_loop_calls_both_relays():
     assert calls.count("_push_pool_advertisement") >= beats, calls
     # Each retry's FIRST call precedes the first push, so two optional 15 s
     # requests cannot delay an owner-approved publication.
-    watched = ("_push_pool_advertisement", "_retry_pending_publications",
-               "_retry_review_card_resolutions", "_retry_review_control_results")
+    watched = ("_push_pool_advertisement", "_retry_withheld_reviews")
+    beat = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_retry_withheld_reviews")
+    retries = [n.func.id for n in ast.walk(beat)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert retries == ["_retry_pending_publications", "_retry_review_card_resolutions",
+                       "_retry_review_control_results"], retries
     lines = {}
     for n in ast.walk(main_fn):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in watched:
@@ -515,25 +548,55 @@ def test_the_identity_is_one_path_segment():
 def test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals():
     """Production 2026-09-12: the broker redeployed at 07:43Z after the last
     snapshot push at 22:58Z and the picker stayed empty, because nothing here
-    changed. Both halves must go again on the cadence, unchanged or not."""
+    changed. Both halves must go again on the cadence, unchanged or not. A body
+    carrying health also refreshes every WORKERS_REFRESH_S for the broker's staleness."""
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
         os.environ["AGENT_CONNECT_STATE_DIR"] = str(base / "state")
         (base / "state").mkdir(parents=True, exist_ok=True)
         m = _load(base)
-        _advertise(m, _record())
+        m._health_snapshot = lambda: {"suspended": None, "agents": [
+            {"id": W1, "role": "worker", "alive": True, "motion": "idle", "condition": "healthy"}]}
+        _advertise(m, {**_record(), "report": {"ts": 1, "workers": [{"id": W1, "state": "live"}]}})
         clock = [1000.0]
         m._now = lambda: clock[0]
         calls = _capture(m)
         m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], calls
         calls.clear()
-        clock[0] += 60
+        clock[0] += m.WORKERS_REFRESH_S - 1
         m._push_pool_advertisement_now()
         assert calls == [], "within the cadence and unchanged: nothing resent"
+        clock[0] += 1
+        m._push_pool_advertisement_now()
+        assert [c[0] for c in calls] == ["POST"], "the workers report refreshes for the broker's staleness window"
+        calls.clear()
         clock[0] += m._REPUSH_EVERY_S
         m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], "past the cadence: both halves resent unchanged"
+
+
+def test_without_health_the_workers_body_keeps_the_slow_cadence():
+    """Only a body carrying health has the broker's 120 s staleness; a standalone
+    sparrow (no health snapshot) re-sends its unchanged body on the 600 s cadence only."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        os.environ["AGENT_CONNECT_STATE_DIR"] = str(base / "state")
+        (base / "state").mkdir(parents=True, exist_ok=True)
+        m = _load(base)
+        m._health_snapshot = lambda: None
+        _advertise(m, _record())
+        clock = [1000.0]
+        m._now = lambda: clock[0]
+        calls = _capture(m)
+        m._push_pool_advertisement_now()
+        calls.clear()
+        clock[0] += m.WORKERS_REFRESH_S * 3
+        m._push_pool_advertisement_now()
+        assert calls == [], "no health: no 20 s refresh"
+        clock[0] += m._REPUSH_EVERY_S
+        m._push_pool_advertisement_now()
+        assert [c[0] for c in calls] == ["POST", "PUT"], calls
 
 
 def test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop():
@@ -547,10 +610,10 @@ def test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop():
         (base / "state").mkdir()
         fifo = base / "state" / "pool-advertisement.json"
         os.mkfifo(fifo)
-        env = {**os.environ, "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+        env = hermetic_env(**{"AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
                "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
                "AGENT_CONNECT_STATE_DIR": str(base / "state"), "AGENT_MXID": MXID,
-               "REMOTE_TASK_URL": "https://gw.example/relay", "REMOTE_TASK_TOKEN": "dummy-secret"}
+               "REMOTE_TASK_URL": "https://gw.example/relay", "REMOTE_TASK_TOKEN": "dummy-secret"})
         code = ("import sys; sys.path.insert(0, %r); "
                 "from ag2_sparrow import remote_gateway_bridge as m; "
                 "print(repr(m._read_pool_advertisement()))"
@@ -667,7 +730,8 @@ def test_a_failing_background_push_is_logged_not_silent():
             raise RuntimeError("relay exploded")
         m._advertisement_or_none = boom
         m._push_pool_advertisement(); m._PUSH_THREAD.join(5)
-        assert any("push failed" in ln and "relay exploded" in ln for ln in lines), lines
+        # The type only: an exception's text never reaches a log (diagnostics.describe).
+        assert any("push failed: RuntimeError" in ln and "relay exploded" not in ln for ln in lines), lines
         print("PASS test_a_failing_background_push_is_logged_not_silent")
 
 
@@ -734,14 +798,13 @@ def test_shutdown_holds_the_lock_until_no_publication_can_complete():
         (base / "state").mkdir()
         (base / "state" / "pool-advertisement.json").write_text(json.dumps(_record(1)))
         started, gate, done = (base / "started"), (base / "gate"), (base / "done")
-        env = {**os.environ,
-               "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+        env = hermetic_env(**{"AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
                "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
                "AGENT_CONNECT_STATE_DIR": str(base / "state"), "AGENT_MXID": MXID,
                "REMOTE_TASK_URL": "https://gw.example/relay",
                "REMOTE_TASK_TOKEN": "dummy-secret",
                "PROBE_STARTED": str(started), "PROBE_GATE": str(gate),
-               "PROBE_DONE": str(done)}
+               "PROBE_DONE": str(done)})
         code = _CHILD_GENERATION % str(pathlib.Path(__file__).resolve().parents[1])
         child = subprocess.Popen([sys.executable, "-c", code], env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -779,6 +842,7 @@ def test_shutdown_holds_the_lock_until_no_publication_can_complete():
 
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
+    test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known()
     test_a_missing_file_pushes_nothing_at_all()
     test_malformed_json_pushes_nothing_and_keeps_the_prior_snapshot()
     test_a_deleted_file_after_a_good_push_changes_nothing()
@@ -802,6 +866,7 @@ if __name__ == "__main__":
     test_one_beat_publishes_one_revision_even_if_the_file_changes_mid_beat()
     test_the_identity_is_one_path_segment()
     test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals()
+    test_without_health_the_workers_body_keeps_the_slow_cadence()
     test_the_hand_off_returns_before_its_requests_complete()
     test_an_in_flight_push_is_skipped_not_queued()
     test_a_failing_background_push_is_logged_not_silent()

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Hermetic test for the dangerous-mode seed in start-cli.sh (#2098).
+"""Hermetic test for the dangerous-mode seed in session-launch.sh (#2098).
 
-On a working-dir launch, start-cli.sh seeds `skipDangerousModePermissionPrompt`
+On a working-dir launch, session-launch.sh seeds `skipDangerousModePermissionPrompt`
 into `<ccd>/settings.json` ONLY when `SUTANDO_ACCEPT_BYPASS_PERMISSIONS` is set —
 the dedicated opt-in the bundled desktop's launch-sutando.sh exports for the
 detached, no-TTY core. `--dangerously-skip-permissions` does NOT bypass Claude
 Code's "Bypass Permissions mode / Yes, I accept" acknowledgement, so a headless
 core hangs on it forever unless the flag is pre-seeded (owner-hit 2026-07-14).
 
-This extracts the ACTUAL embedded seed program from start-cli.sh (source-tied —
+This extracts the ACTUAL embedded seed program from session-launch.sh (source-tied —
 fails if the block is renamed/removed) and drives it with controlled env,
 asserting the four behaviors the review asked for:
   - env set   ⇒ settings.json gains exactly `skipDangerousModePermissionPrompt: true`
@@ -30,14 +30,14 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
 
 
 def _seed_program() -> str:
     """Extract the embedded `python3 - <<'PY' … PY` seed program verbatim."""
     txt = SCRIPT.read_text()
     m = re.search(r"<<'PY'.*?\n(.*?)\nPY\b", txt, re.S)
-    assert m, "seed PY heredoc not found in start-cli.sh — did the seed block move?"
+    assert m, "seed PY heredoc not found in session-launch.sh — did the seed block move?"
     prog = m.group(1)
     assert "skipDangerousModePermissionPrompt" in prog, \
         "extracted seed program no longer references skipDangerousModePermissionPrompt"
