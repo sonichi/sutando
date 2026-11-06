@@ -12,7 +12,6 @@ Run: python3 tests/restart-gateway-lanes-says-what-happened.test.py
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -20,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
 
 isolate_os_environ()
 
@@ -71,9 +70,7 @@ def scratch() -> Path:
 def run(root: Path, launch_rc: str = "0", token: bool = True):
     home, log = root.parent / "home", root.parent / "stub.log"
     home.mkdir()
-    env = {**os.environ, "HOME": str(home), "STUB_LOG": str(log), "STUB_LAUNCH_RC": launch_rc}
-    for key in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
-        env.pop(key, None)
+    env = hermetic_env(home, STUB_LOG=str(log), STUB_LAUNCH_RC=launch_rc)
     store = Path(subprocess.run(["bash", str(root / "scripts/sutando-config.sh"), "claude-sutando-config-dir"],
                                 env=env, capture_output=True, text=True).stdout.strip())
     if token:
