@@ -55,9 +55,9 @@ class SspaceMigrationProbe(unittest.TestCase):
         out = hc.check_sspace_migration(self.ws)
         self.assertEqual(out["name"], "sspace-migration")
         self.assertEqual(out["status"], "warn")
-        self.assertIn("sign this agent in to s.space from the Sutando desktop app", out["detail"])
+        self.assertIn("python3 scripts/connections.py add '<code>'", out["detail"])
         self.assertLess(out["detail"].index("connections.py move --repo . --logs-dir"),
-                        out["detail"].index("desktop app"), "the existing secret is tried first")
+                        out["detail"].index("connections.py add"), "the existing secret is tried first")
         self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", out["detail"])
         self.assertEqual(connections.record_path(self.ws).read_bytes(), before, "the probe never writes")
 
@@ -75,7 +75,7 @@ class SspaceMigrationProbe(unittest.TestCase):
             if args.verb == "promote":
                 self.assertEqual(args.instance, connections.instance_for("s.space"))
                 self.assertIsInstance(args.logs_dir, Path)
-        self.assertEqual(verbs, ["move", "promote"])
+        self.assertEqual(verbs, ["move", "add", "promote"])
 
     def test_warns_for_provisional_gateway_host_row(self):
         self.write([_row("chat.ag2.space", "ag2-space", primary=True)])
@@ -98,7 +98,7 @@ class SspaceMigrationProbe(unittest.TestCase):
     def test_doc_section_names_the_same_commands(self):
         doc = (REPO / "docs" / "connections.md").read_text()
         section = doc.split("### Moving a terminal-run core to s.space", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Sign this agent in to s.space from the Sutando desktop app", section)
+        self.assertIn("python3 scripts/connections.py add '<code>'", section)
         self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", section)
 
 

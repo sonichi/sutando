@@ -9,8 +9,7 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 **Words used here.** A *relay token* is the agent's credential `<relay_url>|<bearer>` (older text calls
 it the `url|secret` connect string: the same bytes). `add` and `update_token` take only a relay token, since
 the gateway URL inside it is what they preview; give the CLI `-` and paste it on stdin, which keeps it out
-of shell history and the process list. This install's agent gets its relay token when it is signed in to s.space from the Sutando desktop app,
-which hands the token to the local agent API. Add agent in the app creates another agent, and that agent's
+of shell history and the process list. Add agent in the app creates another agent, and that agent's
 token is not this one's (`update_token` refuses it: `token_agent_mismatch`).
 
 ## The model
@@ -326,12 +325,12 @@ to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instan
 A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new token
 since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
-s.space). Then fall back to the desktop app:
+s.space). Then fall back to a code:
 
-1. Sign this agent in to s.space from the Sutando desktop app while the local agent API runs
-   (`bash src/startup.sh` starts it). The app hands the agent's relay token to that API, which saves the
-   `s-space` row as a secondary and starts its bridge.
-2. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
+1. Get a connect code for this agent at s.space's agent portal.
+2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
+   server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
+3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
    — starts the s.space bridge as primary, waits for it to connect, then stops and parks the
    ag2.space bridge (the legacy one included). A failure rolls back and changes nothing.
 
