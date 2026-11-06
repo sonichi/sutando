@@ -182,15 +182,17 @@ def publish(staged, path):
     """Put a staged body at `path` unless a result already sits there; the stage goes either way.
     No replace: a result another writer published, or a drain is reading, is never overwritten."""
     try:
-        os.link(staged, path)
+        from .result_publish import publish_staged
+        publish_staged(staged, path, no_replace=True)
     except FileExistsError:
         log("a result is already at", os.path.basename(path), "- the staged copy is discarded")
-    os.unlink(staged)
+    Path(staged).unlink(missing_ok=True)
 
 
 def result_exists(results, task_id):
     """Any generation of the task's result: live, archived, or mid-disposal."""
-    return (local_task_protocol.find_result(Path(results), task_id) is not None
+    from .result_ready import read_ready_result
+    return (any(read_ready_result(p) is not None for p in local_task_protocol.iter_result_candidates(Path(results), task_id))
             or bool(result_disposal.find_claims(Path(results), task_id)))
 
 
@@ -212,7 +214,7 @@ class RelayLoop:
         """Open task files, highest priority first and oldest first within a priority."""
         names = [n for n in os.listdir(self.args.inbox)
                  if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
-                 and not os.path.exists(os.path.join(self.args.results, n))]
+                 and not result_exists(self.args.results, n[:-4])]
         # A file can vanish between listdir and here (a cancel, a cleanup): drop it rather
         # than spend a turn on a task that is no longer there to serve.
         paths = [Path(self.args.inbox, n) for n in names if os.path.exists(os.path.join(self.args.inbox, n))]

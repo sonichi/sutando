@@ -19,6 +19,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+from result_publish import publish_text
 from delivery import readiness  # noqa: E402
 from delivery.readiness import is_ready_body, read_ready_result, ready_body_of  # noqa: E402
 
@@ -34,9 +35,10 @@ CONSUMERS = {
 
 class ContractTest(unittest.TestCase):
     def _write(self, td: str, text: str | None) -> Path:
-        p = Path(td) / "task-abc.txt"
+        p = Path(td) / "results" / "task-abc.txt"
+        p.parent.mkdir(exist_ok=True)
         if text is not None:
-            p.write_text(text)
+            publish_text(p, text)
         return p
 
     # Readiness owns "is there a body"; the caller owns "is it THIS task's".
@@ -58,7 +60,7 @@ class ContractTest(unittest.TestCase):
             read_ready_result(p, attests=lambda raw: seen.append(raw) or True)
         self.assertEqual(seen, ["body\n"])
 
-    def test_no_predicate_keeps_the_previous_behaviour(self):
+    def test_default_predicate_accepts_paired_publication(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(read_ready_result(self._write(td, "hi\n")), "hi")
 
@@ -124,7 +126,7 @@ class ContractTest(unittest.TestCase):
             p = self._write(td, "")
             self.assertIsNone(read_ready_result(p))
             self.assertTrue(p.exists(), "an unready result file was consumed")
-            p.write_text("the answer")
+            publish_text(p, "the answer")
             self.assertEqual(read_ready_result(p), "the answer")
 
     def test_body_still_being_written_is_not_ready(self):
@@ -140,7 +142,7 @@ class ContractTest(unittest.TestCase):
                 self.assertIsNone(read_ready_result(p))
                 t.join()
             self.assertEqual(p.stat().st_size, 2782)
-            self.assertEqual(len(read_ready_result(p)), 2782)
+            self.assertIsNone(read_ready_result(p), "a settled raw write has no receipt")
 
     def test_body_that_grows_during_the_read_is_not_ready(self):
         with tempfile.TemporaryDirectory() as td:
@@ -253,7 +255,7 @@ class DelegationTest(unittest.TestCase):
                 for fn in _functions_reading_result_bytes(path.read_text()):
                     self.assertEqual(_private_readiness(fn), [],
                                      f"{name}.{fn.name}: decides readiness privately")
-                    self.assertIn("ready_body_of", _called(fn), f"{name}.{fn.name}")
+                    self.assertIn("read_ready_result_with_identity", _called(fn), f"{name}.{fn.name}")
 
     def test_the_byte_pin_rejects_a_private_decode(self):
         src = ("def sweep(rfile):\n    data, gen = identity_of(rfile)\n"

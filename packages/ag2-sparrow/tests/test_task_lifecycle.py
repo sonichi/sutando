@@ -5,6 +5,7 @@ package sits in its repository. Run:
     python3 packages/ag2-sparrow/tests/test_task_lifecycle.py
 """
 import ast
+import hashlib
 import atexit
 import select
 import signal
@@ -66,6 +67,9 @@ def src_copy():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+from ag2_sparrow.result_publish import publish_text
 
 
 class Clock:
@@ -414,7 +418,7 @@ class FreshDirTest(Base):
         self.task()
         rc, err = self.main()
         self.assertEqual(rc, 0, err)
-        self.assertEqual(sorted(os.listdir(self.work / "state")), ["claims", "format", "rate.jsonl", "settled-ids"])
+        self.assertEqual(sorted(os.listdir(self.work / "state")), ["claims", "format", "rate.jsonl", "result-pairing", "settled-ids"])
         self.assertIn("task-a", (self.work / "state" / "settled-ids").read_text())
         self.assertEqual(self.main()[0], 0, "this binary's own state restarts")
 
@@ -854,7 +858,7 @@ class ClassifyTest(Base):
     def put(self, rel, text="body\n"):
         p = self.results / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        publish_text(p, text)
 
     def claim_name(self, tid="task-a"):
         return ".%s.disposing-%d-1-1-1-1-%s-abcd1234" % (tid, os.getpid(), "0" * 64)
@@ -880,8 +884,9 @@ class ClassifyTest(Base):
     def test_archived_in_every_layout(self):
         for rel in ("archive/task-a.txt", "archive/2026-10/task-a.txt", "archive-2026-10-01/task-a.txt"):
             with self.subTest(rel=rel), tempfile.TemporaryDirectory() as d:
+                d = str(Path(d) / "results")
                 (Path(d) / rel).parent.mkdir(parents=True)
-                (Path(d) / rel).write_text("x\n")
+                publish_text(Path(d) / rel, "x\n")
                 self.assertEqual(self.lc.classify(d, "task-a"), "ARCHIVED")
 
     def test_quarantined_is_hash_free(self):
@@ -899,10 +904,11 @@ class ClassifyTest(Base):
         ]
         for files, want in pairs:
             with self.subTest(files=sorted(files)), tempfile.TemporaryDirectory() as d:
+                d = str(Path(d) / "results")
                 for rel, text in files.items():
                     rel = self.claim_name() if rel == "CLAIM" else rel
                     (Path(d) / rel).parent.mkdir(parents=True, exist_ok=True)
-                    (Path(d) / rel).write_text(text)
+                    publish_text(Path(d) / rel, text)
                 self.assertEqual(self.lc.classify(d, "task-a"), want)
 
     def test_any_lookup_error_is_unknown_and_beats_everything(self):
@@ -953,6 +959,8 @@ class PublicationTest(Base):
             life.publish_and_settle("task-a")
         publish = events[:events.index("final task-a.txt") + 2]
         self.assertEqual(publish, ["fsync <temp>", "replace .task-a.txt.publish.1", "dir results",
+                                   "fsync <temp>", "replace task-a.ok", "dir " + hashlib.sha256(b"[no-send]\n").hexdigest(),
+                                   "fsync <temp>", "replace task-a.ok", "dir result-pairing",
                                    "final task-a.txt", "dir results"],
                          "temp fsynced, sibling, dir, no-replace final, dir")
         rest = events[len(publish):]
@@ -978,7 +986,9 @@ class PublicationTest(Base):
         prepared_and_reserved = ["dir claims"] + claim + ["fsync rate.jsonl", "dir state", "fsync rate.jsonl"]
         stage = ["fsync <temp>", "replace body", "dir task-a"]
         confirmed_and_queued = claim + ["fsync rate.jsonl"]
-        publication = ["fsync <temp>", "replace .task-a.txt.publish.1", "dir results", "final task-a.txt",
+        publication = ["fsync <temp>", "replace .task-a.txt.publish.1", "dir results",
+                       "fsync <temp>", "replace task-a.ok", "dir " + hashlib.sha256(b"[no-send]\n").hexdigest(),
+                       "fsync <temp>", "replace task-a.ok", "dir result-pairing", "final task-a.txt",
                        "dir results"]
         ledger_created = ["fsync settled-ids", "dir state"]
         self.assertEqual(events, prepared_and_reserved + claim + stage + confirmed_and_queued + claim
@@ -1045,7 +1055,7 @@ class PublicationTest(Base):
     def test_an_existing_live_result_is_never_replaced(self):
         life = self.life()
         self.run_to_outcome(life)
-        (self.results / "task-a.txt").write_text("theirs\n")
+        publish_text((self.results / "task-a.txt"), "theirs\n")
         self.assertEqual(life.publish_and_settle("task-a"), "settled")
         self.assertEqual((self.results / "task-a.txt").read_text(), "theirs\n")
         self.assertFalse(life.claims.load("task-a")["published"]["won"])
@@ -1066,10 +1076,10 @@ class PublicationTest(Base):
         self.assertTrue((self.results / ".task-a.txt.publish.1").exists(), "the sibling waits")
         os.unlink(self.results / "task-a.txt")
         with mock.patch.object(self.lc.undelivered_quarantine, "move_private", someone_first("theirs\n")):
-            self.assertEqual(life.publish_and_settle("task-a"), "settled")
+            self.assertEqual(life.publish_and_settle("task-a"), "parked")
         self.assertEqual((self.results / "task-a.txt").read_text(), "theirs\n")
-        self.assertFalse((self.results / ".task-a.txt.publish.1").exists())
-        self.assertFalse(life.claims.load("task-a")["published"]["won"])
+        self.assertTrue((self.results / ".task-a.txt.publish.1").exists())
+        self.assertEqual(life.claims.load("task-a")["phase"], self.lc.RESULT_STAGED)
 
     def crash_at(self, target, attr):
         life = self.life()
@@ -1800,7 +1810,7 @@ class DecisionTest(Base):
         def nd(life, n, p):
             life.begin_call("task-a", n, p)
             life.not_delivered("task-a", n, "exit 1")
-            (self.results / "task-a.txt").write_text("someone answered\n")
+            publish_text((self.results / "task-a.txt"), "someone answered\n")
         again = self.restart_with(nd)
         self.assertEqual(again.claims.load("task-a")["phase"], "SETTLED")
         self.assertEqual(again.journal.charges(), {})
@@ -1861,7 +1871,7 @@ class DecisionTest(Base):
         def calling_answered(life, n, p):
             life.begin_call("task-a", n, p)
             (self.results / "archive").mkdir()
-            (self.results / "archive" / "task-a.txt").write_text("done\n")
+            publish_text((self.results / "archive" / "task-a.txt"), "done\n")
         again = self.restart_with(calling_answered)
         self.assertFalse((self.results / "task-a.txt").exists())
         self.assertEqual(again.claims.load("task-a")["phase"], "SETTLED")
@@ -2088,7 +2098,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                 self.assertEqual(ra.main(argv, {"CLAUDE_ROUTINE_TOKEN": "t"}, opener), 0)
         self.assertEqual(self.by_module(seen, os.path.join("claude_routine", "routine_adapter.py")) - LOCK_FILES,
                          {"state", "results", "tasks"})
-        self.assertEqual(self.by_module(seen, "relay_loop.py"),
+        self.assertEqual({p for p in self.by_module(seen, "relay_loop.py") if not p.startswith("state/result-pairing")},
                          {"results", "state", "results/<task>.txt", "results/.<task>.txt.staged",
                           "results/..<task>.txt.staged.<tmp>", "state/done", "state/.done.<tmp>",
                           "state/fires.json", "state/.fires.json.<tmp>"})
@@ -2428,7 +2438,7 @@ class LocalClaimTest(Base):
             self.claimed(life, tid)
         (self.work / "tasks" / "task-gone.txt").unlink()
         self.results.mkdir(exist_ok=True)
-        (self.results / "task-done.txt").write_text("already\n")
+        publish_text((self.results / "task-done.txt"), "already\n")
         for tid, phase in (("task-call", "CALLING"), ("task-lost", "OUTCOME_UNKNOWN"), ("task-new", "SOMETHING_NEW")):
             life.claims.save(dict(life.claims.load(tid), phase=phase))
         lost = {"identity": "i", "length": 1, "sha256": "0" * 64, "blob": "blob.1.absent"}

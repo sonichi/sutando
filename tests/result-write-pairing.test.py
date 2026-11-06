@@ -322,12 +322,12 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
             def synced(src, dst):
                 # Hold both writers until each has created its temp file, so
                 # the collision is deterministic rather than timing-dependent.
-                barrier.wait(timeout=10)
                 return real(src, dst)
 
             out, errs = [], []
 
             def go(tag):
+                barrier.wait(timeout=10)
                 try:
                     out.append(result_write.write_paired_result(
                         results, "race", "task: race\nbody\n", tmp_tag=tag))
@@ -364,12 +364,12 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
             real = result_write.publish_text
             errors = []
 
-            def paused(path, body):
+            def paused(path, body, **kwargs):
                 if Path(path).parent == results and body == "A\n":
                     first_paused.set()
                     if not release.wait(5):
                         raise RuntimeError("test release timed out")
-                return real(path, body)
+                return real(path, body, **kwargs)
 
             def go(body, done=None):
                 try:

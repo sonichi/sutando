@@ -110,7 +110,13 @@ def read_ready_result_with_identity(path: str | Path, attests=None) -> "ReadyRes
                 return None  # young and still growing
     except OSError:
         return None                     # missing or unreadable: readable again on a later pass
-    if attests is not None and not attests(data.decode("utf-8", errors="replace")):
+    if attests is None:
+        try:
+            from .result_write import path_verifier
+        except ImportError:
+            from result_write import path_verifier
+        attests = path_verifier(p)
+    if not attests(data.decode("utf-8", errors="replace")):
         return None
     body = ready_body_of(data)
     return ReadyResult(body, identity) if body is not None else None

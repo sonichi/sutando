@@ -351,8 +351,8 @@ from .delivery_core import is_refused_for_good
 from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
-from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
-                           ready_body_of, ResultIdentity)
+from .result_ready import (read_ready_result, read_ready_result_with_identity,
+                           ResultIdentity)
 from . import result_disposal as disposal
 from .result_publish import (is_staged_for as _is_staged_for, publish_staged as _publish_staged_whole,
                              stage_text as _stage_text)
@@ -8317,7 +8317,10 @@ def _post_proactive() -> None:
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
         try:
-            route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
+            peek = read_ready_result(f)
+            if peek is None:
+                continue
+            route, peek_room, _ = _proactive_route(peek)
         except OSError:
             continue  # racing consumer already claimed it
         if route == "foreign":
@@ -10180,6 +10183,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # and waits while that cannot be told; it is never relabelled or quarantined here.
         if _relay_orphan(tid, inflight) is not False:
             continue
+        ready = read_ready_result_with_identity(rfile)
+        if ready is None:
+            continue
         task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is not None:
             try:
@@ -10193,15 +10199,11 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 continue
             if headers.get("source") == task_attempts.CONTROL_SOURCE:
                 try:
-                    _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, tid, identity_of(rfile)[1])
+                    _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, tid, ready.identity)
                 except OSError:
                     pass
                 continue
-        # One open decides every arm below, and only that generation is retired.
-        try:
-            data, generation = identity_of(rfile)
-        except OSError:
-            continue
+        generation = ready.identity
         age = now - generation.mtime_ns / 1e9
         if age < ORPHAN_GRACE_S:
             continue                            # young: normal path may claim it
@@ -10218,7 +10220,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
             _delivery = _delivery_tid(tid)
-            raw = ready_body_of(data)
+            raw = ready.body
             if _delivery is None or raw is None:
                 continue                        # ledger unreadable or not ready: a later sweep decides
             _item = _broker_tid(_delivery)
@@ -10246,7 +10248,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        raw = ready_body_of(data)
+        raw = ready.body
         if raw is None:
             continue                            # blank or a partial write: readable on a later pass
         delivery = _delivery_tid(tid)

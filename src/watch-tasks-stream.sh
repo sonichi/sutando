@@ -697,7 +697,8 @@ handler_result_is_answer() {
   ready="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" find-ready "$RESULTS_DIR" "$filename" 2>/dev/null)" || return 1
   # The FIRST line, anchored: an answer that merely mentions the phrase is an
   # answer, and mistaking it for a refusal re-runs work that already completed.
-  IFS= read -r first < "$ready" || first=""
+  first="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/result_write.py" read "$ready" 2>/dev/null)" || return 1
+  first="${first%%$'\n'*}"
   case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
   return 0
 }

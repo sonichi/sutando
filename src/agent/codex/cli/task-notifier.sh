@@ -139,14 +139,6 @@ assert_result_paired() {
     echo "task-notifier: no result for $filename after ${COMPLETION_TIMEOUT}s; the task turn produced nothing" >&2
     return 1
   fi
-  task_id="$(task_id_of "$filename")"
-  # Attestation, not presence: an empty or stale receipt is exactly what a
-  # presence check cannot tell apart from a matching one.
-  if ! "$NOTIFIER_PY" "$REPO/src/result_write.py" attests "$task_id" \
-      --results-dir "$RESULTS_DIR" --receipts-dir "$RESULT_PAIRING_DIR" >/dev/null 2>&1; then
-    echo "task-notifier: the pairing receipt in $RESULT_PAIRING_DIR does not attest the bytes now in $filename; it was not written through src/result_write.py, or it was overwritten, so it may answer a different task" >&2
-    return 1
-  fi
   return 0
 }
 

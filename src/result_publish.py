@@ -69,10 +69,29 @@ def is_staged_for(name: str, target_name: str) -> bool:
             and all(c in "0123456789abcdef" for c in token))
 
 
-def publish_staged(tmp: str | Path, path: str | Path) -> Path:
+def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_replace=False) -> Path:
     """Rename a staged file onto `path` and fsync the directory, so the name survives a crash."""
     target = Path(path)
-    os.replace(tmp, target)
+    if not _paired and target.suffix == ".txt" and any(p.name == "results" for p in target.absolute().parents):
+        try:
+            from .result_write import result_context, receipt_path, locked_file, record_pairing
+        except ImportError:
+            from result_write import result_context, receipt_path, locked_file, record_pairing
+        context = result_context(target)
+        if context and target.suffix == ".txt":
+            receipts, task_id = context
+            receipt = receipt_path(receipts, task_id)
+            body = Path(tmp).read_bytes().decode("utf-8")
+            with locked_file(receipt.with_suffix(".lock")):
+                if no_replace and target.exists():
+                    raise FileExistsError(str(target))
+                record_pairing(receipts, task_id, body, current=target.parent.name == "results")
+                return publish_staged(tmp, target, _paired=True, no_replace=no_replace)
+    if no_replace:
+        os.link(tmp, target)
+        os.unlink(tmp)
+    else:
+        os.replace(tmp, target)
     if os.name != "nt":
         dfd = os.open(target.parent, os.O_RDONLY)
         try:
@@ -82,11 +101,11 @@ def publish_staged(tmp: str | Path, path: str | Path) -> Path:
     return target
 
 
-def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
+def publish_text(path: str | Path, text: str, mode: int = 0o666, *, _paired=False) -> Path:
     """Publish `text` at `path` whole: a reader sees the name absent or complete, never a prefix."""
     tmp = stage_text(path, text, mode)
     try:
-        return publish_staged(tmp, path)
+        return publish_staged(tmp, path, _paired=_paired)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

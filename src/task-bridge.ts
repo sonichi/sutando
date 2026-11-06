@@ -1,3 +1,4 @@
+import { readVerifiedResult, publishVerifiedResult } from './result-read.js';
 /**
  * Voice → Claude Code session bridge.
  *
@@ -388,7 +389,10 @@ export function voiceTaskOrigin(taskId: string): VoiceSessionOrigin | null {
 }
 
 /** Test seam for the result-file publisher: the two calls it makes, replaceable. */
-export const _resultFileOps = { write: writeFileSync, rename: renameSync };
+export const _resultFileOps = { write: writeFileSync, rename: (from: string, to: string) => {
+	publishVerifiedResult(to, readFileSync(from, 'utf8'));
+	unlinkSync(from);
+} };
 let _resultStageCounter = 0;
 
 /** Publish a result file whole: staged as a dotfile (no drain glob matches one), then renamed
@@ -507,10 +511,10 @@ function _activityPhase(taskId: string): string | null {
 
 /** A result for the task exists, live or archived (results/archive/YYYY-MM/, this month or last). */
 function _hasResult(taskId: string): boolean {
-	if (existsSync(join(RESULT_DIR, `${taskId}.txt`))) return true;
+	if (readVerifiedResult(join(RESULT_DIR, `${taskId}.txt`)) !== null) return true;
 	const now = new Date();
 	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-	return [now, last].some((d) => existsSync(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)));
+	return [now, last].some((d) => readVerifiedResult(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)) !== null);
 }
 
 /** The relay agent's task table: one row per voice task; survives a voice-agent restart. */
@@ -522,7 +526,7 @@ function _readResultText(taskId: string): string | null {
 	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
 	const paths = [join(RESULT_DIR, `${taskId}.txt`), ...[now, last].map((d) => join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`))];
 	for (const p of paths) {
-		try { if (existsSync(p)) return readFileSync(p, 'utf-8').trim(); } catch { /* next */ }
+		try { if (existsSync(p)) { const body = readVerifiedResult(p); if (body !== null) return body; } } catch { /* next */ }
 	}
 	return null;
 }
@@ -1761,7 +1765,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// The old expression here was /\[dm-only\]\s*/gi, which stripped
 				// every occurrence and made this consumer disagree with every
 				// text bridge after the Python side was narrowed.
-				const rawResult = readFileSync(path, 'utf-8');
+				const rawResult = readVerifiedResult(path);
+				if (rawResult === null) continue;
 				// Detected before the strip: an origin-bound result that carries the
 				// marker is kept to the owner's DM (keepVoiceResultToDm).
 				const dmOnly = DM_ONLY_RE.test(rawResult);

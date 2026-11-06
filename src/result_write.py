@@ -4,18 +4,22 @@
 The caller supplies both ids: this catches transposed ids, not prose that
 semantically answers another task. The receipt records bytes, not meaning.
 Publication uses result_publish under a per-task lock; readers must verify
-raw bytes before normalizing text. Missing-receipt rollout is not enforced
-by this module's compatibility predicate yet.
+raw bytes before normalizing text. Missing receipts are refused.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
-from file_lock import locked_file
-from result_publish import publish_text
+try:
+    from .file_lock import locked_file
+    from .result_publish import publish_text
+except ImportError:
+    from file_lock import locked_file
+    from result_publish import publish_text
 
 RECEIPTS_SUBPATH = ("state", "result-pairing")
 
@@ -77,6 +81,18 @@ def receipt_body(task_id: str, body: str) -> str:
                        "bytes": len(body.encode("utf-8"))}, sort_keys=True) + "\n"
 
 
+def history_receipts(receipts_dir, body):
+    return Path(receipts_dir) / "generations" / hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def record_pairing(receipts_dir, task_id, body, *, current=True):
+    """Record proof before publication; the caller holds the task receipt lock."""
+    proof = receipt_body(task_id, body)
+    publish_text(receipt_path(history_receipts(receipts_dir, body), task_id), proof, _paired=True)
+    if current:
+        publish_text(receipt_path(receipts_dir, task_id), proof, _paired=True)
+
+
 def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
     """True only when the receipt names THIS task and THESE bytes. Presence is
     not attestation: an empty or stale receipt answers False."""
@@ -93,19 +109,36 @@ def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
 
 
 def receipt_verifier(receipts_dir, task_id: str):
-    """Verify existing receipts. Missing receipts remain accepted for legacy
-    compatibility, including current producers that bypass this writer.
+    """Require a receipt naming this task and these exact bytes."""
+    return lambda raw_body: receipt_attests(receipts_dir, task_id, raw_body)
 
-    This is not a finite migration or universal integrity gate. Callers that
-    require pairing must use receipt_attests and handle unpaired backlog.
-    """
-    bare = str(task_id).removeprefix("task-")
 
-    def _attests(raw_body: str) -> bool:
-        if not has_pairing_receipt(receipts_dir, bare):
-            return True
-        return receipt_attests(receipts_dir, bare, raw_body)
-    return _attests
+def result_context(path):
+    """Resolve receipt storage and publication id for a result or delivery claim."""
+    p = Path(path).absolute()
+    root = next((parent for parent in p.parents if parent.name == "results"), None)
+    if root is None:
+        return None
+    name = p.name.split(".sending", 1)[0] if ".sending" in p.name else p.stem
+    return receipts_dir_for(root.parent), task_id_from(name)
+
+
+def path_verifier(path):
+    """Fail closed when the result path has no resolvable receipt namespace."""
+    context = result_context(path)
+    if context is None:
+        return lambda body: False
+    receipts, task_id = context
+    ids = [task_id]
+    if Path(path).parent.name != "results":
+        match = re.fullmatch(r"(.+)-[0-9]+", task_id)
+        if match:
+            ids.append(match.group(1))
+    archived = Path(path).parent.name != "results"
+    return lambda body: any(
+        receipt_verifier(receipts, key)(body)
+        or (archived and receipt_verifier(history_receipts(receipts, body), key)(body))
+        for key in ids)
 
 
 def has_pairing_receipt(receipts_dir, task_id: str) -> bool:
@@ -127,13 +160,13 @@ def write_paired_result(results_dir, task_id: str, body: str,
     rest = strip_pairing_echo(task_id, body)
     result = Path(results_dir) / f"task-{task_id}.txt"
     if receipts_dir is None:
-        return publish_text(result, rest)
+        receipts_dir = receipts_dir_for(Path(results_dir).parent)
     receipt = receipt_path(receipts_dir, task_id)
     # Keep both publications inside one per-task transaction. A failed receipt
     # publication prevents a result from becoming visible without its evidence.
     with locked_file(receipt.with_suffix(".lock")):
-        publish_text(receipt, receipt_body(task_id, rest))
-        return publish_text(result, rest)
+        record_pairing(receipts_dir, task_id, rest)
+        return publish_text(result, rest, _paired=True)
 
 
 def _resolve_dirs(args):
@@ -215,7 +248,21 @@ def _attests_cli(argv) -> int:
     return 0 if receipt_attests(receipts, task_id, body) else 1
 
 
+def _read_cli(path):
+    try:
+        from delivery.readiness import read_ready_result
+        body = read_ready_result(path)
+    except (OSError, ValueError):
+        return 1
+    if body is None:
+        return 1
+    sys.stdout.write(body)
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "read":
+        sys.exit(_read_cli(sys.argv[2]))
     if len(sys.argv) >= 2 and sys.argv[1] == "write":
         sys.exit(_write_cli(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "attests":

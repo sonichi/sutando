@@ -82,7 +82,7 @@ FORMAT_LOCAL = "claude-local/1"
 FORMATS = frozenset((FORMAT, FORMAT_LOCAL))
 # The two claude-local records and the two per-root locks live in state/ by name.
 LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock")
-STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json")
+STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json", "result-pairing")
                           + LOCAL_STATE_FILES)
 # Optional records the adapters rewrite in place: when present, each must be a plain file.
 STATE_OPTIONAL_FILES = frozenset(("collaborator-turns.json",) + LOCAL_STATE_FILES)
@@ -358,6 +358,8 @@ def prepare_work_dir(work, check_only=False):
                 return "refusing to start: state/%s in %s is not a plain %s" % (name, state, kind)
         for name in sorted(os.listdir(state)):
             if name in STATE_ALLOWED:
+                if name == "result-pairing" and not _is_type(os.path.join(state, name), "dir"):
+                    return "refusing to start: result-pairing is not a plain directory"
                 if name in STATE_OPTIONAL_FILES and not _is_type(os.path.join(state, name), "file"):
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
                 continue
@@ -448,7 +450,7 @@ def classify(results_dir, task_id):
         names = os.listdir(results)
         live = _read_strict(results / ("%s.txt" % task_id))
         if live is not None:
-            found.add(LIVE_READY if result_ready.ready_body_of(live) else LIVE_UNREADY)
+            found.add(LIVE_READY if result_ready.read_ready_result(results / ("%s.txt" % task_id)) else LIVE_UNREADY)
         for name in names:
             claim = result_disposal.parse_claim(results / name)
             if claim is not None and claim.stem == task_id:
@@ -464,7 +466,7 @@ def classify(results_dir, task_id):
             if candidate == results / ("%s.txt" % task_id):
                 continue
             data = _read_strict(candidate)
-            found.add(ARCHIVED if data is not None and result_ready.ready_body_of(data) else UNKNOWN)
+            found.add(ARCHIVED if data is not None and result_ready.read_ready_result(candidate) else UNKNOWN)
         _list_strict(undelivered_quarantine.quarantine_dir(results))
         if undelivered_quarantine.find_quarantined(results, task_id):
             found.add(QUARANTINED)
@@ -1213,6 +1215,15 @@ class Lifecycle:
         return "settled"
 
     def _publish(self, rec):
+        try:
+            from .result_write import receipts_dir_for, receipt_path, locked_file
+        except ImportError:
+            from result_write import receipts_dir_for, receipt_path, locked_file
+        receipt = receipt_path(receipts_dir_for(self.results.parent), rec["task_id"])
+        with locked_file(receipt.with_suffix(".lock")):
+            return self._publish_locked(rec)
+
+    def _publish_locked(self, rec):
         task_id, attempt = rec["task_id"], rec["attempt"]
         body = self._staged_body(rec)
         if body is None:
@@ -1239,6 +1250,11 @@ class Lifecycle:
             if os.path.lexists(tmp):
                 os.unlink(tmp)
         fsync_dir(self.results)
+        try:
+            from .result_write import record_pairing, receipts_dir_for, task_id_from
+        except ImportError:
+            from result_write import record_pairing, receipts_dir_for, task_id_from
+        record_pairing(receipts_dir_for(self.results.parent), task_id_from(task_id), body.decode("utf-8"))
         try:
             undelivered_quarantine.move_private(sibling, final)
         except FileExistsError as e:
