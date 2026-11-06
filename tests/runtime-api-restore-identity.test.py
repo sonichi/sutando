@@ -7,6 +7,11 @@ Run: python3 tests/runtime-api-restore-identity.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import sys
@@ -30,7 +35,7 @@ class LauncherDefaultRestoresDaemon(unittest.TestCase):
     def test_default_launcher_is_the_daemon_front_door(self):
         # the manifest's launcher must be able to bring THIS daemon back:
         # startup.sh never reaches server.py, so it is not a valid default
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in isolated_child_env().items()
                if k not in ("SUTANDO_LAUNCHER_EXECUTABLE",
                             "SUTANDO_LAUNCHER_ARGS")}
         with mock.patch.dict(os.environ, env, clear=True):

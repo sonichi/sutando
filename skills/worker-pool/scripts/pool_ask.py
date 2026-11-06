@@ -88,7 +88,11 @@ def who(workspace, *, runner=None) -> list:
 def resolve(workspace, name: str) -> str:
     """A label, an id or `core` to the recipient id; unknown names are refused,
     never guessed."""
-    roster = pr.load_roster(workspace)
+    return resolve_in(pr.load_roster(workspace), name)
+
+
+def resolve_in(roster, name: str) -> str:
+    """`resolve` against a roster snapshot the caller already read."""
     if roster is None:
         raise ValueError("no roster: this host has no pool to ask")
     try:
@@ -101,7 +105,8 @@ def resolve(workspace, name: str) -> str:
 
 
 def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
-            tier: str = "team", relayed_from: "str | None" = None) -> str:
+            tier: str = "team", relayed_from: "str | None" = None,
+            parent_task: "str | None" = None, parent_generation: "int | None" = None) -> str:
     """The task file. `task:` is the LAST header: everything below it is body."""
     if tier not in TIERS:
         raise ValueError(f"tier must be one of {TIERS}: {tier!r}")
@@ -123,6 +128,10 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
         lines.append("collaborator: true")
     if to != pr.CORE:
         lines.append(f"requested_worker: {to}")
+    if parent_task:
+        lines.append(f"parent_task: {header_safe_value(parent_task)}")
+        if parent_generation is not None:
+            lines.append(f"parent_generation: {int(parent_generation)}")
     origin = f"[pool-ask from {sender}" + (f", relaying {origin_of}" if origin_of else "") + "]"
     body = confine_user_content(question.strip())
     lines.append(f"task: {origin} {body}\n\n{reply}")
@@ -130,9 +139,11 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
 
 
 def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
-        sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None) -> dict:
+        sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None,
+        parent_task: "str | None" = None, parent_generation: "int | None" = None) -> dict:
     ws = Path(workspace)
-    rid = resolve(ws, to)
+    roster = pr.load_roster(ws)     # one snapshot: the recipient is resolved and routed against it
+    rid = resolve_in(roster, to)
     sender = whoami()
     if rid == sender:
         raise ValueError("that is you")
@@ -140,15 +151,22 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     tasks = ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
-    tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0,
-                           tier=tier, relayed_from=relayed_from), encoding="utf-8")
+    tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0, tier=tier,
+                           relayed_from=relayed_from, parent_task=parent_task,
+                           parent_generation=parent_generation), encoding="utf-8")
     os.replace(tmp, tasks / f"{task_id}.txt")
     out = {"task_id": task_id, "to": rid, "from": sender, "task_file": str(tasks / f"{task_id}.txt")}
+    if parent_task:
+        import handoffs
+        row = (roster.get("workers") or {}).get(rid) if isinstance(roster, dict) else None
+        label = handoffs.label_for("pool", to, verified=(row or {}).get("label"))
+        out["handoff_id"] = handoffs.open_handoff(ws, parent_task, "pool", task_id, label,
+                                                  holds=True, parent_generation=parent_generation)
     if rid != pr.CORE:
         # Routed here as well as by the watcher's own pass: the router is idempotent,
         # so whichever runs second reports `already` and delivers nothing twice.
         task = {"id": task_id, "source": SOURCE, "requested_worker": rid}
-        out["route"] = rt.route(ws, task)
+        out["route"] = rt.route(ws, task, roster)
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out
@@ -179,8 +197,15 @@ def main(argv=None) -> int:
     p.add_argument("--relayed-from", help="who the question really comes from, when it is not you")
     p.add_argument("--tier", choices=TIERS, default="team",
                    help="the tier of relayed content (never owner); default team")
+    p.add_argument("--parent-task", help="the task this ask is part of (its `id:` header): the parent "
+                   "shows as delegated until this ask's result exists")
+    p.add_argument("--parent-generation", type=int, help="the parent task's execution generation, when known")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
+    if a.parent_task:
+        import correlation_log
+        if not correlation_log.is_task_id(a.parent_task):
+            p.error(f"--parent-task {a.parent_task!r} is not a task id")
     if a.who == bool(a.to or a.ask):
         p.error("pass --who, or --to with --ask")
     if bool(a.to) != bool(a.ask):
@@ -201,7 +226,8 @@ def main(argv=None) -> int:
             return 0
         if a.tier != "team" and a.relayed_from is None:
             p.error("--tier below team needs --relayed-from: whose content is it?")
-        out = ask(a.workspace, a.to, a.ask, wait_s=a.wait, tier=a.tier, relayed_from=a.relayed_from)
+        out = ask(a.workspace, a.to, a.ask, wait_s=a.wait, tier=a.tier, relayed_from=a.relayed_from,
+                  parent_task=a.parent_task, parent_generation=a.parent_generation)
     except (ValueError, OSError, rt.RouterRefused) as e:
         print(f"pool_ask: {e}", file=sys.stderr)
         return 2

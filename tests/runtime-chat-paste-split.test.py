@@ -18,6 +18,11 @@ Run: python3 tests/runtime-chat-paste-split.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import pty
@@ -54,7 +59,7 @@ def wait_socket(path, timeout=10):
 
 TMP = tempfile.mkdtemp(prefix="chat-paste-")
 TASKS = Path(TMP) / "tasks"
-ENV = {**os.environ,
+ENV = {**isolated_child_env(),
        "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_INSTANCE_ID": "chat-paste-test",
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),

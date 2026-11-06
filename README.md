@@ -481,7 +481,7 @@ Sutando was largely built by its own autonomous build loop -- a Claude Code sess
 
 ## Acknowledgments
 
-Voice agent built on [bodhi-realtime-agent](https://github.com/sonichi/bodhi_realtime_agent), a Gemini Live voice session library.
+Voice agent built on [bodhi-realtime-agent](https://www.npmjs.com/package/bodhi-realtime-agent), a Gemini Live voice session library.
 
 ---
 

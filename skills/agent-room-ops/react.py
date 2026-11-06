@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · react — add / remove an agent's reaction on a room event.
 
 Native m.reaction add (`react`) + redact (`unreact`) — the Discord auto-react
@@ -33,7 +35,7 @@ def _op(verb, room_id, event_id, key, agent_mxid, gate):
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, room_id=room_id, event_id=event_id, key=key,
                        reason=f"client gate denied for {agent_mxid}")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, event_id=event_id, key=key,
                        reason="no gateway configured")

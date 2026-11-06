@@ -24,12 +24,12 @@ WHY THIS IS A PYTHON TEST DRIVING REAL PROCESSES, and not a shell test or a grep
   * The watcher does not service SIGTERM promptly — it blocks reading from
     fswatch, and bash defers the trap until that read returns. So a test cannot
     drive `cleanup()` with a signal to the watcher. It CAN by killing the
-    watcher's fswatch child: the read hits EOF and the script exits through its
-    EXIT trap, which is the path that runs cleanup.
-  * `cleanup()` ends in `kill 0`, which signals the whole PROCESS GROUP. A
-    harness that starts the watcher in its own group gets killed by the code it
-    is testing (this cost me a shell before `start_new_session=True` went in).
-    Every watcher here is started in its OWN session for that reason.
+    watcher's fswatch child with the relaunch budget at 0: the read hits EOF and
+    the script exits through its EXIT trap, which is the path that runs cleanup.
+  * `cleanup()` signals its whole PROCESS GROUP (`kill 0`) only when the watcher
+    leads that group, as it does under the notifier's setsid. Every watcher here
+    is started in its OWN session, so that production path is the one tested and
+    the signal stays inside the watcher's session, never reaching this harness.
 
 CLEANUP DISCIPLINE: every kill is by a pid this test recorded, via killpg on a
 session this test created. Never `pkill -f watch-tasks-stream` — that pattern
@@ -46,6 +46,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -97,11 +99,15 @@ def resolved_workspace(workspace: Path, env: dict) -> str:
 
 
 class Watcher:
-    """One watcher in its OWN session, so its `kill 0` cannot reach us."""
+    """One watcher leading its OWN session, as under the notifier's setsid: the
+    `kill 0` its cleanup then sends stays inside that session."""
 
     def __init__(self, workspace: Path, bin_dir: Path, args=()):
+        # No fswatch relaunch: this test drives cleanup() through the EOF a
+        # killed fswatch leaves, so the first EOF must end the watcher.
         env = dict(os.environ,
                    SUTANDO_WORKSPACE=str(workspace), SUTANDO_TEST_MODE="1",
+                   SUTANDO_FSWATCH_RESTART_MAX="0",
                    PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH','')}")
         # ASSERT THE RESOLVED PATH BEFORE SPAWNING (@john-the-dev). The script
         # takes STATE_DIR from `sutando-config.sh workspace`, NOT from the
@@ -117,10 +123,9 @@ class Watcher:
                 "  Spawning would write the operator's real sentinel. Fix the\n"
                 "  isolation before running this test."
             )
-        self.proc = subprocess.Popen(
+        self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", *args], cwd=str(REPO), env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
         )
 
     @property

@@ -21,6 +21,7 @@ import { resolve } from 'node:path';
 
 const SRC_PATH = resolve('src/task-bridge.ts');
 const SRC = readFileSync(SRC_PATH, 'utf8');
+const GEN = readFileSync(resolve('src/header_keys.ts'), 'utf8');
 
 describe('task-bridge confineUserContent guard', () => {
 
@@ -83,13 +84,28 @@ describe('task-bridge confineUserContent guard', () => {
 	});
 
 	it('HEADER_KEYS covers access_tier and source', () => {
+		// The keys moved to the generated src/header_keys.ts, which task-bridge
+		// imports; asserting the property where it lives, not where it was copied.
 		assert.ok(
-			SRC.includes("'access_tier'") || SRC.includes('"access_tier"'),
+			GEN.includes("'access_tier'"),
 			'confineUserContent must guard access_tier header key',
 		);
 		assert.ok(
-			SRC.includes("'source'") || SRC.includes('"source"'),
+			GEN.includes("'source'"),
 			'confineUserContent must guard source header key',
+		);
+	});
+
+	it('task-bridge derives the key set rather than restating it', () => {
+		// Without this, deleting the import and pasting a literal back passes
+		// every other assertion here — the generated file would still be right.
+		assert.ok(
+			SRC.includes("from './header_keys.js'"),
+			'task-bridge.ts must import the generated HEADER_KEYS',
+		);
+		assert.ok(
+			!/const _HEADER_KEYS = \[/.test(SRC),
+			'task-bridge.ts must not carry a literal header-key array',
 		);
 	});
 

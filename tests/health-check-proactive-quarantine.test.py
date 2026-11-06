@@ -34,6 +34,11 @@ import time
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "health-check.py")
 _spec = importlib.util.spec_from_file_location("health_check", _SRC)

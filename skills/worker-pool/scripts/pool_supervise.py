@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """The supervision caller: observe the pool, decide, persist. It never remedies.
+Its one other write is housekeeping: the sweep archives spent delivery sentinels.
 
 Two samplers, one ladder. A delivery-time check runs when someone is actually
 waiting on a worker; the design's five-minute sweep covers workers nobody is
@@ -42,6 +43,8 @@ pd = _sibling("pool_delivery")
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
 from delivery import pane_gate, task_dispatch as td  # noqa: E402
+from task_disposition import SPENT, task_disposition  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -49,6 +52,8 @@ STATE_REL = Path("state") / "pool-supervision.json"
 PAUSED_MARKER = "paused"
 # States that are not candidates for recovery at all.
 NOT_SUPERVISED = ("retired",)
+# A sentinel younger than this is left alone: its payload may still be landing.
+SENTINEL_RETIRE_AFTER_S = 3600
 
 
 def state_path(workspace) -> Path:
@@ -56,8 +61,29 @@ def state_path(workspace) -> Path:
 
 
 def is_paused(workspace, worker_id) -> bool:
-    """Only the owner writes or removes this file; nothing here ever does."""
+    """Only the owner writes or removes this file, through `set_paused`."""
     return (wi.worker_dir(workspace, worker_id) / PAUSED_MARKER).exists()
+
+
+def set_paused(workspace, worker_id, paused: bool) -> None:
+    """The owner's pause (`pool_manage.py stop` / `enable`)."""
+    marker = wi.worker_dir(workspace, worker_id) / PAUSED_MARKER
+    if paused:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def run_socket(workspace, worker_id) -> str | None:
+    """The tmux socket of the worker's open run, else of its last run; None when it never ran.
+    A wrong socket answers "no server running" for a host whose real socket is fine."""
+    runs = [r for r in wi.incarnations(workspace, worker_id) if isinstance(r, dict)]
+    open_runs = [r for r in runs if r.get("ended_at") is None]
+    for run in reversed(open_runs or runs):
+        if (run.get("tmux") or {}).get("socket"):
+            return str(run["tmux"]["socket"])
+    return None
 
 
 def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
@@ -104,16 +130,57 @@ def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
     return tmux.get("socket") or None, tmux.get("session_name") or wi.tmux_session_name(worker_id)
 
 
+def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
+    """(owed, spent) ids among this worker's sentinels. Spent is task_disposition.SPENT, the rule
+    pool_delivery applies at boot; answered is spent even with its task file still live in tasks/,
+    since the core never re-queues an answered task. A malformed id is in neither."""
+    owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
+    # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
+    ready = td.ready_result_filenames(pd.results_dir(workspace), [f"{t}.txt" for t in owned])
+    owed, spent = [], set()
+    for t in owned:
+        try:
+            done = f"{t}.txt" in ready or task_disposition(workspace, t, unanswered=True) in SPENT
+        except ValueError:
+            continue
+        if done:
+            spent.add(t)
+        else:
+            owed.append(t)
+    return owed, spent
+
+
+def owed_task_ids(workspace, worker_id) -> list[str]:
+    return sentinel_ids(workspace, worker_id)[0]
+
+
 def work_outstanding(workspace, worker_id) -> bool | None:
-    """Does this worker owe a reply? What task_dispatch says was handed to it, less
-    what already has a ready result (live or archived). None when undecidable."""
+    """Does this worker owe a reply? None when undecidable."""
     try:
-        owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
-        names = [f"{t}.txt" for t in owned]
-        # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
-        return bool(set(names) - td.ready_result_filenames(pd.results_dir(workspace), names))
+        return bool(owed_task_ids(workspace, worker_id))
     except (OSError, ValueError):
         return None
+
+
+def retire_spent_sentinels(workspace, worker_id, now: float,
+                           min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
+    """Move spent sentinels older than `min_age_s` into the inbox's archive/ through
+    pool_delivery.archive_finished, so the inbox holds what is owed. Returns the names moved.
+    An archive/ that cannot be used raises, and the sweep reports it."""
+    inbox = pd.deliveries_dir(workspace, worker_id)
+    spent = sentinel_ids(workspace, worker_id)[1]
+    old: dict[str, list[str]] = {}
+    for f in sorted(inbox.iterdir()) if inbox.is_dir() else []:
+        tid = next((f.name[:-len(x)] for x in td.WORKER_HOLD_SUFFIXES if f.name.endswith(x)), None)
+        if tid not in spent or f.is_symlink() or not f.is_file():
+            continue
+        if now - f.stat().st_mtime < min_age_s:
+            continue
+        old.setdefault(tid, []).append(f.name)
+    if not old:
+        return []
+    moved = pd.archive_finished(workspace, worker_id, task_ids=sorted(old))["archived"]
+    return sorted(n for t in moved for n in old[t])
 
 
 def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,
@@ -124,11 +191,20 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
         return ps.PANE_UNKNOWN
     adapter = pane_gate.ADAPTERS.get(runtime, pane_gate.CLAUDE)
     verdict = pane_gate.classify_pane(text, adapter, workspace, socket, session)
+    # cli_wedge's banners anchor at line start; an -e capture's SGR would hide them.
+    plain = pane_gate.SGR_STRIP.sub("", text)
     if verdict.state == "abnormal":
-        abn = cw.frame_abnormal(text)
-        return ps.PANE_LIMIT if abn and abn.kind == "provider-limit" else ps.PANE_ABNORMAL
+        abn = cw.frame_abnormal(plain)
+        if abn and abn.kind == "provider-limit":
+            return ps.PANE_LIMIT
+        if abn and "needs-login" in abn.names:
+            return ps.PANE_LOGGED_OUT
+        return ps.PANE_ABNORMAL
     if verdict.state == "busy":
-        return ps.PANE_WORKING if verdict.reason == "working" else ps.PANE_GATE
+        # A limit banner under the composer is status, not a dialog: a live turn above it runs.
+        if verdict.reason == "working" or (verdict.reason == "usage-limit" and cw.frame_working(plain)):
+            return ps.PANE_WORKING
+        return ps.PANE_GATE
     if verdict.state in ("idle-ready", "pending"):
         return ps.PANE_IDLE
     return ps.PANE_UNKNOWN
@@ -136,20 +212,30 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
 
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
                  runner=subprocess.run) -> tuple[str | None, str | None]:
-    """(pane kind, raw frame id) of this worker's pane; (None, None) when unread."""
+    """(pane kind, frame id) of this worker's pane; (None, None) when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
         return None, None
     try:
-        done = runner(["tmux", "-S", str(socket), "capture-pane", "-p", "-t", f"={name}:0"],
+        # -e as the notifier captures: both read the same bytes, so a dim placeholder is one verdict.
+        done = runner(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-t", f"={name}:0"],
                       capture_output=True, text=True, timeout=8)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None, None
     text = done.stdout if done.returncode == 0 else None
     if not text or not text.strip():
         return None, None
-    return (classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name),
-            cw.raw_state_id(text))
+    kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
+    if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
+        pane_gate.save_frame(workspace, name, kind, text)
+    return kind, frame_id(text)
+
+
+def frame_id(text: str) -> str:
+    """"raw:progress": the raw frame proves a frozen turn, the progress half a waiting one.
+    Read without SGR: an -e capture's colour changes are not progress, so they must not reset it."""
+    plain = pane_gate.SGR_STRIP.sub("", text)
+    return f"{cw.raw_state_id(plain)}:{pane_gate.progress_id(plain)}"
 
 
 def supervised_workers(workspace) -> dict:
@@ -183,6 +269,7 @@ def observe(workspace, now: float, *, worker_ids=None,
         # retired or unknown id must not reach the ladder through this door.
         rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
+    blocks = {}
     for wid, row in rows.items():
         session_alive = probe_session(workspace, wid, runner=runner)
         watcher_beat = pb.classify(pb.beat_path(workspace, "watcher", wid), now)
@@ -194,6 +281,9 @@ def observe(workspace, now: float, *, worker_ids=None,
         pane, pane_id = (observe_pane(workspace, wid, row.get("runtime") or "claude",
                                       runner=runner)
                          if session_alive is True else (None, None))
+        socket = _open_tmux(workspace, wid)[0] if session_alive is True else None
+        if socket and socket not in blocks:
+            blocks[socket] = delivery_block(socket)
         obs[wid] = ps.Observation(
             beat=pb.classify(pb.beat_path(workspace, "worker", wid), now),
             session_alive=session_alive,
@@ -203,8 +293,16 @@ def observe(workspace, now: float, *, worker_ids=None,
             work_outstanding=work_outstanding(workspace, wid),
             pane=pane,
             pane_id=pane_id,
+            delivery_block=blocks.get(socket) if socket else None,
         )
     return obs
+
+
+def delivery_block(socket) -> str | None:
+    """Why typed delivery cannot reach panes on this tmux socket, or None. Keeps the guard's
+    files fresh first, so a nightly /tmp sweep cannot be what raises the block."""
+    tmux_pane_keys.refresh_guard(socket)
+    return "pane-key-fence" if tmux_pane_keys.fence_status(socket) == "uncertain" else None
 
 
 def session_watcher_holds(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
@@ -294,6 +392,7 @@ def load_state(workspace) -> ps.SupervisionState:
                 wedge_first_detected_at=ev.get("wedge_first_detected_at"),
                 wedge_consecutive=int(ev.get("wedge_consecutive") or 0),
                 wedge_escalated=bool(ev.get("wedge_escalated")),
+                wedge_kind=ev.get("wedge_kind"),
                 last_pane_id=ev.get("last_pane_id"),
             )
     last = raw.get("last_sample_at")
@@ -318,6 +417,7 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "wedge_first_detected_at": e.wedge_first_detected_at,
                         "wedge_consecutive": e.wedge_consecutive,
                         "wedge_escalated": e.wedge_escalated,
+                        "wedge_kind": e.wedge_kind,
                         "last_pane_id": e.last_pane_id}
                     for w, e in state.workers.items()},
     }
@@ -350,12 +450,29 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
+    retired, retire_errors = {}, {}
     if persist:
         save_state(workspace, new_state)
+        if worker_ids is None:  # the sweep only: a delivery-time check stays read-only
+            for wid in obs:
+                try:
+                    if n := len(retire_spent_sentinels(workspace, wid, now)):
+                        retired[wid] = n
+                except (OSError, ValueError) as e:
+                    retire_errors[wid] = f"{type(e).__name__}: {e}"
     asked = list(worker_ids or [])
+    # Reported on every tick, not only when a card decision is due: a dry run must
+    # show the finding after the real sweep already raised (and acknowledged) the card.
     return {"decisions": decisions,
+            "auth_expired": sorted(w for w, o in obs.items() if o.pane == ps.PANE_LOGGED_OUT),
             "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
+            "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
+                            if e.wedge_consecutive and e.wedge_kind},
             "routing": routing_status(workspace),
+            "sentinels_retired": retired,
+            "sentinel_retire_errors": retire_errors,
+            "delivery_blocks": {w: o.delivery_block for w, o in obs.items() if o.delivery_block},
+            "notifier_stalls": notifier_stalls(workspace, obs),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
@@ -363,6 +480,14 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                                  "work_outstanding": o.work_outstanding,
                                  "pane": o.pane} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
+
+
+def notifier_stalls(workspace, workers) -> dict:
+    """{worker id: stall record} for supervised workers whose notifier has timed out waiting
+    for an idle pane pane_gate.STALL_ROUNDS times running; the notifier writes the record."""
+    by_seat = pane_gate.idle_stalls(workspace)
+    return {wid: by_seat[wi.tmux_session_name(wid)] for wid in workers
+            if wi.tmux_session_name(wid) in by_seat}
 
 
 def main(argv=None) -> int:
@@ -394,8 +519,18 @@ def main(argv=None) -> int:
                   f"work={o['work_outstanding']} pane={o['pane']}")
         for wid in out["not_supervised"]:
             print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
+        for wid in out["auth_expired"]:
+            print(f"{wid[:8]}  login expired: the session is alive but cannot work until "
+                  f"/login is run in tmux session {wi.tmux_session_name(wid)}")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
+        for wid, err in sorted(out.get("sentinel_retire_errors", {}).items()):
+            print(f"{wid[:8]}  could not archive spent sentinels: {err}")
+        for wid, cause in sorted(out.get("delivery_blocks", {}).items()):
+            print(f"{wid[:8]}  typed delivery is blocked ({cause}); see the card for the remedy")
+        for wid, rec in sorted(out.get("notifier_stalls", {}).items()):
+            print(f"{wid[:8]}  notifier has not seen an idle pane for {rec.get('rounds')} rounds; "
+                  f"tasks are waiting (frames in state/pane-frames/)")
         if out["routing"]["alarm"]:
             print(out["routing"]["alarm"])
     return 0

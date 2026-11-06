@@ -38,6 +38,9 @@ cd "$REPO"
 if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ]; then
   exec bash "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$@"
 fi
+# shellcheck source=../../../src/agent/launch-path.sh
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO"
 # shellcheck source=../../../src/agent/claude/cli/session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
@@ -51,6 +54,7 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
 # those are the canonical core's alone.
 SURFACE_ARGS=()
+add_skill_claude_plugins
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
@@ -71,6 +75,9 @@ ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SESSION")
 ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+ENV_ARGS+=(-e "SUTANDO_WORKER_ID=${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}")
+# Explicit empties: the core's ids are tmux server-global, so only -e clears them here.
+ENV_ARGS+=(-e SUTANDO_CORE_ID= -e SUTANDO_CORE_POOL_SIZE= -e SUTANDO_WORKER_SEAT=)
 [ -n "${SUTANDO_TASKS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 # A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
 # workspace from it: unforwarded, its results/ and state/ land under deliveries/.
@@ -79,6 +86,8 @@ ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
 # answers go. Derived in-session they become deliveries/results, which no
 # bridge drains.
 [ -n "${SUTANDO_INBOX_KIND:-}" ] && ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+# Always set, empty included: an omitted one inherits the tmux server's global env.
+ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 # Third half of that seam: without the resolver a worker reads the sentinel
 # itself, so an unforwarded one is the zero-byte read, not a missing option.

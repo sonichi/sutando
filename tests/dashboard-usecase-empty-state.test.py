@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Use Cases card must show a real empty state, not a bare "?".
+"""Use Cases card is hidden when there is no score, never a bare "?".
 
 ## Why this test exists
 
 `get_score()` returns "?" when `build_log.md` is missing or has no
 `**Score: …**` marker — every fresh install. The card rendered that
 "?" in the 28px score style: glyph soup that reads like a bug (owner
-screenshot, 2026-07-03 backlog item #2). The fix renders explanatory
-empty-state copy instead, and keeps the big score when one exists.
+screenshot, 2026-07-03 backlog item #2). The card is now hidden when
+there is no score, and keeps the big score when one exists.
 
 Plain-python self-runner (no pytest in CI). Stubs the data-gathering
 functions so render_dashboard() runs without subprocesses.
@@ -41,21 +41,21 @@ def render_with_score(value):
     return dashboard.render_dashboard()
 
 
-def test_no_score_shows_empty_state_not_question_mark():
+def test_no_score_hides_card_not_question_mark():
     html = render_with_score("?")
-    assert "Nothing scored yet" in html, "empty-state copy missing"
+    assert "<h2>Use Cases</h2>" not in html, "empty Use Cases card still rendered"
     assert '<div class="score">?</div>' not in html, 'bare "?" still rendered'
 
 
 def test_real_score_still_renders_big():
     html = render_with_score("7/10")
     assert '<div class="score">7/10</div>' in html, "score display regressed"
-    assert "Nothing scored yet" not in html, "empty state shown despite a score"
+    assert "<h2>Use Cases</h2>" in html, "card hidden despite a score"
 
 
 def main():
     failures = []
-    for fn in (test_no_score_shows_empty_state_not_question_mark, test_real_score_still_renders_big):
+    for fn in (test_no_score_hides_card_not_question_mark, test_real_score_still_renders_big):
         try:
             fn()
             print(f"  ✓ {fn.__name__}")

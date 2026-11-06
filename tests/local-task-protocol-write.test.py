@@ -5,6 +5,12 @@ The golden below pins the EXACT bytes `health-check --emit-task` produced
 before the adoption — the acceptance bar for step 3 is byte-identical output
 with the hand-rolled serialization deleted.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys
@@ -35,6 +41,12 @@ class TestSerializeTaskLast(unittest.TestCase):
     def test_unknown_key_raises(self):
         with self.assertRaises(ValueError):
             serialize_task_last([("evil_key", "v")], "x")
+
+    def test_writer_only_key_raises(self):
+        # task_layout belongs to the task-mid writer; a task-last file carrying it
+        # would hand its multi-line body to the trusted scan.
+        with self.assertRaises(ValueError):
+            serialize_task_last([("id", "task-x"), ("task_layout", "mid")], "body")
 
     def test_task_as_header_raises(self):
         with self.assertRaises(ValueError):

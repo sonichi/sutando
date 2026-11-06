@@ -102,6 +102,15 @@ the same supervisor pid; the second handoff took 12 s.
   owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
   touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a
   different directory than the operand. The supervisor's standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
+- **A session watcher dies with the core that owns it.** A SIGKILLed core runs no Stop hook, so its
+  watcher used to stay up, holding the inbox, until its next write failed. At start a `--role session`
+  watcher records its nearest `claude`/`codex` ancestor (pid + start time); the Monitor's shell wrapper
+  in between survives the kill, so the direct parent is not used. Every 3 s it checks that ancestor,
+  and once it is gone, a zombie, or a reused pid, the watcher TERMs itself through the normal cleanup
+  (claims settled, sentinel released, fswatch stopped), logging the exit to stderr and to
+  `<workspace>/logs/watch-tasks-stream.log` (stderr's only reader was that core). A revived core's
+  start then finds no holder.
+  With no such ancestor the watcher never self-exits. Standby watchers are not checked.
 - **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
   starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker
   session>-watcher`, parameterised with the worker's inbox, pane, identity and the pool beat), and
@@ -120,6 +129,24 @@ the same supervisor pid; the second handoff took 12 s.
   standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
   2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
   affected: #4524.
+- **An early exit, and `exit code 144`.** A notice that the session watcher exited before
+  its `timeout_ms` is the same instruction as the expiry notice: re-arm first, investigate second;
+  the inbox is unwatched until the supervisor's 45 s grace re-arms the standby. On macOS Claude Code
+  reports a background command that died of SIGTERM as `exit code 144` (128 + 16 reads as SIGURG, but
+  SIGURG's default is discard and the watcher ignores it). Before this fix the 144 was the `Monitor`'s
+  own wrapper shell, killed by the watcher's `kill -TERM 0` in `cleanup()`, so every exit reached the
+  session as "144, no stderr"; `cleanup()` now signals the process group only when the watcher leads
+  it. The watcher also relaunches a dead fswatch (backoff 1-16 s, `SUTANDO_FSWATCH_RESTART_MAX`) and
+  exits 1, saying so, only when fswatch will not stay up.
+- **A live fswatch that reports nothing** (a stalled fseventsd, 2026-10-17: pointers landed in every
+  seat inbox for hours and none was announced) is covered by the catch-up pass: every
+  `SUTANDO_WATCHER_CATCHUP_SECONDS` (30 s; empty, non-numeric or 0 reads as 30), whether or not events
+  arrived meanwhile, the watcher lists the inbox for entries whose ctime (so a pointer renamed into the
+  inbox with an old mtime counts) falls after the previous pass and before the last second,
+  and feeds each one through the same dispatch as an fswatch event. Each entry is examined by one pass,
+  so an inbox full of answered pointers costs the startup sweep once and the catch-up passes nothing.
+  Already-dispatched and already-answered entries are refused by the same dedupe the event path uses.
+  A dead fswatch is the relaunch budget's case, above, not this one.
 - **Watchers started before the tag was required** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose
   worker boot skill predated the tagged form) keep running and read as `untagged` holders until
   their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start
