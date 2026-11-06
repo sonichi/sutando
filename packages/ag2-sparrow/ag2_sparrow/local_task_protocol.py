@@ -842,7 +842,7 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
-    `_isVoiceTask` walks. Returns the first existing path or None. Rejects
+    `_isVoiceTask` walks. Returns the first identity-matching path or None. Rejects
     malformed ids rather than globbing with them (traversal gate).
 
     The month scan uses `os.scandir` and filters on the NAME before asking
@@ -867,6 +867,15 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     so the old cost showed up as ~1.8 s of directory scanning on a single
     dashboard poll.
     """
+    # Support package imports and standalone file loaders without a src/ search path.
+    if __package__:
+        from .task_archive import task_id_for
+    else:
+        source_dir = str(Path(__file__).resolve().parent)
+        if source_dir not in sys.path:
+            sys.path.insert(0, source_dir)
+        from task_archive import task_id_for
+
     if not valid_archive_lookup_id(task_id):
         return None
     dirs = [tasks_dir, tasks_dir / "processed", tasks_dir / "archive"]
@@ -882,7 +891,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
         # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST
         # record once `<id>.txt.1` exists, so `.exists()` here returned stale.
         hit = newest_archived(d, task_id)
-        if hit is not None:
+        if hit is not None and task_id_for(hit, accept=valid_archive_lookup_id) == task_id:
             return hit
     return None
 

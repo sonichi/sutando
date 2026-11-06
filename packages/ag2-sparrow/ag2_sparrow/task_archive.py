@@ -104,6 +104,7 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     quarantine — through the one predicate `task_id_for`, so the persisted id
     is the same authority for a quarantined file as for a live one. A live
     variant outranks a quarantine; ties fall to the first lexicographic name.
+    Headerless state-looking names use the canonical filename ID, not the literal stem.
     """
     bare = tasks_dir / f"{task_id}.txt"
     # The bare name of one id is a legal claimed name of another, so the
@@ -121,9 +122,7 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
 
 
 # Collision NAMING lives here (_move_without_clobbering mints `.N`); collision
-# SELECTION lives with the reader in local_task_protocol. No cross-import: both
-# modules are loaded by PATH with src/ off sys.path, where any import of the
-# other raises ModuleNotFoundError and takes its caller down with it.
+# SELECTION lives with the reader in local_task_protocol; it imports this owner.
 
 
 def _move_without_clobbering(src: Path, dest: Path) -> Path:
