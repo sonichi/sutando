@@ -206,15 +206,16 @@ enum SutandoConfig {
             }
             if !legacyEnvWarnPrinted {
                 legacyEnvWarnPrinted = true
-                FileHandle.standardError.write(Data((
-                    "sutando config: $SUTANDO_WORKSPACE is set but NO LONGER HONORED " +
-                    "(removed in v0.8). Workspace resolves only from " +
-                    "sutando.config.{json,local.json} or the {repoRoot}/workspace " +
-                    "baked-in default. If existing workspace data lives at the " +
-                    "$SUTANDO_WORKSPACE path, run `bash scripts/sutando-migrate.sh " +
-                    "--dry-run` then `--commit` to relocate. Unset the env to " +
+                let warning: String = [
+                    "sutando config: $SUTANDO_WORKSPACE is set but NO LONGER HONORED ",
+                    "(removed in v0.8). Workspace resolves only from ",
+                    "sutando.config.{json,local.json} or the {repoRoot}/workspace ",
+                    "baked-in default. If existing workspace data lives at the ",
+                    "$SUTANDO_WORKSPACE path, run `bash scripts/sutando-migrate.sh ",
+                    "--dry-run` then `--commit` to relocate. Unset the env to ",
                     "silence this warning.\n"
-                ).utf8))
+                ].joined()
+                FileHandle.standardError.write(Data(warning.utf8))
             }
         }
 

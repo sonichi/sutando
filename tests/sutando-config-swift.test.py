@@ -33,7 +33,8 @@ class TestSutandoConfigSwift(unittest.TestCase):
         (self.probe_dir / "main.swift").write_text(
             "import Foundation\n"
             "let repo = CommandLine.arguments[1]\n"
-            "print(SutandoConfig.resolveWorkspace(repoRoot: repo))\n",
+            "print(SutandoConfig.resolveWorkspace(repoRoot: repo))\n"
+            "_ = SutandoConfig.resolveWorkspace(repoRoot: repo)\n",
             encoding="utf-8",
         )
         env = os.environ.copy()
@@ -80,7 +81,16 @@ class TestSutandoConfigSwift(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "/from/swift/config")
-        self.assertIn("NO LONGER HONORED", proc.stderr)
+        self.assertEqual(
+            proc.stderr,
+            "sutando config: $SUTANDO_WORKSPACE is set but NO LONGER HONORED "
+            "(removed in v0.8). Workspace resolves only from "
+            "sutando.config.{json,local.json} or the {repoRoot}/workspace "
+            "baked-in default. If existing workspace data lives at the "
+            "$SUTANDO_WORKSPACE path, run `bash scripts/sutando-migrate.sh "
+            "--dry-run` then `--commit` to relocate. Unset the env to "
+            "silence this warning.\n",
+        )
         self.assertNotIn("/from/swift/env", proc.stderr)
 
     def test_test_mode_still_honors_env_path(self) -> None:
