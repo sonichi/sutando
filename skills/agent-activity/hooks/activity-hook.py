@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from file_lock import locked_file  # noqa: E402
 from local_task_protocol import valid_local_task_id  # noqa: E402
 from delivery.task_dispatch import find_ready_result  # noqa: E402
+
 from result_ready import read_ready_result  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402

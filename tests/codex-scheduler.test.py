@@ -495,9 +495,24 @@ def test_main_dispatch_and_error_handling():
         assert scheduler.main() == 1
 
 
+def test_unpaired_result_never_completes_a_schedule():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        archive = ws / "results" / "archive"
+        archive.mkdir(parents=True)
+        live = ws / "results" / "task-unpaired.txt"
+        live.write_text("raw answer")
+        assert scheduler._find_result(ws, ["task-unpaired"]) is None
+        live.rename(archive / live.name)
+        assert scheduler._find_result(ws, ["task-unpaired"]) is None
+        publish_result(archive / live.name, "paired answer")
+        assert scheduler._find_result(ws, ["task-unpaired"]) == archive / live.name
+
+
 def main():
     tests = [
         test_cron_parser,
+        test_unpaired_result_never_completes_a_schedule,
         test_core_loop_completion_and_missing_loop_health,
         test_worker_loop_does_not_become_core_loop,
         test_peer_or_future_scheduler_state_is_not_healthy,

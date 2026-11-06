@@ -6,8 +6,8 @@ exists only as a renamed live file the gateway's archive lookup cannot find.
   b) only task-<ms>.claimed-core-2.txt present, in-thread ask -> the same
   c) only an .assigned-<inst> file present -> the same
   d) an unrecoverable thread (markers do not round-trip) publishes nothing and releases the claim
-  e) a published file edited after publication: an edited room -> zero POSTs; an edited thread or none ->
-     one POST, always to the verified room and thread
+  e) a published file edited after publication is held; unchanged bytes post once
+     to the verified room and thread
   f) a stale reconcile snapshot never releases or settles a successor claim of the same holder
   CONTROL: with a plain [channel:]-only body the gateway cannot recover the thread for such a file
 
@@ -87,7 +87,7 @@ def main() -> int:
         (pub,) = sorted(lane.results.glob("proactive-*.txt"))
         pub.write_text(edit(pub.read_text(encoding="utf-8")), encoding="utf-8")
         lane.drain(**gated(lane))
-        want = 0 if what == "the room" else 1
+        want = 1 if what == "nothing (control)" else 0
         check(r.spoken == [TID] and len(lane.posts) == want
               and all(p.get("thread_root") == sa.MSG_EVT and p["room_id"] == sa.ROOM for p in lane.posts),
               f"e) after publication edits {what}: {len(lane.posts)} POST(s), only to the verified room and "

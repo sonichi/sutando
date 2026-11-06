@@ -13,7 +13,7 @@ export function readVerifiedResult(path: string): string | null {
 		const root = findRepoRoot(dirname(fileURLToPath(import.meta.url)));
 		if (!root) return null;
 		return execFileSync(interpreter(), [join(root, 'src', 'result_write.py'), 'read', path],
-			{ encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+			{ encoding: 'utf8', timeout: 5000, maxBuffer: Infinity, stdio: ['ignore', 'pipe', 'ignore'] });
 	} catch {
 		return null;
 	}

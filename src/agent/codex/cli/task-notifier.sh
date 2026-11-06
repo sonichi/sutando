@@ -18,7 +18,7 @@ fi
 # (a worker's <workspace>/deliveries/<id>); its parent is right only for the core.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
-RESULT_PAIRING_DIR="${SUTANDO_RESULT_PAIRING_DIR:-$WORKSPACE_DIR/state/result-pairing}"
+RESULT_PAIRING_DIR="$WORKSPACE_DIR/state/result-pairing"
 # The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
