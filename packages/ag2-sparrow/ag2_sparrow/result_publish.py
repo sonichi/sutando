@@ -89,14 +89,17 @@ def _clear_delegation(target: Path) -> None:
     """Drop the task's delegation marker once its live result exists; never fails the publish."""
     if target.parent.name != "results":
         return
+    if not target.name.endswith(".txt"):
+        return
+    # The exact id: a claim/assignment suffix is also legal inside a real id, so none is stripped.
+    task_id = target.name[:-len(".txt")]
     try:
         try:
-            from . import task_archive, task_delegation
+            from . import local_task_protocol, task_delegation
         except ImportError:
-            import task_archive
+            import local_task_protocol
             import task_delegation
-        task_id = task_archive.task_id_from_filename(target.name)
-        if task_id is not None:
+        if local_task_protocol.valid_archive_lookup_id(task_id):
             task_delegation.clear(target.parent.parent, task_id)
     except Exception:  # noqa: BLE001 — a stale marker only expires later; the result already stands
         pass

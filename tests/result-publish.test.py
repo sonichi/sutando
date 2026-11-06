@@ -209,6 +209,21 @@ class PublishClearsDelegation(unittest.TestCase):
         result_publish.publish_staged(result_publish.stage_text(target, "done"), target)
         self.assertFalse(marker.exists())
 
+    def test_a_literal_suffix_in_the_id_clears_that_exact_marker(self):
+        for suffix in (".claimed-b", ".assigned-b"):
+            with self.subTest(suffix):
+                base, literal = self.td.mark(self.ws, "task-a", 60), self.td.mark(self.ws, f"task-a{suffix}", 60)
+                result_publish.publish_text(self.ws / "results" / f"task-a{suffix}.txt", "done")
+                self.assertTrue(base.exists(), "the base task's marker was cleared")
+                self.assertFalse(literal.exists(), "the published task's marker survived")
+                self.td.clear(self.ws, "task-a")
+
+    def test_an_invalid_id_clears_nothing(self):
+        with mock.patch.object(self.td, "clear") as clear:
+            result_publish.publish_text(self.ws / "results" / "..txt", "x")
+            result_publish.publish_text(self.ws / "results" / "task-a.md", "x")
+        clear.assert_not_called()
+
     def test_a_file_outside_live_results_clears_nothing(self):
         marker = self.td.mark(self.ws, self.tid, 60)
         result_publish.publish_text(self.ws / "results" / "archive" / f"{self.tid}.txt", "done")
