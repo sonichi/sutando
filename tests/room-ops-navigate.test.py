@@ -9,6 +9,10 @@ The Action is stubbed; nothing reaches a network.
 
 Run: python3 tests/room-ops-navigate.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import fcntl
 import json
 import os

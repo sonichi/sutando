@@ -119,7 +119,11 @@ def _host(url):
 def same_site(url, relay_base):
     """HTTPS on the relay host or its descendants, with ag2.space siblings allowed."""
     relay = _host(relay_base)
-    parent = "ag2.space" if relay == "ag2.space" or relay.endswith(".ag2.space") else relay
+    parent = relay
+    if _gw._core_src_on_path():
+        from dotspace import LEGACY_SERVER
+        if relay == LEGACY_SERVER or relay.endswith("." + LEGACY_SERVER):
+            parent = LEGACY_SERVER
     host = _host(url)
     return urllib.parse.urlsplit(url).scheme == "https" and bool(parent) and bool(host) and \
         (host == parent or host.endswith("." + parent))
