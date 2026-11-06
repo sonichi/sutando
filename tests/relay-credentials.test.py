@@ -151,6 +151,18 @@ class ResolverOrder(_Hermetic):
         self.assertEqual((c.base_url, c.token, c.origin),
                          (self.URL, "fake-vault", "vault"))
 
+    def test_unreadable_active_lane_falls_back_to_vault(self):
+        _VAULT["REMOTE_TASK_TOKEN"] = f"{self.URL}|fake-vault"
+        with mock.patch("channel_env_resolve.active_lane_values", side_effect=OSError("unreadable")):
+            c = rc.resolve_relay_credentials()
+        self.assertEqual((c.base_url, c.token, c.origin),
+                         (self.URL, "fake-vault", "vault"))
+
+    def test_explicit_repo_cannot_supply_a_nonprimary_lane(self):
+        repo = self.write_repo_env(f"REMOTE_TASK_TOKEN={self.URL}|fake-primary\n")
+        c = rc.resolve_relay_credentials("dev-ag2space", repo=repo)
+        self.assertEqual((c.token, c.origin), ("", "none"))
+
     def test_repo_env_alone(self):
         tok = self.only_in_repo()
         c = rc.resolve_relay_credentials()
