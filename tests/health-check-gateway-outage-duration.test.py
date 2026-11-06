@@ -2,6 +2,12 @@
 """The gateway warn line must carry HOW LONG the outage has run.
 Run: python3 tests/health-check-gateway-outage-duration.test.py"""
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import pathlib
@@ -79,6 +85,7 @@ class TestWarnDetail(unittest.TestCase):
         # running returns "configured but NOT running" and never reaches this.
         with mock.patch.object(HC, "_gateway_configured", return_value=True, create=True), \
              mock.patch.object(HC, "subprocess") as sp, \
+             mock.patch.object(HC, "probe_pids", return_value=(["4242"], True)), \
              mock.patch.object(HC, "_gateway_lock_pids", return_value={}, create=True), \
              mock.patch.object(HC, "_gateway_serving", return_value=False), \
              mock.patch.object(HC, "_gateway_last_ok_age_h", return_value=age_h):

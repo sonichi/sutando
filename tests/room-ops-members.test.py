@@ -9,6 +9,11 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "agent-room-ops"))
 
@@ -36,8 +41,15 @@ for uid in ("@yixuan-desktop.agent:ag2.space",
 for uid in ("@sutando-rui:ag2.space", "@sutando-bassil:ag2.space",
             "@sutando-qingyun-001:ag2.space"):
     check(mem.classify_member(uid) == "agent", f"`@sutando-` prefix -> agent ({uid})")
+# The other runtimes' legacy prefixes, the same list the web client reads
+# (cinny agentMxid.ts) — one mxid must classify the same on both sides.
+for uid in ("@codex-x:ag2.space", "@hermes-x:ag2.space", "@openclaw-x:ag2.space",
+            "@cline-x:ag2.space", "@pi-x:ag2.space", "@kilo-x:ag2.space"):
+    check(mem.classify_member(uid) == "agent", f"legacy runtime prefix -> agent ({uid})")
 for uid in ("@qingyun:ag2.space", "@chi:ag2.space", "@vidhu:ag2.space"):
     check(mem.classify_member(uid) == "human", f"bare localpart -> human ({uid})")
+check(mem.classify_member("@codexy:ag2.space") == "human",
+      "a prefix needs its hyphen: `codexy` is not `codex-`")
 check(mem.classify_member("") == "human", "empty id does not crash (defaults human)")
 # `sutando` inside a localpart is not the prefix: the rule is anchored, so a
 # human who happens to be named for the product is not reclassified.
@@ -49,7 +61,7 @@ def _run(payload, *, raises=None):
     """Drive room_members with the gateway stubbed at the http_json seam."""
     saved_g, saved_h = mem.gateway, mem.http_json
     try:
-        mem.gateway = lambda: ("https://example.invalid", {})
+        mem.gateway = lambda *_a: ("https://example.invalid", {})
         if raises is not None:
             def _boom(*a, **k):
                 raise raises
@@ -85,7 +97,7 @@ check(_run({"ok": True})["members"] == [], "missing members key -> empty list, o
 
 saved = mem.gateway
 try:
-    mem.gateway = lambda: (None, {})
+    mem.gateway = lambda *_a: (None, {})
     check(mem.room_members("!r:ag2.space")["reason"] == "no gateway configured",
           "no gateway configured is named, not a crash")
 finally:

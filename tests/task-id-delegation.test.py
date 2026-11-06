@@ -33,9 +33,7 @@ OWNERS = ("src/task_archive.py", "packages/ag2-sparrow/ag2_sparrow/task_archive.
 
 # Known instances, each tracked by a named PR, so this guard covers the unbounded
 # future set now. DELETE a row when its fix lands; section 6 fails on a stale one.
-KNOWN = {
-    "src/runtime-api/tasks_view.py:240": "sonichi/sutando#3656",
-}
+KNOWN = {}
 
 fails = []
 known_hit = []
@@ -73,7 +71,7 @@ for name in ("task_id_from_filename", "find_task_file"):
 
 src_txt = (REPO / OWNERS[0]).read_text()
 vend_txt = (REPO / OWNERS[1]).read_text()
-for pat in ("_ID_STATE", "_ID_PLAIN"):
+for pat in ("_STATE_SUFFIX", "_NOT_A_RECORD"):
     a = re.search(rf"^{pat}\s*=\s*re\.compile\((.+)$", src_txt, re.M)
     b = re.search(rf"^{pat}\s*=\s*re\.compile\((.+)$", vend_txt, re.M)
     check(f"{pat} is byte-identical in both copies of the owner",
@@ -87,7 +85,7 @@ def scan_handrolled(base, roots, bucket):
     seen = 0
     for root in roots:
         for p in sorted((base / root).rglob("*.py")):
-            rel = str(p.relative_to(base))
+            rel = p.relative_to(base).as_posix()
             if rel in OWNERS:
                 continue
             seen += 1
@@ -114,7 +112,7 @@ def scan_unpaired(base, roots, bucket):
     seen = 0
     for root in roots:
         for p in sorted((base / root).rglob("*.py")):
-            rel = str(p.relative_to(base))
+            rel = p.relative_to(base).as_posix()
             if rel in OWNERS:
                 continue
             seen += 1
@@ -194,7 +192,8 @@ for root in ROOTS:
             if SH.search(ln) and not ln.strip().startswith("#"):
                 win = "\n".join(lines[max(0, i - 3):i + 4])
                 tag = "" if ".assigned-" in win else "  (claimed-only)"
-                sh_sites.append(f"{p.relative_to(REPO)}:{i + 1}{tag}")
+                rel = p.relative_to(REPO).as_posix()
+                sh_sites.append(f"{rel}:{i + 1}{tag}")
 for site in sh_sites:
     print(f"  note {site}")
 print(f"  ({len(sh_sites)} shell site(s), not gated)")

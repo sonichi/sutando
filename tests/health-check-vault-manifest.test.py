@@ -15,6 +15,11 @@ this case fails; that is the point.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import hashlib
 import importlib.util
 import json
@@ -88,6 +93,27 @@ def main() -> int:
         # --- clean vault ---------------------------------------------------
         r = hc.check_vault_manifest_integrity(_manifest(tmp, ["K1", "K2"]), _probe(["K1", "K2"]))
         check("all backed -> ok", r["status"] == "ok" and "resolve" in r["detail"], repr(r))
+
+        # A count cannot answer "is credential X already held"; the warn branch
+        # below has always named keys, so only the ok path was blind.
+        check("ok detail names each held key",
+              "K1" in r["detail"] and "K2" in r["detail"], repr(r))
+
+        many = [f"K{i}" for i in range(1, 16)]
+        r = hc.check_vault_manifest_integrity(_manifest(tmp, many), _probe(many))
+        check("15 keys -> 12 named plus an explicit remainder",
+              r["status"] == "ok" and "+3 more" in r["detail"], repr(r))
+        # Set membership, not substring containment: with a key that is a prefix
+        # of another, `in` over-counts and reports a failure that is not there.
+        named = {t.strip() for t in r["detail"].split("—", 1)[1].split(",")}
+        check("the naming is bounded, not the whole manifest dumped",
+              len(named & set(many)) == 12, repr(r))
+
+        # CONTROL: the naming branch needs >=1 backed key — empty returns
+        # earlier, zero-resolved hits "unverifiable". Pins the unconditional append.
+        r = hc.check_vault_manifest_integrity(_manifest(tmp, []), _probe([]))
+        check("empty manifest never reaches the naming branch",
+              r["status"] == "ok" and "resolve in Keychain" not in r["detail"], repr(r))
 
         # --- degenerate inputs ---------------------------------------------
         r = hc.check_vault_manifest_integrity(tmp / "nope.json", _probe([]))

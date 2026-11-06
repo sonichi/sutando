@@ -1,0 +1,49 @@
+{
+  "name": "agent-activity",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "stability": "experimental",
+  "description": "The agent's live activity as rows the desktop renders in the room (events drawer) and the dock (Agent activity panel). Hooks produce the Working and Thinking rows; nothing depends on the agent remembering. Config: AGENT_DISPLAY_NAME names the agent in the first row (env override > this manifest > 'Your agent'). LEDGER_STEP_PUBLISH_ENABLED defaults off; WEDGE_SILENCE_SECONDS defaults to 180; WEDGE_TOOL_MAX_SECONDS bounds open-tool exemption at 900 seconds; the gateway publisher uses room.task.progress when deployed. SUTANDO_STOP_INTERRUPT=1 lets a Stop send one Escape to the core's turn when that turn is on the stopped task alone, and marks the task cancelled only once the stop is ruled; off (default), a cancel marks the task cancelled at once. PHASE_MODEL (off|vertex, default off) refines the phase word and writes a status line with Gemini on PHASE_MODEL_PROJECT; the only network use, and only when on (scripts/phase_line.py).",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
+      "event": "PostToolUse",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
+      "event": "PostToolUseFailure",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
+      "event": "Stop",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
+      "event": "UserPromptSubmit",
+      "command": "./hooks/activity-hook.py"
+    },
+    {
+      "event": "PermissionRequest",
+      "command": "./hooks/activity-hook.py"
+    }
+  ],
+  "config": {
+    "AGENT_DISPLAY_NAME": "",
+    "LEDGER_STEP_PUBLISH_ENABLED": false,
+    "WEDGE_SILENCE_SECONDS": 180,
+    "WEDGE_TOOL_MAX_SECONDS": 900,
+    "PHASE_MODEL": "off",
+    "PHASE_MODEL_PROJECT": "",
+    "PHASE_MODEL_ID": "gemini-3.5-flash-lite",
+    "SUTANDO_STOP_INTERRUPT": ""
+  },
+  "on_stop_requested": "scripts/stop_interrupt.py"
+}

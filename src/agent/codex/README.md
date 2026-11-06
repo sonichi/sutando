@@ -11,6 +11,12 @@ adapts Sutando's streaming file watcher to Codex by submitting one prompt per
 task-file event into the core pane. It runs in a separate managed tmux session
 so it survives launcher exit and is restarted together with the core.
 
+`cli/codex-observer.mjs` feeds HealthStatus (`docs/health-snapshot.md`, "Runtime observation").
+It runs in its own `<session>-observer` tmux session, follows the rollout file the core's Codex
+process holds open, and writes the core's runtime observation record. It is read-only, is replaced
+when its script changes (`SUTANDO_OBSERVER_VERSION`, like the notifier's), and exits once the core
+session is gone.
+
 Watcher events are wake signals rather than queue order. The notifier waits for
 the core's positive `idle` status and a pane without Codex's live working marker
 before touching the interactive input, then selects the highest-priority pending

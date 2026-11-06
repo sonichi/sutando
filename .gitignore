@@ -72,6 +72,7 @@ tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.test.ps1
 !tests/*.test.mjs
 tests/__pycache__/
 !tests/*.txt
@@ -137,12 +138,26 @@ workspace/*
 # AG2 onboarding summary — private (invite codes + ids)
 ag2-onboarding.txt
 
+# IDE / editor workspace state — per-user, never shared.
+.vscode/
 # coverage-gate artifacts (scripts/coverage-gate.sh)
 .coverage
 .coverage.*
 coverage.xml
 diff-cover.md
 coverage-summary.md
+
+# sw[n-p] only: a dot/underscore prefix plus `sw` still admits real assets
+# (`.interface.swg`), so the range is the discriminator.
+[._]*.sw[n-p]
+[._]sw[n-p]
+# Deep range, but only at a real dotenv boundary — `.env` as a bare substring
+# would hide `diagram.environment.svg` and `service.envoy.svc`.
+*.env.s[a-v][a-z]
+*.env.sw[a-p]
+*.env.*.s[a-v][a-z]
+*.env.*.sw[a-p]
+*~
 
 # Built locally from a GAIA copy; carries the answer key -- never commit.
 benchmarks/gaia-100.json

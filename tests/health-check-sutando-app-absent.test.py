@@ -3,6 +3,11 @@
 launchd must not go quiet when the binary is gone."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import ast
 import inspect
 import importlib.util

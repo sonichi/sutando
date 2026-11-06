@@ -10,8 +10,8 @@
  *    deadline, the classifier's persisted terminal classification, and the
  *    credential resolver result). voice-agent passes the provider's `build`
  *    to bodhi as the `probeState` option (when the pin supports it), sends
- *    the frame on every accepted real connection, and re-sends on every
- *    upstream transition.
+ *    the frame on every accepted real or verifier connection, and re-sends
+ *    on every upstream transition.
  *  - `publishLifecycleSnapshot()` — the ONE writer (amendment A9) of
  *    `<workspace>/state/voice-lifecycle.json`, atomically via
  *    temp-file + `renameSync` with unique temp names. `writeVoiceState`'s
@@ -24,6 +24,8 @@
  *    otherwise leave the upstream connected forever. On verifier/probe close
  *    with no real client attached, this fence restores the prior idle state
  *    — and a later real connection fences (invalidates) any pending restore.
+ *  - `createVerifierHooks()` — bodhi's `?verify=1` hooks: the immediate
+ *    frame, the redial of an idle parked upstream, and the restore's arming.
  *
  * The frame schema is WIRE CONTRACT v1 (design 1a′). Do not add/rename
  * fields without a version bump.
@@ -115,9 +117,10 @@ export function mapUpstream(args: {
 	) {
 		return { upstream: 'connecting' };
 	}
-	// CLOSED / CREATED / unknown: upstream is down. With a client attached
+	// CLOSED / UPSTREAM_LOST (parked, bodhi >= 0.4) / CREATED / unknown:
+	// upstream is down. With a client attached
 	// (or a fatal-backoff window pending) the agent is waiting to reconnect;
-	// with neither, this is the healthy idle-teardown fixed point.
+	// with neither, this is the healthy idle state (the idle teardown parks in UPSTREAM_LOST).
 	if (clientAttached || backoffUntil > now) return { upstream: 'backoff' };
 	return { upstream: 'idle' };
 }
@@ -263,13 +266,8 @@ export function publishLifecycleSnapshot(
 
 export interface IsolatedIdleRestore {
 	/**
-	 * Arm the isolated restore timer. Called on verifier/probe-role close
-	 * with no real client attached (SEAM NOTE: the pinned bodhi has no
-	 * probe/verifier role yet — until the Step-11 pin lands, voice-agent
-	 * arms this from its `probeState` callback, the only probe-shaped hook
-	 * this repo controls; when bodhi's role close hook exists it should call
-	 * `arm()` directly on verifier close). No-op while a real client is
-	 * attached.
+	 * Arm the isolated restore timer: on a verifier's attach and close, and on
+	 * each probe. No-op while a real client is attached.
 	 */
 	arm(): void;
 	/**
@@ -318,5 +316,42 @@ export function createIsolatedIdleRestore(opts: {
 		pending(): boolean {
 			return timer !== null;
 		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Verification-role (`?verify=1`) hooks
+// ---------------------------------------------------------------------------
+
+/**
+ * bodhi's `onVerifierConnected`/`onVerifierDisconnected`. A verifier gets the
+ * current frame at once, and an idle parked upstream is redialed so the
+ * verifier then sees connecting → live. Both edges arm the idle restore.
+ */
+export function createVerifierHooks(deps: {
+	/** Send the current frame to the attached connection and return it. */
+	emitImmediate: () => AgentStateV1;
+	sessionState: () => string;
+	/** Redial the parked upstream. */
+	wake: () => void;
+	armIdleRestore: () => void;
+	log: (msg: string) => void;
+}): { onVerifierConnected: () => void; onVerifierDisconnected: () => void } {
+	// bodhi calls these from the socket's connection handler without a guard.
+	const guarded = (what: string, fn: () => void) => (): void => {
+		try {
+			fn();
+		} catch (err) {
+			deps.log(`[AgentState] verifier ${what} failed: ${(err as Error)?.message ?? err}`);
+		}
+	};
+	return {
+		onVerifierConnected: guarded('attach', () => {
+			const frame = deps.emitImmediate();
+			deps.armIdleRestore();
+			// A fatal backoff or a terminal failure is not redialed; its frame already says why.
+			if (deps.sessionState() === 'UPSTREAM_LOST' && frame.upstream === 'idle') deps.wake();
+		}),
+		onVerifierDisconnected: guarded('close', () => deps.armIdleRestore()),
 	};
 }

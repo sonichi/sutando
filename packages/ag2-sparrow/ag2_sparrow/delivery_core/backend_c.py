@@ -233,7 +233,8 @@ class DesignCClaimBackend:
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
-                 destination: Optional[str] = None) -> bool:
+                 destination: Optional[str] = None,
+                 terminal_reason: Optional[str] = None) -> bool:
         parts = token.incarnation.split(SEP)
         if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
             return False                    # forged: worker != the record's
@@ -265,11 +266,25 @@ class DesignCClaimBackend:
                 self._quarantine(src, key, "outcome-unknown", str(time.time_ns()))
                 return True
             n = self._note_attempt(key)
-            if park_at_attempts is not None and n >= park_at_attempts:
-                self._quarantine(src, key, "max-attempts", str(time.time_ns()))
+            if terminal_reason or (park_at_attempts is not None and n >= park_at_attempts):
+                self._quarantine(src, key, terminal_reason or "max-attempts", str(time.time_ns()))
                 return True
             # retryable: back to the single ready slot; a re-publish racing us
             # into that slot quarantines this copy (duplicate precursor).
+            if not _move(src, self._d(READY) / key) and src.exists():
+                self._quarantine(src, key, "collision", str(time.time_ns()))
+            return True
+
+    def release(self, token: ClaimToken) -> bool:
+        parts = token.incarnation.split(SEP)
+        if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker) \
+                or _safe_key(token.item_id) != parts[0]:
+            return False
+        key, src = parts[0], self.root / INFLIGHT / token.incarnation
+        with self._lock(key):
+            if not src.exists():
+                return False
+            # Back to the single ready slot, no attempt counted; a racing re-publish wins it.
             if not _move(src, self._d(READY) / key) and src.exists():
                 self._quarantine(src, key, "collision", str(time.time_ns()))
             return True
@@ -307,6 +322,15 @@ class DesignCClaimBackend:
 
     def attempts(self, item_id: str) -> int:
         return self.attempts_by_key(_safe_key(item_id))
+
+    def resend_epoch(self, item_id: str) -> int:
+        """Operator re-send generation; 0 until a requeue bumps it.
+
+        Same store as A: the epoch is written by `outbox.requeue_item` into the
+        item record on this root, so reading it here is what makes a requeue
+        present a NEW idempotency key instead of the parked attempt's.
+        """
+        return outbox.resend_epoch_for(self.root, item_id)
 
     def park(self, item_id: str, reason: str) -> None:
         key = _safe_key(item_id)

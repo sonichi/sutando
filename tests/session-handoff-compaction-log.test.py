@@ -264,14 +264,17 @@ class CallSitePassesTheResolvedTranscript(unittest.TestCase):
         the call. A re-typed copy could not observe the argument bug."""
         text = SCRIPT.read_text()
         assign = re.search(r'^TRANSCRIPT="\$1".*$', text, re.M)
-        parse = re.search(r'^if \[ -z "\$TRANSCRIPT" \] && \[ ! -t 0 \]; then.*?^fi$',
-                          text, re.S | re.M)
+        # Still EXTRACTED, never re-typed — that is what observes a call-site bug.
+        # REPO is supplied below so the sourced helper resolves.
+        parse = re.search(r'^__TP_HELPER=.*?^unset __TP_HELPER$', text, re.S | re.M)
         call = re.search(r'^record_compaction_event .*$', text, re.M)
         for name, m in (("assignment", assign), ("stdin parse", parse), ("call site", call)):
             if not m:
                 raise AssertionError(f"{name} not found in {SCRIPT}")
-        return "\n".join([f"WORKSPACE_DIR={self.ws!s}", _fn_source(),
-                           assign.group(0), parse.group(0), call.group(0), "exit 0"])
+        repo = SCRIPT.resolve().parent.parent
+        return "\n".join([f"WORKSPACE_DIR={self.ws!s}", f"REPO={shlex.quote(str(repo))}",
+                          _fn_source(),
+                          assign.group(0), parse.group(0), call.group(0), "exit 0"])
 
     def _run_with_stdin(self, payload: str) -> subprocess.CompletedProcess:
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:

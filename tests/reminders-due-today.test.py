@@ -111,7 +111,10 @@ class TestDueTodayFlag(unittest.TestCase):
         mb = ilu.module_from_spec(mb_spec)
         mb_spec.loader.exec_module(mb)
 
-        with patch.object(sp, "run", return_value=fake):
+        import os
+        from unittest.mock import patch as _patch
+        with _patch.dict(os.environ, {"MORNING_BRIEFING_CALENDAR_SOURCE": "macos"}), \
+             patch.object(sp, "run", return_value=fake):
             result = mb.get_reminders()
 
         joined = " ".join(result)

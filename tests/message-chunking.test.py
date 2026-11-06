@@ -73,6 +73,18 @@ fenced_small = "before\n```python\nprint('hi')\n```\nafter"
 check("small fenced block → single unchanged chunk",
       list(chunk_message(fenced_small, 1900)) == [fenced_small])
 
+# 3b. The line that CLOSES a fence must not be charged the closer reserve:
+# a whole-body fence that fits was split into itself plus a content-free tail.
+for _L in (1896, 1897, 1899):
+    _over = len("```\n") + len("\n```")
+    _body = "```\n" + "z" * (_L - _over) + "\n```"
+    _out = list(chunk_message(_body, 1900))
+    check(f"closing fence charges no reserve (len {_L})",
+          _out == [_body], f"got {len(_out)} chunks, lens {[len(c) for c in _out]}")
+    check(f"no content-free tail chunk (len {_L})",
+          all(c.replace("`", "").strip() for c in _out),
+          f"a chunk is only fence markers: {[c for c in _out if not c.replace('`','').strip()]}")
+
 # 4. Inline backticks / info-string-in-prose do NOT toggle fence state → no spurious close.
 inline = 'talk about `print("```")` and ```js inline usage without a real block'
 out_inline = list(chunk_message(inline, 1900))

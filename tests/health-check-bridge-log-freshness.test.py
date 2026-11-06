@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Regression tests for stale bridge logs after a successful restart."""
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import tempfile

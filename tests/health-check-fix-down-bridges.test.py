@@ -43,6 +43,11 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 # Load src/health-check.py as `health_check` (filename has a hyphen, can't
@@ -50,6 +55,8 @@ REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+# Keep fix-run metrics isolated from real workspace state and analytics.
+hc.track_health_fix = lambda *args, **kwargs: None
 
 
 def check(name: str, status: str, detail: str) -> dict:
@@ -88,8 +95,11 @@ def run_with_popen_stub(checks: list, *, action="restart",
         return mock.MagicMock()
 
     with tempfile.TemporaryDirectory() as td:
+        # No supervisor here (keeps these hermetic — no live launchctl probe);
+        # the supervised leg: tests/health-check-supervised-bridge-restart.test.py.
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc, "_load_channel_env", side_effect=_channel_env), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
@@ -301,7 +311,7 @@ def case_f_run_all_checks_emits_slack_configured_not_running() -> list[str]:
     def fake_run(argv, *args, **kwargs):
         # Intercept ONLY the slack-bridge pgrep so it reports "not running".
         if (isinstance(argv, list) and len(argv) >= 3
-                and argv[0] == "/usr/bin/pgrep" and "slack-bridge" in argv[2]):
+                and Path(argv[0]).name == "pgrep" and "slack-bridge" in argv[2]):
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         return real_run(argv, *args, **kwargs)
 
@@ -351,6 +361,7 @@ def case_g_launch_parity_interpreter_and_env() -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="/opt/homebrew/bin/python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-abc", "SLACK_APP_TOKEN": "xapp-xyz"}), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
             restarted = hc.fix_down_bridges(
@@ -386,10 +397,11 @@ def case_h_launch_parity_failsafe_skips() -> list[str]:
     ]
     # discord: no capable interpreter (None). slack: interpreter fine but env
     # has no token — and ensure the ambient env doesn't carry one either.
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    clean_env = hermetic_env()
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", side_effect=lambda n: None if n == "discord-bridge" else "python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc, "_load_channel_env", return_value={}), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.dict(hc.os.environ, clean_env, clear=True), \
@@ -566,6 +578,7 @@ def case_u_defaults_from_config_and_module() -> list[str]:
              mock.patch.object(hc, "_checkout_is_canonical", return_value=(True, "clean")), \
              mock.patch.object(hc, "_default_slack_sender", return_value=True), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=lambda a, **k: mock.MagicMock()):
             restarted = hc.fix_down_bridges(checks)  # no kwargs → module defaults
     if restarted != ["discord-bridge"]:
@@ -647,14 +660,23 @@ def case_x_failed_sender_falls_back_to_a_local_owner_surface() -> list[str]:
     # 5. the shipped default reports False on a non-zero exit rather than assuming success
     if hc._default_local_notifier.__doc__ is None:
         fails.append("x) _default_local_notifier lost its contract docstring")
-    with mock.patch.object(hc.subprocess, "run",
-                           return_value=mock.MagicMock(returncode=1)):
+    import sutando_config
+    with mock.patch.object(sutando_config, "resolve_macos_notifications", return_value=True):
+        with mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.MagicMock(returncode=1)):
+            if hc._default_local_notifier("m") is not False:
+                fails.append("x) default notifier reported success on a non-zero exit")
+        with mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.MagicMock(returncode=0)):
+            if hc._default_local_notifier("m") is not True:
+                fails.append("x) default notifier reported failure on a zero exit")
+    # 6. notifications.macos off (the default): reported undelivered, osascript never run
+    with mock.patch.object(sutando_config, "resolve_macos_notifications", return_value=False), \
+            mock.patch.object(hc.subprocess, "run") as run:
         if hc._default_local_notifier("m") is not False:
-            fails.append("x) default notifier reported success on a non-zero exit")
-    with mock.patch.object(hc.subprocess, "run",
-                           return_value=mock.MagicMock(returncode=0)):
-        if hc._default_local_notifier("m") is not True:
-            fails.append("x) default notifier reported failure on a zero exit")
+            fails.append("x) default notifier claimed delivery with macOS notifications off")
+        if run.called:
+            fails.append("x) default notifier ran osascript with macOS notifications off")
     return fails
 
 
@@ -862,7 +884,7 @@ def case_t_resolve_down_bridge_action() -> list[str]:
     assertion pass for the wrong reason on a machine that sets it explicitly."""
     fails = []
     import sutando_config
-    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    env = hermetic_env()
     with mock.patch.object(sutando_config, "load_config", lambda *a, **k: {}):
         with mock.patch.dict(os.environ, env, clear=True):
             if sutando_config.resolve_down_bridge_action() != "alert":
@@ -877,7 +899,7 @@ def case_t_resolve_down_bridge_action() -> list[str]:
 
     # The stubs above cover the missing-key fallback, a state no install is in:
     # sutando.config.json sets the key, so only an unstubbed read sees what ships.
-    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    env = hermetic_env()
     with mock.patch.dict(os.environ, env, clear=True):
         shipped = sutando_config.resolve_down_bridge_action(REPO)
         if shipped != "alert":
@@ -922,18 +944,28 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
         if isinstance(argv, list) and argv and argv[0] == "/bin/kill":
             killed.append(argv[1])
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        # Stale pre-kill delegates to evict-own-bridge.sh (recorded in `killed`
+        # for plan-before-kill); --list is the verifier, empty = confirmed.
+        if (isinstance(argv, list) and len(argv) >= 4 and argv[0] == "/bin/bash"
+                and str(argv[1]).endswith("evict-own-bridge.sh")):
+            if argv[2] == "--list":
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            killed.append(f"evict:{argv[2]}:{argv[3]}")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        # Post-eviction survivor scan: an empty table proves the pgrep hit gone.
+        if isinstance(argv, list) and argv and argv[0] in ("ps", "/bin/ps"):
+            return subprocess.CompletedProcess(argv, 0, stdout="  PID  PPID ARGS\n", stderr="")
         return real_run(argv, *args, **kwargs)
 
     if plan == "REAL":
         plan_patch = mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/local/bin/python3-probed")
         env_patch = mock.patch.object(hc, "_load_channel_env", return_value=channel_env or {})
-        ambient = ambient_env if ambient_env is not None else {
-            k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+        ambient = ambient_env if ambient_env is not None else hermetic_env()
         os_patch = mock.patch.dict(hc.os.environ, ambient, clear=True)
     else:
         plan_patch = mock.patch.object(hc, "_bridge_launch_plan", return_value=plan)
         env_patch = mock.patch.object(hc, "_load_channel_env", return_value={})
-        os_patch = mock.patch.dict(hc.os.environ, dict(os.environ), clear=True)
+        os_patch = mock.patch.dict(hc.os.environ, hermetic_env(), clear=True)
 
     if stale_guard is None:
         guard_patch = mock.patch.object(hc, "REPO_DIR", Path(repo_dir)) if repo_dir \
@@ -948,6 +980,7 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
              mock.patch.object(hc, "run_all_checks", return_value=checks), \
              mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              plan_patch, env_patch, os_patch, guard_patch, \
              mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen), \
@@ -965,12 +998,12 @@ def case_o_stale_restart_uses_launch_plan() -> list[str]:
     channel env), never bare sys.executable."""
     fails = []
     checks = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
-    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
+    plan = ("/usr/local/bin/python3-probed", hermetic_env())
     out, spawned, killed = _run_main_fix_with_stale(checks, plan)
     if "slack-bridge: restarted (stale code)" not in out:
         fails.append(f"o) missing 'restarted (stale code)' line; got: {out!r}")
-    if killed != ["4242"]:
-        fails.append(f"o) expected old pid 4242 killed, got {killed}")
+    if killed != [f"evict:slack:{hc.REPO_DIR}"]:
+        fails.append(f"o) expected the checkout-scoped evict-own-bridge.sh pre-kill, got {killed}")
     # The canonical-checkout guard probes git before the relaunch, so filter to
     # the bridge spawn itself rather than asserting on the whole recorded list.
     bridge = [a for a in spawned if str(a[-1]).endswith("slack-bridge.py")]
@@ -1015,7 +1048,7 @@ def case_p2_stale_guard_verdicts_wire_through_main() -> list[str]:
     for label, verdict, restarts in cases:
         out, spawned, killed = _run_main_fix_with_stale(stale, plan, stale_guard=verdict)
         if restarts:
-            if killed != ["4242"] or not spawned:
+            if killed != [f"evict:slack:{hc.REPO_DIR}"] or not spawned:
                 fails.append(f"p2/{label}) expected kill+spawn, got killed={killed} spawned={len(spawned)}")
         else:
             if killed or spawned:
@@ -1061,7 +1094,7 @@ def case_p3_pinned_config_full_wiring() -> list[str]:
             out, spawned, killed = _run_main_fix_with_stale(
                 stale, plan, stale_guard=None, repo_dir=pinned)
         sc._CACHE = None
-        if killed != ["4242"] or not spawned:
+        if killed != [f"evict:slack:{pinned}"] or not spawned:
             fails.append(f"p3) pinned-config checkout should restart, got killed={killed} "
                          f"spawned={len(spawned)} out={out!r}")
     return fails
@@ -1072,13 +1105,14 @@ def case_q_down_path_requires_both_slack_tokens() -> list[str]:
     slack restart (the bridge treats empty strings as missing)."""
     fails = []
     checks = [check("slack-bridge", "warn", "configured but not running")]
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    clean_env = hermetic_env()
     for label, env in (("absent", {"SLACK_BOT_TOKEN": "xoxb-only"}),
                        ("empty", {"SLACK_BOT_TOKEN": "xoxb-ok", "SLACK_APP_TOKEN": ""})):
         spawned = []
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
                  mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+                 mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
                  mock.patch.object(hc, "_load_channel_env", return_value=env), \
                  mock.patch.object(hc, "token_from_vault", return_value=""), \
                  mock.patch.dict(hc.os.environ, clean_env, clear=True), \
@@ -1114,7 +1148,7 @@ def case_s_vault_only_slack_tokens_launchable() -> list[str]:
     """Vault-only slack install (tokens only in the Keychain vault, injected
     here) must yield a launchable plan with no secrets embedded in the env."""
     fails = []
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    clean_env = hermetic_env()
     fake_vault = {"SLACK_BOT_TOKEN": "xoxb-vault-secret", "SLACK_APP_TOKEN": "xapp-vault-secret"}
     with mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/fake/python3-probed"), \
          mock.patch.object(hc, "_load_channel_env", return_value={}), \
@@ -1187,7 +1221,7 @@ def case_u_resolved_bare_python3_policy() -> list[str]:
     """_resolved_bare_python3 walks startup.sh's order ($SUTANDO_PY, bundled,
     PATH) and refuses a system-bin python3 unless the developer tools exist."""
     fails = []
-    clean_env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+    clean_env = hermetic_env()
     system_stub = os.path.join("/usr", "bin", "python3")  # assembled: literal is review-flagged
     with tempfile.TemporaryDirectory() as td:
         fake_repo = Path(td) / "repo"

@@ -30,7 +30,7 @@ producer and emit a durable artifact every cycle:
 
     state/core-verdict.json
     {
-      "state":    "working|idle|degraded|needs_login|wedged|offline",
+      "state":    "working|idle|blocked|degraded|needs_login|wedged|offline",
       "severity": "ok|warn|escalate|critical",
       "authed":   true|false|null,
       "detail":   "<human string>",
@@ -56,8 +56,10 @@ shipped as separate fixes).
 | state       | severity  | meaning                                             | action    |
 |-------------|-----------|-----------------------------------------------------|-----------|
 | working/idle| `ok`      | alive and (acting \| idle-at-prompt)                | none      |
+| blocked     | `warn`    | alive, status idle, but tasks are queued and the pane holds them (a draft the dispatcher will not type over, or an abnormal frame) | REPORT, never restart |
 | degraded    | `warn`    | alive but a soft issue (stale quota, memory-index over limit, checkout drift, gateway-down-with-config) | REPORT |
 | needs_login | `escalate`| human-only blocker (login / unrecognized prompt)    | REPORT→human, **never restart** |
+| paused      | `warn`    | the launcher holds the core after a provider limit (429, usage limit); `state/core-limit-hold.json` names the limit, model and reset | REPORT, **never restart**; resumes by itself |
 | wedged      | `critical`| alive but stalled: status stale AND no progress AND no recognized prompt | ACT (gated) |
 | offline     | `critical`| process/session gone (nothing alive to kill)        | ACT (gated) |
 
@@ -100,8 +102,52 @@ Consequences, by design:
    (one consumer at a time, each its own PR).
 3. Retire the now-redundant per-consumer liveness derivations.
 
+## Per-agent snapshot: `GET /health`
+
+Full decision rules: [`docs/health-snapshot.md`](health-snapshot.md).
+
+`src/health_snapshot.py` answers "how is each agent doing?" for the core **and every
+worker**, read-only, from the files the watchers above already write (`.alive`, the
+supervisor files, the `cli_wedge` window, `pool-supervision.json`, `agent-activity.jsonl`,
+result files). It probes no process and writes nothing. agent-api serves it:
+
+```
+GET /health?agent=all|core|workers|<worker id>&view=summary|full
+{"checked_at": ..., "overall": "ok|attention|unknown",
+ "agents": [{"id": "core", "role": "core", "label": null, "alive": true,
+             "motion": "idle|moving|unknown", "condition": "healthy|abnormal|unknown",
+             "reason": null, "since": null}, ...]}
+```
+
+- A source past its freshness window gives no opinion; a stale beat makes the agent
+  `offline` whatever its other files last said.
+- `summary` carries no paths or pane text. `full` adds each source with its age and value
+  and is gated like the history routes (loopback without `Origin`, or the API token).
+- It adds a reader; no existing verdict, consumer or writer changes.
+
 ## Non-goals
 
 Not touching bridge/service health (those are separate `services-status.json`
 concerns). Not changing what counts as `working`/`offline` in `derive()` — only
 adding the severity layer on top and centralizing who reads it.
+
+## Source-backed service restarts in health-check
+
+The `health-check.py --fix` issues loop checks the checkout before each
+source-backed service action: `com.sutando.*` jobs, launchd-backed services,
+bridge restarts, stuck-CONNECTING voice recovery and conversation-server recovery.
+The check is lazy and is repeated for each action; a clean verdict from an earlier
+restart does not authorize a later action after the checkout becomes dirty.
+
+A source checkout must be clean and on `SUTANDO_EXPECTED_BRANCH`, then
+`core.expected_branch`, then `main` in precedence order. Unreadable git state,
+a broken `.git` link or an unverified non-git tree refuses the action. A shipped
+non-git engine with a readable parent `ENGINE_MANIFEST.json` containing a nonempty
+SHA retains recovery. The engine-drift check shares that manifest parser.
+
+This gate composes with pin vetoes, bridge supervision/verified eviction and the
+phone server's idle/drain policy; it does not replace them. Compiled-app launch
+and external ngrok/Tailscale recovery are separate cases. These checks narrow the
+authorization window but do not lock the working tree against concurrent edits.
+The action-inventory test covers this issues loop, not every fixer elsewhere in
+the health-check program.

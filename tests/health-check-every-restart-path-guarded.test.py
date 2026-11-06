@@ -1,125 +1,151 @@
 #!/usr/bin/env python3
-"""Every source-backed restart in main()'s --fix loop consults the canonical guard.
-
-`stale_restart_allowed()` says the guard "belongs to every auto-restart path",
-but it was called from ONE branch. The siblings — the `com.sutando.*` and
-LAUNCHD_BACKED_CHECKS launchd kickstarts, the stuck-CONNECTING voice-agent
-relaunch, and the conversation-server kill+respawn — all boot whatever is
-checked out HERE and reached that code with no guard at all.
-
-Testing the policy in isolation cannot catch this: a correct predicate wired to
-nothing passes every predicate test. So this drives main() and asserts on the
-SIDE EFFECTS each branch would produce.
-
-Run: python3 tests/health-check-every-restart-path-guarded.test.py
-"""
-from __future__ import annotations
-
+"""Guard the fix loop's source-backed actions, including changing checkout state."""
+import ast
+import contextlib
 import importlib.util
-import sys
+import io
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from collections import Counter
 from unittest import mock
 
-REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
+REPO = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("health_check", REPO / "src/health-check.py")
 hc = importlib.util.module_from_spec(spec)
-sys.modules["health_check"] = hc
+sys.modules[spec.name] = hc
 spec.loader.exec_module(hc)
 
-failures = []
+
+def issue(name, **extra):
+    return {"name": name, "status": "stale", "detail": "stale code", **extra}
 
 
-def check(label, cond, extra=""):
-    if cond:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label}  {extra}")
+@contextlib.contextmanager
+def isolated(checks):
+    with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+        for name, value in (("run_all_checks", checks), ("fix_down_bridges", []),
+                            ("publish_health_report", None), ("track_health_fix", None)):
+            stack.enter_context(mock.patch.object(hc, name, return_value=value))
+        stack.enter_context(mock.patch.object(hc, "WORKSPACE_DIR", Path(tmp)))
+        stack.enter_context(mock.patch.object(sys, "argv", ["health-check.py", "--fix", "--quiet"]))
+        yield stack
 
 
-def _chk(name, status="stale", detail="stale code"):
-    return {"name": name, "status": status, "detail": detail}
-
-
-def drive(checks, *, allowed):
-    """Run main() --fix over `checks`; return (launchd_calls, spawns, stdout).
-
-    Only the guard varies between the two calls a case makes — every other stub
-    is identical, so a difference in side effects can only come from the guard.
-    """
-    launchd, spawns, out = [], [], []
-
-    def fake_run(argv, *a, **k):
-        # pgrep in the conversation-server branch must yield no pids, so a
-        # difference in `spawns` is never explained by kill bookkeeping.
-        return mock.MagicMock(stdout="", returncode=0)
-
-    with mock.patch.object(hc, "run_all_checks", return_value=checks), \
-         mock.patch.object(hc, "stale_restart_allowed",
-                           return_value=(allowed, "test-guard: noncanonical")), \
-         mock.patch.object(hc, "fix_launchd",
-                           side_effect=lambda job: launchd.append(job) or "kickstarted"), \
-         mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
-         mock.patch.object(hc.subprocess, "Popen",
-                           side_effect=lambda argv, **k: spawns.append(argv) or mock.MagicMock()), \
-         mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
-         mock.patch.object(sys, "argv", ["health-check.py", "--fix", "--quiet"]), \
-         mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(str(x) for x in a))):
+def invoke():
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
         try:
             hc.main()
         except SystemExit:
             pass
-    return launchd, spawns, "\n".join(out)
+    return out.getvalue()
 
 
-CASES = [
-    ("com.sutando.* launchd job", [_chk("com.sutando.voice-agent")]),
-    ("LAUNCHD_BACKED_CHECKS service", [_chk(next(iter(hc.LAUNCHD_BACKED_CHECKS)))]),
-    ("conversation-server kill+respawn", [_chk("conversation-server")]),
-]
+def action_audit(loop):
+    actions, failures = Counter(), []
+    external = {"/usr/bin/open", "ngrok", "ts_bin"}
 
-for label, checks in CASES:
-    print(f"\n{label}:")
-    l_ref, s_ref, out_ref = drive(checks, allowed=False)
-    check("noncanonical: nothing kickstarted", l_ref == [], f"launchd={l_ref}")
-    check("noncanonical: nothing spawned", s_ref == [], f"spawns={s_ref}")
-    check("noncanonical: says it refused, and why",
-          "refused" in out_ref and "noncanonical" in out_ref, out_ref[-200:])
-    # POSITIVE CONTROL — without it, a branch that never runs at all would pass
-    # every assertion above by construction.
-    l_ok, s_ok, _ = drive(checks, allowed=True)
-    check("canonical control: the branch DOES restart",
-          bool(l_ok or s_ok), f"launchd={l_ok} spawns={s_ok}")
+    def block(statements, guarded=False):
+        pending = False
+        for stmt in statements:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                pending = isinstance(stmt.value.func, ast.Name) and stmt.value.func.id in {
+                    "_restart_gate", "stale_restart_allowed"}
+            if isinstance(stmt, ast.If):
+                block(stmt.body, guarded)
+                block(stmt.orelse, guarded)
+                if (pending and isinstance(stmt.test, ast.UnaryOp)
+                        and isinstance(stmt.test.op, ast.Not)
+                        and isinstance(stmt.test.operand, ast.Name)
+                        and stmt.test.operand.id == "_ok"
+                        and any(isinstance(n, ast.Continue) for n in stmt.body)):
+                    guarded = True
+                continue
+            for call in (n for n in ast.walk(stmt) if isinstance(n, ast.Call)):
+                fn = ast.unparse(call.func)
+                if fn.startswith("fix_") or fn == "_restart_bridge":
+                    actions[fn] += 1
+                    if not guarded:
+                        failures.append(fn)
+                elif fn in {"subprocess.run", "subprocess.Popen"}:
+                    arg = call.args[0]
+                    if isinstance(arg, ast.BinOp):
+                        arg = arg.left
+                    first = arg.elts[0] if isinstance(arg, (ast.List, ast.Tuple)) else arg
+                    command = first.value if isinstance(first, ast.Constant) else ast.unparse(first)
+                    actions[f"command:{command}"] += 1
+                    if command not in external and not guarded:
+                        failures.append(f"command:{command}")
+    block(loop.body)
+    return actions, failures
 
-print("\nstuck-CONNECTING voice-agent:")
-# status MUST be "fail", matching the producer at :4141 — is_issue() treats warn as
-# benign, so a warn fixture never enters issues[] and the branch is never reached.
-vt = [{"name": "voice-transport", "status": "fail", "detail": "stuck CONNECTING",
-       "_stuck_connecting": True}]
-l_ref, s_ref, out_ref = drive(vt, allowed=False)
-l_ok, s_ok, _ = drive(vt, allowed=True)
-check("noncanonical: voice-agent not kickstarted", l_ref == [], f"launchd={l_ref}")
-check("noncanonical: says it refused, and why",
-      "refused" in out_ref and "noncanonical" in out_ref, out_ref[-200:])
-check("canonical control: it IS kickstarted", l_ok == ["com.sutando.voice-agent"], f"launchd={l_ok}")
 
-print("\nthe guard is LAZY and memoized:")
-src = (REPO / "src" / "health-check.py").read_text()
-check("one call site, reached through the memo", src.count("_gate[\"v\"] = stale_restart_allowed(") == 1)
-calls = []
-with mock.patch.object(hc, "run_all_checks", return_value=[_chk("some-unrelated-check", "warn", "x")]), \
-     mock.patch.object(hc, "stale_restart_allowed",
-                       side_effect=lambda r: calls.append(r) or (True, "ok")), \
-     mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
-     mock.patch.object(sys, "argv", ["health-check.py", "--fix", "--quiet"]), \
-     mock.patch("builtins.print", side_effect=lambda *a, **k: None):
-    try:
-        hc.main()
-    except SystemExit:
-        pass
-check("NOT evaluated when no source-backed branch is reached", calls == [], f"calls={calls}")
+class GuardedRestarts(unittest.TestCase):
+    def test_each_existing_dispatch_refuses_and_permits(self):
+        cases = [issue("com.sutando.voice-agent"), issue("conversation-server"),
+                 issue("slack-bridge"), issue("voice-transport", status="fail", _stuck_connecting=True)]
+        cases += [issue(name) for name in hc.LAUNCHD_BACKED_CHECKS]
+        for check in cases:
+            for allowed in (False, True):
+                with self.subTest(check=check["name"], allowed=allowed), isolated([check]) as stack:
+                    calls = []
+                    stack.enter_context(mock.patch.object(hc, "stale_restart_allowed",
+                                                          return_value=(allowed, "noncanonical")))
+                    for name in ("fix_launchd", "fix_conversation_server"):
+                        stack.enter_context(mock.patch.object(hc, name, side_effect=lambda *a: calls.append(a) or "restarted"))
+                    stack.enter_context(mock.patch.object(hc, "_restart_bridge", side_effect=lambda *a, **kw: calls.append(a) or (True, "restarted")))
+                    out = invoke()
+                    self.assertEqual(bool(calls), allowed, out)
+                    if not allowed:
+                        self.assertIn("noncanonical", out)
 
-if failures:
-    print(f"\nFAILED ({len(failures)}): {failures}")
-    sys.exit(1)
-print("\nPASS — every source-backed restart path consults the canonical guard")
+    def test_real_checkout_is_rechecked_between_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main", tmp], check=True, capture_output=True)
+            tracked = repo / "tracked"
+            tracked.write_text("clean")
+            subprocess.run(["git", "-C", tmp, "add", "tracked"], check=True)
+            subprocess.run(["git", "-C", tmp, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "fixture"], check=True, capture_output=True)
+            for change in (False, True):
+                tracked.write_text("clean")
+                with self.subTest(change=change), isolated([issue("com.sutando.first"), issue("com.sutando.second")]) as stack:
+                    calls = []
+                    def launch(job):
+                        calls.append(job)
+                        if change:
+                            tracked.write_text("dirty")
+                        return "restarted"
+                    stack.enter_context(mock.patch.object(hc, "REPO_DIR", repo))
+                    stack.enter_context(mock.patch.dict(os.environ, {"SUTANDO_EXPECTED_BRANCH": "main"}))
+                    stack.enter_context(mock.patch.object(hc, "fix_launchd", side_effect=launch))
+                    invoke()
+                    self.assertEqual(calls, ["com.sutando.first"] if change else ["com.sutando.first", "com.sutando.second"])
+
+    def test_unrelated_check_does_not_probe_checkout(self):
+        with isolated([issue("unrelated")]) as stack:
+            guard = stack.enter_context(mock.patch.object(hc, "stale_restart_allowed"))
+            invoke()
+            guard.assert_not_called()
+
+    def test_restart_action_inventory_and_unguarded_mutation(self):
+        tree = ast.parse((REPO / "src/health-check.py").read_text())
+        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        loop = next(n for n in ast.walk(main) if isinstance(n, ast.For) and isinstance(n.iter, ast.Name) and n.iter.id == "issues"
+                    and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                            and c.func.id == "fix_launchd" for c in ast.walk(n)))
+        actions, failures = action_audit(loop)
+        self.assertEqual(failures, [])
+        self.assertEqual(actions, Counter({"fix_launchd": 3, "_restart_bridge": 1,
+            "fix_conversation_server": 1, "command:/usr/bin/open": 1,
+            "command:ngrok": 1, "command:ts_bin": 1}))
+        loop.body += ast.parse('if c["name"] == "metrics-sidecar":\n    subprocess.run(["launchctl", "kickstart", "-k", "metrics"])').body
+        self.assertIn("command:launchctl", action_audit(loop)[1])
+
+
+if __name__ == "__main__":
+    unittest.main()

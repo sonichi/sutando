@@ -19,6 +19,11 @@ Run: python3 tests/health-check-core-quota.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import time
@@ -51,12 +56,17 @@ class TestCoreQuotaExhausted(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _write(self, *, available, status, age_sec=0, reset=None):
+    def _write(self, *, available, status, age_sec=0, reset=None, util=None, extra=None):
         payload = {"available": available, "headers": {
             "anthropic-ratelimit-unified-status": status,
         }}
         if reset is not None:
             payload["headers"]["anthropic-ratelimit-unified-5h-reset"] = str(reset)
+        if util is not None:
+            payload["headers"]["anthropic-ratelimit-unified-5h-utilization"] = str(util[0])
+            payload["headers"]["anthropic-ratelimit-unified-7d-utilization"] = str(util[1])
+        for k, v in (extra or {}).items():
+            payload["headers"][k] = v
         self.qpath.write_text(json.dumps(payload))
         if age_sec:
             old = time.time() - age_sec
@@ -135,6 +145,88 @@ class TestCoreQuotaExhausted(unittest.TestCase):
     def test_status_not_allowed_even_if_available_flag_true(self):
         # Defensive: trust the unified status header, not just the bool.
         self._write(available=True, status="rejected", reset=int(time.time()) + 60)
+        self.assertEqual(self.hc.check_core_quota_exhausted()["status"], "fail")
+
+    def test_warn_summary_renders_overage_as_a_flag_not_a_budget(self):
+        """A live header set carries a third window, `overage`; `0%` there reads
+        as headroom, so the summary says on/off instead."""
+        self._write(available=False, status="rejected", util=(0.04, 0.24), extra={
+            "anthropic-ratelimit-unified-overage-utilization": "0.0",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("overage: off", c["detail"])
+        self.assertNotIn("overage 0%", c["detail"])
+        self._write(available=False, status="rejected", util=(0.04, 0.24), extra={
+            "anthropic-ratelimit-unified-overage-utilization": "0.3",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("overage: on", c["detail"])
+
+    def test_rejected_with_both_windows_low_is_a_warn_naming_the_shared_proxy(self):
+        # Another client's credit gate through the shared proxy, not this core's window.
+        self._write(available=False, status="rejected", util=(0.13, 0.52))
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("shared credential proxy", c["detail"])
+        self.assertIn("5h 13%", c["detail"])
+        self.assertIn("7d 52%", c["detail"])
+
+    def test_rejected_per_model_window_at_full_still_fails_and_names_it(self):
+        # Live shape 2026-09-03: 5h 13% / 7d 52%, but 7d_oi rejected at 100%.
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("7d_oi (100%, rejected)", c["detail"])
+
+    def test_unparseable_window_utilization_with_rejected_status_still_fails(self):
+        # A rejected window whose utilization does not parse is named as n/a, not crashed on.
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-7d_oi-utilization": "n/a",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("7d_oi (n/a, rejected)", c["detail"])
+
+    def test_per_window_rejected_status_counts_even_below_the_utilization_bar(self):
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-7d_oi-utilization": "0.5",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("7d_oi (50%, rejected)", c["detail"])
+
+    def test_serving_on_extra_usage_does_not_page(self):
+        # Issue #5283: 7d rejected but overage allowed and requests succeed.
+        self._write(available=False, status="rejected", util=(0.2, 1.0), extra={
+            "anthropic-ratelimit-unified-7d-status": "rejected",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("extra usage", c["detail"])
+
+    def test_a_rejected_overage_window_never_pages_on_its_own(self):
+        # overage-status: rejected is permanent with overage off and carries no
+        # utilization; with both limit windows low it is another client's gate.
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-overage-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("shared credential proxy", c["detail"])
+        self.assertIn("overage: on", c["detail"])
+
+    def test_rejected_with_a_window_near_full_still_fails(self):
+        self._write(available=False, status="rejected", util=(0.97, 0.52))
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("OVER QUOTA", c["detail"])
+
+    def test_rejected_without_utilization_headers_still_fails(self):
+        # An unknown reading corroborates nothing: the original page stays loud.
+        self._write(available=False, status="rejected")
         self.assertEqual(self.hc.check_core_quota_exhausted()["status"], "fail")
 
     def test_stale_exhausted_does_not_alert(self):

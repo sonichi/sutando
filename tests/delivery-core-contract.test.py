@@ -22,9 +22,11 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
-    BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
+    BackendCapabilities, ClaimToken, Defer, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
-    ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
+    ProviderIndeterminate, ProviderPermanentRefused, ProviderRefused, RetryPolicy,
+    idempotency_key)
+from ag2_sparrow.delivery_core.core import _resend_epoch  # noqa: E402
 from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
 from ag2_sparrow import outbox  # noqa: E402
 
@@ -79,6 +81,44 @@ class ContractCase(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_every_backend_declares_resend_epoch(self):
+        """Declared, not duck-typed (per sonichi on #3853).
+
+        `_resend_epoch` falls back to 0 for a backend without the method, and 0
+        keeps the idempotency key at `id#0` — so the provider dedupes an
+        operator re-send against the very attempt that parked the item while
+        the operator reads `result: requeued`. The fallback is what made that
+        silent, so no first-party backend may rely on it.
+        """
+        fn = getattr(self.backend, "resend_epoch", None)
+        self.assertTrue(callable(fn),
+                        "resend_epoch is on the ClaimBackend protocol; a backend "
+                        "without it takes the duck-type fallback and its re-sends "
+                        "are deduped against the parked attempt")
+        self.assertIsInstance(fn(ITEM), int)
+
+    def test_a_requeue_presents_a_new_idempotency_key(self):
+        """The coupling itself, not the spelling: requeue must change the key.
+
+        Guarded on outbox visibility because the epoch lives in the outbox item
+        record — a backend whose items outbox cannot see mints no epoch, and
+        `requeue_item` correctly answers ABSENT there rather than reporting a
+        recovery it did not perform.
+        """
+        root = Path(self.tmp.name)
+        self.backend.publish(ITEM, b"x")
+        if not any(r.get("item_id") == ITEM for r in outbox.list_items(root)):
+            self.skipTest("outbox cannot see this backend's items, so requeue "
+                          "answers ABSENT and no epoch is minted")
+        before = idempotency_key(ITEM, _resend_epoch(self.backend, ITEM))
+        outbox.park_item(root, ITEM, "max-attempts")
+        self.assertIs(outbox.requeue_item(root, ITEM, operator="contract"),
+                      outbox.RequeueOutcome.REQUEUED)
+        after = idempotency_key(ITEM, _resend_epoch(self.backend, ITEM))
+        self.assertNotEqual(before, after,
+                            f"requeue must present a NEW logical side effect; "
+                            f"key stayed {after} so the provider dedupes it")
 
     def test_capabilities_are_declared_not_sniffed(self):
         self.assertIsInstance(self.backend.capabilities, BackendCapabilities)
@@ -186,6 +226,80 @@ class ContractCase(unittest.TestCase):
                                    msg="non-declaring backend must raise, "
                                        "never silently no-op"):
                 self.backend.force_release(ITEM)
+
+    def test_a_deferring_revalidation_neither_sends_nor_withdraws(self):
+        """A `Defer` answer releases the claim unsent with no attempt; the next pass sends."""
+        self.backend.publish(ITEM, b"x")
+        p = _Recorder([DeliveryOutcome.CONFIRMED])
+        answers = [Defer("cannot check yet"), None]
+        core = DeliveryCore(self.backend, p, worker="w1", revalidate=lambda *_a: answers.pop(0))
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.status, DrainStatus.DEFERRED)
+        self.assertIsNone(r.outcome)
+        self.assertEqual(r.detail, "cannot check yet")
+        self.assertEqual(p.deliver_calls, [], "no provider call on a deferral")
+        self.assertFalse(self.backend.is_terminal(ITEM), "never parked")
+        self.assertEqual(self.backend.attempts(ITEM), 0, "no attempt counted")
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(len(p.deliver_calls), 1)
+
+    def test_release_by_a_stale_token_changes_nothing(self):
+        self.backend.publish(ITEM, b"x")
+        t = self.backend.claim(ITEM, "w1")
+        self.assertTrue(self.backend.release(t))
+        self.assertFalse(self.backend.release(t), "an already-released token owns nothing")
+        t2 = self.backend.claim(ITEM, "w2")
+        self.assertIsNotNone(t2, "released means claimable again")
+        self.assertFalse(self.backend.release(t), "nor may it release a successor's claim")
+        self.assertIsNone(self.backend.claim(ITEM, "w3"), "the successor still owns it")
+        self.assertTrue(self.backend.release(t2))
+        t3 = self.backend.claim(ITEM, "w1")
+        self.assertIsNotNone(t3)
+        self.assertNotEqual(t3.incarnation, t.incarnation)
+        self.assertFalse(self.backend.release(t), "the same worker's earlier incarnation owns nothing")
+        self.assertIsNone(self.backend.claim(ITEM, "w4"), "w1's live incarnation still owns it")
+
+
+class SharedRootResendEpoch(unittest.TestCase):
+    """sonichi's #3853 control: two backends, ONE outbox root.
+
+    The per-backend suite above gives each backend its own root, so C never
+    holds an outbox-visible item and its behavioural coupling is skipped there.
+    This is the shape the defect was reported in: Design A published, so the
+    record exists and `requeue_item` mints an epoch — and C must read that same
+    epoch, or the operator is told `requeued` while the provider dedupes the
+    re-send against the attempt that parked the item.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.a = DesignAClaimBackend(self.root)
+        self.c = DesignCClaimBackend(self.root, activate=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_both_backends_see_the_same_requeued_epoch(self):
+        self.a.publish(ITEM, b"x")
+        outbox.park_item(self.root, ITEM, "max-attempts")
+        self.assertIs(outbox.requeue_item(self.root, ITEM, operator="contract"),
+                      outbox.RequeueOutcome.REQUEUED)
+        stored = outbox.resend_epoch_for(self.root, ITEM)
+        self.assertEqual(stored, 1, "requeue must mint an epoch on this root")
+        for name, backend in (("A", self.a), ("C", self.c)):
+            with self.subTest(backend=name):
+                self.assertEqual(
+                    _resend_epoch(backend, ITEM), stored,
+                    f"backend {name} reports epoch "
+                    f"{_resend_epoch(backend, ITEM)} against a stored {stored}; "
+                    f"its key would be {idempotency_key(ITEM, _resend_epoch(backend, ITEM))} "
+                    f"while the provider already saw {idempotency_key(ITEM, 0)}")
+        self.assertEqual(idempotency_key(ITEM, _resend_epoch(self.a, ITEM)),
+                         idempotency_key(ITEM, _resend_epoch(self.c, ITEM)),
+                         "the two backends must present the SAME key for the "
+                         "same item on the same root")
 
 
 class CorePolicy(unittest.TestCase):
@@ -378,6 +492,63 @@ class CorePolicy(unittest.TestCase):
         r = self._core(p).deliver_one(ITEM, b"x")
         self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED)
 
+    def replaced(self, hook, outcomes) -> "tuple[list, dict, list]":
+        """A backend with `replace_refused`, the payload "x" published with a source proof, and a
+        drain per outcome: what was sent, the record left, and the keys each send used."""
+        with tempfile.TemporaryDirectory() as d:
+            backend = DesignAClaimBackend(Path(d), replace_refused=hook)
+            backend.publish(ITEM, b"x", source_ready_sha256="ab" * 32)
+            sent: list = []
+
+            class _Sends(_Recorder):
+                def deliver(self, item_id, payload, key):
+                    sent.append(payload)
+                    return super().deliver(item_id, payload, key)
+            provider = _Sends(outcomes)
+            core = DeliveryCore(backend, provider)
+            for _ in range(len(outcomes) + 1):
+                core.deliver_one(ITEM, b"x")
+            return sent, outbox._read_item(backend.root, ITEM), [k for _i, k in provider.deliver_calls]
+
+    def test_a_refusal_for_good_parks_unless_a_replacement_is_configured(self):
+        """`replace_refused` is opt-in. Without it a refusal for good parks, as before. With it
+        the replacement is stored once, the refused payload and the source proof kept, under a
+        new resend epoch, and it is what the next attempt sends."""
+        self._core(_Recorder([ProviderPermanentRefused("HTTP 400")])).deliver_one(ITEM, b"x")
+        self.assertEqual(outbox._read_item(self.backend.root, ITEM)["reason"], "permanent-refusal")
+        sent, record, keys = self.replaced(lambda stored: "y", [ProviderPermanentRefused("HTTP 400"),
+                                                                DeliveryOutcome.CONFIRMED])
+        self.assertEqual(sent, [b"x", b"y"])
+        self.assertEqual((record["status"], record["payload"], record["refused_payload"]),
+                         ("DELIVERED", "y", "x"))
+        self.assertEqual(outbox.source_proof(record), "ab" * 32)
+        self.assertEqual(keys, [idempotency_key(ITEM, 0), idempotency_key(ITEM, 1)],
+                         "the replacement did not get an idempotency key of its own")
+
+    def test_a_refused_replacement_or_none_to_offer_parks_as_refused_for_good(self):
+        refusal = ProviderPermanentRefused("HTTP 400")
+        # A hook that always has another replacement: still only one is ever tried.
+        sent, record, _keys = self.replaced(lambda stored: stored + "'", [refusal, refusal, refusal])
+        self.assertEqual(sent, [b"x", b"x'"], "a refused replacement was replaced again")
+        # The refusal's own reason is kept after the prefix.
+        self.assertEqual((record["status"], record["reason"], record["payload"]),
+                         ("PARKED", "refused-for-good:permanent-refusal", "x'"))
+        sent, record, _keys = self.replaced(lambda stored: None, [refusal])
+        self.assertEqual(sent, [b"x"])
+        self.assertEqual((record["status"], record["reason"], record["payload"]),
+                         ("PARKED", "refused-for-good:permanent-refusal", "x"))
+        self.assertNotIn("refused_payload", record)
+
+    def test_a_refused_for_good_reason_is_matched_with_or_without_the_refusals_reason(self):
+        from ag2_sparrow.delivery_core import REFUSED_FOR_GOOD, is_refused_for_good, refused_for_good
+        self.assertEqual(refused_for_good("HTTP 400"), "refused-for-good:HTTP 400")
+        self.assertEqual((refused_for_good(None), refused_for_good("")), (REFUSED_FOR_GOOD,) * 2)
+        # The bare prefix is what an earlier build parked with.
+        for reason in (REFUSED_FOR_GOOD, "refused-for-good:permanent-refusal"):
+            self.assertTrue(is_refused_for_good(reason), reason)
+        for reason in (None, "", 7, "permanent-refusal", "refused-for-goodness", "x:refused-for-good"):
+            self.assertFalse(is_refused_for_good(reason), reason)
+
     def test_programming_error_propagates(self):
         """Owner review finding 5, the other half: a bare Exception is a
         bug or a config error, not evidence the side effect may have run.
@@ -511,6 +682,9 @@ def load_tests(loader, tests, pattern):
                     {"backend_name": name})
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(loader.loadTestsFromTestCase(CorePolicy))
+    # An unregistered class is collected by nothing here: load_tests
+    # replaces discovery, so a new case must be added explicitly.
+    suite.addTests(loader.loadTestsFromTestCase(SharedRootResendEpoch))
     return suite
 
 

@@ -30,13 +30,16 @@ untouched.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
 import time
 import urllib.request
 import uuid
+
+from . import diagnostics, gateway_instance
+from .file_lock import lock_fd, unlock_fd
+from .local_task_protocol import reply_action_text
 
 _KEYCAP = {f"{i}️⃣": i for i in range(1, 10)}  # 1️⃣..9️⃣ → 1..9
 # The `answer` keyword is OPTIONAL: live human acceptance (2026-07-26) showed
@@ -72,18 +75,19 @@ def _relates_to(event: dict) -> "str | None":
     return None
 
 
-def _text(event: dict) -> str:
-    """Answer-bearing text of an event: the body, plus — when the envelope
-    carries a structured A2UI click (content["space.ag2.a2ui.action"], per
-    A2UI-CONTRACT.md) — that click's value/name. Button actions use our own
-    `answer ha_x N` grammar, so folding them into the scanned text lets ONE
-    regex serve typed replies, ▸-style click bodies, and structured clicks."""
+def _text(event: dict) -> "tuple[str, str]":
+    """Return unquoted owner text separately from the structured click text."""
     content = event.get("content") or {}
-    parts = [str(content.get("body") or content.get("text") or "")]
+    body = reply_action_text(str(content.get("body") or content.get("text") or ""))
+    body = "\n".join(
+        line for line in body.split("\n")
+        if line.rstrip("\r") != ">" and not line.startswith(("> ", ">\t")))
     click = content.get("space.ag2.a2ui.action")
+    click_text = ""
     if isinstance(click, dict):
-        parts += [str(click.get("value") or ""), str(click.get("name") or "")]
-    return " ".join(p for p in parts if p)
+        click_text = " ".join(str(click.get(key) or "")
+                              for key in ("value", "name") if click.get(key))
+    return body, click_text
 
 
 def _emoji_key(event: dict) -> "str | None":
@@ -130,12 +134,12 @@ class ActionStore:
         return os.path.join(self.dir, action_id + ".lock")
 
     def transition_lock(self, action_id: str):
-        """flock-guarded critical section shared by EVERY writer of an action
+        """Lock-guarded critical section shared by EVERY writer of an action
         file (this resolver AND the hook's timeout path — same protocol, same
         lock file). Serializes read→check→write so exactly one terminal
         transition can win (review: CAS race between resolver and expiry)."""
         lock_file = open(self._lock_path(action_id), "a+")
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        lock_fd(lock_file.fileno())
         return lock_file
 
     def update(self, rec: dict) -> None:
@@ -150,11 +154,12 @@ class ActionStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        dfd = os.open(self.dir, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if os.name != "nt":
+            dfd = os.open(self.dir, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
 
     def resolve(self, action_id: str, answers: dict, resolved_by: str) -> bool:
         """Write a decision iff the action is still pending (terminal states
@@ -178,8 +183,10 @@ class ActionStore:
             self.update(rec)
             return True
         finally:
-            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
-            lk.close()
+            try:
+                unlock_fd(lk.fileno())
+            finally:
+                lk.close()
 
 
 class CardPoster:
@@ -265,15 +272,16 @@ class CardPoster:
                 continue
             body = json.dumps({"op": "message", "room_id": self._room,
                                "body": self._render(rec)}).encode()
-            req = urllib.request.Request(
-                self._url + "/v1/room", data=body,
-                headers={**self._headers, "Content-Type": "application/json"},
-                method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    reply = json.loads(resp.read().decode() or "{}")
+                with gateway_instance.gateway_call(self._url):
+                    req = urllib.request.Request(
+                        self._url + "/v1/room", data=body,
+                        headers={**self._headers, "Content-Type": "application/json"},
+                        method="POST")
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        reply = json.loads(resp.read().decode() or "{}")
             except Exception as e:  # noqa: BLE001 — best-effort, retry next sweep
-                self._log(f"human-action: card post failed (will retry): {e}")
+                self._log(f"human-action: card post failed (will retry): {diagnostics.describe(e)}")
                 continue
             event_id = reply.get("event_id") or (reply.get("result") or {}).get("event_id")
             # Record the card on the CURRENT record under the shared transition
@@ -297,8 +305,10 @@ class CardPoster:
                               f"terminal state during card post — card stamp "
                               f"skipped (no resurrect)")
             finally:
-                fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
-                lk.close()
+                try:
+                    unlock_fd(lk.fileno())
+                finally:
+                    lk.close()
         return posted
 
 
@@ -321,7 +331,6 @@ class DecisionHandler:
             return None
         by_card = {r.get("card_event_id"): r for r in pending if r.get("card_event_id")}
         etype = event.get("type")
-        text = _text(event)
 
         rec, choice_nums = None, None
         if etype == "reaction.added":
@@ -331,14 +340,17 @@ class DecisionHandler:
             if rec and num:
                 choice_nums = [num]
         elif etype == "message.created":
-            parsed = _parse_answer(text)
+            owner_text, click_text = _text(event)
+            parsed = _parse_answer(click_text) if click_text else None
+            if parsed is None:
+                parsed = _parse_answer(owner_text)
             if parsed:
                 rec = next((r for r in pending if r["action_id"] == parsed[0]), None)
                 choice_nums = [int(n) for n in re.findall(r"\d+", parsed[1])]
             else:
                 rec = by_card.get(_relates_to(event))
-                if rec and text.strip().isdigit():
-                    choice_nums = [int(text.strip())]
+                if rec and owner_text.strip().isdigit():
+                    choice_nums = [int(owner_text.strip())]
         if not rec or not choice_nums:
             return None
         # AUTHORIZATION — the whole point: only the owner resolves.

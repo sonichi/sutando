@@ -126,6 +126,80 @@ sleep 0.4
 assert_alive "blind-case: env unreadable -> live instance SURVIVED (never kills on unknown)" "$PID_BLIND"
 kill "$PID_BLIND" 2>/dev/null || true
 
+# --- list mode (read-only verifier over the SAME identity decision) ---------
+# The one-owner rule (#3553 round 4): health-check's post-eviction survivor scan
+# delegates here instead of mirroring the policy in Python. OWN only for this
+# checkout; foreign silent; unreadable identity prints INDETERMINATE.
+( cd "$A" && exec "$PY" src/slack-bridge.py ) & PID_LA=$!
+( cd "$B" && exec "$PY" src/slack-bridge.py ) & PID_LB=$!
+sleep 0.6
+LIST_OUT="$(bash "$HELPER" --list slack "$A")"
+case "$LIST_OUT" in
+  "OWN $PID_LA") echo "  ok   list mode: exactly this checkout's pid, foreign silent" ;;
+  *) echo "  FAIL list mode output: '$LIST_OUT' (expected 'OWN $PID_LA')"; FAILED=1 ;;
+esac
+# Indeterminate identity must SURFACE, not hide. The probe seam is overridden
+# directly (platform-portable: /proc makes real env/cwd readable on Linux).
+LIST_BLIND="$( . "$HELPER"; _pid_env() { return 1; }; list_own_bridge slack "$A" GATEWAY_INSTANCE "" 2>/dev/null )"
+case "$LIST_BLIND" in
+  *INDETERMINATE*) echo "  ok   list mode: indeterminate identity prints INDETERMINATE (fail-closed signal)" ;;
+  *) echo "  FAIL list mode hid an indeterminate pid: '$LIST_BLIND'"; FAILED=1 ;;
+esac
+kill "$PID_LA" "$PID_LB" 2>/dev/null || true
+
+# --- a checkout path CONTAINING SPACES (#3553 round 4, blocker 1's shape) ----
+# The bundled install lives under "Application Support"; identity must survive
+# whitespace for both the evicting and listing entry points.
+mkdir -p "$TMP/spaced dir"
+mk_checkout "$TMP/spaced dir/checkoutS"
+SREPO="$(cd "$TMP/spaced dir/checkoutS" && pwd -P)"
+( cd "$SREPO" && exec "$PY" src/slack-bridge.py ) & PID_S=$!
+( cd "$B" && exec "$PY" src/slack-bridge.py ) & PID_SB=$!
+sleep 0.6
+assert_alive "spaced-path checkout's bridge started" "$PID_S"
+SLIST="$(bash "$HELPER" --list slack "$SREPO")"
+case "$SLIST" in
+  "OWN $PID_S") echo "  ok   list mode: spaced-path checkout classified OWN" ;;
+  *) echo "  FAIL spaced-path list output: '$SLIST' (expected 'OWN $PID_S')"; FAILED=1 ;;
+esac
+evict_own_bridge slack "$SREPO"
+sleep 0.4
+assert_dead  "spaced-path checkout's bridge was evicted" "$PID_S"
+assert_alive "other checkout SURVIVED the spaced-path eviction" "$PID_SB"
+kill "$PID_SB" 2>/dev/null || true
+
+# --- hard candidate-discovery failure (#3553 round 5) ------------------------
+# A pgrep rc >1 is an UNREADABLE process table, not emptiness. Both REAL entry
+# points must exit nonzero and take no side effects — rc 0 + '' here is what let
+# health-check report "evicted + confirmed exited" over a live stale bridge.
+BADPG="$TMP/badpgrep"; mkdir -p "$BADPG"
+printf '#!/bin/sh\nexit 3\n' > "$BADPG/pgrep"; chmod +x "$BADPG/pgrep"
+( cd "$A" && exec "$PY" src/slack-bridge.py ) & PID_H=$!
+sleep 0.6
+assert_alive "hard-rc: own bridge started" "$PID_H"
+LIST_HARD_OUT="$(PATH="$BADPG:$PATH" bash "$HELPER" --list slack "$A")"; LIST_HARD_RC=$?
+if [ "$LIST_HARD_RC" -gt 1 ] && [ -z "$LIST_HARD_OUT" ]; then
+  echo "  ok   --list: pgrep rc=3 propagates (rc=$LIST_HARD_RC), no clean-empty lie"
+else
+  echo "  FAIL --list swallowed a hard discovery failure: rc=$LIST_HARD_RC out='$LIST_HARD_OUT'"; FAILED=1
+fi
+EV_HARD_OUT="$(PATH="$BADPG:$PATH" bash "$HELPER" slack "$A" 2>/dev/null)"; EV_HARD_RC=$?
+if [ "$EV_HARD_RC" -gt 1 ]; then
+  echo "  ok   evict: pgrep rc=3 propagates (rc=$EV_HARD_RC)"
+else
+  echo "  FAIL evict swallowed a hard discovery failure: rc=$EV_HARD_RC out='$EV_HARD_OUT'"; FAILED=1
+fi
+sleep 0.3
+assert_alive "hard-rc: bridge UNTOUCHED by the failed discovery (side-effect-free)" "$PID_H"
+# rc 1 (clean no-match) stays a clean empty success — the legitimate case.
+NOMATCH_OUT="$(bash "$HELPER" --list nosuchchannel "$A")"; NOMATCH_RC=$?
+if [ "$NOMATCH_RC" -eq 0 ] && [ -z "$NOMATCH_OUT" ]; then
+  echo "  ok   --list: rc 1 no-match is still a clean empty success"
+else
+  echo "  FAIL no-match case broke: rc=$NOMATCH_RC out='$NOMATCH_OUT'"; FAILED=1
+fi
+kill "$PID_H" 2>/dev/null || true
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "PASS — channel-bridge evict isolation"; exit 0; fi
 echo "FAIL — channel-bridge evict isolation"; exit 1

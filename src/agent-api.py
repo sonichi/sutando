@@ -11,6 +11,7 @@ Endpoints:
   GET  /tasks/history     — authenticated archive-backed task history
   POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
+  GET  /health            — per-agent health snapshot (?agent=all|core|workers|<id>&view=summary|full)
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
   POST /twilio/sms        — inbound SMS webhook (Twilio)
@@ -29,11 +30,20 @@ Twilio setup:
   Set webhook URL in Twilio console to https://<your-tunnel>/twilio/voice (calls)
   and https://<your-tunnel>/twilio/sms (messages).
 
+  The tunnel must also forward /twilio/transcription: handle_twilio_voice sets it
+  as the voicemail transcribeCallback, so an allowlist without it records messages
+  whose transcripts never arrive. Forward ONLY those three. A whole-port tunnel
+  publishes every endpoint above, and a proxy that connects from localhost defeats the
+  AGENT_API_BIND=127.0.0.1 default that is otherwise the only thing in front of
+  POST /task -- check_auth() returns True unconditionally when SUTANDO_API_TOKEN
+  is unset, which is the default.
+
 Security: Set SUTANDO_API_TOKEN in .env for token auth (Authorization: Bearer <token>).
+Without it POST /task is unauthenticated and the bind is the sole protection, so
+set the token BEFORE exposing this port by any route.
 For remote access: use ngrok or SSH tunnel.
 """
 
-import hashlib
 import http.server
 import ipaddress
 import json
@@ -47,9 +57,11 @@ import stat
 import subprocess
 import sys
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timezone
+from typing import Optional
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 
 
 def _safe_id(raw: str) -> str:
@@ -99,16 +111,21 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               files like src/health-check.py, running `git -C` against the
 #               checkout, loading .env, etc. Stays anchored to the checkout.
 # - WORKSPACE_DIR = runtime state (resolve_workspace()) — for tasks/, results/,
-#               core-status.json, pending-questions.md, contextual-chips.json,
+#               core-status.json, the pending-questions outbox, contextual-chips.json,
 #               etc. Honors SUTANDO_WORKSPACE when set so watcher + bridges
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import connections as _connections  # noqa: E402
+import local_api_gate  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+import tmux_probe  # noqa: E402
+import health_snapshot  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
@@ -122,13 +139,30 @@ if _PORT_ENV is not None and not _PORT_ENV.isdigit():
     # witness port must not silently collide with it.
     raise ValueError(f"AGENT_API_PORT={_PORT_ENV!r} is not a port number")
 PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
+# Host names (beyond loopback and IP literals) this API may be reached by, e.g. a LAN name;
+# any other Host is refused as DNS rebinding. The web client's port gets same-host CORS reads.
+ALLOWED_HOSTS = config_get("AGENT_API_ALLOWED_HOSTS", "")
+
+
+def _port_setting(key: str, default: int) -> int:
+    try:
+        return int(config_get(key, str(default)) or default)
+    except ValueError:
+        return default
+
+
+WEB_CLIENT_PORT = _port_setting("CLIENT_PORT", 8080)
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
-from pending_questions_md import active_region  # noqa: E402
+import local_record  # noqa: E402
+import pending_questions_reader  # noqa: E402
+import pending_questions_triage as pq_triage  # noqa: E402
+import skill_roots  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
                                submit_signal_room_task, submission_status)  # noqa: E402
 
@@ -153,6 +187,158 @@ def _emit_task_processed(content: str) -> None:
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
+
+# Connections over HTTP: the web client's transport to src/connections.py (docs/connections.md).
+# Every route, GET included, needs the local API bearer; the gate is local_api_gate's.
+CONNECTIONS_PREFIX = "/api/v1/connections"
+CONNECTIONS_BODY_CAP = 16384
+
+
+def connections_bearer() -> str:
+    return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
+
+
+def pool_room_bindings(repo: Path, workspace: Path):
+    """The worker pool's room bindings when that skill is installed, else None."""
+    return _connections.room_bindings_from_script(
+        Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_roster.py", workspace)
+
+
+def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
+                     workspace: Optional[Path] = None, repo: Optional[Path] = None,
+                     logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
+                     kill=None, getaddrinfo=None, whoami=None) -> "tuple[int, Optional[dict]]":
+    """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
+    The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
+    POST previews or (confirm) creates and starts the bridge, DELETE removes, POST <instance>/primary moves the primary,
+    POST <instance>/promote moves it while the old primary runs (`{"park": true}` also parks the old one),
+    POST <instance>/park parks a secondary, POST park-legacy parks every row but the primary (the cutover),
+    POST <instance>/unpark brings a parked row back, POST <instance>/disconnect stops and disables,
+    POST <instance>/reconnect relaunches,
+    POST <instance>/token replaces the secret with a new code for the same connection,
+    POST move moves a connection to its successor server with its existing secret (`try_reuse_move`);
+    <instance> `legacy` names the legacy row. Dispatch only; every rule lives in src/connections.py."""
+    ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
+    repo = Path(repo) if repo is not None else REPO_DIR
+    logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
+    query = query or {}
+    parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
+    # The legacy row's instance is "", which no path segment can carry.
+    if parts[:1] == [_connections.LEGACY_PATH_SEGMENT]:
+        parts[0] = ""
+    try:
+        if method == "GET" and not parts:
+            rows = _connections.list_connections(ws, vault=vault)
+            return 200, {"connections": [_connections.status_for(r, ws) for r in rows],
+                         "capabilities": list(_connections.CAPABILITIES),
+                         "no_primary": _connections.no_primary(ws)}
+        # A fixed name, matched before any <instance> route so it is never read as a slug.
+        if parts == ["known-servers"]:
+            if method != "GET":
+                return 405, {"error": "method not allowed"}
+            return 200, {"servers": _connections.known_servers(ws)}
+        if parts == ["move"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            instance, dry_run = body.get("instance"), body.get("dry_run", False)
+            if instance is not None and not isinstance(instance, str):
+                return 400, {"error": "instance must be a string"}
+            if not isinstance(dry_run, bool):
+                return 400, {"error": "dry_run must be a boolean"}
+            instance = "" if instance == _connections.LEGACY_PATH_SEGMENT else instance
+            out = _connections.try_reuse_move(instance, repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                              fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, spawn=spawn,
+                                              kill=kill, added_by="ui", dry_run=dry_run,
+                                              room_bindings=pool_room_bindings(repo, ws))
+            return 200, out
+        if parts == ["park-legacy"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            return 200, _connections.park_legacy(workspace=ws, kill=kill)
+        if method == "POST" and not parts:
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            confirm = body.get("confirm", False)
+            if not isinstance(confirm, bool):
+                return 400, {"error": "confirm must be a boolean"}
+            preview = _connections.preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo)
+            if not confirm:
+                return 200, {"preview": preview}
+            expected = body.get("expected_server")
+            if not isinstance(expected, str) or not expected.strip():
+                return 400, {"error": "confirm needs expected_server (the server the preview showed)"}
+            skip_backlog = body.get("skip_backlog", False)
+            if not isinstance(skip_backlog, bool):
+                return 400, {"error": "skip_backlog must be a boolean"}
+            try:
+                row, created = _connections.add_connection(
+                    token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault, kill=kill,
+                    skip_backlog=skip_backlog)
+            except _connections.ConnectionMismatch as e:
+                return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
+            launch = _connections.start_added(row, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                              vault=vault, spawn=spawn)
+            return (201 if created else 200), {"created": created, "launch": launch,
+                                               "connection": _connections.status_for(row, ws)}
+        if len(parts) == 1 and method == "DELETE":
+            force = str((query.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+            try:
+                _connections.remove_connection(parts[0], force=force, workspace=ws, vault=vault, kill=kill)
+            except _connections.Refusal as e:
+                return 409, {"error": e.CODE}
+            except _connections.PrimaryProtected:
+                return 409, {"error": "primary"}
+            return 204, None
+        if len(parts) == 2 and method == "POST" and parts[1] == "primary":
+            row = _connections.set_primary(parts[0], workspace=ws)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "promote":
+            park = body.get("park", False)
+            if not isinstance(park, bool):
+                return 400, {"error": "park must be a boolean"}
+            row = _connections.promote(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                       spawn=spawn, kill=kill, park=park)
+            return 200, {"connection": _connections.status_for(row, ws), "previous": row["previous"],
+                         "kept": row["kept"], "stopped_pid": row["stopped_pid"], "launch": row["launch"],
+                         "changed": row["changed"], "relaunch_needed": row["relaunch_needed"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "park":
+            row = _connections.park(parts[0], workspace=ws, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws), "stopped_pid": row["stopped_pid"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "unpark":
+            row = _connections.unpark(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault, spawn=spawn)
+            return 200, {"connection": _connections.status_for(row, ws), "launch": row["launch"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "disconnect":
+            row = _connections.disconnect(parts[0], workspace=ws, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
+            record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
+            return 202, {"launch": record}
+        if len(parts) == 2 and method == "POST" and parts[1] == "token":
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            row = _connections.update_token(parts[0], token, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        return 404, {"error": "not found"}
+    except _connections.Refusal as e:
+        # One rule for every state refusal: 409 with the module's own code.
+        return 409, {"error": e.CODE}
+    except _connections.VaultUnavailable:
+        return 503, {"error": "vault_unavailable"}
+    except _connections.InvalidToken as e:
+        return 400, {"error": "invalid_gateway" if "invalid_gateway" in str(e) else str(e)}
+    except _connections.UnknownConnection as e:
+        return 404, {"error": str(e)}
+    except _connections.SchemaError as e:
+        return 500, {"error": str(e)}
+    except _connections.ConnectionsError as e:
+        return 400, {"error": str(e)}
 
 RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(parents=True, exist_ok=True)
@@ -226,89 +412,6 @@ def _remember_done_result_file(result_file: Path) -> None:
             entry["source"] = source_line
 
 
-# --- pending-questions.md ---------------------------------------------------
-# ONE parser, shared by GET /status (lists the questions, mints their ids) and
-# POST /answer (resolves an id back to a section). They used to walk the file
-# separately, and drifted: the reader took the free-form format (post-#1265, no
-# **Status:** markers) while the writer still required a **Status:**/**Options:**
-# line, so every free-form question was listed but unanswerable — POST /answer
-# 404'd on every id. Both paths stay on this function.
-PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
-PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
-PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
-PQ_FIELD_RE = re.compile(r'\*\*(?:Status|Options|Asked|Question):\*\*')
-PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
-
-
-def parse_pending_questions(content: str) -> list[dict]:
-    """Open questions in pending-questions.md, in file order.
-
-    Ids are derived from the section's own content, not its title or its
-    position. The agent rewrites this file continuously, so a positional id
-    minted by one GET points at a different — or already-archived — section by
-    the time the owner clicks answer on it. Each dict carries the section's
-    `start`/`end` offsets into `content` so the writer can splice it in place.
-
-    Hashing the *whole section* (not just the title) is what makes an id stable
-    when two open sections share a title. A title-hash plus an occurrence-count
-    suffix (`-2`, `-3`) renumbers the survivors as soon as an earlier duplicate
-    is answered or reordered, so a stale id the UI still holds would silently
-    resolve to a *neighbour* (#2103 review). A content hash is tied to that one
-    section: siblings appearing, being answered, or moving around it don't
-    change it, so a stale id resolves to its original section — or, if that
-    section's own text has since changed, cleanly 404s — but never a neighbour.
-    Two sections with an identical title *and* body are the same question and
-    share an id by design.
-
-    Sections below the `# Resolved` divider are the audit trail, not open
-    questions (same cut as check-pending-questions.py:95).
-    """
-    active = active_region(content)
-    starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
-    questions: list[dict] = []
-    for n, start in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else len(active)
-        section = active[start:end]
-        head, _, body = section.partition('\n')
-        title = head[3:].strip()  # drop the '## '
-        if not title or title.startswith('RESOLVED') or title.startswith('[RESOLVED'):
-            continue
-        if PQ_ANSWERED_RE.search(body):
-            continue
-        # Whitespace-normalised so a reflow of the same prose keeps the id.
-        qid = "Q" + hashlib.sha1(" ".join(section.split()).encode()).hexdigest()[:12]
-        q = {
-            "id": qid,
-            "text": title,
-            "detail": PQ_FIELD_RE.split(body)[0].strip() or title,
-            "start": start,
-            "end": end,
-        }
-        opts = PQ_OPTIONS_RE.search(body)
-        if opts:
-            q["options"] = [o.strip() for o in opts.group(1).split("|")]
-        questions.append(q)
-    return questions
-
-
-def answer_pending_question(content: str, question: dict, answer: str) -> str:
-    """Return `content` with `question`'s section marked answered.
-
-    The resolution has to land on a **Status:** line: check-pending-questions.py
-    treats a status-less section as unanswered (its free-form convention), so a
-    [RESOLVED] title prefix alone would silence this API's own reader while the
-    notifier kept re-asking the owner hourly.
-    """
-    section = content[question["start"]:question["end"]]
-    status = f"**Status:** Answered {datetime.now().strftime('%Y-%m-%d')} — {' '.join(answer.split())}"
-    if PQ_STATUS_RE.search(section):
-        # A function repl, not a string: a raw answer may contain \1-style escapes.
-        new_section = PQ_STATUS_RE.sub(lambda _m: status, section, count=1)
-    else:
-        new_section = section.rstrip("\n") + f"\n{status}\n\n"
-    return content[:question["start"]] + new_section + content[question["end"]:]
-
-
 def get_status() -> dict:
     try:
         # Use sys.executable — under launchd, bare `python3` resolves to
@@ -340,30 +443,56 @@ def get_status() -> dict:
     }
 
 
+def _read_or_none(path) -> "str | None":
+    """Stripped file text, or None when it is absent — one call, no exists()
+    race between the check and the read."""
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _newest_first(paths) -> list:
+    """Paths sorted newest-first, skipping any that vanish during the scan.
+
+    A claim renames a task file, so any glob entry can be gone before its stat.
+    """
+    pairs = []
+    for p in paths:
+        try:
+            pairs.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    pairs.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in pairs]
+
+
 def _active_task_rows() -> list[dict]:
     """Reconcile task/result files into the ten most recent history rows."""
     # Classifier tasks are machinery, not user work, so they stay out of the
     # history the UI shows.
-    for task_file in sorted(
-        (
-            path
-            for path in TASK_DIR.glob("*.txt")
-            if not path.stem.startswith(
-                (
-                    task_workstreams.CLASSIFIER_TASK_PREFIX,
-                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
-                )
+    for task_file in _newest_first(
+        path
+        for path in TASK_DIR.glob("*.txt")
+        if not path.stem.startswith(
+            (
+                task_workstreams.CLASSIFIER_TASK_PREFIX,
+                task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
             )
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+        )
     )[:10]:
         # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
         # the reply at results/{id}.txt — so key AND look up by the canonical id.
         task_id = task_id_from_filename(task_file.name)
         if task_id is None:
             continue
-        content = task_file.read_text()
+        try:
+            content = task_file.read_text()
+            task_mtime = task_file.stat().st_mtime
+        except FileNotFoundError:
+            # Claimed and renamed between the glob and here; the row reappears
+            # under the claimed name on the next poll.
+            continue
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
@@ -377,32 +506,28 @@ def _active_task_rows() -> list[dict]:
             if candidate.exists():
                 archived_file = candidate
                 break
-        if result_file.exists():
+        result_text = _read_or_none(result_file)
+        if result_text is not None:
             status = "done"
-            result_text = result_file.read_text().strip()
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_file is not None:
+        elif archived_file is not None and (_archived := _read_or_none(archived_file)) is not None:
             status = "done"
-            result_text = archived_file.read_text().strip()
+            result_text = _archived
         else:
             status = "working"
             result_text = ""
         task_history[task_id] = {
             "status": status,
             "text": task_line or existing.get("text", task_id),
-            "time": task_file.stat().st_mtime,
+            "time": task_mtime,
             "result": result_text,
             "source": source_line or existing.get("source", ""),
         }
 
     # Results may outlive their task files after bridge cleanup.
-    for result_file in sorted(
-        RESULT_DIR.glob("task-*.txt"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:10]:
+    for result_file in _newest_first(RESULT_DIR.glob("task-*.txt"))[:10]:
         _remember_done_result_file(result_file)
 
     # Reconcile stale rows after the disk scans above.
@@ -431,24 +556,181 @@ def _active_task_rows() -> list[dict]:
     return task_workstreams.enrich_task_rows(WORKSPACE_DIR, rows)
 
 
-def _pending_question_rows() -> list[dict]:
-    """Return open questions without parser-only splice offsets."""
-    pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
-    if not pending_file.exists():
-        return []
-    return [
-        {key: value for key, value in question.items() if key not in ("start", "end")}
-        for question in parse_pending_questions(pending_file.read_text())
-    ]
+# How many referenced PRs one queue render will probe, and how long a verdict is
+# reused. Bounded so triaging a long queue cannot turn into an unbounded gh fan-out.
+PQ_REF_PROBE_LIMIT = 12
+PQ_REF_PROBE_TTL = 120
+PQ_REF_PROBE_TIMEOUT = 5
+
+_pq_ref_cache: dict = {}
+_pq_ref_cache_lock = threading.Lock()
 
 
-def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
+def _dismissed_questions_path() -> Path:
+    return Path(personal_path("dismissed-questions.json", WORKSPACE_DIR))
+
+
+def _probe_ref_states(refs: list) -> dict:
+    """Live state of the PRs a question references, as `(repo, number)` pairs.
+
+    Failure is silent on purpose: an unreachable gh must leave the queue exactly as
+    it was, never mark a question resolved and never drop it.
+    """
+    states: dict = {}
+    now = time.time()
+    stale: list = []
+    with _pq_ref_cache_lock:
+        for ref in refs:
+            hit = _pq_ref_cache.get(ref)
+            if hit and now - hit[0] < PQ_REF_PROBE_TTL:
+                if hit[1]:
+                    states[ref] = hit[1]
+            else:
+                stale.append(ref)
+    for ref in stale[:PQ_REF_PROBE_LIMIT]:
+        state = None
+        try:
+            probe = subprocess.run(
+                ["gh", "pr", "view", str(ref[1]), "--repo", ref[0], "--json", "state"],
+                capture_output=True, text=True, timeout=PQ_REF_PROBE_TIMEOUT,
+            )
+            if probe.returncode == 0:
+                state = (json.loads(probe.stdout) or {}).get("state") or None
+        except Exception:
+            state = None
+        with _pq_ref_cache_lock:
+            _pq_ref_cache[ref] = (time.time(), state)
+        if state:
+            states[ref] = state
+    return states
+
+
+def _question_row(item: dict) -> dict:
+    """One reader item as the triage queue's row shape."""
+    asked_at = item.get("asked_at")
+    asked_dt = datetime.fromtimestamp(asked_at, tz=timezone.utc) if asked_at else None
+    return {
+        "id": item["ask_id"],
+        "text": item["title"],
+        "detail": item.get("snippet") or item["title"],
+        "asked": asked_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if asked_dt else None,
+        "age_days": max(0, (datetime.now(timezone.utc) - asked_dt).days) if asked_dt else None,
+        "in_room": item.get("in_room", True),
+    }
+
+
+def _pending_store():
+    """The store adapter this edge injects: the one an installed skill declares, across the roots."""
+    return skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
+
+
+def _pending_gather() -> dict:
+    """The reader's gather; `unavailable` is carried to the payload so a client never
+    renders an unreachable room as an empty queue."""
+    return pending_questions_reader.gather(WORKSPACE_DIR, _pending_store())
+
+
+def _questions_unavailable(g: dict) -> Optional[str]:
+    return (g["reason"] or "room unreachable") if g["unavailable"] else None
+
+
+def _pending_question_rows(recheck: bool = False, gathered: Optional[dict] = None) -> list[dict]:
+    """Open questions, dismissed ones removed, ordered for the triage queue.
+
+    `recheck` probes the referenced PRs first, so a question whose blocker has since
+    merged is labelled at the moment it is shown rather than carried for weeks.
+    """
+    g = _pending_gather() if gathered is None else gathered
+    rows = [_question_row(item) for item in g["waiting"]]
+    rows = pq_triage.without_dismissed(
+        rows, pq_triage.load_dismissed(_dismissed_questions_path())
+    )
+    ref_states = {}
+    if recheck:
+        wanted: list = []
+        for row in rows:
+            refs = pq_triage.extract_refs(row.get("text"), row.get("detail"))
+            # Only references that carry their own repo are looked up; a bare number
+            # in this multi-repo file would resolve against the wrong repository.
+            for ref in pq_triage.probeable(refs):
+                if ref not in wanted:
+                    wanted.append(ref)
+        ref_states = _probe_ref_states(wanted)
+    pq_triage.apply_recheck(rows, ref_states)
+    return pq_triage.rank(rows)
+
+
+def _questions_queue_payload() -> dict:
+    """Triage queue, re-checked live at the moment it is asked for."""
+    g = _pending_gather()
+    return {"questions": _pending_question_rows(recheck=True, gathered=g), "questions_unavailable": _questions_unavailable(g)}
+
+
+def _file_answer_task(qid: str, answer: str) -> tuple:
+    """(task path, None) once the owner's answer is published whole under tasks/, else (None, why).
+    The name is unique per call (local_record.new_name) and the file is created exclusively, so
+    two answers to one question in the same millisecond are two files, never one overwritten."""
+    safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
+    if not safe_qid:
+        return None, "the id has no file-safe characters"
+    # realpath + startswith: the CodeQL-recognised path-injection
+    # sanitizer pair (Path::PathNormalization + SafeAccessCheck).
+    task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
+    body = f"User answered {safe_qid}: {confine_user_content(answer)}"
+    for _ in range(8):
+        try:
+            name = local_record.new_name("answer-" + safe_qid)
+        except ValueError as e:
+            return None, str(e)
+        task_file_str = os.path.realpath(os.path.join(task_dir_real, f"{name}.txt"))
+        if not task_file_str.startswith(task_dir_real + os.sep):
+            return None, "the id does not name a file under tasks/"
+        try:
+            local_record.create_text_whole(Path(task_file_str), body)
+        except FileExistsError:
+            continue  # another answer took this name a moment ago; its file is left as it is
+        except OSError as e:
+            return None, str(e)
+        return task_file_str, None
+    return None, "no free task name after 8 tries"
+
+
+def answer_question(qid: str, answer: str) -> tuple:
+    """(status, body) for POST /answer. The answer task is published whole BEFORE the close is
+    asked for: a close with no durable answer loses the owner's word; the reverse is at worst
+    a question answered twice. A failed publish leaves the question open."""
+    if not qid or not answer:
+        return 400, {"error": "id and answer required"}
+    g = _pending_gather()
+    if not g["unavailable"] and qid not in {w["ask_id"] for w in g["waiting"]}:
+        return 404, {"error": f"question {qid} is not waiting (answered, dismissed or unknown)"}
+    task_path, err = _file_answer_task(qid, answer)
+    if err:
+        return 500, {"error": f"answer not kept ({err}); the question stays open", "id": qid, "recorded": False}
+    closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered", _pending_store())
+    if not closed:
+        return 503, {"error": f"answer kept as a task; the question could not be closed: {why}",
+                     "id": qid, "recorded": True, "task": task_path}
+    return 200, {"ok": True, "id": qid, "answer": answer, "task": task_path}
+
+
+def dismiss_question(qid: str) -> tuple:
+    """Dismiss `qid` permanently. Returns an (status, body) pair for the route."""
+    if not qid:
+        return 400, {"error": "id required"}
+    pq_triage.dismiss(_dismissed_questions_path(), qid)
+    return 200, {"ok": True, "id": qid}
+
+
+def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
+    g = _pending_gather()
     return {
         "tasks": _active_task_rows(),
         "watcher": watcher_ok,
         "claude": core_ok,
-        "questions": _pending_question_rows(),
+        "questions": _pending_question_rows(gathered=g),
+        "questions_unavailable": _questions_unavailable(g),
     }
 
 
@@ -771,10 +1053,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _bound_port(self) -> "int | None":
+        try:
+            return int(self.server.server_address[1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return None
+
+    def send_cors(self) -> None:
+        """Grant cross-origin reads to loopback pages, and to this host's own API and web-client
+        ports, never `*` (local_api_gate.cors_origin)."""
+        ports = {p for p in (self._bound_port(), PORT, WEB_CLIENT_PORT) if p}
+        origin = local_api_gate.cors_origin(self.headers.get("Origin"), self.headers.get("Host", ""), ports)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Vary", "Origin")
+
     def send_json(self, status: int, data: dict):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors()
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -788,37 +1085,126 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_private_history_auth(self) -> bool:
         """Fail closed for browsers and non-loopback clients without a token."""
-        import hmac as _hmac
-
-        if API_TOKEN:
-            token = self.headers.get("Authorization", "").replace("Bearer ", "")
-            if _hmac.compare_digest(token, API_TOKEN):
-                return True
-            self.send_private_json(401, {"error": "unauthorized"})
+        status, why = local_api_gate.private_history_request_allowed(
+            self.client_address[0], self.headers.get("Origin"), self.headers.get("Authorization", ""),
+            configured_token=API_TOKEN)
+        if status != 200:
+            self.send_private_json(status, {"error": why})
             return False
-        try:
-            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-        # The same-origin web-client proxy and local CLI callers send no
-        # Origin. A browser page always does for cross-origin fetches, so this
-        # also blocks hostile sites from reading localhost history.
-        if loopback and not self.headers.get("Origin"):
-            return True
-        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
-        return False
+        return True
 
     def do_OPTIONS(self):
+        if not self.host_allowed():
+            return
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            # No wildcard grant here: a loopback page may preflight, nothing else gets a header.
+            self.send_response(204)
+            origin = self.headers.get("Origin", "")
+            if origin and local_api_gate.loopback_origin(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.end_headers()
+            return
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_cors()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
+    def _send_connections(self, status: int, payload: "dict | None") -> None:
+        """JSON (or an empty body); the cross-origin grant echoes a loopback Origin only, never a
+        wildcard, on refusals too: without it a webview reads a 401 as a network failure and can
+        never drop a stale bearer. A non-loopback Origin gets no grant at any status."""
+        self.send_response(status)
+        origin = self.headers.get("Origin", "")
+        if origin and local_api_gate.loopback_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Cache-Control", "no-store")
+        if payload is not None:
+            self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        if payload is not None:
+            self.wfile.write(json.dumps(payload).encode())
+
+    def _connections_route(self, method: str) -> None:
+        """Consume the body, then the shared gate (loopback Host on this port, loopback or
+        absent Origin, the local API bearer, always), then dispatch."""
+        parsed = urlparse(self.path)
+        body: dict = {}
+        if method != "GET":
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                self._send_connections(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > CONNECTIONS_BODY_CAP:
+                self._send_connections(413, {"error": "request too large"})
+                return
+            raw = self.rfile.read(length) if length else b""
+            if raw.strip():
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    self._send_connections(400, {"error": "invalid JSON"})
+                    return
+                if not isinstance(body, dict):
+                    self._send_connections(400, {"error": "body must be a JSON object"})
+                    return
+        try:
+            bound_port = int(self.server.server_address[1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            bound_port = None
+        status, why = local_api_gate.bearer_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""), self.headers.get("Authorization", ""),
+            expected_token=connections_bearer(), bound_port=bound_port)
+        if why:
+            self._send_connections(status, {"error": why})
+            return
+        from urllib.parse import parse_qs
+        status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
+        self._send_connections(status, payload)
+
+    def host_allowed(self) -> bool:
+        """Refuse a DNS-rebinding request: its Host is the attacker's name, which a loopback name,
+        an IP literal or AGENT_API_ALLOWED_HOSTS never is. Twilio webhooks arrive through a tunnel
+        under its name and carry their own signature; a valid bearer cannot come from a rebinding
+        page either."""
+        if urlparse(self.path).path.startswith("/twilio/"):
+            return True
+        if local_api_gate.rebinding_safe_host(self.headers.get("Host", ""), ALLOWED_HOSTS):
+            return True
+        auth = self.headers.get("Authorization", "")
+        if (API_TOKEN and local_api_gate.bearer_matches(auth, API_TOKEN)) \
+                or local_api_gate.bearer_matches(auth, connections_bearer()):
+            return True
+        try:  # read a small body first, so the refusal reaches the caller instead of a reset
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if 0 < length <= 65536:
+                self.rfile.read(length)
+        except (TypeError, ValueError, OSError):
+            pass
+        self.send_json(403, {"error": "host not allowed"})
+        return False
+
+    def do_DELETE(self):
+        if not self.host_allowed():
+            return
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("DELETE")
+            return
+        self.send_json(404, {"error": "not found"})
+
     def do_GET(self):
+        if not self.host_allowed():
+            return
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
+        elif path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("GET")
         elif path == "/core-status":
             # Read loop status file for web UI
             status_file = status_read_path("core-status.json", WORKSPACE_DIR)
@@ -848,6 +1234,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
+        elif path == "/health":
+            query = parse_qs(urlparse(self.path).query)
+            agent = (query.get("agent") or ["all"])[0]
+            view = (query.get("view") or ["summary"])[0]
+            if view not in health_snapshot.VIEWS:
+                self.send_private_json(400, {"error": f"view must be one of {', '.join(health_snapshot.VIEWS)}"})
+                return
+            # `full` carries paths and account detail, so it gets the history routes' loopback gate.
+            if not (self.check_private_history_auth() if view == "full" else self.check_auth()):
+                return
+            self.send_private_json(200, health_snapshot.snapshot(WORKSPACE_DIR, agent=agent, view=view))
         elif path == "/tasks/history":
             if not self.check_private_history_auth():
                 return
@@ -871,16 +1268,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "snapshot_hash": inference.snapshot_hash,
             }
             self.send_private_json(200, payload)
+        elif path == "/questions/queue":
+            if not self.check_auth():
+                return
+            self.send_json(200, _questions_queue_payload())
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
-            watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
+            watcher_pids, probe_ok = probe_pids("watch-tasks", timeout=3.0)
+            watcher_ok = bool(watcher_pids) if probe_ok else None
             # Historical response key is `claude`; its meaning is now "selected
             # core CLI is alive" so existing web clients remain compatible.
             try:
-                tmux_bin = (shutil.which("tmux") or
-                            next((p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")
-                                  if Path(p).is_file()), None))
-                claude_ok = bool(tmux_bin) and subprocess.run(
+                tmux_bin = tmux_probe.tmux_binary()
+                claude_ok = subprocess.run(
                     [tmux_bin, "-S", os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
                      "has-session", "-t", "=sutando-core"], capture_output=True,
                 ).returncode == 0
@@ -922,7 +1322,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Cache-Control", "public, max-age=86400")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_cors()
                 self.end_headers()
                 self.wfile.write(avatar_file.read_bytes())
             else:
@@ -1015,7 +1415,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mime = SAFE_TYPES.get(ext, 'application/octet-stream')
             self.send_response(200)
             self.send_header("Content-Type", mime)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_cors()
             self.send_header("Cache-Control", "public, max-age=300")
             self.end_headers()
             self.wfile.write(media_path.read_bytes())
@@ -1045,9 +1445,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Check API token if configured. Returns True if authorized."""
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
-        import hmac as _hmac
-        token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if _hmac.compare_digest(token, API_TOKEN):
+        if local_api_gate.bearer_matches(self.headers.get("Authorization", ""), API_TOKEN):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
@@ -1149,6 +1547,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global voice_desired_state
+        if not self.host_allowed():
+            return
         path = urlparse(self.path).path
 
         # Twilio webhook endpoints (no auth — Twilio signs requests)
@@ -1169,6 +1569,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_twilio_transcription(form_data)
             else:
                 self.send_json(404, {"error": "not found"})
+            return
+
+        if path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("POST")
             return
 
         if path == "/voice/toggle":
@@ -1269,38 +1673,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             try:
                 data = json.loads(body)
-                qid = data.get("id", "")
-                answer = data.get("answer", "")
-                if not qid or not answer:
-                    self.send_json(400, {"error": "id and answer required"})
-                    return
-                pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
-                if pq_file.exists():
-                    content = pq_file.read_text()
-                    # Same parser the ids were minted by — see parse_pending_questions.
-                    match = next(
-                        (q for q in parse_pending_questions(content) if q["id"] == qid),
-                        None,
-                    )
-                    if match:
-                        pq_file.write_text(answer_pending_question(content, match, answer))
-                        ts = int(datetime.now().timestamp() * 1000)
-                        safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
-                        if safe_qid:
-                            # os.path.realpath + str.startswith is the CodeQL-recognized
-                            # path-injection sanitizer pair (Path::PathNormalization
-                            # + Path::SafeAccessCheck in semmle.python).
-                            task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
-                            task_file_str = os.path.realpath(
-                                os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
-                            )
-                            if task_file_str.startswith(task_dir_real + os.sep):
-                                Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
-                        self.send_json(200, {"ok": True, "id": qid, "answer": answer})
-                    else:
-                        self.send_json(404, {"error": f"question {qid} not found or already answered"})
-                else:
-                    self.send_json(404, {"error": "no pending questions"})
+                self.send_json(*answer_question(str(data.get("id", "")), str(data.get("answer", ""))))
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
+            return
+
+        if path == "/question/dismiss":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length))
+                self.send_json(*dismiss_question(str(data.get("id", "")).strip()))
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
             return
@@ -1322,6 +1706,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /scan-text — decoded-value guard re-run for the Signal Room daemon, which
+        # publishes the text itself: markers exempt nothing, scanner outage is a 500.
+        if path == "/scan-text":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > 262144:
+                self.send_json(413, {"error": "scan request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            # json.loads accepts any JSON value, so `[1]` reaches .get() outside
+            # the except above and raises instead of returning this 400.
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "body must be a JSON object"})
+                return
+            texts = data.get("texts")
+            if (not isinstance(texts, list) or not texts or len(texts) > 64
+                    or not all(isinstance(t, str) for t in texts)
+                    or any(len(t) > 16384 for t in texts)):
+                self.send_json(400, {"error": "texts must be 1..64 strings of <=16384 chars"})
+                return
+            try:
+                from policy.egress.result import (SCANNER_UNAVAILABLE,
+                                                  guard_result_for_tier)
+                verdict = "pass"
+                for t in texts:
+                    _safe, reason = guard_result_for_tier(
+                        t, SIGNAL_ROOM_TIER, REPO_DIR, honor_suppressions=False)
+                    if reason is not None:
+                        if reason.startswith(SCANNER_UNAVAILABLE):
+                            self.send_json(500, {"error": "scanner unavailable"})
+                            return
+                        verdict = "withhold"
+                        break
+                self.send_json(200, {"verdict": verdict})
+            except Exception:
+                self.send_json(500, {"error": "scanner unavailable"})
+            return
+
         # /guest-task — the Signal Room lane.
         if path == "/guest-task":
             if not self.check_auth():
@@ -1340,6 +1771,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(self.rfile.read(length).decode() or "{}")
             except Exception:
                 self.send_json(400, {"error": "invalid JSON"})
+                return
+            # json.loads accepts any JSON value; a non-object would reach .get()
+            # and raise outside the except above — a 500 instead of this 400.
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "body must be a JSON object"})
                 return
             task = data.get("task", "")
             if not isinstance(task, str) or not task.strip():
@@ -1384,8 +1820,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # ValueError covers JSONDecodeError, invalid UTF-8 and the int-digit
+            # limit; RecursionError (nesting) is outside it. All are the 400.
             self.send_json(400, {"error": "invalid JSON"})
+            return
+        if not isinstance(data, dict):
+            self.send_json(400, {"error": "body must be a JSON object"})
             return
 
         from_agent = data.get("from", "unknown")
@@ -1405,10 +1846,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # through the voice-only fallback path with incorrect downstream
         # behavior. Strip line terminators; cap to a sane single-line
         # length.
-        from_agent = (
-            from_agent.replace("\r", " ").replace("\n", " ").strip()[:120]
-            or "unknown"
-        )
+        from_agent = header_safe_value(from_agent).strip()[:120] or "unknown"
 
         if not task:
             self.send_json(400, {"error": "task is required"})
@@ -1550,12 +1988,17 @@ def _resolve_local_ip() -> str:
 
 if __name__ == "__main__":
     bind = config_get("AGENT_API_BIND", "127.0.0.1")
+    refusal = local_api_gate.lan_bind_refusal(bind, API_TOKEN)
+    if refusal:
+        print(refusal, file=sys.stderr, flush=True)
+        sys.exit(2)
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    connections_bearer()  # the desktop shell reads state/agent-api.token; mint it before the first client
     workstream_maintenance_stop = threading.Event()
     workstream_maintenance = threading.Thread(
         target=task_workstreams.run_classifier_maintenance,
@@ -1568,13 +2011,16 @@ if __name__ == "__main__":
         daemon=True,
     )
     workstream_maintenance.start()
+    # Rows imported from the environment name no agent until their own token is asked.
+    threading.Thread(target=_connections.run_identity_learner, args=(workstream_maintenance_stop, WORKSPACE_DIR),
+                     name="connections-identity", daemon=True).start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")
     print("  GET  /status — health + capabilities")
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
-        print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+        print("  (localhost only — for LAN access set AGENT_API_BIND=0.0.0.0 and SUTANDO_API_TOKEN)")
     # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
     # sends SIGTERM.
     def _reap_and_exit(_signum, _frame):

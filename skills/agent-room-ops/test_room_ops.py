@@ -8,12 +8,20 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import types
 import unittest
 import urllib.error
+import urllib.parse
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 # Shadow the vault boundary before any gateway() call can reach it. gateway() now
 # resolves the token from the Keychain when the env has none — and this file's
@@ -43,7 +51,6 @@ import read as rd  # noqa: E402
 import media as md  # noqa: E402
 import react as rc  # noqa: E402
 import join as jn  # noqa: E402
-import doc as dc  # noqa: E402
 import room_ops  # noqa: E402
 
 HS = "@agent.a:hs"
@@ -68,6 +75,10 @@ class EnvCase(unittest.TestCase):
             _gateway, "_channel_env_file", lambda: None)
         self._env_file_patch.start()
         self.addCleanup(self._env_file_patch.stop)
+        # Nor the host's connections record: room routing is pinned in tests/.
+        self._route_patch = mock.patch.object(_gateway, "_room_credential", lambda room_id: None)
+        self._route_patch.start()
+        self.addCleanup(self._route_patch.stop)
 
     def tearDown(self):
         _clear()
@@ -229,6 +240,96 @@ class MediaTests(EnvCase):
         self.assertTrue(res["ok"] and os.path.isfile(res["path"]))
         self.assertEqual(open(res["path"], "rb").read(), b"PNG")
 
+    def test_fetch_normalizes_relay_links_and_preserves_room_auth(self):
+        for host, server in (("dev-chat.s.space", "dev.s.space"), ("chat.s.space", "s.space")):
+            room = "!image:" + server
+            base = "https://" + host + "/relay"
+            ref = base + "/v1/media/" + server + "/image?room_id=" + _gateway.quote(room)
+            os.environ["GATEWAY_URL"] = base
+            os.environ["GATEWAY_TOKEN"] = "fixture-bearer"
+            with self.subTest(server=server), mock.patch.object(md, "http_request", return_value=(200, b"PNG", {})) as req:
+                result = md.fetch_media(ref, HS, gate=None)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["room_id"], room)
+                args = req.call_args.args
+                parsed = urllib.parse.urlsplit(args[1])
+                query = urllib.parse.parse_qs(parsed.query)
+                self.assertEqual(parsed.path, "/relay/v1/media/fetch")
+                self.assertEqual(query, {"ref": ["mxc://" + server + "/image"], "room_id": [room]})
+                self.assertEqual(args[2]["Authorization"], "Bearer fixture-bearer")
+                self.assertEqual(req.call_args.kwargs["max_bytes"], md.MAX_BYTES)
+
+    def test_fetch_downloads_bytes_through_the_broker_http_contract(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                parsed = urllib.parse.urlsplit(self.path)
+                expected = {"ref": ["mxc://dev.s.space/image"], "room_id": [ROOM]}
+                valid = (parsed.path == "/relay/v1/media/fetch"
+                         and urllib.parse.parse_qs(parsed.query) == expected
+                         and self.headers.get("Authorization") == "Bearer fixture-bearer")
+                self.send_response(200 if valid else 400)
+                self.end_headers()
+                self.wfile.write(b"PNG" if valid else b"bad request")
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}/relay"
+            try:
+                with mock.patch.object(md, "gateway", return_value=(base, {"Authorization": "Bearer fixture-bearer"})):
+                    for ref, room in [("mxc://dev.s.space/image", ROOM),
+                                      (base + "/v1/media/dev.s.space/image?room_id=" + _gateway.quote(ROOM), None)]:
+                        result = md.fetch_media(ref, HS, room, gate=None)
+                        self.assertTrue(result["ok"], result)
+                        with open(result["path"], "rb") as stream:
+                            self.assertEqual(stream.read(), b"PNG")
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_fetch_requires_room_for_mxc_without_requesting(self):
+        with mock.patch.object(md, "http_request") as req:
+            result = md.fetch_media("mxc://dev.s.space/image", HS, gate=None)
+        self.assertFalse(result["ok"])
+        self.assertIn("--room", result["reason"])
+        req.assert_not_called()
+
+    def test_fetch_refuses_mismatched_or_untrusted_relay_links(self):
+        os.environ["GATEWAY_URL"] = "https://dev-chat.s.space/relay"
+        cases = [
+            ("https://evil.example/relay/v1/media/dev.s.space/image?room_id=" + ROOM, None),
+            ("https://dev-chat.s.space/relay-evil/v1/media/dev.s.space/image", ROOM),
+            ("https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=!other:hs", ROOM),
+            ("https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=" + ROOM + "&room_id=!other:hs", None),
+            ("https://dev-chat.s.space/relay/v1/media/dev.s.space/a%2Fb", ROOM),
+        ]
+        for ref, room in cases:
+            with self.subTest(ref=ref), mock.patch.object(md, "http_request") as req:
+                self.assertFalse(md.fetch_media(ref, HS, room, gate=None)["ok"])
+                req.assert_not_called()
+
+    def test_fetch_rejects_invalid_ref_syntax_before_network(self):
+        os.environ["GATEWAY_URL"] = "https://dev-chat.s.space/relay"
+        for ref in ("file:///image", "https://user:pass@example.com/image",
+                    "mxc://dev.s.space/image#fragment", "mxc://dev.s.space/image?query=1"):
+            with self.subTest(ref=ref), mock.patch.object(md, "http_request") as req:
+                result = md.fetch_media(ref, HS, ROOM, gate=None)
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["reason"])
+                req.assert_not_called()
+
+    def test_embedded_room_reaches_gate_and_connection_selection(self):
+        ref = "https://dev-chat.s.space/relay/v1/media/dev.s.space/image?room_id=" + _gateway.quote(ROOM)
+        with mock.patch.object(md, "gateway", return_value=("https://dev-chat.s.space/relay", {})) as gateway:
+            self.assertFalse(md.fetch_media(ref, HS, gate={})["ok"])
+            gateway.assert_not_called()
+            with mock.patch.object(md, "http_request", return_value=(200, b"PNG", {})):
+                self.assertTrue(md.fetch_media(ref, HS, gate={HS: {"rooms": [ROOM]}})["ok"])
+            gateway.assert_called_once_with(ROOM)
+
     def test_fetch_reads_bounded_and_rejects_oversize(self):
         # Regression for the OOM finding: fetch must (a) bound the read to
         # MAX_BYTES+1 and (b) reject an oversize body — never buffer the full
@@ -342,68 +443,6 @@ class JoinTests(EnvCase):
             self.assertIn("not a joined member", jn.join_room(ROOM, HS, gate=None)["reason"])
 
 
-class DocTests(EnvCase):
-    def test_missing_room(self):
-        self.assertFalse(dc.doc_get("", HS)["ok"])
-
-    def test_gate_deny(self):
-        os.environ["RELAY_URL"] = "https://r"
-        self.assertIn("gate denied", dc.doc_put(ROOM, "x", agent_mxid=HS, gate={})["reason"])
-
-    def test_no_relay(self):
-        self.assertIn("no gateway", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
-
-    def test_get_envelope(self):
-        os.environ["RELAY_URL"] = "https://r"
-        cap = {}
-        fake = {"ok": True, "file": "TODO.md", "folder": "room-todo", "content": "# T"}
-        with mock.patch.object(dc, "http_json",
-                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
-            res = dc.doc_get(ROOM, folder="room-todo", name="TODO.md", agent_mxid=HS, gate=None)
-        self.assertTrue(res["ok"])
-        self.assertTrue(cap["url"].endswith("/v1/room"))
-        self.assertEqual(cap["payload"]["op"], "prep_get")
-        self.assertEqual(cap["payload"]["folder"], "room-todo")
-        self.assertEqual(res["content"], "# T")
-
-    def test_put_envelope_b64(self):
-        os.environ["RELAY_URL"] = "https://r"
-        cap = {}
-        fake = {"ok": True, "file": "notes.md", "sha": "abc123"}
-        with mock.patch.object(dc, "http_json",
-                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, fake))[1]):
-            res = dc.doc_put(ROOM, "hello", folder="scratch", name="notes.md",
-                             message="m", agent_mxid=HS, gate=None)
-        self.assertTrue(res["ok"] and res["sha"] == "abc123")
-        self.assertEqual(cap["payload"]["op"], "prep_put")
-        self.assertEqual(base64.b64decode(cap["payload"]["content_b64"]).decode(), "hello")
-        self.assertEqual(cap["payload"]["message"], "m")
-
-    def test_rm_envelope(self):
-        os.environ["RELAY_URL"] = "https://r"
-        cap = {}
-        with mock.patch.object(dc, "http_json",
-                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
-            res = dc.doc_rm(ROOM, "old.md", folder="room-memo", agent_mxid=HS, gate=None)
-        self.assertTrue(res["ok"])
-        self.assertEqual(cap["payload"]["op"], "prep_delete")
-        self.assertEqual(cap["payload"]["filename"], "old.md")
-
-    def test_gateway_error_degrades(self):
-        os.environ["RELAY_URL"] = "https://r"
-        with mock.patch.object(dc, "http_json",
-                               return_value=(200, {"error": "bad folder (1-3 safe path segments, no leading dots)"})):
-            res = dc.doc_put(ROOM, "x", folder="../etc", agent_mxid=HS, gate=None)
-        self.assertFalse(res["ok"])
-        self.assertIn("bad folder", res["reason"])
-
-    def test_403_degrades(self):
-        os.environ["RELAY_URL"] = "https://r"
-        err = urllib.error.HTTPError("u", 403, "no", {}, None)
-        with mock.patch.object(dc, "http_json", side_effect=err):
-            self.assertIn("not a joined member", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
-
-
 # ----- unified CLI ----- #
 class CliTests(EnvCase):
     def test_read_exits_zero(self):
@@ -426,18 +465,6 @@ class CliTests(EnvCase):
 
     def test_join_exits_zero_on_no_gateway(self):
         self.assertEqual(room_ops._main(["join", ROOM, "--agent", HS]), 0)
-
-    def test_doc_put_missing_file_structured_error(self):
-        # P2 (PR #2050 review): --file read failure must yield the structured
-        # ok:false envelope, not a traceback.
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc_ = room_ops._main(["doc", "put", ROOM, "--file", "/nope/missing.md", "--agent", HS])
-        self.assertEqual(rc_, 0)
-        res = json.loads(buf.getvalue())
-        self.assertFalse(res["ok"])
-        self.assertIn("cannot read --file", res["reason"])
-
 
 class GatewayTokenOnboardingTests(EnvCase):
     """The combined one-token onboarding contract (REMOTE_TASK_TOKEN='url|secret')."""
@@ -565,6 +592,17 @@ _AGENTS = [
     {"id": "@qingyun-air.agent:ag2.space", "label": "core"},
 ]
 
+# One real room's shapes (2026-09-10): a person, their platform agent (the slug keeps
+# the possessive's "s" as a token), a legacy-prefix agent, a short-labelled platform agent.
+_ROSTER = [
+    {"id": "@bassil:ag2.space", "display_name": "Bassil"},
+    {"id": "@bassil-bassil-s-sutando.agent:ag2.space", "display_name": "Bassil's Sutando"},
+    {"id": "@sutando-sonichi:ag2.space", "display_name": "Sonichi's Sutando"},
+    {"id": "@qingyun-air.agent:ag2.space", "display_name": "core"},
+]
+BASSIL_AGENT = "@bassil-bassil-s-sutando.agent:ag2.space"
+SONICHI_AGENT = "@sutando-sonichi:ag2.space"
+
 
 class ResolveTests(unittest.TestCase):
     def test_exact_localpart(self):
@@ -607,8 +645,152 @@ class ResolveTests(unittest.TestCase):
     def test_empty_query(self):
         self.assertFalse(rs.match_agent("", _AGENTS)["ok"])
 
+    # ----- display names, possessives and the platform's slug (2026-09-10) ----- #
+    def test_display_name_resolves_the_agent_in_every_spelling(self):
+        for q in ("Bassil's Sutando", "bassil sutando", "bassil\u2019s sutando",
+                  "@Bassil's Sutando"):
+            r = rs.match_agent(q, _ROSTER)
+            self.assertTrue(r["ok"], (q, r))
+            self.assertEqual(r["mxid"], BASSIL_AGENT, q)
 
-class MentionBodyTests(unittest.TestCase):
+    def test_exact_human_name_beats_agent_preference(self):
+        """The query "Bassil" is the person's exact localpart AND name; the agent only
+        token-prefix-matches. A lower tier never competes, so the preference
+        (which breaks ties INSIDE a tier) has nothing to break."""
+        r = rs.match_member("Bassil", _ROSTER, prefer_agents=True)
+        self.assertEqual(r["mxid"], "@bassil:ag2.space")
+
+    def test_shared_word_across_two_agents_is_ambiguous(self):
+        # Both agents carry "sutando"; the preference cannot pick between two
+        # agents, so this is a refusal with both named.
+        for prefer in (True, False):
+            r = rs.match_member("sutando", _ROSTER, prefer_agents=prefer)
+            self.assertFalse(r["ok"], prefer)
+            self.assertEqual(sorted(r["candidates"]), sorted([BASSIL_AGENT, SONICHI_AGENT]))
+
+    def test_platform_slug_resolves_the_agent(self):
+        self.assertEqual(rs.match_agent("bassil-s-sutando", _ROSTER)["mxid"], BASSIL_AGENT)
+
+    def test_token_prefix_rides_over_the_agent_suffix(self):
+        self.assertEqual(rs.match_agent("qingyun air", _ROSTER)["mxid"],
+                         "@qingyun-air.agent:ag2.space")
+        self.assertEqual(rs.match_agent("core", _ROSTER)["mxid"], "@qingyun-air.agent:ag2.space")
+
+    def test_member_dicts_carry_display_names_bare_ids_do_not(self):
+        """Same roster, two shapes: the {user_id, display_name, kind} dicts
+        `members.room_members` returns, and the bare mxid list older callers
+        pass. The name tier is what the dicts add — the localpart alone
+        cannot answer "Sonichi's Sutando" (its token order differs)."""
+        dicts = [{"user_id": m["id"], "display_name": m["display_name"], "kind": "?"}
+                 for m in _ROSTER]
+        ids = [m["id"] for m in _ROSTER]
+        self.assertEqual(rs.match_member("Sonichi's Sutando", dicts)["mxid"], SONICHI_AGENT)
+        self.assertFalse(rs.match_member("Sonichi's Sutando", ids)["ok"])
+        for q in ("sutando-sonichi", "sonichi"):   # the ids-only callers keep working
+            self.assertEqual(rs.match_member(q, ids)["mxid"], SONICHI_AGENT, q)
+
+    def test_prefer_agents_breaks_a_same_name_tie_only_when_asked(self):
+        pair = [{"id": "@alex:ag2.space", "display_name": "Alex Sutando"},
+                {"id": "@alex-alex-sutando.agent:ag2.space", "display_name": "Alex Sutando"}]
+        self.assertEqual(rs.match_agent("Alex Sutando", pair, prefer_agents=True)["mxid"],
+                         "@alex-alex-sutando.agent:ag2.space")
+        r = rs.match_agent("Alex Sutando", pair, prefer_agents=False)
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(r["candidates"]), 2)
+        # match_member defaults to the preference: a mention is a hand-off, and
+        # the agent is the one that acts on it.
+        self.assertEqual(rs.match_member("Alex Sutando", pair)["mxid"],
+                         "@alex-alex-sutando.agent:ag2.space")
+
+
+# Every apostrophe look-alike `normalize_handle` folds to U+0027. The web client's
+# mention smoke (cinny mentionCandidates) carries the same list — diff the two.
+APOSTROPHE_TWINS = ("\u0027", "\u2019", "\u2018", "\u201b", "\u02bc", "\u2032", "\u0060", "\u00b4")
+
+
+class NormalizeHandleTests(unittest.TestCase):
+    def test_possessive_spacing_case_and_at_collapse(self):
+        for q in ("Bassil's Sutando", "bassil sutando", "bassil\u2019s sutando",
+                  "@Bassil's Sutando", "Bassil_Sutando", "  BASSIL'S  SUTANDO "):
+            self.assertEqual(rs.normalize_handle(q), "bassil-sutando", q)
+
+    def test_every_apostrophe_twin_normalises_to_the_same_handle(self):
+        """One row per code point in APOSTROPHE_TWINS, so a look-alike dropped
+        from either copy of the map shows up as one named failing row."""
+        for apo in APOSTROPHE_TWINS:
+            with self.subTest(code_point=f"U+{ord(apo):04X}"):
+                self.assertEqual(rs.normalize_handle(f"Bassil{apo}s Sutando"), "bassil-sutando")
+                self.assertEqual(rs.normalize_handle(f"Susan{apo}s bot"), "susan-bot")
+
+    def test_a_localpart_is_its_own_normal_form(self):
+        self.assertEqual(rs.normalize_handle("sutando-qingyun-001"), "sutando-qingyun-001")
+        self.assertEqual(rs.normalize_handle("bassil-s-sutando"), "bassil-s-sutando")
+        self.assertEqual(rs.normalize_handle("qingyun-air.agent"), "qingyun-air.agent")
+
+    def test_possessive_only_at_a_token_end(self):
+        # An "s" inside a word is not a possessive; a plural possessive just
+        # loses its apostrophe.
+        self.assertEqual(rs.normalize_handle("o'neil"), "oneil")
+        self.assertEqual(rs.normalize_handle("James' car"), "james-car")
+        self.assertEqual(rs.normalize_handle("Chris's desk"), "chris-desk")
+
+    def test_empty_and_junk(self):
+        for q in ("", None, "@", "'s", "  -  "):
+            self.assertEqual(rs.normalize_handle(q), "", repr(q))
+
+    def test_slug_handle_is_the_platform_spelling(self):
+        self.assertEqual(rs.slug_handle("Susan's bot"), "susan-s-bot")
+        self.assertEqual(rs.slug_handle("Bassil's Sutando"), "bassil-s-sutando")
+        self.assertEqual(rs.slug_handle("@Bassil\u2019s Sutando!"), "bassil-s-sutando")
+        self.assertEqual(rs.slug_handle("qingyun-001"), "qingyun-001")
+        self.assertEqual(rs.slug_handle(""), "")
+
+
+class ResolveUserResponseTests(unittest.TestCase):
+    """`parse_resolve_user_response` reads the broker's three `op: resolve_user`
+    answers (shapes verified against matrix_ingest.py, 2026-09-10) and treats
+    everything else as a miss — never as a hit."""
+
+    def test_hit(self):
+        r = rs.parse_resolve_user_response({"mxid": BASSIL_AGENT, "display_name": "Bassil's Sutando"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], BASSIL_AGENT)
+        self.assertEqual(r["display_name"], "Bassil's Sutando")
+        self.assertEqual(r["candidates"], [])
+        self.assertFalse(rs.is_ambiguous(r))
+
+    def test_ambiguous_lists_the_candidates_and_refuses(self):
+        r = rs.parse_resolve_user_response({"error": f"ambiguous: {SONICHI_AGENT}, {BASSIL_AGENT}"})
+        self.assertFalse(r["ok"])
+        self.assertIsNone(r["mxid"])
+        self.assertEqual(r["candidates"], [SONICHI_AGENT, BASSIL_AGENT])
+        self.assertTrue(rs.is_ambiguous(r))
+
+    def test_not_found_is_a_plain_miss(self):
+        r = rs.parse_resolve_user_response({"error": "user 'nobody' not found in room"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["candidates"], [])
+        self.assertIn("not found", r["reason"])
+        self.assertFalse(rs.is_ambiguous(r))
+
+    def test_junk_is_a_miss_never_a_hit(self):
+        for junk in ("not a dict", None, {}, [], {"mxid": "nobody"}, {"mxid": 42}, {"ok": True}):
+            r = rs.parse_resolve_user_response(junk)
+            self.assertFalse(r["ok"], junk)
+            self.assertIsNone(r["mxid"], junk)
+            self.assertTrue(r["reason"], junk)
+
+    def test_ambiguous_without_names_still_refuses(self):
+        # Defensive: a broker that says "ambiguous" but lists nobody parseable
+        # must still read as too-many, never as a miss for a later source to widen.
+        r = rs.parse_resolve_user_response({"error": "ambiguous"})
+        self.assertEqual(r["candidates"], [])
+        self.assertTrue(rs.is_ambiguous(r))
+
+
+class MentionBodyTests(EnvCase):
+    # EnvCase: an ambiguous directory answer now reads the roster (a gateway
+    # call), so the env must be cleared and the channel .env shadowed here too.
     def test_leads_with_mxid(self):
         b = mn.build_body("@sutando-qingyun-001:ag2.space", "review #149")
         self.assertTrue(b.startswith("@sutando-qingyun-001:ag2.space"))
@@ -620,14 +802,19 @@ class MentionBodyTests(unittest.TestCase):
     def test_ambiguous_handle_does_not_post(self):
         # mention() must refuse to post on an ambiguous handle (never mention the
         # wrong agent) — returns ok:false + candidates, no network touched.
-        res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
+        with mock.patch.object(_gateway, "http_request",
+                               side_effect=AssertionError("network touched")):
+            res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
         self.assertFalse(res["ok"])
         self.assertEqual(len(res["candidates"]), 2)
+        self.assertEqual(res["resolved_by"], "directory")
 
     def test_post_payload_leads_with_mxid_and_carries_mentions(self):
-        # A resolved mention posts op:message to /v1/room with the mxid LEADING
-        # the body (text trigger) AND a forward-compat `mentions:[mxid]` (activates
-        # structured push once the broker honors it). Both pinned so neither regresses.
+        """A resolved mention posts op:message to /v1/room with the mxid LEADING
+        the body (the routing token the broker matches as a whole token, and
+        the literal it pills for humans) AND `mentions:[mxid]` (stamped into
+        m.mentions). Both pinned so neither regresses; `resolved_by` names the
+        source so a wrong hit is traceable."""
         cap = {}
 
         def _fake_http_json(method, url, headers, payload):
@@ -644,6 +831,7 @@ class MentionBodyTests(unittest.TestCase):
         self.assertEqual(p["op"], "message")
         self.assertEqual(p["mentions"], ["@sutando-qingyun-001:ag2.space"])
         self.assertTrue(p["body"].startswith("@sutando-qingyun-001:ag2.space"))
+        self.assertEqual(res["resolved_by"], "directory")
 
 
 import events as ev  # noqa: E402
@@ -1143,15 +1331,16 @@ class EventAccumulatorTests(unittest.TestCase):
         lines = open(paths[0]).read().split("\n")
         self.assertEqual(lines[0], f"id: {base[:-4]}")
         self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
+        self.assertTrue(lines[2].startswith("local_time: "))
         # Origin must be explicit at a glance: the [taskify] marker leads the
         # task line and the promoted-from suffix names the room.
-        self.assertTrue(lines[2].startswith("task: [taskify] "))
-        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
-        self.assertEqual(lines[3], "source: events-promotion")
-        self.assertEqual(lines[4], f"channel_id: {ROOM}")
-        self.assertEqual(lines[5], "priority: low")          # never outranks humans
-        self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
-        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
+        self.assertTrue(lines[3].startswith("task: [taskify] "))
+        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[3])
+        self.assertEqual(lines[4], "source: events-promotion")
+        self.assertEqual(lines[5], f"channel_id: {ROOM}")
+        self.assertEqual(lines[6], "priority: low")          # never outranks humans
+        self.assertEqual(lines[7], "model_hint: efficient")
+        self.assertEqual(lines[8], "access_tier: ambient")  # trust boundary: never owner
         prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
         prov = json.loads(prov_line.split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
@@ -1304,11 +1493,12 @@ class RelationFieldsTests(unittest.TestCase):
     def test_whitespace_is_stripped(self):
         self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to this citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_becomes_its_own_field_and_is_checked_like_a_citation(self):
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(EnvCase):
@@ -1333,12 +1523,31 @@ class SayCitationTests(EnvCase):
         self.assertEqual(cap["payload"]["body"], "hi")
         self.assertEqual(cap["payload"]["op"], "message")
 
-    def test_no_thread_relation_is_ever_sent(self):
-        # Pins the review's requirement: nothing on this path may claim thread
-        # membership the gateway cannot deliver.
+    def test_a_citation_alone_never_claims_a_thread(self):
+        # A reply-to is a citation; only an explicit thread_root asks for the thread.
         _res, cap = self._post(reply_to=EV)
         self.assertNotIn("thread_root", cap["payload"])
         self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_thread_root_rides_the_payload_as_the_gateways_own_field(self):
+        res, cap = self._post(thread_root="$root")
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], "$root")
+        self.assertNotIn("m.relates_to", cap["payload"], "the gateway builds the relation, not this side")
+
+    def test_extra_content_rides_the_payload_beside_the_body(self):
+        anchor = {"space.ag2.collab.doc.comment": {"anchor": {"quote": "x"}, "v": 1}}
+        res, cap = self._post(extra_content=anchor)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.collab.doc.comment"],
+                         anchor["space.ag2.collab.doc.comment"])
+        self.assertEqual(cap["payload"]["body"], "hi")
+
+    def test_extra_content_keeps_the_worker_stamp(self):
+        os.environ["SUTANDO_WORKER_SEAT"] = "7"
+        _res, cap = self._post(extra_content={"space.ag2.x": 1})
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.worker"]["id"], "worker-7")
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.x"], 1)
 
     def test_bad_id_refuses_before_the_network(self):
         os.environ["RELAY_URL"] = "https://r"
@@ -1394,6 +1603,22 @@ class CitationCLITests(EnvCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
         self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_say_extra_content_flag_is_parsed_and_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '{"space.ag2.k": {"v": 1}}'])
+        self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
+
+    def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        out = io.StringIO()
+        with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out.getvalue())["ok"], False)
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}
@@ -1515,6 +1740,34 @@ class ChannelEnvTierTests(EnvCase):
                                lambda: "/nope/does/not/exist/.env"):
             base, _ = _gateway.gateway()
         self.assertEqual(base, "")
+
+class DegradeReasonFromTests(unittest.TestCase):
+    """The server's own error text reaches the caller; auth statuses keep the local diagnosis in front."""
+
+    @staticmethod
+    def _err(code, body):
+        import io
+        from urllib.error import HTTPError
+        return HTTPError("http://gw/v1/room", code, "x", {}, io.BytesIO(body.encode()))
+
+    def test_403_appends_the_servers_reason(self):
+        r = _gateway.degrade_reason_from(self._err(403, '{"error": "permission denied: platform grant events.subscribe missing"}'))
+        self.assertIn("not a joined member", r)
+        self.assertIn("events.subscribe missing", r)
+
+    def test_401_appends_too_and_keeps_the_token_diagnosis(self):
+        r = _gateway.degrade_reason_from(self._err(401, '{"error": "denied - agent not a joined member"}'))
+        self.assertTrue(r.startswith("auth failed"))
+        self.assertIn("server said", r)
+
+    def test_non_auth_status_uses_the_servers_text(self):
+        self.assertEqual(_gateway.degrade_reason_from(self._err(404, '{"error": "roadmap/plan.md not found"}')),
+                         "roadmap/plan.md not found")
+
+    def test_no_body_falls_back_to_the_status_text(self):
+        self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

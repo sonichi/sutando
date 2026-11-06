@@ -69,6 +69,23 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
 3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
 4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
 
+5. **Run the repo's own scanner before you push**, not after CI tells you:
+
+   ```bash
+   git commit ...                                              # it reads COMMITS, not your worktree
+   bash scripts/review-checks.sh --diff <(git diff origin/main...HEAD)
+   ```
+
+   It runs the machine-readable `checks:` block in [`REVIEW.md`](REVIEW.md) — the same one CI runs — so a red result here is a red result there.
+
+   Three things that make it report something other than what you expect, each measured:
+
+   - **Commit first.** Against an uncommitted or merely staged worktree the three-dot range is empty and you get `ERROR — empty diff; nothing was scanned, so this is NOT a pass`. It fails loudly rather than passing, but it is easy to read as "clean".
+   - **Three dots, not two.** `origin/main..HEAD` renders `main`'s own newer commits as your removals.
+   - **`PARTIAL` is not `PASS`.** With no `.py` in the diff it prints `prose-cap had no in-scope files`; from a `gh pr diff` file with no tree to read it prints `prose-cap SKIPPED`. Neither one scanned any prose.
+
+   Worth the second it costs because these findings are mechanical and invisible while writing. `prose-cap` counts **consecutive added comment lines**, so a trailing comment on a code line folds into the block beneath it — `return None  # why` above a 2-line block is a 3-line run, and the fix is a blank line between them, not a rewrite. On 2026-09-01 one file cost four separate CI round-trips across two authors for that class alone.
+
 ## The PR body should answer
 
 In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so the reviewer doesn't wonder whether you forgot it.
@@ -194,7 +211,7 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    The reviewer should not have to re-derive that your change works.
 2. Check the CLA status — CLA-Assistant runs on PR open and flags any commits whose author email isn't mapped to a CLA-signed GitHub account. **A failing CLA check blocks merge**, no matter how green everything else is. Fix with `git config user.email YOUR_GH_MAPPED_EMAIL && git commit --amend --reset-author --no-edit && git push --force-with-lease`. (`git log -1 --format='%ae'` to check what's there now.)
 
-   **`license/cla` FAILING and `license/cla` ABSENT are different problems with different fixes.** The remedy above is for a check that ran and said no. Sometimes the check never posts at all — and because it is a *required* context, "never posted" reads as pending forever and the PR sits at `BLOCKED` with every other check green and both approvals in place. It is easy to misread as a review problem. Tell them apart by asking for the commit statuses directly, since an absent context simply does not appear in the PR's check list:
+   **`license/cla` FAILING and `license/cla` ABSENT are different problems with different fixes.** The remedy above is for a check that ran and said no. Sometimes the check never posts at all — and because it is a *required* context, "never posted" reads as pending forever and the PR sits at `BLOCKED` with every other check green and the required approvals in place. It is easy to misread as a review problem. Tell them apart by asking for the commit statuses directly, since an absent context simply does not appear in the PR's check list:
 
    ```bash
    gh pr view <N> --json headRefOid --jq .headRefOid \
@@ -287,7 +304,7 @@ If you're reviewing someone else's PR (including a bot's), keep the comment thre
 - **Review the current head and the right layer.** For a stacked PR, identify the parent and inspect the child-only change as well as the cumulative interaction. After an update/rebase, re-check the head SHA, required checks, and whether prior approvals still apply.
 - **Scan added lines for hardcoded host paths on every review.** Do not rely only on CI: look for `/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline workspace/home fallbacks. Keep fixture exclusions token-specific so an allowed fixture on a line cannot hide a real production path on that same line.
 - **Clear stale formal blockers.** When the author pushes a fix, re-review the current head. If the request is genuinely resolved, dismiss/replace the stale REQUEST_CHANGES state; if it remains, cite the exact unresolved line or behavior. **"Replace" means an `APPROVED` review or a dismissal — a `COMMENTED` review does not clear your own `CHANGES_REQUESTED`.** GitHub takes the latest *decisive* review per login, and a comment is not one, so writing that the block is satisfied reads as closure in the thread while `reviewDecision` still shows it blocking. Do not leave a resolved change-request blocking merge through automation inertia.
-- **Apply the complete merge gate.** Merge only when the current head is mergeable, required CI and CLA checks are green, and two maintainers have recorded formal approvals. A comment, Discord acknowledgement, bot recommendation, stale approval on an old head, or admin bypass is not a substitute for any gate.
+- **Apply the complete merge gate.** Merge only when the current head is mergeable, required CI and CLA checks are green, and the approvals required by the repository's GitHub ruleset for `main` (currently one approving review, including a code owner; other ruleset settings, such as `require_extra_approval_for_unattributed_changes`, can raise the effective requirement) are recorded on the current head. The ruleset is the source of truth for the count; check the live settings with `gh api repos/sonichi/sutando/rules/branches/main`. "On the current head" is team policy, not something the ruleset enforces: it neither dismisses approvals on push nor requires last-push approval, so GitHub still counts an approval left on an older head. A comment, Discord acknowledgement, bot recommendation, stale approval on an old head, or admin bypass is not a substitute for any gate.
 
 For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC mechanics), see the `review-pr` skill if it's installed.
 
@@ -299,6 +316,11 @@ For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC
 - **Read the diff before pushing.** "I trust the agent" is not enough — bots miss conventions, hallucinate referenced files, and sometimes regenerate unrelated areas. Skim every change.
 - **No "drive-by" repo-wide refactors.** If the agent suggests one, open ONE small PR with the proposal first, get sign-off, then expand.
 - **Take responsibility for what your bot ships.** Its PRs are *your* PRs — your CLA, your review feedback to address, your closes-link to file. If a maintainer closes the PR as duplicate / not-planned / scope-drift, that's data — diagnose the root cause before re-filing.
+- **Say who wrote it and who answers for it.** An agent's work carries an attribution line wherever it lands, so a reader never mistakes it for the human's own:
+  - **Commits:** the accountable human is the author, under a CLA-mapped email, and the agent is named in a `Co-Authored-By:` trailer.
+  - **PR body:** one line naming the agent that wrote it and the human accountable for it.
+  - **Reviews and comments posted from a human's account:** end with `(agent-assisted, <agent> for <human>'s seat)`. A code-owner approval counts toward the merge gate, so the record must show when an agent, not the owner, made the call.
+  - **Outside contributors:** the same applies. A PR from an account that doesn't say whether an agent wrote it may be asked, and its CI is run only after a maintainer has read the diff.
 
 ## Community
 
