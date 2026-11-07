@@ -11,7 +11,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -29,8 +28,6 @@ COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh", "src/sutando_
           "src/agent/codex/codex-home.sh", "src/startup-runtime.sh", "src/repo_root.sh",
           "src/watcher_sentinel.sh", "skills/install.sh", "src/skill_audience.py",
           "sutando.config.json")
-ADAPTERS = ("src/startup-runtime.sh", "src/agent/codex/cli/start-cli.sh",
-            "skills/worker-pool/scripts/launch-codex-worker-session.sh", "skills/install.sh")
 
 
 class Layout(unittest.TestCase):
@@ -317,24 +314,52 @@ class StartupSteps(Layout):
         self.assertTrue((self.app_home / "skills" / "tutorial").is_symlink(), out.stdout)
 
 
-class Wiring(unittest.TestCase):
-    def test_every_adapter_delegates_and_none_creates_the_home_itself(self):
-        for rel in ADAPTERS:
-            with self.subTest(adapter=rel):
-                text = (REPO / rel).read_text()
-                self.assertIn("src/agent/codex/codex-home.sh", text)
-                self.assertIn("sutando_codex_home_prepare", text)
-                self.assertIsNone(re.search(r"mkdir -p \"\$_?config_value\"", text))
-                self.assertNotIn("core-config-dir-value codex", text)
-                self.assertNotIn("${CODEX_HOME:-$HOME/.codex}", text)
+class ProjectTrust(Layout):
+    """codex_project_trust.py writes only into a home it was handed, and never makes one."""
 
-    def test_the_shell_adapter_only_calls_the_owner(self):
-        text = (REPO / "src/agent/codex/codex-home.sh").read_text()
-        self.assertIn("src/codex_home.py\" prepare", text)
-        self.assertNotIn("mkdir", text)
+    def run_trust(self, home, working_dir):
+        return subprocess.run([sys.executable, str(REPO / "src/codex_project_trust.py"),
+                               str(home), str(working_dir), str(working_dir)],
+                              env=self.env(), capture_output=True, text=True, timeout=60)
 
-    def test_project_trust_never_creates_the_home(self):
-        self.assertNotIn("mkdir", (REPO / "src/codex_project_trust.py").read_text())
+    def git_checkout(self):
+        work = self.root / "work"
+        work.mkdir()
+        subprocess.run(["git", "init", "-q", str(work)], check=True, env=self.env())
+        return work
+
+    def test_a_missing_home_fails_and_is_not_created(self):
+        work = self.git_checkout()
+        missing = self.root / "app-support" / "workspace" / ".codex-sutando"
+        before = self.tree()
+        out = self.run_trust(missing, work)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("codex project trust:", out.stderr)
+        self.assertEqual(self.tree(), before)
+
+    def test_an_empty_home_fails_and_writes_nothing(self):
+        work = self.git_checkout()
+        before = self.tree()
+        out = self.run_trust("", work)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_dangling_owner_link_is_not_followed_into_creation(self):
+        work = self.git_checkout()
+        target = self.root / "elsewhere"
+        self.owner.symlink_to(target)
+        before = self.tree()
+        out = self.run_trust(self.owner, work)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(self.tree(), before)
+
+    def test_an_existing_home_gets_the_entry(self):
+        work = self.git_checkout()
+        self.owner.mkdir()
+        out = self.run_trust(self.owner, work)
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "trusted"), out.stderr)
+        self.assertIn("trust_level", (self.owner / "config.toml").read_text())
 
 
 if __name__ == "__main__":
