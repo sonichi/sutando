@@ -100,8 +100,15 @@ THREAD_PARAMS = [
     "message", "client", "bot_mentioned", "role_mentioned", "require_mention",
     "ACCESS_FILE", "mutate_access_file", "_backup_access_to_disk",
     "read_access_for_transaction", "_has_sibling_bots",
-    "_should_notify_owner_on_seed", "_format_seed_notice", "discord",
+    "_should_notify_owner_on_seed", "_format_seed_notice",
+    "_maybe_notify_owner_of_seed", "discord",
 ]
+async def _noop_notify(*_a, **_k):
+    """Stub for the seed-notice wrapper: these cases assert mutation behaviour,
+    not delivery, and the real one would need a DM-capable client."""
+    return False
+
+
 PAIRING_PARAMS = [
     "message", "sender_id", "username", "allowed", "channel_authorized", "policy",
     "ACCESS_FILE", "mutate_access_file", "_backup_access_to_disk",
@@ -226,6 +233,7 @@ class ThreadEngageMutatorBody(unittest.TestCase):
             _has_sibling_bots=lambda *_a, **_k: False,
             _should_notify_owner_on_seed=lambda *_a, **_k: False,
             _format_seed_notice=lambda *_a, **_k: "unused",
+            _maybe_notify_owner_of_seed=_noop_notify,
             discord=discord,
         )
         kwargs.update(overrides)
@@ -333,6 +341,7 @@ class ThreadEngageFailsClosedThroughGate(unittest.TestCase):
             _has_sibling_bots=lambda *_a, **_k: False,
             _should_notify_owner_on_seed=lambda *_a, **_k: False,
             _format_seed_notice=lambda *_a, **_k: "unused",
+            _maybe_notify_owner_of_seed=_noop_notify,
             discord=discord,
             load_allowed=lambda: [],
         )
