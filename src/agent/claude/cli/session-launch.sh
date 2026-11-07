@@ -62,9 +62,10 @@ claude_named_pids() {
   # in-session restart), the live process would otherwise be invisible.
   # `read -r pid _` tolerates procps -a's "pid cmdline" output too.
   pgrep -ax claude 2>/dev/null | while read -r pid _; do
-    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    args=" $(ps -p "$pid" -o args= 2>/dev/null || true) "
+    # The name is a whole token: `sutando-core` must not match `sutando-core-worker`.
     case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
+      *" --name $SESSION "*|*" --name=$SESSION "*) echo "$pid" ;;
     esac
   done
 }

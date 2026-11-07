@@ -238,4 +238,25 @@ rc=$(PGREP_CORE=1 TMUX_PANE_TEXT="$GW" run sonnet --confirm --launcher "$T/launc
 [ "$rc" = 5 ] && [ "$R" = opus ] && [ ! -e "$LCALLS" ] && ok "58 held but a core process runs: no settings write, no launch" || fail "58" "rc=$rc R=$R"
 rm -f "$T/state/core-limit-hold.json"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 58 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- a sibling session's core (`<session>-worker`) is not this session's, in either name form
+if command -v cc > /dev/null 2>&1; then
+  printf '#include <unistd.h>\nint main(void){sleep(60);return 0;}\n' > "$T/c.c"; mkdir -p "$T/cb"; cc -o "$T/cb/claude" "$T/c.c"
+  SS="smt-sib-$$"; n=58
+  for form in "--name $SS-worker" "--name=$SS-worker"; do
+    # shellcheck disable=SC2086
+    "$T/cb/claude" $form < /dev/null > /dev/null 2>&1 & SIB=$!; sleep 0.3
+    printf '{"model":"opus"}\n' > "$T/cfg/settings.json"
+    rc=$(PATH="$REALPATH" "$HERE/scripts/switch-model.sh" sonnet --offline --session "$SS" --socket "$T/none.sock" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
+    R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])"); n=$((n+1))
+    [ "$rc" = 0 ] && [ "$R" = sonnet ] && ok "$n --offline is not refused by a sibling core ($form)" || fail "$n" "rc=$rc R=$R $(cat "$T/err")"
+    printf '{"model":"opus"}\n' > "$T/cfg/settings.json"; rm -f "$LCALLS"; hold
+    rc=$(PATH="$REALPATH" "$HERE/scripts/switch-model.sh" sonnet --confirm --session "$SS" --socket "$T/none.sock" --state-dir "$T/state" --brain "$T/cfg" --launcher "$T/launcher.sh" > "$T/out" 2> "$T/err"; echo $?)
+    n=$((n+1))
+    [ "$rc" = 0 ] && [ -s "$LCALLS" ] && ok "$n held: a sibling core does not stop the write and relaunch ($form)" || fail "$n" "rc=$rc $(cat "$T/err")"
+    rm -f "$T/state/core-limit-hold.json"; kill "$SIB" 2>/dev/null; wait "$SIB" 2>/dev/null
+  done
+else
+  ok "59-62 skipped: no cc to build a process named claude"
+fi
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 62 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
