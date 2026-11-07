@@ -2600,5 +2600,136 @@ class Signing(Base):
         self.assertEqual(self.checks(out).get("hmac key"), "FAIL")
 
 
+SHARED_SESSION_ID = "0b6c4e8e-6d55-4f6e-9a41-8f2a6c1d3e77"
+
+
+class SharedConfigOptions(unittest.TestCase):
+    """--mcp-config and --setting-sources: what a session sharing another config dir loads of it."""
+
+    def test_a_filtered_mcp_set_leaves_the_config_dirs_own_servers_out(self):
+        from ag2_sparrow.adapters.claude_code import hold as hold_mod_  # noqa: F401
+        with tempfile.TemporaryDirectory() as d:
+            ccd = Path(d) / "shared-config"
+            ccd.mkdir()
+            # The shared dir's own MCP: the core's s.space server and the connected-apps one.
+            (ccd / ".claude.json").write_text(json.dumps({"mcpServers": {
+                "s-space": {"type": "stdio", "command": "node"}, "sutando-station": {"type": "http", "url": "https://x"}}}))
+            mcp = Path(d) / "agent-mcp.json"
+            mcp.write_text(json.dumps({"mcpServers": {"sutando-station": {"type": "http", "url": "https://x"}}}))
+            cfg = {"CLAUDE": "/opt/claude", "PLUGIN_DIR": "", "CLAUDE_CONFIG_DIR": str(ccd), "MCP_CONFIG": str(mcp),
+                   "SETTING_SOURCES": "project,local"}
+            argv = hold_mod_.claude_argv(cfg, SHARED_SESSION_ID)
+            at = argv.index("--mcp-config")
+            self.assertEqual(argv[at - 1:at + 2], ["--strict-mcp-config", "--mcp-config", str(mcp)])
+            self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
+            self.assertEqual(argv[-2:], ["--session-id", SHARED_SESSION_ID], "the session id stays last")
+            servers, problem = hold_mod_.mcp_servers(cfg["MCP_CONFIG"])
+            self.assertEqual((servers, problem), (["sutando-station"], ""))
+            self.assertNotIn("s-space", servers, "strict: the config dir's own s.space server is not in the set")
+            plain = hold_mod_.claude_argv(dict(cfg, MCP_CONFIG="", SETTING_SOURCES=""), SHARED_SESSION_ID)
+            self.assertFalse({"--strict-mcp-config", "--mcp-config", "--setting-sources"} & set(plain))
+
+    def test_bad_mcp_files_and_setting_lists_are_refused(self):
+        from ag2_sparrow.adapters.claude_code import cli as cli_, hold as hold_mod_
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "bad.json"
+            bad.write_text("[]")
+            self.assertIn("no mcpServers", hold_mod_.mcp_servers(str(bad))[1])
+            self.assertIn("not a readable MCP config", hold_mod_.mcp_servers(str(Path(d) / "absent.json"))[1])
+            for value in ("", "user,admin", "project,project"):
+                self.assertTrue(hold_mod_.setting_sources_problem(value), value)
+            self.assertEqual(hold_mod_.setting_sources_problem("project,local"), "")
+            args = argparse.Namespace(mcp_config=str(bad), setting_sources=None)
+            self.assertIn("--mcp-config", cli_.session_files_problem(args))
+            self.assertIn("--setting-sources", cli_.session_files_problem(argparse.Namespace(mcp_config=None,
+                                                                                           setting_sources="x")))
+        recorded = {r[0] for r in cli_.RECORDED}
+        self.assertTrue({"MCP_CONFIG", "SETTING_SOURCES", "HMAC_KEY_FILE"} <= recorded, "a repair keeps them")
+        self.assertTrue({"MCP_CONFIG", "SETTING_SOURCES"} <= set(cli_.LOCAL.config_keys))
+
+
+class BridgeSignsForTheSession(unittest.TestCase):
+    """End to end on one key: the bridge an install wires stamps each task, and the Mod's own verifier with
+    hmac_policy in strict mode submits that task and refuses an unsigned or tampered one."""
+
+    def test_signed_tasks_are_submitted_and_unsigned_or_tampered_ones_refused(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from claude_code_fixtures import run_verifier, verify_py
+        from ag2_sparrow import local_task_protocol, task_envelope
+        from ag2_sparrow.adapters.claude_code import hmac_policy
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / "task-hmac.key"
+            self.assertTrue(task_envelope.create_key(key))
+            self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+            self.assertEqual(task_envelope.install_bridge_stamper({"AG2_HMAC_KEY_FILE": str(key)}), "")
+            self.addCleanup(local_task_protocol.set_task_stamper, None)
+            path = local_task_protocol.write_task_file(Path(d) / "tasks", "task-s1",
+                                                       [("source", "ag2space"), ("access_tier", "owner")], "hi")
+            signed = Path(path).read_text()
+            self.assertTrue(signed.split("\n")[1].startswith(task_envelope.STAMP_PREFIX), signed)
+            cfg = {"HMAC_KEY_FILE": str(key), "HMAC_STRICT": "1"}
+            for text, submitted in ((signed, True), (signed.replace("hi", "rm -rf ~"), False),
+                                    ("id: task-u\naccess_tier: owner\ntask: hi\n", False)):
+                verdict, _tier, _collab = run_verifier(verify_py(), text, str(key))
+                ok, why, _retry = hmac_policy.decide(cfg, verdict, hmac_policy.key_digest(str(key)))
+                self.assertEqual(ok, submitted, (verdict, why))
+        self.assertEqual(task_envelope.install_bridge_stamper({}), "", "no key path: nothing changes")
+        self.assertIn("no usable key", task_envelope.install_bridge_stamper({"AG2_HMAC_KEY_FILE": "/nonexistent/k"}))
+
+
+
+class SigningAndMcpPieces(unittest.TestCase):
+    """The pieces a strict, shared-folder agent rests on, each refusal included."""
+
+    def test_keys_are_made_once_and_a_non_key_is_never_replaced(self):
+        from ag2_sparrow import task_envelope
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / "k"
+            self.assertTrue(task_envelope.create_key(key))
+            self.assertFalse(task_envelope.create_key(key), "kept")
+            other = Path(d) / "not-a-key"
+            other.write_text("hello")
+            with self.assertRaises(ValueError):
+                task_envelope.create_key(other)
+            self.assertEqual(other.read_text(), "hello")
+            # Another writer wins the race between the check and the link: its key stands.
+            raced = Path(d) / "raced"
+            real_link = os.link
+
+            def link_after_rival(src, dst):
+                Path(dst).write_text("cd" * 32)
+                return real_link(src, dst)
+            with mock.patch.object(os, "link", side_effect=link_after_rival):
+                self.assertFalse(task_envelope.create_key(raced))
+            self.assertEqual(raced.read_text(), "cd" * 32)
+            signed = task_envelope.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_envelope.load_key(key))
+            self.assertEqual(task_envelope.verify_text(signed, key), task_envelope.VERIFIED)
+            self.assertEqual(task_envelope.verify_text(signed, Path(d) / "absent"), task_envelope.UNVERIFIABLE)
+            self.assertEqual(task_envelope.verify_text("id: t\ntask: hi\n", key), task_envelope.UNSIGNED)
+            self.assertEqual(task_envelope.stamp_text(signed, task_envelope.load_key(key)).count(task_envelope.STAMP_PREFIX),
+                             1, "re-stamping replaces, never doubles")
+
+    def test_an_unwritable_key_dir_is_refused(self):
+        local, _ = cm.agent_job(L, "@helper:s.example")
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HOME": d}):
+            with mock.patch("ag2_sparrow.task_envelope.create_key", side_effect=PermissionError("no")):
+                key, problem = cb.own_hmac_key(local, cb.UNIT)
+            self.assertEqual(key, "")
+            self.assertIn("could not hold the agent's task key (PermissionError)", problem)
+
+    def test_install_refuses_an_unusable_key_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "bad.key"
+            bad.write_text("nope")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(cli, "version_problem", return_value=""), \
+                    mock.patch.object(cli, "resolve_root", return_value=({"root": d, "mode": cb.EXTERNAL,
+                                                                          "agent_id": "", "token_file": ""}, "")):
+                rc = cli.main(["install", "--work", d, "--hmac-key-file", str(bad)])
+            self.assertEqual(rc, cm.EXIT_UNUSABLE)
+            self.assertIn("is not a usable key", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
