@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from ag2_sparrow.delivery_core import DesignAClaimBackend
+from ag2_sparrow.delivery_core import DesignAClaimBackend, recover_claims as _recover_claims
 from ag2_sparrow.delivery_core.contract import ClaimToken, DeliveryOutcome
 
 import outbox
@@ -34,6 +34,11 @@ def result_backend(results_dir: Path) -> DesignAClaimBackend:
     if b is None:
         b = _BACKENDS[root] = DesignAClaimBackend(root)
     return b
+
+
+def recover_claims(results_dir: Path) -> list:
+    """This outbox's turn of the shared, throttled delivery_core.recover_claims: the retired ids."""
+    return _recover_claims(result_backend(results_dir))
 
 
 def is_delivered(results_dir: Path, task_id: str) -> bool:

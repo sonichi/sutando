@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 from .. import outbox
 from .contract import (BackendCapabilities, ClaimToken, CleanupReport,
@@ -285,3 +285,30 @@ class DesignAClaimBackend:
 
     def force_release(self, item_id: str) -> bool:
         return outbox.release_delivery_claim(self.root, item_id, force=True)
+
+
+# Inside the reclaim TTL recover() retires nothing, so a recovery run only at start would not do.
+RECOVER_EVERY_S = 600.0
+_RECOVERED_AT: dict = {}
+
+
+class _RootedBackend(Protocol):
+    """What recover_claims needs: a claim backend's recover(), and the root it is throttled by."""
+
+    root: Path
+
+    def recover(self) -> RecoverReport: ...
+
+
+def recover_claims(backend: _RootedBackend, every_s: float = RECOVER_EVERY_S) -> list:
+    """The one throttled recovery a polling loop runs on every pass: `backend.recover()` on the
+    first call, then at most once per `every_s` per root, which outlasts the reclaim TTL. It
+    retires the claims a crash left on terminal items (complete() writes the terminal status,
+    then releases the claim), and only a dead owner's past that TTL, so live work is never
+    displaced. Returns the retired ids, sorted."""
+    now = time.monotonic()
+    last = _RECOVERED_AT.get(backend.root)
+    if last is not None and 0 <= now - last < every_s:
+        return []
+    _RECOVERED_AT[backend.root] = now
+    return sorted(backend.recover().retired)
