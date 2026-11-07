@@ -3807,6 +3807,12 @@ class Hooks(unittest.TestCase):
         finally:
             release.set()
         drain.join(60)
+        # The first pass returned after DELIVERY_PASS_WAIT_S and left A's send to finish alone; the
+        # worker leaves _DELIVERING only after its settle, so that is the point A has settled by.
+        deadline = time.monotonic() + 60
+        while gw._delivering(a) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(gw._delivering(a), "A's send returned once released")
         self.assertEqual(gw._ATTEMPTS.get(a), {}, "A settles once its send returns")
         del fakes
 
