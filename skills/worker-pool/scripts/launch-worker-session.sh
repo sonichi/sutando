@@ -55,6 +55,9 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # those are the canonical core's alone.
 SURFACE_ARGS=()
 add_skill_claude_plugins
+# Opt-in per spawn: SUTANDO_TASK_WATCH_MOD_WORKER=1 runs this worker's watcher in the
+# task-watch Mod instead of a Monitor (docs/task-watcher-hosting-modes.md).
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-}"
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
@@ -105,6 +108,8 @@ ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 # the spawner's --cwd, which need not be the repo, so a relative path would
 # resolve against the wrong directory.
 ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
+# Always set, empty included: /startup --worker and the hooks read it to skip the Monitor.
+ENV_ARGS+=(-e "SUTANDO_TASK_WATCH_MOD=$TASK_WATCH_MOD")
 # The worker's own watcher beats state/watchers/<id>.alive, so the pool can
 # observe it as a file rather than a process scan.
 ENV_ARGS+=(-e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py")

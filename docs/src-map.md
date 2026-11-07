@@ -365,6 +365,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
 
+## `src/agent/claude/task-watch-mod/hooks/`
+
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
+
 ## `src/agent/codex/cli/`
 
 - **`codex-observer.mjs`** — Read-only observer of the Codex core: publishes its runtime observation record from the rollout file the core's process holds open.
