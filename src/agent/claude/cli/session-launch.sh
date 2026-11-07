@@ -275,7 +275,7 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
@@ -384,11 +384,50 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
+# Re-points hooks a moved install left on its old path at this checkout. Adds no hook,
+# so an opt-in one (the transcript archiver) stays as it was.
+repair_claude_hook_paths() {
+  [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_hooks_settings.py" ] || return 0
+  local _dirs=("$REPO") _wd _d _args=()
+  if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+    _wd="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
+    [ -d "$_wd" ] && _dirs+=("$(cd "$_wd" && pwd -P)")
+  fi
+  for _d in "${_dirs[@]}"; do
+    _args+=(--settings "$_d/.claude/settings.json" --settings "$_d/.claude/settings.local.json")
+  done
+  "$PY" "$REPO/src/claude_hooks_settings.py" repair-paths --repo "$REPO" "${_args[@]}" \
+    || echo "session-launch: hook path repair failed (rc=$?) — a moved install's hooks may still fail" >&2
+}
+
 # Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
 # and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {
   bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
   bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
+}
+
+# PATH a core pane runs under: tmux gives it the session's, else the server's global
+# environment, never this shell's. Falls back to $PATH when no server answers.
+claude_pane_path() {
+  local line
+  line="$(tmux -S "$TMUX_SOCKET" show-environment -t "=$SESSION" PATH 2>/dev/null)" || line=""
+  case "$line" in PATH=*) printf '%s' "${line#PATH=}"; return 0 ;; esac
+  line="$(tmux -S "$TMUX_SOCKET" show-environment -g PATH 2>/dev/null)" || line=""
+  case "$line" in PATH=*) printf '%s' "${line#PATH=}"; return 0 ;; esac
+  printf '%s' "$PATH"
+}
+
+# Returns 1, with the reason in CLAUDE_LAUNCH_FAILURE and on stderr, when `claude` does
+# not resolve on the pane's PATH: tmux would accept the command and the pane would just die.
+claude_cli_resolves() {
+  local pane_path
+  CLAUDE_LAUNCH_FAILURE=""
+  pane_path="$(claude_pane_path)"
+  (PATH="$pane_path"; hash -r; command -v claude >/dev/null 2>&1) && return 0
+  CLAUDE_LAUNCH_FAILURE="claude not found on PATH=$pane_path"
+  echo "  ⚠ $CLAUDE_LAUNCH_FAILURE" >&2
+  return 1
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then
@@ -398,6 +437,7 @@ install_claude_personal_hook() {
 # SESSION_ARGS, BOOT_PROMPT. Returns 0 if the session came up live, 1 otherwise
 # (caller decides what that means — abort, retry, or a heal path).
 launch_claude_session() {
+  claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \

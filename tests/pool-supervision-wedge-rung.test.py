@@ -48,6 +48,7 @@ CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+UNDELIVERED = getattr(ps, "CARD_UNDELIVERED", "card_undelivered")
 LOGGED_OUT = getattr(ps, "PANE_LOGGED_OUT", "logged-out")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
     ("PANE_GATE", "gate"), ("PANE_LIMIT", "limit"), ("PANE_ABNORMAL", "abnormal"),
@@ -71,7 +72,7 @@ def run(seq, period=300.0, ack=True):
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN):
+        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED):
             st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
@@ -87,7 +88,7 @@ check("a gate held with work outstanding asks for a card at the sustain, once, n
       got, [N, N, HUMAN, N, N])
 
 got, _ = run([obs(LIMIT)] * 4)
-check("a limit is a human's wait-or-spend decision: card, never restart", got, [N, N, HUMAN, N])
+check("a limit without a reset time probes after a bounded wait", got, [N, N, N, ps.RETRY_LIMIT])
 
 got, _ = run([obs(ABN)] * 5)
 check("abnormal text sustained asks once for a card naming its cause, never a restart",
@@ -113,7 +114,8 @@ got, _ = run([obs(GATE, work=False)] * 5)
 check("an idle worker parked on a limit owes nothing: not wedged", got, [N] * 5)
 
 got, _ = run([obs(IDLE)] * 5)
-check("at its prompt with work queued is the watcher rung's case, not a wedge", got, [N] * 5)
+check("at its prompt with work queued and a live watcher: carded once UNDELIVERED_AFTER_S passes",
+      got, [N, N, N, UNDELIVERED, N])
 
 got, _ = run([obs(ABN), obs(ABN), obs(IDLE, work=False), obs(ABN), obs(ABN)])
 check("one clean tick clears the wedge clock", got, [N, N, N, N, N])
@@ -157,7 +159,7 @@ check("an acknowledged login card does not silence the abnormal text that follow
       (got, getattr(st.workers["w"], "wedge_kind", None)), ([LOGIN, N, CAUSE, N], "abnormal"))
 
 got, _ = run([obs(LOGGED_OUT, work=False), obs(LIMIT), obs(LIMIT), obs(LIMIT)])
-check("...nor a limit that follows it: that cards at the episode's sustain", got, [LOGIN, N, HUMAN, N])
+check("a subsequent limit starts its own bounded wait", got, [LOGIN, N, N, N])
 
 got, _ = run([obs(ABN)] * 3 + [obs(LOGGED_OUT)] * 2)
 check("an expiry after an acknowledged cause card is carded on the tick that reads it",
@@ -205,6 +207,8 @@ results = pd.results_dir(ws)
 results.mkdir(parents=True, exist_ok=True)
 check("the core's queue is not this worker's work", wo(ws, WID), False)
 (inbox / "task-a.txt").write_text("")
+check("a sentinel whose task is not in tasks/ is stale, not work", wo(ws, WID), False)
+(ws / "tasks" / "task-a.txt").write_text("task: hello\n")
 check("a sentinel handed to it with no reply yet is work", wo(ws, WID), True)
 (inbox / "task-a.txt").rename(inbox / "task-a.accepted")
 check("an accepted sentinel with no reply is work in flight", wo(ws, WID), True)
@@ -277,9 +281,9 @@ check("a move clears the sustain, which starts over once the frame settles",
 got, _ = run([obs(WORK, "turn:t")] + [obs(GATE, "dialog:d")] * 3)
 check("entering a gate changes the frame, which is not progress under it", got, [N, N, N, HUMAN])
 got, _ = run([obs(LIMIT, "f1")] * 3)
-check("a bare raw id carries no progress evidence", got, [N, N, HUMAN])
+check("a bare raw id does not shorten the limit wait", got, [N, N, N])
 got, _ = run([obs(LIMIT, "r1:n1"), obs(LIMIT, "r1:n1"), obs(LIMIT, None)])
-check("an unread frame id is no evidence of progress", got, [N, N, HUMAN])
+check("an unread frame id does not shorten the limit wait", got, [N, N, N])
 
 # A worker genuinely held by the limit: idle prompt, the banner, no turn since, deliveries
 # piling up. Only the footer's counters change, and they are status, not work.
@@ -310,7 +314,8 @@ REFUSED = (f"\u276f check the inbox\n  \u23bf  You've hit your session limit \u0
 for label, text in (("a refused limit turn", REFUSED), ("the limit menu", PANES["limit menu"][0]),
                     ("a permission dialog", PANES["permission"][0])):
     got, _ = run([frame_obs(text)] * 4)
-    check(f"control: {label} on a frozen screen, work owed, is carded", got, [N, N, HUMAN, N])
+    check(f"control: {label} on a frozen screen", got,
+          [N, N, N, ps.RETRY_LIMIT] if label == "a refused limit turn" else [N, N, HUMAN, N])
 
 class Done:
     def __init__(self, rc=0, out="", err=""):
@@ -338,6 +343,7 @@ class Stub:
 
 
 (inbox / "task-b.txt").write_text("")
+(ws / "tasks" / "task-b.txt").write_text("task: hello\n")
 o = sup.observe(ws, 1000.0, runner=Stub(PANES["permission"][0]))[WID]
 check("observe reads the worker's pane and queue",
       (getattr(o, "pane", None), getattr(o, "work_outstanding", None)), (GATE, True))

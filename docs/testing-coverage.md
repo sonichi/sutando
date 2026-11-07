@@ -83,6 +83,15 @@ legitimately cannot meet the bar (rare — e.g. a pure launchd-installer
 change), the owner can merge over a red gate; the gate is a required
 conversation, not an unappealable veto.
 
+### Quarantined suites (non-blocking)
+
+`tests/python-quarantine.txt` lists suites that failed and then passed on a rerun of the same
+commit at least twice. `scripts/select-quarantined-suites.sh` drops them from every gating leg
+before the load-sensitive and cost selection, and the non-blocking `python quarantined tests` job
+runs them on every CI run and reports each outcome in its step summary. Every entry is
+`<path> <issue url>`; an entry with no issue url, listed twice, or naming a suite that is not
+discovered fails every leg (exit 3). A suite whose flake is fixed at its cause leaves the list.
+
 ### Load-sensitive suites (legs 14-15)
 
 `tests/python-load-sensitive-suites.txt` lists the suites CI keeps off the shared

@@ -513,6 +513,50 @@ ok "path containing 'exec ': guarded hook registered exactly once" \
    "$([ "$(echo "$ECMDS" | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
 rm -rf "$EROOT"
 
+# ---- the other revision's spelling of the SAME skill hook is swept, not doubled ----
+# fix/start-cli-installs-claude-hooks (#3997) and fix/core-only-hook-scope (#4309) write the
+# guard and then resolve the interpreter at event time (`. scripts/python-binary.sh …
+# exec "$_py" <hook>`). Its tail after the marker differs from main's `exec python3 <hook>`,
+# so the exact-tail sweep left both registered and every activity row was written twice.
+VROOT="$(mktemp -d)"; VREPO="$VROOT/repo"
+mkdir -p "$VREPO/.claude" "$VREPO/src" "$VREPO/skills/demo/hooks"
+cp "$HERE/../src/install-claude-hooks.sh" "$VREPO/src/"
+cp "$HERE/../src/skill_hooks.py" "$VREPO/src/"
+printf '#!/bin/bash\n:\n' > "$VREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$VREPO/src/check-pending-tasks.sh"
+chmod +x "$VREPO/src/"*.sh
+printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"},{"event":"Stop","command":"./hooks/g.py"}]}\n' \
+    > "$VREPO/skills/demo/manifest.json"
+printf 'import sys; sys.exit(0)\n' > "$VREPO/skills/demo/hooks/g.py"
+VPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$VREPO/skills/demo/hooks/g.py")"
+VQ="$(python3 -c "import shlex,sys;print(shlex.quote(sys.argv[1]))" "$VPATH")"
+export V_SETTINGS="$VREPO/.claude/settings.json"
+export V_OTHER="[ -f $VQ ] || exit 0; . $VREPO/scripts/python-binary.sh 2>/dev/null || exit 0; _py=\"\$(resolve_python $VREPO)\"; [ -n \"\$_py\" ] || exit 0; exec \"\$_py\" $VQ"
+# An operator's own hook that merely runs the same script, without our guard, is NOT ours.
+export V_OPERATOR="python3 $VQ --mine"
+python3 - <<'PY'
+import json, os
+row = lambda c: {"type": "command", "command": c}
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [row(os.environ["V_OTHER"]), row(os.environ["V_OPERATOR"])]}],
+                     "Stop": [{"matcher": "", "hooks": [row(os.environ["V_OTHER"])]}]}},
+          open(os.environ["V_SETTINGS"], "w"), indent=2)
+PY
+bash "$VREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+vcmds() { python3 -c "
+import json, os, sys
+d = json.load(open(os.environ['V_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get(sys.argv[1], []) for h in g['hooks']))
+" "$1"; }
+ok "other spelling: PreToolUse has exactly one guarded entry for the hook" \
+   "$([ "$(vcmds PreToolUse | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
+ok "other spelling: Stop has exactly one guarded entry for the hook" \
+   "$([ "$(vcmds Stop | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
+ok "other spelling: the surviving entry is this installer's" \
+   "$(vcmds PreToolUse | grep -qF "exec python3 $VQ" && echo 0 || echo 1)"
+ok "other spelling: the operator's own unguarded hook survives" \
+   "$(vcmds PreToolUse | grep -qxF "$V_OPERATOR" && echo 0 || echo 1)"
+rm -rf "$VROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then

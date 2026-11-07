@@ -68,6 +68,7 @@ from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
+import wedge_probes  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -3555,6 +3556,112 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
                        f"Re-arm the driver (TaskStop + Monitor) and confirm the stamp moves to {head}.")}
 
 
+# A git write holds index.lock for well under a second; five minutes is ~300x
+# the slowest legitimate case measured here and 113x below the incident's 9.4h.
+GIT_LOCK_STALE_S = 300.0
+
+# `git rev-parse --local-env-vars` (git 2.50) plus the two discovery bounds. Any
+# of these inherited makes git answer for ANOTHER repository despite `-C`.
+GIT_REPO_SELECTION_ENV = frozenset({
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
+
+
+def _git_dir(repo: Path) -> "Path | None":
+    """The real .git directory, as GIT resolves it.
+
+    Asking git is what proves the answer belongs to THIS checkout. A
+    hand-parsed `gitdir:` pointer can name any existing directory, and the
+    probe would then advise removing an unrelated repository's lock; git's own
+    resolver also sidesteps `Path.resolve()`, whose symlink-loop RuntimeError
+    would escape an always-on sweep. Unresolvable means no remedy, not a guess.
+    """
+    import subprocess as _sp
+    env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_SELECTION_ENV}
+    try:
+        r = _sp.run(git_argv("-C", str(repo), "rev-parse", "--absolute-git-dir"),
+                    capture_output=True, timeout=20, env=env)
+    except (OSError, ValueError, _sp.SubprocessError):
+        return None
+    # Bytes, not text: universal newlines would fold a CR in the NAME into
+    # "\n", and only the record terminator comes off — a trailing space stays.
+    raw = r.stdout.removesuffix(b"\n")
+    if r.returncode != 0 or not raw:
+        return None
+    try:
+        g = Path(os.fsdecode(raw))
+        return g if g.is_dir() else None
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+def check_git_index_lock(repo_dir: "Path | None" = None,
+                         now: "float | None" = None) -> dict:
+    """Warn when `.git/index.lock` has outlived any plausible git operation.
+
+    A crashed or killed git leaves the lock behind, and from then on EVERY
+    write in that checkout fails with "Another git process seems to be
+    running" — add, checkout, commit, stash, rebase. Nothing else surfaces it:
+    the failure is per-command, so a seat that does not happen to write sees a
+    healthy repo, and a seat that does write reads the message as a transient
+    collision and retries later. Measured on the live checkout 2026-09-04: a
+    ZERO-byte lock, 9.4 hours old, with no process holding it, had been
+    silently failing git writes for the whole night.
+
+    Read-only and warn-only: a lock younger than the threshold is an ordinary
+    in-flight write, and an unreadable repo is not this probe's business.
+    """
+    name = "git-index-lock"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    gitdir = _git_dir(repo)
+    if gitdir is None:
+        return {"name": name, "status": "ok",
+                "detail": f"{repo} is not a git checkout — nothing to lock"}
+    lock = gitdir / "index.lock"
+    try:
+        # lstat, not stat: a DANGLING symlink named index.lock still occupies the
+        # directory entry, so git's exclusive create fails while stat() says absent.
+        st = lock.lstat()
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no index.lock — git writes are unblocked"}
+    except (OSError, ValueError, RuntimeError) as e:
+        # Only a missing file is an absence; any other stat error leaves the
+        # question unanswered, and "unblocked" would state an unmade measurement.
+        return {"name": name, "status": "warn",
+                "detail": (f"cannot tell whether {lock} exists "
+                           f"({type(e).__name__}: {getattr(e, 'strerror', None) or e}) "
+                           f"— this is UNMEASURED, not a clean checkout")}
+    age = (now if now is not None else time.time()) - st.st_mtime
+    if age < 0:
+        # A future mtime makes every age comparison meaningless, and "in flight"
+        # would report an in-progress write this probe never observed.
+        return {"name": name, "status": "warn",
+                "detail": (f"{lock} is dated {-age:.0f}s in the FUTURE — its age is UNMEASURED, "
+                           f"not young; git writes may be blocked. Check the clock, then inspect "
+                           f"the lock by hand")}
+    if age < GIT_LOCK_STALE_S:
+        return {"name": name, "status": "ok",
+                "detail": f"index.lock present but only {age:.0f}s old — a git write is in flight"}
+    hrs = age / 3600.0
+    when = f"{hrs:.1f}h" if hrs >= 1 else f"{age / 60:.0f}m"
+    # A path with spaces splits into separate argv words, so an unquoted
+    # command would probe — and remove — operands that are not the lock.
+    q = shlex.quote(str(lock))
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{lock} is {when} old ({st.st_size} bytes) — every git write in this checkout "
+                   f"is failing with \"Another git process seems to be running\". Confirm nothing "
+                   f"holds it (`lsof {q}`; a real writer also keeps a git process in `ps`), "
+                   f"then `rm {q}`"),
+    }
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -4072,6 +4179,9 @@ ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
 def _default_local_notifier(msg: str) -> bool:
     """Owner surface that does not depend on any Sutando bridge. True only on a
     zero exit, so a missing osascript reads as undelivered rather than success."""
+    from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+    if not resolve_macos_notifications():
+        return False  # off unless the owner opted in: reported as undelivered
     safe = str(msg).replace('"', "").replace("\\", "")
     try:
         return subprocess.run(
@@ -6760,21 +6870,21 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
         # half-written file caught between os.write() syscalls. Fall through
         # to ok so the next tick sees a (re-)written status.
         return {"name": name, "status": "ok", "detail": f"core-status.json unreadable: {str(e)[:60]}"}
-    state = data.get("status")
-    ts = data.get("ts")
+    state = data.get("status") if isinstance(data, dict) else None
+    ts = data.get("ts") if isinstance(data, dict) else None
     if state != "running":
         return {"name": name, "status": "ok", "detail": f"status={state}"}
-    if not isinstance(ts, (int, float)):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return {"name": name, "status": "ok", "detail": "running, no ts"}
-    age = int(time.time() - ts)
-    if age > threshold_sec:
-        step = data.get("step", "?")
+    now = time.time()
+    stale = wedge_probes.core_status_verdict(data, now, threshold_sec)  # the wedge detector's rule too
+    if stale:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"running for {age}s on '{step}' — last heartbeat > {threshold_sec}s ago",
+            "detail": f"running for {stale['age']}s on '{stale['step']}' — last heartbeat > {threshold_sec}s ago",
         }
-    return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
+    return {"name": name, "status": "ok", "detail": f"running ({int(now - ts)}s ago)"}
 
 
 def check_core_supervisor() -> dict:
@@ -6811,7 +6921,7 @@ def check_core_supervisor() -> dict:
     prompt = data.get("prompt")
     if prompt:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
-    needs_user = {"blocked-human", "logged-out"}
+    needs_user = wedge_probes.NEEDS_USER
     degraded = {"crashed", "hung", "gateway-down"}
     # `gateway-down` means "core up, relay gateway not running". On a host with no
     # gateway configured that is the DESIGNED state — startup.sh never launches the
@@ -8766,7 +8876,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
     orphans: list[tuple[str, int]] = []
-    unreadable = 0
+    unreadable = unretired = 0
     for path in entries:
         # Per-file isolation on purpose. One unreadable entry must not decide
         # the answer for the whole directory: with the guard around the loop
@@ -8824,11 +8934,15 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         except (OSError, ValueError, ImportError):
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
+            unretired += 1
             continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    # A skip was never a lost reply, but a consumer should still have retired it from results/.
+    if unretired:
+        partial += f"; {unretired} skip-marked result(s) still live past the threshold, unretired"
     if not orphans:
         status = "warn" if unreadable else "ok"
         return {"name": name, "status": status,
@@ -9759,6 +9873,16 @@ def _worker_hard_timeout_s() -> float:
     return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
 
 
+def _bridge_auth_held(channel: str) -> bool:
+    """True while channel-bridge-wrapper.sh holds this bridge on a rejected token (stamp: epoch, wrapper pid)."""
+    stamp = WORKSPACE_DIR / "state" / "channel-bridge-supervisor" / f"{channel}.auth-held"
+    try:
+        lines = stamp.read_text().split()
+        return len(lines) >= 2 and _pid_alive(int(lines[1]))
+    except (OSError, ValueError):
+        return False
+
+
 def _task_claim_thresholds() -> tuple[float, float]:
     """(warn, down) seconds from the handler's configured hard timeout."""
     hard = _worker_hard_timeout_s()
@@ -10619,6 +10743,89 @@ def check_codex_presence(which=shutil.which, consumer=None) -> dict:
     return {"name": name, "status": "warn", "detail": detail}
 
 
+# The bridge writes this verbatim when the sandbox could not produce a reply.
+SANDBOX_UNAVAILABLE_MARK = "Sandbox unavailable"
+
+
+def check_sandbox_delegation(window_sec: int = 86400) -> dict:
+    """Report guest/team tasks that got the fallback sentinel instead of an answer.
+
+    Resolving on PATH is not drivability: `codex-presence` stayed ok for two days
+    while every `codex exec` exited 1 on an unsupported model pin. Keying on the
+    sentinel is cause-agnostic — pin, login, quota or wiped binary all land here —
+    and it fires only when a real sender was actually denied a reply.
+    """
+    name = "sandbox-delegation"
+    results_dir = WORKSPACE_DIR / "results"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    # results/ is drained fast, so the evidence is usually already in the
+    # month-partitioned archive; scan both or a same-day outage reads as clean.
+    roots = [results_dir]
+    # archive-stale-results.py sweeps into results/archive-<date>/, a SIBLING of
+    # archive/, on a retention tunable below this probe's fixed 24h window.
+    try:
+        roots += [results_dir / e.name for e in os.scandir(results_dir)
+                  if e.is_dir() and e.name.startswith("archive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
+    archive = results_dir / "archive"
+    if archive.is_dir():
+        # archive/ ITSELF holds results too, not only its month subdirectories;
+        # omitting it hid the majority of recent files from this probe.
+        roots.append(archive)
+        try:
+            roots += [archive / e.name for e in os.scandir(archive) if e.is_dir()]
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"could not scan results/archive/: {exc}"}
+    hits, unreadable = [], 0
+    for root in roots:
+        try:
+            # scandir, not glob: glob swallows a directory-level EACCES and
+            # yields nothing, so an unscannable dir would report a clean one.
+            entries = list(os.scandir(root))
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"could not scan {root.name}/: {exc}"}
+        for e in entries:
+            if not e.name.endswith(".txt") or not e.name.startswith("task-"):
+                continue
+            try:
+                if now - e.stat().st_mtime > window_sec:
+                    continue
+                with open(e.path, "r", encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(200)
+            except OSError:
+                # Per-file isolation: one unreadable entry must not decide the
+                # answer for the directory.
+                unreadable += 1
+                continue
+            if SANDBOX_UNAVAILABLE_MARK in head:
+                hits.append(e.name)
+    if not hits:
+        detail = (f"no sandboxed delegation failed in the last {window_sec // 3600}h "
+                  "(0 fallback sentinels written)")
+        if unreadable:
+            detail += f"; {unreadable} result file(s) unreadable"
+        return {"name": name, "status": "ok", "detail": detail}
+    shown = ", ".join(sorted(hits)[:3])
+    detail = (
+        f"{len(hits)} guest/team task(s) in the last {window_sec // 3600}h got "
+        f"'{SANDBOX_UNAVAILABLE_MARK}' instead of a reply ({shown}"
+        f"{', …' if len(hits) > 3 else ''}). The sandbox is the ONLY permitted path "
+        "for a non-owner task, so those senders were answered by nobody. "
+        "Isolation held; the capability behind it did not. Run "
+        "`codex exec --sandbox read-only -C /tmp -- 'reply OK'` to see the reason "
+        "— a model pin in ~/.codex/config.toml the installed CLI rejects is one."
+    )
+    if unreadable:
+        detail += f" ({unreadable} result file(s) unreadable.)"
+    return {"name": name, "status": "warn", "detail": detail}
+
+
 def check_codex_task_notifier() -> dict:
     """Detect a missing managed notifier even when a bare watcher looks alive."""
     if not _codex_runtime_selected():
@@ -10651,7 +10858,12 @@ def check_codex_task_notifier() -> dict:
                 "session could not be verified"
             ),
         }
-    return _probe_codex_task_notifier(target)
+    probe = _probe_codex_task_notifier(target)
+    from delivery.codex_pickup import warning
+    stalled = warning(WORKSPACE_DIR)
+    if stalled and probe["status"] == "ok":
+        return {"name": "codex-task-notifier", "status": "warn", "detail": stalled}
+    return probe
 
 
 def _claude_runtime_selected() -> bool:
@@ -13254,6 +13466,7 @@ def run_all_checks() -> list[dict]:
     # Per-host channel access.json backup drift (live vs vault-carried copy)
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
+    checks.append(check_git_index_lock())
     checks.append(check_live_checkout_branch())
     checks.append(check_skills_driver_code_drift())
     checks.append(check_sync_conflicts_unmerged())
@@ -13365,6 +13578,10 @@ def run_all_checks() -> list[dict]:
                         "detail": "process probe failed — bridge state unknown"}
                 _apply_pin_findings(_row, _pin_verdicts(name, None))
                 checks.append(_row)
+                continue
+            if _bridge_auth_held(channel_name):
+                checks.append({"name": name, "status": "fail", "detail": (
+                    "held: credential rejected — vault set the token, then bash src/restart.sh")})
                 continue
             # This exact detail string is a contract: fix_down_bridges()
             # matches it as a PREFIX to pick restart candidates (and the
@@ -13655,6 +13872,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
+    checks.append(check_sandbox_delegation())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
@@ -13893,6 +14111,10 @@ def notify_for_failures(
     defaults to `osascript` driving `display notification`. Tests inject a
     fake to avoid spamming the developer's own notification center.
     """
+    if notify_cmd is None:
+        from sutando_config import resolve_macos_notifications  # noqa: PLC0415
+        if not resolve_macos_notifications():
+            return
     failures = [c for c in checks
                 if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
                 and not _alerts_suppressed(c)]
@@ -14434,32 +14656,25 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
 
 
 def _resolve_launch_env() -> dict:
-    """Environment for out-of-process core restarts (start-cli.sh --restart).
-
-    launchd's minimal PATH (``/usr/bin:/bin:/usr/sbin:/sbin``) cannot find the
-    tools start-cli.sh needs — homebrew ``tmux``, ``claude`` in ``~/.local/bin``,
-    or the Sutando.app-bundled ``node`` runtime — so the restart exits rc=127
-    (``node unavailable`` / ``exec: claude: not found``) and silently falls
-    through to the legacy fallback. Prepend all of them.
-
-    Extends the existing tmux-only PATH fix to node + claude. Incident
-    2026-07-10: the watchdog restart path was broken under launchd for ~70 min
-    (queue backlog) because every canonical restart hit rc=127. Same PATH-
-    narrowing class as _resolve_tmux_bin (2026-06-09), applied here.
-    """
+    """Env for out-of-process core probes and restarts: homebrew dirs prepended for tmux.
+    Node and ``claude`` dirs are the launchers' (src/agent/launch-path.sh), after any override."""
     env = dict(os.environ)
     extra = [
         "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
         "/usr/local/bin",                           # homebrew (Intel) / misc
-        str(Path.home() / ".local" / "bin"),        # `claude` install location
     ]
-    # Sutando.app-bundled node runtime: sibling of the repo inside the app bundle
-    # (Contents/Resources/{repo,runtime}). Absent in a plain dev checkout → skipped.
-    bundled_bin = REPO_DIR.parent / "runtime" / "bin"
-    if bundled_bin.is_dir():  # pragma: no cover — only present inside the app bundle
-        extra.append(str(bundled_bin))
     env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
     return env
+
+
+def _core_limit_hold(now: float) -> "dict | None":
+    """The launcher's provider-limit hold in force now, else None; unreadable is None."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import core_limit_hold
+        return core_limit_hold.active_hold(WORKSPACE_DIR, now)
+    except Exception:
+        return None
 
 
 def _default_core_restart() -> bool:
@@ -14567,6 +14782,7 @@ def recover_core_if_wedged(
     restart_fn=None,
     stopped_fn=None,
     sender=None,
+    limit_hold_fn=None,
 ) -> "dict | None":
     """Auto-restart the core when it is alive-but-wedged. Returns a dict
     describing the action taken (for tests / observability), or None when no
@@ -14595,6 +14811,7 @@ def recover_core_if_wedged(
         lambda: _local_core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
     send = sender or _default_slack_sender
+    limit_hold_fn = limit_hold_fn or (lambda: _core_limit_hold(now))
 
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -14685,6 +14902,15 @@ def recover_core_if_wedged(
                 _reset_observation()
                 _save()
             return None
+
+        # The launcher holds a core its provider refused for a limit; relaunching here
+        # would only DM "auto-relaunching" and meet the same hold.
+        hold = limit_hold_fn() if dead else None
+        if hold:
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
+            return {"action": "limit-hold", "until": hold.get("until"), "reason": hold.get("reason")}
 
         # Age alone cannot separate a wedge from one legitimately long task: reset the
         # window when the oldest task changes, the core advances, or the mode flips.
@@ -14911,11 +15137,15 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     return best_socket or default
 
 
-def _resolve_tmux_bin(candidates: "tuple[str, ...]" = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")) -> str:
-    """Absolute tmux path when a known install location exists, else a bare
-    PATH lookup (run with _resolve_launch_env's healed PATH). Same
-    PATH-narrowing class as _resolve_launch_env: under launchd's minimal PATH,
-    homebrew tmux doesn't resolve. Candidates injectable for tests."""
+_TMUX_INSTALL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _resolve_tmux_bin(candidates: "Optional[tuple[str, ...]]" = None) -> str:
+    """Absolute tmux from homebrew or ~/.local/bin (neither is on launchd's PATH, and the
+    launch env does not add ~/.local/bin), else a bare PATH lookup. Candidates injectable."""
+    if candidates is None:
+        candidates = tuple(os.path.join(d, "tmux") for d in _TMUX_INSTALL_DIRS) + (
+            str(Path.home() / ".local" / "bin" / "tmux"),)
     for cand in candidates:
         if os.path.exists(cand):
             return cand

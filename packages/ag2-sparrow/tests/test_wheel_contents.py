@@ -101,6 +101,11 @@ def main():
                            text=True, cwd=d, env=env, timeout=60)
         assert r.returncode == 0 and "install" in r.stdout, f"{r.stdout}\n{r.stderr}"
         print("PASS installed ag2-sparrow-hatch runs the Hatch adapter")
+        r = subprocess.run([str(bindir / "ag2-sparrow-mcp"), "headers"], capture_output=True,
+                           text=True, cwd=d, env=env, timeout=60)
+        assert r.returncode == 1 and r.stdout == "", f"{r.stdout}\n{r.stderr}"
+        assert "REMOTE_TASK_TOKEN" in r.stderr, f"expected the missing-token message:\n{r.stderr}"
+        print("PASS installed ag2-sparrow-mcp fails cleanly without a token")
         # install runs with a PATH that lacks the venv's bin, as a Hatch worker's may.
         home = d / "home"
         home.mkdir()
@@ -147,8 +152,8 @@ def _claude_local_tmux_off_path(d, bindir, py, env):
         store.chmod(0o755)
         if not link.is_symlink():
             link.symlink_to(store)
-        r = subprocess.run([cmd, "connect", "--base", "https://127.0.0.1:9", "--code", "-", "--claude", str(claude),
-                            "--tmux", tmux], input="acp.never-redeemed\n", capture_output=True, text=True, cwd=d,
+        r = subprocess.run([cmd, "connect", "--base", "https://127.0.0.1:9", "--agent", "@probe:ag2.space", "--code", "-",
+                            "--claude", str(claude), "--tmux", tmux], input="acp.never-redeemed\n", capture_output=True, text=True, cwd=d,
                            env=cenv, timeout=60)
         assert r.returncode == 2 and why in r.stderr and "the code was not used" in r.stderr, r.stderr
         assert "could not reach" not in r.stderr, r.stderr

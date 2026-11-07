@@ -120,12 +120,7 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: not written by {' or '.join(WRITERS)}"
     env = decl.get("env")
     mxid = env.get("AGENT_MXID") if isinstance(env, dict) else None
-    try:
-        # The bridge reports the id verbatim, so it must be exact: no surrounding whitespace to strip.
-        own = isinstance(mxid, str) and mxid == mxid.strip() and agent_identity.root_segment(mxid) == segment
-    except ValueError:
-        own = False
-    if not own:
+    if not agent_identity.owns_segment(mxid, segment):     # the bridge reports the id verbatim: exact
         return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
     root = str(Path(agents).resolve() / segment)
     seat = _sources.is_seat(env)

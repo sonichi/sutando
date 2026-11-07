@@ -50,6 +50,9 @@ _load_channel_env() {
         tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
         [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
     fi
+    # The bridge re-reads the file holding the token on an auth rejection, to pick up a rotated one.
+    local held="$dot"; [ -n "$tok" ] && [ -f "$tok" ] && held="$tok"
+    [ -n "$held" ] && [ -f "$held" ] && export REMOTE_TASK_TOKEN_FILE="$held"
     # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
     local v rc
     for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
@@ -111,7 +114,7 @@ fi
 # the bridge's own stand-down and ends the wrapper for good.
 if ! WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || [ -z "$WORKSPACE" ]; then
     echo "[gateway-bridge-wrapper] FATAL: workspace unresolvable via scripts/sutando-config.sh (check sutando.config.local.json) — not starting the bridge" >&2
-    osascript -e 'display notification "Gateway bridge cannot resolve the workspace; it is not running." with title "Sutando"' >/dev/null 2>&1 || true
+    bash "$REPO/src/macos-notify.sh" "Gateway bridge cannot resolve the workspace; it is not running." || true
     exit 0
 fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
@@ -137,7 +140,7 @@ emit_restart_alert() {
   echo "$NOW" > "$ALERT_STAMP"
   printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." \
     | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
-  osascript -e "display notification \"The gateway bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
+  bash "$REPO/src/macos-notify.sh" "The gateway bridge exited and was automatically restarted." || true
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"

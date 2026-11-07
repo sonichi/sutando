@@ -63,6 +63,7 @@ CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+UNDELIVERED = getattr(ps, "CARD_UNDELIVERED", "card_undelivered")
 PANES["logged-out"] = f"❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n{FOOTER}\n"
 
 
@@ -141,12 +142,12 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 st, d = ps.evaluate(st, {"w": o}, t)
                 seen.add(d["w"])
                 t += 300.0
-        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN}, set())
+        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, ps.RETRY_LIMIT, CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED}, set())
         self.assertNotIn(ps.RECOVER, seen)
 
     def test_no_wedge_decision_reaches_kill_send_keys_or_spawn(self):
         self.assertIsNotNone(wc, "no wedge card module")
-        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN):
+        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED):
             for label, pane in PANES.items():
                 ws, t = pool(), Tmux(pane)
                 rem.apply(ws, REPO, {WID: which}, runner=t, spawn=never_spawn)

@@ -20,6 +20,7 @@ from pathlib import Path
 import sys  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.process_group import popen_bound  # noqa: E402
+from _helpers.macos_opt_in import macos_opt_in_env  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "claude_task_notifier_harness", Path(__file__).resolve().parent / "claude-task-notifier.test.py")
@@ -36,6 +37,11 @@ REPO = _h.REPO
 
 class EventDispatchTests(FakeTmuxHarness):
     """--event <filename>: block records, alerts, and staging/submit confirmation."""
+
+    def run_event(self, filename, env_extra=None, timeout=15):
+        # The alerts asserted here are the owner's opt-in (notifications.macos); default is off.
+        env = {**macos_opt_in_env(self.tasks_dir.parent), **(env_extra or {})}
+        return super().run_event(filename, env_extra=env, timeout=timeout)
 
     def test_a_persistent_draft_escalates_once_then_resets(self):
         # A silent retry loop behind a stale draft reads as a dead agent; the

@@ -113,6 +113,24 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
+**AgentTrigger events (`event_type`, `agent_trigger_id`, `playbook`).** A task the
+platform raises for an event, not a message, carries `"interaction_type":
+"system_event"` plus `"event_type"`, a key of `EVENT_PLAYBOOKS` in
+`src/agent_triggers.py` (`room.mention`, `room.joined`); any other value is
+dropped, not passed. Its optional `"agent_trigger_id"` (the event's idempotency
+id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
+most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
+matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
+trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
+allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
+`"playbook": true`), else the registry default for the event (`room.joined` →
+`room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
+as a message. A `room.joined` task names the room in `channel_id`/`source_room_id`,
+the inviter in `user_id` (its `access_tier` is the inviter's) and has no
+`source_message_id`, so its result posts top level. A broker that sends no
+`event_type` keeps today's task: the self-describing body still reads as a
+system event.
+
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
 declares (below). One agent's credential may be used by more than one bridge, so
@@ -451,7 +469,7 @@ Sutando checkout around it sends neither field.
   the adoption's own write and publishes the copy saved for its serve. A copy is removed only by the
   ledger's owner, under the ledger's lock, while no record names it: at start, copies no record
   names are removed, and none while any record or reference cannot be read; a copy whose removal
-  fails is left for the next start. Copies are private (0600). Its result
+  fails is left for the next start. Copies are private (0600) and redacted before they are written: the body, the wake and the room question (as it was redacted on intake) hold no pasted token or `vault set` value. A held copy never stores a `vault set`: the owner's is replaced with a note that it was not stored from this re-sent copy and should be sent again if the key is not stored (a late store could put an old value over a newer one); anyone else's is redacted as usual. Only the first render of a serve stores. A redacted copy is `v2-<hash>.json`, envelope format 2, with what was found under `cleaned`; it is published without a second vault interception, and an earlier bridge never reaches it, as it refuses the format-5 ledger. A `v1-` copy is published as before. Its result
   goes out on the run's own outbox item, `<task>.run-<n>`, as a wake's goes on `<task>.wake-<episode>`.
   An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
   The same holds after the earlier run has finished: a serve under a lease other than the one it
@@ -479,9 +497,10 @@ Sutando checkout around it sends neither field.
   outcome is unknown (a timeout, a crash) keeps its claim and is reconciled under the same id. Each
   start takes the ledger over with a new epoch, and a bridge whose epoch is gone makes no further
   claim or call and stops polling. A ledger that cannot be locked, read or written is never written
-  over, and nothing that depends on it moves. The ledger is format 4 (saved-serve references); a
-  format-3 ledger is read and upgraded on its next write, and a format-3 bridge refuses a format-4
-  ledger rather than serve its debts from a legacy file. A damaged value inside it (its `contract`,
+  over, and nothing that depends on it moves. The ledger is format 5 (saved-serve references, redacted held copies); a
+  format-3 or format-4 ledger is read and upgraded on its next write. An earlier bridge refuses a
+  format-5 ledger and holds every task, rather than serve debts from a legacy file (format 3) or
+  save a raw held copy (format 4); setting the ledger aside starts it clean. A damaged value inside it (its `contract`,
   a record, a run entry) is never read as absent: the work that needs it is held and logged. The way
   out is to stop the bridge, set the ledger aside (or repair the named key), and restart: a missing
   ledger starts empty, and the attempts the old one held are not resumed.
@@ -492,8 +511,17 @@ Sutando checkout around it sends neither field.
   claims it for the run and generation in the same transition, before any effect (attachments,
   Stop, settle, publish). A reply written at the result's name after that is a new result; one that
   arrives after the task's lease closed is kept in `results/undelivered/` for review. A task id is
-  not retired while its pin is held, so the results directory must support hard links. Each
-  result is delivered on a worker of its own, so a send that hangs holds no other task's result.
+  not retired while its pin is held, so the results directory must support hard links. Results
+  ready together go out in intake order (the insertion order of `remote-task-rooms*.json`), one
+  at a time per room on that room's worker, and rooms run in parallel: a send that hangs holds
+  only its own room's later replies, for at most its request timeout (35 s for the result post,
+  60 s per attachment upload). A reply that is still in flight after its turn (a deferred upload,
+  an unreadable alias ledger, a held result, an unconfirmed post) holds its room's later replies
+  until its outbox item is terminal (delivered or parked) or its task is settled; past
+  `ROOM_ORDER_MAX_WAIT_S` (120 s from the reply's write) it stops holding them, and a log line
+  says so. A result that posts nothing (`[no-send]`, `[REPLIED]`, `[deduped:]`) and one with no
+  recorded room are delivered on a worker of their own. Right after an upgrade the map was
+  written sorted, so the first pass may order the tasks already in flight by id.
 - Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
   upgraded; start logs that they are ignored, and attempts in flight across that upgrade are not
   resumed.
@@ -643,7 +671,9 @@ revisions. Unchanged, it is re-sent every 600 s, not at the workers' 20 s refres
 ```
 body: {
   "display": { "name": "<display name>" },
-  "host":    { "host_id": "<short hostname>", "kind": "local" },
+  "host":    { "host_id": "<short hostname>", "kind": "local",
+               "placement": "desktop" },
+             // placement only when SUTANDO_PLACEMENT is "desktop"; display-only
   "workers": { "<worker id>": { "label": "<name>", "runtime": "<runtime>" } }
              // label always; runtime when the publisher knows it
 }
@@ -1115,6 +1145,8 @@ only summary and `last_reported_at`, never phase or blockers. It never uses
 
 An HTTP 404 means the Action is not deployed: log it and skip, leaving the row
 eligible for a later rate-limited retry. Other failures are logged and contained.
+HTTP failures include their status and a sanitized structured error code (or
+`unavailable`); response bodies, exception messages and credentials are never logged.
 Keep the switch off until the Action is live and a live owner-ledger witness has
 been captured. Enabling it does not authorize a bridge restart.
 

@@ -4,6 +4,8 @@
 export const CONTRACT_NAMES = [
  "claim an absent owner task",
  "claim a task whose tier is not admitted: answered once",
+ "claim an attested collaborator task without --allow-collaborator: answered once",
+ "claim an attested collaborator task with --allow-collaborator: admitted",
  "claim a task with a ready result",
  "claim a task with an unready result",
  "claim a prepared task again",
@@ -84,6 +86,61 @@ export const CONTRACT = [
      "exit": 1,
      "refused": true,
      "retry": false
+    }
+   }
+  ]
+ },
+ {
+  "name": "claim an attested collaborator task without --allow-collaborator: answered once",
+  "task": "task-c2b",
+  "tier": "team",
+  "extra": "collaborator: true\n",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-c2b"
+    ],
+    "expect": {
+     "exit": 1,
+     "refused": true,
+     "retry": false
+    }
+   },
+   {
+    "argv": [
+     "claim",
+     "task-c2b"
+    ],
+    "expect": {
+     "exit": 1,
+     "refused": true,
+     "retry": false
+    }
+   }
+  ]
+ },
+ {
+  "name": "claim an attested collaborator task with --allow-collaborator: admitted",
+  "task": "task-c2c",
+  "tier": "team",
+  "extra": "collaborator: true\n",
+  "allow_collaborator": true,
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-c2c"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "admission": "collaborator",
+      "access_tier": "team",
+      "collaborator": true
+     }
     }
    }
   ]

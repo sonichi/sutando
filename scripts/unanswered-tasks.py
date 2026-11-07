@@ -8,10 +8,10 @@ answers in its own transcript, the terminal shows the reply, and only the queue
 disagrees. Measured five times in one session, caught every time by re-listing
 by hand and never by recall.
 
-Exit 1 when a task older than --min-age-sec has no result AND no worker holds
-it, 0 otherwise, 2 when the answer cannot be decided. A task the router
-delegated is that worker's to answer, so counting it here reports the core as
-owing work it must not do.
+Exit 1 when a task older than --min-age-sec has no result AND nobody holds it
+(src/task_delegation.py:holder), 0 otherwise, 2 when the answer cannot be
+decided. A task the router gave a worker, or the core handed to a live background
+agent, is not the core's to answer now, so counting it here reports work it must not redo.
 
 The third code exists because 1 and "cannot decide" must not share one: an
 unreadable deliveries/ says nothing about who holds a task, and reporting that
@@ -68,9 +68,9 @@ def _unanswered_reason(results: Path, task_id: str, tasks: Path | None = None) -
 _POOL_SCRIPTS = _SRC.parent / "skills" / "worker-pool" / "scripts"
 
 
-def _holder(workspace: Path, task_id: str) -> str | None:
+def _pool_holder(workspace: Path, task_id: str) -> str | None:
     """Delegated to the worker-pool skill's worker_delivery.py. The skill is
-    optional: without it there is no router, so nobody can hold a task."""
+    optional: without it there is no router, so no worker can hold a task."""
     try:
         os.stat(_POOL_SCRIPTS / "worker_delivery.py")
     except FileNotFoundError:
@@ -79,6 +79,11 @@ def _holder(workspace: Path, task_id: str) -> str | None:
     sys.path.insert(0, str(_POOL_SCRIPTS))
     from worker_delivery import holder_of  # noqa: E402
     return holder_of(workspace, task_id)
+
+
+def _holder(workspace: Path, task_id: str, task_file: Path | None = None) -> str | None:
+    import task_delegation
+    return task_delegation.holder(workspace, task_id, task_file=task_file, worker_holder=_pool_holder)
 
 
 def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) -> list[tuple[str, float, str]]:
@@ -92,7 +97,7 @@ def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) ->
         age = now - f.stat().st_mtime
         if age < min_age_sec:
             continue  # still plausibly in flight
-        holder = _holder(workspace, f.stem)
+        holder = _holder(workspace, f.stem, f)
         if holder is not None:
             # Not the core's to report: the router made it that worker's. Said
             # on stderr so a genuinely stuck holder stays visible to a human.
@@ -150,7 +155,7 @@ def snapshot(workspace: Path, min_age_sec: float, now: float | None = None,
         mtime = f.stat().st_mtime
         headers = parse_task_headers_lenient(f.read_text(errors="replace")).headers
         intake = status_ack_policy.intake_at(task_id, headers)
-        phase, holder = _phase(workspace, task_id), _holder(workspace, task_id)
+        phase, holder = _phase(workspace, task_id), _holder(workspace, task_id, f)
         reason = _unanswered_reason(results, task_id, tasks)
         claimed = holder is not None or phase in _CLAIMED_PHASES
         age = None if intake is None else max(0.0, now - intake)

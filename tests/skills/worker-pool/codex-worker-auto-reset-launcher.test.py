@@ -25,7 +25,7 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
             for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
                         "scripts/python-binary.sh", "src/agent/codex/codex-home.sh",
                         "src/codex_home.py", "src/codex_host_instructions.py",
-                        "src/sutando_config.py"):
+                        "src/sutando_config.py", "src/agent/launch-path.sh"):
                 dest = root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / rel, dest)

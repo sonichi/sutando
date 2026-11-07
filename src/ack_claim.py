@@ -77,29 +77,28 @@ def _dir_lock(d: Path, mode: int):
 @contextlib.contextmanager
 def _locked(workspace: Path, key: str):
     """Serialises the read-check-write of update/release on one key across processes. The key
-    lock is opened and acquired under the shared directory lock, so cleanup never unlinks it
-    in between; the path must still name the acquired inode, else it is opened again."""
+    lock stays under the shared directory lock until released, so cleanup cannot overtake
+    a publisher; the path must still name the acquired inode, else it is opened again."""
     d = claims_dir(workspace)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{_name(key)}.lock"
-    while True:
-        with _dir_lock(d, fcntl.LOCK_SH):
-            fh = open(path, "a")
-            if _after_open is not None:
-                _after_open(key)
-            fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            same = os.fstat(fh.fileno()).st_ino == os.stat(path).st_ino
-        except FileNotFoundError:
-            same = False
-        if same:
-            break
-        fh.close()
-    try:
-        yield
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+    with _dir_lock(d, fcntl.LOCK_SH):
+        while True:
+            with open(path, "a") as fh:
+                if _after_open is not None:
+                    _after_open(key)
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                try:
+                    same = os.fstat(fh.fileno()).st_ino == os.stat(path).st_ino
+                except FileNotFoundError:
+                    same = False
+                if not same:
+                    continue
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                return
 
 
 def _mine(d, key: str, holder: str, gen) -> bool:

@@ -194,6 +194,8 @@ class HumanCardMigration(unittest.TestCase):
         inbox = rem.pd.deliveries_dir(self.ws, self.wid)
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "task-human.txt").write_text("pending")
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        (self.ws / "tasks" / "task-human.txt").write_text("task: hello\n")
 
     def seed_human_ack(self):
         sup.save_state(self.ws, ps.SupervisionState(last_sample_at=self.now, workers={
@@ -203,8 +205,8 @@ class HumanCardMigration(unittest.TestCase):
     def active(self):
         return wc.manager_for(self.ws).active()
 
-    def test_gate_and_limit_card_once_clear_and_recur(self):
-        for pane in (GATE, LIMIT):
+    def test_gate_cards_once_clears_and_recurs(self):
+        for pane in (GATE,):
             self.panes[self.wid] = pane
             for _ in range(5):
                 self.sweep()
@@ -226,6 +228,14 @@ class HumanCardMigration(unittest.TestCase):
         self.assertTrue(all("capture-pane" in a or "has-session" in a
                             or "inbox-holders" in a for a in self.calls))
 
+    def test_limit_wait_replaces_the_old_human_card_ladder(self):
+        self.panes[self.wid] = LIMIT.replace(" · resets 12:10pm", "")
+        self.sweep()
+        self.assertEqual(self.active(), [])
+        evidence = sup.load_state(self.ws).workers[self.wid]
+        self.assertIsNotNone(evidence.limit_next_at)
+        self.assertIsNone(evidence.wedge_kind)
+
     def test_ack_repair_matches_worker_and_existing_card(self):
         self.add_worker(WORKERS[1])
         other = self.seed_card(WORKERS[1], which=ps.CARD_HUMAN, pane=GATE)
@@ -233,6 +243,8 @@ class HumanCardMigration(unittest.TestCase):
         inbox = rem.pd.deliveries_dir(self.ws, WORKERS[1])
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "task-other.txt").write_text("pending")
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        (self.ws / "tasks" / "task-other.txt").write_text("task: hello\n")
         self.seed_human_ack()
         self.sweep()
         self.assertEqual(len(self.active()), 2)

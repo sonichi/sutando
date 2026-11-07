@@ -58,9 +58,14 @@ export const HEADER_KEYS: readonly string[] = [
 	'hitl_click',
 	'owner_mentioned',
 	'task_layout',
+	'hook',
+	'summon',
 	'local_time',
 	'parent_task',
 	'parent_generation',
+	'event_type',
+	'agent_trigger_id',
+	'playbook',
 ];
 
 /** Alternation source for a header-line guard. Keys are plain

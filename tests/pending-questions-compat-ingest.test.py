@@ -254,6 +254,41 @@ class TestIngest(_Ws):
                     callers.append(p.relative_to(REPO).as_posix())
         self.assertEqual(callers, ["skills/pending-questions/scripts/pending_questions_store.py"])
 
+    def test_a_title_that_says_resolved_without_brackets_or_a_status_line_is_not_imported(self):
+        """sonichi/sutando#5514: main sometimes closes a `## ` section by hand, overwriting its
+        leading timestamp with RESOLVED/SELF-RESOLVED instead of adding a **Status:** line — the
+        shape the old file-based reader's `_TITLE_RESOLVED` caught before it was dropped with that
+        reader (fc02ae4b4). Prose that merely contains the word, not leading, still imports."""
+        resolved_no_brackets = ("## RESOLVED 2026-09-08T09:04:41Z — owner said yes\n\n"
+                                 "Acted on it already; kept for the record.\n\n")
+        self_resolved = "## SELF-RESOLVED 2026-07-31 — no answer needed\n\nMeasured myself; moot.\n\n"
+        still_a_question = ("## #4358 — my diagnosis dispute RESOLVED in agreement; one gap remains\n\n"
+                             "Default: ship as-is.\n\n")
+        mixed_case_leading = "## Resolved by whom should X ship?\n\nStill open; nobody answered yet.\n\n"
+        self.file(resolved_no_brackets, self_resolved, still_a_question, mixed_case_leading)
+        db = self.db()
+        moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+        self.assertEqual(errors, [])
+        titles = [r["title"] for r in db.open_entries()]
+        self.assertEqual(titles, ["#4358 — my diagnosis dispute RESOLVED in agreement; one gap remains",
+                                   "Resolved by whom should X ship?"],
+                          "the all-caps hand-written marker closes a section; mixed-case leading "
+                          "'Resolved' is an ordinary open question and must still import (qingyun-wu)")
+        self.assertEqual(len(moved), 2, "both open questions became rows; the two closed sections never did")
+        text = self.pq.read_text()
+        self.assertIn("## RESOLVED 2026-09-08T09:04:41Z — owner said yes\n\n"
+                      "Acted on it already", text, "untouched: never a row, nothing to mark moved")
+        self.assertEqual(compat.ingest_legacy_file_entries(self.ws, HOST, db), ([], []), "idempotent")
+
+    def test_a_bracketed_bullet_label_that_says_resolved_is_not_imported(self):
+        resolved_bullet = "- **[RESOLVED 2026-08-18, the voice-agent restart fix]** shipped, no answer needed\n"
+        self.file(MAIN_BULLET, resolved_bullet)
+        db = self.db()
+        moved, errors = compat.ingest_legacy_file_entries(self.ws, HOST, db)
+        self.assertEqual(errors, [])
+        self.assertEqual([r["title"] for r in db.open_entries()], ["CLA check, 2026-09-20"])
+        self.assertEqual(len(moved), 1)
+
     def test_the_module_states_its_removal_condition(self):
         doc = compat.__doc__
         self.assertIn("docs/migration-transition-window.md", doc)

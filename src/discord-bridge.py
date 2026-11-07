@@ -117,6 +117,7 @@ if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from channel_auth_exit import exit_auth_rejected  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
 import gateway_sessions  # noqa: E402
@@ -2771,7 +2772,7 @@ def _log_gateway_reasons(stream=None) -> None:
 def _run_bridge() -> None:
     _single_instance_acquire("discord-bridge")
     _log_gateway_reasons()
-    client.run(TOKEN, log_handler=None)
+    _run_gateway()
 
 
 @client.event
@@ -6278,6 +6279,18 @@ def _send_cli_body(argv: list) -> str:
     if not body.strip():
         raise SystemExit(f"ERROR: --body-file {argv[1]!r} is empty — refusing to send")
     return body
+
+
+def _run_gateway() -> None:
+    """Run the gateway client; a rejected token exits EXIT_AUTH_REJECTED, never a crash."""
+    try:
+        client.run(TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        exit_auth_rejected("discord", "DISCORD_BOT_TOKEN")
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) == 401:
+            exit_auth_rejected("discord", "DISCORD_BOT_TOKEN")
+        raise
 
 
 if __name__ == "__main__":

@@ -7,9 +7,10 @@ in a fixture that has every discovered path, the real selector, sharder, cost ta
 list, and a stub lane runner that records the file list and worker count it is handed.
 Whatever the workflow does to pick a leg's files — selector, sharder, or anything that
 replaces them — is what gets measured. It must hold that every discovered suite runs in
-exactly one leg, the listed load-sensitive suites in the second-to-last leg (heaviest first, two
+exactly one leg except the quarantined ones (tests/python-quarantine.txt), which run in none, the listed load-sensitive suites in the second-to-last leg (heaviest first, two
 workers) except those tagged `serial`, which run alone in the last, and the shared legs none of them; and a list with a stale or duplicate entry must stop every
-leg with the selector's exit 3, so a leg that reads the list without the selector fails.
+leg with the selector's exit 3, so a leg that reads the list without the selector fails. A quarantine entry
+that is stale or carries no issue url stops every leg the same way.
 
 Run: python3 tests/python-ci-legs-partition.test.py
 """
@@ -26,8 +27,9 @@ REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
 LIST = "tests/python-load-sensitive-suites.txt"
 COSTS = "tests/python-suite-costs.txt"
+QUARANTINE = "tests/python-quarantine.txt"
 COPIED = ["scripts/discover-python-tests.sh", "scripts/select-load-sensitive-suites.sh",
-          "scripts/shard-by-cost.sh", LIST, COSTS]
+          "scripts/select-quarantined-suites.sh", "scripts/shard-by-cost.sh", LIST, COSTS, QUARANTINE]
 
 LANE_STUB = """#!/usr/bin/env bash
 # Records what the step hands the lane runner, and a passing record per file.
@@ -82,9 +84,10 @@ SHARED_LEGS = range(1, LOAD_LEG)
 ALL_LEGS = range(1, SERIAL_LEG + 1)
 
 
-def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=ALL_LEGS):
+def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=ALL_LEGS, quarantine_text=None):
     body = step_body()
     (fx / LIST).write_text(list_text)
+    (fx / QUARANTINE).write_text((REPO / QUARANTINE).read_text() if quarantine_text is None else quarantine_text)
     getconf = fx.parent / "bin" / "getconf"
     getconf.write_text(f"#!/usr/bin/env bash\necho {nproc}\n")
     getconf.chmod(0o755)
@@ -107,6 +110,9 @@ def main() -> int:
     listed = [r[0] for r in rows]
     serial = [r[0] for r in rows if r[1:] == ["serial"]]
     paired = [f for f in listed if f not in serial]
+    quarantined = [ln.split()[0] for ln in (REPO / QUARANTINE).read_text().splitlines()
+                   if ln.strip() and not ln.startswith("#")]
+    gated = [f for f in disc if f not in quarantined]
     cost = {}
     for ln in (REPO / COSTS).read_text().splitlines():
         if ln and not ln.startswith("#"):
@@ -130,9 +136,12 @@ def main() -> int:
     dups = sorted({f for f in every if every.count(f) > 1})
     if dups:
         fails.append(f"{len(dups)} suite(s) run in more than one leg, e.g. {dups[:3]}")
-    missing = sorted(set(disc) - set(every))
+    missing = sorted(set(gated) - set(every))
     if missing:
         fails.append(f"{len(missing)} discovered suite(s) run in no leg, e.g. {missing[:3]}")
+    leaked = sorted(set(quarantined) & set(every))
+    if leaked:
+        fails.append(f"quarantined suite(s) still run in a gating leg: {leaked[:3]}")
     shared = sorted(set(listed) & {f for s in SHARED_LEGS for f in legs[s][1]})
     if shared:
         fails.append(f"load-sensitive suite(s) in legs 1-{SHARED_LEGS[-1]}: {shared[:3]}")
@@ -170,6 +179,17 @@ def main() -> int:
                 fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3"
                              f"{' and ran ' + str(len(files)) + ' suites' if files else ''}")
 
+    # The quarantine list is read the same way: a stale entry or one with no issue url stops every leg.
+    qreal = (REPO / QUARANTINE).read_text()
+    qdrifted = {
+        "stale quarantine entry": qreal + "tests/no-such-suite.test.py https://github.com/sonichi/sutando/issues/1\n",
+        "quarantine entry without an issue url": qreal + disc[0] + "\n",
+    }
+    for what, text in qdrifted.items():
+        for shard, (rc, files, _w, err, _r) in run_legs(fx, real, quarantine_text=text).items():
+            if rc != 3:
+                fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3")
+
     # No `serial` tag left: the serial leg must stop with a reason, not run nothing.
     untagged = real.replace(f"{serial[0]} serial", serial[0]) if serial else real
     rc, files, _w, err, _r = run_legs(fx, untagged, 8, (SERIAL_LEG,))[SERIAL_LEG]
@@ -181,10 +201,11 @@ def main() -> int:
         print("  FAIL", f)
     if fails:
         return 1
-    print(f"PASS: ci.yml's {len(legs)} legs run all {len(disc)} discovered suites exactly once "
+    print(f"PASS: ci.yml's {len(legs)} legs run all {len(gated)} gated suites exactly once and none of the "
+          f"{len(quarantined)} quarantined "
           f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg {LOAD_LEG} (heaviest first, two "
           f"workers), {len(serial)} `serial` alone in leg {SERIAL_LEG}, on 2- and 8-core hosts; a stale, duplicate or "
-          f"badly tagged list entry stops every leg with exit 3; an untagged list stops leg {SERIAL_LEG} with its reason")
+          f"badly tagged list entry, or a stale or issue-less quarantine entry, stops every leg with exit 3; an untagged list stops leg {SERIAL_LEG} with its reason")
     return 0
 
 

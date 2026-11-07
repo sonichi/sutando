@@ -29,7 +29,8 @@ CLI:
     python3 src/delivery/pane_gate.py leftover --runtime codex < capture.txt   # exit 0 = clearable
     python3 src/delivery/pane_gate.py healthy --runtime claude < capture.txt   # exit 0 = accepts input
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
-        [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
+        [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--require-limit] [--dry-run]
+    python3 src/delivery/pane_gate.py limit-holds --runtime claude < capture.txt   # exit 0 = limit alone
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -49,6 +52,7 @@ sys.path.insert(0, str(_SRC))
 from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
                        core_target, frame_abnormal, frame_working, needs_login_line, normalize,
                        state_id)
+from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl directly)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from worker_auth_state import signed_in_since  # noqa: E402
@@ -142,6 +146,8 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
+# The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
+_LIMIT_MENU_ROW = re.compile(r"wait for (?:the )?limit to reset|usage credits|extra usage", re.I)
 
 
 def _dialog_names_limit(text: str) -> bool:
@@ -154,6 +160,13 @@ def _dialog_names_limit(text: str) -> bool:
     start = rows[-1]
     while start > 0 and _NUMBERED_ROW.match(lines[start - 1]):
         start -= 1
+    end = rows[-1]
+    while end + 1 < len(lines) and _NUMBERED_ROW.match(lines[end + 1]):
+        end += 1
+    # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
+    live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
+    if live and any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
+        return True
     for line in reversed(lines[:start]):
         core = line.strip()
         if not core:
@@ -218,6 +231,7 @@ class RuntimeAdapter:
     automation_leftovers: Tuple[str, ...] = ()
     # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
     pending_blocks_dispatch: bool = False
+    composer_requires_single_line: bool = False
 
 
 CLAUDE = RuntimeAdapter(
@@ -239,6 +253,7 @@ CODEX = RuntimeAdapter(
     # Codex rejects Claude's /startup and leaves it in the composer.
     automation_leftovers=("/startup",),
     pending_blocks_dispatch=True,
+    composer_requires_single_line=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -266,8 +281,10 @@ class Outcome:
     message: str
 
 
-def _prompt_glyph(raw: str, adapter: RuntimeAdapter) -> Optional[str]:
-    plain = _SGR.sub("", raw).lstrip(" \t")
+def _prompt_glyph(raw: str, adapter: RuntimeAdapter, allow_indent: bool = True) -> Optional[str]:
+    plain = _SGR.sub("", raw)
+    if allow_indent:
+        plain = plain.lstrip(" \t")
     return next((glyph for glyph in (adapter.glyph, *adapter.alternate_glyphs)
                  if plain.startswith(glyph)), None)
 
@@ -364,6 +381,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     EXACT-equality staging checks -- core-input-watch.py's `_composer_text`
     aliases this rather than re-deriving it.
 
+    Single-line adapters require a visible footer and preserve all typed bytes.
     From the bottommost prompt line to the end of the capture. Below an editable
     composer the CLI renders its own frame -- box rule(s), at most one idle-footer
     row, at most one hint/tip row -- so the strip removes exactly those, once each,
@@ -372,6 +390,28 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     LAST matching row of each kind is ever popped, and never a second time. The cut
     at the closing rule follows the same rule: the LAST rule row, never an interior one.
     """
+    if adapter.composer_requires_single_line:
+        rows = capture.split("\n")
+        start = next((i for i in range(len(rows) - 1, -1, -1)
+                      if _prompt_glyph(rows[i], adapter, allow_indent=False) is not None), None)
+        footer = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].strip()), None)
+        if (start is None or footer is None or footer <= start
+                or not adapter.idle_ready.search(_SGR.sub("", rows[footer]))):
+            return None
+        block = rows[start:footer]
+        if len(block) > 1 and block[-1] == "":
+            block.pop()
+        if len(block) != 1:
+            return None
+        glyph = _prompt_glyph(block[0], adapter)
+        raw = block[0][block[0].find(glyph) + len(glyph):]
+        ghostless, ghosts = _GHOST.subn("", raw)
+        if ghosts and _SGR.sub("", ghostless) in ("", " ", "\u00a0"):
+            return ""
+        while _SGR.match(raw):
+            raw = raw[_SGR.match(raw).end():]
+        text = raw[1:] if raw[:1] in (" ", "\u00a0") else raw
+        return None if re.search(r"[\x00-\x1f\x7f]", text) else text
     lines = [ln for ln in capture.splitlines() if ln.strip()]
     start = None
     for i in range(len(lines) - 1, -1, -1):
@@ -736,6 +776,25 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     return Verdict("unknown", "no idle affordance")
 
 
+def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
+    """The pane waits on a provider limit and nothing else: an empty composer, no turn
+    running, no other dialog. The banner on screen is the evidence; no quota record is read."""
+    if not capture or not capture.strip():
+        return False
+    lines = _tail_lines(capture)
+    tail = "\n".join(_SGR.sub("", ln) for ln in lines)
+    abn = frame_abnormal(tail)
+    if (abn and abn.retrying) or frame_working(tail) or turn_in_flight(capture):
+        return False
+    line = prompt_line(capture, adapter)
+    if line is None or line.text:
+        return False
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
+    if gate:
+        return gate in LIMIT_GATES
+    return abn is not None and abn.kind == "provider-limit"
+
+
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
             runner: Callable = subprocess.run, env: Optional[dict] = None, workspace=None,
             probe=False) -> Verdict:
@@ -750,12 +809,14 @@ def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: s
 
 
 # tmux-send-line.sh's contract; 2 is its own argument rejection.
-EXIT_STATUS = {0: "sent", 2: "rejected", 3: "no-session", 4: "no-tmux", 5: "pending", 6: "queued", 7: "unknown"}
+EXIT_STATUS = {0: "sent", 2: "rejected", 3: "no-session", 4: "no-tmux", 5: "pending", 6: "queued", 7: "unknown",
+               8: "not-limited"}
 
 
 def deliver(line: str, session: str, runtime: str, socket_path: Optional[str] = None,
             refuse_if_pending: bool = False, skip_if_queued: Optional[str] = None, dry_run: bool = False,
-            runner: Callable = subprocess.run, script: Path = SEND_LINE) -> Outcome:
+            runner: Callable = subprocess.run, script: Path = SEND_LINE,
+            require_limit: bool = False) -> Outcome:
     """Type one line + Enter into the core pane via the ONE sender, scripts/tmux-send-line.sh.
     The prompt read, the queued-input policy and the lock are its; this only maps its exit code."""
     if runtime not in ADAPTERS:
@@ -767,6 +828,8 @@ def deliver(line: str, session: str, runtime: str, socket_path: Optional[str] = 
         argv.append("--refuse-if-pending")
     if skip_if_queued:
         argv += ["--skip-if-queued", skip_if_queued]
+    if require_limit:
+        argv.append("--require-limit")
     if dry_run:
         argv.append("--dry-run")
     proc = runner(argv, capture_output=True, text=True, timeout=60)
@@ -781,6 +844,110 @@ def _read_stdin() -> str:
     except (AttributeError, ValueError):
         pass
     return sys.stdin.read()
+
+
+# A pane judged abnormal or not idle is kept for diagnosis: the live area a TUI
+# redraws (a retry banner, a dialog) is gone from scrollback once it clears.
+FRAMES_REL = Path("state") / "pane-frames"
+FRAMES_KEEP = 5
+_SEAT_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def save_frame(workspace, seat: str, kind: str, text: str, now: Optional[float] = None,
+               keep: int = FRAMES_KEEP) -> Optional[Path]:
+    """Write `text` to state/pane-frames/<seat>/<UTC stamp>-<kind>.txt and keep the newest
+    `keep` per seat. Best effort: None when nothing was written; filesystem errors are swallowed."""
+    if not text or not text.strip():
+        return None
+    seat_dir = _SEAT_NAME.sub("_", seat or "")
+    if seat_dir in ("", ".", ".."):
+        seat_dir = "unknown"
+    try:
+        d = Path(workspace) / FRAMES_REL / seat_dir
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+        base = f"{stamp}-{_SEAT_NAME.sub('_', kind) or 'frame'}"
+        path, n = d / f"{base}.txt", 1
+        while path.exists():  # a second frame in the same second sits beside the first
+            path, n = d / f"{base}.{n}.txt", n + 1
+        _write_atomic(path, text)
+        frames = sorted(f for f in d.glob("*.txt") if f.is_file() and not f.is_symlink())
+        for old in frames[:-keep] if keep > 0 else frames:
+            old.unlink(missing_ok=True)
+        return path
+    except OSError:
+        return None
+
+
+# A notifier that times out waiting for idle restarts as a new process, so its rounds
+# are counted on disk; the third surfaces once, and an idle pane clears the record.
+STALLS_REL = Path("state") / "notifier-stalls"
+STALL_ROUNDS = 3
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _stall_lock(path: Path):
+    """One writer per seat: the count is read, bumped and replaced (or cleared) under it."""
+    return locked_file(path.with_name(f".{path.name}.lock"))
+
+
+def _stall_path(workspace, seat: str) -> Path:
+    name = _SEAT_NAME.sub("_", seat or "")
+    return Path(workspace) / STALLS_REL / f"{name if name not in ('', '.', '..') else 'unknown'}.json"
+
+
+def note_idle_timeout(workspace, seat: str, now: Optional[float] = None) -> int:
+    """Count one more idle-wait timeout for `seat`; returns the rounds so far (0 if unwritable)."""
+    path = _stall_path(workspace, seat)
+    now = time.time() if now is None else now
+    try:
+        with _stall_lock(path):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                rec = rec if isinstance(rec, dict) else {}
+            except (OSError, ValueError):
+                rec = {}
+            rec = {"seat": seat, "since": rec.get("since", now), "last": now,
+                   "rounds": int(rec.get("rounds", 0) or 0) + 1}
+            _write_atomic(path, json.dumps(rec))
+    except OSError:
+        return 0
+    return rec["rounds"]
+
+
+def clear_idle_timeouts(workspace, seat: str) -> bool:
+    path = _stall_path(workspace, seat)
+    if not path.exists():
+        return False
+    try:
+        with _stall_lock(path):
+            path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def idle_stalls(workspace) -> dict:
+    """{seat: record} for every seat whose notifier has timed out STALL_ROUNDS times or more."""
+    out = {}
+    for f in sorted((Path(workspace) / STALLS_REL).glob("*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and int(rec.get("rounds", 0) or 0) >= STALL_ROUNDS:
+            out[str(rec.get("seat") or f.stem)] = rec
+    return out
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -813,6 +980,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
     hp.add_argument("--session", default=None, help="the seat the record must vouch for")
     hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    lh = sub.add_parser("limit-holds")
+    lh.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    sf = sub.add_parser("save-frame")
+    sf.add_argument("--workspace", required=True)
+    sf.add_argument("--seat", required=True)
+    sf.add_argument("--kind", required=True)
+    for name in ("idle-timeout", "idle-ok"):
+        it = sub.add_parser(name)
+        it.add_argument("--workspace", required=True)
+        it.add_argument("--seat", required=True)
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -821,11 +998,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     d.add_argument("--refuse-if-pending", action="store_true")
     d.add_argument("--skip-if-queued", default=None)
     d.add_argument("--dry-run", action="store_true")
+    d.add_argument("--require-limit", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "safe-states":
         # Emitting the SAFE set keeps a caller's membership test fail-closed: anything
         # absent -- a new state, a typo, an empty read -- refuses without being listed.
         print(" ".join(s for s in STATES if not state_is_unsafe(s)))
+        return 0
+    if a.cmd == "save-frame":
+        path = save_frame(a.workspace, a.seat, a.kind, _read_stdin())
+        print(path or "", end="\n" if path else "")
+        return 0 if path else 1
+    if a.cmd == "idle-timeout":
+        # "surface N" exactly once, on the round that reaches STALL_ROUNDS; later rounds stay quiet.
+        rounds = note_idle_timeout(a.workspace, a.seat)
+        print(f"surface {rounds}" if rounds == STALL_ROUNDS else str(rounds))
+        return 0
+    if a.cmd == "idle-ok":
+        clear_idle_timeouts(a.workspace, a.seat)
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":
@@ -890,7 +1080,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "after":
         print(after_prompt(_read_stdin(), adapter, getattr(a, "width", 0)))
         return 0
-    out = deliver(a.line, a.session, a.runtime, a.socket, a.refuse_if_pending, a.skip_if_queued, a.dry_run)
+    if a.cmd == "limit-holds":
+        if not limit_holds(_read_stdin(), adapter):
+            print("pane_gate: the pane does not wait on a usage limit alone", file=sys.stderr)
+            return EXIT_UNSAFE
+        return 0
+    out = deliver(a.line, a.session, a.runtime, a.socket, a.refuse_if_pending, a.skip_if_queued, a.dry_run,
+                  require_limit=a.require_limit)
     print(f"{out.status}: {out.message}" if out.message else out.status, file=sys.stderr if out.code else sys.stdout)
     return out.code
 
