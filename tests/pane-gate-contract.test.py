@@ -1628,5 +1628,36 @@ class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
         self.assertFalse(self.outrun(pane))
 
 
+class LimitHolds(unittest.TestCase):
+    """The recovery sender's under-lock predicate: a limit alone, nothing running or asking."""
+
+    GATE = ("──────── seat-1 ─\n❯ \n────────\n"
+            "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+            "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n")
+
+    def holds(self, capture):
+        return pg.limit_holds(capture, pg.CLAUDE)
+
+    def test_a_limit_alone_holds(self):
+        self.assertTrue(self.holds("  ⎿  You've hit your weekly limit · resets 2pm (UTC)\n❯ \n"))
+        self.assertTrue(self.holds(self.GATE))
+
+    def test_anything_else_refuses(self):
+        for capture in ("", "   \n", "❯ \n",
+                        "You've hit your weekly limit\n✳ Moonwalking… (3s · esc to interrupt)\n❯ \n",
+                        "  ⎿  You've hit your weekly limit\n❯ draft\n",
+                        "  ⎿  You've hit your weekly limit\n",
+                        "❯ \n Do you want to make this edit?\n Enter to confirm · Esc to cancel\n",
+                        "──────── seat-1 ─\n❯ \n────────\n  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"):
+            with self.subTest(capture=capture):
+                self.assertFalse(self.holds(capture))
+
+    def test_cli_exit_codes(self):
+        for capture, code in ((self.GATE, 0), ("❯ \n", pg.EXIT_UNSAFE)):
+            with mock.patch.object(sys, "stdin", io.StringIO(capture)), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pg.main(["limit-holds", "--runtime", "claude"]), code)
+
+
 if __name__ == "__main__":
     unittest.main()

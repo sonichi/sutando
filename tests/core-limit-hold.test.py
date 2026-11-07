@@ -402,6 +402,28 @@ class Launcher(unittest.TestCase):
         self.assertEqual({p.name for p in task_queue.pending_files(self.ws)}, {"task-200.txt"})
 
 
+    def test_the_desktop_card_is_presented_once_with_the_hold(self):
+        app = Path(self.td.name) / "app"
+        (app / "engine").mkdir(parents=True)
+        calls = Path(self.td.name) / "card-calls"
+        (app / "engine" / "local-card.py").write_text(
+            "import sys\nopen(%r, 'a').write(repr(sys.argv[1:]) + '\\n')\n" % str(calls))
+        self.env["SUTANDO_APP_SUPPORT"] = str(app)
+        self.write_quota(limited_record(time.time()))
+        for _ in range(3):
+            self.assertEqual(self.revive()[0], 75)
+        for _ in range(50):
+            if calls.exists():
+                break
+            time.sleep(0.1)
+        lines = calls.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("'present', 'core-model'", lines[0])
+        self.assertIn("usage limit on claude-opus-5-5", lines[0])
+        notice = next((self.ws / "results").glob("proactive-*.txt")).read_text()
+        self.assertIn("card I left you", notice)
+
+
 class StatusSurfaces(unittest.TestCase):
     def _load(self, name, rel):
         spec = importlib.util.spec_from_file_location(name, str(REPO / rel))
@@ -970,6 +992,96 @@ class AdapterEdges(unittest.TestCase):
             self.assertEqual(json.loads(state.read_text())["wedge_first_seen"], 0)
         with mock.patch.dict(sys.modules, {"core_limit_hold": None}):
             self.assertIsNone(hc._core_limit_hold(time.time()))
+
+
+class ModelSwitchWayOut(unittest.TestCase):
+    """#6291: the hold names its way out, and a switch away from the held model is let through."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        self.now = time.time()
+        clh.decide(self.ws, self.now, quota=limited_record(self.now), launch_model="claude-opus-5-5")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def pick(self, model):
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": model}))
+
+    def test_a_hold_binds_only_the_model_family_it_was_seen_on(self):
+        self.assertIsNotNone(clh.binding_hold(self.ws, self.now + 1))
+        self.pick("opus")
+        self.assertIsNotNone(clh.binding_hold(self.ws, self.now + 1))
+        self.pick("sonnet")
+        self.assertIsNone(clh.binding_hold(self.ws, self.now + 1))
+        self.assertIsNotNone(clh.active_hold(self.ws, self.now + 1), "the record itself stays")
+
+    def test_health_check_revives_a_core_switched_away_from_the_hold(self):
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("hc_6291", str(REPO / "src" / "health-check.py"))
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        with mock.patch.object(hc, "WORKSPACE_DIR", self.ws):
+            self.assertIsNotNone(hc._core_limit_hold(self.now + 1))
+            self.pick("sonnet")
+            self.assertIsNone(hc._core_limit_hold(self.now + 1))
+
+    def test_held_cli(self):
+        cli = [sys.executable, str(REPO / "src" / "core_limit_hold.py"), "held", "--workspace", str(self.ws)]
+        r = subprocess.run(cli, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("usage limit on claude-opus-5-5", r.stdout)
+        hold = clh.read_hold(self.ws)
+        (self.ws / "state" / clh.HOLD_FILE).write_text(json.dumps(dict(hold, until=self.now - 1)))
+        self.assertEqual(subprocess.run(cli, capture_output=True, text=True, timeout=60).returncode, 1)
+
+    def test_held_cli_in_process(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(clh.main(["held", "--workspace", str(self.ws)]), 0)
+        self.assertIn("usage limit on claude-opus-5-5", out.getvalue())
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(clh.main(["held", "--workspace", empty]), 1)
+
+    def test_card_is_started_detached_with_the_reason_and_a_bounded_ttl(self):
+        from unittest import mock
+        entry = self.ws / "local-card.py"
+        entry.write_text("")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            with mock.patch("subprocess.Popen") as popen:
+                clh.decide(ws, self.now, quota=limited_record(self.now, reset_in=3 * 86400),
+                           card_entry=str(entry))
+                clh.decide(ws, self.now + 60, quota=limited_record(self.now, reset_in=3 * 86400),
+                           card_entry=str(entry))
+            self.assertEqual(popen.call_count, 1)
+            argv, kw = popen.call_args
+            argv = argv[0]
+            self.assertEqual(argv[1:4], [str(entry), "present", "core-model"])
+            self.assertIn("usage limit on claude-opus-5-5", argv[5])
+            self.assertEqual(argv[5].count("resets"), 1, argv[5])
+            self.assertEqual(argv[6:], ["--ttl", str(clh.LONG_RESET_RECHECK_S)])
+            self.assertTrue(kw["start_new_session"])
+            self.assertTrue(clh.read_hold(ws)["card_presented"])
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            with mock.patch("subprocess.Popen", side_effect=OSError("no python")):
+                self.assertFalse(clh.decide(ws, self.now, quota=limited_record(self.now),
+                                            card_entry=str(entry)).launch)
+            self.assertFalse(clh.read_hold(ws)["card_presented"], "a failed card never stops the hold")
+            self.assertTrue(clh.read_hold(ws)["notice_queued"])
+
+    def test_no_card_presenter_keeps_the_plain_notice(self):
+        body = next((self.ws / "results").glob("proactive-*.txt")).read_text()
+        self.assertNotIn("card I left you", body)
+        self.assertIn("Agent Settings, Runtime, Model", body)
+        self.assertNotIn("card_presented", clh.read_hold(self.ws))
 
 
 def gateway_task(ws: Path, name: str, words: str, tier: str = "owner", *, stamp: bool = True,
