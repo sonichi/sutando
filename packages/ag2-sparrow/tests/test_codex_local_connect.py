@@ -1991,6 +1991,8 @@ class ConnectCode(UndoSeams, Base):
         p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root))],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
+        # Its pipes are closed here, not by the GC: a late ResourceWarning lands in whatever stderr another test captures.
+        self.addCleanup(lambda: (p.stdin.close(), p.stdout.close()))
         self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
         return p
 
