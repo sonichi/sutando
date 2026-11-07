@@ -26,10 +26,11 @@ SESSION_ID_RE = re.compile(r"^\$\d+$")
 TITLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def argv(socket, target, *keys, tmux="tmux"):
+def argv(socket, target, *keys, tmux="tmux", expected_pid=None):
     """The guarded send; the script takes this interpreter explicitly, never a repo helper."""
+    expected = [] if expected_pid is None else ["--expected-pid", str(int(expected_pid))]
     return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
-            "-t", target, "--", *keys]
+            "-t", target, *expected, "--", *keys]
 
 
 def fence_argv(socket, target_pane, predicate_format, action_cmd, tmux="tmux"):

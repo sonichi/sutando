@@ -686,6 +686,105 @@ class OwnerRecovery(unittest.TestCase):
         self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), [])
 
 
+class AccountChange(unittest.TestCase):
+    """A hold binds the account it was seen under: signing in to another account lets the
+    core launch at once, while the same or an unreadable account stays held."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        self.cfg = self.ws / "claude-config"
+        self.cfg.mkdir()
+        self.now = time.time()
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(self.now)))
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def sign_in(self, uuid: str, email: str) -> None:
+        (self.cfg / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": uuid, "organizationUuid": "org-" + uuid, "emailAddress": email}}))
+
+    def gate(self) -> int:
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+        with mock.patch.object(clh, "resolve_workspace", return_value=self.ws), \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return clh.main(["gate", "--cwd", str(self.ws)])
+
+    def test_signing_in_to_another_account_lifts_the_hold(self):
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), clh.HOLD_EXIT)
+        self.assertEqual(self.gate(), clh.HOLD_EXIT, "the same account stays held")
+        self.sign_in("acct-b", "b@example.com")
+        self.assertEqual(self.gate(), 0, "a hold on account A kept a core signed in to account B down")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
+
+    def test_unreadable_account_keeps_the_hold(self):
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), clh.HOLD_EXIT)
+        (self.cfg / ".claude.json").write_text("{not json")
+        self.assertEqual(self.gate(), clh.HOLD_EXIT)
+        (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {}}))
+        self.assertEqual(self.gate(), clh.HOLD_EXIT)
+
+    def test_a_hold_without_an_account_still_binds(self):
+        self.assertFalse(clh.decide(self.ws, self.now).launch)
+        self.assertFalse(clh.decide(self.ws, self.now + 1, launch_account="abc").launch)
+
+    def decide(self, at: float, evidence_at: float, account: str) -> "clh.Decision":
+        return clh.decide(self.ws, at, quota=limited_record(at, ago=at - evidence_at), launch_account=account)
+
+    def test_newer_evidence_seen_under_a_held_account_stays_that_accounts(self):
+        t = self.now
+        self.assertFalse(self.decide(t, t - 30, "A").launch)
+        self.assertFalse(self.decide(t + 60, t + 50, "A").launch, "the same account stays held")
+        switched = self.decide(t + 120, t + 50, "B")
+        self.assertTrue(switched.launch, "account A's newer refusal held account B")
+        self.assertTrue(self.decide(t + 180, t + 50, "B").launch)
+
+    def test_newer_evidence_then_a_direct_switch_launches(self):
+        t = self.now
+        self.assertFalse(self.decide(t, t - 30, "A").launch)
+        self.assertTrue(self.decide(t + 120, t + 100, "B").launch,
+                        "a refusal account A got after its hold was taken as account B's")
+        self.assertTrue(self.decide(t + 180, t + 100, "B").launch)
+
+    def test_direct_switch_after_newer_evidence_through_the_cli(self):
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), clh.HOLD_EXIT)
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(time.time(), ago=5)))
+        self.sign_in("acct-b", "b@example.com")
+        self.assertEqual(self.gate(), 0, "account A's newer refusal held account B")
+
+    def test_unchanged_evidence_lets_the_new_account_launch(self):
+        t = self.now
+        self.assertFalse(self.decide(t, t - 30, "A").launch)
+        self.assertTrue(self.decide(t + 120, t - 30, "B").launch)
+
+    def test_a_refusal_after_the_switch_holds_the_new_account(self):
+        t = self.now
+        self.assertFalse(self.decide(t, t - 30, "A").launch)
+        self.assertTrue(self.decide(t + 120, t - 30, "B").launch)
+        held = self.decide(t + 300, t + 290, "B")
+        self.assertFalse(held.launch, "a refusal under account B after it launched was ignored")
+        self.assertEqual(held.hold["account"], "B")
+        self.assertFalse(self.decide(t + 310, t + 290, "B").launch)
+
+    def test_the_record_keeps_only_a_digest(self):
+        self.sign_in("acct-a", "a@example.com")
+        self.gate()
+        raw = (self.ws / "state" / clh.HOLD_FILE).read_text()
+        self.assertNotIn("acct-a", raw)
+        self.assertNotIn("a@example.com", raw)
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+
+
 class Crash(BaseException):
     """A process death in the middle of an owner action."""
 

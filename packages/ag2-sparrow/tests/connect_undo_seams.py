@@ -328,7 +328,7 @@ class UndoSeams:
                         with mock.patch.object(cm, "is_macos", return_value=mac):
                             rc, out, err = self.connect(self.backend(), fake)
                             self.assertEqual(rc, 0, out + err)
-                            self.assertIn(self.local.name, cm._STARTED, "the settled start is recorded")
+                            self.assertIn(self.local.job, cm._STARTED, "the settled start is recorded")
                             ours, before = fake.runner.session, len(fake.runner.calls)
                             if changed:
                                 fake.runner.start_session(by_manager=True)   # the manager's run is no longer ours
@@ -346,7 +346,7 @@ class UndoSeams:
                             self.assertIsNotNone(ours.wait(timeout=30), "its own run retired")
                             self.assertEqual(fake.runner.respawns, 0)
                             self.assertFalse(STOPS & verbs, "no step named the job to its manager")
-                            self.assertNotIn(self.local.name, cm._STARTED)
+                            self.assertNotIn(self.local.job, cm._STARTED)
                     finally:
                         self._done(fake)
                         with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \
@@ -418,7 +418,9 @@ class UndoSeams:
                     self._done(fake)
                     cm.plist_path(self.local).unlink(missing_ok=True)
 
-    def test_a_failed_install_reports_the_bridge_it_wired_and_never_stops_it_by_name(self):
+    def test_a_failed_install_never_starts_the_bridge_it_wired_and_never_stops_it_by_name(self):
+        """The bridge starts only once the session holds its root: when it never does, the bridge was never
+        started, its unit (still this attempt's bytes) is removed, and one changed since is left and said."""
         bridge = cb.bridge_shape(self.local)
         for changed in (False, True):
             for name, mac in MANAGERS:
@@ -433,19 +435,21 @@ class UndoSeams:
                     with mock.patch.object(cm, "is_macos", return_value=mac), \
                             mock.patch.object(cm, "_holder_problem", side_effect=refused_after_the_wiring):
                         rc, out, err = self.install_seat(fake)
-                        wired, bridge_job, cm_stop = (cm.supervisor_path(bridge).exists(), cm.job_name(bridge),
-                                                      cm.stop_command(bridge))
+                        unit = cm.supervisor_path(bridge)
+                        wired, bridge_job, cm_stop = unit.exists(), cm.job_name(bridge), cm.stop_command(bridge)
                     try:
                         self.assertNotEqual(rc, 0, out + err)
                         self.assertTrue(all(p.poll() is not None for p in fake.runner.spawned), "the session job stopped")
-                        self.assertTrue(wired, "the manager stops a bridge job only by name, so it is left")
-                        self.assertTrue(fake.active, "and still running")
+                        self.assertFalse(fake.active, "the bridge was never started")
+                        self.assertFalse(STARTS & bridge_verbs(fake), "nothing started it")
                         self.assertFalse({"stop", "bootout"} & bridge_verbs(fake), "nothing named the bridge to its manager")
                         if changed:
+                            self.assertTrue(wired, "a unit another writer changed is left")
                             self.assertIn(f"{bridge_job} is no longer the unit this attempt wrote, so it was left", err)
-                        else:
-                            self.assertIn(f"the bridge this attempt wired ({bridge_job}) is active and was left", err)
                             self.assertIn(cm_stop, err, "with the command that stops it")
+                        else:
+                            self.assertFalse(wired, "this attempt's own unit, never started, is removed")
+                            self.assertIn(f"the bridge unit this attempt wrote ({unit}) was removed", err)
                     finally:
                         self._done(fake)
                         with mock.patch.object(cm, "is_macos", return_value=mac), mock.patch.object(sm, "_run", side_effect=fake), \

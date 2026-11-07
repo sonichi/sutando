@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-11-02"
+   "last_verified": "2026-11-05"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-10-28"
+   "last_verified": "2026-10-30"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-01"
+   "last_verified": "2026-11-06"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -350,7 +350,7 @@
    ],
    "status": "active",
    "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
-   "last_verified": "2026-08-21"
+   "last_verified": "2026-11-06"
   },
   "docs/testing-coverage.md": {
    "title": "Unit-test coverage gate",
@@ -483,7 +483,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-10-15"
+   "last_verified": "2026-11-06"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",

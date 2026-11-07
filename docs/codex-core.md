@@ -99,6 +99,75 @@ The Codex implementation:
   known sibling (`gateway-*`, `monitor`) nor started as `codex` could be a core the
   launcher cannot identify, so it refuses to heal (exit 3) rather than start a second core.
 
+### Pickup while delegated work continues
+
+The managed core notifier keeps reading task announcements while a previously
+submitted task awaits its final result. Every new submission, including the first
+one after notifier restart, requires a fresh, healthy, idle observer record bound
+to the same core process incarnation. Missing, unknown, stale or moving runtime
+state blocks submission even if the terminal looks idle. The launcher gives a genuinely new CLI process a fixed managed liveness prompt:
+reply READY without tools, files, or external messages. Existing processes are never
+sent this bootstrap on adoption or notifier restart. The normal observer must see
+the resulting successful turn before task admission; there is no pane-only fallback. The observer must be restarted to emit incarnation data.
+It admits another task only when the
+terminal is positively idle and empty, and the observer has witnessed the exact
+submitted prompt in a successfully completed **parent** turn. The receipt binds
+the prompt digest, its acceptance/completion times and the core process incarnation.
+Subagent completions, aborted/failed turns, stale observations and an idle-looking
+composer alone cannot release the next prompt. Pool-worker notifiers keep their
+existing serial behavior; this does not enable `codex queue` or interrupt a busy turn.
+
+The shared in-flight writer records intent before Enter. A confirmed parent-turn
+receipt is remembered separately until the actual task result arrives, so notifier
+restarts and later observer turns do not replay delegated work. Related workstream
+context remains available until the result is found or the task payload disappears.
+Startup and shutdown reconcile retained artifacts, including tasks completed while
+the notifier was down and therefore omitted from the watcher’s pending sweep.
+Without an explicit `SUTANDO_NOTIFIER_RETRY_INTERVAL`, matching healthy turns are
+checked every second; empty, refused, uncertain or held queues wait 30 seconds.
+An explicit interval must be an integer from 1 to 3600 seconds; invalid values
+refuse notifier startup with a diagnostic. Watcher task announcements wake either wait
+immediately; these intervals do not change admission or recovery eligibility.
+A new core incarnation invalidates the prior incarnation's markers, as in the
+existing shared marker contract; restarting the core is not a duplicate-free retry
+for work that might have completed externally.
+
+Missing proof falls back to waiting for the task's result. After the existing
+completion deadline, an uncertain submission is retained **without automatic
+replay**, and `codex-task-notifier` health reports a warning. A crash between the
+intent record and Enter can therefore require operator inspection. No automatic
+restart or unsafe keystroke recovery is performed. A fully observed failed root turn carries a separate terminal receipt; it never
+acknowledges a task. For `server_overloaded` only, the notifier can send the same
+liveness prompt after a fixed 30-second backoff when no in-flight or yielded task
+markers remain and the positively empty pane and process incarnation still match.
+A durable claim is written before typing. At most one probe is allowed until a
+later successfully completed correlated turn, including across notifier restarts and uncertain
+keystroke outcomes. A failed probe therefore cannot loop requests. Login, quota,
+unclassified API errors, aborted turns, incomplete history and unresolved submitted
+tasks require explicit recovery or disposition. They remain queued without replay.
+Pre-admission refusals are deduplicated in local diagnostics and reported by health.
+The fixed tool-free READY check fits a normal 80-column pane. Recovery requires
+one fully visible composer row and a recognized footer; wrapped or ambiguous drafts
+are refused without folding whitespace. After one paste, recovery polls for up to
+2 seconds on a monotonic clock for the exact probe, accepting only empty or exact
+byte-prefix renderings while waiting. Each check refreshes the candidate receipt
+and process incarnation; unknown or foreign composer content fails closed. Existing
+subprocess timeouts still apply, so this is not a hard 2-second wall-clock limit.
+Recovery never pastes again, and a timeout or refusal leaves the claim spent.
+If a recovery paste leaves a READY check draft or the staged text does not match,
+the claim remains spent. Inspect the pane and manually clear only the draft you
+recognize; automation never clears an unknown human composer to retry recovery.
+For task pickup, a typing failure before Enter is still retried; this change does not establish its underlying cause.
+
+For a trial, restart the managed notifier and observer to load the new code. The
+local `state/codex-pickup.json` records startup code hashes, fixed event counters,
+and the latest 64 timing events. Task keys are hashed; prompt text, pane contents,
+account identifiers and helper stderr are not copied into this evidence. These
+records stay local; publication requires a separate audience/privacy check.
+A useful live witness has a parent return while its worker remains outstanding,
+then a second task answered before the first result. Unit tests alone are not
+that live witness.
+
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F
 '#{pane_in_mode}'` that sends the keys only if the pane is not in a mode at that

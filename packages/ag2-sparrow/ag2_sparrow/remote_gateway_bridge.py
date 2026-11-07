@@ -324,11 +324,12 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
+from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from . import result_labels
@@ -2653,6 +2654,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # the agent's safe parser must see which hook or row change it serves.
                 "hook",
                 "summon",
+                # AgentTrigger context, above "task" so the strict parser reads it: the event
+                # behind this task, its idempotency id and the playbook it names.
+                "event_type", "agent_trigger_id", "playbook",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2696,12 +2700,12 @@ def _context_header(name: str, value) -> "str | None":
         return None
     return line
 
-# Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
-# values outside this set degrade to "message" rather than passing through.
-_INTERACTION_TYPES = frozenset({
-    "message", "realtime_audio", "realtime_video",
-    "tool_initiated", "system_event", "self_reflective",
-})
+# Remote values outside the shared vocabulary degrade to "message" rather than passing through.
+_INTERACTION_TYPES = local_task_protocol.INTERACTION_TYPES
+# A value its sanitizer refuses is dropped: an unknown event or a non-token id never reaches the core.
+_TRIGGER_SANITIZERS = {"event_type": agent_triggers.event_type_value,
+                       "agent_trigger_id": agent_triggers.trigger_id_value,
+                       "playbook": agent_triggers.playbook_value}
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
@@ -6191,6 +6195,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if it not in _INTERACTION_TYPES:
                 it = "message"
             lines.append(f"interaction_type: {it}")
+        elif f in _TRIGGER_SANITIZERS:
+            val = _TRIGGER_SANITIZERS[f](task.get(f))
+            if val:
+                lines.append(f"{f}: {val}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.
@@ -6731,26 +6739,33 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
         # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
         # second sparrow instance ever runs. os.replace is atomic overwrite.
         tmp = TASK_ROOMS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(rooms, sort_keys=True))
+        # Insertion order is the intake order that ready results are delivered in.
+        tmp.write_text(json.dumps(rooms))
         os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"task-rooms persist failed ({diagnostics.describe(e)}) — continuing")
 
 
+# The poll loop and the delivery workers both rewrite the task-room map, whose order the drain sends in.
+_TASK_ROOMS_MUTEX = threading.RLock()
+
+
 def _record_task_room(tid: str, room: str) -> None:
     if not room:
         return
-    rooms = _load_task_rooms()
-    if rooms.get(tid) != room:
-        rooms[tid] = room
-        _save_task_rooms(rooms)
+    with _TASK_ROOMS_MUTEX:
+        rooms = _load_task_rooms()
+        if rooms.get(tid) != room:
+            rooms[tid] = room
+            _save_task_rooms(rooms)
 
 
 def _forget_task_room(tid: str) -> None:
-    rooms = _load_task_rooms()
-    if tid in rooms:
-        rooms.pop(tid)
-        _save_task_rooms(rooms)
+    with _TASK_ROOMS_MUTEX:
+        rooms = _load_task_rooms()
+        if tid in rooms:
+            rooms.pop(tid)
+            _save_task_rooms(rooms)
 
 
 def _load_task_media() -> "dict | None":
@@ -8650,9 +8665,10 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
         aliases[new_id] = delivery
         if not _save_dedup_aliases(aliases):
             return False
-        rooms = _load_task_rooms()
-        rooms[new_id] = room
-        _save_task_rooms(rooms)
+        with _TASK_ROOMS_MUTEX:
+            rooms = _load_task_rooms()
+            rooms[new_id] = room
+            _save_task_rooms(rooms)
         if inflight is not None and new_id not in inflight:
             inflight.add(new_id)
             if not _save_inflight(inflight):
@@ -9705,9 +9721,11 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
     return True
 
 
-# A result's delivery runs on a worker of its own, so one task's stalled send never holds another's.
+# A room's results go out one at a time in intake order on that room's worker; rooms run in parallel.
 DELIVERY_PASS_WAIT_S = 5.0
 _DELIVERING: "set[str]" = set()
+_DELIVERING_ROOMS: "set[str]" = set()
+ROOM_ORDER_MAX_WAIT_S = 120.0
 _DELIVERING_MUTEX = threading.Lock()
 
 
@@ -9716,13 +9734,98 @@ def _delivering(tid: str) -> bool:
         return tid in _DELIVERING
 
 
-def _start_delivery(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> threading.Thread:
+def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None) -> threading.Thread:
+    """One worker delivering `items` ((tid, rfile, raw, generation), in order) one after another;
+    with `room`, that room is busy until the last of them is done."""
     with _DELIVERING_MUTEX:
-        _DELIVERING.add(tid)
-    th = threading.Thread(target=_delivery_worker, args=(tid, rfile, raw, generation, inflight),
-                          name=f"result-{tid}", daemon=True)
+        _DELIVERING.update(item[0] for item in items)
+        if room:
+            _DELIVERING_ROOMS.add(room)
+
+    def run():
+        try:
+            for n, (tid, rfile, raw, generation) in enumerate(items):
+                _delivery_worker(tid, rfile, raw, generation, inflight)
+                if room and _holds_room(tid, rfile, inflight):
+                    _release_unsent(items[n + 1:])
+                    _log(f"room order: {tid} is still in flight — its room's later replies wait")
+                    break
+        finally:
+            if room:
+                with _DELIVERING_MUTEX:
+                    _DELIVERING_ROOMS.discard(room)
+    th = threading.Thread(target=run, name=f"result-{items[0][0]}", daemon=True)
     th.start()
     return th
+
+
+def _result_settled(tid: str, inflight: "set[str]") -> bool:
+    """Whether tid's result is done for ordering: its task left the in-flight set, or its outbox
+    item is terminal (delivered or parked). Anything else may still post later."""
+    if tid not in inflight:
+        return True
+    try:
+        core = _delivery_core()
+        return (read_item(core.backend.root, _broker_tid(tid)) or {}).get("status") in core.backend.TERMINAL
+    except Exception as e:  # noqa: BLE001 — an unreadable record is not proof it went out
+        _log(f"room order: {tid}'s outbox record unreadable ({diagnostics.describe(e)})")
+        return False
+
+
+def _release_unsent(items: list) -> None:
+    """Hand back a room's later replies unsent, so the next pass offers them again in order."""
+    for tid, _rfile, _raw, _generation in items:
+        try:
+            _end_unpublished_claims(_broker_tid(tid))
+        except Exception as e:  # noqa: BLE001 — a claim left open is ended by the next reconcile
+            _log(f"result {tid}: its claim could not be ended yet ({diagnostics.describe(e)})")
+        with _DELIVERING_MUTEX:
+            _DELIVERING.discard(tid)
+
+
+def _room_busy(room: str) -> bool:
+    with _DELIVERING_MUTEX:
+        return room in _DELIVERING_ROOMS
+
+
+def _reply_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> "str | None":
+    """The room tid's written reply takes a place in; None with no reply yet or one that posts nothing."""
+    if not rooms.get(tid):
+        return None
+    try:
+        raw = rfile.read_text(errors="replace")
+    except OSError:
+        return None
+    return _ordered_room(tid, raw, rooms)
+
+
+def _holds_room(tid: str, rfile: Path, inflight: "set[str]") -> bool:
+    """Whether tid's reply, not yet settled, still holds its room's later replies back; past
+    ROOM_ORDER_MAX_WAIT_S it stops holding them, so one stuck reply never silences a room."""
+    if _result_settled(tid, inflight):
+        return False
+    try:
+        waited = time.time() - rfile.stat().st_mtime
+    except OSError:
+        return True
+    if waited <= ROOM_ORDER_MAX_WAIT_S:
+        return True
+    _log_backoff((tid, "room-order"), f"room order: {tid} unsent after {int(waited)}s — "
+                 "its room's later replies go on without it")
+    return False
+
+
+def _intake_ordered(tids, rooms: "dict[str, str]") -> list:
+    """`tids` in intake order (the task-room map's insertion order); unrecorded ones last, by id."""
+    pos = {t: n for n, t in enumerate(rooms)}
+    return sorted(tids, key=lambda t: (pos.get(t, len(pos)), t))
+
+
+def _ordered_room(tid: str, raw: str, rooms: "dict[str, str]") -> "str | None":
+    """The room whose reply order this result takes a place in; None for one that posts nothing."""
+    if has_skip_action(parse_markers(raw).actions):
+        return None
+    return rooms.get(tid) or None
 
 
 def _delivery_worker(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> None:
@@ -9752,37 +9855,61 @@ def _post_ready_results(inflight: set[str]) -> None:
     _recover_disposing_claims()
     _load_settle_pending()
     changed, started = False, []
-    for tid in list(inflight):
+    rooms = _load_task_rooms()
+    queued: "dict[str, list]" = {}
+    held: "set[str]" = set()                    # rooms with an earlier reply still unsent
+    for tid in _intake_ordered(list(inflight), rooms):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if _ATTEMPTS is not None:
-            run = _run_holds_result(tid, rfile)
-            if run is None:
-                continue
-            if run is False:
-                inflight.discard(tid)
-                changed = True
-                continue
-        if _ATTEMPTS is not None and _delivering(tid):
-            continue                            # its delivery is still under way on its own worker
-        raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
-        if raw is None:
-            # A disposed-of id whose task could not be archived earlier is retried here.
-            if not os.path.lexists(rfile):
-                with _retiring(tid):  # the judgement and the settle are one step to a wake
-                    if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
-                        changed |= _settle_task(tid, inflight)
-                _SETTLE_SCANNED.add(tid)
-            continue
-        if _ATTEMPTS is None:
-            changed |= _deliver_ready(tid, rfile, raw, generation, inflight)
-        else:
-            started.append(_start_delivery(tid, rfile, raw, generation, inflight))
+        reply_room = _reply_room(tid, rfile, rooms)
+        if reply_room and (reply_room in held or _room_busy(reply_room)):
+            held.add(reply_room)
+            continue                            # an earlier reply in its room is not out yet
+        try:
+            changed |= _offer_result(tid, rfile, inflight, rooms, queued, started)
+        finally:
+            if (reply_room and not any(i[0] == tid for i in queued.get(reply_room, ()))
+                    and _holds_room(tid, rfile, inflight)):
+                held.add(reply_room)
+    started += [_start_delivery(items, inflight, room) for room, items in queued.items()]
     _await_deliveries(started)
     if changed:
         _save_inflight(inflight)
+
+
+def _offer_result(tid: str, rfile: Path, inflight: "set[str]", rooms: "dict[str, str]",
+                  queued: "dict[str, list]", started: list) -> bool:
+    """One in-flight task's turn in the drain: delivered now (ledger off), queued on its room's
+    worker, started on its own, or left; whether the in-flight set changed."""
+    changed = False
+    if _ATTEMPTS is not None:
+        run = _run_holds_result(tid, rfile)
+        if run is None:
+            return changed
+        if run is False:
+            inflight.discard(tid)
+            return True
+    if _ATTEMPTS is not None and _delivering(tid):
+        return changed                          # its delivery is still under way on its own worker
+    raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
+    if raw is None:
+        # A disposed-of id whose task could not be archived earlier is retried here.
+        if not os.path.lexists(rfile):
+            with _retiring(tid):  # the judgement and the settle are one step to a wake
+                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
+                    changed |= _settle_task(tid, inflight)
+            _SETTLE_SCANNED.add(tid)
+        return changed
+    if _ATTEMPTS is None:
+        return _deliver_ready(tid, rfile, raw, generation, inflight)
+    room = _ordered_room(tid, raw, rooms)
+    if room is None:
+        started.append(_start_delivery([(tid, rfile, raw, generation)], inflight))
+    else:
+        queued.setdefault(room, []).append((tid, rfile, raw, generation))
+    return changed
 
 
 def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> bool:
