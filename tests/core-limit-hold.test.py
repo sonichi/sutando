@@ -1058,6 +1058,25 @@ class ModelSwitchWayOut(unittest.TestCase):
             self.assertIsNone(clh._launch_config_dir())
             self.assertEqual(clh.launch_identity(self.ws), ("sonnet", None))
 
+    def test_a_seat_name_ending_in_a_space_is_kept(self):
+        """The launcher's `$(...)` keeps a seat's trailing space; the gate must read the same dir."""
+        import os
+        from unittest import mock
+        self.pick("sonnet")
+        seat = self.ws / "seat-opus "
+        seat.mkdir()
+        (seat / "settings.json").write_text(json.dumps({"model": "opus"}))
+        self.seat_config("${WORKSPACE_DIR}/seat-opus ")
+        env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            shell = subprocess.run(
+                ["bash", "-c", 'source "$1/src/claude_config_dir.sh"; d="$(resolve_claude_config_dir "$1" t)";'
+                 ' printf "%s" "$d"', "t", str(REPO)], capture_output=True, text=True, timeout=60)
+            self.assertTrue(shell.stdout.endswith("seat-opus "), repr(shell.stdout))
+            self.assertEqual(clh._launch_config_dir(), shell.stdout)
+            self.assertEqual(clh.launch_identity(self.ws)[0], "opus")
+
     def test_no_launcher_resolver_reads_as_no_seat(self):
         """No checkout to find the resolver in, or no bash to run it: the gate reads no seat."""
         from unittest import mock

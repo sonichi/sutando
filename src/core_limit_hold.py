@@ -380,7 +380,8 @@ def _launch_config_dir() -> Optional[str]:
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
-    seat = run.stdout.strip()
+    # Command substitution drops trailing newlines only; a seat name may end in spaces.
+    seat = run.stdout.rstrip("\n")
     # rc 2 is the resolver's "helper absent, caller's CLAUDE_CONFIG_DIR used" success.
     return seat if run.returncode in (0, 2) and seat else None
 
