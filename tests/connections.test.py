@@ -2700,7 +2700,7 @@ class UpdateToken(Base):
                 self.update("beta-fixture-net", self.NEW_B)
         message = str(cm.exception)
         self.assertEqual(cm.exception.CODE, "token_restore_failed")
-        for part in ("OSError", "disk full", "restoring the previous secret failed", "RuntimeError", "holds the NEW code"):
+        for part in ("OSError", "disk full", "restoring the previous secret failed", "RuntimeError", "holds the NEW token"):
             self.assertIn(part, message)
         self.assertNotIn("secret-beta", message)
         self.assertEqual(sets, [self.NEW_B, TOKEN_B], "the restore was attempted with the previous secret")
@@ -2716,7 +2716,7 @@ class UpdateToken(Base):
             self.assertEqual(bridge.wait(timeout=5), 0, "the running bridge was stopped first")
         finally:
             bridge_lease.stop(bridge)
-        self.assertIn("relaunched on the unchanged code", str(cm.exception))
+        self.assertIn("relaunched on the unchanged token", str(cm.exception))
         self.assertEqual(self.spawned, [("beta-fixture-net", TOKEN_B)], "relaunched on the old code")
         self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], TOKEN_B)
 
@@ -4269,13 +4269,13 @@ class VaultPartialWrite(Base):
                               fetch=agents("@s:beta-fixture.net"))
 
     def test_keychain_written_then_manifest_failing_is_put_back_and_read_back(self):
-        """Both directions fail after the Keychain write: the NEW code's and the restore's."""
+        """Both directions fail after the Keychain write: the NEW token's and the restore's."""
         with unittest.mock.patch.object(self.vi, "_register_key", side_effect=OSError("manifest read-only")):
             with self.assertRaises(C.VaultUnavailable) as cm:
                 self.update()
         self.assertEqual(self.keychain.items[self.REF], TOKEN_B, "read back as the previous secret")
         self.assertEqual(self.spawned, [TOKEN_B], "relaunched on the code the vault really holds")
-        self.assertIn("relaunched on the unchanged code", str(cm.exception))
+        self.assertIn("relaunched on the unchanged token", str(cm.exception))
         self.assertEqual({r["instance"]: r for r in self.rows()}["beta-fixture-net"]["gateway_url"],
                          "https://relay.beta-fixture.net:8443")
 
@@ -4285,7 +4285,7 @@ class VaultPartialWrite(Base):
             with self.assertRaises(C.TokenRestoreFailed) as cm:
                 self.update()
         self.assertEqual(self.keychain.items[self.REF], self.NEW)
-        self.assertIn("read back, AG2_REMOTE_TOKEN_BETA_FIXTURE_NET holds the NEW code", str(cm.exception))
+        self.assertIn("read back, AG2_REMOTE_TOKEN_BETA_FIXTURE_NET holds the NEW token", str(cm.exception))
         self.assertNotIn("secret-beta", str(cm.exception))
         self.assertEqual(self.spawned, [], "never relaunched")
 
@@ -4315,7 +4315,7 @@ class VaultPartialWrite(Base):
         self.assertNotIsInstance(cm.exception, C.TokenStateUnknown)
         self.assertEqual(self.keychain.items[self.REF], TOKEN_B, "compared as the new code, swapped back")
         self.assertEqual(self.spawned, [TOKEN_B], "the stopped bridge relaunched on the previous secret")
-        self.assertIn("relaunched on the unchanged code", str(cm.exception))
+        self.assertIn("relaunched on the unchanged token", str(cm.exception))
 
     def test_a_read_back_that_cannot_tell_is_token_state_unknown(self):
         def write(path, record):
@@ -4328,7 +4328,7 @@ class VaultPartialWrite(Base):
         self.assertEqual(cm.exception.CODE, "token_state_unknown")
         self.assertIsInstance(cm.exception, C.Refusal)
         self.assertTrue(message.startswith("token_state_unknown"))
-        for claim in ("NEW code", "unchanged code", "previous secret is back", "secret-beta"):
+        for claim in ("NEW token", "unchanged token", "previous secret is back", "secret-beta"):
             self.assertNotIn(claim, message)
         self.assertIn("not known which secret", message)
         self.assertEqual(self.spawned, [], "no relaunch on an assumed code")
@@ -5067,7 +5067,7 @@ class LingeringBridge(Base):
                            workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=os.kill,
                            fetch=agents("@s:beta-fixture.net"))
         self.assert_lingering(ctx)
-        self.assertIn("was not confirmed stopped and may still be running on the old code", str(ctx.exception))
+        self.assertIn("was not confirmed stopped and may still be running on the old token", str(ctx.exception))
         self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault still holds the old code")
         self.assertEqual(self.beta(), before, "the row is unchanged")
         self.assertEqual(self.spawned, [], "no second bridge")

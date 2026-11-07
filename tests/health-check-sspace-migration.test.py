@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """health-check's sspace-migration probe: warns while every connection row is on ag2.space and
-none on s.space, with the real add/promote commands; quiet once an s.space row exists."""
+none on s.space, with the real move command and the desktop app's step; quiet once an s.space row exists."""
 
 from _helpers.hermetic_env import isolate_os_environ
 
@@ -55,10 +55,11 @@ class SspaceMigrationProbe(unittest.TestCase):
         out = hc.check_sspace_migration(self.ws)
         self.assertEqual(out["name"], "sspace-migration")
         self.assertEqual(out["status"], "warn")
-        self.assertIn("python3 scripts/connections.py add '<code>'", out["detail"])
+        self.assertTrue(out["detail"].endswith("; if it is refused, in the Sutando desktop app, open Homeserver connections and choose Update code… (Reconnect with a code… if it is paused)"), out["detail"])
         self.assertLess(out["detail"].index("connections.py move --repo . --logs-dir"),
-                        out["detail"].index("connections.py add"), "the existing secret is tried first")
-        self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", out["detail"])
+                        out["detail"].index("Homeserver connections"), "the existing secret is tried first")
+        for gone in ("agent portal", "connections.py add", "connections.py promote"):
+            self.assertNotIn(gone, out["detail"])
         self.assertEqual(connections.record_path(self.ws).read_bytes(), before, "the probe never writes")
 
     def test_commands_parse_with_the_real_cli(self):
@@ -66,7 +67,7 @@ class SspaceMigrationProbe(unittest.TestCase):
         detail = hc.check_sspace_migration(self.ws)["detail"]
         detail = detail.replace('"$(bash scripts/sutando-config.sh workspace)/logs"', "/w/logs")
         verbs = []
-        for line in re.findall(r"python3 scripts/connections\.py ([^&(]+?)(?: &&| \(|$)", detail):
+        for line in re.findall(r"python3 scripts/connections\.py ([^&(;]+?)(?: &&| \(|;|$)", detail):
             argv = shlex.split(line)
             args = cli.build_parser().parse_args(argv)
             verbs.append(args.verb)
@@ -75,7 +76,7 @@ class SspaceMigrationProbe(unittest.TestCase):
             if args.verb == "promote":
                 self.assertEqual(args.instance, connections.instance_for("s.space"))
                 self.assertIsInstance(args.logs_dir, Path)
-        self.assertEqual(verbs, ["move", "add", "promote"])
+        self.assertEqual(verbs, ["move"])
 
     def test_warns_for_provisional_gateway_host_row(self):
         self.write([_row("chat.ag2.space", "ag2-space", primary=True)])
@@ -98,8 +99,10 @@ class SspaceMigrationProbe(unittest.TestCase):
     def test_doc_section_names_the_same_commands(self):
         doc = (REPO / "docs" / "connections.md").read_text()
         section = doc.split("### Moving a terminal-run core to s.space", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("python3 scripts/connections.py add '<code>'", section)
-        self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", section)
+        self.assertIn("Then, in the Sutando desktop app, open Homeserver connections and choose Update code\u2026\n"
+                      "(Reconnect with a code\u2026 if it is paused).", section)
+        self.assertNotIn("agent portal", section)
+        self.assertNotIn("connections.py add '<code>'", section)
 
 
 if __name__ == "__main__":

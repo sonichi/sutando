@@ -86,7 +86,7 @@ instance is a config entry.
    ```
 
    For that entry's gateway host only (its `gateway_host`; its `server` when it names none), a
-   connect code may name a single-label host and must resolve to a loopback, private (RFC 1918,
+   relay token's gateway URL may name a single-label host and must resolve to a loopback, private (RFC 1918,
    IPv6 ULA) or shared (100.64/10) address, never link-local, unspecified or public
    (`connections._local_address`). Plain `http` is allowed only when the gateway host itself names
    loopback (`localhost`, a `*.localhost` name, a 127/8 or `::1` literal), not merely resolves to

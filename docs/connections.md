@@ -6,6 +6,12 @@ remote-gateway bridge instance. The directory of connections lives at
 the CLI (`scripts/connections.py`), the runtime API (`connection.*` methods) and
 startup (`src/startup-runtime.sh`) all call that module and never touch the file.
 
+**Words used here.** A *relay token* is the agent's credential `<relay_url>|<bearer>` (older text calls
+it the `url|secret` connect string: the same bytes). `add` and `update_token` take only a relay token, since
+the gateway URL inside it is what they preview; give the CLI `-` and paste it on stdin, which keeps it out
+of shell history and the process list. Add agent in the app creates another agent, and that agent's
+token is not this one's (`update_token` refuses it: `token_agent_mismatch`).
+
 ## The model
 
 | Field | Meaning |
@@ -39,7 +45,7 @@ import made that row primary. While that same pid holds the row's lease the row 
 
 ### Refusals by code
 
-Every refusal that comes from a row's or a code's state is a `connections.Refusal` whose
+Every refusal that comes from a row's or a token's state is a `connections.Refusal` whose
 `CODE` each surface returns as is: HTTP **409** `{"error": "<code>"}`, runtime API
 **CONFLICT** with the module's message, CLI exit 1 with `connections: <code>: ...` on
 stderr. Nothing is written when one is raised, except `token_restore_failed` and `token_state_unknown`,
@@ -56,19 +62,19 @@ which say what reading the vault back found.
 | `new_primary_not_started` | `promote` | The new row's bridge did not start (the message names the launch `reason`). The old primary was never stopped; the primary flag and a `parked` flag the call cleared are restored. |
 | `promote_conflict` | `promote` | Another writer moved the primary, or removed or parked the row this promote was to park, while the new bridge was connecting. That change stands: the bridge this call started is stopped, a `parked` flag it cleared is restored, and nothing was parked or stopped. Re-read the list and retry if still wanted. |
 | `new_primary_not_connected` | `promote` | The new row's bridge started but its own status never showed a gateway poll within `CONNECT_TIMEOUT_S` (`reason: timeout`), showed its token rejected (`auth_rejected`), or the bridge exited (`exited`). Rolled back: that bridge is stopped, the primary and `parked` flags are restored, a secondary bridge the call stopped to relaunch is started again, and the old primary's bridge was never touched. |
-| `legacy_row_unmanaged` | `disconnect`, `update_token` | The legacy unsuffixed row (`instance: ""`) is launched from `REMOTE_TASK_TOKEN` in the environment, not from this directory; change that variable instead, or paste a fresh code through `add`, which re-adopts the server into a named row. |
-| `legacy_primary_in_use` | `add` | A fresh code for the legacy row's server arrived while the legacy bridge runs as the primary (the legacy row is primary, or no row is). Getting the code already rotated its credential, but it is not adopted underneath the bridge carrying the proactive room: promote another connection first, then paste the code again. Nothing changed. |
-| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token`, `promote`, `park`, `park_legacy`, `add` (re-adopt) | The bridge still held its lease past the stop deadline, released it but was still running at the deadline, or refused the signal; the message names the pid. Nothing changed: the row stays (never marked `disabled` over a live process), `remove` keeps the row, launch record, status file and vault key, `reconnect` spawns no second bridge, and `update_token` writes nothing and says the bridge was not confirmed stopped and may still be running on the old code. `promote` rolls back: the old primary stays primary and unparked, a bridge the call started for the new row is stopped and a `parked` flag it cleared is restored (left cleared when that bridge will not stop either). Retrying is safe. |
+| `legacy_row_unmanaged` | `disconnect`, `update_token` | The legacy unsuffixed row (`instance: ""`) is launched from `REMOTE_TASK_TOKEN` in the environment, not from this directory; change that variable instead, or paste a fresh relay token through `add`, which re-adopts the server into a named row. |
+| `legacy_primary_in_use` | `add` | A fresh relay token for the legacy row's server arrived while the legacy bridge runs as the primary (the legacy row is primary, or no row is). Getting the token already rotated its credential, but it is not adopted underneath the bridge carrying the proactive room: promote another connection first, then paste the token again. Nothing changed. |
+| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token`, `promote`, `park`, `park_legacy`, `add` (re-adopt) | The bridge still held its lease past the stop deadline, released it but was still running at the deadline, or refused the signal; the message names the pid. Nothing changed: the row stays (never marked `disabled` over a live process), `remove` keeps the row, launch record, status file and vault key, `reconnect` spawns no second bridge, and `update_token` writes nothing and says the bridge was not confirmed stopped and may still be running on the old token. `promote` rolls back: the old primary stays primary and unparked, a bridge the call started for the new row is stopped and a `parked` flag it cleared is restored (left cleared when that bridge will not stop either). Retrying is safe. |
 | `bridge_lease_indeterminate` | `disconnect`, `remove`, `reconnect`, `update_token`, `set_primary`, `promote` | The bridge's lease file exists but does not prove which process holds it (unreadable or malformed, written for another role, workspace or schema such as a copied lease, another host's, no recorded start time, or a start time that cannot be checked); the message names which. Nothing is signalled or written. Restart that bridge (`bash src/restart.sh`) so it writes a current lease. |
 | `legacy_primary_running` | `set_primary` | The legacy unsuffixed bridge holds its lease, whatever the record's primary (legacy, none, or a named row). It settles the proactive room once, right after taking its lease, so it may carry it and would keep it. Stop it (`bash src/restart.sh --stop-only`), make the new row primary, then start again (`bash src/startup.sh`). |
 | `token_source_shadowed` | `update_token` | The row's `token_ref` (`AG2_REMOTE_TOKEN_<INST>`) is set in the environment, which the bridge reads before the vault; the new secret would be stored and never used. Unset the variable (or let `import-env` own that row) and retry. |
-| `token_server_mismatch` | `update_token` | The code previews as another server, or as a server another row already holds. |
-| `token_agent_mismatch` | `update_token` | The row names an agent and the code's gateway names another; that agent is its own connection. |
-| `token_unverified` | `update_token` | The row names an agent and the preview did not confirm it (gateway unreachable, an error, a listing naming none or several); the code is not shown to be this connection's. |
+| `token_server_mismatch` | `update_token` | The token previews as another server, or as a server another row already holds. |
+| `token_agent_mismatch` | `update_token` | The row names an agent and the token's gateway names another; that agent is its own connection. |
+| `token_unverified` | `update_token` | The row names an agent and the preview did not confirm it (gateway unreachable, an error, a listing naming none or several); the token is not shown to be this connection's. |
 | `token_rejected` | `add`, `update_token` | The gateway answered 401/403 on the preview. |
-| `vault_unreadable` | `update_token` | The vault could not say whether it holds the row's current secret (a read error, not a miss). Refused before the stop and the write, because a rollback to "absent" would delete a working code. |
-| `token_restore_failed` | `update_token` | Not a clean refusal: a write after the vault write began failed, and so did putting the previous secret back. The message names both failures; read back, the vault holds the **new** code while the row is unchanged. The bridge is not relaunched. |
-| `token_state_unknown` | `update_token` | Not a clean refusal: a write after the vault write began failed and reading the key back could not establish which secret it holds (the read failed, or it showed another writer's value, which is left in place). The message claims neither code and carries no secret; the bridge is not relaunched on a guess. Run `update-token` again with the code you want. |
+| `vault_unreadable` | `update_token` | The vault could not say whether it holds the row's current secret (a read error, not a miss). Refused before the stop and the write, because a rollback to "absent" would delete a working token. |
+| `token_restore_failed` | `update_token` | Not a clean refusal: a write after the vault write began failed, and so did putting the previous secret back. The message names both failures; read back, the vault holds the **new** token while the row is unchanged. The bridge is not relaunched. |
+| `token_state_unknown` | `update_token` | Not a clean refusal: a write after the vault write began failed and reading the key back could not establish which secret it holds (the read failed, or it showed another writer's value, which is left in place). The message claims neither token and carries no secret; the bridge is not relaunched on a guess. Run `update-token` again with the token you want. |
 | `vault_key_in_use` | `add` | The vault already holds a secret under the new row's key and no row owns it. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
@@ -86,7 +92,7 @@ grants the new gateway nothing beyond what its own token already carries.
 
 ## Adding: preview, then confirm
 
-Adding is two-step and does not care where the code came from (pasted into the UI,
+Adding is two-step and does not care where the token came from (pasted into the UI,
 typed at the CLI, handed over by a browser flow, present in the environment):
 
 1. **Preview.** `preview_connection(token)` first checks the gateway URL and host: the
@@ -143,7 +149,7 @@ key unchanged. A row keyed by identity is never demoted.
 ### Re-adopting the legacy row's server
 
 The legacy row (`instance: ""`) runs on `REMOTE_TASK_TOKEN` from the environment, and getting a
-new code from the portal rotates that credential. So a **verified** code that matches the legacy
+new relay token for the agent rotates that credential. So a **verified** token that matches the legacy
 row (by server, as above) and is not the secret that row already holds (its vault key, the
 environment or the channel env file) is not "already connected": `add` adopts it. Under one hold of
 the record lock it stores the secret under the new row's `token_ref`
@@ -154,13 +160,13 @@ The launchd wrapper and the bare launch then stand the legacy bridge down, `impo
 the row back, and the new row is matched for that server from then on. The result is `created: true`
 (201), and the HTTP and runtime adds start the new bridge as for any added row. It is a secondary
 unless the install has no primary left (a stopped legacy primary hands it over); `promote` or
-`set_primary` moves the primary. A code for another agent than the one the legacy row learned
+`set_primary` moves the primary. A token for another agent than the one the legacy row learned
 is refused (`token_agent_mismatch`, as `update_token` refuses it), a legacy bridge that runs as the
 primary is refused (`legacy_primary_in_use`), and a bridge that will not stop (`bridge_still_running`) takes the
-new secret back out; either way nothing changed. An unverified preview, or the code the legacy
+new secret back out; either way nothing changed. An unverified preview, or the token the legacy
 row already runs on, answers the legacy row with `created: false` as before.
 
-A client gates its "Reconnect with a code" action on `legacy_readopt` in the list's
+A client gates a reconnect with a fresh relay token on `legacy_readopt` in the list's
 `capabilities` (`connections.CAPABILITIES`); an engine without this answers no such field.
 
 A saved row is primary only when the install has no primary yet. `import-env` gives the
@@ -299,8 +305,8 @@ python3 scripts/connections.py move --dry-run
 python3 scripts/connections.py move --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
 ```
 
-s.space's registry started as a copy of ag2.space's, so an agent that neither server has re-coded
-since still has the same relay secret on both. `move` swaps only the gateway: it takes the ag2.space
+s.space's registry started as a copy of ag2.space's, so an agent that neither server has issued a new
+relay token for since still has the same relay secret on both. `move` swaps only the gateway: it takes the ag2.space
 row's secret (the primary, else the legacy row; name another instance to pick it), puts it behind
 s.space's registered gateway and asks that gateway who it is. Only when s.space verifies the same
 agent localpart does it save the `s-space` row (settling its backlog), promote it (the ag2.space
@@ -309,24 +315,18 @@ and, when the worker pool is installed, bind each ag2.space room's s.space twin 
 The descriptor is the one the core's Claude Code MCP config names (`AG2_MCP_DESCRIPTOR`) inside the
 workspace, else `state/ag2-mcp.json`; the desktop app's own descriptor is the app's and never
 touched. Its mint and MCP URLs, `relay` and `agent_id` move to s.space, and `env_file` names a
-0600 file holding the code, single-quoted. `bearer_digest` stays because the secret is the same.
+0600 file holding the relay token, single-quoted. `bearer_digest` stays because the secret is the same.
 The old descriptor is kept as `<name>.bak-ag2-space`. A move whose promote failed is resumed by
 running `move` again. `--dry-run` checks and writes nothing. The secret
 is never printed. Over HTTP the same step is `POST /api/v1/connections/move` (`{"dry_run": true}`
 to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instance, agent_mxid}` or
 `{ok: false, reason}`.
 
-A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new code
+A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new token
 since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
-s.space). Then fall back to a code:
-
-1. Get a connect code for this agent at s.space's agent portal.
-2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
-   server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
-3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
-   — starts the s.space bridge as primary, waits for it to connect, then stops and parks the
-   ag2.space bridge (the legacy one included). A failure rolls back and changes nothing.
+s.space). Then, in the Sutando desktop app, open Homeserver connections and choose Update code…
+(Reconnect with a code… if it is paused).
 
 To go back: `unpark ''`, let its launcher resume the legacy bridge, then `promote ''`.
 
@@ -389,19 +389,19 @@ still without a lease after `LEASE_TIMEOUT_S` is killed and the launch fails (`l
 `reconnect(instance)` clears the flag, stops the bridge if one is
 running, learns the identity its token answers to now and launches it again; the other
 connections keep running. A plain `launch` of a disabled row is refused by name
-("disconnected; reconnect it"). `update_token(instance, token)` is for a code that was
-rotated or revoked on the homeserver (Get new token, Revoke) or an agent moved away and
+("disconnected; reconnect it"). `update_token(instance, token)` is for a relay token that was
+rotated or revoked on the homeserver or an agent moved away and
 back. It is refused with the vault and the row untouched, in this order: on the legacy row
 (`legacy_row_unmanaged`); when the row's `token_ref` is **set in the environment**
 (`token_source_shadowed`) — `launch_env` and the bridge's own source order read the variable
 before the vault, so a vault write would report success and the relaunch, and every later
-restart, would run on the old code; rows that `import-env` created from
+restart, would run on the old token; rows that `import-env` created from
 `AG2_REMOTE_TOKEN_<INST>` are the usual case, and the owner unsets the variable first (or
-lets the import path own that row); for a code the gateway rejected (`token_rejected`); for
+lets the import path own that row); for a token the gateway rejected (`token_rejected`); for
 another server, or for a server another row already holds (`token_server_mismatch`); and,
 while the row names an agent, unless the preview **confirms that same agent**: an unconfirmed
 preview (gateway unreachable, an error, a listing naming none or several agents) is
-`token_unverified`, another agent `token_agent_mismatch` (a code for another agent is a new
+`token_unverified`, another agent `token_agent_mismatch` (a token for another agent is a new
 connection, never pasted over this row). A provisional row with no agent keeps its earlier
 behaviour and learns the identity. The new row is built and validated **before** any
 external effect; only then is the bridge stopped (`bridge_still_running` if it will not) and
@@ -424,7 +424,7 @@ vault write. After the stop it takes the lock again (bounded, below) and holds i
 prior-value snapshot through the new vault write, the record publication and any restore, so no
 other vault writer, in this process or another, can land in between. A narrow race remains: a
 writer that takes the lock between the probe and the re-take makes the re-take wait for it, with
-the bridge already stopped (and relaunched on the unchanged code if that wait runs out). The lock order is
+the bridge already stopped (and relaunched on the unchanged token if that wait runs out). The lock order is
 `connections.lock`, then the vault lock; nothing in the vault layer takes `connections.lock`. The
 lock is released when its holder raises or exits (a killed holder's lock is dropped by the
 kernel), and its file stays empty. A lock that cannot be taken fails the write.
@@ -452,21 +452,21 @@ locks, and their writes to the same key are not serialized against each other. G
 checkout's rows distinct instance names, or point both at one workspace.
 
 The restore is still a compare-and-swap on the stored value: the previous secret is written back
-only when a read shows exactly the new code this update wrote, then read back again. Read back
+only when a read shows exactly the new token this update wrote, then read back again. Read back
 as the previous secret, a bridge stopped for the update is relaunched on it and the error says
-whether that worked; still the new code, `token_restore_failed`; any other value or a read that
+whether that worked; still the new token, `token_restore_failed`; any other value or a read that
 fails, `token_state_unknown`, with the row unchanged. Neither of the last two relaunches. A public
-write that arrives meanwhile, a different value or the same new code, waits for the transaction
+write that arrives meanwhile, a different value or the same new token, waits for the transaction
 and then lands, so its value is the final one. Only a write that bypasses `vault_intercept` (the
 `security` command run by hand) is outside the transaction.
 
 On success `update_token` replaces the secret under the row's existing
 `token_ref`, keeps the instance, primary flag, `added_at` and launch record, updates
 `gateway_url` and the identity fields from the preview, clears `disabled` and relaunches the
-bridge the way `reconnect` does, so a disconnected or failed row comes back on the new code;
+bridge the way `reconnect` does, so a disconnected or failed row comes back on the new token;
 a relaunch that fails is the row's `failed` state, not an error of the update. A row keyed by
 identity refreshes its identity fields only from a verified preview of **the same agent**:
-adding or previewing another agent's code on that server leaves the row (and its token)
+adding or previewing another agent's token on that server leaves the row (and its token)
 exactly as it was. `remove_connection(instance)`
 stops that bridge the same way, then drops the row, its vault key, its launch record and its
 status sidecar (`gateway-status.<instance>.json`, so a re-added name lists as `pending` until
@@ -580,7 +580,7 @@ not here.
 
 ## Surfaces
 
-- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | park | park-legacy | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled`. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR [--park]`, `park INSTANCE`, `park-legacy` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | park | park-legacy | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled`. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR [--park]`, `park INSTANCE`, `park-legacy` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new token from stdin, which keeps it out of the process list (`ps` shows every argument); a literal token in its place is for scripts. `add - --yes --expected-server <server>` reads it from stdin the same way; stdin then cannot answer the save prompt, hence `--yes` with the server the preview must name. `set-primary` prints "reconnect it" when the new primary's bridge is running.
 - Runtime API (Unix socket, JSON-RPC): `connection.list` (`{connections, capabilities}`, as over HTTP), `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves and starts the bridge), `connection.remove`, `connection.set_primary`, `connection.promote` (`{instance, park?}`), `connection.park` and `connection.unpark` (`{instance}`, `""` for the legacy row; promote answers `{connection, previous, kept, stopped_pid, launch, changed, relaunch_needed}`, park `{connection, stopped_pid}`, unpark `{connection, launch}`), `connection.park_legacy` (`{primary, parked, stopped}`), `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
@@ -589,7 +589,7 @@ not here.
   | `GET /api/v1/connections` | — | 200 `{"connections": [rows joined with status, state, server_source, disabled, parked, legacy, identity fields; no secrets], "capabilities": ["legacy_readopt", "promote_keeps_lanes"]}` (`promote_keeps_lanes`: promote leaves the old primary running unless asked to park it) |
   | `GET /api/v1/connections/known-servers` | — | 200 `{"servers": [{"server", "connected", "instance", "primary", "disabled"}]}`; matched before any `<instance>` route (405 for another method, never a slug lookup) |
   | `POST /api/v1/connections` | `{"token", "confirm": false}` | 200 `{"preview": {...}}` |
-  | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "launch": record, "connection": row}`, the bridge started (`launch` null for a disabled row); 200 `{"created": false, ...}` for an existing row, started when it was not running; 201 for a fresh code that re-adopts the legacy row's server into a named row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`, `legacy_primary_in_use`, `token_agent_mismatch` or `bridge_still_running` (nothing changed); 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
+  | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "launch": record, "connection": row}`, the bridge started (`launch` null for a disabled row); 200 `{"created": false, ...}` for an existing row, started when it was not running; 201 for a fresh token that re-adopts the legacy row's server into a named row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`, `legacy_primary_in_use`, `token_agent_mismatch` or `bridge_still_running` (nothing changed); 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
   | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 409 `bridge_still_running`; 404 |
   | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` (with `relaunch_needed`); 409 `{"error": "disabled_cannot_be_primary"}`, `legacy_primary_running` or `bridge_lease_indeterminate` (nothing moved); 404 |
   | `POST /api/v1/connections/<instance>/promote` | `{}` or `{"park": true}` | 200 `{"connection": row, "previous", "kept", "stopped_pid", "launch", "changed", "relaunch_needed"}`: the new row's bridge relaunched as primary and connected; the old owner's keeps running (`kept`), or with `park` is stopped and its row `parked`; 400 for a non-boolean `park`; 409 `disabled_cannot_be_primary`, `legacy_bridge_not_running`, `new_primary_not_started`, `new_primary_not_connected`, `promote_conflict`, `bridge_still_running` or `bridge_lease_indeterminate` (rolled back, primary unmoved); 404 |
