@@ -1,0 +1,6 @@
+{
+  "name": "task-watch",
+  "version": "0.1.0",
+  "author": { "name": "Sutando" },
+  "description": "Runs the session's task watcher and starts a turn for each task it announces, in place of a Monitor"
+}
