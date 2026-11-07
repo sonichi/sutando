@@ -9,9 +9,10 @@ re-arm before anything else. Both must name the same inbox and command.
     watcher_rearm.py target --repo R --workspace W         # inbox line, then command line
     watcher_rearm.py session-start --repo R --workspace W  # hook JSON, or nothing
     watcher_rearm.py watch-argv --repo R --workspace W     # the same command, one argument per line
+    watcher_rearm.py mod-ready [--repo R --workspace W]    # yes: skip the Monitor; no: start it
 
-watch-argv serves the task-watch Mod, so it watches the inbox the Stop hook checks;
-a session launched with SUTANDO_TASK_WATCH_MOD=1 is never asked for a Monitor.
+watch-argv serves the task-watch Mod, so it watches the inbox the Stop hook checks; mod-ready
+answers yes only when the Mod is installed AND a ready session watcher holds that inbox.
 
 A pool worker is the session carrying SUTANDO_INSTANCE_ID; anything else is the core.
 """
@@ -21,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -76,6 +78,27 @@ def session_start_context(repo: str, workspace: str, instance_id: Optional[str])
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
 
 
+def mod_ready(repo: str, workspace: str, instance_id: Optional[str], env=None,
+              wait_s: float = 30.0, sleep=time.sleep) -> str:
+    env = os.environ if env is None else env
+    if env.get("SUTANDO_TASK_WATCH_MOD") != "1":
+        return "no"
+    inbox, _ = target(repo, workspace, instance_id)
+    # A refused, unloaded or crashed Mod never makes this yes, so the Monitor is skipped only on proof.
+    for _ in range(max(1, int(wait_s))):
+        if session_verdict(inbox, f"{workspace}/state") == "yes":
+            return "yes"
+        sleep(1)
+    return "no"
+
+
+def _default_opts() -> dict:
+    repo = str(Path(__file__).resolve().parent.parent)
+    out = subprocess.run(["bash", f"{repo}/scripts/sutando-config.sh", "workspace"],
+                         capture_output=True, text=True, timeout=30)
+    return {"repo": repo, "workspace": (out.stdout or "").strip() or f"{repo}/workspace"}
+
+
 def _opts(rest):
     opts = {}
     it = iter(rest)
@@ -91,11 +114,12 @@ def _opts(rest):
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        cmd, opts = args[0], _opts(args[1:])
-        if cmd not in ("target", "session-start", "watch-argv"):
+        cmd = args[0]
+        opts = _default_opts() if cmd == "mod-ready" and len(args) == 1 else _opts(args[1:])
+        if cmd not in ("target", "session-start", "watch-argv", "mod-ready"):
             raise ValueError(cmd)
     except (IndexError, ValueError, StopIteration):
-        print("usage: watcher_rearm.py target|session-start|watch-argv --repo R --workspace W", file=sys.stderr)
+        print("usage: watcher_rearm.py target|session-start|watch-argv|mod-ready --repo R --workspace W", file=sys.stderr)
         return 64
     instance_id = os.environ.get("SUTANDO_INSTANCE_ID") or None
     if cmd == "target":
@@ -108,7 +132,8 @@ def main(argv=None) -> int:
             print(f"watcher_rearm.py: {err}", file=sys.stderr)
             return 1
         return 0
-    if os.environ.get("SUTANDO_TASK_WATCH_MOD") == "1":
+    if cmd == "mod-ready":
+        print(mod_ready(opts["repo"], opts["workspace"], instance_id))
         return 0
     payload = session_start_context(opts["repo"], opts["workspace"], instance_id)
     if payload is not None:

@@ -96,9 +96,13 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   retried.
 - The session's end (not `/clear`, not a resume) kills the one child the Mod spawned, nothing else.
 - The launcher sets `SUTANDO_TASK_WATCH_MOD=1` in the session only when it installed the Mod, and
-  sets it empty otherwise. `CLAUDE.md`, `/startup` and `/schedule-crons` skip their `Monitor` step on
-  `1`; the compaction/resume hint (`watcher_rearm.py session-start`) stays silent. Codex seats and
-  Claude seats without the Mod keep the `Monitor` path unchanged.
+  sets it empty otherwise. `CLAUDE.md`, `/startup` and `/schedule-crons` skip their `Monitor` step
+  only when `watcher_rearm.py mod-ready` prints `yes`: the marker is `1` AND a ready session watcher
+  holds the inbox (waiting up to 30 s for the Mod's to come up). A Mod that refused (old engine),
+  never loaded or gave up therefore leaves `no`, and the session starts the `Monitor` as before. The
+  compaction/resume hint fires on an unwatched inbox whatever the marker. The launcher gates the
+  version on the same absolute `claude` path the session runs (the one the tmux pane's `PATH`
+  resolves). Codex seats and Claude seats without the Mod keep the `Monitor` path unchanged.
 
 The opt-in is per launcher, off by default: `SUTANDO_TASK_WATCH_MOD_WORKER=1` in the environment of
 a worker spawn, `SUTANDO_TASK_WATCH_MOD_CORE=1` for the core launcher. Either way the launcher installs

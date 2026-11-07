@@ -92,7 +92,30 @@ try:
     with redirect_stdout(out):
         rc = wr.main(["session-start", "--repo", "/R", "--workspace", "/W"])
     os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
-    check("a Mod-hosted session is never asked for a Monitor", rc == 0 and out.getvalue() == "", out.getvalue())
+    check("a Mod-marked session with an unwatched inbox is still asked for a Monitor",
+          rc == 0 and "Re-arm it NOW" in out.getvalue(), out.getvalue())
+
+    # mod-ready: yes only on the marker AND a ready session watcher; a refused or absent Mod is no.
+    naps = []
+    subprocess.run, calls = fake_run(stdout="yes\n")
+    check("mod-ready without the marker is no, and probes nothing",
+          wr.mod_ready("/R", "/W", None, env={}, sleep=naps.append) == "no" and not calls)
+    check("mod-ready with the marker and a ready watcher is yes",
+          wr.mod_ready("/R", "/W", None, env={"SUTANDO_TASK_WATCH_MOD": "1"}, sleep=naps.append) == "yes"
+          and calls[0][2:] == ["role-present", "session", "--inbox", "/W/tasks", "--ready", "/W/state"], calls)
+    for verdict in ("no\n", "unknown\n"):
+        naps.clear()
+        subprocess.run, calls = fake_run(stdout=verdict)
+        got = wr.mod_ready("/R", "/W", "w1", env={"SUTANDO_TASK_WATCH_MOD": "1"}, wait_s=30, sleep=naps.append)
+        check(f"a Mod that refused or never came up ({verdict.strip()}) is no after the 30 s wait",
+              got == "no" and len(naps) == 30 and calls[0][5] == "/W/deliveries/w1", (got, len(naps)))
+    os.environ["SUTANDO_TASK_WATCH_MOD"] = "1"
+    subprocess.run, _ = fake_run(stdout="yes\n")
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["mod-ready", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
+    check("main mod-ready prints the word", rc == 0 and out.getvalue() == "yes\n", out.getvalue())
 
     check("core watch-argv is the target's command, one argument each",
           wr.watch_argv("/R", "/W", None, {}) == ["bash", "/R/src/watch-tasks-stream.sh", "/W/tasks", "--role", "session", "--inbox", "/W/tasks"])

@@ -360,14 +360,17 @@ claude_version_at_least() {
   return 0
 }
 
-# With $1 = "1", hosts the session's task watcher in the task-watch Mod instead of a
-# Monitor: appends its --plugin-dir and sets TASK_WATCH_MOD=1 (else empty). Reads REPO.
+# With $1 = "1": --plugin-dir for the task-watch Mod and TASK_WATCH_MOD=1, gated on CLAUDE_BIN,
+# the claude the session's PATH resolves, which the launch then runs. Reads REPO.
 add_task_watch_mod() {
   TASK_WATCH_MOD=""
+  CLAUDE_BIN=""
   [ "${1:-}" = "1" ] || return 0
   local dir="$REPO/src/agent/claude/task-watch-mod" min have
+  CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
+  case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
   min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)"
-  have="$(claude --version 2>/dev/null | awk 'NR==1 {print $1}')"
+  have="$([ -n "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version 2>/dev/null | awk 'NR==1 {print $1}')"
   if [ -z "$min" ] || [ -z "$have" ] || ! claude_version_at_least "$have" "$min"; then
     echo "task-watch Mod: Claude Code ${have:-unknown} is not at least ${min:-unknown}; this session keeps the Monitor watcher" >&2
     return 0
@@ -470,7 +473,7 @@ launch_claude_session() {
   claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do
