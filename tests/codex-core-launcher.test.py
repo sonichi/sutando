@@ -122,6 +122,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/agent/core-window.sh",
+            "src/agent/core-workspace-log.sh",
             "src/agent/launch-path.sh",
             "src/claude_config_dir.sh",
             "src/local_services.sh",
@@ -181,6 +182,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
         monitor = self.root / "src/core-input-watch.py"
         monitor.write_text(
             "import os, sys\n"
+            "print('monitor-stdout', ' '.join(sys.argv[1:]), flush=True)\n"
             "with open(os.environ['MONITOR_LOG'], 'w') as f:\n"
             "    f.write(' '.join(sys.argv[1:]))\n"
         )
@@ -746,6 +748,15 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def test_the_input_watch_log_is_this_workspaces_not_the_shared_tmp_one(self):
+        # A scratch core on another socket truncated the production core's log at the shared path.
+        result = self.run_launcher(env_extra={"SUTANDO_SELF_DEVELOPMENT_ENABLED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        own = self.root / "workspace" / "logs" / "core-input-watch.log"
+        text = _read_when_nonempty(own, time.monotonic() + 5)
+        self.assertIsNotNone(text, "the monitor's output did not reach the workspace's logs/")
+        self.assertIn("monitor-stdout", text)
+
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """The core entry point refuses a pool instance. Through the dispatcher's
         --runtime and directly, an instance launch touches none of the core's durable
