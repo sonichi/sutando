@@ -99,11 +99,11 @@ describe('the session-end task', () => {
 		const src = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(src, /postSessionPipeline: callEnd\.pipeline,/);
 		assert.match(src, /drainPostSession: true,/, 'close() is followed by process.exit');
-		assert.match(src, /onClientConnected: \(\) => callEnd\.clientConnected\(\),/);
-		assert.match(src, /onClientDisconnected: \(\) => \{\n\t\t\tcallEnd\.clientDisconnected\(\);/);
+		assert.match(src, /onClientConnected: \(\) => \{\n\t\t\tcallOrigin\.clientConnected\(\);\n\t\t\tcallEnd\.clientConnected\(\);/);
+		assert.match(src, /onClientDisconnected: \(\) => \{\n\t\t\tcallOrigin\.clientLeaving\(\);\n\t\t\tcallEnd\.clientDisconnected\(\);/);
 		assert.match(src, /subscribe\('turn\.end', \(\) => callEnd\.collect\(\)\);/);
 		assert.match(src, /beforeConversationClear = \(\) => callEnd\.collect\(\);/);
-		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript\);/);
+		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript, callOrigin\.take\(\)\);/);
 	});
 });
 

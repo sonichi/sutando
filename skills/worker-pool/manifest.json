@@ -1,0 +1,19 @@
+{
+  "name": "worker-pool",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "access_tier": "owner",
+  "enabled": true,
+  "description": "Worker pool voice hook: resolves a worker the user names by voice (\"ask Pro-dev to …\") against the roster, so the work task carries requested_worker; an unknown or ambiguous name is told to the user. Contributes no tools. Optional: without it a named worker is refused and voice work routes as before.",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-only",
+    "secrets": "none"
+  },
+  "tools": "./tools.ts",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
