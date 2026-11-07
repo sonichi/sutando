@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 
+from ... import task_envelope
 from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
@@ -196,6 +197,14 @@ class Connector:
         root's current pathname (a resumed thread keeps its own cwd otherwise, so a root renamed after
         the thread opened would leave later turns at the old pathname); a non-owner's scratch dir."""
         return (self.args.cwd or os.getcwd()) if owner else self.scratch_cwd
+
+    def envelope(self, path):
+        """`verified` when no key is configured (nothing to check), else the file's stamp checked against the key
+        read now: only `verified` is served, so an unsigned, tampered or unverifiable task is refused."""
+        if not self.args.hmac_key_file:
+            return task_envelope.VERIFIED
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return task_envelope.verify_text(f.read(), self.args.hmac_key_file)
 
     def thread_params(self, owner):
         p = {"cwd": self.turn_cwd(owner), "approvalPolicy": "never",
@@ -416,6 +425,14 @@ class Connector:
             t_mtime = os.stat(path).st_mtime
             t_seen = time.time()
             headers, message, operator_lines = parse_task(path)
+            verdict = self.envelope(path)
+            if verdict != task_envelope.VERIFIED:
+                log("refused (envelope %s, --hmac-key-file set) ->" % verdict, task_id, headers["access_tier"])
+                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                record_done(done_path, task_id)
+                done += 1
+                idle_since = time.time()
+                continue
             if admission(headers, self.args.allow_non_owner) is None:
                 log("refused (non-owner, --allow-non-owner not set) ->", task_id, headers["access_tier"])
                 write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
@@ -493,6 +510,9 @@ def build_parser():
                          "collaborator claim the broker did not attest), each on its own ephemeral read-only "
                          "thread. Off by default: they are refused with a plain line. An attested collaborator "
                          "never needs it: it always gets that ephemeral read-only thread.")
+    ap.add_argument("--hmac-key-file", default=None,
+                    help="serve only tasks whose envelope stamp verifies under this key (read per task); every other "
+                         "task is refused with the plain line")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")

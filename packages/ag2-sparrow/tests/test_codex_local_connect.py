@@ -2541,5 +2541,64 @@ class InstallTokenEnvFile(Base):
         self.assertFalse(cli.config_path(LA).exists())
 
 
+
+class Signing(Base):
+    AGENT = "@helper:s.example"
+
+    def test_hmac_makes_the_agents_own_key_and_the_job_records_only_its_path(self):
+        from ag2_sparrow import task_envelope
+        local, _ = cm.agent_job(L, self.AGENT)
+        path, problem = cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None), local, cb.UNIT)
+        self.assertEqual(problem, "")
+        self.assertEqual(Path(path), cm.config_dir(local) / cb.OWN_HMAC_KEY)
+        self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o600)
+        key = Path(path).read_text().strip()
+        task_envelope.load_key(path)
+        self.assertEqual(cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None), local, cb.UNIT), (path, ""))
+        self.assertEqual(Path(path).read_text().strip(), key, "a reinstall keeps the key")
+        argv = cli.connector_argv({"CODEX": str(self.codex), "HMAC_KEY_FILE": path}, str(self.work), 7)
+        self.assertEqual(argv[-2:], ["--hmac-key-file", path])
+        self.assertNotIn(key, " ".join(argv), "the key is never in argv")
+        cfg = {"ROOT": str(self.work), "AGENT_ID": self.AGENT, "TOKEN_ENV_FILE": "", "BRIDGE": cb.UNIT,
+               "BRIDGE_STATE_DIR": str(self.home / "state"), "HMAC_KEY_FILE": path}
+        env, problem = cb.launch_env(cfg)
+        self.assertEqual((env["AG2_HMAC_KEY_FILE"], problem), (path, ""), "the bridge gets the path to sign with")
+        self.assertFalse(any(key in v for v in env.values()), "the key is never in the bridge's environment")
+        env, _ = cb.launch_env(dict(cfg, BRIDGE="sparrowd"))
+        self.assertNotIn("AG2_HMAC_KEY_FILE", env, "a host supervisor's bridge keeps its canonical environment")
+        self.assertIn("pass --hmac-key-file", cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None),
+                                                           local, "sparrowd")[1])
+
+    def test_hmac_needs_the_agents_own_bridge_and_a_named_key_must_be_usable(self):
+        local, _ = cm.agent_job(L, self.AGENT)
+        self.assertIn("where a host or you run the bridge", cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None),
+                                                           L, cb.EXTERNAL)[1])
+        self.assertIn("pass one", cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file="/k"), local, cb.UNIT)[1])
+        bad = self.home / "bad.key"
+        bad.write_text("not a key")
+        self.assertIn("not a usable key", cli.hmac_key(argparse.Namespace(hmac=False, hmac_key_file=str(bad)),
+                                                       local, cb.UNIT)[1])
+        self.assertEqual(cli.hmac_key(argparse.Namespace(hmac=False, hmac_key_file=None), local, cb.UNIT), ("", ""))
+
+    def test_verify_shows_the_signing_mode(self):
+        from ag2_sparrow import task_envelope
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn("INFO hmac mode: off (tasks are not signed)", out)
+        key = self.home / "k.key"
+        task_envelope.create_key(key)
+        self.configure(HMAC_KEY_FILE=str(key))
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn("INFO hmac mode: strict", out)
+        self.assertEqual(self.checks(out).get("hmac key"), "PASS")
+        key.write_text("broken")
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertEqual(self.checks(out).get("hmac key"), "FAIL")
+
+
 if __name__ == "__main__":
     unittest.main()

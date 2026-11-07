@@ -1857,7 +1857,9 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(env, sorted([f'Environment="AGENT_CONNECT_TASK_DIR={self.root}/tasks"',
                                       f'Environment="AGENT_CONNECT_RESULT_DIR={self.root}/results"',
                                       f'Environment="AGENT_CONNECT_STATE_DIR={home}/state"',
-                                      f'Environment="AGENT_MXID={AGENT}"', f'Environment="AG2_DEVICE_ENV={self.relay}"']))
+                                      f'Environment="AGENT_MXID={AGENT}"', f'Environment="AG2_DEVICE_ENV={self.relay}"',
+                                      # The install's key path: its own bridge signs every task the strict session checks.
+                                      f'Environment="AG2_HMAC_KEY_FILE={self.home / "task-hmac.key"}"']))
         self.assertNotIn(TOKEN, unit + cli.config_path(LA).read_text(), "the token stays in its file")
         self.assertEqual(fake.verbs(), ["show", "enable", "restart"], "absent: registered and started, no stop")
         self.assertIn(f"started: {BA.service_name}, feeding {self.root}/tasks as {AGENT}", out)
@@ -2144,7 +2146,8 @@ class ConnectHostSupervised(AgentRootBase):
         seg = "probe.agent_ag2.space"
         self.assertEqual(body["env"], {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks",
                                        "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results",
-                                       "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT})
+                                       "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT},
+                         "a host supervisor's bridge signs with the host's key: no key path in its declaration")
         self.assertEqual((body["name"], body["token_vault_key"], body["host"], body["module"]),
                          (cli.worker_name(seg), cli.vault_key(seg), "sparrowd", "ag2_sparrow.remote_gateway_bridge"))
         self.assertRegex(body["name"], r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", "sparrowd's worker-name rule")
