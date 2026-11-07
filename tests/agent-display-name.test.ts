@@ -5,13 +5,13 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const mod = await import('../src/agent-display-name.js');
-const { agentDisplayName, agentDisplayNameScriptPath, resetAgentDisplayNameForTests, nameFromJson, LIVE_REFRESH_MS, FALLBACK_AGENT_NAME } = mod;
+const { agentDisplayName, agentDisplayNameScriptPath, resolverRunner, resetAgentDisplayNameForTests, nameFromJson, LIVE_REFRESH_MS, FALLBACK_AGENT_NAME } = mod;
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 
 function runner(offline: string | Error, live: string | null) {
@@ -85,4 +85,29 @@ test('the bundled layout (module in dist/) finds the resolver in src/', () => {
 	assert.strictEqual(script, join(REPO, 'src', 'agent_display_name.py'));
 	assert.ok(existsSync(script));
 	assert.strictEqual(agentDisplayNameScriptPath(join(REPO, 'src')), script);
+});
+
+test('a missing resolver script is warned about once, by cause, and falls back', () => {
+	const warnings: string[] = [];
+	const r = resolverRunner(join(REPO, 'dist', 'agent_display_name.py'), (m: string) => warnings.push(m));
+	assert.strictEqual(agentDisplayName(r, 0), FALLBACK_AGENT_NAME);
+	agentDisplayName(r, LIVE_REFRESH_MS);
+	agentDisplayName(r, 2 * LIVE_REFRESH_MS);
+	assert.strictEqual(warnings.length, 1, warnings.join('\n'));
+	assert.match(warnings[0], /resolver script not found at .*agent_display_name\.py/);
+});
+
+test('a failing resolver is warned about once per distinct cause', () => {
+	const tmp = mkdtempSync(join(tmpdir(), 'adn-fail-'));
+	try {
+		const script = join(tmp, 'agent_display_name.py');
+		writeFileSync(script, 'import sys\nsys.exit(3)\n');
+		const warnings: string[] = [];
+		const r = resolverRunner(script, (m: string) => warnings.push(m));
+		assert.throws(() => r.sync(['--offline', '--json']));
+		assert.throws(() => r.sync(['--offline', '--json']));
+		assert.deepStrictEqual(warnings, ['[agent-display-name] resolver exited with status 3; using the last known name or "Sutando"']);
+	} finally {
+		rmSync(tmp, { recursive: true, force: true });
+	}
 });

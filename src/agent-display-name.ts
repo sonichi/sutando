@@ -8,6 +8,7 @@
  * When python or the resolver is unavailable, the name is the resolver's own fallback, "Sutando".
  */
 import { execFile, execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolvePython } from './python-binary.js';
@@ -29,18 +30,51 @@ export interface NameRunner {
 	async(args: string[], done: (stdout: string | null) => void): void;
 }
 
-const defaultRunner: NameRunner = {
-	sync(args) {
+const warned = new Set<string>();
+
+/** Warn once per process per distinct cause; causes carry no env values or resolver output. */
+function warnOnce(cause: string, sink: (msg: string) => void): void {
+	if (warned.has(cause)) return;
+	warned.add(cause);
+	sink(`[agent-display-name] ${cause}; using the last known name or "${FALLBACK_AGENT_NAME}"`);
+}
+
+function failureCause(err: unknown): string {
+	const e = err as { code?: unknown; signal?: unknown; status?: unknown } | null;
+	if (e?.code === 'ETIMEDOUT' || e?.signal) return 'resolver timed out';
+	if (typeof e?.status === 'number') return `resolver exited with status ${e.status}`;
+	if (typeof e?.code === 'number') return `resolver exited with status ${e.code}`;
+	return typeof e?.code === 'string' ? `resolver failed to start (${e.code})` : 'resolver failed';
+}
+
+/** The production runner for `script`; warnings go to `sink`. Exported for tests. */
+export function resolverRunner(script: string = SCRIPT, sink: (msg: string) => void = console.warn): NameRunner {
+	const python = (): string | null => {
+		if (!existsSync(script)) { warnOnce(`resolver script not found at ${script}`, sink); return null; }
 		const py = resolvePython();
-		if (py === null) throw new Error('python unavailable');
-		return execFileSync(py, [SCRIPT, ...args], { timeout: OFFLINE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-	},
-	async(args, done) {
-		const py = resolvePython();
-		if (py === null) { done(null); return; }
-		execFile(py, [SCRIPT, ...args], { timeout: LIVE_TIMEOUT_MS }, (err, stdout) => done(err ? null : String(stdout)));
-	},
-};
+		if (py === null) warnOnce('python unavailable', sink);
+		return py;
+	};
+	return {
+		sync(args) {
+			const py = python();
+			if (py === null) throw new Error('resolver unavailable');
+			try {
+				return execFileSync(py, [script, ...args], { timeout: OFFLINE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+			} catch (err) { warnOnce(failureCause(err), sink); throw err; }
+		},
+		async(args, done) {
+			const py = python();
+			if (py === null) { done(null); return; }
+			execFile(py, [script, ...args], { timeout: LIVE_TIMEOUT_MS }, (err, stdout) => {
+				if (err) warnOnce(failureCause(err), sink);
+				done(err ? null : String(stdout));
+			});
+		},
+	};
+}
+
+const defaultRunner = resolverRunner();
 
 /** The `name` of the resolver's `--json` line, or '' for anything else. */
 export function nameFromJson(stdout: string | null): string {
@@ -72,4 +106,5 @@ export function agentDisplayName(runner: NameRunner = defaultRunner, now: number
 export function resetAgentDisplayNameForTests(): void {
 	cached = undefined;
 	liveStartedAt = -Infinity;
+	warned.clear();
 }
