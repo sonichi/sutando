@@ -8,7 +8,9 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { createProxyServer, appendRejection, requestModel, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { brotliCompressSync, deflateRawSync, deflateSync, gzipSync } from 'node:zlib';
+import { randomBytes } from 'node:crypto';
+import { createProxyServer, appendRejection, rejectionSnippet, requestModel, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
 
 const NOW = 1_700_000_000_000;
 let upstreamHandler: (req: IncomingMessage, res: ServerResponse) => void = () => {};
@@ -42,12 +44,12 @@ async function startProxy(): Promise<number> {
 	return listen(createProxyServer(deps));
 }
 
-function call(port: number, reqBody = '{}', headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
+function call(port: number, reqBody = '{}', headers: Record<string, string> = {}): Promise<{ status: number; body: string; raw: Buffer }> {
 	return new Promise((resolve, reject) => {
 		const req = httpRequest({ hostname: '127.0.0.1', port, path: '/v1/messages?beta=true', method: 'POST', headers }, (res) => {
 			const chunks: Buffer[] = [];
 			res.on('data', (c) => chunks.push(c));
-			res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+			res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString(), raw: Buffer.concat(chunks) }));
 		});
 		req.on('error', reject);
 		req.end(reqBody);
@@ -132,4 +134,57 @@ test('appendRejection bounds the ledger, drops foreign entries, keeps the newest
 	assert.equal(out[out.length - 1].snippet, String(MAX_RECENT_REJECTIONS + 6));
 	assert.deepEqual(appendRejection(undefined, mk(0)), [mk(0)], 'a missing ledger starts fresh');
 	assert.deepEqual(appendRejection('not-a-list', mk(0)), [mk(0)]);
+});
+
+const OVERLOADED = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+
+test('a gzip-encoded rejection is recorded as its decoded text, and the client still gets the gzip bytes unchanged', async () => {
+	const gz = gzipSync(OVERLOADED);
+	upstreamHandler = (_req, res) => { res.writeHead(529, { 'content-type': 'application/json', 'content-encoding': 'gzip' }); res.end(gz); };
+	const port = await startProxy();
+	const r = await call(port, '{}', { 'accept-encoding': 'gzip' });
+	await settle();
+	assert.equal(r.status, 529);
+	assert.ok(r.raw.equals(gz), 'the client receives the compressed body byte for byte');
+	assert.equal(recorded.length, 1);
+	assert.match(recorded[0].snippet, /overloaded_error/);
+	assert.doesNotMatch(recorded[0].snippet, /\uFFFD/, 'no replacement characters from decoding gzip as UTF-8');
+});
+
+test('br and deflate (zlib-wrapped or raw) are decoded too; an absent or identity encoding is read as text', () => {
+	const text = Buffer.from(OVERLOADED);
+	assert.equal(rejectionSnippet(brotliCompressSync(text), 'br'), OVERLOADED);
+	assert.equal(rejectionSnippet(deflateSync(text), 'deflate'), OVERLOADED);
+	assert.equal(rejectionSnippet(deflateRawSync(text), 'deflate'), OVERLOADED);
+	assert.equal(rejectionSnippet(gzipSync(text), ' GZIP '), OVERLOADED, 'the header value is trimmed and case-folded');
+	assert.equal(rejectionSnippet(text, undefined), OVERLOADED);
+	assert.equal(rejectionSnippet(text, 'identity'), OVERLOADED);
+});
+
+test('a capture cut short of the gzip trailer still yields the text it holds', () => {
+	const big = OVERLOADED + ' ' + randomBytes(6000).toString('hex');
+	const gz = gzipSync(big);
+	const cut = gz.subarray(0, 2048);
+	const out = rejectionSnippet(cut, 'gzip');
+	assert.ok(out.startsWith(OVERLOADED), `decoded prefix kept, got ${JSON.stringify(out.slice(0, 80))}`);
+	assert.ok(out.length <= 2048, 'bounded to the snippet length');
+});
+
+test('br and deflate captures cut short also yield the text they hold', () => {
+	const big = Buffer.from(OVERLOADED + ' ' + randomBytes(6000).toString('hex'));
+	for (const [enc, packed] of [['br', brotliCompressSync(big)], ['deflate', deflateSync(big)], ['deflate', deflateRawSync(big)]] as const) {
+		const out = rejectionSnippet(packed.subarray(0, 2048), enc);
+		assert.ok(out.startsWith(OVERLOADED), `${enc}: decoded prefix kept, got ${JSON.stringify(out.slice(0, 80))}`);
+		assert.ok(out.length <= 2048, `${enc}: bounded to the snippet length`);
+	}
+});
+
+test('an unknown or undecodable encoding is named, never stored as raw bytes', () => {
+	assert.equal(rejectionSnippet(Buffer.from([1, 2, 3]), 'zstd'), '<3-byte body, content-encoding zstd>');
+	assert.equal(rejectionSnippet(Buffer.from('not gzip at all'), 'gzip'), '<15-byte body, content-encoding gzip, not decodable>');
+});
+
+test('a body that inflates past the decode cap is named rather than expanded', () => {
+	const bomb = gzipSync(Buffer.alloc(8 * 1024 * 1024, 0x61));
+	assert.match(rejectionSnippet(bomb, 'gzip'), /^<\d+-byte body, content-encoding gzip, not decodable>$/);
 });
