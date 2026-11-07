@@ -142,6 +142,13 @@ class Contract(Layout):
                         self.prepare()
                 self.assertFalse(self.app_home.exists())
 
+    def test_a_failed_create_refuses_and_leaves_no_home(self):
+        self.checkout()
+        with patch.object(codex_home.codex_host_instructions, "create_home", side_effect=OSError("denied")):
+            with self.assertRaises(codex_home.Refused):
+                self.prepare()
+        self.assertFalse(self.app_home.exists())
+
     def test_a_desktop_alternate_env_name_is_refused_before_any_write(self):
         self.checkout(env_name="CODEX_CONFIG_DIR")
         before = self.tree()

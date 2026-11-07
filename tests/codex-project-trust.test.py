@@ -156,6 +156,50 @@ class EnsureTrusted(unittest.TestCase):
                          ["-y", "pkg@1.2"])
 
 
+class EnsureTrustedHosted(unittest.TestCase):
+    """A desktop-hosted checkout: the config is read and written below a no-follow descriptor."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name).resolve()
+        self.home = root / "home"
+        self.home.mkdir()
+        self.repo = root / "engine" / "sutando"
+        self.repo.mkdir(parents=True)
+        (root / "engine" / "AGENTS.md").write_text("host\n")
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        self.codex_home = root / "workspace" / ".codex-sutando"
+        self.codex_home.mkdir(parents=True)
+        self.config = self.codex_home / "config.toml"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def trust(self):
+        return cpt.ensure_trusted(self.codex_home, self.repo, self.repo, home=self.home)
+
+    def test_trusts_once_through_the_descriptor_keeping_settings_and_mode(self):
+        self.config.write_text('model = "x"')
+        os.chmod(self.config, 0o640)
+        self.assertEqual(self.trust(), "trusted")
+        self.assertEqual(self.trust(), "already-set")
+        self.assertEqual(cpt.tomllib.loads(self.config.read_text())["projects"],
+                         {str(self.repo): {"trust_level": "trusted"}})
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
+
+    def test_a_missing_config_is_created_private(self):
+        self.assertEqual(self.trust(), "trusted")
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_a_missing_home_raises_and_a_failed_write_leaves_no_temp_file(self):
+        with self.assertRaises(FileNotFoundError):
+            cpt.ensure_trusted(self.codex_home / "gone", self.repo, self.repo, home=self.home)
+        with patch.object(cpt.os, "replace", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                self.trust()
+        self.assertEqual(sorted(p.name for p in self.codex_home.iterdir()), [])
+
+
 class EnsureTrustedWithoutTomllib(EnsureTrusted):
     """Python 3.9/3.10: the same contract through the bundled reader."""
     cpt = load_without_tomllib()

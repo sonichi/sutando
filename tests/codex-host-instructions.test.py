@@ -792,6 +792,38 @@ class CreateHome(Base):
         self.assertFalse(self.codex_home.exists())
 
 
+class OpenHome(Base):
+    def test_an_existing_home_opens_as_a_directory_descriptor(self):
+        self.codex_home.mkdir(parents=True)
+        fd = chi.open_home(self.codex_home, self.home)
+        try:
+            self.assertTrue(os.path.samestat(os.fstat(fd), self.codex_home.stat()))
+        finally:
+            os.close(fd)
+
+    def test_the_owner_home_and_an_invalid_home_raise_value_error(self):
+        for bad in (self.owner / "x", "relative/home", f"{self.root}/a/../b"):
+            with self.assertRaises(ValueError):
+                chi.open_home(bad, self.home)
+
+    def test_a_missing_home_raises_and_creates_nothing(self):
+        before = self.tree()
+        with self.assertRaises(FileNotFoundError):
+            chi.open_home(self.codex_home, self.home)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_link_component_is_refused(self):
+        (self.root / "elsewhere").mkdir()
+        (self.root / "workspace").symlink_to(self.root / "elsewhere")
+        with self.assertRaises(ValueError):
+            chi.open_home(self.codex_home, self.home)
+
+    def test_an_unreadable_owner_identity_raises_value_error(self):
+        with patch.object(chi, "_owner_anchor", side_effect=OSError("denied")):
+            with self.assertRaisesRegex(ValueError, "owner home unreadable"):
+                chi.open_home(self.codex_home, self.home)
+
+
 class DesktopLayout(Base):
     COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh",
               "src/sutando_config.py", "sutando.config.json")
