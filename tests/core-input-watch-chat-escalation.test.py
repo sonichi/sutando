@@ -386,14 +386,17 @@ class TestDrive(unittest.TestCase):
     def _blocked(self, m, session="s"):
         return M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, session)
 
-    def test_the_real_dialog_through_classify_is_a_no_yes_card(self):
-        """Through the monitor's own classifier, not a hand-picked gate label: the
-        live pane names this dialog `selection`, and the card must still be No/Yes."""
+    def test_the_real_dialog_through_classify_offers_every_option(self):
+        """Through the monitor's own classifier, not a hand-picked gate label: the live
+        pane names this dialog `selection`, and the card carries all three of its
+        options (V42) rather than collapsing to No/Yes."""
         state, detail, prompt, kind = M.compose_state(PERM, "working", True)
         self.assertEqual((state, kind), ("blocked-human", "selection"))
         r = M.escalate(_mgr(), state, detail, kind, prompt, "s")
-        self.assertEqual(r.kind, "permission")
-        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual(r.kind, "choice")
+        self.assertEqual([a.label for a in r.actions],
+                         ["Yes", "Yes, and don't ask again for rm commands", "No",
+                          "Open terminal"])
 
     def test_a_numbered_trust_dialog_through_classify_gets_no_button(self):
         """End to end through the monitor's own classifier: this pane is labelled
@@ -406,15 +409,17 @@ class TestDrive(unittest.TestCase):
         self.assertEqual(r.kind, "core-blocked")
         self.assertEqual([a.label for a in r.actions], ["Open terminal"])
 
-    def test_a_permission_gate_carries_no_yes_buttons_not_ack(self):
+    def test_a_permission_gate_carries_option_buttons_not_ack(self):
         r = self._blocked(_mgr())
-        self.assertEqual(r.kind, "permission")
-        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual(r.kind, "choice")
+        self.assertEqual([a.label for a in r.actions],
+                         ["Yes", "Yes, and don't ask again for rm commands", "No",
+                          "Open terminal"])
 
     def test_a_clicked_no_walks_the_caret_to_no_and_confirms(self):
         m, sent = _mgr(), []
         r = self._blocked(m)
-        _click(m, r, "deny")
+        _click(m, r, "opt3")
         acted = M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
         self.assertEqual(sent, ["Down", "Down", "Enter"])
         self.assertEqual(acted, [(r.id, ["Down", "Down", "Enter"])])
@@ -422,7 +427,7 @@ class TestDrive(unittest.TestCase):
     def test_a_click_is_driven_once_not_every_tick(self):
         m, sent = _mgr(), []
         r = self._blocked(m)
-        _click(m, r, "allow")
+        _click(m, r, "opt1")
         for _ in range(5):
             M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
         self.assertEqual(sent, ["Enter"])
@@ -431,7 +436,7 @@ class TestDrive(unittest.TestCase):
         from hitl.schema import STATUS_EXPIRED
         m, sent = _mgr(), []
         r = self._blocked(m)
-        _click(m, r, "allow")
+        _click(m, r, "opt1")
         other = PERM.replace("possibly-empty", "non-empty")
         M.drive_escalations(m, "s", other, "blocked-human", lambda k: sent.append(k) or True)
         self.assertEqual(sent, [])
@@ -447,7 +452,7 @@ class TestDrive(unittest.TestCase):
     def test_another_sessions_click_is_not_driven_into_this_pane(self):
         m, sent = _mgr(), []
         r = self._blocked(m, session="worker-2")
-        _click(m, r, "allow")
+        _click(m, r, "opt1")
         M.drive_escalations(m, "worker-1", PERM, "blocked-human", lambda k: sent.append(k) or True)
         self.assertEqual(sent, [])
 
@@ -455,7 +460,7 @@ class TestDrive(unittest.TestCase):
         from hitl.manager import POLICY_DECIDER
         m, sent = _mgr(), []
         r = self._blocked(m)
-        _click(m, r, "allow")
+        _click(m, r, "opt1")
         with m.store.locked():
             cur = m.get(r.id); cur.decided_by = POLICY_DECIDER; m.store.save(cur)
         M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
@@ -488,7 +493,7 @@ class TestPartialSend(unittest.TestCase):
         from hitl.schema import STATUS_EXPIRED
         m, sent = _mgr(), []
         r = self._blocked(m)
-        _click(m, r, "deny")                      # plan: Down, Down, Enter
+        _click(m, r, "opt3")                      # plan: Down, Down, Enter
         def flaky(k):
             sent.append(k)
             return len(sent) < 2                  # first Down accepted, second refused
@@ -504,7 +509,7 @@ class TestPartialSend(unittest.TestCase):
     def test_after_a_partial_send_nothing_is_ever_typed_again_for_that_card(self):
         m, sent = _mgr(), []
         r = self._blocked(m)
-        _click(m, r, "deny")
+        _click(m, r, "opt3")
         M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or len(sent) < 2)
         moved = PERM.replace("  ❯ 1. Yes", "    1. Yes").replace("    2. Yes, and", "  ❯ 2. Yes, and")
         for _ in range(3):
