@@ -158,6 +158,16 @@ def _normalize(items):
     return out
 
 
+def _newest_first(messages):
+    """The messages by timestamp, newest first, so the order the result declares is the one it
+    has: the gateway pulls a replied-to message up behind its reply (#6176). Ties keep the
+    gateway's order. Unless every timestamp is a number, the gateway's order is kept as is."""
+    if all(isinstance(m.get("ts"), (int, float)) and not isinstance(m.get("ts"), bool)
+           for m in messages):
+        return sorted(messages, key=lambda m: m["ts"], reverse=True)
+    return list(messages)
+
+
 def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, before=None,
               oldest_first=False):
     """Pull up to `limit` recent messages from `room_id` via the gateway verb."""
@@ -237,7 +247,7 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     # safe direction for a function whose failure mode is a confident empty.
     # Still the NEWEST `limit` messages either way — `oldest_first` reverses only the
     # rendering, so `| tail` shows the latest instead of the oldest.
-    kept = messages[:limit]
+    kept = _newest_first(messages)[:limit]
     if oldest_first:
         kept = list(reversed(kept))
     return _result(True, kept, room_id=room_id, complete=len(messages) >= limit,
