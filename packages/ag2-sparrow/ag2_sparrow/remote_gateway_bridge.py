@@ -10659,6 +10659,9 @@ def _maybe_start_event_channel() -> None:
         probe = _hitl_reply_handler("", log=_log)
         if probe is not None:
             claimants.append(_HitlClicks(probe, log=_log))
+        # Last claimant: a reaction on our own message is an outcome signal, never a task.
+        from .outcome_reactions import OutcomeReactionHandler
+        claimants.append(OutcomeReactionHandler(_STATE / "correlation.jsonl", log=_log))
         if claimants:
             from .human_action import HandlerChain
             handler = HandlerChain(claimants + [handler])
