@@ -9,7 +9,7 @@ re-arm before anything else. Both must name the same inbox and command.
     watcher_rearm.py target --repo R --workspace W         # inbox line, then command line
     watcher_rearm.py session-start --repo R --workspace W  # hook JSON, or nothing
     watcher_rearm.py watch-argv --repo R --workspace W     # the same command, one argument per line
-    watcher_rearm.py mod-ready [--repo R --workspace W]    # yes: skip the Monitor; no: start it
+    watcher_rearm.py mod-ready --repo R --workspace W      # yes: skip the Monitor; no: start it
 
 watch-argv serves the task-watch Mod, so it watches the inbox the Stop hook checks; mod-ready
 answers yes only when the Mod is installed AND a ready session watcher holds that inbox.
@@ -92,13 +92,6 @@ def mod_ready(repo: str, workspace: str, instance_id: Optional[str], env=None,
     return "no"
 
 
-def _default_opts() -> dict:
-    repo = str(Path(__file__).resolve().parent.parent)
-    out = subprocess.run(["bash", f"{repo}/scripts/sutando-config.sh", "workspace"],
-                         capture_output=True, text=True, timeout=30)
-    return {"repo": repo, "workspace": (out.stdout or "").strip() or f"{repo}/workspace"}
-
-
 def _opts(rest):
     opts = {}
     it = iter(rest)
@@ -115,7 +108,7 @@ def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
         cmd = args[0]
-        opts = _default_opts() if cmd == "mod-ready" and len(args) == 1 else _opts(args[1:])
+        opts = _opts(args[1:])
         if cmd not in ("target", "session-start", "watch-argv", "mod-ready"):
             raise ValueError(cmd)
     except (IndexError, ValueError, StopIteration):
