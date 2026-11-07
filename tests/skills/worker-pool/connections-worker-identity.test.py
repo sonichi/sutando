@@ -16,7 +16,7 @@
 
 The vault, the gateway probe and the process spawn are fakes, from tests/connections.test.py.
 
-Run: python3 tests/connections-worker-identity.test.py
+Run: python3 tests/skills/worker-pool/connections-worker-identity.test.py
 """
 import sys
 from pathlib import Path

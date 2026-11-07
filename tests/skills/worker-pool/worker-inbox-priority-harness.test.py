@@ -2,7 +2,7 @@
 """worker-inbox-priority.test.py under a runtime harness: the harness file's paths reach the children
 and the diagnostics are copied beside it, while anything else in that file (a token) reaches nothing.
 
-Run: python3 tests/worker-inbox-priority-harness.test.py
+Run: python3 tests/skills/worker-pool/worker-inbox-priority-harness.test.py
 """
 from __future__ import annotations
 

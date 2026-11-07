@@ -8,7 +8,7 @@ every call to its runner. spawn_worker._run ALSO hardcodes them internally
 (`subprocess.run(argv, capture_output=True, text=True, **kw)`), so a call
 through `runner=_run` duplicated both keywords -- a TypeError Python raises at
 the call site itself, before any real subprocess exists. The existing
-spawn-wiring test (tests/pool-remedy-timer-ensured-on-spawn.test.py) could not
+spawn-wiring test (tests/skills/worker-pool/pool-remedy-timer-ensured-on-spawn.test.py) could not
 catch this: its `Launchctl.__call__(self, argv, **kw)` mock accepts and
 swallows any kwargs, so it never reproduces `_run`'s actual signature.
 

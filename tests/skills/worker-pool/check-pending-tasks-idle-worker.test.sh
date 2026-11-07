@@ -10,7 +10,7 @@
 # is owed. The core keeps the gate (control), and a worker that owes a delivery
 # is still blocked (control).
 #
-# Run: bash tests/check-pending-tasks-idle-worker.test.sh
+# Run: bash tests/skills/worker-pool/check-pending-tasks-idle-worker.test.sh
 set -u
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
