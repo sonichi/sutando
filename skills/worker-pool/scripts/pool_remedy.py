@@ -400,6 +400,50 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
+def retry_limit(workspace, repo, worker_id, *, runner=None):
+    """Route the recovery task and wake its limited worker through the guarded sender."""
+    if (sup.is_paused(workspace, worker_id)
+            or worker_id not in sup.supervised_workers(workspace)
+            or sup.work_outstanding(workspace, worker_id) is not True):
+        return {"worker_id": worker_id, "outcome": "no-work-or-paused"}
+    run = runner or subprocess.run
+    socket, session = sup._open_tmux(workspace, worker_id)
+    row = (sw.pr.load_roster(workspace) or {}).get("workers", {}).get(worker_id, {})
+    runtime = row.get("runtime") or "claude"
+    if not socket or runtime != "claude":
+        return {"worker_id": worker_id, "outcome": "unsupported-or-no-session"}
+    try:
+        capture = run(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-J", "-t", session],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"worker_id": worker_id, "outcome": "capture-failed"}
+    if (capture.returncode != 0
+            or sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
+            or sup.pane_gate.pending_text(capture.stdout, sup.pane_gate.CLAUDE) != ""):
+        return {"worker_id": worker_id, "outcome": "pane-changed-or-pending"}
+    ask = _sibling("pool_ask")
+    try:
+        delivery = ask.ask(workspace, worker_id,
+            "The usage-limit recovery probe is due. Re-arm your session-role task watcher "
+            "using the normal worker bootstrap, then process your outstanding deliveries. "
+            "Do not run core startup or core schedules. If still usage-limited, leave the "
+            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.")
+    except (OSError, ValueError) as exc:
+        return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
+    task_id = delivery["task_id"]
+    if sup.is_paused(workspace, worker_id) or suspension(workspace):
+        return {"worker_id": worker_id, "outcome": "rearm-queued", "task_id": task_id}
+    prompt = f"Read {pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
+    try:
+        sent = sup.pane_gate.deliver(prompt, session, runtime, socket_path=str(socket),
+            refuse_if_pending=True, require_limit=True, runner=run,
+            script=Path(repo) / "scripts/tmux-send-line.sh")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"worker_id": worker_id, "outcome": "wake-failed", "task_id": task_id, "why": str(exc)}
+    return {"worker_id": worker_id, "outcome": "rearm-sent" if sent.code == 0 else "wake-refused",
+            "task_id": task_id, "send_code": sent.code}
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
@@ -425,6 +469,8 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
                 continue
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
+        elif decision == ps.RETRY_LIMIT:
+            rearms[worker_id] = retry_limit(workspace, repo, worker_id, runner=runner)
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
