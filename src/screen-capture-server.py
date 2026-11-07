@@ -268,7 +268,7 @@ def list_displays() -> list[dict]:
     if not is_macos():
         path = _os.path.join(DIR, "displayprobe-virtual.png")
         try:
-            _os.makedirs(DIR, exist_ok=True)
+            _os.makedirs(DIR, mode=0o700, exist_ok=True)
             if not _platform_capture_screen(path, fmt="png"):
                 return []
             width, height = _png_size(path)
@@ -415,7 +415,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Opt out with SUTANDO_CAPTURE_NOTIFY=0. Debounced at 5s so a
             # burst of captures raises one notification.
             _notify_capture()
-        os.makedirs(DIR, exist_ok=True)
+        os.makedirs(DIR, mode=0o700, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         display_raw = query.get("display", [None])[0]
         # Coerce to int so the value cannot taint the subprocess argument
@@ -530,7 +530,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ⌃R toggle — START: spawn an open-ended `screencapture -v` (no -V) and
         # return immediately; the second ⌃R (action=stop) ends it.
         if action == "start":
-            os.makedirs(DIR, exist_ok=True)
+            os.makedirs(DIR, mode=0o700, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             display_raw = query.get("display", [None])[0]
             display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
