@@ -194,6 +194,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`recovery_issues.py`** — Durable issue identities for recovery telemetry, independent of retry counts.
 - **`relay-agent.ts`** — Sutando's relay agent: the voice side's task manager between the voice model and the core, run as the bodhi subagent behind the NON_BLOCKING `work` tool: each call stays open until its task's result returns as that call's own response (WHEN_IDLE).
+- **`relay_credentials.py`** — Relay gateway URL + bearer for in-session consumers, without trusting the environment.
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
 - **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
