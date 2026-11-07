@@ -150,9 +150,7 @@ class WhatIsALimit(unittest.TestCase):
         self.assertTrue(is_usage_limit("selection", menu))
 
     def test_the_limit_menu_under_its_refusal_line_reads_as_a_limit(self):
-        # V43 (owner 2026-10-31, card-ugly3): the weekly-limit menu with its title as a "⎿" line
-        # was carded as an unknown gate saying only "open the Runtime panel"; it is a limit, and
-        # the card says how to unblock it.
+        # The menu's title is a "⎿" line; its own rows still name the limit, and the card says how.
         from delivery.pane_gate import is_usage_limit
         menu = ("  ⎿ You've hit your weekly limit · resets Nov 2 at 11am (America/Los_Angeles)\n\n"
                 " What do you want to do?\n\n"
@@ -166,6 +164,14 @@ class WhatIsALimit(unittest.TestCase):
                                     SESSION, "claude")
         self.assertIn("/login to switch to another account", body)
         self.assertNotIn("Open the Runtime panel", body)
+
+    def test_a_numbered_list_in_a_reply_is_not_a_limit_menu(self):
+        from delivery.pane_gate import is_usage_limit
+        reply = ("● Two ways forward:\n"
+                 "  1. Enable extra usage in the console\n"
+                 "  2. Switch to usage credits for the team\n")
+        for kind in ("selection", "unknown"):
+            self.assertFalse(is_usage_limit(kind, reply), kind)
 
     def test_a_dialog_under_a_refused_turn_is_that_dialog_not_the_limit(self):
         from delivery.pane_gate import is_usage_limit

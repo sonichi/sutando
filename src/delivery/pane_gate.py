@@ -145,9 +145,7 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
-# The limit menu's own choices. Its title can sit under the refused turn as a "⎿" line, which the
-# walk back below takes for the turn and skips, so the rows are read too (V43: a weekly-limit menu
-# was carded as an unknown gate, with no word on how to unblock it).
+# The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
 _LIMIT_MENU_ROW = re.compile(r"wait for (?:the )?limit to reset|usage credits|extra usage", re.I)
 
 
@@ -164,7 +162,9 @@ def _dialog_names_limit(text: str) -> bool:
     end = rows[-1]
     while end + 1 < len(lines) and _NUMBERED_ROW.match(lines[end + 1]):
         end += 1
-    if any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
+    # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
+    live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
+    if live and any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
         return True
     for line in reversed(lines[:start]):
         core = line.strip()
