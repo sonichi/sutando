@@ -118,6 +118,7 @@ class Rows(unittest.TestCase):
         self.assertEqual(payload["questions_unavailable"], "room down")
         self.assertEqual([q["id"] for q in payload["questions"]], ["ask-held"])
         self.assertEqual(queue["questions_unavailable"], "room down")
+        api.pending_questions_reader.forget_recent(self.tmp)  # /tasks/active reuses a read otherwise
         with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
             self.assertIsNone(api._active_tasks_payload(True, True)["questions_unavailable"])
 
@@ -200,6 +201,7 @@ class AnswerRoute(unittest.TestCase):
             if ask_id in [c[0] for c in closed] or ask_id not in {i["ask_id"] for i in ITEMS}:
                 return False, f"no open row for {ask_id}"
             closed.append((ask_id, status))
+            api.pending_questions_reader.forget_recent(ws)  # the reader's resolve does this
             return True, "closed"
 
         def _gather(ws, store=None):
