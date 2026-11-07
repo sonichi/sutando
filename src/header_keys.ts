@@ -57,6 +57,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'requested_worker',
 	'hitl_click',
 	'owner_mentioned',
+	'asked_by',
 	'task_layout',
 	'hook',
 	'summon',
