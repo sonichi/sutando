@@ -2954,8 +2954,15 @@ def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: 
 
 
 def _exit_code(child) -> Optional[int]:
+    """An exited child's rc; poll() reads None while the reaper holds the wait lock, so wait for it."""
     poll = getattr(child, "poll", None)
-    return poll() if poll is not None else None
+    rc = poll() if poll is not None else None
+    if rc is None and hasattr(child, "wait"):
+        try:
+            rc = child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return None
+    return rc
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
