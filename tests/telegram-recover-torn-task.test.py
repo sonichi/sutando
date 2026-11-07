@@ -66,8 +66,8 @@ def test_torn_task_does_not_kill_recovery():
         tasks, results = ws / "tasks", ws / "results"
         tasks.mkdir(); results.mkdir()
         # one torn, one clean — the clean one must still be recovered
-        (tasks / "task-TORN.txt").write_bytes(torn(HEAD.format(tid="TORN", chat="111")))
-        (tasks / "task-OK.txt").write_text(HEAD.format(tid="OK", chat="222"))
+        (tasks / "task-TORN.txt").write_bytes(torn(HEAD.format(tid="task-TORN", chat="111")))
+        (tasks / "task-OK.txt").write_text(HEAD.format(tid="task-OK", chat="222"))
         for t in ("TORN", "OK"):
             (results / f"task-{t}.txt").write_text("done\n")
         raw = (tasks / "task-TORN.txt").read_bytes()
