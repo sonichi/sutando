@@ -56,7 +56,7 @@ DM_ROOM = "!dm:example.org"
 class FakeGateway:
     def __init__(self):
         self.calls = []
-        self.rosters = {OK_ROOM: [AGENT, OWNER]}
+        self.rosters = {OK_ROOM: [AGENT, OWNER], DM_ROOM: [AGENT, OWNER]}
         self.owner = OWNER
         self.posts = []
 
