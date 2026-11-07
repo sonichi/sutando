@@ -55,24 +55,41 @@ JOBS="${REFRESH_SKILL_JOBS:-8}"
 EXCLUDES=(--exclude='workspace' --exclude='node_modules' --exclude='generated'
           --exclude='__pycache__' --exclude='.git' --exclude='*.mp4' --exclude='*.png'
           --exclude='*.wav' --exclude='.venv')
+# Per-run scratch for worker results (parallel materialize). Removed on exit.
+MAPDIR="$(mktemp -d)"
+trap 'rm -rf "$MAPDIR"' EXIT
 
 refresh_one() {
+  # 0 = materialized (target on stdout), 3 = skipped (nothing to do), 1 = error
   local name="$1"
   local link="$SKILLS_DST/$name"
   if [ ! -e "$link" ] && [ ! -L "$link" ]; then
-    echo "  skip $name (NOT INSTALLED at $SKILLS_DST — nothing to refresh)"; return 0
+    echo "  skip $name (NOT INSTALLED at $SKILLS_DST — nothing to refresh)" >&2; return 3
   fi
   if [ ! -L "$link" ]; then
-    echo "  skip $name (not a symlink — won't clobber a local/copy install)"; return 0
+    echo "  skip $name (not a symlink — won't clobber a local/copy install)" >&2; return 3
   fi
   local target; target="$(readlink "$link")"
   if [ ! -d "$target" ]; then
-    echo "  skip $name (symlink target missing: $target)"; return 0
+    echo "  skip $name (symlink target missing: $target)" >&2; return 3
   fi
-  # cp-then-swap, but ALWAYS restore the symlink even if the copy step errors.
+  # Materialize: replace the symlink with a REAL directory (fires the watcher's
+  # fs-event). The settle happens while this directory is still on disk.
   rm -f "$link"
-  rsync -a "${EXCLUDES[@]}" "$target"/ "$link"/ 2>/dev/null || cp -R "$target" "$link" 2>/dev/null
-  sync; sleep "$SETTLE_S"
+  if ! { rsync -a "${EXCLUDES[@]}" "$target"/ "$link"/ 2>/dev/null || cp -R "$target" "$link" 2>/dev/null; }; then
+    echo "  ERROR copying $name — symlink restored, nothing refreshed" >&2
+    rm -rf "$link"; ln -s "$target" "$link"
+    return 1
+  fi
+  echo "$target"
+  return 0
+}
+
+restore_one() {
+  # Swap the real directory back to the clean symlink. ALWAYS restore even if
+  # the materialize step errored — a symlink is safer than a half copy.
+  local name="$1" link="$SKILLS_DST/$1" target="$2"
+  [ -n "$target" ] || { echo "  ERROR restoring $name symlink! (no target)"; return 1; }
   rm -rf "$link"
   ln -s "$target" "$link"
   if [ -L "$link" ]; then
@@ -83,14 +100,69 @@ refresh_one() {
   return 1
 }
 
-# Wait every background refresh in a chunk and retain failure if ANY child
-# failed. A bare `wait` reports only the job it waits for, which made --all
-# discard an earlier restore failure when another child completed cleanly.
-wait_refresh_batch() {
-  local pid rc=0
-  for pid in "$@"; do
-    wait "$pid" || rc=1
+# Settle ONCE while the chunk's real directories are on disk, so the watcher
+# has a window to read them before they are swapped back to symlinks. Paying
+# SETTLE_S per skill made --all cost SETTLE_S x skill-count (90s at 90 skills).
+settle_once() {
+  sync
+  sleep "$SETTLE_S"
+}
+
+# Materialize a batch, settle while the real dirs are visible, then restore.
+# Materialize and restore run in parallel chunks of $JOBS, so the wall clock is
+# copy-time + ONE settle, not copy-time + one settle per chunk.
+refresh_batch() {
+  local name rc=0 any=0 target
+  local -a done_names=() done_targets=()
+  local -a pids=()
+  local p
+
+  # Phase 1 — materialize in parallel waves of $JOBS.
+  for name in "$@"; do
+    (
+      t="$(refresh_one "$name")"
+      echo "$?|$name|$t" > "$MAPDIR/$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_').map"
+    ) &
+    pids+=("$!")
+    if [ "${#pids[@]}" -ge "$JOBS" ]; then
+      for p in "${pids[@]}"; do wait "$p" 2>/dev/null || rc=1; done
+      pids=()
+    fi
   done
+  if [ "${#pids[@]}" -gt 0 ]; then
+    wait "${pids[@]}" 2>/dev/null || rc=1
+  fi
+
+  for f in "$MAPDIR"/*.map; do
+    [ -e "$f" ] || continue
+    IFS='|' read -r code mname mtarget < "$f"
+    case "$code" in
+      0) any=1; done_names+=("$mname"); done_targets+=("$mtarget") ;;
+      3) ;;      # skipped
+      *) rc=1 ;; # copy error, symlink already restored in the worker
+    esac
+    rm -f "$f"
+  done
+
+  # Phase 2 — ONE settle while every real directory is on disk.
+  if [ "$any" = 1 ]; then
+    settle_once
+    # Phase 3 — restore in parallel waves of $JOBS.
+    local i=0
+    pids=()
+    for name in "${done_names[@]}"; do
+      restore_one "$name" "${done_targets[$i]}" &
+      pids+=("$!")
+      i=$((i + 1))
+      if [ "${#pids[@]}" -ge "$JOBS" ]; then
+        for p in "${pids[@]}"; do wait "$p" 2>/dev/null || rc=1; done
+        pids=()
+      fi
+    done
+    if [ "${#pids[@]}" -gt 0 ]; then
+      for p in "${pids[@]}"; do wait "$p" 2>/dev/null || rc=1; done
+    fi
+  fi
   return "$rc"
 }
 
@@ -99,29 +171,23 @@ main() {
   [ "$#" -ge 1 ] || { echo "usage: refresh-skill.sh <name> [<name> ...] | --all" >&2; exit 2; }
   local failed=0
   if [ "$1" = "--all" ]; then
-    # Each skill's settle is WAITING, not work, so --all runs them concurrently.
-    # Chunked, not unbounded: a crash strands at most $REFRESH_SKILL_JOBS as copies,
-    # which refresh_one then refuses to touch ("not a symlink").
-    local any=0 running=0
-    local -a pids=()
+    # One batch for the whole tree: materialize all (parallel waves of $JOBS),
+    # ONE settle while every real dir is visible, then restore all. A crash
+    # strands at most $JOBS copies, which restore_one refuses to touch.
+    local -a names=()
+    local saw_any=0
     for link in "$SKILLS_DST"/*; do
       [ -L "$link" ] || continue
-      refresh_one "$(basename "$link")" &
-      pids+=("$!")
-      any=1; running=$((running + 1))
-      if [ "$running" -ge "$JOBS" ]; then
-        wait_refresh_batch "${pids[@]}" || failed=1
-        pids=(); running=0
-      fi
+      names+=("$(basename "$link")")
+      saw_any=1
     done
-    if [ "${#pids[@]}" -gt 0 ]; then
-      wait_refresh_batch "${pids[@]}" || failed=1
+    if [ "$saw_any" = 1 ]; then
+      refresh_batch "${names[@]}" || failed=1
+    else
+      echo "  (no symlinked skills under $SKILLS_DST)"
     fi
-    [ "$any" = 1 ] || echo "  (no symlinked skills under $SKILLS_DST)"
   else
-    for name in "$@"; do
-      refresh_one "$name" || failed=1
-    done
+    refresh_batch "$@" || failed=1
   fi
   if [ "$failed" = 0 ]; then
     echo "done — updated skills are live in the running session (no restart)."
