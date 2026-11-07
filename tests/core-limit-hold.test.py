@@ -1018,6 +1018,28 @@ class ModelSwitchWayOut(unittest.TestCase):
         self.assertIsNone(clh.binding_hold(self.ws, self.now + 1))
         self.assertIsNotNone(clh.active_hold(self.ws, self.now + 1), "the record itself stays")
 
+    def test_watchdog_reads_the_seat_the_launcher_resolves_without_its_env(self):
+        """Sutando.app runs health-check without CLAUDE_CONFIG_DIR; the gate reads the resolved
+        seat's settings.json, so the watchdog must too, or it revives a core the gate holds."""
+        import os
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("hc_6293_seat", str(REPO / "src" / "health-check.py"))
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        seat = self.ws / ".claude-sutando"
+        seat.mkdir()
+        self.pick("sonnet")  # a stale record: the model was changed outside switch-model
+        (seat / "settings.json").write_text(json.dumps({"model": "opus"}))
+        env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(hc, "WORKSPACE_DIR", self.ws):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertIsNotNone(hc._core_limit_hold(self.now + 1),
+                                 "the watchdog would revive a core the launcher gate holds (exit 75)")
+            self.assertEqual(clh.launch_identity(self.ws)[0], "opus")
+            (seat / "settings.json").write_text(json.dumps({"model": "sonnet"}))
+            self.pick("opus")
+            self.assertIsNone(hc._core_limit_hold(self.now + 1), "a seat switched away is revived")
+
     def test_health_check_revives_a_core_switched_away_from_the_hold(self):
         from unittest import mock
         spec = importlib.util.spec_from_file_location("hc_6291", str(REPO / "src" / "health-check.py"))
@@ -1076,6 +1098,24 @@ class ModelSwitchWayOut(unittest.TestCase):
                                             card_entry=str(entry)).launch)
             self.assertFalse(clh.read_hold(ws)["card_presented"], "a failed card never stops the hold")
             self.assertTrue(clh.read_hold(ws)["notice_queued"])
+
+    def test_card_outlives_no_part_of_a_hold_6_to_24h_long(self):
+        """A reset 6-24h away holds until reset + grace; notice_queued stops a re-present, so
+        a card capped at 6h left the owner without one for the rest of the pause."""
+        from unittest import mock
+        entry = self.ws / "local-card.py"
+        entry.write_text("")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            with mock.patch("subprocess.Popen") as popen:
+                d = clh.decide(ws, self.now, quota=limited_record(self.now, reset_in=20 * 3600),
+                               card_entry=str(entry))
+            self.assertFalse(d.launch)
+            argv = popen.call_args[0][0]
+            ttl = int(argv[argv.index("--ttl") + 1])
+            self.assertGreaterEqual(self.now + ttl, d.hold["until"] - 1,
+                                    "the card expires before the hold it offers a way out of")
 
     def test_no_card_presenter_keeps_the_plain_notice(self):
         body = next((self.ws / "results").glob("proactive-*.txt")).read_text()
