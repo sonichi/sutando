@@ -17,6 +17,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import codex_host_instructions  # noqa: E402
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11: the launcher may resolve the system 3.9
@@ -35,20 +38,36 @@ def git_root(path):
     return Path(out.stdout.strip()).resolve()
 
 
-def ensure_trusted(codex_home, working_dir, repo):
+def ensure_trusted(codex_home, working_dir, repo, home=None):
     """Returns "not-git", "foreign", "already-set" or "trusted".
 
     "foreign": the working directory is not inside the launcher's checkout `repo`;
     trusting an arbitrary configured directory is the operator's decision, not ours.
+    On a desktop host the config is read and written relative to a descriptor opened
+    through the no-follow owner guard, so a swapped home is refused, never followed.
     """
     root = git_root(working_dir)
     if root is None:
         return "not-git"
     if root != Path(repo).resolve():
         return "foreign"
-    config = Path(codex_home) / "config.toml"
+    if codex_host_instructions.host_instructions(repo) is None:
+        return _trust(Path(codex_home) / "config.toml", None, root)
+    fd = codex_host_instructions.open_home(codex_home, Path.home() if home is None else home)
     try:
-        text = config.read_text()
+        return _trust("config.toml", fd, root)
+    finally:
+        os.close(fd)
+
+
+def _trust(config, dir_fd, root):
+    """Record `root` in `config` (a path, or a name below `dir_fd`); no link is followed
+    under `dir_fd`."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0) if dir_fd is not None else 0
+    try:
+        fd = os.open(config, os.O_RDONLY | nofollow, dir_fd=dir_fd)
+        with os.fdopen(fd) as f:
+            text = f.read()
     except FileNotFoundError:
         text = ""
     projects = tomllib.loads(text).get("projects", {})
@@ -59,18 +78,25 @@ def ensure_trusted(codex_home, working_dir, repo):
     # json.dumps quotes a TOML basic-string key the same way (backslashes, quotes).
     text += f'\n[projects.{json.dumps(str(root))}]\ntrust_level = "trusted"\n'
     tomllib.loads(text)  # never write a file Codex could not parse
-    tmp = config.with_name(f"{config.name}.tmp.{os.getpid()}")
+    tmp = f"{config}.tmp.{os.getpid()}"
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600, dir_fd=dir_fd)
         with os.fdopen(fd, "w") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        if config.exists():
-            os.chmod(tmp, config.stat().st_mode & 0o777)
-        os.replace(tmp, config)
+        try:
+            mode = os.stat(config, dir_fd=dir_fd).st_mode & 0o777
+        except FileNotFoundError:
+            mode = None
+        if mode is not None:
+            os.chmod(tmp, mode, dir_fd=dir_fd)
+        os.replace(tmp, config, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
         raise
     return "trusted"
 

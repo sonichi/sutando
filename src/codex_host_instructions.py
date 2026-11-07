@@ -250,6 +250,26 @@ def create_home(codex_home, home):
     return "ok" if status == "open" else status
 
 
+def open_home(codex_home, home):
+    """Open an existing `codex_home` through the no-follow walk; the caller closes the fd.
+
+    Raises ValueError for an owner or invalid home and FileNotFoundError when it is absent.
+    """
+    parts = _parts(codex_home)
+    if _lexically_owner(parts, home):
+        raise ValueError(f"{codex_home}: is, or leads into, the owner's Codex home")
+    try:
+        anchor, missing = _owner_anchor(home)
+    except OSError as exc:
+        raise ValueError(f"{codex_home}: owner home unreadable ({exc})") from exc
+    status, fd = _walk(parts, home, anchor, missing, create=False)
+    if status == "open":
+        return fd
+    if status == "absent":
+        raise FileNotFoundError(codex_home)
+    raise ValueError(f"{codex_home}: {status}")
+
+
 def ensure_linked(codex_home, repo, home):
     """Returns "no-host", "invalid-home", "owner-home", "overridden", "foreign", "dangling",
     "already-set" or "linked".

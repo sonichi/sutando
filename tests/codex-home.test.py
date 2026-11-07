@@ -377,5 +377,29 @@ class ProjectTrust(Layout):
         self.assertIn("trust_level", (self.owner / "config.toml").read_text())
 
 
+    def test_a_desktop_app_home_swapped_for_a_link_after_creation_is_not_written_through(self):
+        repo = self.checkout()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env())
+        self.assertEqual(self.prepare()[2], str(self.app_home))
+        self.owner.mkdir()
+        (self.owner / "config.toml").write_text('model = "owner"\n')
+        self.app_home.rmdir()
+        self.app_home.symlink_to(self.owner)
+        before = self.tree()
+        out = self.run_trust(self.app_home, repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual((self.owner / "config.toml").read_text(), 'model = "owner"\n')
+
+    def test_a_desktop_app_home_gets_the_entry_through_its_descriptor(self):
+        repo = self.checkout()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env())
+        self.prepare()
+        for expected in ("trusted", "already-set"):
+            out = self.run_trust(self.app_home, repo)
+            self.assertEqual((out.returncode, out.stdout.strip()), (0, expected), out.stderr)
+        self.assertIn("trust_level", (self.app_home / "config.toml").read_text())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
