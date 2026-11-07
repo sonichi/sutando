@@ -178,6 +178,64 @@ class PureContractCases:
         registry.register("\udcff")  # a non-UTF-8 environment byte: total, never raises
         self.assertTrue(registry.contains("x \udcff y"))
 
+    def test_quoted_multiline_private_key_assignment_is_withheld(self):
+        unit = (
+            'PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n'
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n"
+            "BKcwggSjAgEAAoIBAQC7\n"
+            '-----END PRIVATE KEY-----"\n'
+            "echo hi\n"
+        )
+        self.assertEqual(
+            self.c.mask_env_assignments(unit),
+            f"PRIVATE_KEY={self.c.WITHHELD}\necho hi\n",
+        )
+
+    def test_hash_line_inside_a_quoted_credential_stays_in_the_value(self):
+        unit = 'REMOTE_TASK_TOKEN="first\n# second\nthird"\n'
+        self.assertEqual(
+            self.c.mask_env_assignments(unit),
+            f"REMOTE_TASK_TOKEN={self.c.WITHHELD}\n",
+        )
+        registry = self.c.SecretRegistry()
+        self.c.register_assignments(registry, unit)
+        # The parsed value keeps the #-leading line, so the WHOLE value — not just the
+        # per-line fragments — is masked wherever it recurs.
+        shown = registry.scrub("see first\n# second\nthird")
+        for fragment in ("first", "second", "third"):
+            self.assertNotIn(fragment, shown)
+
+    def test_unterminated_quoted_private_key_does_not_expose_body_lines(self):
+        unit = (
+            'PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n'
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n"
+            "BKcwggSjAgEAAoIBAQC7\n"
+        )
+        shown = self.c.mask_env_assignments(unit)
+        self.assertNotIn("MIIE", shown)
+        self.assertNotIn("BKcw", shown)
+
+    def test_noncredential_quoted_multiline_assignment_is_unchanged(self):
+        unit = 'MSG="hello\nworld"\necho hi\n'
+        self.assertEqual(self.c.mask_env_assignments(unit), unit)
+
+    def test_noncredential_multiline_url_still_redacts_userinfo(self):
+        unit = 'MSG="hello\nhttps://a:b@example.com/path"\necho hi\n'
+        shown = self.c.mask_env_assignments(unit)
+        self.assertNotIn("a:b@", shown)
+        self.assertEqual(shown, f"MSG={self.c.REDACTED_URL}\necho hi\n")
+
+    def test_json_surrogate_pair_renderings_are_registered_and_scrubbed(self):
+        secret = "pass\U0001F511word-xyz"
+        escaped = '"pass\\ud83d\\udd11word-xyz"'
+        registry = self.c.SecretRegistry()
+        registry.register(secret)
+        self.assertTrue(registry.contains(escaped))
+        self.assertEqual(registry.scrub(escaped), self.c.WITHHELD_TEXT)
+        shown = self.c.mask_env_assignments('NOTE="pass\\ud83d\\udd11word-xyz"\n', registry)
+        self.assertNotIn("word-xyz", shown)
+        self.assertEqual(self.c.json_unescape(r"\ud83d"), "\ud83d")
+
     def test_pieces_and_code_fields(self):
         registry = self.c.SecretRegistry()
         registry.register("bearer-secret-value-77")

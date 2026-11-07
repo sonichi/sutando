@@ -23,7 +23,7 @@ per-type pattern against the source line and replaces the full secret span.
 
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 # Slack's token family has one owner; a private copy here missed xapp-/xoxe- tokens.
@@ -135,6 +135,8 @@ class SecretHit:
 
     secret_type: str
     line_number: int
+    # The detector's matched text, possibly only a prefix of the secret; never shown.
+    secret_value: str = field(default="", repr=False, compare=False)
 
 
 def scan_secrets(text: str) -> list[SecretHit]:
@@ -152,7 +154,8 @@ def scan_secrets(text: str) -> list[SecretHit]:
     if DETECT_SECRETS_ACTIVE:
         with transient_settings({"plugins_used": _PLUGINS_CONFIG}):
             hits = [
-                SecretHit(secret_type=secret.type, line_number=secret.line_number)
+                SecretHit(secret_type=secret.type, line_number=secret.line_number,
+                          secret_value=secret.secret_value or "")
                 for secret in _process_line_based_plugins(
                     lines=list(enumerate(text.split("\n"), start=1)),
                     filename="adhoc-string-scan",
