@@ -1124,10 +1124,11 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
     say(report.selected_reason)
     say(f"using {sel.path} ({sel.version})")
     auth = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
-    if auth["login"] == "logged-out":
-        outcome["why"] = f"{spec.binary} is not logged in"
+    if auth["login"] == "logged-out" or (enforce_auth and auth["login"] != "ok"):
+        reason = "is not logged in" if auth["login"] == "logged-out" else "authentication could not be verified"
+        outcome["why"] = f"{spec.binary} {reason}"
         outcome["login_remedy"] = auth["remedy"]
-        say(f"{spec.binary} is not logged in: {auth['detail']}")
+        say(f"{spec.binary} {reason}: {auth['detail']}")
         say(f"fix: {auth['remedy']}")
         if enforce_auth and notify_owner and inc is not None and inc.notify(login_notice_body(runtime, auth)):
             say("asked the owner in their DM to log in.")
@@ -1137,10 +1138,13 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
             replies()
             holder["auth"] = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
             outcome["login_remedy"] = holder["auth"].get("remedy") or outcome["login_remedy"]
+            if holder["auth"]["login"] == "unknown":
+                say(holder["auth"]["detail"])
             return holder["auth"]
-        _wait(auth, wait_s, recheck_auth, lambda a: a["login"] != "logged-out", say, sleep, now,
+        _wait(auth, wait_s, recheck_auth,
+              lambda a: a["login"] == "ok" if enforce_auth else a["login"] != "logged-out", say, sleep, now,
               f"waiting up to {int(wait_s)}s for the login; the launch continues on its own.")
-        if holder["auth"]["login"] == "logged-out" and enforce_auth:
+        if holder["auth"]["login"] != "ok" and enforce_auth:
             say(f"{spec.binary} is not authenticated; the core was not started.{again}")
             return EXIT_LOGIN, None
     return EXIT_OK, sel.path
@@ -1323,8 +1327,9 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
         if a.enforce_auth:
             auth = auth_status(a.runtime, rep.selected.path, env=env,
                               claude_config_dir=a.claude_config_dir or None)
-            if auth["login"] == "logged-out":
-                _say(f"{RUNTIMES[a.runtime].binary} is not logged in: {auth['remedy']}")
+            if auth["login"] != "ok":
+                _say(f"{RUNTIMES[a.runtime].binary} authentication not verified: {auth['detail']}")
+                _say(f"fix: {auth['remedy']}")
                 return EXIT_LOGIN
         return 0
     if a.cmd == "repair":

@@ -279,7 +279,7 @@
    ],
    "status": "canonical",
    "canonical_for": "Claude Code and Codex CLI version, capability and login states, and how each is repaired",
-   "last_verified": "2026-10-17"
+   "last_verified": "2026-11-07"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",

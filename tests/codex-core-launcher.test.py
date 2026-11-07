@@ -1191,6 +1191,16 @@ cp "$CODEX_GOOD" "$PREFIX/bin/codex"
         self.assertEqual(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt")), [])
         self.assertFalse(ran.exists())
 
+    def test_app_surface_login_timeout_does_not_request_a_session(self):
+        hanging = CODEX_STUB.replace("esac\nexit 0", "  login) exec /bin/sleep 30 ;;\nesac\nexit 0")
+        self._write_exe("codex", hanging)
+        result = self.run_launcher(env_extra={"SUTANDO_RUNTIME_CONSENT_SURFACE": "app",
+                                              "SUTANDO_RUNTIME_WAIT_S": "600"})
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("login status failed", result.stderr)
+        self.assertNotIn("new-session", self._tmux_calls())
+        self.assertNotIn("new-window", self._tmux_calls())
+
     def _owner_reply_installs(self, installed_stub):
         """Broken codex, one launch to open the incident, then the owner's install reply."""
         self._write_exe("codex", "#!/bin/bash\nexit 1\n")

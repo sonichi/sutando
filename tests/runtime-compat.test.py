@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from _helpers.hermetic_env import isolate_os_environ
 
@@ -608,6 +609,24 @@ class Ensure(Base):
         code, _ = self.ensure([self.report()], [out], enforce_auth=True)
         self.assertEqual(code, rc.EXIT_LOGIN)
         self.assertTrue(any("not authenticated" in m for m in self.said))
+
+    def test_unknown_auth_enforced_stops(self):
+        unknown = {"login": "unknown", "remedy": "codex login", "detail": "login status timed out"}
+        code, path = self.ensure([self.report()], [unknown], enforce_auth=True)
+        self.assertEqual((code, path), (rc.EXIT_LOGIN, None))
+        self.assertTrue(any("timed out" in m for m in self.said))
+
+    def test_auth_retry_unknown_is_not_success(self):
+        out = {"login": "logged-out", "remedy": "codex login", "detail": "logged out"}
+        unknown = dict(out, login="unknown", detail="login status timed out")
+        code, path = self.ensure([self.report()], [out, unknown], enforce_auth=True, wait_s=10)
+        self.assertEqual((code, path), (rc.EXIT_LOGIN, None))
+
+    def test_unknown_auth_can_recover_to_explicit_success(self):
+        unknown = {"login": "unknown", "remedy": "codex login", "detail": "login status timed out"}
+        code, _ = self.ensure([self.report()], [unknown, {"login": "ok"}],
+                              enforce_auth=True, wait_s=10)
+        self.assertEqual(code, 0)
 
     def test_logged_out_advisory_continues(self):
         out = {"login": "logged-out", "remedy": "/login", "detail": "x"}
@@ -1590,6 +1609,20 @@ class Cli(Base):
 
     def test_ensure_unusable_exit_code(self):
         self.assertEqual(self.main("ensure", "--runtime", "codex")[0], rc.EXIT_UNUSABLE)
+
+    def test_app_timeout_fails_closed_for_ensure_and_which(self):
+        binary = Path(fake_cli(self.bin1 / "codex", "0.160.1", CODEX_FLAGS, label=""))
+        source = binary.read_text()
+        binary.write_text(source.replace('case "$1" in',
+                                        'if [ "$1" = login ]; then exec /bin/sleep 5; fi\ncase "$1" in'))
+        self.assertNotEqual(binary.read_text(), source)
+        self.env["SUTANDO_RUNTIME_CONSENT_SURFACE"] = "app"
+        with patch.object(rc, "APP_PROBE_TIMEOUT_S", 2):
+            for command in ("ensure", "which"):
+                with self.subTest(command=command):
+                    code, _, err = self.main(command, "--runtime", "codex", "--enforce-auth")
+                    self.assertEqual(code, rc.EXIT_LOGIN, err)
+                    self.assertIn("login status failed", err)
 
     def test_which_finds_the_managed_install_off_path_and_acts_on_nothing(self):
         code, out, err = self.main("which", "--runtime", "codex")
