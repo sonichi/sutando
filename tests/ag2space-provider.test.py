@@ -105,6 +105,73 @@ def main() -> int:
     check("URLError -> Indeterminate", isinstance(r, ProviderIndeterminate))
     r, _ = outcome_of(TimeoutError("t"))
     check("timeout -> Indeterminate", isinstance(r, ProviderIndeterminate))
+    r, _ = outcome_of(json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0))
+    check("non-JSON 2xx body -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
+    r, _ = outcome_of(ValueError("unknown url type: 'htps'"))
+    check("a non-decode ValueError (e.g. a bad URL) -> Indeterminate, labelled as a request error",
+          isinstance(r, ProviderIndeterminate) and "request error" in str(r)
+          and "unreadable 2xx" not in str(r), repr(r))
+    r, _ = outcome_of(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"))
+    check("an undecodable 2xx body -> Indeterminate, labelled unreadable",
+          isinstance(r, ProviderIndeterminate) and "unreadable 2xx" in str(r), repr(r))
+    for shape in (["ok"], "ok", 1):
+        r, _ = outcome_of(shape)
+        check(f"non-mapping 2xx {shape!r} -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
+
+    # A malformed first 2xx must release the claim, so a later pass can still deliver.
+    with tempfile.TemporaryDirectory() as td:
+        bad = json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0)
+        gw = ScriptedGateway(bad, bad, {"ok": True, "duplicate": True})
+        core = DeliveryCore(DesignAClaimBackend(Path(td)),
+                            AG2SpaceResultProvider(gw),
+                            policy=RetryPolicy(max_attempts=10), worker="w")
+        core.backend.publish("task-X", ENVELOPE)
+        try:
+            res = core.deliver_one("task-X", ENVELOPE)
+            check("malformed 2xx twice completes NOT_DELIVERED (retryable)",
+                  res.outcome is DeliveryOutcome.NOT_DELIVERED, repr(res))
+        except Exception as e:  # noqa: BLE001 - escaping here is the defect
+            check("malformed 2xx twice completes NOT_DELIVERED (retryable)", False, repr(e))
+        res = core.deliver_one("task-X", ENVELOPE)
+        check("the next pass re-claims it, not NOT_CLAIMED, and the dedup answer confirms",
+              res.outcome is DeliveryOutcome.CONFIRMED, repr(res))
+
+    # The room-message provider (proactive and withheld-review lanes) reads the same _req answer.
+    from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider
+    room_msg = json.dumps({"room_id": "!r:example.org", "body": "hello"}).encode()
+    for name, exc in (("non-JSON 2xx", json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0)),
+                      ("undecodable 2xx", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")),
+                      ("IncompleteRead", http.client.IncompleteRead(b"par")),
+                      ("bad-URL ValueError", ValueError("unknown url type: 'htps'"))):
+        def raising(*_a, exc=exc):
+            raise exc
+        try:
+            r = AG2SpaceRoomMessageProvider(raising, lambda *_a: None).deliver("p-1", room_msg, "p-1#0")
+        except Exception as e:  # noqa: BLE001 - which exception escapes is the check
+            r = e
+        check(f"room message: {name} -> Indeterminate", isinstance(r, ProviderIndeterminate), repr(r))
+
+    # A non-idempotent send that may have landed is parked, never stranded under a live claim.
+    with tempfile.TemporaryDirectory() as td:
+        sent = []
+
+        def malformed(*a):
+            sent.append(a)
+            raise json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0)
+        core = DeliveryCore(DesignAClaimBackend(Path(td)),
+                            AG2SpaceRoomMessageProvider(malformed, lambda *_a: None),
+                            policy=RetryPolicy(max_attempts=10), worker="w")
+        core.backend.publish("p-1", room_msg)
+        try:
+            res = core.deliver_one("p-1", room_msg)
+            check("room message: a malformed 2xx completes OUTCOME_UNKNOWN (it may have been posted)",
+                  res.outcome is DeliveryOutcome.OUTCOME_UNKNOWN, repr(res))
+        except Exception as e:  # noqa: BLE001 - escaping here is the defect
+            check("room message: a malformed 2xx completes OUTCOME_UNKNOWN (it may have been posted)",
+                  False, repr(e))
+        res = core.deliver_one("p-1", room_msg)
+        check("the next pass finds it parked, not under a stranded claim, and never re-posts it",
+              res.status is DrainStatus.TERMINAL and len(sent) == 1, f"{res!r} sends={len(sent)}")
 
     # -- the optional thread field (docs/remote-gateway-protocol.md) -------
     from ag2_sparrow.delivery_core import provider_ag2space as pa
