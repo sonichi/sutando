@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sutando — dead-man's-switch ping launchd job (template).
+
+  Role: the outbound half of off-machine liveness monitoring. Everything
+  else in the health stack (health-check.py, core heartbeat, the
+  health-check-fallback launchd job) runs ON this Mac — when the machine
+  sleeps or dies, they all go silent together and the owner can't tell a
+  dead Sutando from a quiet one. This job pings an external dead-man's-
+  switch monitor (healthchecks.io or compatible) every 5 min; the monitor
+  alerts the owner when pings STOP.
+
+  Cadence: every 300s, matching the monitor-side check period (grace
+  period is configured monitor-side, e.g. 15 min to tolerate brief naps).
+
+  Installed by `bash skills/dead-mans-switch/install.sh` after it
+  substitutes __REPO__ and __WORKSPACE__. Do NOT load this template
+  directly.
+
+  Behavior:
+    - Runs scripts/ping.sh: core alive -> GET <url>; core dead -> GET
+      <url>/fail (instant alert); URL unconfigured -> silent no-op.
+    - Empty GETs only — no system data leaves the machine.
+    - Exit-only job (no KeepAlive); ThrottleInterval prevents crash-loop
+      thrash; output to $WORKSPACE/logs/deadman-ping.log.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.deadman-ping</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/skills/dead-mans-switch/scripts/ping.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOMEBREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/logs/deadman-ping.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/logs/deadman-ping.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
