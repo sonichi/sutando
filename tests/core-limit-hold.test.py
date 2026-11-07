@@ -1037,6 +1037,45 @@ class ModelSwitchWayOut(unittest.TestCase):
         (self.ws / "state" / clh.HOLD_FILE).write_text(json.dumps(dict(hold, until=self.now - 1)))
         self.assertEqual(subprocess.run(cli, capture_output=True, text=True, timeout=60).returncode, 1)
 
+    def test_held_cli_in_process(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(clh.main(["held", "--workspace", str(self.ws)]), 0)
+        self.assertIn("usage limit on claude-opus-5-5", out.getvalue())
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(clh.main(["held", "--workspace", empty]), 1)
+
+    def test_card_is_started_detached_with_the_reason_and_a_bounded_ttl(self):
+        from unittest import mock
+        entry = self.ws / "local-card.py"
+        entry.write_text("")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            with mock.patch("subprocess.Popen") as popen:
+                clh.decide(ws, self.now, quota=limited_record(self.now, reset_in=3 * 86400),
+                           card_entry=str(entry))
+                clh.decide(ws, self.now + 60, quota=limited_record(self.now, reset_in=3 * 86400),
+                           card_entry=str(entry))
+            self.assertEqual(popen.call_count, 1)
+            argv, kw = popen.call_args
+            argv = argv[0]
+            self.assertEqual(argv[1:4], [str(entry), "present", "core-model"])
+            self.assertIn("usage limit on claude-opus-5-5", argv[5])
+            self.assertEqual(argv[6:], ["--ttl", str(clh.LONG_RESET_RECHECK_S)])
+            self.assertTrue(kw["start_new_session"])
+            self.assertTrue(clh.read_hold(ws)["card_presented"])
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            with mock.patch("subprocess.Popen", side_effect=OSError("no python")):
+                self.assertFalse(clh.decide(ws, self.now, quota=limited_record(self.now),
+                                            card_entry=str(entry)).launch)
+            self.assertFalse(clh.read_hold(ws)["card_presented"], "a failed card never stops the hold")
+            self.assertTrue(clh.read_hold(ws)["notice_queued"])
+
     def test_no_card_presenter_keeps_the_plain_notice(self):
         body = next((self.ws / "results").glob("proactive-*.txt")).read_text()
         self.assertNotIn("card I left you", body)
