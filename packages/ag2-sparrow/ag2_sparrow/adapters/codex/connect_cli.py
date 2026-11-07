@@ -34,7 +34,7 @@ from ... import task_envelope
 SHAPE = "codex-local"
 COMMAND = "ag2-sparrow-codex-local"
 MIN_CODEX = (0, 160, 1)
-SANDBOXES = ("read-only", "workspace-write")
+SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
@@ -191,6 +191,10 @@ def install(args) -> int:
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
+    if args.sandbox == "danger-full-access":
+        print("NOTE sandbox: danger-full-access lets an owner turn run commands, change files anywhere this user can "
+              "and use the network, all without asking; a turn retried after the app-server dies can repeat side "
+              "effects the first attempt already made. Non-owner and collaborator turns stay read-only")
     def installed() -> int:
         rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
         if rc != 0 or mode == EXTERNAL:
@@ -398,7 +402,8 @@ def session_options(p) -> None:
     p.add_argument("--codex", default="codex", help="the codex executable (default: codex on PATH)")
     p.add_argument("--codex-home", help="CODEX_HOME holding the login the connector uses (default: the CLI's own)")
     p.add_argument("--sandbox", choices=SANDBOXES, default="read-only",
-                   help="the owner threads' sandbox (default read-only; non-owner turns are always read-only)")
+                   help="the owner threads' sandbox (default read-only; danger-full-access lets owner turns change "
+                        "anything this user can and use the network; non-owner turns are always read-only)")
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
     p.add_argument("--hmac", action="store_true",

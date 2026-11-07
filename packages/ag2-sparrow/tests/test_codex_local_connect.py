@@ -485,7 +485,23 @@ class Install(Base):
         self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
                          ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
+            cli.main(["install", "--work", str(self.work), "--sandbox", "no-such-sandbox"])
+
+    def test_full_access_is_explicit_persisted_shown_and_owner_only(self):
+        runner = self.runner()
+        rc, out, _ = self.install_with(runner, False, "--sandbox", "danger-full-access")
+        self.assertEqual(rc, 0)
+        self.assertIn("NOTE sandbox: danger-full-access lets an owner turn run commands, change files anywhere this "
+                      "user can and use the network, all without asking", out)
+        self.assertIn("can repeat side effects", out)
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual(cfg["SANDBOX"], "danger-full-access")
+        argv = cli.connector_argv(cfg, str(self.work), 7)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn("INFO sandbox: danger-full-access for owner turns; non-owner turns are always read-only", out)
+        self.assertEqual(cc.NON_OWNER_SANDBOX, "read-only", "the connector's non-owner floor is unchanged")
 
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")
