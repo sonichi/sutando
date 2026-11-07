@@ -59,7 +59,16 @@ export const RETURN_NUDGE_MS = 15_000;
 export const RETURN_RELEASE_MS = 60_000;
 
 const EVIDENCE_STOP = new Set(['about', 'after', 'again', 'already', 'also', 'because', 'before', 'being', 'could', 'every', 'first', 'found', 'from', 'have', 'here', 'into', 'just', 'last', 'more', 'most', 'other', 'over', 'ready', 'result', 'results', 'said', 'should', 'since', 'some', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until', 'very', 'were', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your', 'task', 'done', 'request', 'user']);
-export interface ResultEvidence { numbers: string[]; words: string[] }
+/** Short words that are never the noun a number counts: "2 and", "3 are", "1 for". */
+const COUNT_STOP = new Set(['and', 'are', 'but', 'for', 'has', 'had', 'its', 'not', 'nor', 'now', 'our', 'out', 'off', 'per', 'the', 'was', 'yet', 'you', 'ago', 'all', 'any', 'did', 'got', 'left', 'more', 'less', 'times']);
+/** How long or when, never what a result counts: "in three minutes", "two days ago" are said in turns about anything. */
+const TIME_UNITS = new Set(['second', 'sec', 'minute', 'min', 'hour', 'hr', 'day', 'week', 'month', 'year', 'percent', 'time']);
+const countStopped = (w: string) => EVIDENCE_STOP.has(w) || COUNT_STOP.has(w) || EVIDENCE_STOP.has(w.replace(/s$/, '')) || COUNT_STOP.has(w.replace(/s$/, ''));
+const notCountNoun = (w: string) => countStopped(w) || TIME_UNITS.has(w.replace(/s$/, ''));
+/** `phrases`: a small number with the one or two words after it ("3 pull requests", "1 new message", "5 tasks"). A
+ *  number under 13 alone proves nothing, but said before the same words it is the answer: "you merged three pull
+ *  requests" carries "3 pull requests". Both words must match, so an adjective ("new", "open") never stands for its noun. */
+export interface ResultEvidence { numbers: string[]; words: string[]; phrases?: Array<[string, string, string?]> }
 const CJK = /[一-鿿]/;
 const cjkGrams = (run: string): string[] => { const out: string[] = []; for (let i = 0; i + 2 <= run.length; i++) out.push(run.slice(i, i + 2)); return out; };
 const evidenceOf = (text: string): ResultEvidence => {
@@ -69,10 +78,18 @@ const evidenceOf = (text: string): ResultEvidence => {
 		.replace(/\b\d{1,2}:\d{2}\b/g, ' ');
 	// A number under 13 is too common a word ("one", "two", "ten") to prove anything on its own.
 	const numbers = [...new Set((plain.match(/\d+(?:[.,]\d+)?/g) ?? []).filter((n) => n.includes('.') || n.includes(',') || Number(n) >= 13))];
+	const phrases: Array<[string, string, string?]> = [];
+	for (const m of plain.toLowerCase().matchAll(/\b(\d{1,2})\s+([a-z][a-z'-]{2,})(?:[ \t]+([a-z][a-z'-]{2,}))?/g)) {
+		const [n, w] = [m[1], m[2].replace(/'s$|'$/, '')];
+		const next = m[3]?.replace(/'s$|'$/, '');
+		if (Number(n) >= 13 || notCountNoun(w)) continue;
+		const p: [string, string, string?] = next && !countStopped(next) ? [n, w, next] : [n, w];
+		if (!phrases.some((q) => q.join(' ') === p.join(' '))) phrases.push(p);
+	}
 	const words = new Set<string>();
 	for (const w of plain.toLowerCase().match(/[a-z][a-z'-]{3,}/g) ?? []) { const k = w.replace(/'s$|'$/, ''); if (k.length >= 4 && !EVIDENCE_STOP.has(k)) words.add(k); }
 	for (const run of plain.match(/[一-鿿]{2,}/g) ?? []) for (const g of cjkGrams(run)) words.add(g); // CJK words: 2-character n-grams
-	return { numbers, words: [...words] };
+	return { numbers, words: [...words], phrases };
 };
 /** What a spoken turn must carry to count as the result: its numbers and its distinctive words, minus whatever
  *  it shares with the request itself (the PR number, the thing asked about): restating the request is not the answer. */
@@ -80,7 +97,12 @@ export function resultEvidence(text: string, request = ''): ResultEvidence {
 	const own = evidenceOf(text);
 	if (!request) return own;
 	const asked = evidenceOf(request);
-	return { numbers: own.numbers.filter((n) => !asked.numbers.includes(n)), words: own.words.filter((w) => !asked.words.includes(w)) };
+	const askedPhrase = (p: [string, string, string?]) => (asked.phrases ?? []).some(([n, w]) => n === p[0] && w === p[1]);
+	return {
+		numbers: own.numbers.filter((n) => !asked.numbers.includes(n)),
+		words: own.words.filter((w) => !asked.words.includes(w)),
+		phrases: (own.phrases ?? []).filter((p) => !askedPhrase(p)),
+	};
 }
 
 const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
@@ -161,10 +183,25 @@ function turnSaysForm(tokens: string[], cjkRuns: string[], form: string): boolea
 }
 /** The turn said the result: one of its numbers (as digits, or as the transcript spells them); else its distinctive
  *  words, two of them when the result has numbers it did not say or has that many. No evidence at all: never by content. */
+export const hasEvidence = (e: ResultEvidence): boolean => !!(e.numbers.length || e.words.length || e.phrases?.length);
 export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean {
-	if (!evidence.numbers.length && !evidence.words.length) return false;
+	if (!hasEvidence(evidence)) return false;
 	const lower = turn.toLowerCase();
 	const tokens: string[] = lower.match(/[a-z0-9]+/g) ?? [];
+	// A small number said right before the result's own words: "three pull requests" for "3 pull requests". With two
+	// words, the turn says both, or ends its sentence after the first ("you have three tasks." for "3 tasks waiting").
+	const stem = (t: string | undefined) => t?.replace(/s$/, '');
+	const sentences = lower.split(/[.!?;:,。！？；]+/).map((x) => x.match(/[a-z0-9]+/g) ?? []);
+	for (const [n, w, next] of evidence.phrases ?? []) {
+		for (const form of [n, ONES[Number(n)]]) {
+			for (const words of sentences) {
+				for (let i = 0; i + 1 < words.length; i++) {
+					if (words[i] !== form || stem(words[i + 1]) !== stem(w)) continue;
+					if (!next || i + 2 === words.length || stem(words[i + 2]) === stem(next)) return true;
+				}
+			}
+		}
+	}
 	const cjkRuns: string[] = turn.match(/[一-鿿]+/g) ?? [];
 	for (const n of evidence.numbers) {
 		const digits = n.replace(/,/g, '');
@@ -293,7 +330,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		for (const r of [...returnedUnheard]) {
 			if (r.at > modelTurnStartedAt) continue;
 			// Nothing distinctive to look for (the result only restates the request): the turn after the nudge counts.
-			const noEvidence = !r.evidence.numbers.length && !r.evidence.words.length;
+			const noEvidence = !hasEvidence(r.evidence);
 			if (words !== null && (noEvidence ? !r.nudged : !turnSaysResult(words, r.evidence))) {
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
 				continue;
