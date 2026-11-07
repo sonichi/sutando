@@ -5,9 +5,9 @@ tests/telegram-bridge-tofu.test.py and telegram-bridge-access.test.py pin
 load_allowed() and tofu_onboard() one at a time. This file drives the real
 main() poll loop, with only urllib's Telegram boundary faked, and checks the
 wiring between them: who gets onboarded when access.json is missing, who passes
-the allowlist gate (an onboarded or listed owner gets a task, anyone else is
-dropped without TOFU), and that deleting access.json later still leaves the
-enrollment-code gate armed (#899).
+the allowlist gate, that set() locks the bridge down without TOFU, that the
+onboarding race guard keeps a concurrently written owner, and that deleting
+access.json later still leaves the enrollment-code gate armed (#899).
 
 Run: python3 tests/telegram-bridge-dispatch-e2e.test.py
 """
@@ -192,6 +192,44 @@ class TelegramDispatch(unittest.TestCase):
         self.assertEqual(s.sent("sendMessage"), [])
         self.assertEqual(s.access.read_bytes(), before)
         self.assertIn(f"Dropped message from non-allowed @user{STRANGER}", s.log)
+
+    def test_empty_or_malformed_access_locks_down_without_tofu(self):
+        for label, content in (("empty allowFrom", json.dumps({"allowFrom": []})),
+                               ("malformed JSON", "NOT JSON {{{")):
+            with self.subTest(label):
+                s = Scenario(access=content)
+                update = dm(OWNER, "anyone home?", "owner")
+                tofu = s.run([update])
+                tofu.assert_not_called()
+                self.assertEqual(s.tasks(), [])
+                self.assertEqual(s.sent("sendChatAction"), [])
+                self.assertEqual(s.sent("sendMessage"), [], "a locked-down bridge never prompts for enrollment")
+                self.assertEqual(s.access.read_text(), content)
+
+    def test_access_written_mid_dispatch_wins_the_onboarding_race(self):
+        s = Scenario(access=None)
+        racer = json.dumps({"allowFrom": [str(RACER)], "tofuOwner": str(RACER)})
+        real_load = s.bridge.load_allowed
+        holder = {}
+
+        def load_then_race():
+            allowed = real_load()
+            if allowed is None and "owner" in holder:  # the per-message reload, not main()'s startup read
+                s.access.write_text(racer)
+            return allowed
+
+        s.bridge.load_allowed = load_then_race
+
+        def owner_with_code(bridge):
+            holder["owner"] = dm(OWNER, f"enrol me {bridge._TOFU_ENROLLMENT_CODE}", "owner")
+            return [holder["owner"]]
+
+        tofu = s.run(owner_with_code)
+        tofu.assert_called_once_with(str(OWNER), "owner")
+        self.assertEqual(s.access.read_text(), racer, "the concurrent writer's access.json is not clobbered")
+        self.assertEqual(s.tasks(), [], "the late TOFU sender is not onboarded")
+        self.assertEqual(s.sent("sendChatAction"), [])
+        self.assertEqual(s.sent("sendMessage"), [])
 
     def test_access_deleted_after_enrolment_still_requires_the_code(self):
         s = Scenario(access=None)
