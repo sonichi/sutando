@@ -364,9 +364,21 @@ def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
+def _launch_config_dir() -> Optional[str]:
+    """The config dir the launcher runs the core in: its export when set, else the resolver it
+    exports from, so a caller the launcher did not start (the watchdog) reads the same seat."""
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return os.environ["CLAUDE_CONFIG_DIR"]
+    try:
+        from sutando_config import resolve_claude_sutando_config_dir
+        return str(resolve_claude_sutando_config_dir())
+    except Exception:
+        return None
+
+
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") if config_dir is None else config_dir
+    config_dir = _launch_config_dir() if config_dir is None else config_dir
     model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
     return model, account_fingerprint(config_dir)
 
@@ -430,7 +442,8 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
     Detached: the card's DM mirror may take its own deadline, and the launch must not wait on it."""
     import subprocess
     body = f"Paused: {hold['reason'].split(': ', 1)[-1]}. Pick another model to keep working now."
-    ttl = int(max(600, min(float(hold.get("until") or now) - now, LONG_RESET_RECHECK_S)))
+    # The card lasts as long as the hold: notice_queued stops a second present for this pause.
+    ttl = int(max(600, float(hold.get("until") or now) - now))
     try:
         subprocess.Popen([sys.executable, card_entry, "present", "core-model", "--set", f"body={body}",
                           "--ttl", str(ttl)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
