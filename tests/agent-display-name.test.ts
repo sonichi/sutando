@@ -68,11 +68,11 @@ test('only a JSON name is accepted', () => {
 
 test('the default runner runs the real resolver', () => {
 	const tmp = mkdtempSync(join(tmpdir(), 'adn-ts-'));
-	const keys = ['AGENT_MXID', 'SUTANDO_DISPLAY_NAME', 'CLAUDE_CONFIG_DIR', 'SUTANDO_WORKSPACE'] as const;
+	const keys = ['AGENT_MXID', 'SUTANDO_DISPLAY_NAME', 'CLAUDE_CONFIG_DIR'] as const;
 	const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
 	try {
 		Object.assign(process.env, { AGENT_MXID: '@not-an-mxid', SUTANDO_DISPLAY_NAME: 'Display Name X',
-			CLAUDE_CONFIG_DIR: join(tmp, 'claude'), SUTANDO_WORKSPACE: join(tmp, 'workspace') });
+			CLAUDE_CONFIG_DIR: join(tmp, 'claude') });
 		assert.strictEqual(agentDisplayName(), 'Display Name X');
 	} finally {
 		for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
