@@ -3428,9 +3428,20 @@ def _old_identity(row: Mapping[str, object], environ, vault, probe: dict) -> "tu
     return str(seen["agent_mxid"]), str(seen.get("owner_mxid") or "")
 
 
+class UnquotableValue(ConnectionsError):
+    """A value the single-quoted env line cannot hold: a `'` or a line break."""
+
+
 def _env_file_with(path: Path, key: str, value: str) -> str:
     """`path`'s lines with `key` set to `value`, single-quoted so a shell that sources the file
-    never runs what follows the `|` (every other line kept)."""
+    never runs what follows the `|` (every other line kept). A value holding `'` or a line break
+    is refused (`UnquotableValue`): the env readers only strip the outer quotes, so `'\\''` would
+    reach them undecoded."""
+    if "'" in value or "\n" in value or "\r" in value:
+        logging.getLogger(__name__).warning(
+            "connections: not writing %s to %s: its value holds a quote or line break the env readers "
+            "cannot decode", key, path.name)
+        raise UnquotableValue(key)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
@@ -3603,9 +3614,17 @@ def _unlink_lane(lanes: Path, slug: str) -> bool:
 
 def drop_mcp_lane(instance: str, workspace: Optional[Path] = None,
                   environ: Optional[Mapping[str, str]] = None) -> bool:
-    """Remove one connection's lane descriptor and env file, offline; whether any existed."""
+    """Remove one connection's lane descriptor and env file, offline; whether any existed. Under the
+    lanes lock `sync_mcp_lanes` holds, so a sync that read the row before it changed cannot write
+    the lane back after this. With no lock file yet no sync has reached its row read, so any sync
+    reads the row as already changed and no lock is created here."""
+    lanes, slug = mcp_lanes_dir(workspace, environ), mcp_lane_slug(instance)
+    lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
     try:
-        return _unlink_lane(mcp_lanes_dir(workspace, environ), mcp_lane_slug(instance))
+        if not lock.exists():
+            return _unlink_lane(lanes, slug)
+        with locked_file(lock, create_mode=0o600):
+            return _unlink_lane(lanes, slug)
     except OSError as e:
         logging.getLogger(__name__).warning("connections: dropping MCP lane %s failed (%s)",
                                             mcp_lane_slug(instance), type(e).__name__)
@@ -3645,18 +3664,29 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
             if desc is None:
                 out["skipped"][slug] = reason
                 continue
-            want.add(slug)
             value = token.strip() if gateway_url_of(token) else f"{desc['relay']}|{token.strip()}"
+            try:
+                env_body = _env_file_with(env_file, str(row["token_ref"]), value)
+            except UnquotableValue:
+                out["skipped"][slug] = "unquotable_token"
+                continue
+            want.add(slug)
             # The env first, then the descriptor: the proxy reads the descriptor to find the env.
-            changed = _write_if_changed(env_file, _env_file_with(env_file, str(row["token_ref"]), value))
+            changed = _write_if_changed(env_file, env_body)
             body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
             changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body) or changed
             out["written" if changed else "unchanged"].append(slug)
         try:
-            present = sorted({p.stem[len(MCP_LANE_PREFIX):] for p in lanes.iterdir()
-                              if p.name.startswith(MCP_LANE_PREFIX) and p.suffix in (".json", ".env")})
+            entries = list(lanes.iterdir())
         except FileNotFoundError:
-            present = []
+            entries = []
+        present = sorted({p.stem[len(MCP_LANE_PREFIX):] for p in entries
+                          if p.name.startswith(MCP_LANE_PREFIX) and p.suffix in (".json", ".env")})
+        # A temp file left by a crash mid-write may hold a token; no write of ours is in flight here.
+        for p in entries:
+            if p.name.startswith(f".{MCP_LANE_PREFIX}") and p.name.endswith(".tmp"):
+                with contextlib.suppress(FileNotFoundError):
+                    p.unlink()
         for slug in present:
             if slug not in want and _unlink_lane(lanes, slug):
                 out["removed"].append(slug)

@@ -21,6 +21,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -266,6 +267,62 @@ class Removes(Base):
                 self.assertLogs("connections", "WARNING") as logs:
             self.assertFalse(C.drop_mcp_lane("dev-s-space", self.ws, {}))
         self.assertIn("PermissionError", "".join(logs.output))
+
+
+class DropSyncRace(Base):
+    def test_a_sync_that_read_the_row_as_enabled_cannot_write_the_lane_back_after_a_drop(self):
+        self.record([S_SPACE, DEV_S])
+        reading, go = threading.Event(), threading.Event()
+
+        def slow_space_of(name):
+            if name == "dev.s.space":
+                reading.set()
+                go.wait(5)
+            return space_of(name)
+
+        syncer = threading.Thread(target=lambda: self.sync(space_of=slow_space_of))
+        syncer.start()
+        self.assertTrue(reading.wait(5))
+        # The row turns disabled after the sync read it, then its lane is dropped.
+        self.record([S_SPACE, dict(DEV_S, disabled=True)])
+        dropper = threading.Thread(target=lambda: C.drop_mcp_lane("dev-s-space", self.ws, {}))
+        dropper.start()
+        dropper.join(0.3)
+        self.assertTrue(dropper.is_alive(), "the drop waits for the sync's lanes lock")
+        go.set()
+        syncer.join(5)
+        dropper.join(5)
+        self.assertEqual(self.names(), [])
+
+
+class Quoting(Base):
+    def test_a_token_holding_a_quote_gets_no_lane_and_its_old_lane_is_removed(self):
+        self.record([S_SPACE, DEV_S])
+        self.sync()
+        self.vault.store["AG2_REMOTE_TOKEN_DEV_S_SPACE"] = "https://dev-chat.s.space/relay|sec'ret"
+        with self.assertLogs("connections", "WARNING") as logs:
+            out = self.sync()
+        self.assertEqual((out["skipped"], out["removed"]), ({"dev-s-space": "unquotable_token"}, ["dev-s-space"]))
+        self.assertEqual(self.names(), [])
+        self.assertIn("AG2_REMOTE_TOKEN_DEV_S_SPACE", "".join(logs.output))
+        self.assertNotIn("sec'ret", "".join(logs.output))
+
+    def test_a_line_break_is_refused_too_and_a_plain_value_is_single_quoted(self):
+        path = self.ws / "x.env"
+        for bad in ("a\nB=c", "a\rb"):
+            with self.assertRaises(C.UnquotableValue), self.assertLogs("connections", "WARNING"):
+                C._env_file_with(path, "K", bad)
+        self.assertEqual(C._env_file_with(path, "K", "u|s-_.~"), "K='u|s-_.~'\n")
+
+
+class TempSweep(Base):
+    def test_a_temp_file_a_crash_left_is_swept_and_other_dotfiles_stay(self):
+        self.record([S_SPACE, DEV_S])
+        self.lanes.mkdir(parents=True)
+        for name in (".conn-dev-s-space.env.k3j9.tmp", ".conn-gone.json.a1.tmp", ".other.tmp", ".conn-keep"):
+            (self.lanes / name).write_text("x")
+        self.sync()
+        self.assertEqual(self.names(), [".conn-keep", ".other.tmp", "conn-dev-s-space.env", "conn-dev-s-space.json"])
 
 
 class MainDescriptor(Base):
