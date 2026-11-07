@@ -2179,6 +2179,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The broker's word that the message mentioned the owner, not this agent.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "owner_mentioned",
+                # Who asked a relay task; its user_id is the account it runs for. Above "task"
+                # so the strict parser reads it, and the dedup fold checks it.
+                "asked_by",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
