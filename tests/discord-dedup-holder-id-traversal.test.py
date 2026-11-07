@@ -10,6 +10,7 @@ from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
+from _helpers.paired_result import publish_result
 
 import pathlib
 import os
@@ -80,7 +81,7 @@ def main() -> int:
             check((action, body) == ("report", MALFORMED_TEMPLATE),
                   f"3) Discord reports malformed holder {bad!r}")
             check(lookup.call_count == 0, "3) malformed holder never reaches a task lookup")
-    (bridge.RESULTS_DIR / "task-holder.txt").write_text("[REPLIED]")
+    publish_result(bridge.RESULTS_DIR / "task-holder.txt", "[REPLIED]")
     (bridge.TASKS_DIR / "task-holder.txt").write_text("channel_id: 4242\n")
     check(bridge._dedup_recover("task-ask", "task-holder", 4242) == ("honour", None),
           "3) valid same-room holder still reaches normal recovery")

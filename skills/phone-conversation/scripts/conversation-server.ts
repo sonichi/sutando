@@ -1,4 +1,5 @@
 #!/usr/bin/env npx tsx
+import { readVerifiedResult } from '../../../src/result-read.js';
 /**
  * Phone Conversation Server — Twilio Media Streams + bodhi VoiceSession
  *
@@ -50,7 +51,7 @@ import { config as _dotenvConfig } from 'dotenv';
 // yields a literal "%20" that points at no file and the .env silently never loads. (#2228)
 _dotenvConfig({ path: fileURLToPath(new URL('../../../.env', import.meta.url)), override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
@@ -455,9 +456,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			return;
 		}
 		if (existsSync(resultPath)) {
+			const result = readVerifiedResult(resultPath);
+			if (result === null) return;
 			clearInterval(poll);
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
-			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			callSession.recorder.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
 			// Archive both the result + task files so phone surfaces match the
@@ -971,11 +973,12 @@ async function createCallSession(params: {
 			// Typed key constructor — keeps writer + consumer in sync on
 			// the `phone-` prefix; prevents cross-consumer namespace collisions.
 			if (!resultBelongsTo(name, phoneCallKey(callSession.callSid))) continue;
-			callSession.channelScanSeen!.set(name, Date.now());
 			const full = join(RESULTS_DIR, name);
 			let body: string;
 			try {
-				body = readFileSync(full, 'utf-8').trim();
+				const verified = readVerifiedResult(full);
+				if (verified === null) continue;
+				body = verified;
 			} catch {
 				continue;
 			}
@@ -983,6 +986,7 @@ async function createCallSession(params: {
 				try { unlinkSync(full); } catch {}
 				continue;
 			}
+			callSession.channelScanSeen!.set(name, Date.now());
 			console.log(`${ts()} [ChannelScan] picked up ${name} for ${callSession.callSid} (${body.length}B)`);
 			callSession.recorder.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
 			try {
@@ -991,7 +995,8 @@ async function createCallSession(params: {
 					true,
 				);
 			} catch (e) {
-				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
+				callSession.channelScanSeen!.set(name, Date.now());
+			console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
 			}
 			try { unlinkSync(full); } catch {}
 		}

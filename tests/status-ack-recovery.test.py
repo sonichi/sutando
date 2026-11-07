@@ -19,6 +19,7 @@ Run: python3 tests/status-ack-recovery.test.py
 """
 from __future__ import annotations
 
+
 import json
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
@@ -119,7 +121,9 @@ def main() -> int:
         lane = pl.Lane(gb, ISO)
         sa.task(lane.ws, TID)
         dead_claim(lane.ws)
-        (lane.results / "archive" / archived).write_text("Received. Not picked up yet.\n", encoding="utf-8")
+        result = lane.results / VIA
+        publish_result(result, "Received. Not picked up yet.\n", encoding="utf-8")
+        result.rename(lane.results / "archive" / archived)
         reports = restart(lane, DUE, n=2)
         check(ack_claim.state(lane.ws, KEY) == "claimed" and reports[0].get("recovered") == [] and lane.posts == [],
               f"c) delivered, only in {label}: left as it is, no line ({ack_claim.state(lane.ws, KEY)})")

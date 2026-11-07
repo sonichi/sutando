@@ -28,7 +28,7 @@ class Block2bArchives(unittest.TestCase):
     def test_2b_instructs_a_no_send_result_so_the_task_archives(self):
         b = block_2b(SRC)
         self.assertIn("[no-send]", b)
-        self.assertIn("results/task-{id}.txt", b)
+        self.assertIn("RESULT PUBLICATION command", b)
 
     def test_2b_no_longer_forbids_the_task_result(self):
         b = block_2b(SRC)
@@ -39,7 +39,7 @@ class Block2bArchives(unittest.TestCase):
         self.assertIn("results/proactive-{ts}.txt", b)
 
     def test_positive_control_the_old_wording_would_fail(self):
-        old = SRC.replace("Then write exactly `[no-send]` to results/task-{id}.txt", "Do NOT write to results/task-{id}.txt (no sender reply)")
+        old = SRC.replace("Then publish exactly `[no-send]` through the RESULT PUBLICATION command", "Do NOT write to results/task-{id}.txt (no sender reply)")
         b = block_2b(old)
         self.assertIn("Do NOT write to results/task-{id}.txt", b)
         self.assertNotIn("[no-send]", b.split("Do NOT")[0])

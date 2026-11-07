@@ -11,6 +11,7 @@ from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
+from _helpers.paired_result import publish_result
 
 import atexit
 import importlib.util
@@ -104,7 +105,8 @@ class BridgeWrapperTest(unittest.TestCase):
         (results / "archive").mkdir(parents=True)
         tasks.mkdir(parents=True)
         if holder_body is not None:
-            (results / "archive" / f"{HOLDER}-1785976425.txt").write_text(holder_body)
+            publish_result(results / f"{HOLDER}.txt", holder_body)
+            (results / f"{HOLDER}.txt").rename(results / "archive" / f"{HOLDER}-1785976425.txt")
         if orig is not None:
             (tasks / f"{TID}.txt").write_text(orig)
         mod.RESULTS_DIR, mod.TASKS_DIR = results, tasks

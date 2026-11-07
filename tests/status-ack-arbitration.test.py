@@ -18,12 +18,14 @@ Run: python3 tests/status-ack-arbitration.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
@@ -86,7 +88,7 @@ def main() -> int:
     check(rc == 0 and len(NOTIFY_POSTS) == 1 and NOTIFY_POSTS[0].get("body", "").startswith("Done with"),
           f"b) a later notify is progress and still goes out ({NOTIFY_POSTS})")
     result = lane.results / f"{tid}.txt"
-    result.write_text("Here is the answer.\n", encoding="utf-8")
+    publish_result(result, "Here is the answer.\n", encoding="utf-8")
     runner_pass(lane, sa.T0 + 400)
     lane.drain()
     check(result.read_text(encoding="utf-8") == "Here is the answer.\n" and len(lane.posts) == 1,

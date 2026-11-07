@@ -8,6 +8,8 @@ from _helpers.hermetic_env import isolate_os_environ
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
+from _helpers.paired_result import publish_result
+
 import asyncio
 import builtins
 import importlib.util
@@ -240,7 +242,7 @@ def main() -> int:
     (box2 / "task-FILLS.txt").write_text("")
     db._empty_result_polls.clear()
     out2 = _drive(box2, "task-FILLS", 3)
-    (box2 / "task-FILLS.txt").write_text("the real body")
+    publish_result(box2 / "task-FILLS.txt", "the real body")
     out2 += _drive(box2, "task-FILLS", 1)
     check("a file filled BEFORE the bound never announces",
           not any("PRESENT BUT EMPTY" in line for line in out2),

@@ -15,6 +15,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from result_write import path_verifier  # noqa: E402
 PWSH = shutil.which("pwsh") or shutil.which("powershell.exe")
 
 
@@ -34,6 +36,9 @@ class NotifyDelegation(unittest.TestCase):
             (repo / "scripts").mkdir()
             shutil.copy(ROOT / "scripts/python-binary.ps1", repo / "scripts")
             shutil.copy(ROOT / "src/notify.ps1", src)
+            for name in ("result_publish.py", "result_write.py", "file_lock.py", "local_task_protocol.py", "result_identity.py"):
+                if (ROOT / "src" / name).exists():
+                    shutil.copy(ROOT / "src" / name, src)
             (src / "workspace_default.ps1").write_text(
                 "function Resolve-SutandoWorkspace { return $env:TEST_REPO }\n")
             (src / "dm-result.py").write_text(
@@ -68,7 +73,10 @@ function Add-Type {
             self.assertTrue((repo / "sent.txt").exists(), "shared send_dm was not called")
             self.assertEqual((repo / "sent.txt").read_bytes(), message.encode("utf-8"))
             self.assertTrue((repo / "desktop-reached").exists())
-            self.assertEqual(len(list((repo / "results").glob("proactive-*.txt"))), 1)
+            results = list((repo / "results").glob("proactive-*.txt"))
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].read_bytes(), message.encode("utf-8"))
+            self.assertTrue(path_verifier(results[0])(message))
 
 
 if __name__ == '__main__':

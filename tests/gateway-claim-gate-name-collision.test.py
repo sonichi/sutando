@@ -14,6 +14,7 @@ Run: python3 tests/gateway-claim-gate-name-collision.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import os
@@ -23,6 +24,7 @@ import time
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 isolate_os_environ()
 
@@ -81,17 +83,17 @@ def main() -> int:
             return room == ROOM
     mod.VOICE_ROOM_VERIFIER = Verified()
     voice = results / "proactive-result-1.to-ag2space.txt"
-    voice.write_text(f"[channel: {ROOM}]\nyour answer\n", encoding="utf-8")
+    publish_result(voice, f"[channel: {ROOM}]\nyour answer\n", encoding="utf-8")
     got = gate(mod, voice)
     check(got is True, f"b) verified-room voice result is claimed, got {got!r}")
 
     bare = results / "proactive-2.txt"
-    bare.write_text("owner nudge\n", encoding="utf-8")
+    publish_result(bare, "owner nudge\n", encoding="utf-8")
     got = gate(mod, bare)
     check(got is False, f"c) bare file with discord last-active is left for discord, got {got!r}")
 
     discord = results / "proactive-3.to-discord.txt"
-    discord.write_text("for discord\n", encoding="utf-8")
+    publish_result(discord, "for discord\n", encoding="utf-8")
     got = gate(mod, discord)
     check(got is False, f"d) a .to-discord file is never claimed, got {got!r}")
     check(discord.exists(), "d) and stays on disk")

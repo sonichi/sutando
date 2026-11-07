@@ -12,7 +12,9 @@ Run: python3 tests/discord-bridge-delivery-failure-visible.test.py
 
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -117,7 +119,7 @@ async def _exercise():
     (bridge.TASKS_DIR / f"{task_id}.txt").write_text(
         f"id: {task_id}\nsource: discord\naccess_tier: owner\n"
     )
-    (bridge.RESULTS_DIR / f"{task_id}.txt").write_text(
+    publish_result(bridge.RESULTS_DIR / f"{task_id}.txt",
         f"Your video is ready.\n[file: {attachment}]\n"
     )
     bridge.pending_replies.clear()

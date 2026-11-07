@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 // A result with no open work call, after a reconnect: handed as live input, not as a system notice
 // (bodhi 0.4.6's notices stop reaching the model after a reconnect). Own process: the result watcher
 // is process-wide, so this runtime cannot share one with relay-agent-e2e.
@@ -53,7 +54,7 @@ const modelSpeaks = (turnId: string) => { session.emit('turn.start'); session.em
 describe('a result with no open call: notice before any reconnect, live input after one', () => {
 	it('before a reconnect it goes as a system notice', async () => {
 		const id = callLessTask('count the PRs');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Four PRs were merged this week.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'Four PRs were merged this week.');
 		await until(() => voiceTaskStore.get(id)?.delivery === 'injected');
 		assert.equal(notices.filter((n) => n.includes('Four PRs')).length, 1, 'one notice');
 		assert.equal(live.length, 0, 'not live input');
@@ -66,7 +67,7 @@ describe('a result with no open call: notice before any reconnect, live input af
 		session.emit('session.reconnectBoundary', {});
 		session.emit('session.stateChange', { toState: 'ACTIVE' });
 		const id = callLessTask('build the trainer app');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Your trainer app is built and published.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'Your trainer app is built and published.');
 		await until(() => voiceTaskStore.get(id)?.delivery === 'injected');
 		assert.equal(live.filter((n) => n.includes('trainer app is built')).length, 1, 'handed as live input');
 		assert.equal(notices.filter((n) => n.includes('trainer app')).length, 0, 'no notice for it');
@@ -78,7 +79,7 @@ describe('a result with no open call: notice before any reconnect, live input af
 	it('once the model has completed a spoken turn on the new connection, notices are trusted again', async () => {
 		// The spoken turn t2 above completed after ACTIVE: the notification path is back.
 		const id = callLessTask('send the file to Discord');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Sent hello world.txt to your Discord DM.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'Sent hello world.txt to your Discord DM.');
 		await until(() => voiceTaskStore.get(id)?.delivery === 'injected');
 		assert.equal(notices.filter((n) => n.includes('hello world')).length, 1, 'a notice again');
 		assert.equal(live.filter((n) => n.includes('hello world.txt')).length, 0, 'not live input');

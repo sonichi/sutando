@@ -1452,7 +1452,7 @@ def make_durable(path: Path) -> None:
 
 
 def write_if_absent(path: Path, text: str, claim: "Callable[[list], bool] | None" = None,
-                    mode: int = 0o644) -> "bool | None":
+                    mode: int = 0o644, *, pair_result=False) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file already
     was (it wins). `claim` is given the file's identity before it is published, and False from it
     publishes nothing. Raises OSError on a failure, with nothing left at `path`, so a retry can write it."""
@@ -1467,8 +1467,8 @@ def write_if_absent(path: Path, text: str, claim: "Callable[[list], bool] | None
             return False
         # link() publishes the complete file and never replaces one already there; it keeps the
         # inode and write time, so the identity claimed is the published file's.
-        os.link(tmp, path)
-        agent_turn._fsync_dir(path.parent)
+        from .result_publish import publish_staged
+        publish_staged(tmp, path, no_replace=True, pair_result=pair_result)
         return True
     except FileExistsError:
         return None

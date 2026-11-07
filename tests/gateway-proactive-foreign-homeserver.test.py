@@ -23,6 +23,7 @@ Run: python3 tests/gateway-proactive-foreign-homeserver.test.py
 """
 from __future__ import annotations
 
+
 import os
 import sys
 import tempfile
@@ -30,6 +31,7 @@ import urllib.error
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -93,12 +95,12 @@ def lane(identity: str, tmp: Path, posts: list, fail_post: bool = False):
 def fresh() -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="gw-foreign-hs-"))
     (tmp / "archive").mkdir()
-    (tmp / "proactive-1.txt").write_text(BODY, encoding="utf-8")
+    publish_result(tmp / "proactive-1.txt", BODY, encoding="utf-8")
     return tmp
 
 
 def names(tmp: Path) -> list[str]:
-    return sorted(p.relative_to(tmp).as_posix() for p in tmp.rglob("*") if p.is_file())
+    return sorted(p.relative_to(tmp).as_posix() for p in tmp.rglob("*") if p.is_file() and ".result-pairing" not in p.parts)
 
 
 def main() -> int:

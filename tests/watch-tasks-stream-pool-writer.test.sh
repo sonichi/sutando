@@ -158,6 +158,7 @@ check "nonzero done writer: failure is logged" "1" "$(grep -c 'could not record 
 # marker. Done failure must log but reach the marker, including through the
 # watcher's `|| handler_rc=1` branch without changing handler_rc.
 notifier_hook="$(awk '/^mark_worker_stage\(\) \{/,/^\}/' "$NOTIFIER")"
+pair_hook="$(awk '/^task_id_of\(\) \{/,/^\}/' "$NOTIFIER"; awk '/^assert_result_paired\(\) \{/,/^\}/' "$NOTIFIER")"
 submit_hook="$(awk '/^submit_task\(\) \{/,/^\}/' "$NOTIFIER")"
 cat > "$tmp/stage-errexit.sh" <<'BASH'
 #!/bin/bash
@@ -170,7 +171,9 @@ case "$1" in
     ;;
   managed_submit)
     eval "$NOTIFIER_HOOK"
+    eval "$PAIR_HOOK"
     eval "$SUBMIT_HOOK"
+    RESULT_PAIRING_DIR="$WORKSPACE_DIR/state/result-pairing"
     RESULTS_DIR="$WORKSPACE_DIR/results"
     TMUX_SOCKET=/tmp/test-socket SESSION=test-worker
     COMPLETION_TIMEOUT=2 POLL_INTERVAL=0.01
@@ -179,7 +182,10 @@ case "$1" in
     has_result() { [ -s "$RESULTS_DIR/$1" ]; }
     tmux() { return 0; }
     clear_workstream_context() { :; }
-    deliver_prompt() { printf 'done\n' > "$RESULTS_DIR/$1"; }
+    deliver_prompt() {
+      printf 'task: %s\ndone\n' "$(task_id_of "$1")" | "$NOTIFIER_PY" "$REPO/src/result_write.py" \
+        write "$1" --results-dir "$RESULTS_DIR" --receipts-dir "$RESULT_PAIRING_DIR" >/dev/null
+    }
     log_notifier() { :; }
     # This is a BARE managed-loop call, not inside `if`, `||` or `$()`.
     submit_task task-x.txt 1
@@ -199,7 +205,7 @@ BASH
 
 run_stage_errexit() {  # run_stage_errexit <caller> <stage> <writer> <output-stem> <expected-status>
     STAGE_WRITER="$STAGE_WRITER" NOTIFIER_HOOK="$notifier_hook" SUBMIT_HOOK="$submit_hook" WATCHER_HOOK="$hook" \
-    WORKSPACE_DIR="$ws" NOTIFIER_PY="$PY" SUTANDO_PY_BIN="$PY" \
+    REPO="$REPO" PAIR_HOOK="$pair_hook" WORKSPACE_DIR="$ws" NOTIFIER_PY="$PY" SUTANDO_PY_BIN="$PY" \
     WORKER_INSTANCE=worker-3 SUTANDO_INSTANCE_ID=worker-3 \
     SUTANDO_POOL_DELIVERY_SCRIPT="$3" REAL_WRITER="$WRITER" \
     bash "$tmp/stage-errexit.sh" "$1" "$2" > "$tmp/$4.out" 2> "$tmp/$4.err"

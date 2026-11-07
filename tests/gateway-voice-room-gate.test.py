@@ -9,6 +9,7 @@ gateway in `_req`, so every branch is driven without a network or a process.
 """
 from __future__ import annotations
 
+
 import contextlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -101,7 +103,7 @@ class _LoaderFixture(unittest.TestCase):
 
     def _result(self, name, body):
         p = Path(self.ws) / "results" / name
-        p.write_text(body, encoding="utf-8")
+        publish_result(p, body, encoding="utf-8")
         return p
 
 
@@ -294,11 +296,11 @@ class DrainRoomGateTests(_LoaderFixture):
     def _completing_rename(self, target: Path, body: str, on_claim=None, handback_fails=False):
         """A Path.rename that finishes writing `target` just before it is claimed:
         the writer's last bytes landing between the drain's peek and its claim."""
-        real_rename, real_write = Path.rename, Path.write_text
+        real_rename = Path.rename
 
         def rename(path, dest):
             if path.name == target.name:
-                real_write(path, body)
+                publish_result(path, body)
                 if on_claim:
                     on_claim()
             elif handback_fails and Path(dest).name == target.name:

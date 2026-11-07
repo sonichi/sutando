@@ -6,6 +6,8 @@ never answered; adapters keep only their routing and notification.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import ast
 import io
 import sys
@@ -54,9 +56,11 @@ class _Space:
         if month:
             d = self.results / "archive" / "2026-08"
             d.mkdir(exist_ok=True)
-            (d / f"{HOLDER}.txt").write_text(body)
+            publish_result(d / f"{HOLDER}.txt", body)
         else:
-            (self.results / "archive" / f"{HOLDER}-1785976425.txt").write_text(body)
+            result = self.results / f"{HOLDER}.txt"
+            publish_result(result, body)
+            result.rename(self.results / "archive" / f"{HOLDER}-1785976425.txt")
 
     def orig(self, text: str = ORIG):
         (self.tasks / f"{TID}.txt").write_text(text)
@@ -98,7 +102,7 @@ class PlanTest(unittest.TestCase):
                     sp = _Space(td)
                     sp.orig(ORIG + f"dedup_requeue_count: {count}\n")
                     if layout == "live":
-                        (sp.results / f"{HOLDER}.txt").write_text("[REPLIED]")
+                        publish_result(sp.results / f"{HOLDER}.txt", "[REPLIED]")
                     else:
                         sp.holder("[REPLIED]", month=layout == "month")
                     self.assertEqual(sp.plan(), ("honour", None))
@@ -154,7 +158,7 @@ class PlanTest(unittest.TestCase):
         holder's result is still live in results/ rather than archive/."""
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.orig()
-            (sp.results / f"{HOLDER}.txt").write_text("the full answer")
+            publish_result(sp.results / f"{HOLDER}.txt", "the full answer")
             self.assertEqual(sp.plan(), ("honour", None))
             self.assertFalse((sp.tasks / f"{NEW}.txt").exists(),
                              "a holder that delivered must not be re-asked")
@@ -324,7 +328,7 @@ class PublishOnceTest(unittest.TestCase):
                     (sp.tasks / "archive").mkdir()
                     (sp.tasks / "archive" / f"{NEW}.txt").write_text("another question")
                 elif where == "answer only":
-                    (sp.results / f"{NEW}.txt").write_text("an answer whose task is unknown")
+                    publish_result(sp.results / f"{NEW}.txt", "an answer whose task is unknown")
                 else:
                     (sp.tasks / f"{NEW}.txt").mkdir()          # present, but no body can be read
                 committed = []
@@ -424,7 +428,7 @@ class ArchiveLocatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             arc = Path(td) / "archive"
             arc.mkdir()
-            (arc / f"{HOLDER}.txt").write_text("legacy flat layout")
+            publish_result(arc / f"{HOLDER}.txt", "legacy flat layout")
             found = find_archived_result(Path(td), HOLDER)
             self.assertIsNotNone(found)
             self.assertEqual(found.read_text(), "legacy flat layout")

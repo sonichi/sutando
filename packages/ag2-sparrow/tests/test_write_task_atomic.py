@@ -146,7 +146,9 @@ def test_write_task_does_not_reexecute_a_completed_task():
         m = _load(pathlib.Path(d))
         tid = "task-1784500000011"
         m.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (m.ARCHIVE_RESULTS_DIR / f"{tid}-1784500000999.txt").write_text("earlier reply\n")
+        from ag2_sparrow.result_publish import publish_text
+        publish_text(m.RESULTS_DIR / f"{tid}.txt", "earlier reply\n", pair_result=True)
+        (m.RESULTS_DIR / f"{tid}.txt").rename(m.ARCHIVE_RESULTS_DIR / f"{tid}-1784500000999.txt")
         assert m._write_task(_task(tid)) == (tid, True)
         assert list(m.TASKS_DIR.glob("task-*.txt")) == []
         rfile = m.RESULTS_DIR / f"{tid}.txt"

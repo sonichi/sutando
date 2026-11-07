@@ -151,3 +151,31 @@ inside a root is a protocol violation**, not cleanup.
 
 When those merge, their sections above should be folded in as shipped behavior
 — this document tracks `main`, not intent.
+
+## Task-result pairing
+
+`src/result_write.py write <task-filename> --workspace <workspace>` takes an
+answer on stdin whose first line is `task: <bare-id>`. It refuses a mismatching
+id before creating any files. This checks an explicit id echo, not the semantic
+relationship between the prose and the task: a caller controlling both ids can
+still submit the wrong answer with matching ids.
+
+The paired writer delegates atomic publication to `result_publish`. A per-task
+`file_lock` transaction installs a content-bound receipt before replacing the
+result. Concurrent writers use independent staging files and cannot leave the
+final result paired with another writer's receipt. Receipt failures propagate
+instead of reporting successful paired publication. Verification uses the exact
+UTF-8 bytes, including CRLF and trailing whitespace, before presentation strips
+them. A reader may temporarily defer while the two files are being replaced.
+
+Every shared readiness read requires a matching receipt, including proactive,
+voice, gateway and restart/archive completion reads. Missing, malformed and
+stale receipts leave the result pending. Existing unpaired results are not
+backfilled or silently accepted: an operator must arrange a fresh paired answer.
+The shared publisher records receipts for programmatic producers; the explicit
+paired CLI additionally checks the caller's task-id echo. Immutable generation
+receipts preserve verification after a paired result is archived and a newer
+answer is published under the same task id. They are created only at publication.
+
+A real post-restart notifier-to-bridge round trip remains required before
+rollout; this change has only been exercised with isolated fixtures and CI.

@@ -10,6 +10,8 @@ Run: python3 tests/runtime-api-edge-gaps.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import json
 import os
 import sys
@@ -45,7 +47,7 @@ class TasksViewEdges(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_status_done_when_result_exists(self):
-        (self.results / "task-rtapi-a1.txt").write_text("finished")
+        publish_result(self.results / "task-rtapi-a1.txt", "finished")
         self.assertEqual(self.v.status("task-rtapi-a1")["state"], "done")
 
     def test_unreadable_task_file_degrades_to_absent_details(self):
@@ -60,7 +62,7 @@ class TasksViewEdges(unittest.TestCase):
 
     def test_unreadable_result_degrades_to_pending(self):
         f = self.results / "task-c3.txt"
-        f.write_text("body")
+        publish_result(f, "body")
         f.chmod(0o000)
         try:
             out = self.v.get_result("task-c3")
@@ -91,14 +93,14 @@ class TasksViewMoreEdges(unittest.TestCase):
 
     def test_latest_result_unreadable_is_none(self):
         f = self.results / "task-rtapi-new.txt"
-        f.write_text("body")
+        publish_result(f, "body")
         f.chmod(0o000)
         self.assertIsNone(self.v.get_result())  # latest (no id) form
 
     def test_list_results_skips_unreadable(self):
-        (self.results / "task-rtapi-a.txt").write_text("A")
+        publish_result(self.results / "task-rtapi-a.txt", "A")
         bad = self.results / "task-rtapi-b.txt"
-        bad.write_text("B")
+        publish_result(bad, "B")
         bad.chmod(0o000)
         out = self.v.list_results()
         ids = [r["taskId"] for r in out.get("results", out) or []]             if isinstance(out, (dict, list)) else []
@@ -245,15 +247,15 @@ class TasksViewArchiveAndRaces(unittest.TestCase):
 
     def test_latest_result_unreadable_is_none_not_crash(self):
         f = self.results / "task-rtapi-locked.txt"
-        f.write_text("secret")
+        publish_result(f, "secret")
         f.chmod(0o000)
         self.assertIsNone(self.v.get_result())
 
     def test_list_results_skips_unreadable_entry(self):
         ok = self.results / "task-rtapi-okay.txt"
-        ok.write_text("fine")
+        publish_result(ok, "fine")
         locked = self.results / "task-rtapi-locked.txt"
-        locked.write_text("secret")
+        publish_result(locked, "secret")
         locked.chmod(0o000)
         ids = [r["taskId"] for r in self.v.list_results()["results"]]
         self.assertIn("task-rtapi-okay", ids)

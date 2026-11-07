@@ -32,6 +32,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -116,6 +117,35 @@ class ProgressLoopDisabledTest(unittest.TestCase):
             with contextlib.suppress(_SleptTwice):
                 asyncio.run(self.mod._supervise_loop(coro_fn, name))
         return buf.getvalue()
+
+    def test_progress_stops_only_after_a_verified_result(self):
+        from result_publish import publish_text
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td) / "results"
+            results.mkdir()
+            result = results / "task-proof.txt"
+            result.write_text("unattested answer")
+            message = mock.Mock(delete=mock.AsyncMock())
+            entry = {"msg": message, "first": 0, "last_edit": 0}
+            async def stop(_seconds):
+                raise _SleptTwice
+            with mock.patch.object(self.mod, "RESULTS_DIR", results), \
+                 mock.patch.object(self.mod, "pending_replies", {"task-proof": object()}), \
+                 mock.patch.object(self.mod, "_progress_msgs", {"task-proof": entry}), \
+                 mock.patch.object(self.mod, "_is_delivered", return_value=False), \
+                 mock.patch.object(self.mod.progress_stream, "stream_enabled", return_value=True), \
+                 mock.patch.object(self.mod.progress_stream, "placeholder_expired", return_value=False), \
+                 mock.patch.object(self.mod.progress_stream, "should_edit", return_value=False), \
+                 mock.patch.object(self.mod.asyncio, "sleep", stop):
+                with self.assertRaises(_SleptTwice):
+                    asyncio.run(self.mod.poll_progress())
+                message.delete.assert_not_awaited()
+                self.assertIn("task-proof", self.mod._progress_msgs)
+                publish_text(result, "verified answer")
+                with self.assertRaises(_SleptTwice):
+                    asyncio.run(self.mod.poll_progress())
+                message.delete.assert_awaited_once()
+                self.assertNotIn("task-proof", self.mod._progress_msgs)
 
     def test_disabled_progress_loop_is_not_restarted(self):
         """The shipped default must not spin the supervisor."""

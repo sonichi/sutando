@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from _helpers.hermetic_env import isolate_os_environ
 
+from _helpers.paired_result import publish_result
+
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
@@ -139,7 +141,7 @@ def main() -> int:
 
     name = "proactive-release-on-send-failure.txt"
     body = "a proactive message slack cannot deliver"
-    (results / name).write_text(body)
+    publish_result(results / name, body)
 
     watcher = threading.Thread(target=bridge.result_watcher, daemon=True)
     watcher.start()
@@ -179,7 +181,7 @@ def main() -> int:
     bridge._send_reply = _returns_false
     name2 = "proactive-slack-refused-not-raised.txt"
     body2 = "a proactive message slack refuses without raising"
-    (results / name2).write_text(body2)
+    publish_result(results / name2, body2)
     txt2 = results / name2
     sending2 = results / name2.replace(".txt", ".sending")
 

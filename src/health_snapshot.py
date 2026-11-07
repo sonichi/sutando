@@ -26,6 +26,7 @@ import cli_wedge
 import gateway_serving
 import pool_suspension
 import runtime_observation
+from delivery.task_dispatch import has_ready_result
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
 
@@ -181,13 +182,8 @@ def _wedge_source(ws: Path, now: float) -> dict:
 
 
 def _has_result(ws: Path, tid: str) -> bool:
-    """A result file is the task's last write, so its presence ends the task. Archivers move it
-    within seconds, flat or into a month folder: archive/[<YYYY-MM>/]<id>[-<ts>].txt."""
-    results = ws / "results"
-    if (results / f"{tid}.txt").exists():
-        return True
-    name = re.compile(re.escape(tid) + r"(?:-\d+)?\.txt")
-    return any(name.fullmatch(f.name) for f in (results / "archive").rglob(f"{tid}*.txt"))
+    """Only a verified ready result ends activity, including archived generations."""
+    return has_ready_result(ws / "results", f"{tid}.txt")
 
 
 def _activity_by_agent(ws: Path, now: float, worker_ids) -> dict:

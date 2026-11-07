@@ -17,6 +17,7 @@ Run: python3 tests/status-ack-suppression.test.py
 """
 from __future__ import annotations
 
+
 import functools
 import json
 import sys
@@ -24,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
@@ -45,8 +47,8 @@ def phase(ws: Path, tid: str, value: str) -> None:
 
 
 LANDINGS = {
-    "a) a result": lambda ws, tid: (ws / "results" / f"{tid}.txt").write_text("the answer\n"),
-    "b) a no-send result": lambda ws, tid: (ws / "results" / f"{tid}.txt").write_text("[no-send]\n"),
+    "a) a result": lambda ws, tid: publish_result(ws / "results" / f"{tid}.txt", "the answer\n"),
+    "b) a no-send result": lambda ws, tid: publish_result(ws / "results" / f"{tid}.txt", "[no-send]\n"),
     "c) WAITING": lambda ws, tid: phase(ws, tid, "WAITING"),
     "d) a cancel": lambda ws, tid: (ws / "tasks" / "task-1761300009999.txt").write_text(
         f"id: task-1761300009999\ntask: CANCEL_INSTRUCTION: stop processing {tid}\n"),
@@ -88,7 +90,7 @@ def main() -> int:
     tid = "task-1761300000001"
     sa.task(lane.ws, tid, thread_root=sa.ROOT_EVT)
     mod.run_once(lane.ws, sa.on(mod), now=NOW, holders=sa.SESSION)
-    (lane.results / f"{tid}.txt").write_text("the answer\n", encoding="utf-8")
+    publish_result(lane.results / f"{tid}.txt", "the answer\n", encoding="utf-8")
     lane.drain(gate=functools.partial(dispatch_veto, workspace=lane.ws))
     r = mod.run_once(lane.ws, sa.on(mod), now=NOW + 15, holders=sa.SESSION)
     check(lane.posts == [] and ("ack:%s:initial" % tid, "released") in r.settled

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ... import gateway_instance, local_task_protocol, task_hold
 from ...task_io import attested_headers
+from ...result_ready import read_ready_result
 
 SNIPPET_MAX = 500
 REPLY_CONTEXT_MAX = 2000
@@ -135,7 +136,7 @@ def list_open_tasks(task_dir: Path, result_dir: Path, instance: "str | None" = "
 
     items = []
     for path in sorted(task_dir.glob("task-*.txt"), key=lambda p: (mtime(p), p.name)):
-        if (result_dir / path.name).exists():
+        if read_ready_result(result_dir / path.name) is not None:
             continue
         item = task_fields(path, result_dir, instance)
         if item is not None:

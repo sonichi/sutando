@@ -13,6 +13,8 @@ Run: python3 tests/discord-bridge-reply-directive.test.py
 """
 
 from __future__ import annotations
+
+from _helpers.paired_result import publish_result
 import asyncio
 import contextlib
 import importlib.util
@@ -239,7 +241,7 @@ async def _run_one_poll_iteration(task_id, channel, result_text):
     # Write the result file under bridge's RESULTS_DIR
     result_file = bridge.RESULTS_DIR / f"{task_id}.txt"
     result_file.parent.mkdir(parents=True, exist_ok=True)
-    result_file.write_text(result_text)
+    publish_result(result_file, result_text)
     # Stub client.is_ready so heartbeat block is skipped cleanly
     bridge.client.is_ready = lambda: True
     # Stub save_pending_replies so we don't write to disk during tests

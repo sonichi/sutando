@@ -13,7 +13,9 @@ Run: python3 tests/discord-redirect-archive-tier-drive.test.py   (exit 0/1)
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -102,7 +104,7 @@ def drive(tid: str, archived_task_text: str):
     if live.exists():
         live.unlink()
     (month / f"{tid}.txt").write_text(archived_task_text)
-    (db.RESULTS_DIR / f"{tid}.txt").write_text(f"[channel: {TARGET}]\nredirected body for {tid}\n")
+    publish_result(db.RESULTS_DIR / f"{tid}.txt", f"[channel: {TARGET}]\nredirected body for {tid}\n")
     db.pending_replies[tid] = origin
     # In-memory tier is what admits the result past the team-guard once the
     # live file is archived; the redirect gate then re-reads the archived file.

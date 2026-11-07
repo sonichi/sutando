@@ -7,6 +7,8 @@ file is already renamed, so nothing recovers it.
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import re
 import sys
 import tempfile
@@ -29,7 +31,7 @@ CONSUMERS = {
 class ReleaseClaimTest(unittest.TestCase):
     def _claim(self, td: str, body: str) -> Path:
         src = Path(td) / "proactive-1785904100.txt"
-        src.write_text(body)
+        publish_result(src, body)
         claim = src.with_suffix(".sending")
         src.rename(claim)
         return claim
@@ -48,7 +50,7 @@ class ReleaseClaimTest(unittest.TestCase):
             claim = self._claim(td, "")
             release_claim(claim)
             restored = claim.with_suffix(".txt")
-            restored.write_text("the proactive message")
+            publish_result(restored, "the proactive message")
             self.assertEqual(read_ready_result(restored), "the proactive message")
 
     def test_release_preserves_content(self):

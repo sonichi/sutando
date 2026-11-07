@@ -23,6 +23,7 @@ Run: python3 tests/gateway-durable-ack.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import io
 import json
@@ -37,6 +38,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -270,7 +272,7 @@ class DurableAck(unittest.TestCase):
         # What the local core left behind: a reply written with a plain
         # write_text, so this process has committed nothing of its own.
         rfile = mod.RESULTS_DIR / "task-red.txt"
-        rfile.write_text("the answer the core already produced")
+        publish_result(rfile, "the answer the core already produced")
         want = {rfile.stat().st_ino}
         if os.name != "nt":
             want.add(mod.RESULTS_DIR.stat().st_ino)
@@ -288,7 +290,7 @@ class DurableAck(unittest.TestCase):
         (mod.TASKS_DIR / "archive").mkdir(parents=True, exist_ok=True)
         (mod.TASKS_DIR / "archive" / "task-red2.txt").write_text("id: task-red2\n")
         rfile = mod.RESULTS_DIR / "task-red2.txt"
-        rfile.write_text("an earlier answer")
+        publish_result(rfile, "an earlier answer")
         with self._refuse_fsync_of(rfile, mod.RESULTS_DIR):
             self._ack_round([self._task("task-red2")])
         self.assertEqual(self._acks()[0][2], {"id": "task-red2"},

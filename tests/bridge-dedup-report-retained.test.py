@@ -14,7 +14,9 @@ Run: python3 tests/bridge-dedup-report-retained.test.py
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -113,12 +115,12 @@ class DiscordRealLoop(unittest.TestCase):
         db = self.db
         orig = orig if orig is not None else H.ORIG + "dedup_requeue_count: 1\n"
         results, tasks = H._seed(db, td, "", orig)
-        (results / f"{H.TID}.txt").write_text(marker)
+        publish_result(results / f"{H.TID}.txt", marker)
         if holder_channel is not None:
             (tasks / "archive").mkdir()
             (tasks / "archive" / f"{H.HOLDER}.txt").write_text(
                 f"channel_id: {holder_channel}\n")
-            (results / "archive" / f"{H.HOLDER}-1785976425.txt").write_text("[REPLIED]")
+            publish_result(results / "archive" / f"{H.HOLDER}-1785976425.txt", "[REPLIED]")
         sent = []
 
         class _Chan:

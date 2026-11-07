@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 // cancel_task decides from where the task really stands (state/activity, results/), never
 // from the newest file in tasks/, and writes no "Cancelled." result of its own.
 // Run: npx tsx --test --test-force-exit tests/voice-task-cancel.test.ts
@@ -119,7 +120,7 @@ describe('cancel_task decides from the task state', () => {
 	it('a finished task (result written, not yet read) is left alone: the real result is not overwritten', async () => {
 		const id = submit('draw a fence');
 		coreWorks(id);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), "Here's your fence.");
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), "Here's your fence.");
 		const out = await cancel();
 		assert.equal(out.status, 'already_done');
 		assert.equal(readFileSync(join(TMP, 'results', `${id}.txt`), 'utf-8'), "Here's your fence.");
@@ -148,7 +149,7 @@ describe('cancel_task decides from the task state', () => {
 		const id = `task-${1_800_000_000_000 + ++seq}`;
 		const month = new Date().toISOString().slice(0, 7);
 		mkdirSync(join(TMP, 'results', 'archive', month), { recursive: true });
-		writeFileSync(join(TMP, 'results', 'archive', month, `${id}.txt`), "Here's your mouse.");
+		publishVerifiedResult(join(TMP, 'results', 'archive', month, `${id}.txt`), "Here's your mouse.");
 		tb.voiceTaskStore.add(id, 'draw a mouse');
 		tb.voiceTaskStore.set(id, 'spoken');
 		const out = await cancel({ query: 'mouse' });
@@ -167,7 +168,7 @@ describe('cancel_task decides from the task state', () => {
 	it('a cancelled task the core finished anyway is spoken with a note saying so', async () => {
 		const id = submit('draw a boat');
 		await cancel();
-		writeFileSync(join(TMP, 'results', `${id}.txt`), "Here's your boat.");
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), "Here's your boat.");
 		await tick(2_500);
 		assert.deepEqual(spoken, [{ text: "Here's your boat.", note: CANCELLED_BUT_FINISHED_NOTE }]);
 	});

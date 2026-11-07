@@ -100,15 +100,23 @@ def drop_lock(work):
     shutil.rmtree(holder_lock.lock_dir(str(work)), ignore_errors=True)
 
 
+def publish_existing(path, body):
+    from ag2_sparrow.result_publish import publish_text
+    publish_text(path, body)
+
+
 def summary(base, work, calls, adapter="codex"):
-    results = {}
+    from ag2_sparrow.result_write import path_verifier
+    results, pairing = {}, {}
     for p in sorted((work / "results").rglob("*")):
         if p.is_file() and not p.name.startswith(".disposal"):
-            text = norm_text(base, p.read_text())
+            raw = p.read_text()
+            pairing[str(p.relative_to(work / "results"))] = path_verifier(p)(raw)
+            text = norm_text(base, raw)
             if adapter == "routine":
                 text = text.replace("(timeout)", "(TimeoutError)")  # socket.timeout's name before 3.10
             results[str(p.relative_to(work / "results"))] = text
-    return {"provider": norm(base, calls), "results": results, "state": read_state(base, work)}
+    return {"provider": norm(base, calls), "results": results, "state": read_state(base, work), "pairing": pairing}
 
 
 class Broker:
@@ -186,7 +194,8 @@ def routine_scenarios(base):
 
     def preexisting(work):
         (work / "results").mkdir(parents=True, exist_ok=True)
-        (work / "results" / (TASKS[0][0] + ".txt")).write_text("answered elsewhere\n")
+        publish_existing(
+            work / "results" / (TASKS[0][0] + ".txt"), "answered elsewhere\n")
     run("pre-existing result", [TASKS[0], TASKS[3]], [OK], 1, before=preexisting)
     run("429 then ok", TASKS[:1], [(429, {"Retry-After": "1"}, 0), OK], 1)
     run("timeout", TASKS[:1], [(200, {}, 3)], 1, extra=("--timeout", "1"))
@@ -246,7 +255,8 @@ def codex_scenarios(base):
 
     def preexisting(work):
         (work / "results").mkdir(parents=True, exist_ok=True)
-        (work / "results" / (TASKS[0][0] + ".txt")).write_text("answered elsewhere\n")
+        publish_existing(
+            work / "results" / (TASKS[0][0] + ".txt"), "answered elsewhere\n")
     run("pre-existing result", [TASKS[0], TASKS[3]], 1, before=preexisting)
     run("turn timeout", [("task-1700000000006", "owner", "!room:ag2.space", "[[stall]] slow", 1006)], 1,
         extra=("--turn-timeout", "1", "--interrupt-grace", "2"))

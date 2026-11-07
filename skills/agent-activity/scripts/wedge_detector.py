@@ -14,7 +14,9 @@ import time
 from pathlib import Path
 
 from file_lock import locked_file
-from local_task_protocol import find_archived_task, find_result, parse_task_headers, valid_local_task_id
+from local_task_protocol import find_archived_task, parse_task_headers, valid_local_task_id
+from result_publish import publish_staged
+from delivery.task_dispatch import has_ready_result
 from ag2space_links import room_link
 from proactive_routing import proactive_filename
 
@@ -158,7 +160,7 @@ def _owner_notice(workspace, task_id, state, path):
         stream.write(f"[dm-only]\n{context}: {MESSAGES[state['kind']]}\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(tmp, result)
+    publish_staged(tmp, result)
 
 
 def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s=SILENCE_S, active_tool=False):
@@ -175,7 +177,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with locked_file(root / ".lock", create_mode=0o600):
         previous = _read(path)
-        if find_result(workspace / "results", task_id) is not None:
+        if has_ready_result(workspace / "results", f"{task_id}.txt"):
             path.unlink(missing_ok=True)
             return status
         if status is None:

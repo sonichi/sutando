@@ -26,7 +26,9 @@ fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ(SUTANDO_TEST_MODE="1", AG2_DEVICE_ENV="", REMOTE_TASK_URL="http://127.0.0.1:9",
@@ -110,7 +112,7 @@ def workspace() -> Path:
 
 def drain(mod, ws: Path, name: str):
     f = ws / "results" / name
-    f.write_text(BRIEFING, encoding="utf-8")
+    publish_result(f, BRIEFING, encoding="utf-8")
     mod._post_proactive()
     return f.exists()
 
@@ -200,7 +202,7 @@ def main() -> int:
 
     ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
     om = "proactive-owner-mention-om1.to-ag2space.txt"
-    (ws / "results" / om).write_text(f"[channel: {DM}]\nAlice asked about the deck\n", encoding="utf-8")
+    publish_result(ws / "results" / om, f"[channel: {DM}]\nAlice asked about the deck\n", encoding="utf-8")
     gw.members[DM].append("@intruder:example.org")
     mod._post_proactive()
     check((ws / "results" / om).exists() and gw.posts == [],
@@ -208,7 +210,7 @@ def main() -> int:
 
     ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
     om = "proactive-owner-mention-om2.to-ag2space.txt"
-    (ws / "results" / om).write_text("[channel: !old-dm:example.org]\nAlice asked about the deck\n", encoding="utf-8")
+    publish_result(ws / "results" / om, "[channel: !old-dm:example.org]\nAlice asked about the deck\n", encoding="utf-8")
     mod._post_proactive()
     check(not (ws / "results" / om).exists() and [p["room_id"] for p in gw.posts] == [DM],
           f"m) an owner-mention DM goes to the owner DM read at send time, not the room baked in: {gw.posts}")
@@ -217,7 +219,7 @@ def main() -> int:
     mod._routing_file().write_text(json.dumps(mod._routing_record(AGENT, mod.URL, DM)))
     drain(mod, ws, "proactive-morning-10.txt")
     om = "proactive-owner-mention-om3.to-ag2space.txt"
-    (ws / "results" / om).write_text(f"[channel: {DM}]\nAlice asked about the deck\n", encoding="utf-8")
+    publish_result(ws / "results" / om, f"[channel: {DM}]\nAlice asked about the deck\n", encoding="utf-8")
     mod._post_proactive()
     record = json.loads(mod._routing_file().read_text())
     rooms = [p["room_id"] for p in gw.posts]

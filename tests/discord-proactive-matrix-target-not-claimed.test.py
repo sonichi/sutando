@@ -20,6 +20,8 @@ import shutil
 import sys
 import tempfile
 
+from _helpers.paired_result import publish_result
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 # Isolate BEFORE any bridge import: channel_access_path() falls back to the real
@@ -81,9 +83,9 @@ try:
     fence.claim = counting_claim
 
     room = results / "proactive-1791739083.txt"
-    room.write_text("[channel: !XLdYRwrweOuCCtaSnE:ag2.space]\nroom body\n")
+    publish_result(room, "[channel: !XLdYRwrweOuCCtaSnE:ag2.space]\nroom body\n")
     d7 = results / "proactive-d7.txt"
-    d7.write_text("**[core: 2]**\n[channel: !XLdYRwrweOuCCtaSnE:ag2.space]\nroom body\n")
+    publish_result(d7, "**[core: 2]**\n[channel: !XLdYRwrweOuCCtaSnE:ag2.space]\nroom body\n")
 
     async def one_pass():
         try:
@@ -105,7 +107,7 @@ try:
 
     # Positive control: a Discord-addressed body is still claimed by Discord.
     native = results / "proactive-native.txt"
-    native.write_text("[channel: 1530802402603700415]\nchannel body\n")
+    publish_result(native, "[channel: 1530802402603700415]\nchannel body\n")
     asyncio.run(one_pass())
     check(claimed == ["proactive-native.txt"],
           "a DISCORD-addressed body is still claimed (the gate does not over-fire)")

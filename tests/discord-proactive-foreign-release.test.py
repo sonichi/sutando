@@ -9,6 +9,8 @@ whether the branch runs, and the branch is the whole fix.
 Loaded with the real path in `compile()` so coverage attributes the executed lines
 to src/discord-bridge.py rather than to "<string>".
 """
+
+from _helpers.paired_result import publish_result
 import asyncio
 import importlib.util
 import os
@@ -74,12 +76,12 @@ try:
     bridge.STATE_DIR = state
 
     foreign = results / "proactive-foreign.txt"
-    foreign.write_text("[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
+    publish_result(foreign, "[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
 
     # D7 header form: parse_markers peels `**[core: N]**` before the marker, so a
     # raw first-line regex misses it and Discord claims another bridge's file.
     d7 = results / "proactive-d7.txt"
-    d7.write_text("**[core: 2]**\n[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
+    publish_result(d7, "**[core: 2]**\n[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
 
     async def one_pass():
         try:
@@ -100,7 +102,7 @@ try:
 
     # Positive control: the check must not over-fire on a real Discord target.
     native = results / "proactive-native.txt"
-    native.write_text("[channel: 1530802402603700415]\nchannel body\n")
+    publish_result(native, "[channel: 1530802402603700415]\nchannel body\n")
     asyncio.run(one_pass())
     check(not native.exists(),
           "a DISCORD-shaped target is still claimed (the check does not over-fire)")

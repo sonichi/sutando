@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import os
 import pathlib
 import sys
@@ -66,7 +68,7 @@ def main() -> int:
     # sees, with no timing involved.
     box = pathlib.Path(tempfile.mkdtemp(prefix="empty-result-"))
     target = box / "r.txt"
-    target.write_text("a previous, complete result")
+    publish_result(target, "a previous, complete result")
     fh = open(target, "w")                      # truncate-at-open, nothing written yet
     try:
         mid_write_exists = target.exists()
@@ -115,7 +117,8 @@ def main() -> int:
         # Emptiness lives in the shared read_ready_result owner, so assert that
         # spelling: the contract moved, and the assertion follows it rather than loosening.
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
-              "read_ready_result(result_file)" in src
+              "read_ready_result(" in src
+              and "reply_text = read_ready_result(result_file)" in src
               and "if reply_text is None:" in src and src.count("continue") > 0,
               "the partial-write guard was removed")
 

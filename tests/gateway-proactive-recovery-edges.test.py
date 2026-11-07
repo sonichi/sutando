@@ -30,11 +30,13 @@ Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
 from __future__ import annotations
 
+
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 import json
@@ -80,7 +82,7 @@ def die_as_restart(lane, item_id: str) -> None:
     claim_file = vendored._claim_path(lane.results / ".outbox-ag2space-proactive", item_id)
     if claim_file.exists():
         data = json.loads(claim_file.read_text())
-        claim_file.write_text(json.dumps({**data, "pid": dead.pid, "start_usec": None,
+        publish_result(claim_file, json.dumps({**data, "pid": dead.pid, "start_usec": None,
                                           "claimed_at": data["claimed_at"] - 3600}))
     for c in lane.results.glob("proactive-*.sending.*"):
         c.rename(lane.results / (c.name.split(".sending.")[0] + ".txt"))
@@ -427,7 +429,7 @@ def newer_body_survives_archive_failure() -> None:
     def rename(self, target):
         if ".sending." in self.name and Path(target).parent.name == "archive" and not failed:
             failed.append(True)
-            (lane.results / "proactive-10.txt").write_text("body B\n", encoding="utf-8")
+            publish_result(lane.results / "proactive-10.txt", "body B\n", encoding="utf-8")
             raise OSError("archive unavailable")
         return real(self, target)
     Path.rename = rename
@@ -496,7 +498,7 @@ def retained_claim_survives_next_drain() -> None:
     def respond(payload):
         calls["n"] += 1
         if calls["n"] == 1:
-            (lane.results / "proactive-14r.txt").write_text("body B\n", encoding="utf-8")
+            publish_result(lane.results / "proactive-14r.txt", "body B\n", encoding="utf-8")
             raise urllib.error.HTTPError("https://gw.example/relay/v1/room", 429, "slow", {}, None)
         return {"ok": True, "event_id": f"$e{calls['n']}"}
     lane.respond = respond
@@ -521,7 +523,7 @@ def torn_claim_then_moved_dm() -> None:
         root = lane.results / ".outbox-ag2space-proactive"
         cp = vendored._claim_path(root, item_id)
         cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text("")
+        publish_result(cp, "")
         old = gb.time.time() - age
         _os.utime(cp, (old, old))
         lane.owner_dm = f"!Moved{stem}:ag2.space"
@@ -557,7 +559,7 @@ def malformed_and_unknown_claims() -> None:
         item_id = gb._proactive_item_id(stem, "sixteen")
         cp = vendored._claim_path(lane.results / ".outbox-ag2space-proactive", item_id)
         cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(json.dumps({"item_id": item_id, "drainer_id": "x", "pid": pid, "claimed_at": "not-a-time"}))
+        publish_result(cp, json.dumps({"item_id": item_id, "drainer_id": "x", "pid": pid, "claimed_at": "not-a-time"}))
         old = gb.time.time() - 3600
         _os.utime(cp, (old, old))
         lane.owner_dm = f"!Moved{stem}:ag2.space"
@@ -631,7 +633,7 @@ def upgrade_park_refused() -> None:
 def restore_refuses_empty_digest() -> None:
     results = pl.scratch("restore-empty-")
     (results / "undelivered").mkdir()
-    (results / "undelivered" / "proactive-x-1.txt").write_text("x\n")
+    publish_result(results / "undelivered" / "proactive-x-1.txt", "x\n")
     try:
         out = undelivered_quarantine.restore(results, "proactive-x", body_sha256="")
         refused_it = False

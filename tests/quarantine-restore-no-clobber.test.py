@@ -18,6 +18,8 @@ import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from result_publish import publish_text
 _spec = importlib.util.spec_from_file_location(
     "undelivered_quarantine", ROOT / "src" / "undelivered_quarantine.py")
 uq = importlib.util.module_from_spec(_spec)
@@ -34,8 +36,66 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
 
     def _quarantine(self, task_id, body, when):
         p = self.results / uq.DIRNAME / uq.quarantine_name(f"task-{task_id}", when)
-        p.write_text(body, encoding="utf-8")
+        live = self.results / f"task-{task_id}.txt"
+        publish_text(live, body, pair_result=True)
+        live.rename(p)
         return p
+
+    def test_unreadable_quarantined_bytes_stay_quarantined(self):
+        source = self._quarantine("invalid", "original", 1)
+        source.write_bytes(b"\xff")
+        outcome, path = uq.restore(self.results, "invalid")
+        self.assertIs(outcome, uq.RestoreOutcome.UNPAIRED)
+        self.assertEqual(path, source)
+        self.assertEqual(source.read_bytes(), b"\xff")
+        self.assertFalse((self.results / "task-invalid.txt").exists())
+
+    def test_rebinding_never_clobbers_a_live_target(self):
+        source = self._quarantine("source", "original", 1)
+        target = self.results / "task-target.txt"
+        publish_text(target, "new answer", pair_result=True)
+        with self.assertRaises(FileExistsError):
+            uq.rebind_verified(source, target)
+        self.assertEqual(target.read_text(), "new answer")
+        self.assertEqual(source.read_text(), "original")
+
+    def test_rebinding_unreadable_source_never_publishes(self):
+        source = self._quarantine("source", "original", 1)
+        source.write_bytes(b"\xff")
+        target = self.results / "task-target.txt"
+        self.assertFalse(uq.rebind_verified(source, target))
+        self.assertTrue(source.exists())
+        self.assertFalse(target.exists())
+
+    def test_missing_receipt_is_not_backfilled(self):
+        p = self.results / uq.DIRNAME / uq.quarantine_name("task-raw", 1)
+        p.write_text("unverified legacy result")
+        outcome, path = uq.restore(self.results, "raw")
+        self.assertIs(outcome, uq.RestoreOutcome.UNPAIRED)
+        self.assertEqual(path, p)
+        self.assertTrue(p.exists())
+        self.assertFalse((self.results / "task-raw.txt").exists())
+
+    def test_rebinding_requires_the_source_generation_proof(self):
+        source = self._quarantine("reask", "verified answer", 1)
+        target = self.results / "task-original.txt"
+        self.assertTrue(uq.rebind_verified(source, target))
+        from result_ready import read_ready_result
+        self.assertEqual(read_ready_result(target), "verified answer")
+        source.write_text("unverified replacement")
+        target.unlink()
+        self.assertFalse(uq.rebind_verified(source, target))
+        self.assertFalse(target.exists())
+
+    def test_restore_promotes_the_verified_older_generation(self):
+        self._quarantine("old", "older result", 1)
+        live = self.results / "task-old.txt"
+        publish_text(live, "newer result", pair_result=True)
+        live.unlink()
+        outcome, _ = uq.restore(self.results, "old")
+        from result_ready import read_ready_result
+        self.assertIs(outcome, uq.RestoreOutcome.RESTORED)
+        self.assertEqual(read_ready_result(live), "older result")
 
     def test_a_reply_written_inside_the_window_survives(self):
         """A producer lands a newer reply at the canonical name in the instant

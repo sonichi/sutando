@@ -23,6 +23,7 @@ Run: python3 tests/gateway-signal-task-media.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import io
 import json
@@ -35,6 +36,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -111,7 +113,7 @@ class TaskMediaRoute(unittest.TestCase):
                 "thread_root": "$root:server", "source_room_id": "!room:server"}
 
     def _result(self, mod, tid: str, body: str) -> None:
-        (mod.RESULTS_DIR / f"{tid}.txt").write_text(body)
+        publish_result(mod.RESULTS_DIR / f"{tid}.txt", body)
 
     def _media_posts(self):
         return [c for c in self.calls if "/media" in c[1]]
@@ -301,7 +303,7 @@ class TaskMediaRoute(unittest.TestCase):
         holder = "task-22d83e59601f3a1fef"
         mod._write_task(self._team_signal_task("task-team-rq"))
         mod.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt").write_text("")
+        publish_result(mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt", "")
         self._result(mod, "task-team-rq", f"[deduped: {holder}]")
         inflight = {"task-team-rq"}
         mod._post_ready_results(inflight)
@@ -422,7 +424,7 @@ class TaskMediaRoute(unittest.TestCase):
         mod._write_task(self._signal_task("task-requeue"))
         # The holder delivered nothing, so the plan re-asks rather than honouring.
         mod.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt").write_text("")
+        publish_result(mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt", "")
         self._result(mod, "task-requeue", f"[deduped: {holder}]")
         inflight = {"task-requeue"}
         mod._post_ready_results(inflight)

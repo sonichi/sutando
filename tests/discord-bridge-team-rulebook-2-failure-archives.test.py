@@ -18,7 +18,7 @@ from pathlib import Path
 SRC = (Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py").read_text()
 
 
-ANCHOR = ("then write exactly `[no-send]` to results/task-{id}.txt "
+ANCHOR = ("then publish exactly `[no-send]` through the RESULT PUBLICATION command "
           "so the task archives")
 REVERTED = "and do NOT write results/task-{id}.txt"
 
@@ -34,7 +34,7 @@ class Block2FailureArchives(unittest.TestCase):
         b = block_2(SRC)
         self.assertIn("On FAILURE", b)
         self.assertIn("[no-send]", b)
-        self.assertIn("results/task-{id}.txt", b)
+        self.assertIn("RESULT PUBLICATION command", b)
 
     def test_the_failure_fallback_no_longer_forbids_the_task_result(self):
         self.assertNotIn("do NOT write results/task-{id}.txt", block_2(SRC))

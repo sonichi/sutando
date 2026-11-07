@@ -145,7 +145,7 @@
    ],
    "status": "active",
    "canonical_for": "delivery_core file-protocol transitions, fencing, crash matrix, support boundary, GC status",
-   "last_verified": "2026-08-22"
+   "last_verified": "2026-11-06"
   },
   "docs/design-core-health-verdict.md": {
    "title": "Core health verdict + severity gate",

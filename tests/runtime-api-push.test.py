@@ -4,7 +4,9 @@ NEW result to every subscriber, skips the boot-seeded backlog, and drops dead
 writers without wedging. Tests the extracted one-pass step (_emit_new_results)
 so it needs no live socket."""
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -55,10 +57,10 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pushes_new_skips_seed_drops_dead_no_repush(self):
         good, dead = _FakeWriter(), _FakeWriter(dead=True)
         self.srv._subscribers = {good, dead}
-        (self.results / "task-rtapi-old.txt").write_text("old")     # pre-existing
+        publish_result(self.results / "task-rtapi-old.txt", "old")     # pre-existing
         seen = {f.name for f, _ts in self.tv._result_files()}            # seeded
 
-        (self.results / "task-rtapi-new.txt").write_text("hello stream")  # new
+        publish_result(self.results / "task-rtapi-new.txt", "hello stream")  # new
         await self.srv._emit_new_results(self.tv, seen)
         # good got exactly the new result, as a NO-ID notification
         self.assertEqual(len(good.frames), 1)
@@ -81,11 +83,11 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
         w = _FakeWriter()
         self.srv._subscribers = {w}
         self.srv.dispatcher = type("_D", (), {"tasks": self.tv})()
-        (self.results / "task-rtapi-boot.txt").write_text("   ")      # unready
-        (self.results / "task-rtapi-done.txt").write_text("ALREADY DONE")
+        publish_result(self.results / "task-rtapi-boot.txt", "   ")      # unready
+        publish_result(self.results / "task-rtapi-done.txt", "ALREADY DONE")
         watcher = asyncio.create_task(self.srv._results_watcher())
         await asyncio.sleep(0.05)                                     # seed runs
-        (self.results / "task-rtapi-boot.txt").write_text("BOOT ANSWER")
+        publish_result(self.results / "task-rtapi-boot.txt", "BOOT ANSWER")
         await asyncio.sleep(0.10)                                     # poll pass
         watcher.cancel()
         try:
@@ -102,7 +104,7 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
         good = _FakeWriter()
         self.srv._subscribers = {good}
         seen = {f.name for f, _ts in self.tv._result_files()}
-        (self.results / "task-1234567890.txt").write_text("a room reply")
+        publish_result(self.results / "task-1234567890.txt", "a room reply")
         await self.srv._emit_new_results(self.tv, seen)
         self.assertEqual(good.frames, [])  # not streamed
 

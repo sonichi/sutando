@@ -26,6 +26,8 @@ Run: python3 tests/stop-hook-emits-valid-json.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import json
 import os
 import pathlib
@@ -170,7 +172,10 @@ def _test_result_readiness_matches_the_delivery_owner() -> None:
         (ws / "tasks" / "task-1.txt").write_text("id: task-1\ntask: answer me\n")
         stub = _stub(ws)
         for body, should_block, label in cases:
-            (ws / "results" / "task-1.txt").write_bytes(body)
+            if should_block:
+                (ws / "results" / "task-1.txt").write_bytes(body)
+            else:
+                publish_result(ws / "results" / "task-1.txt", body.decode("utf-8"))
             out = subprocess.run(["/bin/bash", str(stub)], capture_output=True,
                                  text=True, stdin=subprocess.DEVNULL, env=env)
             assert out.returncode == 0, f"{label}: hook exited {out.returncode}"

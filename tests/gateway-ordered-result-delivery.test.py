@@ -33,6 +33,8 @@ from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 gw, _READS = isolate_then_import(env={"REMOTE_TASK_LIFECYCLE_V2": "1", "REMOTE_TASK_TURN_CONTEXT": "1"})
 assert gw._ATTEMPTS.take_ownership()
 
+from _helpers.paired_result import publish_result  # noqa: E402
+
 BURST_ONLY = "--burst-only"
 ROOM_A, ROOM_B = "!room-a:example.org", "!room-b:example.org"
 
@@ -84,9 +86,7 @@ class Harness(unittest.TestCase):
         self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L1"))
 
     def core_writes(self, tid, text):
-        tmp = gw.RESULTS_DIR / f".{tid}.core"
-        tmp.write_text(text)
-        os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", text)
 
     def drain(self, inflight):
         th = threading.Thread(target=gw._post_ready_results, args=(inflight,))
@@ -96,6 +96,18 @@ class Harness(unittest.TestCase):
 
 
 class Ordered(Harness):
+    def test_room_order_uses_only_the_requested_tasks_verified_result(self):
+        tid = "task-room-proof"
+        path = gw.RESULTS_DIR / f"{tid}.txt"
+        rooms = {tid: ROOM_A, "task-other-proof": ROOM_A}
+        path.write_text("unpaired")
+        self.assertIsNone(gw._reply_room(tid, path, rooms))
+        self.core_writes(tid, "verified answer")
+        self.assertEqual(gw._reply_room(tid, path, rooms), ROOM_A)
+        self.assertIsNone(gw._reply_room("task-other-proof", path, rooms))
+        path.write_text("substituted")
+        self.assertIsNone(gw._reply_room(tid, path, rooms))
+
     def test_a_burst_ready_in_one_pass_is_posted_in_intake_order(self):
         # Taken in descending id order, so neither id order nor set order can pass by chance.
         tids = [f"task-burst-{n:02d}" for n in range(9, -1, -1)]

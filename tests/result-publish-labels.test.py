@@ -56,9 +56,9 @@ class Publish(unittest.TestCase):
         seen = []
         real = self.rp.publish_text
 
-        def publish(path, text, *a):
+        def publish(path, text, *a, **kw):
             seen.append(self.side_doc(text))
-            return real(path, text, *a)
+            return real(path, text, *a, **kw)
         with patch.object(self.rp, 'publish_text', publish):
             code, err = self.run_cli('Done.', '--title', 'Add the two numbers',
                                      '--outcome', 'Replied with 4')
@@ -68,7 +68,7 @@ class Publish(unittest.TestCase):
 
     def test_no_flags_publish_as_before(self):
         self.assertEqual(self.run_cli('Done.'), (0, ''))
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['task-1.txt'])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['.result-pairing', 'task-1.txt'])
         self.assertEqual(self.result.read_text(), 'Done.')
 
     def test_a_result_without_labels_never_takes_an_earlier_attempts(self):

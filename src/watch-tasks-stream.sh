@@ -596,9 +596,8 @@ publish_terminal_failure() {
   temporary="$(mktemp "$RESULTS_DIR/.$filename.XXXXXX.tmp")" || return 1
   chmod 600 "$temporary" 2>/dev/null || true
   printf '%s\n' "I $TERMINAL_REFUSAL_MARK this Team-tier task because the restricted runtime $reason. No unrestricted fallback was used." > "$temporary"
-  # `ln` is the only write to the destination: it establishes ownership or fails.
-  # Reading then mutating a path a provider can still claim has no safe ordering.
-  if ln "$temporary" "$result" 2>/dev/null; then
+  # The shared publisher pairs the body and refuses an occupied destination.
+  if PYTHONPATH="$__SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" "${SUTANDO_PY_BIN:-python3}" -c 'import sys; from result_publish import publish_staged; publish_staged(sys.argv[1], sys.argv[2], no_replace=True, pair_result=True)' "$temporary" "$result" 2>/dev/null; then
     rc=0
     # The scheduler's FAILED: the task ends here, whatever a provider observed.
     ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$payload" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
@@ -697,7 +696,8 @@ handler_result_is_answer() {
   ready="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" find-ready "$RESULTS_DIR" "$filename" 2>/dev/null)" || return 1
   # The FIRST line, anchored: an answer that merely mentions the phrase is an
   # answer, and mistaking it for a refusal re-runs work that already completed.
-  IFS= read -r first < "$ready" || first=""
+  first="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/result_write.py" read "$ready" 2>/dev/null)" || return 1
+  first="${first%%$'\n'*}"
   case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
   return 0
 }

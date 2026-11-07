@@ -352,8 +352,8 @@ from .delivery_core import is_refused_for_good
 from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
-from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
-                           ready_body_of, ResultIdentity)
+from .result_ready import (read_ready_result, read_ready_result_with_identity,
+                           ResultIdentity)
 from . import result_disposal as disposal
 from .result_publish import (is_staged_for as _is_staged_for, publish_staged as _publish_staged_whole,
                              stage_text as _stage_text)
@@ -658,7 +658,7 @@ def _stage_durable(path: Path, text: str) -> "Path | None":
 def _publish_staged(tmp: Path, path: Path) -> bool:
     """Rename a staged file into place through the shared publisher."""
     try:
-        _publish_staged_whole(tmp, path)
+        _publish_staged_whole(tmp, path, pair_result=path.parent == RESULTS_DIR)
         return True
     except Exception as exc:  # noqa: BLE001
         _log(f"durable publish failed for {path.name} ({diagnostics.describe(exc)})")
@@ -681,7 +681,7 @@ def _write_if_absent(path: Path, text: str, claim=None) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file
     already was (it wins), False on an error or a refused `claim`, with nothing left at `path`."""
     try:
-        return task_attempts.write_if_absent(path, text, claim)
+        return task_attempts.write_if_absent(path, text, claim, pair_result=path.parent == RESULTS_DIR)
     except OSError as exc:
         _log(f"could not write {path.name} ({diagnostics.describe(exc)})")
         return False
@@ -4504,7 +4504,7 @@ def _publish_task_steps_snapshot(inflight: set[str], live: "set[str] | None" = N
         if not gateway_instance.owns(tid, GATEWAY_INSTANCE):
             continue
         wire = _broker_tid(tid)
-        if not _valid_tid(wire) or (RESULTS_DIR / f"{tid}.txt").exists():
+        if not _valid_tid(wire) or read_ready_result(RESULTS_DIR / f"{tid}.txt") is not None:
             continue
         if _ATTEMPTS is not None:
             rec = _ATTEMPTS.entry(wire)
@@ -4527,7 +4527,7 @@ def _publish_task_steps_snapshot(inflight: set[str], live: "set[str] | None" = N
                       "room_id": headers.get("source_room_id") or headers.get("channel_id")}
     _STEP_PUBLISHER.status_of = TASK_STATUS
     _STEP_PUBLISHER.publish(tasks, open_now=lambda tid: (live is None or tid in live)
-                            and not (RESULTS_DIR / f"{tid}.txt").exists())
+                            and read_ready_result(RESULTS_DIR / f"{tid}.txt") is None)
 
 
 def _claim_ack(wire_tid: str, lease_id: "str | None", local: "str | None" = None, durable: bool = False,
@@ -5283,7 +5283,7 @@ def _watch_dispatch(t) -> None:
     then went quiet for STALLED_S with no result. Its beats stop; the failure is posted."""
     tid = _run_tid(t.wire, t.rec)
     pending = _task_pending(tid)
-    answered = _on_disk(RESULTS_DIR / f"{tid}.txt") is not False or _own_copy_exists(tid)
+    answered = read_ready_result(RESULTS_DIR / f"{tid}.txt") is not None or _own_copy_exists(tid)
     activity = task_attempts.last_activity(_STATE, tid)
     if t.dispatch_lost_due(pending or answered, activity):
         _fail_unanswered(t, tid, DISPATCH_LOST_RESULT, "its task file left the queue unanswered, "
@@ -5332,11 +5332,11 @@ def _resolve_stop(t) -> None:
     ctl = rec.get("stop_ctl") if isinstance(rec, dict) else None
     if not (ctl and rec.get("stop_requested")):
         return
-    if not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
+    if not (read_ready_result(RESULTS_DIR / f"{ctl}.txt") is not None or _delivered_copy_exists(ctl)):
         return                                  # the core has not reached the control task yet
     tid = _run_tid(t.wire, rec)
     if _on_disk(RESULTS_DIR / f"{tid}.txt") is not False:
-        return                                  # delivery rules: a reply posts, nothing to send stops
+        return                                  # occupied: delivery decides; do not rule an unreadable reply stopped
     t.stop_outcome(stopped=not _own_copy_exists(tid))
 
 
@@ -6060,9 +6060,8 @@ def _settle_as_handled(tid: str) -> bool:
     """Answer a task this node will not queue with the redelivery control result; True when durable."""
     rfile = RESULTS_DIR / f"{tid}.txt"
     if rfile.exists():
-        # A reply the local core wrote with a plain write_text: this process
-        # has committed nothing yet, so fsync before claiming durable.
-        return _fsync_in_place(tid, rfile, RESULTS_DIR)
+        # Occupied but unpaired is not completion, and must not be overwritten.
+        return read_ready_result(rfile) is not None and _fsync_in_place(tid, rfile, RESULTS_DIR)
     durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
     # Provenance the result BODY cannot carry: a Team runtime controls
     # the body and can emit these exact bytes, but not this process's set.
@@ -6963,7 +6962,10 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
             continue
         try:
             with disposal.locked(RESULTS_DIR):
-                undelivered_quarantine.rename_noreplace(copy, target, _log)
+                if not undelivered_quarantine.rebind_verified(
+                        copy, target, lambda src, dst: undelivered_quarantine.rename_noreplace(src, dst, _log)):
+                    _log(f"result {local}: its quarantined copy has no matching receipt; left in place")
+                    continue
         except FileExistsError as e:
             _log(f"result {local}: its parked relay result stays as {copy.name}: "
                  + ("this platform has no no-replace rename" if undelivered_quarantine.no_primitive(e)
@@ -7842,6 +7844,8 @@ def _run_holds_result(tid: str, rfile: Path) -> "bool | None":
     if not at_name:
         return True                             # nothing at the name: the settle path decides
     _, generation = _read_ready_generation(rfile)
+    if generation is None:
+        return None
     why = ("its run was closed before this result was written" if mapping is not None
            else "no run of this task has this id")
     return False if _quarantine_orphan(rfile, tid, why, generation) else None
@@ -8118,7 +8122,7 @@ def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
         return None
     if not tid:
         return None
-    if (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid):
+    if read_ready_result(RESULTS_DIR / f"{tid}.txt") is not None or _delivered_copy_exists(tid):
         return "the task has been answered"
     held = task_hold.line_veto(RESULTS_DIR, tid, about_task_ts(item_id.rsplit("~", 1)[0] + ".txt"))
     if held is not None:
@@ -8325,7 +8329,10 @@ def _post_proactive() -> None:
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
         try:
-            route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
+            peek = read_ready_result(f)
+            if peek is None:
+                continue
+            route, peek_room, _ = _proactive_route(peek)
         except OSError:
             continue  # racing consumer already claimed it
         if route == "foreign":
@@ -8634,11 +8641,11 @@ def _holder_delivery_state(holder_id: str) -> str:
     if body is None:
         for path in candidates:
             if path is not None:
-                body = read_ready_result(path)
+                body = read_ready_result(path, task_id=holder_id)
                 if body:
                     break
     return classify_holder_delivery(record, body,
-                                    (RESULTS_DIR / f"{holder_id}.txt").exists())
+                                    read_ready_result(RESULTS_DIR / f"{holder_id}.txt") is not None)
 
 
 def _reask_id(tid: str) -> str:
@@ -9792,9 +9799,8 @@ def _reply_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> "str | None":
     """The room tid's written reply takes a place in; None with no reply yet or one that posts nothing."""
     if not rooms.get(tid):
         return None
-    try:
-        raw = rfile.read_text(errors="replace")
-    except OSError:
+    raw = read_ready_result(rfile, task_id=tid)
+    if raw is None:
         return None
     return _ordered_room(tid, raw, rooms)
 
@@ -10205,15 +10211,12 @@ def _delivered_copy_exists(tid: str) -> bool:
     replies to re-delivery (peer-measured 4/50 on a live corpus)."""
     # The id boundary must be unambiguous: a bare `{tid}-*` glob also matches
     # a LONGER valid id's archive entry, so `task-a` reads as delivered.
-    if any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
-           for p in ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
-        return True
-    if (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists():   # flat bare: retired writer
-        return True
-    if any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")):
-        return True
-    return any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
-               for p in ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
+    candidates = [ARCHIVE_RESULTS_DIR / f"{tid}.txt"]
+    candidates.extend(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt"))
+    for pattern in (f"{tid}-*.txt", f"*/{tid}-*.txt"):
+        candidates.extend(p for p in ARCHIVE_RESULTS_DIR.glob(pattern)
+                          if _ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):]))
+    return any(read_ready_result(path, task_id=tid) is not None for path in candidates)
 
 
 def _names(base: str, tries: int = 64):
@@ -10300,6 +10303,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # and waits while that cannot be told; it is never relabelled or quarantined here.
         if _relay_orphan(tid, inflight) is not False:
             continue
+        ready = read_ready_result_with_identity(rfile)
+        if ready is None:
+            continue
         task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is not None:
             try:
@@ -10313,15 +10319,11 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 continue
             if headers.get("source") == task_attempts.CONTROL_SOURCE:
                 try:
-                    _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, tid, identity_of(rfile)[1])
+                    _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, tid, ready.identity)
                 except OSError:
                     pass
                 continue
-        # One open decides every arm below, and only that generation is retired.
-        try:
-            data, generation = identity_of(rfile)
-        except OSError:
-            continue
+        generation = ready.identity
         age = now - generation.mtime_ns / 1e9
         if age < ORPHAN_GRACE_S:
             continue                            # young: normal path may claim it
@@ -10338,7 +10340,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
             _delivery = _delivery_tid(tid)
-            raw = ready_body_of(data)
+            raw = ready.body
             if _delivery is None or raw is None:
                 continue                        # ledger unreadable or not ready: a later sweep decides
             _item = _broker_tid(_delivery)
@@ -10366,7 +10368,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        raw = ready_body_of(data)
+        raw = ready.body
         if raw is None:
             continue                            # blank or a partial write: readable on a later pass
         delivery = _delivery_tid(tid)

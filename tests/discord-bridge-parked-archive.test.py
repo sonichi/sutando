@@ -7,7 +7,9 @@ The pass must finish the archive; a claim merely HELD elsewhere must not.
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -82,7 +84,7 @@ class ParkedArchiveTest(unittest.TestCase):
         tasks.mkdir(parents=True)
         (tasks / f"{TID}.txt").write_text(
             f"id: {TID}\nsource: x\naccess_tier: owner\ntask: hi\n")
-        (results / f"{TID}.txt").write_text("a reply body")
+        publish_result(results / f"{TID}.txt", "a reply body")
         prepare(results)
         db.RESULTS_DIR, db.TASKS_DIR = results, tasks
         db.ARCHIVE_RESULTS_DIR = results / "archive"

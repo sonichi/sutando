@@ -19,6 +19,7 @@ Run: python3 tests/gateway-channel-skip-owner.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import os
@@ -27,6 +28,7 @@ import time
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -85,7 +87,7 @@ def main() -> int:
     h = Harness()
     h.task("task-cs-d")
     rfile = h.mod.RESULTS_DIR / "task-cs-d.txt"
-    rfile.write_text(f"[channel: {OTHER}]\n[no-send]\nvisible\n")
+    publish_result(rfile, f"[channel: {OTHER}]\n[no-send]\nvisible\n")
     old = time.time() - h.mod.ORPHAN_GRACE_S - 60
     os.utime(rfile, (old, old))
     h.mod._last_orphan_sweep = 0.0
@@ -101,7 +103,7 @@ def main() -> int:
     h = Harness()
     (h.ws / "state" / "last-owner-activity.json").write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "t"}))
-    (h.mod.RESULTS_DIR / "proactive-1.txt").write_text(f"[channel: {ROOM}]\n[no-send]\nvisible\n")
+    publish_result(h.mod.RESULTS_DIR / "proactive-1.txt", f"[channel: {ROOM}]\n[no-send]\nvisible\n")
     h.mod._post_proactive()
     posts = [c[2] for c in h.calls if c[1] == "/v1/room" and (c[2] or {}).get("op") == "message"]
     check(posts == [], f"e) proactive: nothing posted; got {posts}")

@@ -17,6 +17,7 @@ import io
 import multiprocessing
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -65,6 +66,19 @@ def _poll_sizes(results: str, expected: int, stop_at: float, out) -> None:
 
 
 class PublisherContract(unittest.TestCase):
+    def test_prompt_command_quotes_paths_and_publishes_verified_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "space ' and $literal" / "results" / "task-1.txt"
+            command = result_publish.publication_command(path)
+            self.assertEqual(shlex.split(command)[-1], str(path))
+            run = subprocess.run(shlex.split(command), input="answer\n", text=True, capture_output=True,
+                                 env=isolated_child_env())
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(read_ready_result(path), "answer")
+            prompt = result_publish.publication_instruction(path)
+            self.assertIn(command, prompt)
+            self.assertIn("pairing receipts", prompt)
+
     def test_publishes_the_exact_body_and_nothing_else(self):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "results" / "task-1.txt"
@@ -199,9 +213,14 @@ class PublishClearsDelegation(unittest.TestCase):
 
     def test_publishing_the_result_clears_its_marker_only(self):
         mine, other = self.td.mark(self.ws, self.tid, 60), self.td.mark(self.ws, "task-other-1", 60)
-        result_publish.publish_text(self.ws / "results" / f"{self.tid}.txt", "done")
+        target = self.ws / "results" / f"{self.tid}.txt"
+        result_publish.publish_text(target, "done")
         self.assertFalse(mine.exists())
         self.assertTrue(other.exists())
+        from delivery.readiness import read_ready_result
+        self.assertEqual(read_ready_result(target), "done")
+        target.write_text("substituted")
+        self.assertIsNone(read_ready_result(target))
 
     def test_a_staged_publish_clears_it_too(self):
         marker = self.td.mark(self.ws, self.tid, 60)
@@ -220,7 +239,10 @@ class PublishClearsDelegation(unittest.TestCase):
 
     def test_an_invalid_id_clears_nothing(self):
         with mock.patch.object(self.td, "clear") as clear:
-            result_publish.publish_text(self.ws / "results" / "..txt", "x")
+            invalid = self.ws / "results" / "task-.txt"
+            with self.assertRaises(ValueError):
+                result_publish.publish_text(invalid, "x")
+            self.assertFalse(invalid.exists())
             result_publish.publish_text(self.ws / "results" / "task-a.md", "x")
         clear.assert_not_called()
 
@@ -399,6 +421,16 @@ _OLD_TS_CANCEL = "writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.
 
 
 class DelegationTest(unittest.TestCase):
+    def test_chat_prompts_delegate_all_result_publication(self):
+        for name in ("discord", "slack", "telegram"):
+            source = (REPO / "src" / f"{name}-bridge.py").read_text()
+            self.assertIn("publication_instruction(RESULTS_DIR", source)
+        discord = (REPO / "src" / "discord-bridge.py").read_text()
+        self.assertNotRegex(discord, r"Stage 2:.*: mv ")
+        self.assertIn("{result_command} < {staging_path}", discord)
+        self.assertIn("{proactive_command}", discord)
+        self.assertIn("only the shared publisher may update its own pairing receipts", discord)
+
     def test_every_writer_reaches_the_publisher(self):
         for rel, needle in {**WRITERS, **VIA_LOCAL_RECORD}.items():
             with self.subTest(writer=rel):
@@ -433,7 +465,7 @@ class DelegationTest(unittest.TestCase):
     def test_bridge_stage_and_publish_delegate(self):
         src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text(encoding="utf-8")
         self.assertIn("return _stage_text(path, text)", src)
-        self.assertIn("_publish_staged_whole(tmp, path)", src)
+        self.assertIn("_publish_staged_whole(tmp, path, pair_result=", src)
         self.assertNotIn("uuid.uuid4().hex}.tmp\")\n        with open(tmp", src)
 
     def test_ts_cancel_writes_no_result_body_directly(self):
@@ -450,7 +482,7 @@ class DelegationTest(unittest.TestCase):
         src = (REPO / "src" / "result_publish.py").read_text(encoding="utf-8")
         for line in src.splitlines():
             if line.startswith(("import ", "from ")) and "__future__" not in line:
-                self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib"), line)
+                self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib", "shlex"), line)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -29,8 +30,8 @@ describe('result watcher vs a bridge-destined proactive file', () => {
 	it('speaks and archives the untagged control, leaves the .to-ag2space ask in place, unspoken', async () => {
 		const destined = 'proactive-ask-1800000000000-7-abcdef.to-ag2space.txt';
 		const control = 'proactive-ask-1800000000001-7-abcdef.txt';
-		writeFileSync(join(RESULT_DIR, destined), '[channel: !room:ag2.space]\nQuestion for you: ship it?\n');
-		writeFileSync(join(RESULT_DIR, control), '[dm-only]\nControl: untagged proactive.\n');
+		publishVerifiedResult(join(RESULT_DIR, destined), '[channel: !room:ag2.space]\nQuestion for you: ship it?\n');
+		publishVerifiedResult(join(RESULT_DIR, control), '[dm-only]\nControl: untagged proactive.\n');
 		const spoken: string[] = [];
 		startResultWatcher((result: string) => { spoken.push(result); }, () => true);
 		assert.ok(await until(() => spoken.some(s => s.includes('Control: untagged')), 8000), `control never spoken: ${JSON.stringify(spoken)}`);

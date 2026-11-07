@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 // The relay agent: the work subagent whose async call returns its task's result, and the voice task
 // table (how each result reached the user, which result answered it) with the reconcile rule over it.
 // Run: npx tsx --test --test-force-exit tests/relay-agent.test.ts
@@ -859,7 +860,7 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 	function finished(text: string, result: string): string {
 		const id = `task-${1_800_000_400_000 + ++seq}`;
 		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${id}.txt`), `id: ${id}\nsource: voice\nchannel_id: local-voice\ntask: ${text}\n`);
-		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), result);
+		publishVerifiedResult(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), result);
 		voiceTaskStore.add(id, text);
 		return id;
 	}
@@ -893,7 +894,7 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 	it('a result still landing in results/ is left to the watcher', () => {
 		const id = `task-${1_800_000_500_000 + ++seq}`;
 		writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR 4100\n`);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 4100 is open.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 4100 is open.');
 		voiceTaskStore.add(id, 'check PR 4100');
 		reconcileVoiceTasks(deliver, () => false);
 		assert.ok(!owed.some((o) => o.taskId === id));
@@ -926,7 +927,7 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 	it('a task whose offline DM copy is still in results/ is not handed over again (the drain speaks it)', () => {
 		const id = `task-${1_800_000_800_000 + ++seq}`;
 		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR 9\n`);
-		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), 'PR 9 status.');
+		publishVerifiedResult(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), 'PR 9 status.');
 		voiceTaskStore.add(id, 'check PR 9');
 		voiceTaskStore.set(id, 'dm');
 		const copy = join(TMP, 'results', `proactive-result-${id}-1800000800.txt`);
@@ -944,8 +945,8 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		const b = `task-${1_800_000_900_000 + ++seq}`;
 		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${a}.txt`), `id: ${a}\nsource: voice\ntask: check PR 5308\n`);
 		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${b}.txt`), `id: ${b}\nsource: voice\ntask: check PR 5309\n`);
-		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${a}.txt`), 'All three: 5308 merged, 5309 ready.');
-		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${b}.txt`), `[deduped: ${a}]`);
+		publishVerifiedResult(join(TMP, 'results', 'archive', MONTH, `${a}.txt`), 'All three: 5308 merged, 5309 ready.');
+		publishVerifiedResult(join(TMP, 'results', 'archive', MONTH, `${b}.txt`), `[deduped: ${a}]`);
 		voiceTaskStore.add(a, 'check PR 5308');
 		voiceTaskStore.add(b, 'check PR 5309');
 		voiceTaskStore.set(a, 'spoken');      // said before the core marked b deduped into it
@@ -961,8 +962,8 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		const b = `task-${1_800_000_900_000 + ++seq}`;
 		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${a}.txt`), `id: ${a}\nsource: voice\ntask: check PR 5318\n`);
 		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${b}.txt`), `id: ${b}\nsource: voice\ntask: check PR 5319\n`);
-		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${a}.txt`), 'Both: 5318 merged, 5319 ready.');
-		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${b}.txt`), `[deduped: ${a}]`);
+		publishVerifiedResult(join(TMP, 'results', 'archive', MONTH, `${a}.txt`), 'Both: 5318 merged, 5319 ready.');
+		publishVerifiedResult(join(TMP, 'results', 'archive', MONTH, `${b}.txt`), `[deduped: ${a}]`);
 		voiceTaskStore.add(a, 'check PR 5318');
 		voiceTaskStore.add(b, 'check PR 5319');
 		voiceTaskStore.setAnsweredBy(b, a);

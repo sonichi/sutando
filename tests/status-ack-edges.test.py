@@ -15,6 +15,7 @@ Run: python3 tests/status-ack-edges.test.py
 """
 from __future__ import annotations
 
+
 import contextlib
 import importlib.util
 import io
@@ -23,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
@@ -61,6 +63,14 @@ def run(lane, **kw):
 
 def main() -> int:
     lane = fresh()
+    raw = lane.results / f"{TID}.txt"
+    raw.write_text("unpaired answer")
+    check(mod.result_state(lane.ws, TID) == "none", "an unpaired answer is not completion")
+    check(not mod._published(lane.ws, raw.name), "an unpaired file is not publication evidence")
+    publish_result(raw, "paired answer")
+    check(mod.result_state(lane.ws, TID) == "answered", "paired answer confirms completion")
+    check(mod._published(lane.ws, raw.name), "paired file confirms publication")
+    lane = fresh()
 
     def broken_probe():
         raise ImportError("no probe")
@@ -71,7 +81,7 @@ def main() -> int:
           f"a) no probe -> nothing said ({r.skipped})")
 
     lane = fresh()
-    (lane.results / f"{TID}.txt.sending.1").write_text("x", encoding="utf-8")
+    publish_result(lane.results / f"{TID}.txt.sending.1", "x", encoding="utf-8")
     r = run(lane)
     check(not r.spoken and "sending" in r.skipped.get(TID, ""), f"b) a result being sent -> no line ({r.skipped})")
     lane = fresh()

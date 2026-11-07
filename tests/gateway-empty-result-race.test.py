@@ -7,12 +7,14 @@ orphaning the real answer written moments later.
 """
 from __future__ import annotations
 
+
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -102,7 +104,7 @@ class GatewayEmptyResultTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with _Harness(self.gw, Path(td)) as h:
                 if contents is not None:
-                    (h.results / f"{TID}.txt").write_text(contents)
+                    publish_result(h.results / f"{TID}.txt", contents)
                 inflight = {TID}
                 self.gw._post_ready_results(inflight)
                 return _Outcome(posts=list(h.posts),
@@ -154,12 +156,12 @@ class GatewayEmptyResultTest(unittest.TestCase):
                 rfile = h.results / f"{TID}.txt"
                 inflight = {TID}
 
-                rfile.write_text("")
+                publish_result(rfile, "")
                 self.gw._post_ready_results(inflight)
                 self.assertEqual(h.posts, [], "first pass delivered the empty file")
                 self.assertIn(TID, inflight, "first pass consumed the in-flight id")
 
-                rfile.write_text(answer)
+                publish_result(rfile, answer)
                 self.gw._post_ready_results(inflight)
                 self.assertEqual(len(h.posts), 1, "second pass did not deliver the answer")
                 self.assertEqual(h.posts[0]["payload"]["body"], answer)

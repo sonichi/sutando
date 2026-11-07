@@ -13,6 +13,8 @@ on the MAIN thread while requests are issued from a worker thread.
 
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import http.server
 import importlib.util
 import json
@@ -57,7 +59,7 @@ def test_result_only_history_uses_archived_task_text():
             "task: original user request\n"
         )
         result_file = api.RESULT_DIR / "task-123.txt"
-        result_file.write_text("Done - result summary\n\nDetails follow.\n")
+        publish_result(result_file, "Done - result summary\n\nDetails follow.\n")
 
         api._remember_done_result_file(result_file)
 
@@ -78,7 +80,7 @@ def test_result_only_history_falls_back_without_task_file():
         api.RESULT_DIR.mkdir(parents=True)
 
         result_file = api.RESULT_DIR / "task-456.txt"
-        result_file.write_text("Done - result summary\n\nDetails follow.\n")
+        publish_result(result_file, "Done - result summary\n\nDetails follow.\n")
 
         api._remember_done_result_file(result_file)
 
@@ -117,7 +119,7 @@ def test_remember_updates_existing_non_done_entry():
         (archive / "task-778.txt").write_text("source: voice\ntask: the original ask\n")
         api.task_history["task-778"] = {"status": "working", "text": "", "source": ""}
         result_file = api.RESULT_DIR / "task-778.txt"
-        result_file.write_text("Done - summarized\n")
+        publish_result(result_file, "Done - summarized\n")
 
         api._remember_done_result_file(result_file)
 
@@ -142,7 +144,7 @@ def test_remember_repairs_done_fallback_on_later_poll():
         api.RESULT_DIR.mkdir(parents=True)
 
         result_file = api.RESULT_DIR / "task-999.txt"
-        result_file.write_text("Done - fallback summary\n\nbody\n")
+        publish_result(result_file, "Done - fallback summary\n\nbody\n")
 
         # Poll 1: task not yet archived → fallback summary used.
         api._remember_done_result_file(result_file)

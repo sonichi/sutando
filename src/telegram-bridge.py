@@ -37,6 +37,7 @@ sys.stderr.reconfigure(line_buffering=True)
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
 # best-effort so the bridge keeps booting if vision_push.py is missing.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from result_publish import publication_instruction  # noqa: E402
 try:
     from vision_push import push_image as _push_vision_image  # type: ignore
 except Exception:  # pragma: no cover — bridge must keep running
@@ -630,7 +631,7 @@ def poll_progress(pending_replies: dict) -> None:
         return
     now = time.time()
     for task_id, chat_id in list(pending_replies.items()):
-        done = (RESULTS_DIR / f"{task_id}.txt").exists()
+        done = read_ready_result(RESULTS_DIR / f"{task_id}.txt") is not None
         info = _progress_msgs.get(task_id)
         if info is not None:
             if info.get("expired"):
@@ -1009,7 +1010,7 @@ def main():  # pragma: no cover
                     attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
                     lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
                     step += 1
-                lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                lines.append(f"{step}. Process transcript and publish the result through the RESULT PUBLICATION command below")
                 tg_skill_hints = "\n" + "\n".join(lines) + "\n"
 
                 # interaction-model 4D, step 1.5: structured media headers
@@ -1031,6 +1032,7 @@ def main():  # pragma: no cover
                     f"priority: {priority}\n"
                     f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
+                    f"{publication_instruction(RESULTS_DIR / f'{task_id}.txt')}"
                     f"{secret_notice}"
                 )
                 # HMAC envelope (#3014 writer census): stamp at this writer's edge,
@@ -1094,7 +1096,9 @@ def main():  # pragma: no cover
                         # Peek before claiming: a body addressed to another bridge
                         # is delivered by that bridge, not sent here as literal text.
                         try:
-                            peek = f.read_text(errors="ignore").lstrip()
+                            peek = read_ready_result(f)
+                            if peek is None:
+                                continue
                         except OSError:
                             continue
                         if not should_claim_proactive_peeked(

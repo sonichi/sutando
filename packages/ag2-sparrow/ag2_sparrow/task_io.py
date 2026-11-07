@@ -13,6 +13,7 @@ import stat
 import sys
 import threading
 import time
+from pathlib import Path
 
 from . import holder_lock, local_task_protocol
 
@@ -78,7 +79,7 @@ def parse_task(path):
     return headers, body, []
 
 
-def write_atomic(path, text):
+def write_atomic(path, text, *, pair_result=False):
     """Write via a sibling temp file and rename; returns the file's mtime, read from the
     temp fd because a drain may claim-rename the result the moment it appears."""
     d = os.path.dirname(path)
@@ -90,7 +91,8 @@ def write_atomic(path, text):
             f.flush()
             os.fsync(f.fileno())
             mtime = os.fstat(f.fileno()).st_mtime
-        os.replace(tmp, path)
+        from .result_publish import publish_staged
+        publish_staged(Path(tmp), Path(path), pair_result=pair_result)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

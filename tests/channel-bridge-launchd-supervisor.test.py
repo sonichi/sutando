@@ -64,7 +64,7 @@ def test_wrapper_restart_signal() -> None:
         (config / "channels" / "slack").mkdir(parents=True)
         workspace.mkdir()
         shutil.copy2(WRAPPER, repo / "src" / "launchd" / WRAPPER.name)
-        for name in ("result_publish.py", "result_labels.py"):
+        for name in ("result_publish.py", "result_write.py", "file_lock.py", "result_labels.py"):
             shutil.copy2(WRAPPER.parents[1] / name, repo / "src")
         (repo / "src" / "slack-bridge.py").write_text("# dummy\n")
         (config / "channels" / "slack" / ".env").write_text("SLACK_BOT_TOKEN=x-test\n")
@@ -127,7 +127,7 @@ def _stage_clean_exit(root, rc=75):
     (config / "channels" / "slack").mkdir(parents=True)
     workspace.mkdir()
     shutil.copy2(WRAPPER, repo / "src" / "launchd" / WRAPPER.name)
-    for name in ("result_publish.py", "result_labels.py"):
+    for name in ("result_publish.py", "result_write.py", "file_lock.py", "result_labels.py"):
         shutil.copy2(WRAPPER.parents[1] / name, repo / "src")
     (repo / "src" / "slack-bridge.py").write_text("# dummy\n")
     (config / "channels" / "slack" / ".env").write_text("SLACK_BOT_TOKEN=x-test\n")

@@ -33,7 +33,7 @@ EOS
   echo "import sys; sys.exit($code)" > "$d/src/remote-gateway-bridge.py"
   # the agent-bridge supervisor the wrapper keeps beside the bridge (its own suite pins it)
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_write.py" "$REPO/src/file_lock.py" "$REPO/src/result_labels.py" "$d/src/"
   # the wrapper calls the literal `python3`; shim it to the resolved interpreter
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
   printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
@@ -99,7 +99,7 @@ EOS
   # each child records the token it was launched with, then exits 0 (relaunch path)
   printf 'import os,sys\nopen("%s/seen.log","a").write(os.environ.get("REMOTE_TASK_TOKEN","<unset>")+"\\n")\nsys.exit(0)\n' "$d" > "$d/src/remote-gateway-bridge.py"
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_write.py" "$REPO/src/file_lock.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
   ( cd "$d"; env -u REMOTE_TASK_TOKEN -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
@@ -130,7 +130,7 @@ EOS
   printf 'import os,sys\nsys.exit(0 if sys.argv[1:] == ["legacy-parked"] and os.path.exists("%s/parked") else 1)\n' "$d" > "$d/scripts/connections.py"
   printf 'import time\nopen("%s/launched.log","a").write("x\\n")\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/remote-gateway-bridge.py"
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_write.py" "$REPO/src/file_lock.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
   touch "$d/parked"

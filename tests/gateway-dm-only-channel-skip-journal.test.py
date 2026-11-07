@@ -21,12 +21,14 @@ Run: python3 tests/gateway-dm-only-channel-skip-journal.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -103,7 +105,7 @@ def main() -> int:
     h = Harness()
     h.task("dj-f")
     rfile = h.mod.RESULTS_DIR / "dj-f.txt"
-    rfile.write_text(f"[channel: {OTHER}]\n[no-send]\nvisible\n", encoding="utf-8")
+    publish_result(rfile, f"[channel: {OTHER}]\n[no-send]\nvisible\n", encoding="utf-8")
     h.mod._quarantine_unsent(rfile, "dj-f", "dj-f")
     lines = [m for m in h.logs if "dj-f" in m]
     check(any("suppressed ([no-send])" in m and "is archived" in m for m in lines),
@@ -114,7 +116,7 @@ def main() -> int:
     h.task("dj-g", tier="team")
     rfile = h.mod.RESULTS_DIR / "dj-g.txt"
     body = f"[dm-only]\n[channel: {OTHER}]\n[no-send]\nvisible\n"
-    rfile.write_text(body, encoding="utf-8")
+    publish_result(rfile, body, encoding="utf-8")
     h.mod._quarantine_unsent(rfile, "dj-g", "dj-g")
     lines = [m for m in h.logs if "dj-g" in m]
     check(any("suppressed ([no-send])" in m for m in lines) and h.archived("dj-g"),

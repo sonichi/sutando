@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests for the durable Codex schedule-crons runner."""
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import json
 import os
@@ -84,7 +86,7 @@ def test_core_loop_completion_and_missing_loop_health():
         assert read_completion(ws, "test-host") is None
         task = next((ws / "tasks").glob("*.txt"))
         (ws / "results").mkdir()
-        (ws / "results" / task.name).write_text("[no-send]\n")
+        publish_result(ws / "results" / task.name, "[no-send]\n")
         with mock.patch.object(scheduler, "write_completion", wraps=scheduler.write_completion) as writer:
             completed = scheduler.tick(ws, "test-host", at(6, 11), include_main_loop=True)
             writer.assert_called_once_with(ws, "test-host", now=at(6, 11).timestamp())
@@ -121,7 +123,7 @@ def test_delayed_result_does_not_claim_a_fresh_pass():
         task = next((ws / "tasks").glob("*.txt"))
         (ws / "results").mkdir()
         result = ws / "results" / task.name
-        result.write_text("[no-send]\n")
+        publish_result(result, "[no-send]\n")
         finished = at(6, 11).timestamp()
         os.utime(result, (finished, finished))
         scheduler.tick(ws, "test-host", at(6, 11) + timedelta(days=1), include_main_loop=True)
@@ -136,7 +138,7 @@ def test_tick_does_not_convert_peer_result_into_local_completion():
         scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
         task = next((ws / "tasks").glob("*.txt"))
         (ws / "results").mkdir()
-        (ws / "results" / task.name).write_text("[no-send]\n")
+        publish_result(ws / "results" / task.name, "[no-send]\n")
         path = ws / "state/schedules/codex-scheduler.json"
         state = json.loads(path.read_text())
         state["host_label"] = "peer-host"
@@ -283,7 +285,7 @@ def test_enqueue_retry_complete_and_no_duplicate():
         task_id = tasks[0].stem
         result = ws / "results" / "archive" / "2026-07" / f"{task_id}.txt"
         result.parent.mkdir(parents=True, exist_ok=True)
-        result.write_text("[no-send]\n")
+        publish_result(result, "[no-send]\n")
         done = scheduler.tick(ws, "test-host", at(6, 8))
         assert done["events"] == [{"job": "daily-news", "event": "completed"}]
         state = json.loads((ws / "state" / "schedules" / "codex-scheduler.json").read_text())
@@ -493,9 +495,24 @@ def test_main_dispatch_and_error_handling():
         assert scheduler.main() == 1
 
 
+def test_unpaired_result_never_completes_a_schedule():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        archive = ws / "results" / "archive"
+        archive.mkdir(parents=True)
+        live = ws / "results" / "task-unpaired.txt"
+        live.write_text("raw answer")
+        assert scheduler._find_result(ws, ["task-unpaired"]) is None
+        live.rename(archive / live.name)
+        assert scheduler._find_result(ws, ["task-unpaired"]) is None
+        publish_result(archive / live.name, "paired answer")
+        assert scheduler._find_result(ws, ["task-unpaired"]) == archive / live.name
+
+
 def main():
     tests = [
         test_cron_parser,
+        test_unpaired_result_never_completes_a_schedule,
         test_core_loop_completion_and_missing_loop_health,
         test_worker_loop_does_not_become_core_loop,
         test_peer_or_future_scheduler_state_is_not_healthy,

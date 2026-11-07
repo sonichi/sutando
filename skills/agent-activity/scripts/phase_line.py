@@ -677,7 +677,8 @@ def _ts(value, default: "float | None" = None) -> "float | None":
 
 def _finished(workspace, task_id: str) -> bool:
     """The task has its result (results/<id>.txt) or a done summary in the summaries log's tail."""
-    if (Path(workspace) / "results" / f"{task_id}.txt").exists():
+    from result_ready import read_ready_result
+    if read_ready_result(Path(workspace) / "results" / f"{task_id}.txt") is not None:
         return True
     try:
         with open(Path(workspace) / "state" / "agent-activity.summaries.jsonl", "rb") as f:

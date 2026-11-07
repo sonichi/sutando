@@ -64,6 +64,20 @@ def main() -> int:
             assert stdout.getvalue().startswith("Usage: python3 src/dm-result.py")
             print(f"ok: direct main({flag}) returns before voice/network work")
 
+        with tempfile.TemporaryDirectory() as td:
+            result = Path(td) / "task-raw.txt"
+            result.write_text("unattested reply")
+            dm.sys.argv = [str(SCRIPT), "--file", str(result)]
+            stderr = io.StringIO()
+            try:
+                with redirect_stderr(stderr):
+                    dm.main()
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError("unpaired file must not reach delivery")
+            assert "result not ready or unpaired" in stderr.getvalue()
+
         dm.sys.argv = [str(SCRIPT)]
         stderr = io.StringIO()
         try:

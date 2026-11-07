@@ -40,6 +40,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+from result_publish import publish_text
 from delivery.task_dispatch import (  # noqa: E402
     clear_inflight, inflight_is_live, mark_inflight,
     mark_partial_paste, partial_paste_leftover,
@@ -65,7 +66,17 @@ F = f"{TASK}.txt"
 
 def _write(path: Path, text: str = "done\n") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    root = next((parent for parent in path.parents if parent.name == "results"), None)
+    if root is not None and path.parent != root:
+        tid = re.sub(r"^(task-probe|task-a|task-fx[0-9]+)-[0-9]+$", r"\1", path.stem)
+        live = root / f"{tid}.txt"
+        previous = live.read_text() if live.exists() else None
+        publish_text(live, text)
+        live.rename(path)
+        if previous is not None:
+            publish_text(live, previous)
+    else:
+        publish_text(path, text)
     return path
 
 
@@ -432,7 +443,7 @@ class PendingCandidatesTest(unittest.TestCase):
     def test_completed_task_is_excluded(self):
         self._write_task("task-a.txt")
         self._write_task("task-b.txt")
-        (self.results_dir / "task-a.txt").write_text("done\n")
+        publish_text((self.results_dir / "task-a.txt"), "done\n")
         self.assertEqual(next_pending_task(self.tasks_dir, self.results_dir), "task-b.txt")
 
     def test_zero_byte_result_does_not_suppress_the_task(self):
@@ -457,7 +468,7 @@ class PendingCandidatesTest(unittest.TestCase):
     def test_ready_archive_behind_whitespace_live_placeholder_suppresses_the_task(self):
         self._write_task("task-a.txt")
         _write(self.results_dir / "archive" / "task-a.txt")
-        (self.results_dir / "task-a.txt").write_text("   \n\n")
+        publish_text((self.results_dir / "task-a.txt"), "   \n\n")
         self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
         self.assertIsNone(next_pending_task(self.tasks_dir, self.results_dir))
 
@@ -485,7 +496,7 @@ class PendingCandidatesTest(unittest.TestCase):
         self._write_task("task-normal.txt", priority="normal")
         self._write_task("task-urgent.txt", priority="urgent")
         self._write_task("task-low.txt", priority="low")
-        (self.results_dir / "task-low.txt").write_text("done\n")
+        publish_text((self.results_dir / "task-low.txt"), "done\n")
         self.assertEqual(
             list(pending_candidates(self.tasks_dir, self.results_dir)),
             ["task-urgent.txt", "task-normal.txt"],
@@ -627,7 +638,7 @@ class PendingCandidatesBatchTest(unittest.TestCase):
                 self.assertEqual(has_ready_result(self.results_dir, name), ready)
                 self.assertEqual(name not in got, ready)
 
-    def test_one_archived_file_satisfies_an_exact_id_and_its_epoch_base_id(self):
+    def test_archived_file_satisfies_only_its_receipt_bound_id(self):
         names = ["task-a.txt", "task-a-1700000000.txt"]
         for layout in ("archive", "archive/2026-09", "archive-2026-09-20"):
             with self.subTest(layout=layout):
@@ -636,8 +647,8 @@ class PendingCandidatesBatchTest(unittest.TestCase):
                 for name in names:
                     (self.tasks_dir / name).write_text("priority: normal\ntask: fixture\n")
                 _write(self.results_dir / layout / names[1])
-                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, True])
-                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
+                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, False])
+                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [names[1]])
 
     def test_overlapping_ids_match_has_ready_result_in_every_layout(self):
         ids = ["task-o", "task-o-1700000000", "task-o-1700000000-1800000000", "task-o-x"]
@@ -767,7 +778,7 @@ class MainDispatchTest(unittest.TestCase):
         self.assertEqual(self._run()[0], 2)
 
     def test_has_result_both_outcomes(self):
-        (self.results_dir / "task-a.txt").write_text("done\n")
+        publish_text((self.results_dir / "task-a.txt"), "done\n")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-a.txt")[0], 0)
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
 
@@ -776,7 +787,7 @@ class MainDispatchTest(unittest.TestCase):
         _write(self.results_dir / "archive" / "2026-09" / "task-a.txt")
         (self.results_dir / "task-a.txt").write_text("")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-a.txt")[0], 0)
-        (self.results_dir / "task-b.txt").write_text("   \n")
+        publish_text((self.results_dir / "task-b.txt"), "   \n")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
 
     def test_a_result_older_than_the_queued_file_answered_an_earlier_turn(self):
@@ -793,7 +804,7 @@ class MainDispatchTest(unittest.TestCase):
         task.write_text("id: task-a\nwake_episode: e1\ntask: resumed\n")
         self.assertEqual(self._run("wake-turn", str(self.tasks_dir), "task-a.txt")[0], 0)
         self.assertEqual(self._run(*has, "--task-file", str(task))[0], 1)
-        (self.results_dir / "task-a.txt").write_text("this turn's answer\n")
+        publish_text((self.results_dir / "task-a.txt"), "this turn's answer\n")
         self.assertEqual(self._run(*has, "--task-file", str(task))[0], 0)
         self.assertEqual(self._run(*has, "--task-file", str(self.tasks_dir / "gone.txt"))[0], 0,
                          "an unreadable task file filters nothing")
@@ -1048,7 +1059,7 @@ class MainDispatchTest(unittest.TestCase):
         rc, out, _ = self._run("find-ready", str(self.results_dir), "task-a.txt")
         self.assertEqual(rc, 1)
         self.assertEqual(out, "")
-        (self.results_dir / "task-a.txt").write_text("done\n")
+        publish_text((self.results_dir / "task-a.txt"), "done\n")
         rc, out, _ = self._run("find-ready", str(self.results_dir), "task-a.txt")
         self.assertEqual((rc, out), (0, f"{self.results_dir / 'task-a.txt'}\n"))
 
@@ -1218,8 +1229,9 @@ class CliSmokeTest(unittest.TestCase):
 
     def test_has_result_via_interpreter(self):
         with tempfile.TemporaryDirectory() as td:
-            results = Path(td)
-            (results / "task-a.txt").write_text("done\n")
+            results = Path(td) / "results"
+            results.mkdir()
+            publish_text(results / "task-a.txt", "done\n")
             ok = subprocess.run([sys.executable, str(CLI), "has-result", str(results), "task-a.txt"],
                                 capture_output=True, text=True, timeout=30)
             miss = subprocess.run([sys.executable, str(CLI), "has-result", str(results), "task-b.txt"],
@@ -1229,8 +1241,9 @@ class CliSmokeTest(unittest.TestCase):
 
     def test_find_ready_via_interpreter(self):
         with tempfile.TemporaryDirectory() as td:
-            results = Path(td)
-            (results / "task-a.txt").write_text("done\n")
+            results = Path(td) / "results"
+            results.mkdir()
+            publish_text(results / "task-a.txt", "done\n")
             ok = subprocess.run([sys.executable, str(CLI), "find-ready", str(results), "task-a.txt"],
                                 capture_output=True, text=True, timeout=30)
             miss = subprocess.run([sys.executable, str(CLI), "find-ready", str(results), "task-b.txt"],

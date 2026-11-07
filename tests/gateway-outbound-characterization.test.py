@@ -11,12 +11,14 @@ Run: python3 tests/gateway-outbound-characterization.test.py
 """
 from __future__ import annotations
 
+
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -87,7 +89,7 @@ class _Base(unittest.TestCase):
         (gw.TASKS_DIR / f"{TID}.txt").write_text(
             f"id: {TID}\ntask: characterization fixture\naccess_tier: {tier}\n")
         f = gw.RESULTS_DIR / f"{TID}.txt"
-        f.write_text(body)
+        publish_result(f, body)
         return f
 
 
@@ -152,7 +154,7 @@ class MarkerHandling(_Base):
         resolves guest, routes private owner review, and closes the lease
         without honouring the marker in the shared room."""
         f = gw.RESULTS_DIR / f"{TID}.txt"
-        f.write_text("[channel: C123ABC]\nthe reply")
+        publish_result(f, "[channel: C123ABC]\nthe reply")
         gw._post_ready_results({TID})
         self.assertEqual(len(self.posted), 1)
         self.assertNotIn("[channel: C123ABC]", self.posted[0][2]["body"])

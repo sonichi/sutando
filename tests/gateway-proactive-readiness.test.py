@@ -33,6 +33,7 @@ os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="gw-ready-cc-")
 os.environ["REMOTE_PROACTIVE_ROOM"] = ""
 
 from ag2_sparrow import remote_gateway_bridge as gb  # noqa: E402
+from ag2_sparrow.result_publish import publish_text
 from ag2_sparrow import result_ready  # noqa: E402
 
 ROOM = "!ReadyRoomAbCdEf:ag2.space"
@@ -75,7 +76,8 @@ def drain(tmp: Path, during_hold=None, claim_gate=None) -> list[str]:
 
 
 def fresh() -> Path:
-    tmp = Path(tempfile.mkdtemp(prefix="gw-ready-"))
+    tmp = Path(tempfile.mkdtemp(prefix="gw-ready-")) / "results"
+    tmp.mkdir()
     (tmp / "archive").mkdir()
     return tmp
 
@@ -99,6 +101,7 @@ def main() -> int:
     # b) Settled now: the next pass delivers the whole body.
     if f.exists():
         os.utime(f, (f.stat().st_atime, f.stat().st_mtime - 5))
+    publish_text(f, HEAD + TAIL)
     posts = drain(tmp)
     check(len(posts) == 1 and posts[0].endswith("B" * 2575), f"b) the settled file posts whole, got {[len(p) for p in posts]}")
     check(not f.exists(), "b) and is retired after delivery")
@@ -106,7 +109,7 @@ def main() -> int:
     # c) Addressed at the peek, truncated before the claim: hand back, never post.
     tmp = fresh()
     g = tmp / "proactive-2.txt"
-    g.write_text(f"[channel: {ROOM}]\nlater\n", encoding="utf-8")
+    publish_text(g, f"[channel: {ROOM}]\nlater\n")
     posts = drain(tmp, claim_gate=lambda p: (p.write_text("", encoding="utf-8"), True)[1])
     check(posts == [] and g.exists() and g.stat().st_size == 0,
           f"c) an empty claim is handed back, nothing posted, got {posts}")
@@ -114,7 +117,7 @@ def main() -> int:
     # d) No regression for an ordinary settled body.
     tmp = fresh()
     h = tmp / "proactive-3.txt"
-    h.write_text(f"[channel: {ROOM}]\nhello room\n", encoding="utf-8")
+    publish_text(h, f"[channel: {ROOM}]\nhello room\n")
     os.utime(h, (h.stat().st_atime, h.stat().st_mtime - 5))
     posts = drain(tmp)
     check(posts == ["hello room"], f"d) a settled body posts unchanged, got {posts}")

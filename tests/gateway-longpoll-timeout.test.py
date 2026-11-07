@@ -2,6 +2,7 @@
 """Long-poll timeout grace preserves retry timing without inventing poll evidence."""
 from __future__ import annotations
 
+
 import re
 import sys
 import json
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -942,7 +944,7 @@ class RelayResultsInTheLoopTest(unittest.TestCase):
 
             def lands_during_the_poll(method, path, *a, **k):
                 if path.startswith("/v1/tasks?"):
-                    (self.gw.RESULTS_DIR / f"{self.ASK}.txt").write_text("Your calendar is clear.")
+                    publish_result(self.gw.RESULTS_DIR / f"{self.ASK}.txt", "Your calendar is clear.")
                 return poll(method, path, *a, **k)
             self.gw._req = lands_during_the_poll
             with patch.object(self.gw, "wake_outbound", new=lambda: self.calls.append(

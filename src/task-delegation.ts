@@ -1,3 +1,4 @@
+import { readVerifiedResult } from './result-read.js';
 /**
  * TaskDelegationService — step 4 of the interaction-planes refactor
  * (issue #1947, built under the architecture names per design R3).
@@ -28,7 +29,7 @@
  * read / archive), so the same watcher semantics run over either backend.
  */
 
-import { writeFileSync, readdirSync, readFileSync, accessSync, constants, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, readdirSync, accessSync, constants, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -107,7 +108,7 @@ export class LocalTaskBackend implements TaskDelegationService {
 	}
 
 	readResultFile(name: string): string {
-		return readFileSync(join(this.resultDir, name), 'utf-8');
+		return readVerifiedResult(join(this.resultDir, name)) ?? '';
 	}
 
 	archiveResultFile(name: string, taskId: string): void {

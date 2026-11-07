@@ -6,7 +6,9 @@ drive the real task-result watchers, where a refusal used to archive silently.
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -67,7 +69,7 @@ def _seed(mod, task_id: str, body: str, headers: str = "") -> tuple[Path, Path]:
     tasks.mkdir(parents=True, exist_ok=True)
     rf = results / f"{task_id}.txt"
     tf = tasks / f"{task_id}.txt"
-    rf.write_text(body)
+    publish_result(rf, body)
     # `task:` terminates the header block, so it must come last or the routing
     # headers after it are invisible to parse_task_headers.
     tf.write_text(f"id: {task_id}\n{headers}task: anything\n")

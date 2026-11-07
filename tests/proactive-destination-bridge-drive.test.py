@@ -10,7 +10,9 @@ Single-pass technique per proactive-dm-failure-keeps-file-behaviour: the
 sleep at the end of each loop is patched to raise a sentinel.
 """
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -131,10 +133,10 @@ def drive_slack_watcher():
 
     sb = _load("sbridge_dest_drive", REPO / "src" / "slack-bridge.py")
     td = Path(tempfile.mkdtemp(prefix="dest-drive-slack-"))
-    (td / "proactive-9.to-discord.txt").write_text("plain body")
+    publish_result(td / "proactive-9.to-discord.txt", "plain body")
     # Untagged, Slack-addressed body while the owner was last seen on Discord
     # beside a configured Discord bridge: the address must outrank both.
-    (td / "proactive-10.txt").write_text("[channel: C0123456789]\naddressed body")
+    publish_result(td / "proactive-10.txt", "[channel: C0123456789]\naddressed body")
     sb.RESULTS_DIR = td
     sb.TASKS_DIR = Path(tempfile.mkdtemp(prefix="dest-drive-slack-tasks-"))
     sb.STATE_DIR = Path(tempfile.mkdtemp(prefix="dest-drive-slack-state-"))

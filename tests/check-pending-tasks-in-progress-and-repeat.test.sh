@@ -161,7 +161,7 @@ OUT="$(run_hook 'not json at all')"
 case "$OUT" in *'"decision":"block"'*) ok "unparseable stdin reads as a first Stop and still blocks" ;; *) bad "unparseable stdin still blocks" "got: ${OUT:0:160}" ;; esac
 OUT="$(bash "$HOOK" </dev/null 2>/dev/null)"
 case "$OUT" in *'"decision":"block"'*) ok "no stdin at all still blocks (the hook never waits on it)" ;; *) bad "no stdin at all still blocks" "got: ${OUT:0:160}" ;; esac
-printf 'done\n' > "$WS/results/$TASK.txt"
+printf 'done\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS/results/$TASK.txt"
 record_delivery
 OUT="$(run_hook '{"stop_hook_active":true}')"
 [ "$OUT" = "{}" ] && [ ! -e "$COUNTER" ] && ok "an answered queue lets the turn end and clears the counter" || bad "an answered queue lets the turn end and clears the counter" "out=${OUT:0:80} counter=$(cat "$COUNTER" 2>/dev/null)"

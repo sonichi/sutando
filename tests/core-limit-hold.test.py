@@ -17,6 +17,7 @@ Run: python3 tests/core-limit-hold.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import subprocess
@@ -29,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 isolate_os_environ()
 
@@ -648,7 +650,7 @@ class OwnerRecovery(unittest.TestCase):
     def test_answered_but_unarchived_reply_is_archived_not_redone(self):
         owner_task(self.ws / "tasks", "task-8", "retry now")
         (self.ws / "results").mkdir(exist_ok=True)
-        (self.ws / "results" / "task-8.txt").write_text("answered before a crash\n")
+        publish_result(self.ws / "results" / "task-8.txt", "answered before a crash\n")
         self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), [])
         self.assertFalse((self.ws / "tasks" / "task-8.txt").exists())
         self.assertEqual((self.ws / "results" / "task-8.txt").read_text(), "answered before a crash\n")
