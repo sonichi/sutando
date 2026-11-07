@@ -462,6 +462,23 @@ retry_held_tasks_if_due() {
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
+# The installed provider owns whether missing routing is safe; delivery inboxes
+# already contain assigned work and must never consult this prerequisite.
+if [ -n "$HANDLER_CONFIG_PATH" ] &&
+   { [ -z "$CURRENT_HANDLER" ] || [ ! -f "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; } &&
+   [ "${SUTANDO_ALLOW_UNROUTED_BINDINGS:-}" != "1" ]; then
+  if ! reason="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/skill_manifest_capability.py" \
+      --check "$__REPO_ROOT" SUTANDO_TASK_ROUTING_REQUIREMENT "$WORKSPACE_DIR" 2>&1)"; then
+    echo "watch-tasks-stream: REFUSING to start: $reason" >&2
+    echo "  Publish a usable task-event-handler.json declaration, or set" >&2
+    echo "  SUTANDO_TASK_EVENT_HANDLER=<executable regular file>. To deliberately bypass" >&2
+    echo "  this prerequisite, set SUTANDO_ALLOW_UNROUTED_BINDINGS=1." >&2
+    rm -f "$WATCH_RUNTIME_DIR/events"
+    rmdir "$WATCH_RUNTIME_DIR"
+    exit 78
+  fi
+fi
+
 # A pid alone can be recycled between a watcher's death and the next sweep;
 # the start time beside it, read in one fixed locale, tells them apart.
 proc_start() {
