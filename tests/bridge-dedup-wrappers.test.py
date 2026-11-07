@@ -108,6 +108,7 @@ class BridgeWrapperTest(unittest.TestCase):
         if orig is not None:
             (tasks / f"{TID}.txt").write_text(orig)
         mod.RESULTS_DIR, mod.TASKS_DIR = results, tasks
+        mod.STATE_DIR = Path(td) / "state"
         return results, tasks
 
     def _each(self):
@@ -148,7 +149,7 @@ class BridgeWrapperTest(unittest.TestCase):
     def test_wrapper_binds_its_own_dirs_and_requeues(self):
         for name, mod in self._each():
             with self.subTest(bridge=name):
-                saved = (mod.RESULTS_DIR, mod.TASKS_DIR)
+                saved = (mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR)
                 try:
                     with tempfile.TemporaryDirectory() as td:
                         _, tasks = self._seed(mod, td, "")
@@ -160,12 +161,34 @@ class BridgeWrapperTest(unittest.TestCase):
                             f"its own TASKS_DIR, or it swallowed the plan")
                         self.assertIn("delivered nothing", written[0].read_text())
                 finally:
-                    mod.RESULTS_DIR, mod.TASKS_DIR = saved
+                    mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR = saved
+
+    def test_accepted_fold_uses_each_bridges_resolved_state(self):
+        from task_origins import read_origins
+        seen = set()
+        for name, mod in self._each():
+            seen.add(name)
+            with self.subTest(bridge=name), tempfile.TemporaryDirectory() as td:
+                saved = mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR
+                try:
+                    field = "chat_id" if name == "telegram" else "channel_id"
+                    header = f"source: {name}\n{field}: C1\nuser_id: asker\n"
+                    _, tasks = self._seed(mod, td, "a real answer",
+                                         header + "source_message_id: follow-up\ntask: question\n")
+                    (tasks / f"{HOLDER}.txt").write_text(
+                        header + "source_message_id: first\ntask: question\n")
+                    mod.STATE_DIR = Path(td) / "separate" / "state"
+                    self._call(name, mod)
+                    self.assertEqual(read_origins(mod.STATE_DIR, HOLDER), ["first", "follow-up"])
+                    self.assertEqual(read_origins(tasks.parent / "state", HOLDER), [])
+                finally:
+                    mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR = saved
+        self.assertEqual(seen, set(BRIDGES))
 
     def test_wrapper_honours_a_holder_that_answered(self):
         for name, mod in self._each():
             with self.subTest(bridge=name):
-                saved = (mod.RESULTS_DIR, mod.TASKS_DIR)
+                saved = (mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR)
                 try:
                     with tempfile.TemporaryDirectory() as td:
                         _, tasks = self._seed(mod, td, "a real answer")
@@ -174,7 +197,7 @@ class BridgeWrapperTest(unittest.TestCase):
                             [p for p in tasks.glob("task-*.txt") if p.stem != TID], [],
                             f"{name}: re-asked a dedup whose holder answered")
                 finally:
-                    mod.RESULTS_DIR, mod.TASKS_DIR = saved
+                    mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR = saved
 
     def test_replied_holder_respects_each_adapter_destination(self):
         seen = set()
@@ -184,7 +207,7 @@ class BridgeWrapperTest(unittest.TestCase):
                                      else ("channel_id", "C1", "C2"))
             for destination in (asking, other):
                 with self.subTest(bridge=name, destination=destination):
-                    saved = (mod.RESULTS_DIR, mod.TASKS_DIR)
+                    saved = (mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR)
                     try:
                         with tempfile.TemporaryDirectory() as td:
                             _, tasks = self._seed(
@@ -199,7 +222,7 @@ class BridgeWrapperTest(unittest.TestCase):
                                 self.assertIn(f"{field}: {asking}", written[0].read_text())
                                 self.assertIn("DIFFERENT channel", written[0].read_text())
                     finally:
-                        mod.RESULTS_DIR, mod.TASKS_DIR = saved
+                        mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR = saved
         self.assertEqual(seen, set(BRIDGES), "every affected adapter must be exercised")
 
     def test_two_askers_in_one_millisecond_get_their_own_reasks_and_routes(self):
@@ -238,12 +261,12 @@ class BridgeWrapperTest(unittest.TestCase):
         """A recovery failure must not take the poll loop down with it."""
         for name, mod in self._each():
             with self.subTest(bridge=name):
-                saved = (mod.RESULTS_DIR, mod.TASKS_DIR)
+                saved = (mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR)
                 try:
                     mod.RESULTS_DIR = mod.TASKS_DIR = Path("/nonexistent/dedup-test")
                     self._call(name, mod)  # must not raise
                 finally:
-                    mod.RESULTS_DIR, mod.TASKS_DIR = saved
+                    mod.RESULTS_DIR, mod.TASKS_DIR, mod.STATE_DIR = saved
 
     def test_wrapper_swallows_a_raising_plan(self):
         """Directories that merely do not exist are handled inside the plan;

@@ -570,7 +570,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-            (target or {}).get("channel", ""), fresh_reask_id())
+            (target or {}).get("channel", ""), fresh_reask_id(), state_dir=STATE_DIR)
         if action == "requeue":
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)

@@ -171,7 +171,7 @@ def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tu
 KNOWN_HEADER_KEYS = (
     "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
     "task_id", "execution_generation",
-    "channel_id", "priority", "interaction_type", "source_message_id",
+    "channel_id", "priority", "interaction_type", "source_message_id", "origin_message_ids",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
     "author_id", "chat_id",
@@ -1031,6 +1031,24 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
     Header values must be single-line — a newline in a value could forge a
     header, so it raises instead of writing a corrupt file.
     """
+    headers = list(headers)
+    if not any(k == "origin_message_ids" for k, _ in headers):
+        try:
+            from .task_origins import origin_header
+        except ImportError:
+            try:
+                from task_origins import origin_header
+            except ImportError:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "_task_origin_header", Path(__file__).with_name("task_origins.py"))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                origin_header = module.origin_header
+        source = next((v for k, v in headers if k == "source_message_id"), "")
+        seeded = origin_header(source)
+        if seeded:
+            headers.append(("origin_message_ids", seeded.partition(": ")[2].strip()))
     lines = []
     for key, value in headers:
         if key == "task":

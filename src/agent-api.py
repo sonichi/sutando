@@ -126,6 +126,7 @@ import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 import tmux_probe  # noqa: E402
 import health_snapshot  # noqa: E402
+from activity_projection import project_activity_media  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
@@ -1411,14 +1412,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 '.txt': 'text/plain', '.html': 'text/html', '.css': 'text/css',
                 '.js': 'application/javascript',
             }
+            projected = project_activity_media(media_path, repo_resolved)
             ext = media_path.suffix.lower()
             mime = SAFE_TYPES.get(ext, 'application/octet-stream')
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_cors()
-            self.send_header("Cache-Control", "public, max-age=300")
+            self.send_header("Cache-Control", "no-store" if projected is not None else "public, max-age=300")
             self.end_headers()
-            self.wfile.write(media_path.read_bytes())
+            self.wfile.write(projected if projected is not None else media_path.read_bytes())
         elif path == "/logs/voice":
             # Return last 30 lines of voice-agent.log for debugging.
             # Canonical path is logs/voice-agent.log (see startup.sh:153,

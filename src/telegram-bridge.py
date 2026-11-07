@@ -37,6 +37,7 @@ sys.stderr.reconfigure(line_buffering=True)
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
 # best-effort so the bridge keeps booting if vision_push.py is missing.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from task_origins import origin_header  # noqa: E402
 try:
     from vision_push import push_image as _push_vision_image  # type: ignore
 except Exception:  # pragma: no cover — bridge must keep running
@@ -498,7 +499,7 @@ def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str | None, str]:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
-            fresh_reask_id())
+            fresh_reask_id(), state_dir=STATE_DIR)
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
             requeued = payload
@@ -918,7 +919,7 @@ def main():  # pragma: no cover
                 parent_line = ""
                 _src_mid = msg.get("message_id")
                 if _src_mid is not None:
-                    src_line = f"source_message_id: {_src_mid}\n"
+                    src_line = f"source_message_id: {_src_mid}\n" + origin_header(str(_src_mid))
                 _rep = msg.get("reply_to_message")
                 if _rep:
                     _rep_user = (

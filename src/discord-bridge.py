@@ -111,6 +111,7 @@ except ModuleNotFoundError:
     raise
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from task_origins import origin_header  # noqa: E402
 # Entrypoint-owned path setup: ``import ag2_sparrow`` resolves uninstalled (5b).
 _PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package (gateway-shim parity)
 if _PKG_ROOT not in sys.path:
@@ -563,7 +564,7 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
     the caller routes or sends, because those are async here."""
     try:
         return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-                                   channel_id, fresh_reask_id())
+                                   channel_id, fresh_reask_id(), state_dir=STATE_DIR)
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
         # A planner that raised proved nothing about the asker being answered.
@@ -4329,6 +4330,7 @@ async def _handle_discord_message(message, force=False):
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"
             f"source_message_id: {message.id}\n"
+            f"{origin_header(str(message.id))}"
             # Same namespace as the addressee in the body (`<@id>`), so a non-addressed core
             # can tell. Must stay above `task:` — later lines parse as untrusted body.
             f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"

@@ -6202,6 +6202,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.
+            from .task_origins import origin_header
+            seed = origin_header(_one_line(task.get("source_message_id") or ""))
+            if seed:
+                lines.append(seed.rstrip("\n"))
             if woken:
                 lines.append(f"wake_episode: {_one_line(woken)}")
             if collaborator_enabled:
@@ -8683,7 +8687,8 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
             action, payload = plan_dedup_recovery(
                 RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
                 _reask_id(tid), commit_identity=_commit,
-                channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
+                channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state,
+                state_dir=_STATE)
     except OSError as e:
         _log(f"dedup decision for {tid} deferred: {diagnostics.describe(e)}")
         return "defer", None, room
