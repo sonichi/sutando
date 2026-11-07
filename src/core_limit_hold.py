@@ -17,6 +17,7 @@ never held, so it is revived as before.
 
     core_limit_hold.py gate [--cwd DIR]   exit 0: launch; exit 75: held, reason on stdout
     core_limit_hold.py status             the hold record, if any
+    core_limit_hold.py held               exit 0 and the reason while a hold is in force, else 1
     core_limit_hold.py clear              lift the hold now (the next revive launches)
 
 A hold also records a digest of the account it was observed under; a launch under a different
@@ -26,7 +27,9 @@ passes this gate, so evidence older than the gate's first sight of an account is
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
 Tasks that arrive during a hold are listed in its record (`held_tasks`), so the orphan check
-on the next boot leaves them for the core; each hold incident sends its own notice.
+on the next boot leaves them for the core; each hold incident sends its own notice. Given the
+desktop's card presenter (`gate --card-entry`), that notice also presents the core-model card.
+A hold binds only launches on the model family and account it was seen under (`binding_hold`).
 """
 from __future__ import annotations
 
@@ -357,6 +360,27 @@ def _same_account(held_account: Optional[str], launch_account: Optional[str]) ->
     return not (held_account and launch_account and held_account != launch_account)
 
 
+def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str]) -> bool:
+    return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
+
+
+def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
+    """(model, account) the next launch would run as, read the way the gate reads them."""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") if config_dir is None else config_dir
+    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
+    return model, account_fingerprint(config_dir)
+
+
+def binding_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+    """The hold in force that would stop the next launch, else None. Read-only.
+    A hold the owner switched away from (another model family or account) does not bind."""
+    hold = active_hold(workspace, now)
+    if hold is None:
+        return None
+    model, account = launch_identity(workspace)
+    return hold if _binds(hold, model, account) else None
+
+
 def _relevant(limit: Optional[Limit], launch_model: Optional[str], since: Optional[float] = None) -> bool:
     return limit is not None and _same_family(limit.model, launch_model) \
         and not (isinstance(since, (int, float)) and limit.at <= since)
@@ -383,32 +407,57 @@ def _task_predates(path: Path, started: object) -> bool:
     return True
 
 
-def _notice_body(hold: dict) -> str:
-    from result_markers import neutralize_markers
-    when = (f"It resets {_when(hold['reset_at'])}" if isinstance(hold.get("reset_at"), (int, float))
+def _when_line(hold: dict) -> str:
+    return (f"It resets {_when(hold['reset_at'])}" if isinstance(hold.get("reset_at"), (int, float))
             else f"It tries again {_when(hold['until'])}")
+
+
+def _notice_body(hold: dict, card: bool = False) -> str:
+    from result_markers import neutralize_markers
+    where = ('pick a model on the "Your agent\'s model" card I left you, or under Agent Settings, Runtime, Model'
+             if card else "pick a model in the core-model card under Agent Settings, Runtime, Model")
     return "[dm-only]\n" + neutralize_markers(
         f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]} (pause {_incident_ref(hold)}).\n\n"
-        f"{when}, and the core starts again by itself after that. Messages you send meanwhile "
+        f"{_when_line(hold)}, and the core starts again by itself after that. Messages you send meanwhile "
         "wait and are answered then.\n\n"
         'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
-        "haiku, opus, fable), or pick a model in the core-model card under Agent Settings, Runtime, Model. "
+        f"haiku, opus, fable), or {where}. "
         'Send "retry now" to try the current model again at once.\n')
 
 
-def _ensure_notice(workspace: Path, hold: dict) -> bool:
-    """Queue the hold's owed DM under its stable name, once. True when it is queued.
+def _present_card(hold: dict, card_entry: str, now: float) -> bool:
+    """Start the desktop's core-model card for this hold, fail-open. True when it was started.
+    Detached: the card's DM mirror may take its own deadline, and the launch must not wait on it."""
+    import subprocess
+    body = f"Paused: {hold['reason'].split(': ', 1)[-1]}. Pick another model to keep working now."
+    ttl = int(max(600, min(float(hold.get("until") or now) - now, LONG_RESET_RECHECK_S)))
+    try:
+        subprocess.Popen([sys.executable, card_entry, "present", "core-model", "--set", f"body={body}",
+                          "--ttl", str(ttl)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def _ensure_notice(workspace: Path, hold: dict, card_entry: Optional[str] = None,
+                   now: Optional[float] = None) -> bool:
+    """Queue the hold's owed DM under its stable name, once, and present the core-model card
+    with it when the launcher provides one. True when it is queued.
     A retry rewrites the same name, so it cannot become a second message."""
     if hold.get("notice_queued"):
         return False
     from local_record import write_text_whole
-    body = _notice_body(hold)
+    card = bool(card_entry) and Path(card_entry).is_file()
+    body = _notice_body(hold, card)
     try:
         write_text_whole(Path(workspace) / "results" / hold["notice"], body)
     except OSError:
         return False
     hold["notice_queued"] = True
     hold["notice_line"] = body.split("\n", 1)[1].split("\n", 1)[0]
+    if card:
+        hold["card_presented"] = _present_card(hold, card_entry, time.time() if now is None else now)
     return True
 
 
@@ -429,7 +478,7 @@ class Decision:
 
 def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
            projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
-           launch_account: Optional[str] = None) -> Decision:
+           launch_account: Optional[str] = None, card_entry: Optional[str] = None) -> Decision:
     """Launch, or hold and say why. The one writer of the hold record."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
@@ -439,9 +488,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         if admitted is not hold:
             hold = admitted
             _write_hold(workspace, hold)
-    if active_hold(workspace, now) and _same_family(hold.get("model"), launch_model) \
-            and _same_account(hold.get("account"), launch_account):
-        if _ensure_notice(workspace, hold):
+    if active_hold(workspace, now) and _binds(hold, launch_model, launch_account):
+        if _ensure_notice(workspace, hold, card_entry, now):
             _write_hold(workspace, hold)
         return Decision(False, hold, status_line(hold))
     switched = bool(hold and launch_account and hold.get("account")
@@ -484,7 +532,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             new["notice_queued"] = False
             new["held_tasks"] = carried
             new["present_at_hold"] = [t for t in live if t not in carried][-HELD_TASKS_MAX:]
-        _ensure_notice(workspace, new)
+        _ensure_notice(workspace, new, card_entry, now)
         _write_hold(workspace, new)
         _mirror_core_status(workspace, "paused", new["reason"], now)
         return Decision(False, new, new["reason"])
@@ -664,9 +712,17 @@ def main(argv=None) -> int:
     gate = sub.add_parser("gate", help="decide whether the core may launch now")
     gate.add_argument("--cwd", default="", help="the core's working directory (finds its transcripts)")
     gate.add_argument("--switch-entry", default="", help="the model-switch entry the launcher provides")
+    gate.add_argument("--card-entry", default="", help="the desktop's local-card presenter, when the launcher has one")
     sub.add_parser("status", help="print the hold record")
+    held = sub.add_parser("held", help="exit 0 and print the reason while a hold is in force")
+    held.add_argument("--workspace", default="", help="the workspace to read (default: the resolved one)")
     sub.add_parser("clear", help="lift the hold now")
     args = ap.parse_args(argv)
+    if args.cmd == "held":
+        hold = active_hold(Path(args.workspace) if args.workspace else resolve_workspace())
+        if hold:
+            print(hold.get("reason") or status_line(hold))
+        return 0 if hold else 1
     workspace = resolve_workspace()
     if args.cmd == "status":
         hold = read_hold(workspace)
@@ -677,10 +733,9 @@ def main(argv=None) -> int:
         print("hold lifted" if hold and hold.get("status") == "cleared" else "no hold in force")
         return 0
     handle_owner_actions(workspace, switch_cmd=args.switch_entry or None)
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), workspace)
+    model, account = launch_identity(workspace)
     decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model,
-                      launch_account=account_fingerprint(config_dir))
+                      launch_account=account, card_entry=args.card_entry or None)
     if decision.launch:
         return 0
     print(decision.line)
