@@ -54,3 +54,13 @@ and its absence is the most common change-request on this repo.
 ## Test plan
 
 <!-- How did you verify this works? `npx tsc --noEmit` + actual run; tests; manual repro. Be specific. -->
+
+## Regression declaration
+
+<!-- Required for fix/fix(scope) titles or the bug label. Remove unused fields.
+Put each value on the SAME LINE as its label; link or refer to output pasted
+elsewhere in this body. Existing reviewers assess evidence and exceptions;
+no additional approval. -->
+Regression test: <!-- test file/name and command -->
+Regression evidence: <!-- actual failing-before and passing-after output, or link to it -->
+Regression exception: <!-- reason a regression test is not practical; reviewed under existing approval -->
