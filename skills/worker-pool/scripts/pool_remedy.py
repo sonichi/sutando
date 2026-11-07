@@ -540,6 +540,8 @@ def _sweep(a, runner=None) -> int:
         acted["cards_closed"] = wc.resolve_cleared(
             a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered,
             runner=runner)
+    if tick.get("sentinels_deferred"):
+        acted["sentinels_deferred"] = tick["sentinels_deferred"]
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())
