@@ -1058,6 +1058,15 @@ class ModelSwitchWayOut(unittest.TestCase):
             self.assertIsNone(clh._launch_config_dir())
             self.assertEqual(clh.launch_identity(self.ws), ("sonnet", None))
 
+    def test_no_launcher_resolver_reads_as_no_seat(self):
+        """No checkout to find the resolver in, or no bash to run it: the gate reads no seat."""
+        from unittest import mock
+        import sutando_config
+        with mock.patch.object(sutando_config, "_find_repo_root", return_value=None):
+            self.assertIsNone(clh._launch_config_dir())
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("bash")):
+            self.assertIsNone(clh._launch_config_dir())
+
     def test_watchdog_reads_the_configured_seat_not_a_foreign_env_seat(self):
         """Review of #6300: the launcher takes the configured seat over CLAUDE_CONFIG_DIR, so a
         watchdog whose env names another seat must still read the configured one, or it calls
