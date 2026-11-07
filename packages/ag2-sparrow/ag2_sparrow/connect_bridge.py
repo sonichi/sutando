@@ -80,6 +80,27 @@ def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
     return env
 
 
+OWN_HMAC_KEY = "task-hmac.key"
+
+
+def own_hmac_key(local: cm.Shape, mode: str, given: str = "") -> "tuple[str, str]":
+    """(the agent's own task-signing key, made now if absent, 0600 in its job's config dir; '') or ('', why). Only
+    an install that runs the agent's bridge can sign with it, so an explicit root (a bridge you run) is refused."""
+    from . import task_envelope
+    if given:
+        return "", "--hmac makes the agent's own key; --hmac-key-file names one: pass one"
+    if mode != UNIT or not local.agent:
+        return "", ("--hmac signs through the bridge this install runs; where a host or you run the bridge, pass "
+                    "--hmac-key-file with the key that bridge signs with")
+    path = cm.config_dir(local) / OWN_HMAC_KEY
+    try:
+        made = task_envelope.create_key(path)
+    except (OSError, ValueError) as e:
+        return "", f"{path} could not hold the agent's task key ({type(e).__name__})"
+    print(f"{'made' if made else 'kept'} the agent's task key: {path} (mode 600; its bridge signs every task with it)")
+    return str(path), ""
+
+
 def seat_env(token_file: str, agent_id: str) -> "tuple[dict, str]":
     """(the seat's launch variables, '') when `token_file` is a seat .env, ({}, '') when it is none, or
     ({}, why): the credential owner exports the seat and clears what the bridge would inherit."""
@@ -113,6 +134,10 @@ def launch_env(cfg: dict) -> "tuple[dict, str]":
     if problem:
         return {}, problem
     env.update(seat)
+    if cfg.get("HMAC_KEY_FILE") and bridge_mode(cfg) == UNIT:
+        # The key's path: this install's own bridge signs every task with it. A host supervisor's bridge signs
+        # with the host's own key and accepts only its canonical environment, so it gets none.
+        env["AG2_HMAC_KEY_FILE"] = cfg["HMAC_KEY_FILE"]
     return env, ""
 
 

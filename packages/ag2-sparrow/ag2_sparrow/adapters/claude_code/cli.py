@@ -169,6 +169,7 @@ def resolve_tmux(args, shape: Shape = LOCAL) -> "tuple[str, str]":
 RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v if v and resolve_plugin_dir(v)[1] is False else ""),
             ("CLAUDE_CONFIG_DIR", "claude_config_dir", str),
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
+            ("MCP_CONFIG", "mcp_config", str), ("SETTING_SOURCES", "setting_sources", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
             (inbox.ALLOW_NON_OWNER, "allow_non_owner", lambda v: v == "1"),
             (inbox.ALLOW_COLLABORATOR, "allow_collaborator", lambda v: v == "1"))
@@ -192,6 +193,7 @@ def install(args) -> int:
         print(f"error: {plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)", file=sys.stderr)
         return EXIT_UNUSABLE
     key_file, strict, problem, note = hmac_settings(args)
+    problem = problem or session_files_problem(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -210,6 +212,12 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     bridge = cb.bridge_shape(local)
+    if getattr(args, "hmac", False):
+        key_file, problem = cb.own_hmac_key(local, mode, args.hmac_key_file)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return EXIT_UNUSABLE
+        strict = True
     tmux, problem = resolve_tmux(args, local)
     problem = problem or launcher.socket_problem(config_dir(local))
     if problem:
@@ -230,6 +238,8 @@ def install(args) -> int:
               "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
+              "MCP_CONFIG": str(Path(args.mcp_config).expanduser().resolve()) if getattr(args, "mcp_config", None) else "",
+              "SETTING_SOURCES": getattr(args, "setting_sources", None) or "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "",
               inbox.ALLOW_COLLABORATOR: "1" if args.allow_collaborator else "", "AGENT_ID": agent_id, "BRIDGE": mode,
@@ -284,6 +294,17 @@ def hmac_settings(args) -> "tuple[str, bool, str, str]":
         why = "--hmac-strict" if args.hmac_strict else "strict mode, the default with --hmac-key-file (--no-hmac-strict opts out),"
         return key_file, strict, f"{why} needs a usable key: {problem}", ""
     return key_file, strict, "", problem
+
+
+def session_files_problem(args) -> str:
+    """'' when --mcp-config names a readable MCP config and --setting-sources a valid list, else why not."""
+    if getattr(args, "mcp_config", None):
+        _servers, problem = hold.mcp_servers(str(Path(args.mcp_config).expanduser().resolve()))
+        if problem:
+            return f"--mcp-config: {problem}"
+    if getattr(args, "setting_sources", None):
+        return hold.setting_sources_problem(args.setting_sources)
+    return ""
 
 
 def plugin_dir(args) -> Path:
@@ -470,6 +491,14 @@ def verify(args) -> int:
     if hmac_policy.legacy_opt_out(cfg):
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
+    if cfg.get("MCP_CONFIG"):
+        servers, problem = hold.mcp_servers(cfg["MCP_CONFIG"])
+        cm.check(results, not problem, "mcp config", problem or cfg["MCP_CONFIG"])
+        print("INFO mcp servers: only " + (", ".join(servers) or "none") + " (--strict-mcp-config: the config dir's "
+              "own MCP servers are not loaded)")
+    else:
+        print("INFO mcp servers: the config dir's own")
+    print("INFO setting sources: " + (cfg.get("SETTING_SOURCES") or "Claude Code's default (user, project, local)"))
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
                                       if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     print("INFO collaborator tasks: " + ("submitted into this session with the non-owner note (--allow-collaborator)"
@@ -610,6 +639,13 @@ def session_options(p) -> None:
     p.add_argument("--claude-config-dir", help="CLAUDE_CONFIG_DIR holding the login the session uses (default: "
                    "the CLI's own)")
     p.add_argument("--hmac-key-file", help="the task-envelope key Sutando stamps with (AG2_HMAC_KEY_FILE)")
+    p.add_argument("--hmac", action="store_true", help="sign every task with a key of the agent's own, made at install "
+                   "(0600 in its job's config dir): the bridge this install runs stamps each task and the session "
+                   "submits verified ones only (strict). Not with --hmac-key-file or an explicit root")
+    p.add_argument("--mcp-config", help="an MCP config file (mcpServers JSON) that is the session's whole MCP set: "
+                   "passed with --strict-mcp-config, so the config dir's own MCP servers are not loaded")
+    p.add_argument("--setting-sources", help="the comma list of setting sources the session loads (user, project, "
+                   "local); e.g. project,local leaves a shared config dir's user settings and hooks out")
     hm = p.add_mutually_exclusive_group()
     hm.add_argument("--hmac-strict", action="store_true", help="submit verified envelopes only (the default with "
                     "--hmac-key-file)")

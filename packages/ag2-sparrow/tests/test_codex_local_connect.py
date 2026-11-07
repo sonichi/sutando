@@ -485,7 +485,23 @@ class Install(Base):
         self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
                          ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
+            cli.main(["install", "--work", str(self.work), "--sandbox", "no-such-sandbox"])
+
+    def test_full_access_is_explicit_persisted_shown_and_owner_only(self):
+        runner = self.runner()
+        rc, out, _ = self.install_with(runner, False, "--sandbox", "danger-full-access")
+        self.assertEqual(rc, 0)
+        self.assertIn("NOTE sandbox: danger-full-access lets an owner turn run commands, change files anywhere this "
+                      "user can and use the network, all without asking", out)
+        self.assertIn("can repeat side effects", out)
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual(cfg["SANDBOX"], "danger-full-access")
+        argv = cli.connector_argv(cfg, str(self.work), 7)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn("INFO sandbox: danger-full-access for owner turns; non-owner turns are always read-only", out)
+        self.assertEqual(cc.NON_OWNER_SANDBOX, "read-only", "the connector's non-owner floor is unchanged")
 
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")
@@ -1179,6 +1195,13 @@ class ConnectCode(UndoSeams, Base):
         return cb.bridge_home(self.root) / "channels" / "ag2space"
 
     def test_connect_is_off_without_the_experimental_flag_and_touches_nothing(self):
+        import gc
+        import warnings
+        # Garbage an earlier test left (a pipe, say) is collected now, quietly: its ResourceWarning would
+        # otherwise land in the exact stderr this test compares.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            gc.collect()
         backend, fake, stdin = Backend(), self.fake(), io.StringIO(CODE + "\n")
         out, err = io.StringIO(), io.StringIO()
         spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
@@ -1991,6 +2014,8 @@ class ConnectCode(UndoSeams, Base):
         p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root))],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
+        # Its pipes are closed here, not by the GC: a late ResourceWarning lands in whatever stderr another test captures.
+        self.addCleanup(lambda: (p.stdin.close(), p.stdout.close()))
         self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
         return p
 
@@ -2539,6 +2564,148 @@ class InstallTokenEnvFile(Base):
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertIn(f"names {AGENT}, not @other:ag2.space", err)
         self.assertFalse(cli.config_path(LA).exists())
+
+
+
+class Signing(Base):
+    AGENT = "@helper:s.example"
+
+    def test_hmac_makes_the_agents_own_key_and_the_job_records_only_its_path(self):
+        from ag2_sparrow import task_envelope
+        local, _ = cm.agent_job(L, self.AGENT)
+        path, problem = cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None), local, cb.UNIT)
+        self.assertEqual(problem, "")
+        self.assertEqual(Path(path), cm.config_dir(local) / cb.OWN_HMAC_KEY)
+        self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o600)
+        key = Path(path).read_text().strip()
+        task_envelope.load_key(path)
+        self.assertEqual(cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None), local, cb.UNIT), (path, ""))
+        self.assertEqual(Path(path).read_text().strip(), key, "a reinstall keeps the key")
+        argv = cli.connector_argv({"CODEX": str(self.codex), "HMAC_KEY_FILE": path}, str(self.work), 7)
+        self.assertEqual(argv[-2:], ["--hmac-key-file", path])
+        self.assertNotIn(key, " ".join(argv), "the key is never in argv")
+        cfg = {"ROOT": str(self.work), "AGENT_ID": self.AGENT, "TOKEN_ENV_FILE": "", "BRIDGE": cb.UNIT,
+               "BRIDGE_STATE_DIR": str(self.home / "state"), "HMAC_KEY_FILE": path}
+        env, problem = cb.launch_env(cfg)
+        self.assertEqual((env["AG2_HMAC_KEY_FILE"], problem), (path, ""), "the bridge gets the path to sign with")
+        self.assertFalse(any(key in v for v in env.values()), "the key is never in the bridge's environment")
+        env, _ = cb.launch_env(dict(cfg, BRIDGE="sparrowd"))
+        self.assertNotIn("AG2_HMAC_KEY_FILE", env, "a host supervisor's bridge keeps its canonical environment")
+        self.assertIn("pass --hmac-key-file", cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None),
+                                                           local, "sparrowd")[1])
+
+    def test_hmac_needs_the_agents_own_bridge_and_a_named_key_must_be_usable(self):
+        local, _ = cm.agent_job(L, self.AGENT)
+        self.assertIn("where a host or you run the bridge", cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None),
+                                                           L, cb.EXTERNAL)[1])
+        self.assertIn("pass one", cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file="/k"), local, cb.UNIT)[1])
+        bad = self.home / "bad.key"
+        bad.write_text("not a key")
+        self.assertIn("not a usable key", cli.hmac_key(argparse.Namespace(hmac=False, hmac_key_file=str(bad)),
+                                                       local, cb.UNIT)[1])
+        self.assertEqual(cli.hmac_key(argparse.Namespace(hmac=False, hmac_key_file=None), local, cb.UNIT), ("", ""))
+
+    def test_verify_shows_the_signing_mode(self):
+        from ag2_sparrow import task_envelope
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn("INFO hmac mode: off (tasks are not signed)", out)
+        key = self.home / "k.key"
+        task_envelope.create_key(key)
+        self.configure(HMAC_KEY_FILE=str(key))
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn("INFO hmac mode: strict", out)
+        self.assertEqual(self.checks(out).get("hmac key"), "PASS")
+        key.write_text("broken")
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertEqual(self.checks(out).get("hmac key"), "FAIL")
+
+
+class BridgeSignsForTheSession(unittest.TestCase):
+    """End to end on one key: the bridge an install wires stamps each task, and the Mod's own verifier with
+    hmac_policy in strict mode submits that task and refuses an unsigned or tampered one."""
+
+    def test_signed_tasks_are_submitted_and_unsigned_or_tampered_ones_refused(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from claude_code_fixtures import run_verifier, verify_py
+        from ag2_sparrow import local_task_protocol, task_envelope
+        from ag2_sparrow.adapters.claude_code import hmac_policy
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / "task-hmac.key"
+            self.assertTrue(task_envelope.create_key(key))
+            self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+            self.assertEqual(task_envelope.install_bridge_stamper({"AG2_HMAC_KEY_FILE": str(key)}), "")
+            self.addCleanup(local_task_protocol.set_task_stamper, None)
+            path = local_task_protocol.write_task_file(Path(d) / "tasks", "task-s1",
+                                                       [("source", "ag2space"), ("access_tier", "owner")], "hi")
+            signed = Path(path).read_text()
+            self.assertTrue(signed.split("\n")[1].startswith(task_envelope.STAMP_PREFIX), signed)
+            cfg = {"HMAC_KEY_FILE": str(key), "HMAC_STRICT": "1"}
+            for text, submitted in ((signed, True), (signed.replace("hi", "rm -rf ~"), False),
+                                    ("id: task-u\naccess_tier: owner\ntask: hi\n", False)):
+                verdict, _tier, _collab = run_verifier(verify_py(), text, str(key))
+                ok, why, _retry = hmac_policy.decide(cfg, verdict, hmac_policy.key_digest(str(key)))
+                self.assertEqual(ok, submitted, (verdict, why))
+        self.assertEqual(task_envelope.install_bridge_stamper({}), "", "no key path: nothing changes")
+        self.assertIn("no usable key", task_envelope.install_bridge_stamper({"AG2_HMAC_KEY_FILE": "/nonexistent/k"}))
+
+
+
+class SigningAndMcpPieces(unittest.TestCase):
+    """The pieces a strict, shared-folder agent rests on, each refusal included."""
+
+    def test_keys_are_made_once_and_a_non_key_is_never_replaced(self):
+        from ag2_sparrow import task_envelope
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / "k"
+            self.assertTrue(task_envelope.create_key(key))
+            self.assertFalse(task_envelope.create_key(key), "kept")
+            other = Path(d) / "not-a-key"
+            other.write_text("hello")
+            with self.assertRaises(ValueError):
+                task_envelope.create_key(other)
+            self.assertEqual(other.read_text(), "hello")
+            # Another writer wins the race between the check and the link: its key stands.
+            raced = Path(d) / "raced"
+            real_link = os.link
+
+            def link_after_rival(src, dst):
+                Path(dst).write_text("cd" * 32)
+                return real_link(src, dst)
+            with mock.patch.object(os, "link", side_effect=link_after_rival):
+                self.assertFalse(task_envelope.create_key(raced))
+            self.assertEqual(raced.read_text(), "cd" * 32)
+            signed = task_envelope.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_envelope.load_key(key))
+            self.assertEqual(task_envelope.verify_text(signed, key), task_envelope.VERIFIED)
+            self.assertEqual(task_envelope.verify_text(signed, Path(d) / "absent"), task_envelope.UNVERIFIABLE)
+            self.assertEqual(task_envelope.verify_text("id: t\ntask: hi\n", key), task_envelope.UNSIGNED)
+            self.assertEqual(task_envelope.stamp_text(signed, task_envelope.load_key(key)).count(task_envelope.STAMP_PREFIX),
+                             1, "re-stamping replaces, never doubles")
+
+    def test_an_unwritable_key_dir_is_refused(self):
+        local, _ = cm.agent_job(L, "@helper:s.example")
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HOME": d}):
+            with mock.patch("ag2_sparrow.task_envelope.create_key", side_effect=PermissionError("no")):
+                key, problem = cb.own_hmac_key(local, cb.UNIT)
+            self.assertEqual(key, "")
+            self.assertIn("could not hold the agent's task key (PermissionError)", problem)
+
+    def test_install_refuses_an_unusable_key_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "bad.key"
+            bad.write_text("nope")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(cli, "version_problem", return_value=""), \
+                    mock.patch.object(cli, "resolve_root", return_value=({"root": d, "mode": cb.EXTERNAL,
+                                                                          "agent_id": "", "token_file": ""}, "")):
+                rc = cli.main(["install", "--work", d, "--hmac-key-file", str(bad)])
+            self.assertEqual(rc, cm.EXIT_UNUSABLE)
+            self.assertIn("is not a usable key", err.getvalue())
 
 
 if __name__ == "__main__":
