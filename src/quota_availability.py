@@ -193,6 +193,7 @@ FRESH_SEC = 10 * 60
 class QuotaRecord:
     payload: dict
     age_s: Optional[float]    # None: no usable timestamp on the record
+    checked_at: Optional[float] = None    # the epoch age_s was taken from (last_checked, else mtime)
 
     def fresh(self, fresh_sec: float = FRESH_SEC) -> bool:
         return self.age_s is not None and 0 <= self.age_s <= fresh_sec
@@ -236,7 +237,7 @@ def read_quota_record(workspace, now: Optional[float] = None) -> Optional[QuotaR
         except OSError:
             when = None
     at = time.time() if now is None else now
-    return QuotaRecord(data, None if when is None else at - when)
+    return QuotaRecord(data, None if when is None else at - when, when)
 
 
 # ---- the running seat's routing -------------------------------------------
@@ -571,18 +572,20 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
 def _log_reread(workspace, seat: str, rec: QuotaRecord, env: SeatEnv, fresh_sec: float, at: float) -> None:
     """The record as read AFTER a probe landed: written by whichever poll first
     sees a record newer than the marker (the probe is detached, so the poll that
-    sent it reads the old record), once per record stamp."""
+    sent it reads the old record), once per probe window per seat."""
     if rec.age_s is None:
         return
     try:
         marked = (Path(workspace) / "state" / PROBE_MARK).stat().st_mtime
     except OSError:
         return
-    stamp = int(at - rec.age_s)
+    # The record's own time: `at` is a later clock read than the one age_s was taken at.
+    stamp = int(rec.checked_at) if rec.checked_at is not None else int(at - rec.age_s)
     if stamp <= int(marked):
         return
-    _log_probe(workspace, at, once=f"stamp={stamp}", seat=seat, reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
-               record=record_model(rec.payload), stamp=stamp,
+    # One line per probe window: other seats' traffic rewrites the record at their request rate.
+    _log_probe(workspace, at, once=f"probe={int(marked)}", seat=seat, reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
+               record=record_model(rec.payload), stamp=stamp, probe=int(marked),
                windows="allowed" if gate_windows_allowed(rec.payload) else "rejected")
 
 

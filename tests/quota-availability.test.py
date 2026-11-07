@@ -752,6 +752,30 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertEqual(len(self._log_lines()), 1)
         self.assertEqual((log.parent / (qa.PROBE_LOG + ".1")).stat().st_size, qa.PROBE_LOG_MAX_BYTES)
 
+    def test_the_re_read_stamp_is_the_records_own_time_not_the_logging_clock(self):
+        # Production reads the record at one clock and logs at a later one; age-derived stamps drifted.
+        (self.ws / "state" / qa.PROBE_MARK).write_text(str(NOW))
+        os.utime(self.ws / "state" / qa.PROBE_MARK, (NOW, NOW))
+        self.write(_record(age_s=-3.5))                       # last_checked NOW+3.5
+        rec = qa.read_quota_record(self.ws, NOW + 5)
+        self.assertEqual(rec.checked_at, NOW + 3.5)
+        for later in (5.2, 5.7):
+            qa._log_reread(self.ws, SEAT, rec, qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW + later)
+        rereads = [ln for ln in self._log_lines() if "reread=" in ln]
+        self.assertEqual(len(rereads), 1, rereads)
+        self.assertIn(f"stamp={int(NOW + 3)}", rereads[0])
+
+    def test_other_seats_traffic_writes_one_re_read_per_probe_window(self):
+        (self.ws / "state" / qa.PROBE_MARK).write_text(str(NOW))
+        os.utime(self.ws / "state" / qa.PROBE_MARK, (NOW, NOW))
+        for n, dt in enumerate((3, 6, 9, 12)):            # the record rewritten by another seat's requests
+            self.write(_record(age_s=-dt))
+            rec = qa.read_quota_record(self.ws, NOW + dt + 1)
+            qa._log_reread(self.ws, SEAT, rec, qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW + dt + 1)
+        rereads = [ln for ln in self._log_lines() if "reread=" in ln]
+        self.assertEqual(len(rereads), 1, rereads)
+        self.assertIn(f"probe={int(NOW)}", rereads[0])
+
     def test_a_record_with_no_usable_time_writes_no_re_read(self):
         qa._log_reread(self.ws, SEAT, qa.QuotaRecord(_record(), None), qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW)
         self.assertEqual(self._log_lines(), [])
