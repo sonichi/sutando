@@ -21,6 +21,15 @@ if ! . "$(dirname "${BASH_SOURCE[0]}")/repo_root.sh" 2>/dev/null; then
   return 1 2>/dev/null || exit 1
 fi
 
+# Without the gate (a partial copy of src/) the CLI checks fail open, as the launchers' do.
+if [ -r "$(dirname "${BASH_SOURCE[0]}")/agent/runtime-compat-gate.sh" ]; then
+  # shellcheck source=agent/runtime-compat-gate.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/agent/runtime-compat-gate.sh"
+else
+  sutando_runtime_compat_gate() { SUTANDO_CORE_CLI_BIN="$2"; }
+  sutando_core_cli_path() { command -v "$2" || return 3; }
+fi
+
 resolve_startup_core_runtime() {
   local _repo
   _repo="$(sutando_repo_root)"
@@ -39,9 +48,8 @@ claude_auth_carry_enabled() {
   [ "${1:-claude}" = "claude" ]
 }
 
-# Fail before services launch when the SELECTED core cannot authenticate.
-# Claude keeps its existing rich auth-preflight gate. Codex uses the same
-# configured CODEX_HOME as its launcher, then asks the CLI itself for status.
+# Fail before services launch when the SELECTED core cannot run or authenticate.
+# The launchers' gate finds the CLI (a managed install off PATH included) and owns the repair.
 preflight_selected_core_auth() {
   local _runtime="${1:-claude}" _claude_config_dir="${2:-}"
   local _repo _config_env _config_value
@@ -49,6 +57,8 @@ preflight_selected_core_auth() {
 
   case "$_runtime" in
     claude)
+      # Login is left to auth-preflight-gate.sh below, which blocks; the gate only finds the CLI.
+      sutando_runtime_compat_gate "$_repo" claude || return $?
       if [ -n "$_claude_config_dir" ]; then
         bash "$_repo/src/auth-preflight-gate.sh" "$_claude_config_dir"
       fi
@@ -70,14 +80,7 @@ preflight_selected_core_auth() {
         echo "codex-auth-preflight: skipped (SUTANDO_SKIP_AUTH_PREFLIGHT=1)"
         return 0
       fi
-      if ! command -v codex >/dev/null 2>&1; then
-        echo "startup: Codex CLI is not installed — install it, run 'codex login', then retry" >&2
-        return 127
-      fi
-      if ! codex login status >/dev/null 2>&1; then
-        echo "startup: Codex CLI is not authenticated for ${CODEX_HOME:-the configured Codex home} — run 'codex login' and retry" >&2
-        return 1
-      fi
+      sutando_runtime_compat_gate "$_repo" codex --enforce-auth || return $?
       echo "codex-auth-preflight: OK — ${CODEX_HOME:-the configured Codex home} can boot authenticated"
       ;;
     *)

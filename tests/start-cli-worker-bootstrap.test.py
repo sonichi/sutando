@@ -97,7 +97,7 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
             (bind / stub).chmod(0o755)
         sock = td / "t.sock"
         session = extra_env.get("SUTANDO_TMUX_SESSION", "sutando-core")
-        env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
+        env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                "HOME": str(td / "home"), "SUTANDO_TMUX_SOCKET": str(sock),
                "SUTANDO_TEST_MODE": "1",
                **({"SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_script)}

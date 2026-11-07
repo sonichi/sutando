@@ -424,7 +424,7 @@ claude_cli_resolves() {
   local pane_path
   CLAUDE_LAUNCH_FAILURE=""
   pane_path="$(claude_pane_path)"
-  (PATH="$pane_path"; hash -r; command -v claude >/dev/null 2>&1) && return 0
+  (PATH="$pane_path"; hash -r; command -v "${SUTANDO_CORE_CLI_BIN:-claude}" >/dev/null 2>&1) && return 0
   CLAUDE_LAUNCH_FAILURE="claude not found on PATH=$pane_path"
   echo "  ⚠ $CLAUDE_LAUNCH_FAILURE" >&2
   return 1
@@ -440,7 +440,7 @@ launch_claude_session() {
   claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    "${SUTANDO_CORE_CLI_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do
