@@ -2032,6 +2032,7 @@ def park(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
         stopped = _stop_row(row, workspace, kill)
         row["parked"] = True
         _write(path, rec)
+    drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2064,6 +2065,8 @@ def park_legacy(*, workspace: Optional[Path] = None, kill=None) -> dict:
                 rec[LEGACY_PARKED_KEY] = rec[LEGACY_PARKED_KEY] or bool(pid)
         finally:
             _write(path, rec)
+            for inst in parked:
+                drop_mcp_lane(inst, workspace)
     return {"primary": primary["instance"], "parked": parked, "stopped": stopped}
 
 
@@ -2098,6 +2101,7 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
                 stale_path.unlink()
             except FileNotFoundError:
                 pass
+        drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2204,6 +2208,7 @@ def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) ->
             raise PrimaryCannotDisconnect(instance)
         stopped = _stop_row(row, workspace, kill)
         row["disabled"] = True
+    drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2952,6 +2957,17 @@ def _exit_code(child) -> Optional[int]:
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
            env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
+    """`_launch`, then a successful launch refreshes the MCP lanes (`sync_mcp_lanes`)."""
+    rec = _launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
+                  spawn=spawn, python=python, env_only=env_only, fetch=fetch, getaddrinfo=getaddrinfo)
+    if rec.get("ok"):
+        _refresh_mcp_lanes(workspace, environ, vault)
+    return rec
+
+
+def _launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+            env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
     plan read until the child is proven to hold its lease or has exited (`lease` in the record),
@@ -3485,6 +3501,174 @@ def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: st
     except (OSError, UnicodeDecodeError, ConnectionsError):
         return "write_failed"
     return "repointed"
+
+
+# ── MCP lanes: one proxy descriptor per extra connection ─────────────────────
+
+MCP_LANES_DIR_NAME = "ag2-mcp.d"
+MCP_LANES_DIR_ENV = "AG2_MCP_LANES_DIR"
+MCP_LANE_PREFIX = "conn-"
+
+
+def mcp_lanes_dir(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> Path:
+    """Where the MCP proxy reads its extra lanes: `AG2_MCP_LANES_DIR`, else `state/ag2-mcp.d`."""
+    environ = os.environ if environ is None else environ
+    named = (environ.get(MCP_LANES_DIR_ENV) or "").strip()
+    return Path(named) if named else _workspace(workspace) / "state" / MCP_LANES_DIR_NAME
+
+
+def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], mcp_config: Optional[Path],
+                         descriptor: Optional[Path]) -> Optional[dict]:
+    """The primary lane's descriptor, read only: `descriptor`, else `AG2_MCP_DESCRIPTOR`, else any
+    descriptor the Claude Code MCP config names (the desktop's lives outside the workspace), else
+    `state/ag2-mcp.json`. None when none is a readable version-1 descriptor."""
+    paths = [descriptor] if descriptor is not None else []
+    if (environ.get("AG2_MCP_DESCRIPTOR") or "").strip():
+        paths.append(Path(environ["AG2_MCP_DESCRIPTOR"].strip()))
+    if mcp_config is None:
+        from util_paths import claude_home_path
+        mcp_config = claude_home_path(".claude.json")
+    try:
+        servers = json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
+    except (OSError, ValueError, AttributeError):
+        servers = {}
+    for entry in servers.values() if isinstance(servers, dict) else []:
+        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
+        if isinstance(named, str) and named:
+            paths.append(Path(named))
+    paths.append(_workspace(workspace) / "state" / MCP_DESCRIPTOR_NAME)
+    for path in paths:
+        try:
+            desc = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(desc, dict) and desc.get("version") == 1 and isinstance(desc.get("mint_url"), str):
+            return desc
+    return None
+
+
+def mcp_lane_slug(instance: str) -> str:
+    return instance or LEGACY_PATH_SEGMENT
+
+
+def _lane_relay(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
+
+def _mcp_lane(row: Mapping[str, object], token: str, main: Mapping[str, object], env_file: Path,
+              space_of=None) -> "tuple[Optional[dict], str]":
+    """(descriptor, '') for one row, or (None, reason). Endpoints are never invented: MCP from the
+    row server's DotSpace, mint at the main descriptor's mint path on the row's own relay origin."""
+    relay = _lane_relay(gateway_url_of(token) or str(row["gateway_url"]))
+    secret = secret_of(token) if gateway_url_of(token) else token.strip()
+    mxid = str(row.get("agent_mxid") or "").strip()
+    server = server_of_mxid(mxid) or str(row["server"]).lower()
+    space = _space(server, space_of)
+    mcp_url = str(getattr(space, "mcp_url", "") or "")
+    mint_path = urllib.parse.urlsplit(str(main.get("mint_url") or "")).path
+    parts = urllib.parse.urlsplit(relay)
+    secure = parts.scheme == "https" or (parts.scheme == "http" and _loopback_host(parts.hostname or ""))
+    if not (mcp_url and mint_path and parts.netloc and secure and secret):
+        return None, "no_endpoints"
+    return {
+        "version": 1, "lane": mcp_lane_slug(str(row["instance"])), "server": server,
+        "env_file": str(env_file), "env_key": str(row["token_ref"]),
+        "mint_url": urllib.parse.urlunsplit((parts.scheme, parts.netloc, mint_path, "", "")),
+        "mcp_url": mcp_url, "ca_bundle": main.get("ca_bundle"),
+        "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
+        "relay": relay, "bearer_digest": hashlib.sha256(secret.encode()).hexdigest(),
+    }, ""
+
+
+def _write_if_changed(path: Path, body: str) -> bool:
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    _atomic_text(path, body)
+    return True
+
+
+def _unlink_lane(lanes: Path, slug: str) -> bool:
+    gone = False
+    for suffix in (".json", ".env"):  # descriptor first: the proxy never sees one without its env
+        try:
+            (lanes / f"{MCP_LANE_PREFIX}{slug}{suffix}").unlink()
+            gone = True
+        except FileNotFoundError:
+            pass
+    return gone
+
+
+def drop_mcp_lane(instance: str, workspace: Optional[Path] = None,
+                  environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Remove one connection's lane descriptor and env file, offline; whether any existed."""
+    try:
+        return _unlink_lane(mcp_lanes_dir(workspace, environ), mcp_lane_slug(instance))
+    except OSError as e:
+        logging.getLogger(__name__).warning("connections: dropping MCP lane %s failed (%s)",
+                                            mcp_lane_slug(instance), type(e).__name__)
+        return False
+
+
+def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None, vault=None,
+                   mcp_config: Optional[Path] = None, descriptor: Optional[Path] = None, space_of=None) -> dict:
+    """Write `conn-<instance>.json` (and a 0600 `conn-<instance>.env` holding the row's bearer under its
+    `token_ref`) in `mcp_lanes_dir` for each enabled core row the main descriptor does not already
+    serve, and remove every other `conn-*` file there. Without a readable main descriptor nothing is
+    touched (`skipped: no_main_descriptor`). Returns slugs only, never a secret."""
+    environ = os.environ if environ is None else environ
+    lanes = mcp_lanes_dir(workspace, environ)
+    out = {"ok": True, "lanes_dir": str(lanes), "written": [], "unchanged": [], "removed": [], "skipped": {}}
+    main = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor)
+    if main is None:
+        out.update(ok=False, reason="no_main_descriptor")
+        return out
+    served = {s for s in (str(main.get("server") or "").lower(), server_of_mxid(str(main.get("agent_id") or ""))) if s}
+    main_relay = _lane_relay(str(main.get("relay") or ""))
+    want = set()
+    lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(lock, create_mode=0o600):
+        for row in _core_rows(enabled_rows(workspace)):
+            slug = mcp_lane_slug(str(row["instance"]))
+            if _row_servers(row) & served or (main_relay and _lane_relay(str(row["gateway_url"])) == main_relay):
+                continue
+            try:
+                _, token = connection_credential(row, environ, vault=vault)
+            except ConnectionsError:
+                out["skipped"][slug] = "no_token"
+                continue
+            env_file = lanes / f"{MCP_LANE_PREFIX}{slug}.env"
+            desc, reason = _mcp_lane(row, token, main, env_file, space_of)
+            if desc is None:
+                out["skipped"][slug] = reason
+                continue
+            want.add(slug)
+            value = token.strip() if gateway_url_of(token) else f"{desc['relay']}|{token.strip()}"
+            # The env first, then the descriptor: the proxy reads the descriptor to find the env.
+            changed = _write_if_changed(env_file, _env_file_with(env_file, str(row["token_ref"]), value))
+            body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body) or changed
+            out["written" if changed else "unchanged"].append(slug)
+        try:
+            present = sorted({p.stem[len(MCP_LANE_PREFIX):] for p in lanes.iterdir()
+                              if p.name.startswith(MCP_LANE_PREFIX) and p.suffix in (".json", ".env")})
+        except FileNotFoundError:
+            present = []
+        for slug in present:
+            if slug not in want and _unlink_lane(lanes, slug):
+                out["removed"].append(slug)
+    return out
+
+
+def _refresh_mcp_lanes(workspace: Optional[Path], environ: Optional[Mapping[str, str]], vault) -> None:
+    """`sync_mcp_lanes` after a lifecycle change; it never fails the change it follows."""
+    try:
+        sync_mcp_lanes(workspace, environ=environ, vault=vault)
+    except Exception as e:  # noqa: BLE001 - derived state: the next lifecycle change or CLI run repairs it
+        logging.getLogger(__name__).warning("connections: MCP lane sync failed (%s)", type(e).__name__)
 
 
 def mirror_room_bindings(bindings: Mapping[str, str], legacy: str, successor: str,
