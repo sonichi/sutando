@@ -16,7 +16,11 @@ Run: python3 tests/skills/worker-pool/pool-sweep-never-blocks-routing.test.py
 from __future__ import annotations
 
 import importlib
+import contextlib
+import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,8 +39,8 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 sys.path.insert(0, str(REPO / "src"))
 
-pd, pr, rt, sup = (importlib.import_module(m) for m in
-                    ("pool_delivery", "pool_roster", "pool_router", "pool_supervise"))
+pd, pr, rt, sup, rem = (importlib.import_module(m) for m in
+                         ("pool_delivery", "pool_roster", "pool_router", "pool_supervise", "pool_remedy"))
 
 W = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 SRC = "room:!abc:ag2.space"
@@ -204,6 +208,58 @@ class TestRecheckUnderTheLock(Base):
         with mock.patch.object(pd, "arbitration", lambda ws, r, **kw: Counted(real(ws, r, **kw))):
             pd.archive_finished(self.ws, W, task_ids=ids)
         self.assertEqual((len(taken), peak[0]), (5, 1))
+
+
+class NoTmux:
+    def __call__(self, argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", "can't find session: x")
+
+
+class TestSweepReportsTheBudget(Base):
+    def worker(self):
+        wid = sup.wi.new_worker_id()
+        sup.wi.create_worker(self.ws, runtime="claude", cwd=str(self.ws), host="h",
+                             session_id="11111111-1111-4111-8111-111111111111",
+                             tmux_socket="/recorded/tmux.sock", worker_id=wid)
+        pr.register_worker(self.ws, wid, "w")
+        box = pd.deliveries_dir(self.ws, wid)
+        box.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            t = f"task-old{i}"
+            (self.ws / "tasks/archive" / f"{t}.txt").write_text(f"id: {t}\ntask: x\n")
+            (box / f"{t}.txt").write_bytes(b"")
+            os.utime(box / f"{t}.txt", (1.0, 1.0))
+        return wid
+
+    def test_a_worker_past_its_budget_is_deferred_then_retired(self):
+        wid = self.worker()
+        with mock.patch.object(sup, "SENTINEL_RETIRE_BUDGET_S", -1.0):
+            out = sup.tick(self.ws, 10000.0, runner=NoTmux())
+        self.assertEqual((out["sentinels_retired"], out["sentinels_deferred"]), ({}, {wid: 3}))
+        out = sup.tick(self.ws, 10300.0, runner=NoTmux())
+        self.assertEqual((out["sentinels_retired"], out["sentinels_deferred"]), ({wid: 3}, {}))
+
+    def test_a_spent_total_budget_starts_no_worker(self):
+        wid = self.worker()
+        with mock.patch.object(sup, "SENTINEL_RETIRE_TOTAL_BUDGET_S", -1.0):
+            out = sup.tick(self.ws, 10000.0, runner=NoTmux())
+        self.assertEqual(out["sentinels_deferred"], {wid: "not-started"})
+        self.assertEqual(sorted(os.listdir(pd.deliveries_dir(self.ws, wid))),
+                         ["task-old0.txt", "task-old1.txt", "task-old2.txt"])
+
+    def test_both_sweep_commands_report_what_was_left(self):
+        tick = {"decisions": {}, "observations": {}, "not_supervised": [], "auth_expired": [],
+                "resumed": False, "routing": {"alarm": None}, "sentinels_deferred": {W: 7}}
+        buf = io.StringIO()
+        with mock.patch.object(sup, "tick", return_value=tick), contextlib.redirect_stdout(buf):
+            sup.main(["--workspace", str(self.ws), "--sweep"])
+        self.assertIn(f"{W[:8]}  spent-sentinel archiving ran out of time; left for the next sweep: 7",
+                      buf.getvalue())
+        args = types.SimpleNamespace(workspace=self.ws, repo=REPO, resume=False, recipient=None, dry_run=True)
+        buf = io.StringIO()
+        with mock.patch.object(sup, "tick", return_value=tick), contextlib.redirect_stdout(buf):
+            self.assertEqual(rem._sweep(args), 0)
+        self.assertEqual(json.loads(buf.getvalue())["sentinels_deferred"], {W: 7})
 
 
 if __name__ == "__main__":
