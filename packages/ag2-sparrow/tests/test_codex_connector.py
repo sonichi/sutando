@@ -750,5 +750,21 @@ class TierMatrixTest(unittest.TestCase):
         tier_shapes.check_matrix(self, decide, collaborator_admitted=True)
 
 
+    def test_under_workspace_write_only_the_owner_writes(self):
+        """As the desktop installs it (--sandbox workspace-write): the owner's turn gets workspace-write, a stamped
+        collaborator's still runs read-only on its own ephemeral thread, and a guest is refused."""
+        tid = "task-1792100000009"
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-o", "owner asks", mtime=now - 30)
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True), mtime=now - 20)
+            write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 10)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(run_connector(d, once=3, extra=["--sandbox", "workspace-write"]), 0)
+            self.assertIn("[sandbox=workspace-write ephemeral=False cwd=", result(d, "task-chat-o"))
+            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
+            self.assertEqual(result(d, "task-chat-g"), task_io.NON_OWNER_REFUSED)
+
+
 if __name__ == "__main__":
     unittest.main()
