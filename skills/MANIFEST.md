@@ -11,7 +11,7 @@ A manifest-loaded skill is a directory containing:
 - `tools.ts` (if `manifest.tools` is set) — exports `tools: ToolDefinition[]`, picked up at agent startup
 - optional `server.py` / `start.sh` / other runtime infrastructure the tools rely on
 
-At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans `<repo>/skills`, `<workspace>/skills`, the optional `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/` and every sibling checkout's `skills/`, dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools` (see "Loader behavior" for the order and how duplicates resolve).
+At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans `<repo>/skills`, `<workspace>/skills`, the optional `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/` and every sibling checkout's `skills/`, dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools` (see "Loader behavior" for the order and how duplicates resolve). A tools file outside the engine may fall back to the engine's dependencies when its own resolution fails.
 
 The same `inlineTools` list is also pushed into the phone agent's tool table (see `skills/phone-conversation/scripts/conversation-server.ts:587`), so any tool a manifest-loaded skill contributes is automatically available to:
 
@@ -122,7 +122,7 @@ Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifes
 
 ## Supervised workers (`supervised_worker`)
 
-A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `*/manifest.json` in every skill root — shipped `skills/`, `<workspace>/skills/`, external plugin dirs and, only in the app's `engine/` layout, sibling checkouts (a plain clone opts siblings in through `$SUTANDO_EXTERNAL_PLUGIN_DIRS`), in the order `src/installed_skill_roots.py` (`scripts/sutando-config.sh skill-roots`) gives; a shipped skill wins a name collision, as in `skills/install.sh`; `enabled` gates inline tools, not supervision: a declared worker is started even when it is false or absent, and the worker owns its runtime opt-in; an unreadable root or skill folder is skipped, and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
 
 ```json
 "supervised_worker": {
@@ -153,7 +153,7 @@ two-arg `remind(argv, workspace)` still works. The field is in `schemas/skill-ma
 skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
 friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py` —
 `declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
-roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
+roots, `<repo>/skills` and `<workspace>/skills` (the restricted declaration roots; the script must
 resolve inside its skill), and refuses when more than one installed skill declares it, in one root
 or one per root — except the same skill name in both roots, where the shipped copy wins and the owner's is shadowed, the rule `skills/install.sh` applies; a `--store-adapter <path>` flag overrides the scan. The reminder
 (`pending_questions_remind.py`) reads an adapter through exactly these entry points: `reconcile_pass(workspace)`,
@@ -188,8 +188,7 @@ only, and only a JSON `true` opts in.
 ```
 
 `src/skill_audience.py` owns the decision and every installer calls it: `skills/install.sh`
-(both roots, `<repo>/skills` and `<workspace>/skills`, into the Claude and Codex skills
-dirs), `skills/install.ps1`, and `health-check.py --fix` (`skill-symlinks`). A developer
+(every `installed_skill_roots.py` root, into the Claude and Codex skills dirs), `skills/install.ps1`, and `health-check.py --fix` (`skill-symlinks`). A developer
 skill already linked on a host without the opt-in is left in place with a note; nothing deletes
 it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
 
@@ -202,8 +201,14 @@ refuses their fields on a developer-only skill. Which directories depends on the
   `$SUTANDO_MEMORY_DIR/skills`;
 - `pending_questions_store`, `on_launch` and `on_stop_requested` (`src/skill_roots.py`):
   `<repo>/skills` and `<workspace>/skills`;
-- `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`) and
-  `supervised_worker` (`src/sparrowd.py`): `<repo>/skills` only.
+- `hooks` (`src/skill_hooks.py`) and `claude_plugin` (`src/skill-manifest-config.sh`): `<repo>/skills` only.
+- `supervised_worker` (`src/sparrowd.py`): the installation roots from `installed_skill_roots.py`.
+
+Installation and supervision intentionally include explicitly configured external roots and app-managed
+engine siblings. Declaration consumers retain the engine/workspace pair: expanding their hook and
+store discovery would change startup execution and conflict detection outside this feature. The TS
+tool loader retains its existing broader scan and last-wins policy; installation/supervision are
+first-root-wins. A plain clone does not auto-install or supervise sibling checkouts.
 
 ## Launch hook (`on_launch`)
 
