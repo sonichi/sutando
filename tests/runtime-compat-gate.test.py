@@ -202,6 +202,15 @@ class ClaudeConsentRepairLaunchesTheRepairedBinary(unittest.TestCase):
     """The real Claude launcher: consent repairs a broken claude and launches the new one."""
 
     def test_consent_repair_launches_the_managed_claude(self):
+        self.repair_launch("2.4.0", False)
+
+    def test_mod_uses_repaired_cli_version_and_session_marker(self):
+        self.repair_launch("2.4.0", True)
+
+    def test_mod_stays_off_when_repaired_cli_is_below_its_floor(self):
+        self.repair_launch("2.1.286", True)
+
+    def repair_launch(self, version, mod):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
         bin_dir = tmp / "bin"
@@ -212,20 +221,27 @@ class ClaudeConsentRepairLaunchesTheRepairedBinary(unittest.TestCase):
         write_exe(bin_dir / "npm", f"""PREFIX=""
 while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
 mkdir -p "$PREFIX/bin"
-printf '#!/bin/sh\\ncase "$1" in --version) echo 2.4.0;; --help) echo "{CLAUDE_FLAGS}";; esac\\n' > "$PREFIX/bin/claude"
+printf '#!/bin/sh\\ncase "$1" in --version) echo {version};; --help) echo "{CLAUDE_FLAGS}";; esac\\n' > "$PREFIX/bin/claude"
 chmod +x "$PREFIX/bin/claude"
 """)
         env = {"HOME": str(tmp / "home"), "PATH": f"{bin_dir}:/usr/bin:/bin",
                "SUTANDO_RUNTIMES_DIR": str(tmp / "runtimes"), "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
                "SUTANDO_RUNTIME_WAIT_S": "0", "SUTANDO_TMUX_SOCKET": str(tmp / "sock"),
                "SUTANDO_SKIP_AUTH_PREFLIGHT": "1", "CLAUDE_CONFIG_DIR": str(tmp / "cfg"),
-               "SUTANDO_RUNTIME_REPAIR_CONSENT": "1"}
+               "SUTANDO_RUNTIME_REPAIR_CONSENT": "1",
+               "SUTANDO_TASK_WATCH_MOD_CORE": "1" if mod else ""}
         r = subprocess.run(["bash", str(launcher_copy(tmp) / "src/agent/claude/cli/start-cli.sh")],
                            env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                            timeout=180)
-        self.assertIn("repair succeeded: claude 2.4.0", r.stderr)
+        self.assertIn(f"repair succeeded: claude {version}", r.stderr)
         managed = tmp / "runtimes" / "bin" / "claude"
         self.assertIn(f" {managed} --name sutando-core ", log.read_text(), r.stderr[-2000:])
+        core = next(line for line in log.read_text().splitlines()
+                    if f" {managed} --name sutando-core " in line)
+        enabled = mod and version == "2.4.0"
+        self.assertEqual("--plugin-dir" in core, enabled, core)
+        self.assertIn(f"SUTANDO_TASK_WATCH_MOD={'1' if enabled else ''} ", core)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

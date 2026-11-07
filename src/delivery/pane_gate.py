@@ -29,7 +29,8 @@ CLI:
     python3 src/delivery/pane_gate.py leftover --runtime codex < capture.txt   # exit 0 = clearable
     python3 src/delivery/pane_gate.py healthy --runtime claude < capture.txt   # exit 0 = accepts input
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
-        [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
+        [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--require-limit] [--dry-run]
+    python3 src/delivery/pane_gate.py limit-holds --runtime claude < capture.txt   # exit 0 = limit alone
 """
 
 from __future__ import annotations
@@ -145,6 +146,8 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
+# The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
+_LIMIT_MENU_ROW = re.compile(r"wait for (?:the )?limit to reset|usage credits|extra usage", re.I)
 
 
 def _dialog_names_limit(text: str) -> bool:
@@ -157,6 +160,13 @@ def _dialog_names_limit(text: str) -> bool:
     start = rows[-1]
     while start > 0 and _NUMBERED_ROW.match(lines[start - 1]):
         start -= 1
+    end = rows[-1]
+    while end + 1 < len(lines) and _NUMBERED_ROW.match(lines[end + 1]):
+        end += 1
+    # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
+    live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
+    if live and any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
+        return True
     for line in reversed(lines[:start]):
         core = line.strip()
         if not core:
@@ -766,6 +776,25 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     return Verdict("unknown", "no idle affordance")
 
 
+def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
+    """The pane waits on a provider limit and nothing else: an empty composer, no turn
+    running, no other dialog. The banner on screen is the evidence; no quota record is read."""
+    if not capture or not capture.strip():
+        return False
+    lines = _tail_lines(capture)
+    tail = "\n".join(_SGR.sub("", ln) for ln in lines)
+    abn = frame_abnormal(tail)
+    if (abn and abn.retrying) or frame_working(tail) or turn_in_flight(capture):
+        return False
+    line = prompt_line(capture, adapter)
+    if line is None or line.text:
+        return False
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
+    if gate:
+        return gate in LIMIT_GATES
+    return abn is not None and abn.kind == "provider-limit"
+
+
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
             runner: Callable = subprocess.run, env: Optional[dict] = None, workspace=None,
             probe=False) -> Verdict:
@@ -780,12 +809,14 @@ def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: s
 
 
 # tmux-send-line.sh's contract; 2 is its own argument rejection.
-EXIT_STATUS = {0: "sent", 2: "rejected", 3: "no-session", 4: "no-tmux", 5: "pending", 6: "queued", 7: "unknown"}
+EXIT_STATUS = {0: "sent", 2: "rejected", 3: "no-session", 4: "no-tmux", 5: "pending", 6: "queued", 7: "unknown",
+               8: "not-limited"}
 
 
 def deliver(line: str, session: str, runtime: str, socket_path: Optional[str] = None,
             refuse_if_pending: bool = False, skip_if_queued: Optional[str] = None, dry_run: bool = False,
-            runner: Callable = subprocess.run, script: Path = SEND_LINE) -> Outcome:
+            runner: Callable = subprocess.run, script: Path = SEND_LINE,
+            require_limit: bool = False) -> Outcome:
     """Type one line + Enter into the core pane via the ONE sender, scripts/tmux-send-line.sh.
     The prompt read, the queued-input policy and the lock are its; this only maps its exit code."""
     if runtime not in ADAPTERS:
@@ -797,6 +828,8 @@ def deliver(line: str, session: str, runtime: str, socket_path: Optional[str] = 
         argv.append("--refuse-if-pending")
     if skip_if_queued:
         argv += ["--skip-if-queued", skip_if_queued]
+    if require_limit:
+        argv.append("--require-limit")
     if dry_run:
         argv.append("--dry-run")
     proc = runner(argv, capture_output=True, text=True, timeout=60)
@@ -947,6 +980,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
     hp.add_argument("--session", default=None, help="the seat the record must vouch for")
     hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    lh = sub.add_parser("limit-holds")
+    lh.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     sf = sub.add_parser("save-frame")
     sf.add_argument("--workspace", required=True)
     sf.add_argument("--seat", required=True)
@@ -963,6 +998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     d.add_argument("--refuse-if-pending", action="store_true")
     d.add_argument("--skip-if-queued", default=None)
     d.add_argument("--dry-run", action="store_true")
+    d.add_argument("--require-limit", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "safe-states":
         # Emitting the SAFE set keeps a caller's membership test fail-closed: anything
@@ -1044,7 +1080,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "after":
         print(after_prompt(_read_stdin(), adapter, getattr(a, "width", 0)))
         return 0
-    out = deliver(a.line, a.session, a.runtime, a.socket, a.refuse_if_pending, a.skip_if_queued, a.dry_run)
+    if a.cmd == "limit-holds":
+        if not limit_holds(_read_stdin(), adapter):
+            print("pane_gate: the pane does not wait on a usage limit alone", file=sys.stderr)
+            return EXIT_UNSAFE
+        return 0
+    out = deliver(a.line, a.session, a.runtime, a.socket, a.refuse_if_pending, a.skip_if_queued, a.dry_run,
+                  require_limit=a.require_limit)
     print(f"{out.status}: {out.message}" if out.message else out.status, file=sys.stderr if out.code else sys.stdout)
     return out.code
 

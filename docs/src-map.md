@@ -24,6 +24,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
+- **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`agent_triggers.py`** — AgentTrigger vocabulary and playbook dispatch: which platform events a task may name and which skill runs it.
 - **`agent_turn.py`** — Per-invocation turn context and the 3-outcome turn gate for relay tasks.
@@ -52,7 +53,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
-- **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
+- **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
@@ -260,6 +261,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
+- **`task_delegation.py`** — A task the core handed to an in-session background agent, for a bounded time.
 - **`task_disposition.py`** — What happened to a task whose file is not where a notification said it was.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
@@ -365,6 +367,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
+
+## `src/agent/claude/task-watch-mod/hooks/`
+
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
 
 ## `src/agent/codex/cli/`
 

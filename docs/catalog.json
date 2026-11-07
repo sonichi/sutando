@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-05"
+   "last_verified": "2026-11-06"
   },
   "docs/runtime-compat-repair-matrix.md": {
    "title": "Core CLI repair matrix",
@@ -362,7 +362,7 @@
    ],
    "status": "active",
    "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
-   "last_verified": "2026-08-21"
+   "last_verified": "2026-11-06"
   },
   "docs/testing-coverage.md": {
    "title": "Unit-test coverage gate",
@@ -515,7 +515,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-11-03"
+   "last_verified": "2026-11-06"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -534,8 +534,8 @@
     "maintainers"
    ],
    "status": "canonical",
-   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
-   "last_verified": "2026-10-22"
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the opt-in task-watch Mod",
+   "last_verified": "2026-11-06"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",

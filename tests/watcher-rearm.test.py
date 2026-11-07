@@ -86,6 +86,76 @@ try:
     with redirect_stdout(out):
         rc = wr.main(["session-start", "--repo", "/R", "--workspace", "/W"])
     check("main session-start is silent when held", rc == 0 and out.getvalue() == "", out.getvalue())
+    subprocess.run, _ = fake_run(stdout="no\n")
+    os.environ["SUTANDO_TASK_WATCH_MOD"] = "1"
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["session-start", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
+    check("a Mod-marked session with an unwatched inbox is still asked for a Monitor",
+          rc == 0 and "Re-arm it NOW" in out.getvalue(), out.getvalue())
+
+    # mod-ready: yes only on the marker AND a ready session watcher; a refused or absent Mod is no.
+    naps = []
+    subprocess.run, calls = fake_run(stdout="yes\n")
+    check("mod-ready without the marker is no, and probes nothing",
+          wr.mod_ready("/R", "/W", None, env={}, sleep=naps.append) == "no" and not calls)
+    check("mod-ready with the marker and a ready watcher is yes",
+          wr.mod_ready("/R", "/W", None, env={"SUTANDO_TASK_WATCH_MOD": "1"}, sleep=naps.append) == "yes"
+          and calls[0][2:] == ["role-present", "session", "--inbox", "/W/tasks", "--ready", "/W/state"], calls)
+    for verdict in ("no\n", "unknown\n"):
+        naps.clear()
+        subprocess.run, calls = fake_run(stdout=verdict)
+        now = [0.0]
+        got = wr.mod_ready("/R", "/W", "w1", env={"SUTANDO_TASK_WATCH_MOD": "1"}, wait_s=30,
+                           sleep=lambda s: (naps.append(s), now.__setitem__(0, now[0] + s)), clock=lambda: now[0])
+        check(f"a Mod that refused or never came up ({verdict.strip()}) is no after the 30 s wait",
+              got == "no" and len(naps) == 30 and calls[0][5] == "/W/deliveries/w1", (got, len(naps)))
+    # A probe slower than the wait: the deadline bounds the total, and each probe gets only the time left.
+    import time as _time
+    timeouts = []
+
+    def slow_run(argv, **kw):
+        timeouts.append(kw.get("timeout"))
+        _time.sleep(min(1.5, kw.get("timeout") or 1.5))
+        if (kw.get("timeout") or 99) < 1.5:
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return SimpleNamespace(stdout="no\n", returncode=0)
+    subprocess.run = slow_run
+    t0 = _time.monotonic()
+    got = wr.mod_ready("/R", "/W", None, env={"SUTANDO_TASK_WATCH_MOD": "1"}, wait_s=1)
+    took = _time.monotonic() - t0
+    check("a slow probe cannot overrun the wait: no within wait_s plus a small margin",
+          got == "no" and took < 1.3 and all(t is not None and t <= 1 for t in timeouts), (got, round(took, 2), timeouts))
+    os.environ["SUTANDO_TASK_WATCH_MOD"] = "1"
+    subprocess.run, _ = fake_run(stdout="yes\n")
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["mod-ready", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
+    check("main mod-ready prints the word", rc == 0 and out.getvalue() == "yes\n", out.getvalue())
+
+    check("core watch-argv is the target's command, one argument each",
+          wr.watch_argv("/R", "/W", None, {}) == ["bash", "/R/src/watch-tasks-stream.sh", "/W/tasks", "--role", "session", "--inbox", "/W/tasks"])
+    check("worker watch-argv takes the launcher's command and the target's inbox",
+          wr.watch_argv("/R", "/W", "w1", {"SUTANDO_WATCHER_CMD": "/X/w.sh"})
+          == ["bash", "/X/w.sh", "/W/deliveries/w1", "--role", "session", "--inbox", "/W/deliveries/w1"])
+    try:
+        wr.watch_argv("/R", "/W", "w1", {})
+        check("a worker without SUTANDO_WATCHER_CMD is refused", False)
+    except ValueError:
+        check("a worker without SUTANDO_WATCHER_CMD is refused", True)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["watch-argv", "--repo", "/R", "--workspace", "/W"])
+    check("main watch-argv prints one argument per line", rc == 0 and out.getvalue().splitlines()[1:3] == ["/R/src/watch-tasks-stream.sh", "/W/tasks"], out.getvalue())
+    os.environ["SUTANDO_INSTANCE_ID"] = "w1"
+    os.environ.pop("SUTANDO_WATCHER_CMD", None)
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        rc = wr.main(["watch-argv", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_INSTANCE_ID", None)
+    check("main watch-argv fails loudly for a worker with no command", rc == 1 and "SUTANDO_WATCHER_CMD" in err.getvalue(), err.getvalue())
     for bad in ([], ["bogus", "--repo", "/R", "--workspace", "/W"], ["target", "--repo", "/R"],
                 ["target", "--repo"], ["target", "--nope", "x", "--workspace", "/W"]):
         err = io.StringIO()
