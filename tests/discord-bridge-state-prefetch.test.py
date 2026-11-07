@@ -29,6 +29,7 @@ Exit 0 on pass, 1 on fail.
 from __future__ import annotations
 import tempfile
 import os
+import json
 import asyncio
 import importlib.util
 import sys
@@ -433,6 +434,159 @@ def case_l_history_timeout_returns_none():
     return fails
 
 
+def case_m_unresolved_blacklisted_ref_does_not_use_cache():
+    fails = []
+    _clear_cache()
+    origin = 123456
+    ref = 789012
+    access_file = Path(tempfile.mkdtemp()) / "access.json"
+    access_file.write_text(json.dumps({
+        "groups": {str(origin): {"contextNotFrom": ["345678"]}},
+    }))
+    original_access_file = bridge.ACCESS_FILE
+    bridge.ACCESS_FILE = access_file
+    try:
+        _install_mock_client({})
+        bucket = int(time.time() // bridge._PREFETCH_CACHE_TTL_S)
+        bridge._PREFETCH_CACHE[(ref, bucket)] = "cached message without authorization"
+        enriched = asyncio.run(bridge._prefetch_discord_state_refs(
+            f"read <#{ref}>", origin_channel_id=origin))
+        if enriched is not None:
+            fails.append("m) unresolved ref with active contextNotFrom must fail whole prefetch")
+        if enriched and "cached message without authorization" in enriched:
+            fails.append("m) cached text must not be reused when channel resolution fails")
+    finally:
+        bridge.ACCESS_FILE = original_access_file
+    return fails
+
+
+def case_n_guildless_channel_fails_closed_under_blacklist():
+    fails = []
+    _clear_cache()
+    origin = 123456
+    ref = 789012
+    access_file = Path(tempfile.mkdtemp()) / "access.json"
+    access_file.write_text(json.dumps({
+        "groups": {str(origin): {"contextNotFrom": ["345678"]}},
+    }))
+    original_access_file = bridge.ACCESS_FILE
+    bridge.ACCESS_FILE = access_file
+    try:
+        _install_mock_client({ref: _MockChannel(ref)})
+        enriched = asyncio.run(bridge._prefetch_discord_state_refs(
+            f"read <#{ref}>", origin_channel_id=origin))
+        if enriched is not None:
+            fails.append("n) a ref whose guild cannot be proven must fail the prefetch")
+    finally:
+        bridge.ACCESS_FILE = original_access_file
+    return fails
+
+
+def case_o_blacklist_skips_channel_guild_and_null_ref():
+    """Under an active contextNotFrom: a channel-id entry skips its ref, a
+    resolved-but-guild-blocked ref skips, and a ref resolving to nothing
+    (get_channel AND fetch_channel both return None) fails the whole prefetch."""
+    fails = []
+    _clear_cache()
+    origin = 123456
+    ref_blocked_ch = 789011
+    ref_blocked_guild = 789012
+    ref_null = 789013
+    blocked_guild = 345678
+    access_file = Path(tempfile.mkdtemp()) / "access.json"
+    access_file.write_text(json.dumps({
+        "groups": {str(origin): {"contextNotFrom": [str(ref_blocked_ch), str(blocked_guild)]}},
+    }))
+    original_access_file = bridge.ACCESS_FILE
+    bridge.ACCESS_FILE = access_file
+
+    guild_ch = _MockChannel(ref_blocked_guild)
+    guild_ch.guild = types.SimpleNamespace(id=blocked_guild)
+
+    class _NullClient(_Client):
+        async def fetch_channel(self, cid):
+            return self._channels.get(cid)  # miss -> None, not a raise
+
+    c = _NullClient()
+    c._channels = {ref_blocked_guild: guild_ch}
+    bridge.client = c
+    try:
+        enriched = asyncio.run(bridge._prefetch_discord_state_refs(
+            f"read <#{ref_blocked_ch}> and <#{ref_blocked_guild}> then <#{ref_null}>",
+            origin_channel_id=origin))
+        if enriched is not None:
+            fails.append("o) a null-resolving ref under an active blacklist must fail the prefetch")
+    finally:
+        bridge.ACCESS_FILE = original_access_file
+    return fails
+
+
+def case_q_blacklist_skip_keeps_allowed_sibling():
+    """Channel-id and guild skips drop their ref while an allowed sibling
+    enriches — the outcome case_o's null ref can never observe."""
+    fails = []
+    _clear_cache()
+    origin = 123456
+    ref_blocked_ch = 789011
+    ref_blocked_guild = 789012
+    ref_allowed = 789014
+    blocked_guild = 345678
+    access_file = Path(tempfile.mkdtemp()) / "access.json"
+    access_file.write_text(json.dumps({
+        "groups": {str(origin): {"contextNotFrom": [str(ref_blocked_ch), str(blocked_guild)]}},
+    }))
+    original_access_file = bridge.ACCESS_FILE
+    bridge.ACCESS_FILE = access_file
+
+    blocked_ch = _MockChannel(ref_blocked_guild)
+    blocked_ch.guild = types.SimpleNamespace(id=blocked_guild)
+    allowed_ch = _MockChannel(ref_allowed, messages=[
+        _MockMessage("1", "u9", "allowed sibling text", _now_dt()),
+    ])
+    allowed_ch.guild = types.SimpleNamespace(id=999999)
+    _install_mock_client({ref_blocked_guild: blocked_ch, ref_allowed: allowed_ch})
+    try:
+        enriched = asyncio.run(bridge._prefetch_discord_state_refs(
+            f"read <#{ref_blocked_ch}> and <#{ref_blocked_guild}> plus <#{ref_allowed}>",
+            origin_channel_id=origin))
+        if enriched is None:
+            fails.append("q) allowed sibling must still enrich when blocked refs skip")
+            return fails
+        if "allowed sibling text" not in enriched:
+            fails.append("q) allowed sibling's messages missing from enriched body")
+        for skipped in (ref_blocked_ch, ref_blocked_guild):
+            if f"Channel <#{skipped}> recent messages" in enriched:
+                fails.append(f"q) blocked ref <#{skipped}> must be skipped, not enriched")
+    finally:
+        bridge.ACCESS_FILE = original_access_file
+    return fails
+
+
+def case_p_post_refusal_when_validator_resolution_fails():
+    """A post_gate import/validator failure returns a refusal, never raises."""
+    fails = []
+    bad = types.ModuleType("channels.discord.post_gate")
+
+    def _boom():
+        raise RuntimeError("validator import exploded")
+    bad.resolve_validator = _boom
+    original_module = sys.modules.get("channels.discord.post_gate")
+    original_validator = bridge._GATEWAY_POST_VALIDATOR
+    sys.modules["channels.discord.post_gate"] = bad
+    bridge._GATEWAY_POST_VALIDATOR = bridge._GATEWAY_POST_VALIDATOR_UNSET
+    try:
+        refusal = bridge._gateway_post_refusal("42", {"text": "hi"})
+        if not (refusal and "validator resolution failed" in refusal):
+            fails.append(f"p) expected a validator-resolution refusal, got {refusal!r}")
+    finally:
+        if original_module is None:
+            sys.modules.pop("channels.discord.post_gate", None)
+        else:
+            sys.modules["channels.discord.post_gate"] = original_module
+        bridge._GATEWAY_POST_VALIDATOR = original_validator
+    return fails
+
+
 def main():
     cases = [
         ("a-ref-with-perms-prepends", case_a_ref_with_perms_prepends),
@@ -447,6 +601,11 @@ def main():
         ("j-unexpected-exception-silent-fail", case_j_unexpected_exception_silent_fail),
         ("k-partial-failure-fails-whole-prefetch", case_k_partial_failure_fails_whole_prefetch),
         ("l-history-timeout-returns-none", case_l_history_timeout_returns_none),
+        ("m-unresolved-blacklisted-ref-does-not-use-cache", case_m_unresolved_blacklisted_ref_does_not_use_cache),
+        ("n-guildless-channel-fails-closed-under-blacklist", case_n_guildless_channel_fails_closed_under_blacklist),
+        ("o-blacklist-skips-channel-guild-and-null-ref", case_o_blacklist_skips_channel_guild_and_null_ref),
+        ("q-blacklist-skip-keeps-allowed-sibling", case_q_blacklist_skip_keeps_allowed_sibling),
+        ("p-post-refusal-when-validator-resolution-fails", case_p_post_refusal_when_validator_resolution_fails),
     ]
     failures = []
     for label, fn in cases:

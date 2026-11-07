@@ -42,6 +42,19 @@ UA = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
 _DISCORD_ID_KEYS = ("id",)
 
 
+def validator_refusal(validator, channel_id, payload) -> str | None:
+    if validator is None:
+        return None
+    try:
+        reason = validator(str(channel_id), payload)
+    except Exception as e:
+        return (f"validator crashed ({type(e).__name__}: {e}) — "
+                "refusing the unvalidated send")
+    if reason:
+        return f"refused by validator: {reason}"
+    return None
+
+
 def _default_transport(req, timeout):
     """One urlopen -> (status, parsed-json-or-text). Raises on transport failure.
 
@@ -81,18 +94,9 @@ class DiscordRestClient:
     def _gate_refusal(self, channel_id, payload: dict):
         """The refusing DeliveryReceipt when the injected validator blocks this
         (channel_id, payload), else None. No validator -> no refusal."""
-        if self._validator is None:
-            return None
-        try:
-            reason = self._validator(str(channel_id), payload)
-        except Exception as e:  # noqa: BLE001 — a broken gate must not fail open
-            return DeliveryReceipt(
-                DeliveryOutcome.NOT_DELIVERED,
-                detail=f"validator crashed ({type(e).__name__}: {e}) — "
-                       "refusing the unvalidated send")
-        if reason:
-            return DeliveryReceipt(DeliveryOutcome.NOT_DELIVERED,
-                                   detail=f"refused by validator: {reason}")
+        reason = validator_refusal(self._validator, channel_id, payload)
+        if reason is not None:
+            return DeliveryReceipt(DeliveryOutcome.NOT_DELIVERED, detail=reason)
         return None
 
     def _headers(self, content_type: str | None = "application/json"):
