@@ -392,18 +392,61 @@ def card_room(dest: Destination) -> str:
     return (dest.channel or "") if dest.bridge == CARD_BRIDGE else ""
 
 
+# The word that introduced the detail goes with it, or removal leaves "green on ,".
+_LEAD = r"(?:\b(?:on|at|in|from|see|via|per|against)\s+)?"
+_TIDY = ((r"\s+([,.;:])", r"\1"), (r"([,;:])\s*(?=[,.;:])", ""),
+         (r"\s*\u2014\s*(?=[,.]|$)", ""), (r"\(\s*\)", ""), (r"\s{2,}", " "))
+
+
+def _is_hash(token: str) -> bool:
+    """A commit hash, not an ordinary word or a plain number: hex with both kinds."""
+    low = token.lower()
+    return any(c.isdigit() for c in low) and any(c.isalpha() for c in low)
+
+
+def card_plain(text: Optional[str], host: str = "") -> str:
+    """Card prose the owner reads: no URLs, commit hashes or machine names (V36). The
+    card is for deciding; those three read as log output and never change the answer."""
+    src = text or ""
+    out = re.sub(_LEAD + r"https?://\S+", "", src)
+    out = re.sub(_LEAD + r"\b[0-9a-f]{7,40}\b",
+                 lambda m: "" if _is_hash(m.group(0).split()[-1]) else m.group(0),
+                 out, flags=re.I)
+    if host and host.strip():
+        out = re.sub(_LEAD + r"\(?" + re.escape(host.strip()) + r"\)?", "", out, flags=re.I)
+    if out == src:
+        return " ".join(src.split())
+    # Removing "see <url>" strands the clause around it ("— built"); drop what is left
+    # of a clause once it is too short to say anything.
+    kept, tail = [], ""
+    for piece in re.split(r"([,;\u2014]|\.\s|\.$)", out):
+        if piece is None:
+            continue
+        if re.fullmatch(r"[,;\u2014]|\.\s|\.", piece or ""):
+            tail = "." if piece.strip() == "." or piece.strip().startswith(".") else piece
+            continue
+        if len(piece.split()) >= 2:
+            kept.append(piece.strip())
+    out = ", ".join(kept)
+    for pat, rep in _TIDY:
+        out = re.sub(pat, rep, out)
+    out = " ".join(out.split()).strip(" ,;:\u2014-")
+    return f"{out}." if out and tail == "." else out
+
+
 def card_message(question: str, context: Optional[str], default_action: Optional[str],
                  reason: Optional[str], options, link: Optional[str] = None,
-                 intro: Optional[str] = None) -> str:
-    parts = [question.strip()]
-    if context and context.strip():
-        parts.append(context.strip())
-    if reason and reason.strip() and (default_action or "").strip():
-        parts.append(f"Why Approve: {reason.strip()}")
+                 intro: Optional[str] = None, host: str = "") -> str:
+    """V36/V111 order: the ask, then what she acts on, then why, then background last.
+    Context used to sit between the question and the buttons, so she read it first."""
+    parts = [card_plain(question, host) or question.strip()]
     parts.append("\n".join(f"{label}: {what}" if what else label
                            for label, what in card_choices(default_action, options)))
-    if link:
-        parts.append(f"Or set its Status on the row: {link}")
+    if reason and reason.strip() and (default_action or "").strip():
+        parts.append(f"Why Approve: {card_plain(reason, host) or reason.strip()}")
+    ctx = card_plain(context, host)
+    if ctx:
+        parts.append(ctx)
     if intro and intro.strip():
         parts.append(intro.strip())
     return "\n\n".join(parts)
@@ -415,7 +458,7 @@ def build_card(ask_id: str, question: str, context: Optional[str], host: str,
     """The question's card, built but not stored, with its id already allocated."""
     from hitl.cards import choice_request, new_id  # noqa: PLC0415
     return choice_request(
-        card_message(question, context, default_action, reason, options, link, intro),
+        card_message(question, context, default_action, reason, options, link, intro, host),
         card_actions(default_action, options), ask_id,
         {"ask_id": ask_id, "choices": card_consequences(default_action, options)},
         runtime=CARD_RUNTIME, title=f"Question from the {host} core",

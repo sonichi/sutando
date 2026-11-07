@@ -961,9 +961,55 @@ class CardRoom(unittest.TestCase):
 
 
 class EdgePaths(unittest.TestCase):
-    def test_the_card_carries_the_row_link(self):
+    def test_the_card_does_not_carry_the_row_link(self):
+        """V36 (owner, 2026-11-06): no links on the human-facing card -- a raw URL read
+        as log output. The text message still carries the row for anyone who wants it."""
         msg = ask.card_message("Q?", None, "go", None, (), link="https://row.test.invalid/1")
-        self.assertIn("https://row.test.invalid/1", msg)
+        self.assertNotIn("https://row.test.invalid/1", msg)
+        self.assertNotIn("Or set its Status", msg)
+
+
+class CardHierarchyAndPlainProse(unittest.TestCase):
+    """V36/V111 (owner, 2026-11-06): 一句话 + 选项按钮，细节收起来 — the ask, then the
+    options she acts on, then why, then background last; and no hashes, URLs or
+    machine names in the prose."""
+
+    OPTS = (("Approve", "merge it to main"), ("Hold", "leave it for Chi"))
+
+    def test_the_options_come_before_the_background(self):
+        msg = ask.card_message("Merge it?", "Some background here.", "merge it",
+                               "it is blocking", self.OPTS)
+        self.assertLess(msg.index("Approve: merge it to main"), msg.index("Some background"))
+        self.assertLess(msg.index("Merge it?"), msg.index("Approve: merge it to main"))
+        self.assertLess(msg.index("Why Approve:"), msg.index("Some background"))
+
+    def test_hashes_urls_and_the_machine_name_leave_the_prose(self):
+        msg = ask.card_message(
+            "Merge it?",
+            "CI green on 106918153b, see https://example.invalid/1 — built on box-7.",
+            "merge it", None, self.OPTS, host="box-7")
+        self.assertNotIn("106918153b", msg)
+        self.assertNotIn("https://", msg)
+        self.assertNotIn("box-7", msg)
+        self.assertIn("CI green.", msg)          # the part worth reading survives
+
+    def test_prose_with_nothing_to_strip_is_untouched(self):
+        """The control that matters: a sanitizer that rewrites clean text is a bug.
+        Punctuation must survive exactly, including ; and sentence breaks."""
+        for clean in ("CI is green and nothing else needs doing.",
+                      "Chi asked for this in the review; PR 6280 covers it.",
+                      "Two sentences here. The second one also matters.",
+                      "The deface pattern and facade module are unchanged.",
+                      "Order 19700000 shipped."):
+            self.assertEqual(ask.card_plain(clean), clean)
+
+    def test_a_word_of_hex_letters_is_not_a_hash(self):
+        self.assertEqual(ask.card_plain("The facade is unchanged."), "The facade is unchanged.")
+
+    def test_empty_prose_stays_empty(self):
+        self.assertEqual(ask.card_plain(None), "")
+        self.assertEqual(ask.card_plain(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()
