@@ -728,6 +728,30 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertEqual(calls, [])
         self.assertIn("sent=0 why=marker-unwritable", self._log_lines()[0])
 
+    def test_a_line_with_no_seat_still_dedups_on_its_token(self):
+        for dt in (0, 5, 10):
+            qa._log_probe(self.ws, NOW + dt, once="mark=7", sent=0, why="marker-fresh", mark=7)
+        self.assertEqual(len(self._log_lines()), 1, self._log_lines())
+
+    def test_the_dedup_reads_only_the_logs_tail(self):
+        log = self.ws / "logs" / qa.PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        filler = "".join(f"2026-01-01T00:00:00Z seat=other n={i}\n" for i in range(qa.PROBE_LOG_TAIL_BYTES // 30))
+        log.write_text(f"2026-01-01T00:00:00Z seat={SEAT} mark=7\n" + filler)
+        qa._log_probe(self.ws, NOW, once="mark=7", seat=SEAT, mark=7)
+        self.assertEqual(sum(f"seat={SEAT} " in ln for ln in self._log_lines()), 2,
+                         "a token older than the tail is not looked for")
+        qa._log_probe(self.ws, NOW + 5, once="mark=7", seat=SEAT, mark=7)
+        self.assertEqual(sum(f"seat={SEAT} " in ln for ln in self._log_lines()), 2, "one inside the tail still dedups")
+
+    def test_a_full_log_is_rotated_before_the_next_line(self):
+        log = self.ws / "logs" / qa.PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("x" * qa.PROBE_LOG_MAX_BYTES)
+        qa._log_probe(self.ws, NOW, seat=SEAT, sent=1)
+        self.assertEqual(len(self._log_lines()), 1)
+        self.assertEqual((log.parent / (qa.PROBE_LOG + ".1")).stat().st_size, qa.PROBE_LOG_MAX_BYTES)
+
     def test_a_record_with_no_usable_time_writes_no_re_read(self):
         qa._log_reread(self.ws, SEAT, qa.QuotaRecord(_record(), None), qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW)
         self.assertEqual(self._log_lines(), [])
