@@ -9,7 +9,6 @@ the durable runner cannot replay a backlog of old actions.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sys
@@ -19,9 +18,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'src'))
+from file_lock import locked_file
+from cron_ownership import CORE, entry_owner
+
 
 def launchd_eligible(entry: dict[str, Any]) -> bool:
     """Return whether Codex should move this entry to the launchd runner."""
+    if entry_owner(entry) != CORE or entry.get("monitor"):
+        return False
     if entry.get("launchd") is True or entry.get("execution") == "codex-task":
         return False
     if entry.get("loop") == "dynamic" or not entry.get("cron"):
@@ -65,13 +70,8 @@ def _state_lock(state_file: Path) -> Iterator[None]:
     the two read-modify-write sections mutually exclusive so the boundary
     always survives. Peer: ``cron-runner._state_lock``."""
     lock_path = state_file.parent / (state_file.name + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with locked_file(lock_path):
+        yield
 
 
 def _atomic_json(path: Path, value: Any) -> None:
