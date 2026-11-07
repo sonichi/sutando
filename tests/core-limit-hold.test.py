@@ -1040,6 +1040,17 @@ class ModelSwitchWayOut(unittest.TestCase):
             self.pick("opus")
             self.assertIsNone(hc._core_limit_hold(self.now + 1), "a seat switched away is revived")
 
+    def test_an_unresolvable_seat_falls_back_to_the_model_switch_record(self):
+        import os
+        from unittest import mock
+        import sutando_config
+        self.pick("sonnet")
+        with mock.patch.object(sutando_config, "resolve_claude_sutando_config_dir",
+                               side_effect=ValueError("both config fields set")), \
+                mock.patch.dict(os.environ, {}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertEqual(clh.launch_identity(self.ws), ("sonnet", None))
+
     def test_health_check_revives_a_core_switched_away_from_the_hold(self):
         from unittest import mock
         spec = importlib.util.spec_from_file_location("hc_6291", str(REPO / "src" / "health-check.py"))
