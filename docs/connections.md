@@ -576,13 +576,18 @@ sync-mcp-lanes`) writes, for each enabled core row the main descriptor does not 
 0600 `conn-<instance>.env` holding the row's token under its `token_ref`. The descriptor carries
 `lane`, `server`, `env_file`, `env_key`, `relay` (the token's gateway), `agent_id`, `bearer_digest`,
 `mint_url` (the main descriptor's mint path on the row's own relay origin) and `mcp_url` (the row
-server's DotSpace); a row with no token or no such endpoints is skipped by reason. Every other
-`conn-*` file is removed. Without a readable main descriptor nothing is touched.
+server's DotSpace); a row with no token or no such endpoints is skipped by reason, and so is a
+token holding `'` or a line break (`unquotable_token`), since the env readers only strip the outer
+quotes. Every other `conn-*` file is removed, and so is any `.conn-*.tmp` a crashed write left.
+Without a readable main descriptor nothing is touched. `drop_mcp_lane` takes the same lanes lock as
+the sync, so a sync that read a row before it was disabled cannot write its lane back.
 
 A successful `launch` (so startup, add, reconnect, unpark, promote and update-token) runs the sync;
 `disconnect`, `park`, `park-legacy` and `remove` drop that row's lane at once. The env file is a
 copy of a secret that may live in the Keychain, kept in `state/` (never in the channel dir, where
-`connection_credential` would read it ahead of the vault).
+`connection_credential` would read it ahead of the vault). The vault sync carries nothing under
+`state/` unless `vault.sync.include` names it, and the shipped `vault.sync.exclude` carves
+`state/ag2-mcp.d/` out even then.
 
 ## Known servers
 
