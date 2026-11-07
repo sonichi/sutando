@@ -150,7 +150,8 @@ class QueueQuestion(unittest.TestCase):
         self.assertEqual((req.runtime, req.guard, req.subject["ask_id"]), (ask.CARD_RUNTIME, out["ask_id"], out["ask_id"]))
         self.assertEqual([(a.id, a.label) for a in req.actions], [("approve", "Approve"), ("option-1", "Hold")])
         self.assertTrue(req.turn_on_action)
-        self.assertIn("Approve: merge it", req.message)
+        self.assertNotIn("Approve: merge it", req.message, "the buttons carry the choices")
+        self.assertEqual(req.subject["choices"]["approve"], "merge it")
         self.assertIn(f"**Sent:** card {out['card']}", out["sent_line"])
         self.assertTrue(out["outbox"], "the question is still held for its row")
         self.assertTrue(any("decision card" in ln for ln in ask.report_lines(out)))
@@ -961,9 +962,16 @@ class CardRoom(unittest.TestCase):
 
 
 class EdgePaths(unittest.TestCase):
-    def test_the_card_carries_the_row_link(self):
-        msg = ask.card_message("Q?", None, "go", None, (), link="https://row.test.invalid/1")
-        self.assertIn("https://row.test.invalid/1", msg)
+    def test_the_row_link_rides_in_the_subject_not_the_text(self):
+        req = ask.build_card("ask-1", "Merge cinny #3285 into dev?", None, "qingyun-mac-mini", "merge it",
+                             None, (("Hold", "wait for CI"),), link="https://row.test.invalid/1")
+        wire = req.to_wire()
+        self.assertEqual(wire["subject"]["row_link"], "https://row.test.invalid/1")
+        for leak in ("https://", "qingyun-mac-mini", "Hold: wait for CI", "set its Status"):
+            self.assertNotIn(leak, req.message)
+        self.assertNotIn("qingyun-mac-mini", req.title or "")
+        self.assertEqual([a.label for a in req.actions], ["Approve", "Hold"])
+        self.assertEqual(wire["subject"]["choices"], {"approve": "merge it", "option-1": "wait for CI"})
 
 if __name__ == "__main__":
     unittest.main()

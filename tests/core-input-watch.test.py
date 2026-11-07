@@ -1563,7 +1563,10 @@ class TestStyledPermissionCaretRow(unittest.TestCase):
     def test_the_card_offers_yes_and_no(self):
         _, _, _, req = self._card()
         self.assertEqual(req.kind, "permission")
-        self.assertEqual([a.label for a in req.actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual([a.label for a in req.actions][:3], [
+            "Yes", "Yes, and don’t ask again for: sh -c 'for f in ./x; do rm \"$f\"; done'", "No"])
+        self.assertEqual([a.kind for a in req.actions],
+                         ["allow_once", "allow_always", "reject_once", "open_terminal"])
         self.assertNotIn("╌", req.message)
         self.assertIn("This command requires approval Do you want to proceed?", req.message)
 

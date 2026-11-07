@@ -47,7 +47,7 @@ def _actions_for(ev: Dict) -> List[Action]:
             # the option kind itself (allow_once / reject_once) and reads the choice.
             out.append(Action(id=oid, kind=str(o.get("kind") or "tui_select"), label=label))
     # The floor: every TUI-sourced requirement can be finished in the terminal.
-    out.append(Action(id=JUMP_ACTION_ID, kind="open_terminal", label=f"Open terminal ({ev.get('session', '?')})"))
+    out.append(Action(id=JUMP_ACTION_ID, kind="open_terminal", label="Open terminal"))
     return out
 
 
@@ -66,11 +66,11 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
     return HumanRequirement(
         kind=str(ev.get("kind") or "unknown"),
         runtime=runtime,
-        message=f"{prompt} — session {session}",
+        message=prompt,
         guard=str(ev.get("guard") or ""),
         subject=dict(ev.get("subject") or {}) if isinstance(ev.get("subject"), dict) else {},
         device=device,
-        title=f"{runtime} · {session}",
+        title=f"{runtime} needs you",
         actions=_actions_for(ev),
     )
 

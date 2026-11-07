@@ -721,9 +721,7 @@ def escalation_message(state, detail, kind, prompt, session=None, runtime=None):
     head = ("I am blocked and cannot continue without you."
             if state == "blocked-human" else
             "I am signed out and cannot continue without you.")
-    lines = [head, "", f"State: {state} — {detail}"]
-    if kind and kind != "unknown":
-        lines.append(f"Gate: {kind}")
+    lines = [head]
     excerpt = prompt_excerpt(prompt) if prompt else []
     if excerpt:
         # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
@@ -756,15 +754,11 @@ def _hitl_manager(out_path):
 
 
 def _name_seat(req, session, seat):
-    """Say which seat is asking: a card from one of several watched panes must
-    name its own, and its terminal jump must name that pane's session."""
-    from hitl.schema import Action
+    """Say which seat is asking by its display name; the session stays in `device.id`,
+    where the terminal jump reads it, and never in the text a person reads."""
     req.title = f"{seat} · {req.title}"
-    req.message = f"{seat} (tmux session {session})\n\n{req.message}"
     req.device = {"id": session, "name": seat}
     req.subject = {**(req.subject or {}), "seat": seat}
-    req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
-                   if a.kind == "open_terminal" else a for a in req.actions]
     return req
 
 

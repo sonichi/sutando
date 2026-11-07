@@ -135,12 +135,26 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(self.drive(), [])
         self.assertNotIn(req.id, pending_ids(self.mgr, clock=self.clock))
 
-    def test_resolve_is_the_edit_plus_one_recovery_message(self):
+    def remind(self):
+        """Let the seat's first reminder go out, so its recovery is owed."""
+        self.clock.advance(31 * MIN)
+        self.assertIn("message", [p["op"] for p in self.drive()])
+
+    def test_resolve_before_any_reminder_is_the_edit_only(self):
+        req = self.mgr.create(blocking())
+        self.drive()
+        self.mgr.resolve(req.id)
+        sent = self.drive()
+        self.assertEqual([p["op"] for p in sent], ["edit"])
+        self.assertEqual(sent[0]["extra_content"][WIRE_FIELD]["status"], "resolved")
+
+    def test_resolve_after_a_reminder_is_the_edit_plus_one_recovery_message(self):
         req = self.mgr.create(blocking())
         self.mgr.link_blocked_task(req.id, "task-1")
         self.mgr.link_blocked_task(req.id, "task-2")
         self.mgr.link_blocked_task(req.id, "task-3")
         self.drive()
+        self.remind()
         self.mgr.resolve(req.id)
         sent = self.drive()
         self.assertEqual([p["op"] for p in sent], ["edit", "message"])
@@ -171,6 +185,7 @@ class RenotifyTests(unittest.TestCase):
 
     def test_many_cards_for_one_seat_resolved_at_once_send_one_recovery(self):
         ids = self._seat_cards("pro-dev", 58)
+        self.remind()
         for i in ids:
             self.mgr.resolve(i)
         sent = self.drive()
@@ -189,6 +204,7 @@ class RenotifyTests(unittest.TestCase):
 
     def test_a_rejected_resolve_edit_does_not_split_the_recovery(self):
         ids = self._seat_cards("pro-dev", 3)
+        self.remind()
         for i in ids:
             self.mgr.resolve(i)
         straggler = ids[0]
@@ -207,9 +223,79 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(len(messages), 1, [m["body"] for m in messages])
         self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
 
+    def test_a_newer_never_reminded_card_whose_resolve_edit_is_refused_fences_the_seat(self):
+        # Older card reminded, newer same-seat card not, both resolved, only the newer edit
+        # refused: the seat's recovery waits for that edit.
+        old = self._seat_cards("pro-dev", 1)[0]
+        self.remind()
+        new = self.mgr.create(seat_card("pro-dev", "pro-dev-g9", self.clock.t)).id
+        self.drive()
+        self.assertEqual(int(self.mgr.store.projection(new).get("reminders") or 0), 0)
+        for i in (old, new):
+            self.mgr.resolve(i)
+        flaky = FlakySender(new)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery while the newer card's resolve edit is refused")
+        self.assertFalse(self.mgr.store.projection(old).get("recovered"))
+        self.clock.advance(MIN)
+        before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        messages = [p for p in flaky.sent[before:] if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(self.mgr.store.projection(old).get("recovered"))
+
+    def test_a_newer_card_on_a_pre_upgrade_ledger_whose_resolve_edit_is_refused_fences_the_seat(self):
+        # Older current card reminded and resolved; newer same-seat card on a bare {revision,
+        # event_id} ledger with its resolve edit still pending: no "cleared" until that edit lands.
+        old = self._seat_cards("pro-dev", 1)[0]
+        self.remind()
+        self.mgr.resolve(old)
+        new = self._pre_upgrade(seat_card("pro-dev", "pro-dev-g9", self.clock.t), edited=False).id
+        self.assertNotIn("notified_at", self.mgr.store.projection(new))
+        flaky = FlakySender(new)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery while the legacy card's resolve edit is refused")
+        self.assertFalse(self.mgr.store.projection(old).get("recovered"))
+        self.clock.advance(MIN)
+        before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        messages = [p for p in flaky.sent[before:] if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(self.mgr.store.projection(old).get("recovered"))
+
+    def _stale_terminal_edit_fences_the_seat(self, end):
+        # Older card reminded and resolved; a newer same-seat card ends another way, and only its
+        # terminal edit is refused: no "cleared" while that card is still visibly stale.
+        old = self._seat_cards("pro-dev", 1)[0]
+        self.remind()
+        new = self.mgr.create(seat_card("pro-dev", "pro-dev-g9", self.clock.t)).id
+        self.drive()
+        self.mgr.resolve(old)
+        end(new)
+        flaky = FlakySender(new)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["body"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery while the newer card's terminal edit is refused")
+        self.assertFalse(self.mgr.store.projection(old).get("recovered"))
+        self.clock.advance(MIN)
+        before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        messages = [p for p in flaky.sent[before:] if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(self.mgr.store.projection(old).get("recovered"))
+
+    def test_a_newer_cancelled_card_whose_edit_is_refused_fences_the_seat(self):
+        self._stale_terminal_edit_fences_the_seat(self.mgr.cancel)
+
+    def test_a_newer_expired_card_whose_edit_is_refused_fences_the_seat(self):
+        self._stale_terminal_edit_fences_the_seat(self.mgr.expire)
+
     def test_one_recovery_per_seat(self):
         seats = ("pro-dev", "pro-fast", "pro-comm")
         ids = [i for seat in seats for i in self._seat_cards(seat, 4)]
+        self.remind()
         for i in ids:
             self.mgr.resolve(i)
         bodies = sorted(p["body"] for p in self.drive() if p["op"] == "message")
@@ -218,6 +304,7 @@ class RenotifyTests(unittest.TestCase):
 
     def test_a_seat_still_blocked_owes_no_recovery_yet(self):
         old, new = self._seat_cards("pro-dev", 2)
+        self.remind()
         self.mgr.resolve(old)
         self.assertEqual([p["op"] for p in self.drive()], ["edit"])
         self.mgr.resolve(new)
