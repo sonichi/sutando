@@ -194,10 +194,13 @@ class TestWorkerOnAServerBornFromACoreLaunch(unittest.TestCase):
     worker's own session must override the marker — omitting -e does not."""
     def setUp(self):
         wid = "d" * 32
+        # spawn_worker.py:199 always sets this for a real worker launch —
+        # omitting it here would never exercise the hint's worker path.
         self.got = _boot({"SUTANDO_INSTANCE_ID": wid,
                           "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
                           "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
-                          "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+                          "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555",
+                          "SUTANDO_WORKER_BOOTSTRAP": "/fake/worker_bootstrap.py"},
                          server_env={"SUTANDO_CORE_SESSION": "1"},
                          launcher="skills/worker-pool/scripts/launch-worker-session.sh")
 
@@ -209,8 +212,13 @@ class TestWorkerOnAServerBornFromACoreLaunch(unittest.TestCase):
         self.assertNotIn("SUTANDO_CORE_SESSION=1", self.got["pane_env"],
                          "the worker's shell carries the core marker")
 
-    def test_the_session_hint_stays_silent_for_the_worker(self):
-        self.assertEqual(self.got["hint"], "",
+    def test_the_session_hint_tells_the_worker_to_run_its_own_startup(self):
+        """A worker's comm-sweep cron vanished 22.6h at a compaction boundary
+        because nothing prompted it to re-run its own bootstrap (2026-09-28).
+        The hint must fire for the worker too now — mentioning ITS startup
+        variant, never the core's plain /startup."""
+        self.assertIn("/startup --worker", self.got["hint"])
+        self.assertNotIn("SUTANDO STARTUP:", self.got["hint"],
                          "the worker was told to run the canonical core's /startup")
 
 
