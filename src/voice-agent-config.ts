@@ -69,13 +69,17 @@ function introName(overrides?: ConfigOverrides): string {
 }
 
 function standIdentityLine(overrides?: ConfigOverrides): string {
+	let stand = '';
 	try {
 		const raw = overrides?.standIdentityJson !== undefined
 			? overrides.standIdentityJson
 			: readFileSync(personalPath('stand-identity.json'), 'utf-8');
 		const si = JSON.parse(raw);
-		return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m ${introName(overrides)}."` : '';
-	} catch { return ''; }
+		if (si.name) stand = `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}.`;
+	} catch { /* no Stand name */ }
+	const name = introName(overrides);
+	const ask = name ? `When asked your name or who you are, say "I\'m ${name}."` : '';
+	return [stand, ask].filter(Boolean).join(' ');
 }
 
 function voiceContextBlock(overrides?: ConfigOverrides): string {

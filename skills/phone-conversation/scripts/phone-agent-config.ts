@@ -107,14 +107,17 @@ export function buildCallGreeting(callSession: Pick<CallSessionShape, 'isMeeting
 }
 
 function standIdLine(overrides?: PhoneInstructionDeps['overrides']): string {
+	let stand = '';
 	try {
 		const raw = overrides?.standIdentityJson !== undefined
 			? overrides.standIdentityJson
 			: readFileSync(personalPath('stand-identity.json'), 'utf-8');
 		const si = JSON.parse(raw);
-		if (!si.name) return '';
-		return `Your Stand name is ${si.name}. When asked your name, say "I'm ${phoneIntroName(overrides)}."`;
-	} catch { return ''; }
+		if (si.name) stand = `Your Stand name is ${si.name}.`;
+	} catch { /* no Stand name */ }
+	const name = phoneIntroName(overrides);
+	const ask = name ? `When asked your name, say "I'm ${name}."` : '';
+	return [stand, ask].filter(Boolean).join(' ');
 }
 
 // ── The tuned per-call instruction assembly (moved verbatim) ─────────────────

@@ -130,6 +130,18 @@ test('spoken introductions use the display name; role lines and the meeting menu
 	}
 });
 
+test('the name answer is given with or without a Stand name; only the Stand line is gated', () => {
+	for (const [standIdentityJson, named] of [['{}', false], ['not json', false], ['{"name":"AnchorStand"}', true]] as const) {
+		for (const variant of ['inbound_owner', 'inbound_verified', 'inbound_unverified', 'outbound_owner'] as const) {
+			const deps = { ...DEPS, overrides: { ...DEPS.overrides, standIdentityJson } };
+			const text = cfg.buildPhoneInstructions(VARIANTS[variant], deps);
+			assert.ok(text.includes(`When asked your name, say "I'm ${SHOWN}."`), `${variant} ${standIdentityJson}`);
+			assert.strictEqual(text.includes('Your Stand name is AnchorStand.'), named, `${variant} ${standIdentityJson}`);
+			assert.strictEqual(text.includes('Your Stand name is'), named, `${variant} ${standIdentityJson}`);
+		}
+	}
+});
+
 test('the call greeting speaks the display name, and the server uses it', () => {
 	const pinned = { agentName: SHOWN };
 	assert.strictEqual(cfg.buildCallGreeting({ isMeeting: false, purpose: null }, pinned),
