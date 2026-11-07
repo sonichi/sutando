@@ -65,6 +65,8 @@ NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
 add_skill_claude_plugins
+# Off unless SUTANDO_TASK_WATCH_MOD_CORE=1: the core keeps its Monitor watcher by default.
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_CORE:-}"
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
@@ -127,6 +129,9 @@ restore_shutdown_sentinel() {
 }
 export SUTANDO_CORE_RUNTIME=claude
 ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=1)
+# Always set, empty included, so a stale tmux server value cannot switch the watcher path.
+export SUTANDO_TASK_WATCH_MOD="$TASK_WATCH_MOD"
+ENV_ARGS+=(-e "SUTANDO_TASK_WATCH_MOD=$TASK_WATCH_MOD")
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
@@ -587,7 +592,7 @@ if claude_named_tmux_session_exists; then
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
     exit 127
   fi
-  CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+  CORE_CMD=("${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
