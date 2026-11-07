@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-05"
+   "last_verified": "2026-11-06"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -350,7 +350,7 @@
    ],
    "status": "active",
    "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
-   "last_verified": "2026-08-21"
+   "last_verified": "2026-11-06"
   },
   "docs/testing-coverage.md": {
    "title": "Unit-test coverage gate",

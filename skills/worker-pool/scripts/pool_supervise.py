@@ -54,6 +54,10 @@ PAUSED_MARKER = "paused"
 NOT_SUPERVISED = ("retired",)
 # A sentinel younger than this is left alone: its payload may still be landing.
 SENTINEL_RETIRE_AFTER_S = 3600
+# Time a sweep spends archiving spent sentinels, per worker and in all; what is left waits for
+# the next sweep (SAMPLE_PERIOD_S later), so a backlog drains over sweeps and never stalls one.
+SENTINEL_RETIRE_BUDGET_S = 10.0
+SENTINEL_RETIRE_TOTAL_BUDGET_S = 60.0
 
 
 def state_path(workspace) -> Path:
@@ -163,10 +167,12 @@ def work_outstanding(workspace, worker_id) -> bool | None:
 
 
 def retire_spent_sentinels(workspace, worker_id, now: float,
-                           min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
+                           min_age_s: float = SENTINEL_RETIRE_AFTER_S, *,
+                           deadline: float | None = None, progress: dict | None = None) -> list[str]:
     """Move spent sentinels older than `min_age_s` into the inbox's archive/ through
     pool_delivery.archive_finished, so the inbox holds what is owed. Returns the names moved.
-    An archive/ that cannot be used raises, and the sweep reports it."""
+    `deadline` (time.monotonic) bounds the pass; `progress["deferred"]` gets the task ids it left
+    for the next sweep. An archive/ that cannot be used raises, and the sweep reports it."""
     inbox = pd.deliveries_dir(workspace, worker_id)
     spent = sentinel_ids(workspace, worker_id)[1]
     old: dict[str, list[str]] = {}
@@ -179,8 +185,10 @@ def retire_spent_sentinels(workspace, worker_id, now: float,
         old.setdefault(tid, []).append(f.name)
     if not old:
         return []
-    moved = pd.archive_finished(workspace, worker_id, task_ids=sorted(old))["archived"]
-    return sorted(n for t in moved for n in old[t])
+    got = pd.archive_finished(workspace, worker_id, task_ids=sorted(old), deadline=deadline)
+    if progress is not None:
+        progress["deferred"] = got.get("deferred", 0)
+    return sorted(n for t in got["archived"] for n in old[t])
 
 
 def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,
@@ -450,16 +458,25 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
-    retired, retire_errors = {}, {}
+    retired, retire_errors, deferred = {}, {}, {}
     if persist:
         save_state(workspace, new_state)
         if worker_ids is None:  # the sweep only: a delivery-time check stays read-only
+            total = time.monotonic() + SENTINEL_RETIRE_TOTAL_BUDGET_S
             for wid in obs:
+                progress = {}
                 try:
-                    if n := len(retire_spent_sentinels(workspace, wid, now)):
+                    if time.monotonic() >= total:
+                        deferred[wid] = "not-started"
+                        continue
+                    if n := len(retire_spent_sentinels(
+                            workspace, wid, now, deadline=min(total, time.monotonic() + SENTINEL_RETIRE_BUDGET_S),
+                            progress=progress)):
                         retired[wid] = n
                 except (OSError, ValueError) as e:
                     retire_errors[wid] = f"{type(e).__name__}: {e}"
+                if progress.get("deferred"):
+                    deferred[wid] = progress["deferred"]
     asked = list(worker_ids or [])
     # Reported on every tick, not only when a card decision is due: a dry run must
     # show the finding after the real sweep already raised (and acknowledged) the card.
@@ -471,6 +488,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "routing": routing_status(workspace),
             "sentinels_retired": retired,
             "sentinel_retire_errors": retire_errors,
+            "sentinels_deferred": deferred,
             "delivery_blocks": {w: o.delivery_block for w, o in obs.items() if o.delivery_block},
             "notifier_stalls": notifier_stalls(workspace, obs),
             "not_supervised": [w for w in asked if w not in obs],
@@ -526,6 +544,8 @@ def main(argv=None) -> int:
             print("resumed: this sample was discarded as evidence (host slept)")
         for wid, err in sorted(out.get("sentinel_retire_errors", {}).items()):
             print(f"{wid[:8]}  could not archive spent sentinels: {err}")
+        for wid, left in sorted(out.get("sentinels_deferred", {}).items()):
+            print(f"{wid[:8]}  spent-sentinel archiving ran out of time; left for the next sweep: {left}")
         for wid, cause in sorted(out.get("delivery_blocks", {}).items()):
             print(f"{wid[:8]}  typed delivery is blocked ({cause}); see the card for the remedy")
         for wid, rec in sorted(out.get("notifier_stalls", {}).items()):
