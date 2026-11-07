@@ -4627,6 +4627,26 @@ class ZombieProbeFailures(unittest.TestCase):
                 unittest.mock.patch.object(C.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
             self.assertFalse(C._zombie(12345))
 
+    def test_our_child_already_collected_by_the_reaper_reads_as_exited(self):
+        with unittest.mock.patch.object(C.os, "waitid", side_effect=ChildProcessError, create=True):
+            self.assertTrue(C._exited_while_waited(12345))
+
+    def test_a_waitid_error_on_our_child_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitid", side_effect=PermissionError, create=True):
+            self.assertFalse(C._exited_while_waited(12345))
+
+    def test_our_child_without_waitid_is_read_from_ps_without_reaping(self):
+        with unittest.mock.patch.object(C.os, "waitid", None, create=True), \
+                unittest.mock.patch.object(C, "_ps_zombie", return_value=True) as ps, \
+                unittest.mock.patch.object(C.os, "waitpid", side_effect=AssertionError("reaped")):
+            self.assertTrue(C._exited_while_waited(12345))
+        ps.assert_called_once_with(12345)
+
+    def test_an_exit_code_the_reaper_never_releases_falls_back_to_poll(self):
+        child = unittest.mock.Mock(**{"wait.side_effect": subprocess.TimeoutExpired("bridge", 5), "poll.return_value": None})
+        self.assertIsNone(C._exit_code(child))
+        child.wait.assert_called_once_with(timeout=5)
+
 
 FAKE_SECURITY = r"""#!/usr/bin/env bash
 verb="$1"; shift; key=""; value=""
