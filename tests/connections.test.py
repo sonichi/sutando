@@ -4505,6 +4505,20 @@ class ZombieChild(Base):
         self.assertEqual((record["ok"], record["reason"]), (False, "exited"))
         self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
 
+    def test_an_exited_child_whose_reaper_holds_the_waitpid_lock_fails_the_launch(self):
+        def slow_reaper(child):
+            held = threading.Event()
+
+            def reap():
+                with child._waitpid_lock:  # poll() returns None unchecked while this is held
+                    held.set()
+                    time.sleep(0.3)
+                child.wait()
+            threading.Thread(target=reap, daemon=True).start()
+            held.wait(5)
+        with unittest.mock.patch.object(C, "_reap_when_done", slow_reaper):
+            self.test_a_child_that_writes_its_lease_then_exits_2_fails_the_launch()
+
 
 @unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
 class ZombieWithoutWaitid(Base):

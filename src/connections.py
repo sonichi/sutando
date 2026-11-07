@@ -2849,7 +2849,7 @@ def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
     if child is not None:
-        if child.poll() is None:
+        if child.poll() is None and not _exited_while_waited(pid):
             return False
         _CHILDREN.pop(pid, None)
         return True
@@ -2875,6 +2875,20 @@ def _exited(pid: int) -> bool:
     except OSError:
         return False
     return False
+
+
+def _exited_while_waited(pid: int) -> bool:
+    """Whether our own child has exited though poll() said None, asked of the kernel without reaping it."""
+    # poll() returns None unchecked while the reaper's wait() holds the Popen's waitpid lock.
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:
+        return os.name != "nt" and _ps_zombie(pid)
+    try:
+        return waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:  # the reaper has already collected it
+        return True
+    except OSError:
+        return False
 
 
 def _zombie(pid: int) -> bool:
@@ -2945,6 +2959,12 @@ def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: 
 
 
 def _exit_code(child) -> Optional[int]:
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        try:  # the child has exited; wait for the reaper's lock so its rc is read, not None
+            return wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
     poll = getattr(child, "poll", None)
     return poll() if poll is not None else None
 
