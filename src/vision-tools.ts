@@ -434,8 +434,9 @@ export function _getVisionFrameHookCount(): number {
 // swap-and-restore. Once DeviceSession exists, frames should carry a target
 // device ID and fan out only to that session.
 export function setVisionSession(session: unknown): void {
+	// A capture belongs to the session it started on; a new recipient never inherits it.
+	if (session !== sessionRef) stopStream();
 	sessionRef = session as MinimalSession | null;
-	if (!session) stopStream();
 }
 
 // --- Tool-surface updater registry ----------------------------------------
