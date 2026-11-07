@@ -1179,6 +1179,13 @@ class ConnectCode(UndoSeams, Base):
         return cb.bridge_home(self.root) / "channels" / "ag2space"
 
     def test_connect_is_off_without_the_experimental_flag_and_touches_nothing(self):
+        import gc
+        import warnings
+        # Garbage an earlier test left (a pipe, say) is collected now, quietly: its ResourceWarning would
+        # otherwise land in the exact stderr this test compares.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            gc.collect()
         backend, fake, stdin = Backend(), self.fake(), io.StringIO(CODE + "\n")
         out, err = io.StringIO(), io.StringIO()
         spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
