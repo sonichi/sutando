@@ -62,6 +62,16 @@ if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
   ENV_ARGS+=(-e "SUTANDO_CODEX_AUTO_RESET_ENABLED=$SUTANDO_CODEX_AUTO_RESET_ENABLED")
 fi
 
+CHANNEL_ENV_NAMES="$("$WORKER_PY" "$REPO/src/channel_env_resolve.py" --launch-env-names)"
+while IFS= read -r forwarded; do
+  [ -n "$forwarded" ] || continue
+  if [ "${1:-}" = "--print-env" ]; then
+    ENV_ARGS+=(-e "$forwarded=<redacted>")
+  else
+    ENV_ARGS+=(-e "$forwarded=${!forwarded}")
+  fi
+done <<< "$CHANNEL_ENV_NAMES"
+
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' "${ENV_ARGS[@]}"
   exit 0

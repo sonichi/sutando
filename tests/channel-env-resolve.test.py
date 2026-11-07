@@ -422,6 +422,20 @@ class TestCli(_Base):
     """`main()` in-process. The wrapper cases below cover the same paths through
     bash, but only as a subprocess — which no coverage run can see."""
 
+    def test_launch_env_names_prints_sorted_names_without_values(self):
+        env = {"REMOTE_TASK_TOKEN": "synthetic-secret", "AG2_DEVICE_ENV": "synthetic-path",
+               "AG2_REMOTE_TOKEN_S_SPACE": "synthetic-lane-secret", "UNRELATED_SECRET": "hidden"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            rc, out, err = self._main(["channel_env_resolve.py", "--launch-env-names"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "AG2_DEVICE_ENV\nAG2_REMOTE_TOKEN_S_SPACE\nREMOTE_TASK_TOKEN\n")
+        self.assertEqual(err, "")
+
+    def test_launch_env_names_with_empty_environment_succeeds(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            rc, out, err = self._main(["channel_env_resolve.py", "--launch-env-names"])
+        self.assertEqual((rc, out, err), (0, "\n", ""))
+
     def _main(self, argv: list[str]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

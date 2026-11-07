@@ -134,6 +134,19 @@ fi
 # as the core launcher's --print-core-env, so a regression suite can assert
 # the allowlist/proxy-routing policy without touching tmux. No production
 # caller passes this.
+CHANNEL_ENV_NAMES=""
+if [ -n "$WORKER_PY" ]; then
+  CHANNEL_ENV_NAMES="$("$WORKER_PY" "$REPO/src/channel_env_resolve.py" --launch-env-names)"
+fi
+while IFS= read -r forwarded; do
+  [ -n "$forwarded" ] || continue
+  if [ "${1:-}" = "--print-env" ]; then
+    ENV_ARGS+=(-e "$forwarded=<redacted>")
+  else
+    ENV_ARGS+=(-e "$forwarded=${!forwarded}")
+  fi
+done <<< "$CHANNEL_ENV_NAMES"
+
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
   exit 0

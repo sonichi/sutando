@@ -2,7 +2,6 @@
 """Check that a Codex worker reconciles the shared reset timer at launch."""
 
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,10 +11,12 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / "tests"))
+from _helpers.hermetic_env import hermetic_env
 
 
 class CodexWorkerResetLauncherTests(unittest.TestCase):
-    def _launch(self, tmp):
+    def _launch(self, tmp, extra=None):
             root = Path(tmp) / "repo"
             home = Path(tmp) / "home"
             workspace = Path(tmp) / "workspace"
@@ -23,10 +24,11 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
             for path in (home, workspace, bin_dir):
                 path.mkdir()
             for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
-                        "scripts/python-binary.sh", "src/agent/launch-path.sh"):
+                        "scripts/python-binary.sh"):
                 dest = root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / rel, dest)
+            (root / "src").symlink_to(REPO / "src", target_is_directory=True)
             config = root / "scripts/sutando-config.sh"
             config.write_text(
                 '#!/bin/sh\n'
@@ -60,7 +62,9 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
                 path.chmod(0o755)
             reset_log = Path(tmp) / "reset.json"
             tmux_log = Path(tmp) / "tmux.log"
-            env = {**os.environ, "HOME": str(home),
+            env = hermetic_env(home)
+            env.update(extra or {})
+            env.update({"HOME": str(home),
                    "PATH": f"{bin_dir}:/usr/bin:/bin",
                    "SUTANDO_PY": sys.executable,
                    "SUTANDO_INSTANCE_ID": "worker-test",
@@ -72,7 +76,7 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
                    "SUTANDO_POOL_DELIVERY_SCRIPT": str(root / "delivery.py"),
                    "SUTANDO_CODEX_AUTO_RESET_ENABLED": "0",
                    "RESET_LOG": str(reset_log), "TMUX_LOG": str(tmux_log),
-                   "TMUX_SESSION_STATE": str(Path(tmp) / "session-started")}
+                   "TMUX_SESSION_STATE": str(Path(tmp) / "session-started")})
             result = subprocess.run(
                 ["bash", str(root / "skills/worker-pool/scripts/launch-codex-worker-session.sh")],
                 cwd=root, env=env, capture_output=True, text=True, timeout=15,

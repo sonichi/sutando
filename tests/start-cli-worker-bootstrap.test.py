@@ -67,6 +67,7 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
     try:
         root = td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "shared", root / "shared", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
         shutil.copy2(

@@ -48,6 +48,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -60,6 +61,15 @@ TOKEN_VARS = RELAY_TOKEN_VARS
 
 DEVICE_ENV_VAR = "AG2_DEVICE_ENV"
 DEVICE_ENV_SOURCE = "ag2space"
+
+
+def launch_env_names(environ: Optional[Mapping[str, str]] = None) -> list[str]:
+    """Names to carry across a session launcher; never open files or inspect values."""
+    from connections import connection_env_names
+    env = os.environ if environ is None else environ
+    names = {DEVICE_ENV_VAR, "CLAUDE_CONFIG_DIR", "SUTANDO_APP_SUPPORT", *TOKEN_VARS,
+             "REMOTE_TASK_URL", "AG2_GATEWAY_URL"}
+    return sorted((names & env.keys()) | set(connection_env_names(env)))
 
 
 def _has_token(path: Path) -> bool:
@@ -256,6 +266,9 @@ def resolve_room_channel_env(channels_dir, source: str, room_id: str) -> Path | 
 
 def main(argv: list[str]) -> int:
     args = argv[1:]
+    if args == ["--launch-env-names"]:
+        print("\n".join(launch_env_names()))
+        return 0
     room = ""
     if len(args) == 4 and args[2] == "--room":
         room, args = args[3], args[:2]
