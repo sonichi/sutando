@@ -19,7 +19,6 @@ does not import the room-commons skill.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -116,18 +115,21 @@ def _host(url):
     return (urllib.parse.urlsplit(url).hostname or "").lower()
 
 
-def same_site(url, relay_base):
-    """HTTPS on the relay host or its descendants, with ag2.space siblings allowed."""
-    relay = _host(relay_base)
-    parent = relay
-    if _gw._core_src_on_path():
-        from dotspace import LEGACY_SERVER
-        if relay == LEGACY_SERVER or relay.endswith("." + LEGACY_SERVER):
-            parent = LEGACY_SERVER
-    host = _host(url)
-    return urllib.parse.urlsplit(url).scheme == "https" and bool(parent) and bool(host) and \
-        (host == parent or host.endswith("." + parent))
+def _discovery_policy():
+    if not _gw._core_src_on_path():
+        raise Refused("core src/ not found; no token is sent", "NO_MCP")
+    import mcp_discovery
+    return mcp_discovery
 
+
+def same_site(url, relay_base):
+    """The MCP URL may carry the minted token: `mcp_discovery.mcp_url`'s rule."""
+    policy = _discovery_policy()
+    try:
+        policy.mcp_url(relay_base, url)
+    except policy.DiscoveryRefused:
+        return False
+    return True
 
 
 class Door:
@@ -142,10 +144,11 @@ class Door:
         if not same_site(str(found["mcp_url"]), relay_base):
             raise Refused("the MCP URL is not on the relay's site; no token is sent there",
                           "MCP_HOST")
-        mint_url = str(found.get("mint_url") or "")
-        if _host(mint_url) != _host(relay_base):
-            raise Refused("the mint URL is not on the relay's host; the bearer is not sent there",
-                          "MINT_HOST")
+        policy = _discovery_policy()
+        try:
+            mint_url = policy.mint_url(relay_base, found.get("mint_url"))
+        except policy.DiscoveryRefused as exc:
+            raise Refused(str(exc), "MINT_HOST") from None
         status, _, raw = post(mint_url, bearer, {})
         access = (_json(raw) or {}).get("access_token") if 200 <= status < 300 else None
         if not isinstance(access, str) or not access:
@@ -210,8 +213,16 @@ class Door:
         return got["result"]
 
 
-def open_door():
-    base, headers = _gw.gateway()
+def _connection(room_id):
+    """(base, headers) of the connection serving `room_id`'s server; ("", {}) when refused."""
+    try:
+        return _gw.gateway(room_id)
+    except _gw.RoomConnectionError:
+        return "", {}
+
+
+def open_door(room_id=None):
+    base, headers = _connection(room_id)
     bearer = (headers.get("Authorization") or "").partition(" ")[2]
     if not base or not bearer:
         raise Refused("no gateway configured", "NO_GATEWAY")
@@ -221,7 +232,7 @@ def open_door():
 def navigate(owner_dm, arguments, door_factory=open_door):
     """Execute room.navigate in the owner DM; {"ok", "event_id"|"reason", "code"}."""
     try:
-        out = door_factory().execute(owner_dm, ACTION, arguments,
+        out = door_factory(owner_dm).execute(owner_dm, ACTION, arguments,
                                      operation_id_for(owner_dm, arguments))
     except Refused as exc:
         return {"ok": False, "reason": str(exc), "code": exc.code}
@@ -242,16 +253,22 @@ def _instance_suffix():
 
 
 class Rooms:
-    """What the owner-DM resolution reads, through the room-ops gateway."""
+    """What the owner-DM resolution reads, through the connection serving `via_room`."""
+
+    def __init__(self, via_room=None):
+        self.via_room = via_room
 
     def agents(self):
-        base, headers = _gw.gateway()
+        base, headers = _connection(self.via_room)
+        if not base:
+            return []
         _status, res = _gw.http_json("GET", f"{base}/v1/agents", headers)
         return res.get("agents") or [] if isinstance(res, dict) else []
 
     def joined(self):
         import rooms as _rooms
-        return [r for r in _rooms.joined_rooms().get("rooms") or [] if isinstance(r, str)]
+        return [r for r in _rooms.joined_rooms(via_room=self.via_room).get("rooms") or []
+                if isinstance(r, str)]
 
     def members(self, room_id):
         import members as _members
@@ -312,8 +329,11 @@ def forget_owner_dm(workspace, refused_room=""):
     _write_dm_cache(workspace, {"refused": refused + ([refused_room] if refused_room else [])})
 
 
-def pick_owner_dm(candidates, last_owner_ts):
-    """The candidate with the most recent owner message; with none, the lowest room id."""
+def pick_owner_dm(candidates, last_owner_ts, hint=""):
+    """The gateway's owner_dm_room when it is a candidate; else the candidate with the most
+    recent owner message; with none, the lowest room id."""
+    if hint and hint in candidates:
+        return hint, "the gateway's owner_dm_room"
     spoken = [(ts, r) for r in candidates if (ts := last_owner_ts(r)) is not None]
     if spoken:
         return max(spoken)[1], "most recent owner message"
@@ -347,7 +367,8 @@ def owner_dm_room(workspace, gateway_base, rooms=None, now=None):
     with ThreadPoolExecutor(OWNER_DM_SCAN_WORKERS) as pool:
         got = list(pool.map(rooms.members, joined))
     candidates = sorted(r for r, m in zip(joined, got) if m == want and r not in refused)
-    room, why = pick_owner_dm(candidates, lambda r: rooms.last_message_by(r, owner))
+    room, why = pick_owner_dm(candidates, lambda r: rooms.last_message_by(r, owner),
+                              str(row.get("owner_dm_room") or ""))
     if room:
         _log(workspace, f"owner DM for {agent}: {room} ({why}; {len(candidates)} candidate(s): "
                         f"{', '.join(candidates)})")
@@ -379,6 +400,8 @@ class Ledger:
         self._lock_path = self.path.with_name("." + self.path.name + ".lock")
 
     def __enter__(self):
+        import fcntl  # POSIX only; imported here so the other room_ops verbs load without it
+        self._fcntl = fcntl
         self._fh = open(self._lock_path, "a")
         fcntl.flock(self._fh, fcntl.LOCK_EX)
         try:
@@ -395,7 +418,7 @@ class Ledger:
         os.replace(tmp, self.path)
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fcntl.flock(self._fh, self._fcntl.LOCK_UN)
         self._fh.close()
 
 
@@ -435,7 +458,7 @@ def mention_from_task(text, workspace=None):
 def reason_for(m, extra=0):
     who = m.sender or "Someone"
     where = m.room_name or m.room_id
-    more = f" (+{extra} more mention{'s' if extra != 1 else ''} just before)" if extra else ""
+    more = f" (+{extra} more mention{'s' if extra != 1 else ''} since the last pointer)" if extra else ""
     return clip_reason(f"{who} mentioned you in {where}{more}")
 
 
@@ -489,7 +512,11 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
     if m is None:
         return {"ok": True, "navigated": False, "skipped": "not an owner-mention task"}
     if owner_dm is None:
-        owner_dm = owner_dm_room(workspace, _gw.gateway()[0])
+        with Ledger(workspace) as led:
+            handled = m.event_id in led.data["seen"] and not led.data.get("pending")
+        if handled:
+            return {"ok": True, "navigated": False, "skipped": "already navigated for this message"}
+        owner_dm = owner_dm_room(workspace, _connection(m.room_id)[0], rooms=Rooms(m.room_id))
     with Ledger(workspace) as led:
         stale = _take_due(led, now, window)
         d = decide(m, led.data, now, owner_dm, window)
@@ -559,8 +586,6 @@ def flush(workspace, now=None, owner_dm=None, window=None, door_factory=open_doo
     """The trailing navigate: the latest held mention, once the window has passed."""
     now = time.time() if now is None else now
     window = window_seconds() if window is None else window
-    if owner_dm is None:
-        owner_dm = owner_dm_room(workspace, _gw.gateway()[0])
     with Ledger(workspace) as led:
         pending = led.data.get("pending")
         if not isinstance(pending, dict):
@@ -571,6 +596,9 @@ def flush(workspace, now=None, owner_dm=None, window=None, door_factory=open_doo
         led.data["pending"] = None
         led.data["last_nav_at"] = now
         led.save()
+    if owner_dm is None:
+        room = str(pending.get("room_id") or "") or None
+        owner_dm = owner_dm_room(workspace, _connection(room)[0], rooms=Rooms(room))
     return _deliver_held(pending, workspace, owner_dm, door_factory, dm_writer)
 
 
@@ -628,7 +656,8 @@ def add_arguments(p):
 def run(a):
     ws = _workspace()
     if a.nav_cmd == "to":
-        owner_dm = a.owner_dm or owner_dm_room(ws, _gw.gateway()[0])
+        owner_dm = a.owner_dm or owner_dm_room(ws, _connection(a.room_id)[0],
+                                               rooms=Rooms(a.room_id))
         if not owner_dm:
             return {"ok": False, "reason": "no owner DM reading for this gateway; pass --owner-dm"}
         args = build_input(a.room_id, a.view, a.event_id, a.thread_id, a.page, a.reason)

@@ -53,14 +53,17 @@ The normative op→Action map is the backend contract
 ## Owner mentions: point the owner's Navigator at them
 
 On a task whose headers carry `owner_mentioned: true` (a room message that
-@-mentioned your owner, not you), run this first, before the DM the task's
-system instructions ask for:
+@-mentioned your owner, not you), the task's system-instructions block governs.
+After its step 1 (if that step ends in `[no-send]`, stop: do not run this), run
+this as part of its step 2, the DM to the owner:
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py navigate mention --task-file <workspace>/tasks/<task>.txt
 ```
 
-It calls the `room.navigate` Action in the owner DM, so the owner's Navigator
+It acts for the owner, not for the sender: it writes only into the owner DM, and
+the sender cannot aim it (the ids come from the attested headers). It calls the
+`room.navigate` Action in the owner DM, so the owner's Navigator
 gets a row with Open that lands on the mentioning message, with a reason naming
 who mentioned them and where. The verb decides; you do not:
 
@@ -82,15 +85,17 @@ bearer discovers the hosted MCP on its relay, mints a delegation there, and runs
 `room.action.execute` with `operation_id` derived from the target, so a repeated
 call is the same operation.
 Every request that carries a token refuses redirects (a 3xx is an answer, never
-followed), the mint must be on the relay's host. The MCP URL must use HTTPS on that host
-or a subdomain; AG2 Space relays also allow siblings under `ag2.space`.
+followed). Where each token may go is `src/mcp_discovery.py`, the rule ag2-sparrow's
+MCP credential also uses: the mint must be https (or http to loopback) on the relay's
+origin at its exact mint path; the MCP URL must be on the relay host, a host under it,
+or the MCP host the DotSpace registry pairs with the relay's server.
 A held mention whose trailing flush never ran is folded into the next new mention,
 or delivered after releasing the ledger lock when that mention is skipped.
 
 The owner DM is the room whose members are exactly {this agent, its owner} (owner
-from the gateway's `/v1/agents` row): the only room the Action accepts. The
-gateway's `owner_dm_room` reading is not used as-is, because it can hold other
-members. With several such rooms, the one with the most recent owner message wins
+from the gateway's `/v1/agents` row): the only room the Action accepts. The row's
+`owner_dm_room` wins when it is such a room; it is not used as-is, because it can
+hold other members. Otherwise the one with the most recent owner message wins
 (else the lowest room id); the pick is logged to `logs/owner-mention-navigate.log`
 and cached for a day in `state/owner-mention-dm.json`. A room the Action refuses
 as the DM is excluded from later picks; a refusal about the target keeps it.
@@ -132,7 +137,10 @@ does the privileged Matrix ops + authoritative membership enforcement.
 On an install connected to several servers, a verb that names a room acts through the connection
 serving that room's server. `rooms`, `history`, `agents`, `resolve` and `events list|pull|stream`
 name none, so they act through the primary connection only.
-`navigate` also uses the primary connection to resolve the owner DM and Actions door.
+`navigate` acts through the connection serving the mentioning (or target) room's server:
+the owner DM, the agent identity read for that gateway and the Actions door all come from it.
+The owner-DM scan reads through the room-ops gateway; where that is gone, `mention`
+answers `skipped: no owner DM reading for this gateway` rather than navigating.
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'

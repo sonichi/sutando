@@ -51,9 +51,10 @@ def task_text(owner_mentioned=True, room=ROOM, event="$m1", sender="Alice", body
 
 class FakeDoor:
     def __init__(self, fail=None):
-        self.calls, self.fail = [], fail
+        self.calls, self.fail, self.rooms = [], fail, []
 
-    def __call__(self):
+    def __call__(self, room_id=None):
+        self.rooms.append(room_id)
         return self
 
     def execute(self, room_id, action, arguments, operation_id):
@@ -204,7 +205,7 @@ class AppliesTheRule(unittest.TestCase):
         self.assertTrue(out["navigated"])
         self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$c"])
         self.assertEqual(self.door.calls[1][2]["reason"],
-                         "Carol mentioned you in G (+1 more mention just before)")
+                         "Carol mentioned you in G (+1 more mention since the last pointer)")
         self.assertEqual(self.flush(1300.0)["skipped"], "nothing held")
 
     def test_one_navigate_per_message(self):
@@ -262,7 +263,7 @@ class AppliesTheRule(unittest.TestCase):
         self.assertTrue(out["navigated"])
         self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$d"])
         self.assertEqual(self.door.calls[-1][2]["reason"],
-                         "Dana mentioned you in G (+2 more mentions just before)")
+                         "Dana mentioned you in G (+2 more mentions since the last pointer)")
         self.assertEqual(self.flush(1600.0)["skipped"], "nothing held")
 
     def test_skipped_mention_delivers_stale_hold_without_locking_other_writers(self):
@@ -368,9 +369,9 @@ class Mcp:
     def __call__(self, url, token, body=None, headers=None, method="POST"):
         self.sent.append((url, token, body, headers))
         if url.endswith("/v1/mcp/discovery"):
-            return 200, {}, json.dumps({"mint_url": "https://hs.example/mint",
+            return 200, {}, json.dumps({"mint_url": "https://hs.example/api/v1/mcp/agent-access-tokens",
                                         "mcp_url": "https://mcp.hs.example/mcp"}).encode()
-        if url.endswith("/mint"):
+        if url.endswith("/agent-access-tokens"):
             return 200, {}, b'{"access_token": "deleg"}'
         if "id" not in body:
             return 202, {}, b""
@@ -433,7 +434,7 @@ class DoorPaths(unittest.TestCase):
 
         def no_mint(url, token, body=None, headers=None, method="POST"):
             if url.endswith("discovery"):
-                return 200, {}, json.dumps({"mint_url": "https://hs.example/m", "mcp_url": "https://mcp.hs.example/x"}).encode()
+                return 200, {}, json.dumps({"mint_url": "https://hs.example/api/v1/mcp/agent-access-tokens", "mcp_url": "https://mcp.hs.example/x"}).encode()
             return 401, {}, b"{}"
         with self.assertRaises(nav.Refused) as cm:
             nav.Door("https://hs.example/relay", "b", post=no_mint)
@@ -445,10 +446,10 @@ class DoorPaths(unittest.TestCase):
         self.assertEqual((out["ok"], out["code"]), (False, "FORBIDDEN"))
 
     def test_open_door_needs_a_gateway(self):
-        with patch.object(nav._gw, "gateway", lambda: ("", {})):
+        with patch.object(nav._gw, "gateway", lambda room_id=None: ("", {})):
             with self.assertRaises(nav.Refused):
                 nav.open_door()
-        with patch.object(nav._gw, "gateway", lambda: ("https://hs.example/relay", {"Authorization": "Bearer t"})), \
+        with patch.object(nav._gw, "gateway", lambda room_id=None: ("https://hs.example/relay", {"Authorization": "Bearer t"})), \
                 patch.object(nav, "Door", lambda base, bearer: (base, bearer)):
             self.assertEqual(nav.open_door(), ("https://hs.example/relay", "t"))
 
@@ -457,7 +458,7 @@ class SiteChecks(unittest.TestCase):
     def test_same_site(self):
         relay = "https://chat.ag2.space/relay"
         for url, want in (("https://mcp.ag2.space/mcp", True), ("https://chat.ag2.space/x", True),
-                          ("https://ag2.space/x", True), ("https://evil.example/mcp", False),
+                          ("https://ag2.space/x", False), ("https://evil.example/mcp", False),
                           ("https://ag2.space.evil.example/", False), ("http://mcp.ag2.space/", False),
                           ("https:///nohost", False)):
             self.assertEqual(nav.same_site(url, relay), want, url)
@@ -477,7 +478,7 @@ class SiteChecks(unittest.TestCase):
 
         def post(url, token, body=None, headers=None, method="POST"):
             sent.append(url)
-            return 200, {}, json.dumps({"mint_url": "https://hs.example/mint",
+            return 200, {}, json.dumps({"mint_url": "https://hs.example/api/v1/mcp/agent-access-tokens",
                                         "mcp_url": "https://evil.example/mcp"}).encode()
 
         with self.assertRaises(nav.Refused) as cm:
@@ -572,9 +573,9 @@ class GatewayReads(unittest.TestCase):
         import members as m_mod
         import read as r_mod
         import rooms as rooms_mod
-        with patch.object(nav._gw, "gateway", lambda: ("https://hs/relay", {})), \
+        with patch.object(nav._gw, "gateway", lambda room_id=None: ("https://hs/relay", {})), \
                 patch.object(nav._gw, "http_json", lambda *a, **k: (200, {"agents": [{"id": "@a"}]})), \
-                patch.object(rooms_mod, "joined_rooms", lambda: {"rooms": ["!a", 3]}), \
+                patch.object(rooms_mod, "joined_rooms", lambda **k: {"rooms": ["!a", 3]}), \
                 patch.object(m_mod, "room_members", lambda r: {"ok": r == "!a", "members": [{"user_id": "@a"}]}), \
                 patch.object(r_mod, "read_room", lambda r, limit: {"messages": [
                     {"sender": "@o", "ts": 5}, {"sender": "@o", "ts": 9}, {"sender": "@x", "ts": 99}]}):
@@ -624,8 +625,8 @@ class EdgesAndCli(unittest.TestCase):
         self.assertEqual(nav.owner_dm_room(self.ws, GW, rooms), "!dm:hs")
 
     def test_resolves_the_dm_when_not_given(self):
-        with patch.object(nav, "owner_dm_room", lambda ws, base: OWNER_DM), \
-                patch.object(nav._gw, "gateway", lambda: (GW, {})):
+        with patch.object(nav, "owner_dm_room", lambda ws, base, **k: OWNER_DM), \
+                patch.object(nav._gw, "gateway", lambda room_id=None: (GW, {})):
             self.assertTrue(nav.on_mention(nav.Mention(ROOM, "$a"), self.ws, now=1000.0, window=120,
                                            door_factory=FakeDoor())["navigated"])
             nav.on_mention(nav.Mention(ROOM, "$b"), self.ws, now=1010.0, window=120,
@@ -693,8 +694,8 @@ class EdgesAndCli(unittest.TestCase):
         task = self.ws / "t.txt"
         task.write_text(task_text(owner_mentioned=False))
         with patch.object(nav, "_workspace", lambda: self.ws), \
-                patch.object(nav, "owner_dm_room", lambda ws, base: ""), \
-                patch.object(nav._gw, "gateway", lambda: ("https://hs/relay", {})), \
+                patch.object(nav, "owner_dm_room", lambda ws, base, **k: ""), \
+                patch.object(nav._gw, "gateway", lambda room_id=None: ("https://hs/relay", {})), \
                 patch.object(nav, "navigate", lambda dm, args, *a: {"ok": True, "dm": dm, "args": args}):
             self.assertFalse(self.cli("to", ROOM)["ok"])
             out = self.cli("to", ROOM, "--owner-dm", OWNER_DM, "--event", "$e", "--reason", "r")
@@ -713,6 +714,149 @@ class EdgesAndCli(unittest.TestCase):
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(room_ops._main(["navigate", "flush"]), 0)
         self.assertEqual(json.loads(out.getvalue()), {"ok": True, "cmd": "flush"})
+
+
+MINT_PATH = "/api/v1/mcp/agent-access-tokens"
+
+
+def discovery_post(mint, mcp, sent):
+    """Discovery answering (mint, mcp); the mint and MCP answer just enough to open a session."""
+    def post(url, token, body=None, headers=None, method="POST"):
+        sent.append((url, token))
+        if url.endswith("/v1/mcp/discovery"):
+            return 200, {}, json.dumps({"mint_url": mint, "mcp_url": mcp}).encode()
+        if url == mint:
+            return 200, {}, b'{"access_token": "deleg"}'
+        return 200, {"mcp-session-id": "s1"}, json.dumps(
+            {"jsonrpc": "2.0", "id": (body or {}).get("id"), "result": {}}).encode()
+    return post
+
+
+class RegisteredDotSpacesReachTheirMcp(unittest.TestCase):
+    """Every registered DotSpace pairs a relay with its MCP host; the door admits each pair."""
+
+    def test_every_registered_relay_opens_its_registered_mcp(self):
+        import dotspace
+        for ds in dotspace.DEFAULT_INSTANCES:
+            relay = f"https://{ds['gateway_host']}/relay"
+            sent = []
+            nav.Door(relay, "bearer", post=discovery_post(
+                f"https://{ds['gateway_host']}{MINT_PATH}", ds["mcp_url"], sent))
+            self.assertIn((ds["mcp_url"], "deleg"), sent, ds["server"])
+
+    def test_another_servers_mcp_is_refused(self):
+        sent = []
+        with self.assertRaises(nav.Refused) as cm:
+            nav.Door("https://chat.s.space/relay", "bearer", post=discovery_post(
+                f"https://chat.s.space{MINT_PATH}", "https://mcp.ag2.space/mcp", sent))
+        self.assertEqual(cm.exception.code, "MCP_HOST")
+        self.assertEqual(len(sent), 1, "no mint, no MCP call")
+
+
+class MintNeedsTheRelaysOriginAndPath(unittest.TestCase):
+    def test_cleartext_port_or_path_mismatch_gets_no_bearer(self):
+        relay = "https://chat.ag2.space/relay"
+        for mint in ("http://chat.ag2.space:8080/anything", f"http://chat.ag2.space{MINT_PATH}",
+                     f"https://chat.ag2.space:8443{MINT_PATH}", "https://chat.ag2.space/anything"):
+            sent = []
+            with self.assertRaises(nav.Refused) as cm:
+                nav.Door(relay, "bearer", post=discovery_post(mint, "https://mcp.ag2.space/mcp", sent))
+            self.assertEqual(cm.exception.code, "MINT_HOST", mint)
+            self.assertEqual([u for u, _ in sent], [relay + "/v1/mcp/discovery"], mint)
+
+
+class RoutesByTheMentioningRoom(unittest.TestCase):
+    """On several connections, the mention's room picks the connection for the DM and the door."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="nav-route-"))
+
+    def test_resolution_and_door_follow_the_room(self):
+        asked, opened = [], []
+
+        def gateway(room_id=None):
+            asked.append(room_id)
+            return (f"https://{room_id or 'primary'}/relay", {"Authorization": "Bearer t"})
+
+        def owner_dm_room(ws, base, rooms=None):
+            opened.append(("dm", base, rooms.via_room))
+            return OWNER_DM
+        door = FakeDoor()
+        with patch.object(nav._gw, "gateway", gateway), patch.object(nav, "owner_dm_room", owner_dm_room):
+            nav.on_mention(nav.Mention(ROOM, "$a"), self.ws, now=1000.0, window=120,
+                           door_factory=door)
+        self.assertEqual(opened, [("dm", f"https://{ROOM}/relay", ROOM)])
+        self.assertEqual(door.rooms, [OWNER_DM])
+        with patch.object(nav._gw, "gateway", gateway), \
+                patch.object(nav, "Door", lambda base, bearer: base):
+            self.assertEqual(nav.open_door(OWNER_DM), f"https://{OWNER_DM}/relay")
+
+    def test_a_refused_connection_navigates_nowhere(self):
+        def gateway(room_id=None):
+            raise nav._gw.RoomConnectionError("no connection serves that server")
+        with patch.object(nav._gw, "gateway", gateway):
+            out = nav.on_mention(nav.Mention(ROOM, "$a"), self.ws, now=1000.0, window=120,
+                                 door_factory=FakeDoor())
+            self.assertEqual(out["skipped"], "no owner DM reading for this gateway")
+            with self.assertRaises(nav.Refused):
+                nav.open_door(OWNER_DM)
+
+    def test_rooms_reads_through_the_rooms_connection(self):
+        import rooms as rooms_mod
+        asked = []
+        with patch.object(nav._gw, "gateway", lambda room_id=None: asked.append(room_id) or ("https://hs/relay", {})), \
+                patch.object(nav._gw, "http_json", lambda *a, **k: (200, {"agents": []})), \
+                patch.object(rooms_mod, "gateway", lambda room_id=None: asked.append(room_id) or ("", {})):
+            nav.Rooms(ROOM).agents()
+            nav.Rooms(ROOM).joined()
+        self.assertEqual(asked, [ROOM, ROOM])
+
+
+class PrefersTheGatewaysOwnerDm(unittest.TestCase):
+    """The agent row's owner_dm_room wins when it is a two-member room; a guess comes after."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="nav-hint-"))
+        (self.ws / "state").mkdir()
+        (self.ws / "state" / "owner-routing.json").write_text(json.dumps({"identity": AGENT, "gateway": GW}))
+        os.environ.pop("AGENT_MXID", None)
+
+    def rooms(self, hint):
+        r = FakeRooms({"!main:hs": {AGENT, OWNER}, "!quiet:hs": {AGENT, OWNER},
+                       "!three:hs": {AGENT, OWNER, "@a:hs"}}, {"!main:hs": 900.0})
+        r.agents = lambda: [{"id": AGENT, "owner": OWNER, "owner_dm_room": hint}]
+        return r
+
+    def test_the_gateways_two_member_room_wins_over_a_more_recent_one(self):
+        self.assertEqual(nav.owner_dm_room(self.ws, GW, self.rooms("!quiet:hs"), now=1000.0), "!quiet:hs")
+
+    def test_a_shared_gateway_room_falls_back_to_the_guess(self):
+        self.assertEqual(nav.owner_dm_room(self.ws, GW, self.rooms("!three:hs"), now=1000.0), "!main:hs")
+
+
+class CheapPathsComeFirst(unittest.TestCase):
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="nav-cheap-"))
+
+    def test_an_already_handled_message_skips_before_resolving_the_dm(self):
+        nav.on_mention(nav.Mention(ROOM, "$a"), self.ws, now=1000.0, owner_dm=OWNER_DM, window=120,
+                       door_factory=FakeDoor())
+
+        def scan(*a, **k):
+            raise AssertionError("the owner DM was resolved for a handled message")
+        with patch.object(nav, "owner_dm_room", scan):
+            out = nav.on_mention(nav.Mention(ROOM, "$a"), self.ws, now=1001.0, window=120,
+                                 door_factory=FakeDoor())
+        self.assertEqual(out["skipped"], "already navigated for this message")
+
+    def test_room_ops_runs_without_fcntl(self):
+        import subprocess
+        code = ("import sys, runpy; sys.modules['fcntl'] = None; "
+                "sys.argv = ['room_ops.py', 'capabilities']; "
+                f"runpy.run_path({str(REPO / 'skills' / 'agent-room-ops' / 'room_ops.py')!r}, run_name='__main__')")
+        got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn("navigate", json.loads(got.stdout)["commands"])
 
 
 if __name__ == "__main__":

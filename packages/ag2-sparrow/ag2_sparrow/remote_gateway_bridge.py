@@ -93,6 +93,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .dotspace import NO_FETCH as _NO_FETCH, dotspace_for as _dotspace_for
+from . import mcp_discovery as _mcp_discovery
 
 # Prefer IPv4 for connections to any DotSpace gateway/relay (e.g. chat.ag2.space): they
 # publish AAAA records, but some hosts have IPv6 black-holed at the network
@@ -4317,7 +4318,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
 
 # Room Actions go as the agent's MCP proxy sends them: a delegation minted from the relay credential,
 # then one stateless tools/call on the lane's MCP endpoint (the relay bearer is refused there).
-AGENT_ACCESS_MINT_PATH = "/api/v1/mcp/agent-access-tokens"
+AGENT_ACCESS_MINT_PATH = _mcp_discovery.AGENT_ACCESS_MINT_PATH
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_AUTH_CODE = "AUTHENTICATION_FAILED"  # the proxy's in-band auth failure, read from content[0]
 MINT_RATE_LIMIT_S = 60.0  # the mint allows 30 per 60 s per agent, shared with its MCP tools
@@ -5685,20 +5686,8 @@ def _to_authed_media_url(url: str) -> str:
 
 
 def _same_origin(url: str, base: str) -> bool:
-    """True iff `url` shares scheme+host+port with `base` (exact origin match —
-    parsed, never string-prefix: `https://relay.example.evil` must NOT match
-    a base of `https://relay.example`). Whole body is guarded: `.port` raises
-    ValueError at ACCESS time for a malformed port (`https://h:bad/`), and a
-    gateway-controlled URL must never crash task intake — malformed ⇒ False."""
-    try:
-        u, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
-        if not u.scheme or not u.hostname or u.scheme != b.scheme:
-            return False
-        default = {"https": 443, "http": 80}.get(u.scheme)
-        return (u.hostname.lower() == (b.hostname or "").lower()
-                and (u.port or default) == (b.port or default))
-    except ValueError:
-        return False
+    """Exact origin match (scheme, host, port); `mcp_discovery.same_origin` owns the rule."""
+    return _mcp_discovery.same_origin(url, base)
 
 
 def _under_gateway(url: str) -> bool:

@@ -144,6 +144,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`local_time.ts`** — The owner's wall clock for the `local_time:` task header; mirrors local_task_protocol.local_time_value (ISO-8601 with offset, then the IANA zone).
 - **`loop_completion.py`** — Host-specific proof that a proactive-loop pass completed.
 - **`macos-notify.sh`** — Post one macOS notification, only when the owner opted in (notifications.macos).
+- **`mcp_discovery.py`** — mcp_discovery — where a relay's MCP discovery answer may send the relay bearer and the MCP token.
 - **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-input-hold.ts`** — In meeting mode bodhi runs the session in transcription mode: the voice model must not speak.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.

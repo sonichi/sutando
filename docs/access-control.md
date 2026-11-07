@@ -129,7 +129,8 @@ room's turn with `no_send` (rule:
 `policy/egress/result.owner_mention_result_refused_by_room`). The guard covers
 that path only: a core that posts directly through room_ops and then writes
 `[REPLIED]` is bound by the instruction alone.
-The core also points the owner's Navigator at the message with
+Where the agent-room-ops skill is installed, the core may also point the owner's
+Navigator at the message, after the block's step 1, with
 `room_ops.py navigate mention --task-file <task>` (`skills/agent-room-ops/SKILL.md`,
 "Owner mentions"): one `room.navigate` pointer in the owner DM per message, never a room post.
 Mentions inside the coalescing window fold into the latest; a stranded held mention
