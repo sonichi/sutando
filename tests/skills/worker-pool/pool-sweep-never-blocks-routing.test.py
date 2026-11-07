@@ -15,6 +15,7 @@ Run: python3 tests/skills/worker-pool/pool-sweep-never-blocks-routing.test.py
 """
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import tempfile
@@ -34,10 +35,8 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 sys.path.insert(0, str(REPO / "src"))
 
-import pool_delivery as pd  # noqa: E402
-import pool_roster as pr  # noqa: E402
-import pool_router as rt  # noqa: E402
-import pool_supervise as sup  # noqa: E402
+pd, pr, rt, sup = (importlib.import_module(m) for m in
+                    ("pool_delivery", "pool_roster", "pool_router", "pool_supervise"))
 
 W = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 SRC = "room:!abc:ag2.space"
