@@ -49,13 +49,13 @@ def watch_argv(repo: str, workspace: str, instance_id: Optional[str], env=None) 
     return ["bash", cmd, inbox, "--role", "session", "--inbox", inbox]
 
 
-def session_verdict(inbox: str, state_dir: str) -> str:
+def session_verdict(inbox: str, state_dir: str, timeout: float = 15) -> str:
     """`yes`, `no` or `unknown` from watcher_identity's role-present; only `no` is evidence."""
     script = Path(__file__).resolve().parent / "watcher_identity.py"
     try:
         out = subprocess.run(
             [sys.executable, str(script), "role-present", "session", "--inbox", inbox, "--ready", state_dir],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=timeout,
         )
     except Exception:  # noqa: BLE001 -- an unobservable host is not an unwatched inbox
         return "unknown"
@@ -79,16 +79,19 @@ def session_start_context(repo: str, workspace: str, instance_id: Optional[str])
 
 
 def mod_ready(repo: str, workspace: str, instance_id: Optional[str], env=None,
-              wait_s: float = 30.0, sleep=time.sleep) -> str:
+              wait_s: float = 30.0, sleep=time.sleep, clock=time.monotonic) -> str:
     env = os.environ if env is None else env
     if env.get("SUTANDO_TASK_WATCH_MOD") != "1":
         return "no"
     inbox, _ = target(repo, workspace, instance_id)
     # A refused, unloaded or crashed Mod never makes this yes, so the Monitor is skipped only on proof.
-    for _ in range(max(1, int(wait_s))):
-        if session_verdict(inbox, f"{workspace}/state") == "yes":
+    # A deadline, not a probe count: each probe gets only the time left, so a slow one cannot overrun.
+    deadline = clock() + wait_s
+    while (left := deadline - clock()) > 0:
+        if session_verdict(inbox, f"{workspace}/state", timeout=min(15, left)) == "yes":
             return "yes"
-        sleep(1)
+        if (left := deadline - clock()) > 0:
+            sleep(min(1, left))
     return "no"
 
 

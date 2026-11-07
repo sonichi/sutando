@@ -106,9 +106,27 @@ try:
     for verdict in ("no\n", "unknown\n"):
         naps.clear()
         subprocess.run, calls = fake_run(stdout=verdict)
-        got = wr.mod_ready("/R", "/W", "w1", env={"SUTANDO_TASK_WATCH_MOD": "1"}, wait_s=30, sleep=naps.append)
+        now = [0.0]
+        got = wr.mod_ready("/R", "/W", "w1", env={"SUTANDO_TASK_WATCH_MOD": "1"}, wait_s=30,
+                           sleep=lambda s: (naps.append(s), now.__setitem__(0, now[0] + s)), clock=lambda: now[0])
         check(f"a Mod that refused or never came up ({verdict.strip()}) is no after the 30 s wait",
               got == "no" and len(naps) == 30 and calls[0][5] == "/W/deliveries/w1", (got, len(naps)))
+    # A probe slower than the wait: the deadline bounds the total, and each probe gets only the time left.
+    import time as _time
+    timeouts = []
+
+    def slow_run(argv, **kw):
+        timeouts.append(kw.get("timeout"))
+        _time.sleep(min(1.5, kw.get("timeout") or 1.5))
+        if (kw.get("timeout") or 99) < 1.5:
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return SimpleNamespace(stdout="no\n", returncode=0)
+    subprocess.run = slow_run
+    t0 = _time.monotonic()
+    got = wr.mod_ready("/R", "/W", None, env={"SUTANDO_TASK_WATCH_MOD": "1"}, wait_s=1)
+    took = _time.monotonic() - t0
+    check("a slow probe cannot overrun the wait: no within wait_s plus a small margin",
+          got == "no" and took < 1.3 and all(t is not None and t <= 1 for t in timeouts), (got, round(took, 2), timeouts))
     os.environ["SUTANDO_TASK_WATCH_MOD"] = "1"
     subprocess.run, _ = fake_run(stdout="yes\n")
     out = io.StringIO()
