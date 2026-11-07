@@ -438,3 +438,11 @@ launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as
 then starts the core. A hold binds only the Claude account it was seen under: after signing in to
 another account, the next restart launches the core at once. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
 `... clear` lifts it.
+
+While quota is high the proxy also rewrites the model requests run on (`skills/quota-tracker/SKILL.md`
+→ "Model fallback"): `quota-state.json`'s `fallback.tier` / `fallback.active_model_map` say what is
+actually running, `health-check.py`'s `quota-model-fallback` probe reports it, and
+`python3 skills/quota-tracker/scripts/fallback-config.py show|set …` adjusts the thresholds (per-host
+override under `<workspace>/hosts/<host>/`). A
+`fallback.runtime_switch.to == "codex"` means the unified quota was rejected and a Codex switch was
+requested — it is a manual step in this version.

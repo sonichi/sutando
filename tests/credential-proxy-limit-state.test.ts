@@ -65,3 +65,9 @@ test('the next successful write after a 429 returns to overage', () => {
 	assert.equal(s.limit_state, 'overage');
 	assert.equal(s.available, true);
 });
+
+test('a header write carries the model-fallback state across the file replace', () => {
+	const fallback = { tier: 2, since: T0 };
+	const s = quotaStateFromHeaders({ fallback }, INCIDENT, '', '2026-10-09T12:00:02.000Z');
+	assert.deepEqual(s.fallback, fallback);
+});
