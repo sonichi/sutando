@@ -735,5 +735,37 @@ class HeldRootRefusalTest(unittest.TestCase):
         release.assert_called_once()
 
 
+
+class TierMatrixTest(unittest.TestCase):
+    """The serve loop's own decision over tier_shapes.REFUSED with no flags, as an install without
+    --allow-non-owner runs it: the owner and the broker-stamped collaborator, nothing else."""
+
+    def test_only_the_owner_and_a_stamped_collaborator_reach_the_session(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import tier_shapes
+
+        def decide(root, name):
+            headers, _, _ = task_io.parse_task(os.path.join(root, "tasks", name + ".txt"))
+            return cc.admission(headers, False)
+        tier_shapes.check_matrix(self, decide, collaborator_admitted=True)
+
+
+    def test_under_a_writable_sandbox_only_the_owner_writes(self):
+        """As the desktop installs it (--sandbox workspace-write on 0.8.0, danger-full-access later): the owner's turn
+        gets that sandbox, a stamped collaborator's still runs read-only on its own ephemeral thread, a guest is refused."""
+        tid = "task-1792100000009"
+        for sandbox in ("workspace-write", "danger-full-access"):
+            with self.subTest(sandbox=sandbox), tempfile.TemporaryDirectory() as d:
+                now = time.time()
+                write_task(d, "task-chat-o", "owner asks", mtime=now - 30)
+                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True), mtime=now - 20)
+                write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 10)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(run_connector(d, once=3, extra=["--sandbox", sandbox]), 0)
+                self.assertIn("[sandbox=%s ephemeral=False cwd=" % sandbox, result(d, "task-chat-o"))
+                self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
+                self.assertEqual(result(d, "task-chat-g"), task_io.NON_OWNER_REFUSED)
+
+
 if __name__ == "__main__":
     unittest.main()
