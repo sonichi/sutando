@@ -5,8 +5,9 @@ tests/telegram-bridge-tofu.test.py and telegram-bridge-access.test.py pin
 load_allowed() and tofu_onboard() one at a time. This file drives the real
 main() poll loop, with only urllib's Telegram boundary faked, and checks the
 wiring between them: who gets onboarded when access.json is missing, who passes
-the allowlist gate: an onboarded or listed owner gets a task, anyone else is
-dropped without TOFU.
+the allowlist gate (an onboarded or listed owner gets a task, anyone else is
+dropped without TOFU), and that deleting access.json later still leaves the
+enrollment-code gate armed (#899).
 
 Run: python3 tests/telegram-bridge-dispatch-e2e.test.py
 """
@@ -191,6 +192,26 @@ class TelegramDispatch(unittest.TestCase):
         self.assertEqual(s.sent("sendMessage"), [])
         self.assertEqual(s.access.read_bytes(), before)
         self.assertIn(f"Dropped message from non-allowed @user{STRANGER}", s.log)
+
+    def test_access_deleted_after_enrolment_still_requires_the_code(self):
+        s = Scenario(access=None)
+        holder = {}
+
+        def enrol(bridge):
+            holder["owner"] = dm(OWNER, f"code {bridge._TOFU_ENROLLMENT_CODE}", "owner")
+            return [holder["owner"]]
+
+        def delete_then_stranger(bridge):
+            bridge.ACCESS_FILE.unlink()
+            return [dm(STRANGER, "I'll be the owner now")]
+
+        tofu = s.run(enrol, delete_then_stranger)
+        tofu.assert_called_once_with(str(OWNER), "owner")
+        self.assertFalse(s.access.exists(), "no code, so the stranger is never onboarded")
+        self.assertEqual(s.tasks(), [s.task(holder["owner"]).name])
+        prompts = s.sent("sendMessage")
+        self.assertEqual([p["chat_id"] for p in prompts], [STRANGER])
+        self.assertIn("Enrollment code required", prompts[0]["text"])
 
 
 if __name__ == "__main__":
