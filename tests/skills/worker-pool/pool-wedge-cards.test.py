@@ -142,7 +142,7 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 st, d = ps.evaluate(st, {"w": o}, t)
                 seen.add(d["w"])
                 t += 300.0
-        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED}, set())
+        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, ps.RETRY_LIMIT, CAUSE, FROZEN, LOGIN, HUMAN, UNDELIVERED}, set())
         self.assertNotIn(ps.RECOVER, seen)
 
     def test_no_wedge_decision_reaches_kill_send_keys_or_spawn(self):

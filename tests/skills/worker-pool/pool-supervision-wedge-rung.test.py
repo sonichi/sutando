@@ -88,7 +88,7 @@ check("a gate held with work outstanding asks for a card at the sustain, once, n
       got, [N, N, HUMAN, N, N])
 
 got, _ = run([obs(LIMIT)] * 4)
-check("a limit is a human's wait-or-spend decision: card, never restart", got, [N, N, HUMAN, N])
+check("a limit without a reset time probes after a bounded wait", got, [N, N, N, ps.RETRY_LIMIT])
 
 got, _ = run([obs(ABN)] * 5)
 check("abnormal text sustained asks once for a card naming its cause, never a restart",
@@ -159,7 +159,7 @@ check("an acknowledged login card does not silence the abnormal text that follow
       (got, getattr(st.workers["w"], "wedge_kind", None)), ([LOGIN, N, CAUSE, N], "abnormal"))
 
 got, _ = run([obs(LOGGED_OUT, work=False), obs(LIMIT), obs(LIMIT), obs(LIMIT)])
-check("...nor a limit that follows it: that cards at the episode's sustain", got, [LOGIN, N, HUMAN, N])
+check("a subsequent limit starts its own bounded wait", got, [LOGIN, N, N, N])
 
 got, _ = run([obs(ABN)] * 3 + [obs(LOGGED_OUT)] * 2)
 check("an expiry after an acknowledged cause card is carded on the tick that reads it",
@@ -281,9 +281,9 @@ check("a move clears the sustain, which starts over once the frame settles",
 got, _ = run([obs(WORK, "turn:t")] + [obs(GATE, "dialog:d")] * 3)
 check("entering a gate changes the frame, which is not progress under it", got, [N, N, N, HUMAN])
 got, _ = run([obs(LIMIT, "f1")] * 3)
-check("a bare raw id carries no progress evidence", got, [N, N, HUMAN])
+check("a bare raw id does not shorten the limit wait", got, [N, N, N])
 got, _ = run([obs(LIMIT, "r1:n1"), obs(LIMIT, "r1:n1"), obs(LIMIT, None)])
-check("an unread frame id is no evidence of progress", got, [N, N, HUMAN])
+check("an unread frame id does not shorten the limit wait", got, [N, N, N])
 
 # A worker genuinely held by the limit: idle prompt, the banner, no turn since, deliveries
 # piling up. Only the footer's counters change, and they are status, not work.
@@ -314,7 +314,8 @@ REFUSED = (f"\u276f check the inbox\n  \u23bf  You've hit your session limit \u0
 for label, text in (("a refused limit turn", REFUSED), ("the limit menu", PANES["limit menu"][0]),
                     ("a permission dialog", PANES["permission"][0])):
     got, _ = run([frame_obs(text)] * 4)
-    check(f"control: {label} on a frozen screen, work owed, is carded", got, [N, N, HUMAN, N])
+    check(f"control: {label} on a frozen screen", got,
+          [N, N, N, ps.RETRY_LIMIT] if label == "a refused limit turn" else [N, N, HUMAN, N])
 
 class Done:
     def __init__(self, rc=0, out="", err=""):
