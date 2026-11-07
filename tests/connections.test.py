@@ -4530,6 +4530,22 @@ class OwnChildWhileTheReaperHoldsItsLock(unittest.TestCase):
         with proc._waitpid_lock:
             self.assertFalse(C._exited(proc.pid))
 
+    def test_its_rc_is_read_once_the_reaper_releases_the_lock(self):
+        proc = self.spawn("raise SystemExit(2)")
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        proc._waitpid_lock.acquire()
+        threading.Timer(0.2, proc._waitpid_lock.release).start()
+        self.assertEqual(C._exit_code(proc), 2)
+
+    def test_a_child_that_never_finishes_waiting_has_no_rc(self):
+        class Stuck:
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("bridge", timeout)
+        self.assertIsNone(C._exit_code(Stuck()))
+
     def test_a_child_the_reaper_already_collected_reads_exited(self):
         def raises(error):
             def waitid(*_a):
