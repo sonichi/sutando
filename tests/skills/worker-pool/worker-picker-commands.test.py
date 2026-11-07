@@ -5,7 +5,7 @@ The texts below are the broker's own, copied from its handlers on
 ag2space-backend main, so a wording change upstream fails these rather than
 silently producing None.
 
-Run: python3 tests/worker-picker-commands.test.py
+Run: python3 tests/skills/worker-pool/worker-picker-commands.test.py
 """
 from __future__ import annotations
 

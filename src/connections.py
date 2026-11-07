@@ -2848,12 +2848,13 @@ def _reap_when_done(child) -> None:
 def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
+    waitid = getattr(os, "waitid", None)
     if child is not None:
         if child.poll() is None:
-            return False
+            # poll() also reads None while the reaper thread holds Popen's wait lock.
+            return waitid is not None and _waitid_exited(waitid, pid)
         _CHILDREN.pop(pid, None)
         return True
-    waitid = getattr(os, "waitid", None)
     if waitid is not None:
         try:  # an exited, unreaped child of this process: seen without reaping it
             if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
@@ -2875,6 +2876,14 @@ def _exited(pid: int) -> bool:
     except OSError:
         return False
     return False
+
+
+def _waitid_exited(waitid, pid: int) -> bool:
+    """Whether our child `pid` has exited, by the kernel and without reaping it."""
+    try:
+        return waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except OSError as e:  # ChildProcessError: the reaper already collected it
+        return isinstance(e, ChildProcessError)
 
 
 def _zombie(pid: int) -> bool:
@@ -2945,8 +2954,15 @@ def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: 
 
 
 def _exit_code(child) -> Optional[int]:
+    """An exited child's rc; poll() reads None while the reaper holds the wait lock, so wait for it."""
     poll = getattr(child, "poll", None)
-    return poll() if poll is not None else None
+    rc = poll() if poll is not None else None
+    if rc is None and hasattr(child, "wait"):
+        try:
+            rc = child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return None
+    return rc
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
