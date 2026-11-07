@@ -184,7 +184,9 @@ kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 [ "$rc" = 75 ] && [ ! -s "$T/out" ] && ! grep -q send-keys "$TMUX_LOG" && ok "50 the observer's Enter while another sender holds the lock returns 75, not TIMEOUT" || fail "50" "rc=$rc $(cat "$T/out")"
 
 # --- --offline: the core is down, so its settings carry the model to the next launch
-printf '#!/bin/bash\n[ -n "${PGREP_CORE:-}" ] && exit 0; exit 1\n' > "$T/bin/pgrep"; chmod +x "$T/bin/pgrep"
+# A running core, as the launcher sees one: a process named `claude` whose args name the session.
+printf '#!/bin/bash\n[ -n "${PGREP_CORE:-}" ] && { echo "4242 claude"; exit 0; }; exit 1\n' > "$T/bin/pgrep"; chmod +x "$T/bin/pgrep"
+printf '#!/bin/bash\n[ "$*" = "-p 4242 -o args=" ] && { echo "claude --name sutando-core --dangerously-skip-permissions"; exit 0; }; exec /bin/ps "$@"\n' > "$T/bin/ps"; chmod +x "$T/bin/ps"
 printf '{"permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; rm -f "$T/state/model-switch.json"
 rc=$(run sonnet --offline); R=$(python3 -c "import json;s=json.load(open('$T/cfg/settings.json'));r=json.load(open('$T/state/model-switch.json'));print(s['model'],s['permissions']['allow'][0],r['model'],r['accepted'])" 2>/dev/null)
 [ "$rc" = 0 ] && [ "$R" = "sonnet Bash sonnet False" ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "next launch" "$T/out" \
@@ -195,4 +197,45 @@ rc=$(PGREP_CORE=1 run haiku --offline); R=$(python3 -c "import json;print(json.l
 printf 'not json' > "$T/cfg/settings.json"; rc=$(run haiku --offline)
 [ "$rc" = 1 ] && [ "$(cat "$T/cfg/settings.json")" = "not json" ] && ok "53 --offline never overwrites settings it cannot read" || fail "53" "rc=$rc"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 53 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+
+# --- #6291: a tmux server whose argv names the session is not a running core
+REALPATH="${PATH#"$T/bin:"}"; REALTMUX="$(PATH="$REALPATH" command -v tmux)"
+if [ -n "$REALTMUX" ]; then
+  RS="$T/r.sock"; RSESS="smt-$$"
+  "$REALTMUX" -S "$RS" new-session -d -s "$RSESS" sh -c 'sleep 60' claude --name "$RSESS"
+  "$REALTMUX" -S "$RS" new-window -d -t "$RSESS" sleep 60; "$REALTMUX" -S "$RS" kill-window -t "$RSESS:0"
+  printf '{"model":"opus"}\n' > "$T/cfg/settings.json"
+  rc=$(PATH="$REALPATH" "$HERE/scripts/switch-model.sh" sonnet --offline --session "$RSESS" --socket "$RS" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
+  R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])"); "$REALTMUX" -S "$RS" kill-server 2>/dev/null
+  [ "$rc" = 0 ] && [ "$R" = sonnet ] && ok "54 --offline with only the session's tmux server left (its argv names the session) writes the model" || fail "54" "rc=$rc R=$R $(cat "$T/err")"
+else
+  ok "54 skipped: no real tmux on this host"
+fi
+
+# --- #6291: held for a provider limit, the session up but no core: the pick is written and the core started
+hold(){ python3 -c "import json,sys,time;json.dump({'status':'held','until':time.time()+3600,'reason':'core paused: usage limit on claude-opus-5-5, resets later'},open(sys.argv[1],'w'))" "$T/state/core-limit-hold.json"; }
+cat > "$T/launcher.sh" <<'SH'
+#!/bin/bash
+python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['model'])" "$LCFG/settings.json" >> "$LCALLS"
+python3 -c "import fcntl,sys;f=open(sys.argv[1],'a');fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB);print('lock-free')" "$LSTATE/.model-switch.lock" >> "$LCALLS" 2>/dev/null || echo lock-held >> "$LCALLS"
+[ -n "${LAUNCH_HOLD:-}" ] && { echo "  ⏸ sutando-core not launched — core paused: usage limit on claude-sonnet-5, resets later" >&2; exit 75; }
+exit 0
+SH
+chmod +x "$T/launcher.sh"; export LCALLS="$T/launch-calls" LCFG="$T/cfg" LSTATE="$T/state"
+GW='gateway-keepalive: starting remote-gateway-bridge.py\n'
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"; rm -f "$LCALLS"; hold
+rc=$(TMUX_PANE_TEXT="$GW" run sonnet --confirm --launcher "$T/launcher.sh"); R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")
+[ "$rc" = 0 ] && [ "$R" = sonnet ] && [ "$(tr '\n' ' ' < "$LCALLS")" = "sonnet lock-free " ] && ! grep -q -- "-l /model" "$TMUX_LOG" && grep -q "starting on sonnet" "$T/out" \
+  && ok "55 a held core with no process: the pick is written, then the core is launched on it with the switch lock released" || fail "55" "rc=$rc R=$R calls=$(cat "$LCALLS" 2>/dev/null) $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"; rm -f "$LCALLS"; hold
+rc=$(LAUNCH_HOLD=1 TMUX_PANE_TEXT="$GW" run sonnet --confirm --launcher "$T/launcher.sh")
+[ "$rc" = 10 ] && grep -q "usage limit on claude-sonnet-5" "$T/err" && ok "56 a launch the gate still holds is reported (rc=10, with its reason), not as started" || fail "56" "rc=$rc $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"; rm -f "$LCALLS" "$T/state/core-limit-hold.json"
+rc=$(TMUX_PANE_TEXT="$GW" run sonnet --confirm --launcher "$T/launcher.sh"); R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")
+[ "$rc" = 5 ] && [ "$R" = opus ] && [ ! -e "$LCALLS" ] && ok "57 no hold: a down core is not started and its settings are untouched (rc=5 as before)" || fail "57" "rc=$rc R=$R"
+hold; rm -f "$LCALLS"
+rc=$(PGREP_CORE=1 TMUX_PANE_TEXT="$GW" run sonnet --confirm --launcher "$T/launcher.sh"); R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")
+[ "$rc" = 5 ] && [ "$R" = opus ] && [ ! -e "$LCALLS" ] && ok "58 held but a core process runs: no settings write, no launch" || fail "58" "rc=$rc R=$R"
+rm -f "$T/state/core-limit-hold.json"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 58 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

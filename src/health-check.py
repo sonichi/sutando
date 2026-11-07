@@ -14668,11 +14668,12 @@ def _resolve_launch_env() -> dict:
 
 
 def _core_limit_hold(now: float) -> "dict | None":
-    """The launcher's provider-limit hold in force now, else None; unreadable is None."""
+    """The launcher's provider-limit hold that would stop a relaunch now, else None; unreadable
+    is None. A hold the owner switched away from does not bind, so the core is revived."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import core_limit_hold
-        return core_limit_hold.active_hold(WORKSPACE_DIR, now)
+        return core_limit_hold.binding_hold(WORKSPACE_DIR, now)
     except Exception:
         return None
 
