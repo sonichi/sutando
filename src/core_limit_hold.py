@@ -363,7 +363,6 @@ def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
-_REPO = Path(__file__).resolve().parent.parent
 _RESOLVE_CCD = 'source "$1/src/claude_config_dir.sh" && resolve_claude_config_dir "$1" core-limit-hold'
 
 
@@ -372,8 +371,12 @@ def _launch_config_dir() -> Optional[str]:
     (src/claude_config_dir.sh), so the watchdog and the gate read the seat it launches.
     None where the launcher would refuse to start: the hold then keeps binding."""
     import subprocess
+    from sutando_config import _find_repo_root
+    repo = _find_repo_root()
+    if repo is None:
+        return None
     try:
-        run = subprocess.run(["bash", "-c", _RESOLVE_CCD, "core-limit-hold", str(_REPO)],
+        run = subprocess.run(["bash", "-c", _RESOLVE_CCD, "core-limit-hold", str(repo)],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
