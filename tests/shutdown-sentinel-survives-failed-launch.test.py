@@ -28,6 +28,8 @@ LAUNCHERS = {
     "claude": REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh",
     "codex": REPO / "src" / "agent" / "codex" / "cli" / "start-cli.sh",
 }
+CLI_WORD = r'(?:claude|codex|"\$SUTANDO_CORE_CLI_BIN"|' + re.escape(
+    '"${CLAUDE_BIN:-${SUTANDO_CORE_CLI_BIN:-claude}}"') + ')'
 failures: list[str] = []
 checks = 0
 
@@ -65,7 +67,7 @@ for label, path in LAUNCHERS.items():
     check(f"{label}: arms `shopt -s execfail` on a live line",
           re.search(r"^[ \t]*shopt -s execfail\b", src, re.M) is not None,
           "otherwise the restore below is dead code")
-    execs = [m.end() for m in re.finditer(rf'^[ \t]*exec (?:{label}\b|"\$SUTANDO_CORE_CLI_BIN")', src, re.M)]
+    execs = [m.end() for m in re.finditer(rf'^[ \t]*exec {CLI_WORD}(?=\s)', src, re.M)]
     check(f"{label}: has a bare-exec launch path at all", bool(execs))
     for pos in execs:
         after = src[pos:pos + 1200]
@@ -73,7 +75,7 @@ for label, path in LAUNCHERS.items():
               re.search(r"^[ \t]*restore_shutdown_sentinel[ \t]*$", after, re.M) is not None,
               "the definition existing is not the same as it being called")
     check(f"{label}: refuses to clear when the core binary is absent",
-          re.search(r"command -v (claude|codex|\"\$SUTANDO_CORE_CLI_BIN\").*\n.*not clearing the shutdown sentinel",
+          re.search(rf"command -v {CLI_WORD}.*\n.*not clearing the shutdown sentinel",
                     src, re.M) is not None)
 
 # 3. ORDERING: no clear may precede the verification that a core is live.
@@ -89,7 +91,8 @@ for pos in calls:
     # launch_claude_session (session-launch.sh) now does the create+poll
     # internally; a caller checking its return has the same proof.
     verified = ("tmux_core_session_running" in w or "healed_idx" in w
-                or "command -v claude" in w or "command -v \"$SUTANDO_CORE_CLI_BIN\"" in w or "launch_claude_session" in w)
+                or re.search(rf"command -v {CLI_WORD}(?=\s)", w) is not None
+                or "launch_claude_session" in w)
     check(f"claude: clear at line {claude[:pos].count(chr(10))+1} follows a liveness proof",
           verified, "a clear with no preceding verification can open intake with no core")
 
