@@ -1064,6 +1064,7 @@ class ModelSwitchWayOut(unittest.TestCase):
             argv = argv[0]
             self.assertEqual(argv[1:4], [str(entry), "present", "core-model"])
             self.assertIn("usage limit on claude-opus-5-5", argv[5])
+            self.assertEqual(argv[5].count("resets"), 1, argv[5])
             self.assertEqual(argv[6:], ["--ttl", str(clh.LONG_RESET_RECHECK_S)])
             self.assertTrue(kw["start_new_session"])
             self.assertTrue(clh.read_hold(ws)["card_presented"])

@@ -429,8 +429,7 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
     """Start the desktop's core-model card for this hold, fail-open. True when it was started.
     Detached: the card's DM mirror may take its own deadline, and the launch must not wait on it."""
     import subprocess
-    body = (f"Paused: {hold['reason'].split(': ', 1)[-1]}. {_when_line(hold)}. "
-            "Pick another model to keep working now.")
+    body = f"Paused: {hold['reason'].split(': ', 1)[-1]}. Pick another model to keep working now."
     ttl = int(max(600, min(float(hold.get("until") or now) - now, LONG_RESET_RECHECK_S)))
     try:
         subprocess.Popen([sys.executable, card_entry, "present", "core-model", "--set", f"body={body}",
