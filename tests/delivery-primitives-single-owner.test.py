@@ -141,8 +141,10 @@ def instantiation_violations(found: dict, owners: dict) -> list[str]:
 prod_sources = {rel(f): f.read_text() for f in scan_files}
 INSTANTIATION_OWNERS = {
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py::_delivery_core::DesignAClaimBackend": 1,
-    # Discord's proactive leg is pinned migration debt, not precedent.
-    "src/discord-bridge.py::_proactive_fence::DesignAClaimBackend": 1,
+    # Proactive selector: A construction plus the reverse-transition type check;
+    # C has one opt-in construction. Neither permits another delivery leg.
+    "src/discord-bridge.py::_proactive_fence::DesignAClaimBackend": 2,
+    "src/discord-bridge.py::_proactive_fence::DesignCClaimBackend": 1,
     # The one outbox coordinator for the Discord result leg: return annotation
     # plus the cached construction. A third reference here must fail the gate.
     "src/discord_result_delivery.py::result_backend::DesignAClaimBackend": 2,
@@ -172,8 +174,15 @@ mutated2[_db] = prod_sources[_db] + (
     "    DesignAClaimBackend('one'); DesignAClaimBackend('two')\n")
 mviol2 = instantiation_violations(scan_instantiations(mutated2),
                                   INSTANTIATION_OWNERS)
-check(any("_proactive_fence::DesignAClaimBackend x3 (pinned x1)" in v for v in mviol2),
+check(any("_proactive_fence::DesignAClaimBackend x4 (pinned x2)" in v for v in mviol2),
       "multiplicity ratchet: extra calls under a pinned key exceed its count")
+mutated_c = dict(prod_sources)
+mutated_c[_db] = prod_sources[_db] + (
+    "\n\ndef _proactive_fence():\n"
+    "    DesignCClaimBackend('extra')\n")
+cviol = instantiation_violations(scan_instantiations(mutated_c), INSTANTIATION_OWNERS)
+check(any("_proactive_fence::DesignCClaimBackend x2 (pinned x1)" in v for v in cviol),
+      "C multiplicity ratchet: an extra call at the selector still fails")
 # alias control (reviewer P1, permanent): a local rebinding is still a construction
 mutated3 = dict(prod_sources)
 mutated3[_db] = prod_sources[_db] + (
