@@ -322,7 +322,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
-from .task_archive import find_task_file
+from .task_archive import deliveries_root_for, find_task_file, retire_delivery_pointers
 from .local_task_protocol import find_archived_task
 from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
@@ -7734,7 +7734,10 @@ def _archive_task_file(tid: str) -> bool:
             tfile.rename(archive_dir / f"{tid}.txt")
         except OSError:
             pass
-    return find_task_file(TASKS_DIR, tid) is None
+    gone = find_task_file(TASKS_DIR, tid) is None
+    if gone:
+        retire_delivery_pointers(deliveries_root_for(TASKS_DIR), tid, log=_log)
+    return gone
 
 
 # Ids whose result is disposed of but whose task could not be archived yet; each
@@ -7905,6 +7908,7 @@ def _settle_task_locked(tid: str, inflight: "set[str] | None") -> bool:
     _forget_dedup_alias(tid)
     _log(f"result {tid}: its result is disposed of and its task is archived; the task is retired")
     return True
+
 
 
 # A legacy bare `.sending` claim carries no owner info, so recovery for those

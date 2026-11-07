@@ -21,6 +21,8 @@ set -u -m
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=fixtures/clean-watcher-env.sh
+. "$REPO/tests/fixtures/clean-watcher-env.sh"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 # (c) needs bash 3.2's `read -t`: /bin/bash when that is 3.x, the interpreter the
 # notifier execs its standby under; PATH's bash (5 on Homebrew and CI) cannot show it.

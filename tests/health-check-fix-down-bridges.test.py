@@ -880,7 +880,7 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
         return mock.MagicMock()
 
     def fake_run(argv, *args, **kwargs):
-        if isinstance(argv, list) and argv and argv[0] == "/usr/bin/pgrep":
+        if isinstance(argv, list) and argv and Path(argv[0]).name == "pgrep":
             return subprocess.CompletedProcess(argv, 0, stdout="4242\n", stderr="")
         if isinstance(argv, list) and argv and argv[0] == "/bin/kill":
             killed.append(argv[1])
