@@ -1208,8 +1208,13 @@ fi
 # life (a relaunch writes at once). 0: still up half a second later; 1: it was not.
 FSWATCH_READER_OPEN=""
 FSWATCH_STARTED_AT=0
+# SUTANDO_FSWATCH_MONITOR names fswatch's monitor (`fswatch -M` lists them); unset is fswatch's default.
+FSWATCH_MONITOR="${SUTANDO_FSWATCH_MONITOR:-}"
 launch_fswatch() {
+  local monitor_args=()
+  [ -z "$FSWATCH_MONITOR" ] || monitor_args=(-m "$FSWATCH_MONITOR")
   fswatch \
+    ${monitor_args[@]+"${monitor_args[@]}"} \
     -l 0.5 \
     --event Created \
     --event Renamed \
@@ -1295,28 +1300,58 @@ handle_event() {
 # Readiness is a real round-trip: a probe this watcher writes into its own inbox
 # must come back through fswatch. Its name matches no admission pattern.
 PRE_READY_EVENTS=""
-if [ "$WATCHER_ROLE" = "session" ]; then
-  READY_DEADLINE=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} ))
-  probe_n=0
-  : > "$TASKS_DIR/.ready-$$-$probe_n"
-  ready=0
-  while [ "$(date +%s)" -lt "$READY_DEADLINE" ]; do
+probe_n=0
+probe_round=0
+# 0: a probe of THIS round came back through fswatch within SUTANDO_WATCHER_READY_TIMEOUT; 1: it did not.
+# An earlier round's probe still in the FIFO proves nothing about the monitor now running.
+readiness_round_trip() {
+  local deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} )) path rc=1 tag
+  probe_round=$((probe_round + 1))
+  tag=".ready-$$-r$probe_round"
+  : > "$TASKS_DIR/$tag-$probe_n"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! IFS= read -r -t 1 path <&3; then
       kill -0 "$FSWATCH_PID" 2>/dev/null || break
       # A probe written before fswatch subscribed raises nothing: write a fresh one.
       probe_n=$((probe_n + 1))
-      : > "$TASKS_DIR/.ready-$$-$probe_n"
+      : > "$TASKS_DIR/$tag-$probe_n"
       continue
     fi
     case "$path" in
-      */.ready-$$-*|.ready-$$-*) ready=1; break ;;
+      */"$tag"-*|"$tag"-*) rc=0; break ;;
+      */.ready-$$-*|.ready-$$-*) ;;
       *) PRE_READY_EVENTS="$PRE_READY_EVENTS$path
 " ;;
     esac
   done
   rm -f "$TASKS_DIR"/.ready-$$-*
+  return "$rc"
+}
+# Stops the fswatch the readiness probe gave up on: TERM, then KILL after 2 s, since a monitor
+# wedged on a stalled event service may never act on TERM and the start lock is still held.
+stop_stalled_fswatch() {
+  local _
+  kill -TERM "$FSWATCH_PID" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    { kill -0 "$FSWATCH_PID" 2>/dev/null && ! proc_is_zombie "$FSWATCH_PID"; } || break
+    sleep 0.1
+  done
+  kill -KILL "$FSWATCH_PID" 2>/dev/null
+  wait "$FSWATCH_PID" 2>/dev/null
+}
+if [ "$WATCHER_ROLE" = "session" ]; then
+  ready=0
+  readiness_round_trip && ready=1
+  # A live fswatch whose default monitor reports nothing (a stalled fseventsd): poll_monitor
+  # stats the inbox itself. A monitor the owner named is theirs, and is not second-guessed.
+  if [ "$ready" -ne 1 ] && [ -z "$FSWATCH_MONITOR" ] && kill -0 "$FSWATCH_PID" 2>/dev/null; then
+    echo "watch-tasks-stream: fswatch's default monitor reported nothing from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; relaunching fswatch with poll_monitor" >&2
+    stop_stalled_fswatch
+    FSWATCH_MONITOR=poll_monitor
+    launch_fswatch && readiness_round_trip && ready=1
+  fi
   if [ "$ready" -ne 1 ]; then
-    echo "watch-tasks-stream: no event came back from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; no sentinel written and no standby touched" >&2
+    echo "watch-tasks-stream: no event came back from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s (fswatch monitor: ${FSWATCH_MONITOR:-default}); no sentinel written and no standby touched" >&2
     exit 1
   fi
 fi
