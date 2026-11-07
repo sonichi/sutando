@@ -76,6 +76,8 @@ function ctx(overrides: Partial<{ meeting: boolean; googleSearch: boolean }> = {
 }
 const OVERRIDES = {
 	standIdentityJson: '{"name":"AnchorStand","nameOrigin":"fixture"}',
+	// The name the prompt rendered before agentDisplayName(): the fixture hashes stay byte-identical.
+	agentName: 'Sutando — AnchorStand',
 	voiceContext: '[ANCHOR-VOICE-CONTEXT]',
 	repoUrl: 'https://github.com/sonichi/sutando',
 	voiceAgentContext: '[ANCHOR-AGENT-CONTEXT]',
@@ -172,9 +174,30 @@ test('greeting: meeting-mode string is exact', () => {
 });
 
 test('greeting: fresh-connect shape (env-dependent hints excluded)', () => {
-	const g = cfg.buildGreeting(ctx());
-	assert.ok(g.startsWith('[System: A user just connected. Say hi and introduce yourself as Sutando'));
+	const g = cfg.buildGreeting(ctx(), OVERRIDES);
+	assert.ok(g.startsWith('[System: A user just connected. Say hi and introduce yourself as Sutando — AnchorStand — their personal AI.'));
 	assert.ok(g.endsWith(MODE.marker), 'ends with the mode marker');
+});
+
+test('self-introduction uses the display name; only the name changes', () => {
+	const shown = { ...OVERRIDES, agentName: 'Display Name X' };
+	const inst = cfg.buildInstructions(ctx(), shown);
+	assert.ok(inst.includes('When asked your name or who you are, say "I\'m Display Name X."'));
+	assert.ok(!inst.includes('Sutando — AnchorStand'));
+	assert.strictEqual(inst, instructions.replace('say "I\'m Sutando — AnchorStand."', 'say "I\'m Display Name X."'));
+	const g = cfg.buildGreeting(ctx(), shown);
+	assert.ok(g.startsWith('[System: A user just connected. Say hi and introduce yourself as Display Name X — their personal AI.'));
+	assert.strictEqual(g, cfg.buildGreeting(ctx(), OVERRIDES).replace('as Sutando — AnchorStand —', 'as Display Name X —'));
+});
+
+test('the name answer is given with or without a Stand name; only the Stand line is gated', () => {
+	const ask = 'When asked your name or who you are, say "I\'m Display Name X."';
+	for (const [standIdentityJson, named] of [['{}', false], ['not json', false], ['{"name":"AnchorStand","nameOrigin":"fixture"}', true]] as const) {
+		const inst = cfg.buildInstructions(ctx(), { ...OVERRIDES, standIdentityJson, agentName: 'Display Name X' });
+		assert.ok(inst.includes(ask), standIdentityJson);
+		assert.strictEqual(inst.includes('Your Stand name is AnchorStand. Origin: fixture.'), named, standIdentityJson);
+		assert.strictEqual(inst.includes('Your Stand name is'), named, standIdentityJson);
+	}
 });
 
 test('greeting: reconnect replay guard preserved', () => {
