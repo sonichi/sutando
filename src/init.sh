@@ -93,17 +93,6 @@ create_dir_if_missing() {
   fi
 }
 
-# Repo-rooted copy helper — for shipping example configs from the checkout
-# into a stable location. Used today only for skills/schedule-crons/crons.json
-# which lives in the repo, NOT the workspace.
-copy_if_missing() {
-  local src="$1"; local dst="$2"
-  if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
-    cp "$REPO/$src" "$REPO/$dst"
-    echo "  ✓ created $dst (from $src)"
-  fi
-}
-
 # One-time migration of stale repo-root runtime state into $WORKSPACE. Fires
 # only when the migration sentinel is absent — same idempotent posture as
 # workspace_default.py's _migrate_from_legacy (PR #762). Non-destructive on
@@ -301,8 +290,8 @@ tier1() {
     "{\"connected\":false,\"ts\":$(date +%s)}
 "
 
-  # crons.json — copy from the example if present
-  copy_if_missing "skills/schedule-crons/crons.example.json" "skills/schedule-crons/crons.json"
+  # No repo-side crons.json: the per-host seed (seed_crons.py) derives a fresh install from
+  # crons.example.json, and a legacy copy made here would read as an owner's schedule.
 }
 
 # --- Tier 2: preflight (warn, don't block) ---
