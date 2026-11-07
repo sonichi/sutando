@@ -288,6 +288,8 @@ room: 'I sent it to you in our DM.' Never move silently.
 
 If the watcher stops, start it again the same way; a start on a watched inbox exits 0 by itself. See [`docs/task-watcher-hosting-modes.md`](docs/task-watcher-hosting-modes.md).
 
+When `$SUTANDO_TASK_WATCH_MOD` is `1`, the launcher installed the task-watch Mod: it runs this same watcher and restarts it, and each `TASK_FILE:` line (with its `QUEUE:` line) arrives as a message from that plugin. Start no Monitor for it, and handle that message exactly as a notification.
+
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 
 **Voice session context.** On a durable decision the voice agent may reference later, update `state/voice-session-context.json` — schema and rules: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#voice-session-context).

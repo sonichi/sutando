@@ -86,6 +86,35 @@ try:
     with redirect_stdout(out):
         rc = wr.main(["session-start", "--repo", "/R", "--workspace", "/W"])
     check("main session-start is silent when held", rc == 0 and out.getvalue() == "", out.getvalue())
+    subprocess.run, _ = fake_run(stdout="no\n")
+    os.environ["SUTANDO_TASK_WATCH_MOD"] = "1"
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["session-start", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
+    check("a Mod-hosted session is never asked for a Monitor", rc == 0 and out.getvalue() == "", out.getvalue())
+
+    check("core watch-argv is the target's command, one argument each",
+          wr.watch_argv("/R", "/W", None, {}) == ["bash", "/R/src/watch-tasks-stream.sh", "/W/tasks", "--role", "session", "--inbox", "/W/tasks"])
+    check("worker watch-argv takes the launcher's command and the target's inbox",
+          wr.watch_argv("/R", "/W", "w1", {"SUTANDO_WATCHER_CMD": "/X/w.sh"})
+          == ["bash", "/X/w.sh", "/W/deliveries/w1", "--role", "session", "--inbox", "/W/deliveries/w1"])
+    try:
+        wr.watch_argv("/R", "/W", "w1", {})
+        check("a worker without SUTANDO_WATCHER_CMD is refused", False)
+    except ValueError:
+        check("a worker without SUTANDO_WATCHER_CMD is refused", True)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["watch-argv", "--repo", "/R", "--workspace", "/W"])
+    check("main watch-argv prints one argument per line", rc == 0 and out.getvalue().splitlines()[1:3] == ["/R/src/watch-tasks-stream.sh", "/W/tasks"], out.getvalue())
+    os.environ["SUTANDO_INSTANCE_ID"] = "w1"
+    os.environ.pop("SUTANDO_WATCHER_CMD", None)
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        rc = wr.main(["watch-argv", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_INSTANCE_ID", None)
+    check("main watch-argv fails loudly for a worker with no command", rc == 1 and "SUTANDO_WATCHER_CMD" in err.getvalue(), err.getvalue())
     for bad in ([], ["bogus", "--repo", "/R", "--workspace", "/W"], ["target", "--repo", "/R"],
                 ["target", "--repo"], ["target", "--nope", "x", "--workspace", "/W"]):
         err = io.StringIO()
