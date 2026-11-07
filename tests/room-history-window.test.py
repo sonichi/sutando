@@ -131,11 +131,11 @@ class HistoryTests(unittest.TestCase):
             body = "Literal `code` $(do not execute)\nSecond line"
             file.write_text(body)
             with patch.object(cli._say, "say", return_value={"ok": True, "event_id": "event"}) as say, patch.object(cli, "_record_say"), contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(cli._main(["say", "room", "--body-file", str(file)]), 0)
+                self.assertEqual(cli._main(["say", "!room:test.invalid", "--body-file", str(file)]), 0)
             self.assertEqual(say.call_args.args[0], body)
 
     def test_invalid_or_ambiguous_body_file_never_sends(self):
-        for args in (["say", "room"], ["say", "room", "text", "--body-file", "missing"], ["say", "room", "--body-file", "missing"]):
+        for args in (["say", "!room:test.invalid"], ["say", "!room:test.invalid", "text", "--body-file", "missing"], ["say", "!room:test.invalid", "--body-file", "missing"]):
             with patch.object(cli._say, "say") as say, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli._main(args), 2)
                 say.assert_not_called()
