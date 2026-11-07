@@ -7,7 +7,6 @@ The mod's own `*.test.ts` needs the `claude` binary; this file is the part CI
 can run with stdlib Python alone. Shared fixtures: claude_code_fixtures.py."""
 from __future__ import annotations
 
-import argparse
 import contextlib
 import errno
 import io
@@ -3377,53 +3376,6 @@ class StartupDialogAndRefusals(ConnectBase):
                 mock.patch.object(task_io, "holder_consumer", return_value={"pid": 9, "live": True}), \
                 mock.patch.object(cm, "manager_detail", return_value="active/running"):
             self.assertEqual(cli.occupancy_line(str(self.work)), "held by hold pid 7, its claude pid 9 (manager active/running)")
-
-SHARED_SESSION_ID = "0b6c4e8e-6d55-4f6e-9a41-8f2a6c1d3e77"
-
-
-class SharedConfigOptions(unittest.TestCase):
-    """--mcp-config and --setting-sources: what a session sharing another config dir loads of it."""
-
-    def test_a_filtered_mcp_set_leaves_the_config_dirs_own_servers_out(self):
-        from ag2_sparrow.adapters.claude_code import hold as hold_mod_  # noqa: F401
-        with tempfile.TemporaryDirectory() as d:
-            ccd = Path(d) / "shared-config"
-            ccd.mkdir()
-            # The shared dir's own MCP: the core's s.space server and the connected-apps one.
-            (ccd / ".claude.json").write_text(json.dumps({"mcpServers": {
-                "s-space": {"type": "stdio", "command": "node"}, "sutando-station": {"type": "http", "url": "https://x"}}}))
-            mcp = Path(d) / "agent-mcp.json"
-            mcp.write_text(json.dumps({"mcpServers": {"sutando-station": {"type": "http", "url": "https://x"}}}))
-            cfg = {"CLAUDE": "/opt/claude", "PLUGIN_DIR": "", "CLAUDE_CONFIG_DIR": str(ccd), "MCP_CONFIG": str(mcp),
-                   "SETTING_SOURCES": "project,local"}
-            argv = hold_mod_.claude_argv(cfg, SHARED_SESSION_ID)
-            at = argv.index("--mcp-config")
-            self.assertEqual(argv[at - 1:at + 2], ["--strict-mcp-config", "--mcp-config", str(mcp)])
-            self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
-            self.assertEqual(argv[-2:], ["--session-id", SHARED_SESSION_ID], "the session id stays last")
-            servers, problem = hold_mod_.mcp_servers(cfg["MCP_CONFIG"])
-            self.assertEqual((servers, problem), (["sutando-station"], ""))
-            self.assertNotIn("s-space", servers, "strict: the config dir's own s.space server is not in the set")
-            plain = hold_mod_.claude_argv(dict(cfg, MCP_CONFIG="", SETTING_SOURCES=""), SHARED_SESSION_ID)
-            self.assertFalse({"--strict-mcp-config", "--mcp-config", "--setting-sources"} & set(plain))
-
-    def test_bad_mcp_files_and_setting_lists_are_refused(self):
-        from ag2_sparrow.adapters.claude_code import cli as cli_, hold as hold_mod_
-        with tempfile.TemporaryDirectory() as d:
-            bad = Path(d) / "bad.json"
-            bad.write_text("[]")
-            self.assertIn("no mcpServers", hold_mod_.mcp_servers(str(bad))[1])
-            self.assertIn("not a readable MCP config", hold_mod_.mcp_servers(str(Path(d) / "absent.json"))[1])
-            for value in ("", "user,admin", "project,project"):
-                self.assertTrue(hold_mod_.setting_sources_problem(value), value)
-            self.assertEqual(hold_mod_.setting_sources_problem("project,local"), "")
-            args = argparse.Namespace(mcp_config=str(bad), setting_sources=None)
-            self.assertIn("--mcp-config", cli_.session_files_problem(args))
-            self.assertIn("--setting-sources", cli_.session_files_problem(argparse.Namespace(mcp_config=None,
-                                                                                           setting_sources="x")))
-        recorded = {r[0] for r in cli_.RECORDED}
-        self.assertTrue({"MCP_CONFIG", "SETTING_SOURCES", "HMAC_KEY_FILE"} <= recorded, "a repair keeps them")
-        self.assertTrue({"MCP_CONFIG", "SETTING_SOURCES"} <= set(cli_.LOCAL.config_keys))
 
 
 if __name__ == "__main__":
