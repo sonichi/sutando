@@ -29,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import activity_bus  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
+import task_envelope as te  # noqa: E402
 
+import pool_delivery as pd  # noqa: E402
 import pool_roster as pr  # noqa: E402
 import worker_picker_commands as wpc  # noqa: E402
 
@@ -42,7 +44,7 @@ MUST_HANDLE = 4
 PICKER_WIRE = "worker-picker"
 
 
-def read_task(task_file: str) -> dict:
+def read_task(task_file: str, workspace=None) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
     `requested_worker` (and its legacy alias) is read only from ABOVE `task:`,
@@ -67,6 +69,9 @@ def read_task(task_file: str) -> dict:
         for k in ("channel_id", "source", "wire_source"):
             if not task.get(k) and lenient.get(k):
                 task[k] = str(lenient.get(k)).strip()
+    # The tier as the picker reads it: below `task:` only on an attested gateway file, else strict.
+    attested = te.attested_task_headers(text, workspace).headers.get("access_tier") or ""
+    task["sent_by_owner"] = attested.strip() == "owner"
     return task
 
 
@@ -97,14 +102,14 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE, [], None
     if committed is not None and committed != pr.CORE:
-        return 0, [committed], roster
+        return _to_worker(task, [committed], roster)
     try:
         holder = rt.stop_holder(workspace, task, roster=roster)
     except rt.RouterRefused as e:      # whose the stopped task is cannot be told
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE, [], None
     if holder is not None:
-        return 0, [holder], roster
+        return _to_worker(task, [holder], roster)
     if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
@@ -123,7 +128,16 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
-    return 0, targets, roster
+    return _to_worker(task, targets, roster)
+
+
+def _to_worker(task: dict, targets: list, roster: dict | None) -> tuple[int, list, dict | None]:
+    """A task bound for a worker: accepted, unless its id is one no sentinel can carry. Then only
+    the owner's falls to the unrestricted core; any other tier fails closed rather than crossing
+    that boundary. A task no worker would get keeps its route, whatever its tier."""
+    if pd.carries(task.get("id") or ""):
+        return 0, targets, roster
+    return (DECLINE if task.get("sent_by_owner") else MUST_HANDLE), [], None
 
 
 def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
@@ -175,7 +189,7 @@ def main(argv=None) -> int:
     except Exception as e:  # noqa: BLE001 — ANY failure, per the contract above:
         # an escape here routes a BOUND task to the unrestricted live core.
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
-    task = read_task(args.task_file)
+    task = read_task(args.task_file, ws)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)

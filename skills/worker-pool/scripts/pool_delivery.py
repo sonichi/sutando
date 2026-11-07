@@ -86,6 +86,15 @@ def parse_sentinel(name: str) -> tuple[str, bool] | None:
     return m.group("id"), m.group("accepted") is not None
 
 
+def carries(task_id: str) -> bool:
+    """True when a sentinel for `task_id` is one its recipient can parse.
+
+    A sentinel that fails `parse_sentinel` is never resolved by the worker, yet
+    still reads as held to every "is it delegated?" reader, so the task is
+    answered by nobody (seen with `voice-end-<hex>`)."""
+    return bool(task_id) and parse_sentinel(f"{task_id}{PENDING_SUFFIX}") is not None
+
+
 def _root(workspace) -> Path:
     """`None` resolves through the one sanctioned helper — a second resolution
     path is how a reader and a writer end up in different trees."""
@@ -159,7 +168,7 @@ def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Pa
     record is never demoted, so a late `pending` cannot reopen retired work.
     """
     require_recipient(recipient)
-    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+    if not carries(task_id):
         raise ValueError(f"not a task id: {task_id!r}")
     done = done_flag(workspace, recipient, task_id)
     pend = pending_flag(workspace, recipient, task_id)
@@ -181,7 +190,7 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     fallback that fires twice is harmless.
     """
     require_recipient(recipient)
-    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+    if not carries(task_id):
         raise ValueError(f"not a task id: {task_id!r}")
     pend = pending_flag(workspace, recipient, task_id)
     with contextlib.suppress(FileNotFoundError):
