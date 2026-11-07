@@ -286,7 +286,8 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         _accepted(manager)
-        # Every card the notice covered is stamped, so none of them is ever sent again.
-        for r, pj in n.members:
+        # Every card the notice covered is stamped, the newest last: until it is, a re-drive after a
+        # crash picks it again and resends this notice's own dedupe key, which the gateway absorbs.
+        for r, pj in sorted(n.members, key=lambda m: m[0].id == n.req.id):
             manager.record_notice(r.id, renotify.after(n.notice, pj, now, n.reminders))
         out.append((n.req.id, str(answer.get("event_id") or "") or None))

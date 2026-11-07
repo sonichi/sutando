@@ -187,6 +187,47 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(self.drive(), [])
         self.assertEqual(pending_ids(self.mgr, clock=self.clock), [])
 
+    def _recoveries_after_a_crash_mid_stamp(self, dies_after):
+        """Resolve one seat's cards, let the stamp loop die right after stamping the card
+        `dies_after(ids, stamped)` picks, re-drive, and return (ids, recovery messages sent)."""
+        ids = []
+        for i in range(6):  # ids descending with age, so the store lists the newest card first
+            card = seat_card("pro-dev", f"pro-dev-g{i}", self.clock.t)
+            card.id = f"hitl_{5 - i:012x}"
+            ids.append(self.mgr.create(card).id)
+            self.drive()
+            self.clock.advance(MIN)
+        self.assertEqual(sorted(ids)[0], ids[-1])
+        for i in ids:
+            self.mgr.resolve(i)
+        real, stamped = self.mgr.record_notice, []
+
+        def record(req_id, fields):
+            real(req_id, fields)
+            if fields.get("recovered"):
+                stamped.append(req_id)
+                if dies_after(ids, stamped):
+                    raise RuntimeError("crash mid-stamp")
+        self.mgr.record_notice = record
+        with self.assertRaises(RuntimeError):
+            self.drive()
+        self.mgr.record_notice = real
+        self.drive()
+        return ids, [p for p in self.send.sent if p["op"] == "message"
+                     and (p.get("extra_content") or {}).get(NOTICE_FIELD, {}).get("notice") == "recovery"]
+
+    def test_a_crash_right_after_the_newest_card_is_stamped_sends_no_second_recovery(self):
+        # Stamped first, the newest card would leave the rest owed under a new newest card: a new key.
+        ids, recoveries = self._recoveries_after_a_crash_mid_stamp(lambda ids, s: s[-1] == ids[-1])
+        self.assertEqual(len(recoveries), 1, [p["dedupe_key"] for p in recoveries])
+        self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
+
+    def test_a_crash_on_the_first_stamp_resends_under_the_same_dedupe_key(self):
+        ids, recoveries = self._recoveries_after_a_crash_mid_stamp(lambda ids, s: len(s) == 1)
+        self.assertEqual({p["dedupe_key"] for p in recoveries}, {f"hitl:{ids[-1]}:recovered"},
+                         [p["dedupe_key"] for p in recoveries])
+        self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
+
     def test_a_rejected_resolve_edit_does_not_split_the_recovery(self):
         ids = self._seat_cards("pro-dev", 3)
         for i in ids:
