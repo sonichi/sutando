@@ -961,9 +961,12 @@ class CardRoom(unittest.TestCase):
 
 
 class EdgePaths(unittest.TestCase):
-    def test_the_card_carries_the_row_link(self):
+    def test_the_card_does_not_carry_the_row_link(self):
+        """V36 (owner, 2026-11-06): no links on the human-facing card -- a raw URL read
+        as log output. The text message still carries the row for anyone who wants it."""
         msg = ask.card_message("Q?", None, "go", None, (), link="https://row.test.invalid/1")
-        self.assertIn("https://row.test.invalid/1", msg)
+        self.assertNotIn("https://row.test.invalid/1", msg)
+        self.assertNotIn("Or set its Status", msg)
 
 if __name__ == "__main__":
     unittest.main()

@@ -402,8 +402,8 @@ def card_message(question: str, context: Optional[str], default_action: Optional
         parts.append(f"Why Approve: {reason.strip()}")
     parts.append("\n".join(f"{label}: {what}" if what else label
                            for label, what in card_choices(default_action, options)))
-    if link:
-        parts.append(f"Or set its Status on the row: {link}")
+    # No row URL on the card: it carries the buttons, and the text message still has
+    # the link for anyone who wants the row.
     if intro and intro.strip():
         parts.append(intro.strip())
     return "\n\n".join(parts)
