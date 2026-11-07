@@ -767,6 +767,31 @@ class CheckMode(Base):
         self.assertFalse(os.path.lexists(self.codex_home))
 
 
+class CreateHome(Base):
+    def test_a_missing_home_is_created_and_is_ok(self):
+        self.assertEqual(chi.create_home(self.codex_home, self.home), "ok")
+        self.assertTrue(self.codex_home.is_dir())
+
+    def test_a_relative_or_dotdot_home_is_invalid_and_creates_nothing(self):
+        before = self.tree()
+        for bad in ("relative/home", f"{self.root}/a/../b"):
+            self.assertEqual(chi.create_home(bad, self.home), "invalid-home")
+        self.assertEqual(self.tree(), before)
+
+    def test_the_owner_home_and_a_link_component_are_refused_creating_nothing(self):
+        (self.root / "workspace").symlink_to(self.root / "elsewhere")
+        (self.root / "elsewhere").mkdir()
+        before = self.tree()
+        self.assertEqual(chi.create_home(self.owner / "x", self.home), "owner-home")
+        self.assertEqual(chi.create_home(self.codex_home, self.home), "invalid-home")
+        self.assertEqual(self.tree(), before)
+
+    def test_an_unreadable_owner_identity_fails_closed(self):
+        with patch.object(chi, "_owner_anchor", side_effect=OSError("denied")):
+            self.assertEqual(chi.create_home(self.codex_home, self.home), "owner-home")
+        self.assertFalse(self.codex_home.exists())
+
+
 class DesktopLayout(Base):
     COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh",
               "src/sutando_config.py", "sutando.config.json")

@@ -228,6 +228,28 @@ def check(codex_home, repo, home):
     return status if status in ("owner-home", "invalid-home") else "ok"
 
 
+def create_home(codex_home, home):
+    """Create `codex_home` through the same no-follow walk as ensure_linked.
+
+    Returns "ok", "invalid-home" or "owner-home"; nothing is followed, so a component swapped
+    for a symlink since check() is refused instead of creating a directory elsewhere.
+    """
+    try:
+        parts = _parts(codex_home)
+    except ValueError:
+        return "invalid-home"
+    if _lexically_owner(parts, home):
+        return "owner-home"
+    try:
+        anchor, missing = _owner_anchor(home)
+    except OSError:
+        return "owner-home"
+    status, fd = _walk(parts, home, anchor, missing, create=True)
+    if fd is not None:
+        os.close(fd)
+    return "ok" if status == "open" else status
+
+
 def ensure_linked(codex_home, repo, home):
     """Returns "no-host", "invalid-home", "owner-home", "overridden", "foreign", "dangling",
     "already-set" or "linked".

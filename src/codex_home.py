@@ -64,6 +64,11 @@ def prepare(repo, home, environ=None):
         raise Refused(f"the configured Codex home ({env or 'no env'}={value or 'unset'}) "
                       "is not a CODEX_HOME, the only name Codex reads")
     verdict = _check(value, repo, home)
+    if verdict in PERMITTED:
+        try:
+            verdict = codex_host_instructions.create_home(value, home)
+        except Exception as exc:  # noqa: BLE001 - a failed create refuses, never falls back
+            verdict = f"error: {exc}"
     if verdict == "owner-home":
         raise Refused(f"CODEX_HOME={value} is, or leads into, the owner's own Codex home")
     if verdict == "invalid-home":
@@ -71,7 +76,6 @@ def prepare(repo, home, environ=None):
                       "non-directory component")
     if verdict not in PERMITTED:
         raise Refused(f"CODEX_HOME={value} could not be checked ({verdict or 'no answer'})")
-    os.makedirs(value, exist_ok=True)
     return env, value, value
 
 

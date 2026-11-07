@@ -110,6 +110,21 @@ class Contract(Layout):
             self.prepare()
         self.assertEqual(self.tree(), before)
 
+    def test_a_component_swapped_for_a_link_after_the_check_is_not_created_through(self):
+        self.checkout()
+        self.owner.mkdir()
+        real_check = codex_home._check
+
+        def check_then_swap(value, repo, home):
+            verdict = real_check(value, repo, home)
+            self.workspace.rmdir()
+            self.workspace.symlink_to(self.owner)
+            return verdict
+        with patch.object(codex_home, "_check", check_then_swap):
+            with self.assertRaisesRegex(codex_home.Refused, "symlink or non-directory"):
+                self.prepare()
+        self.assertEqual(sorted(p.name for p in self.owner.iterdir()), [])
+
     def test_a_desktop_invalid_home_is_refused(self):
         self.checkout()
         with patch.object(codex_home.codex_host_instructions, "check", return_value="invalid-home"):
