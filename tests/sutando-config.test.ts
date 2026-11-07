@@ -22,6 +22,7 @@ import {
 	detectEnvWorkspaceInDotenv,
 	findRepoRoot,
 	loadConfig,
+	repoSrcScriptPath,
 	resetCacheForTests,
 	resolveCoreRuntime,
 	resolveVault,
@@ -605,6 +606,22 @@ describe('sutando_config loader', () => {
 			assert.equal(detectEnvWorkspaceInDotenv(repo), undefined);
 		} finally {
 			restoreEnvAndRepo();
+		}
+	});
+});
+
+describe('repoSrcScriptPath', () => {
+	it('prefers <repo>/src/<name> from a bundled dist/ module, else the module sibling', () => {
+		const repo = makeRepo();
+		try {
+			writeConfig(repo, 'sutando.config.json', {});
+			mkdirSync(join(repo, 'src'));
+			mkdirSync(join(repo, 'dist'));
+			writeFileSync(join(repo, 'src', 'x.py'), '');
+			assert.equal(repoSrcScriptPath('x.py', join(repo, 'dist')), join(resolve(repo), 'src', 'x.py'));
+			assert.equal(repoSrcScriptPath('missing.py', join(repo, 'dist')), join(repo, 'dist', 'missing.py'));
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
 		}
 	});
 });

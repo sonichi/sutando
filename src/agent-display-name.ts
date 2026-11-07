@@ -8,12 +8,17 @@
  * When python or the resolver is unavailable, the name is the resolver's own fallback, "Sutando".
  */
 import { execFile, execFileSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolvePython } from './python-binary.js';
+import { repoSrcScriptPath } from './sutando_config.js';
 
 export const FALLBACK_AGENT_NAME = 'Sutando';
-const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'agent_display_name.py');
+/** The resolver script for a module running from `moduleDir` (src/ in dev, dist/ when bundled). */
+export function agentDisplayNameScriptPath(moduleDir: string = dirname(fileURLToPath(import.meta.url))): string {
+	return repoSrcScriptPath('agent_display_name.py', moduleDir);
+}
+const SCRIPT = agentDisplayNameScriptPath();
 const OFFLINE_TIMEOUT_MS = 5_000;
 const LIVE_TIMEOUT_MS = 20_000;
 export const LIVE_REFRESH_MS = 10 * 60_000;

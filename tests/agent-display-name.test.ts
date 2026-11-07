@@ -5,12 +5,14 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const mod = await import('../src/agent-display-name.js');
-const { agentDisplayName, resetAgentDisplayNameForTests, nameFromJson, LIVE_REFRESH_MS, FALLBACK_AGENT_NAME } = mod;
+const { agentDisplayName, agentDisplayNameScriptPath, resetAgentDisplayNameForTests, nameFromJson, LIVE_REFRESH_MS, FALLBACK_AGENT_NAME } = mod;
+const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 
 function runner(offline: string | Error, live: string | null) {
 	const calls: string[][] = [];
@@ -76,4 +78,11 @@ test('the default runner runs the real resolver', () => {
 		for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
 		rmSync(tmp, { recursive: true, force: true });
 	}
+});
+
+test('the bundled layout (module in dist/) finds the resolver in src/', () => {
+	const script = agentDisplayNameScriptPath(join(REPO, 'dist'));
+	assert.strictEqual(script, join(REPO, 'src', 'agent_display_name.py'));
+	assert.ok(existsSync(script));
+	assert.strictEqual(agentDisplayNameScriptPath(join(REPO, 'src')), script);
 });
