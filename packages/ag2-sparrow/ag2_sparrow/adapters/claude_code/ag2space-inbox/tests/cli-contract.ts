@@ -34,7 +34,8 @@ export const CONTRACT_NAMES = [
  "park a turn whose answer is staged: the staged answer is published",
  "strict envelope with the key present: only verified is submitted",
  "strict envelope with the key file missing: every task held",
- "strict envelope whose verdict was read with another key: held"
+ "strict envelope whose verdict was read with another key: held",
+ "claim with a stale --task-sha256: parked, retry"
 ]
 export const CONTRACT = [
  {
@@ -1743,6 +1744,42 @@ export const CONTRACT = [
       "submit": false,
       "reason": "the key file changed after this envelope was verified; verified again"
      }
+    }
+   }
+  ]
+ },
+ {
+  "name": "claim with a stale --task-sha256: parked, retry",
+  "task": "task-c34",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-c34",
+     "--task-sha256",
+     "0000000000000000000000000000000000000000000000000000000000000000"
+    ],
+    "expect": {
+     "exit": 1,
+     "refused": true,
+     "retry": true
+    }
+   },
+   {
+    "argv": [
+     "claim",
+     "task-c34"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "attempt",
+      "admission",
+      "access_tier"
+     ]
     }
    }
   ]

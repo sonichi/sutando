@@ -358,7 +358,7 @@ class InboxCli(ConnectBase):
 
     def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
         names = [sc["name"] for sc in contract_scenarios()]
-        self.assertEqual(len(names), 33)
+        self.assertEqual(len(names), 34)
         self.assertEqual(contract_set_problem(names), "")
         for i in (0, 17, len(names) - 1):
             self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)

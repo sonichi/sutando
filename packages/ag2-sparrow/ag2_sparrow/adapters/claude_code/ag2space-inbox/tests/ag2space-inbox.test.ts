@@ -27,6 +27,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                keySwap?: { from: string; to: string; signedWith: string };
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean; allowCollaborator?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
+                               swapOnClaim?: Record<string, string>;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
                                unstuckFails?: number; unstuckHardFails?: number; unstuckThrows?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
@@ -215,7 +216,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; a collaborator needs
       // --allow-collaborator, any other non-owner --allow-non-owner.
+      // A file rewritten after the Mod verified it (swapOnClaim) no longer has the text whose hash it sent.
+      const swap = opts.swapOnClaim?.[task]
+      if (swap !== undefined) { files[`/in/${task}.txt`] = swap; delete opts.swapOnClaim![task] }
       const text = files[`/in/${task}.txt`] ?? ''
+      // As the CLI's admit: a --task-sha256 that is not the file's text parks the claim (verified again).
+      const pinned = argv.indexOf('--task-sha256')
+      if (pinned > 0 && argv[pinned + 1] !== hash(text)) {
+        return out(1, { refused: `${task} changed after its envelope was verified; verified again`, retry: true })
+      }
       const tier = text.match(/^access_tier: (\S+)/m)?.[1]
       const collab = tier === 'team' && text.includes('\ncollaborator: true\n')
       const admission = !tier ? '' : tier === 'owner' ? 'owner' : collab ? (opts.allowCollaborator ? 'collaborator' : '')
@@ -1803,6 +1812,27 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
   expect(scenarioSetProblem(ran)).toBe('')                // the pinned scenario set
 })
 
+// The Mod claims the very text it verified: its claim carries that text's hash, so a file swapped between the
+// verifier's read and the claim is parked and verified again, and the swapped text is what is then submitted.
+test('a claim carries the hash of the text the Mod verified; a file swapped since is verified again', async ($, on) => {
+  const first = TASK('task-sw1')
+  const swapped = TASK('task-sw1', 'owner', 'note: swapped after the verifier read\n')
+  const h = host(on, { swapOnClaim: { 'task-sw1': swapped } })
+  h.files['/in/task-sw1.txt'] = first
+  await arm($, h)
+  await h.clock.advance(1000)
+  const claimsSent = h.runs.filter((a: string[]) => a[1] === 'inbox' && a[2] === 'claim')
+  expect(claimsSent[0].slice(2)).toEqual(['claim', 'task-sw1', '--task-sha256', h.hash(first)])
+  expect(h.submitted.length).toBe(0)                    // parked: the text it verified is gone
+  expect(h.claims['task-sw1']).toBeUndefined()
+  for (let i = 0; i < 60 && h.submitted.length === 0; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain(swapped)             // verified again, then submitted as it now reads
+  expect(h.submitted[0]).not.toContain(first + '\nReply')
+  const last = h.runs.filter((a: string[]) => a[1] === 'inbox' && a[2] === 'claim').pop()!
+  expect(last.slice(2)).toEqual(['claim', 'task-sw1', '--task-sha256', h.hash(swapped)])
+})
+
 // '' when `ran` is exactly the pinned scenario set (cli-contract.ts CONTRACT_NAMES), else what differs.
 function scenarioSetProblem(ran: string[]): string {
   const want = CONTRACT_NAMES as string[]
@@ -1813,7 +1843,7 @@ function scenarioSetProblem(ran: string[]): string {
 
 test('the contract set pin fails on a dropped or an extra scenario', async () => {
   const names = (CONTRACT as any[]).map(sc => sc.name)
-  expect(names.length).toBe(33)
+  expect(names.length).toBe(34)
   expect(scenarioSetProblem(names)).toBe('')
   for (const i of [0, 17, names.length - 1]) {
     expect(scenarioSetProblem(names.filter((_, j) => j !== i))).toContain(`missing ${JSON.stringify([names[i]])}`)
