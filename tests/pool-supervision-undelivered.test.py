@@ -523,6 +523,74 @@ with mock.patch.object(os, "link", rival):
     check("a rival repair that gets there first leaves this one busy", tpk.recover_guard(sock_l, ep_l), tpk.BUSY)
 check("and no scratch mutex is left behind", list(tpk.guard_path(sock_l).glob(".mutex-*")), [])
 
+def rival_recovery_rc(s, episode):
+    """A real second recovery, in its own process."""
+    code = "import sys, tmux_pane_keys as t; sys.exit(t.recover_guard(sys.argv[1], sys.argv[2]))"
+    return subprocess.run([sys.executable, "-c", code, str(s), episode], cwd=REPO / "src", capture_output=True,
+                          timeout=30).returncode
+
+
+# A recovery about to publish a new guard: a rival is refused, and cannot put a send behind it.
+for make in (dangling, plain_file, link_to_a_file):
+    n = make.__name__
+    sock_p, guard_p = tmp / f"publish-{n}.sock", tpk.guard_path(tmp / f"publish-{n}.sock")
+    make(guard_p)
+    ep, rivals = tpk.fence_episode(sock_p), []
+
+    def rival_then_publish(src, dst):
+        if not rivals:
+            rivals.append(rival_recovery_rc(sock_p, ep))
+        return real_replace(src, dst)
+
+    with mock.patch.object(os, "replace", rival_then_publish):
+        got = tpk.recover_guard(sock_p, ep)
+    check(f"{n}: a rival repair just before publication is refused", rivals, [tpk.BUSY])
+    check(f"{n}: and this one settles its own fence", (got, tpk.fence_status(sock_p)), (0, "clear"))
+
+    # The rival finishes first, and a send is interrupted behind it, before this recovery takes the repair lock.
+    sock_q, guard_q = tmp / f"late-{n}.sock", tpk.guard_path(tmp / f"late-{n}.sock")
+    make(guard_q)
+    ep, late, real_lock = tpk.fence_episode(sock_q), [], tpk._lock_fd
+
+    def rival_then_lock(fd):
+        if not late:
+            late.append((rival_recovery_rc(sock_q, ep), claimed_ticket(sock_q, f"late-{n}")))
+        return real_lock(fd)
+
+    with mock.patch.object(tpk, "_lock_fd", rival_then_lock):
+        got = tpk.recover_guard(sock_q, ep)
+    check(f"{n}: the rival's recovery went through", late[0][0], 0)
+    check(f"{n}: the stale approval is refused", got, tpk.FENCE_CHANGED)
+    check(f"{n}: and the newer send's record survives",
+          (tpk.fence_episode(sock_q), tpk.fence_status(sock_q)), (str(late[0][1]), "uncertain"))
+
+# A guard that was absent is never overwritten: a sender may have just created it.
+sock_v, guard_v = tmp / "absent-guard.sock", tpk.guard_path(tmp / "absent-guard.sock")
+made_v = []
+
+
+def sender_creates_guard(src, dst):
+    if not made_v:
+        made_v.append(claimed_ticket(sock_v, "absent-b"))
+    return real_link(src, dst)
+
+
+with mock.patch.object(os, "link", sender_creates_guard):
+    got = tpk.recover_guard(sock_v)
+check("a guard created during the repair leaves this one busy", got, tpk.BUSY)
+check("and that send's record survives", tpk.fence_episode(sock_v), str(made_v[0]))
+check("and only that sender's guard directory remains",
+      [x.name for x in tmp.glob(guard_v.name + ".*")], [guard_v.resolve().name])
+check("an absent guard is otherwise built", tpk.recover_guard(tmp / "absent-plain.sock"), 0)
+check("and reads clear", tpk.fence_status(tmp / "absent-plain.sock"), "clear")
+
+sock_u = tmp / "repair-lock-held.sock"
+plain_file(tpk.guard_path(sock_u))
+with open(f"{sock_u}.pane-keys-repair", "ab") as repair_holder:
+    tpk._lock_fd(repair_holder.fileno())
+    check("a repair already running leaves this one busy", tpk.recover_guard(sock_u), tpk.BUSY)
+check("and the guard is untouched", tpk.guard_path(sock_u).is_file(), True)
+
 # Recovery's exits in this process, through the command line that reports them.
 def main_rc(*argv):
     with mock.patch.object(sys, "argv", ["tmux_pane_keys.py", *argv]), contextlib.redirect_stderr(io.StringIO()) as err:

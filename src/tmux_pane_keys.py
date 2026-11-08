@@ -229,6 +229,7 @@ def _repair_guard(socket):
     mutex is locked before it is published, so no send is admitted; returns it, or None if a rival repair won."""
     guard = guard_path(socket)
     mutex = guard / "mutex"
+    absent = not os.path.lexists(guard)
     home = guard if guard.is_dir() else Path(tempfile.mkdtemp(prefix=guard.name + ".", dir=guard.absolute().parent))
     fd, name = tempfile.mkstemp(prefix=".mutex-", dir=home)
     held = os.fdopen(fd, "ab")
@@ -239,17 +240,18 @@ def _repair_guard(socket):
         elif home == guard and mutex.is_symlink():
             mutex.unlink()
         os.link(name, home / "mutex")
-        if home != guard:
+        if absent:
+            guard.symlink_to(home)  # a sender may create the guard meanwhile: never overwrite that one
+        elif home != guard:
             link = home.with_name(home.name + ".link")
             link.symlink_to(home)
             os.replace(link, guard)
-    except FileExistsError:
-        held.close()
-        return None
-    except BaseException:
+    except BaseException as exc:
         held.close()
         if home != guard:
             shutil.rmtree(home, ignore_errors=True)
+        if isinstance(exc, FileExistsError):
+            return None
         raise
     finally:
         Path(name).unlink(missing_ok=True)
@@ -257,16 +259,19 @@ def _repair_guard(socket):
 
 
 def recover_guard(socket, episode=None):
-    """Settle the fence; given `episode`, only that fence: compared under the lock or, for a guard
-    with no lockable mutex, before the repair that publishes its mutex already locked."""
+    """Settle the fence; given `episode`, only that fence: compared under the mutex or, for a guard with no
+    lockable mutex, under a repair lock beside it, so one repair can never overwrite another's guard."""
     if not (guard_path(socket) / "mutex").is_file():
-        if episode is not None and fence_episode(socket) != episode:
-            return FENCE_CHANGED
-        held = _repair_guard(socket)
-        if held is None:
-            return BUSY
-        with held:
-            return finish_guard(socket, completed=True)
+        with Path(f"{socket}.pane-keys-repair").open("ab") as repair:
+            if _lock_fd(repair.fileno()) == BUSY:
+                return BUSY
+            if episode is not None and fence_episode(socket) != episode:
+                return FENCE_CHANGED
+            held = _repair_guard(socket)
+            if held is None:
+                return BUSY
+            with held:
+                return finish_guard(socket, completed=True)
     with prepare_guard(socket).open("ab") as stream:
         rc = _lock_fd(stream.fileno())
         if rc == BUSY:
