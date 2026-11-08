@@ -22,7 +22,7 @@ import { resolveWorkspace, statusPath } from '../../../src/workspace_default.js'
 import { resolveHostLabel } from '../../../src/util_paths.js';
 import {
 	EMPTY_DM_GATE, decideModel, flushHeld, gateLine, initialState, nextFlushAt, nextState, observationFromHeaders,
-	pushSample, requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
+	persistedStateChanged, pushSample, requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
 	type DmGate, type DmKind, type FallbackConfig, type FallbackState, type Sample,
 } from './quota-fallback-policy.js';
 import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
@@ -505,6 +505,11 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		fallbackState = next;
 		if (changed) {
 			console.log(`${ts()} [Fallback] tier ${next.tier} (low-priority ${next.low_priority_tier}): ${next.reason}${next.runtime_switch ? ` runtime_switch→${next.runtime_switch.to}` : ''}`);
+		}
+		// Saving is NOT gated on `changed`: that only dedups the owner's DM. A
+		// same-tier handoff between windows changes which window holds the tier and
+		// when it ends, and the health check reads exactly that from disk (#5275).
+		if (persistedStateChanged(prev, next)) {
 			try { deps.recordFallback(next); } catch { /* best effort */ }
 		}
 		if (line) {

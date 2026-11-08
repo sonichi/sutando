@@ -365,14 +365,19 @@ export function nextState(prev: FallbackState | null, obs: QuotaObservation, cfg
 	}
 
 	const changed = tier !== base.tier || lowTier !== base.low_priority_tier;
-	const fired = changed ? firingWindow(windows, tier, cfg) : (base.fired ?? null);
+	// A same-tier handoff: the window that fired no longer holds the tier (it reset,
+	// or fell back on hysteresis) while the other window holds it at the same level.
+	// The tier did not change, so `since` stays, but the firing window and the reason
+	// must name the window holding it NOW, or they describe one that has ended (#5275).
+	const handedOff = !changed && !!base.fired && windows[base.fired.window]?.tier !== tier;
+	const fired = changed || handedOff ? firingWindow(windows, tier, cfg) : (base.fired ?? null);
 	return {
 		tier,
 		low_priority_tier: lowTier,
 		windows,
 		active_model_map: activeModelMap(tier, cfg),
 		since: changed ? now : base.since,
-		reason: changed ? describeTier(windows, tier, fired) : base.reason,
+		reason: changed || handedOff ? describeTier(windows, tier, fired) : base.reason,
 		fired,
 		runtime_switch: runtimeSwitch,
 	};
@@ -419,6 +424,28 @@ export function stateChanged(a: FallbackState | null, b: FallbackState): boolean
 	if (!a) return true;
 	return a.tier !== b.tier || a.low_priority_tier !== b.low_priority_tier
 		|| (a.runtime_switch?.to ?? null) !== (b.runtime_switch?.to ?? null);
+}
+
+/** What the persisted record must keep current: everything a reader of
+ *  quota-state.json `fallback` decides from. The health check finds the window at
+ *  the effective tier and calls it cleared once that window's reset has passed, so
+ *  per-window tiers and reset epochs belong here, with the reason and model map.
+ *  Per-sample numbers (utilization, projection, eta) are left out: they move on
+ *  every response and no reader decides from them. */
+function persistedView(s: FallbackState): string {
+	const w = (x: WindowState | undefined) => [x?.tier ?? null, x?.low_tier ?? null, x?.reset ?? null];
+	const f = s.fired ? [s.fired.window, s.fired.key, s.fired.threshold] : null;
+	const map = Object.entries(s.active_model_map ?? {}).sort(([x], [y]) => x.localeCompare(y));
+	return JSON.stringify([s.tier, s.low_priority_tier, s.runtime_switch?.to ?? null, s.reason, f, map,
+		w(s.windows?.['5h']), w(s.windows?.['7d'])]);
+}
+
+/** Whether the persisted record is out of date — separate from `stateChanged`,
+ *  which only gates the owner's DM. A same-tier handoff between windows changes
+ *  nothing the owner acts on, but it does change which window holds the tier and
+ *  when that ends, so it must reach disk (#5275 review). */
+export function persistedStateChanged(a: FallbackState | null, b: FallbackState): boolean {
+	return !a || persistedView(a) !== persistedView(b);
 }
 
 export interface ModelDecision {

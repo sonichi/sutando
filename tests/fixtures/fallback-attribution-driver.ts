@@ -7,7 +7,11 @@
  * and then with 400s (rejections). Every record goes through quotaStateFromHeaders
  * and appendRejection — the functions production uses — into argv[2].
  *
- * Usage: tsx tests/fixtures/fallback-attribution-driver.ts <quota-state.json> [rejections]
+ * Mode `handoff` replays a same-tier handoff instead: 7d over its level2 line sets
+ * tier 3, then 7d resets while 5h crosses ITS level2 line, so tier 3 holds on the 5h
+ * window's account. The fallback state is persisted the way production does it.
+ *
+ * Usage: tsx tests/fixtures/fallback-attribution-driver.ts <quota-state.json> [rejections | handoff]
  */
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
@@ -18,7 +22,8 @@ import {
 import { DEFAULT_FALLBACK_CONFIG, type FallbackConfig } from '../../skills/quota-tracker/scripts/quota-fallback-policy.ts';
 
 const out = process.argv[2];
-const rejections = Number(process.argv[3] ?? '5');
+const mode = process.argv[3] === 'handoff' ? 'handoff' : 'attribution';
+const rejections = mode === 'attribution' ? Number(process.argv[3] ?? '5') : 0;
 const REQUESTED = 'claude-opus-5-5';
 const NOW = Date.now();
 
@@ -41,6 +46,7 @@ const CFG: FallbackConfig = {
 };
 
 let status = 200;
+let headers: Record<string, string> = HEADERS;
 const servers: Server[] = [];
 const listen = (s: Server): Promise<number> => new Promise((resolve) => {
 	servers.push(s);
@@ -53,7 +59,7 @@ const upstreamPort = await listen(createServer((req, res) => {
 	req.on('data', (c) => chunks.push(c));
 	req.on('end', () => {
 		sent.push(JSON.parse(Buffer.concat(chunks).toString()).model);
-		res.writeHead(status, { 'content-type': 'application/json', ...HEADERS });
+		res.writeHead(status, { 'content-type': 'application/json', ...headers });
 		res.end(status === 200 ? '{"ok":true}' : '{"error":"invalid_request_error"}');
 	});
 }));
@@ -77,7 +83,8 @@ const deps: Partial<ProxyDeps> = {
 	idleTimeoutMs: 5000,
 	fallbackConfig: () => CFG,
 	readFallbackState: () => tierState as never,
-	recordFallback: (s) => { tierState = s; },
+	// As production's recordFallback: the whole state under `fallback`.
+	recordFallback: (s) => { tierState = s; write({ ...read(), fallback: s }); },
 	notifyOwner: () => {},
 	readHistorySamples: () => [],
 };
@@ -92,11 +99,31 @@ const call = (): Promise<number> => new Promise((resolve, reject) => {
 	req.end(JSON.stringify({ model: REQUESTED, messages: [] }));
 });
 
-// The first response establishes the tier; the rest are rewritten under it.
-await call();
-await call();
-status = 400;
-for (let i = 0; i < rejections; i++) await call();
+if (mode === 'handoff') {
+	const sec = Math.floor(NOW / 1000);
+	// 7d at 96% (over its 0.95 level2 line) on a window whose reset is already
+	// behind us by the time anyone reads the record.
+	headers = {
+		'anthropic-ratelimit-unified-status': 'allowed',
+		'anthropic-ratelimit-unified-7d-utilization': '0.96', 'anthropic-ratelimit-unified-7d-reset': String(sec - 60),
+		'anthropic-ratelimit-unified-5h-utilization': '0.20', 'anthropic-ratelimit-unified-5h-reset': String(sec + 1800),
+	};
+	await call();
+	// The 7d window resets (new epoch, usage drops) as 5h crosses its 0.97 line.
+	headers = {
+		'anthropic-ratelimit-unified-status': 'allowed',
+		'anthropic-ratelimit-unified-7d-utilization': '0.10', 'anthropic-ratelimit-unified-7d-reset': String(sec + 7 * 86_400),
+		'anthropic-ratelimit-unified-5h-utilization': '0.98', 'anthropic-ratelimit-unified-5h-reset': String(sec + 3600),
+	};
+	await call();
+	await call();
+} else {
+	// The first response establishes the tier; the rest are rewritten under it.
+	await call();
+	await call();
+	status = 400;
+	for (let i = 0; i < rejections; i++) await call();
+}
 // A rejection is written when the upstream body ends, just after the client's.
 await new Promise((r) => setTimeout(r, 200));
 

@@ -210,6 +210,53 @@ test('control: the same headers on a real 429 do request the runtime switch', as
 	assert.ok(h.notified.some((l) => /Codex/.test(l)));
 });
 
+// #5275 review point 3: a same-tier handoff between windows must reach disk. The
+// health check reads the PERSISTED windows to decide "cleared", so a record that
+// still says the expired 7d window holds the tier reports cleared while the proxy
+// keeps rewriting on the 5h window's account.
+test('same-tier handoff: 7d resets while 5h takes tier 3 over — the persisted state follows the 5h window', async () => {
+	const h = await start();
+	h.setUpstreamHeaders({
+		'anthropic-ratelimit-unified-status': 'allowed',
+		'anthropic-ratelimit-unified-7d-utilization': '0.96', 'anthropic-ratelimit-unified-7d-reset': '1700600000',
+		'anthropic-ratelimit-unified-5h-utilization': '0.20', 'anthropic-ratelimit-unified-5h-reset': '1700018000',
+	});
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	const first = h.recorded.at(-1)!;
+	assert.strictEqual(first.tier, 3, '7d over its level2 line');
+	assert.strictEqual(first.windows['7d'].tier, 3);
+	assert.strictEqual(first.fired?.window, '7d');
+
+	// The 7d window resets (new reset epoch, usage drops) as 5h crosses its level2 line.
+	h.setUpstreamHeaders({
+		'anthropic-ratelimit-unified-status': 'allowed',
+		'anthropic-ratelimit-unified-7d-utilization': '0.10', 'anthropic-ratelimit-unified-7d-reset': '1701200000',
+		'anthropic-ratelimit-unified-5h-utilization': '0.98', 'anthropic-ratelimit-unified-5h-reset': '1700036000',
+	});
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.notStrictEqual(JSON.parse(h.seen[2].body).model, 'claude-fable-5-1', 'still rewriting: the tier held');
+
+	const saved = h.recorded.at(-1)!;
+	assert.strictEqual(saved.tier, 3, 'the effective tier is unchanged');
+	assert.strictEqual(saved.windows['7d'].tier, 1, 'the reset 7d window is saved as primary');
+	assert.strictEqual(saved.windows['7d'].reset, '1701200000', 'with its NEW reset epoch');
+	assert.strictEqual(saved.windows['5h'].tier, 3, 'the 5h window that now holds the tier is saved');
+	assert.strictEqual(saved.windows['5h'].reset, '1700036000');
+	assert.strictEqual(saved.fired?.window, '5h', 'the saved reason names the window that holds the tier now');
+	assert.ok(!h.notified.some((l, i) => i > 0 && /now run on|over the/.test(l) && /7d/.test(l)),
+		'no second DM for a handoff that changed nothing the owner acts on');
+});
+
+test('a response that changes nothing persisted is not written again', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(H7('0.50'));
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(h.recorded.length, 1, 'identical observations do not rewrite the record');
+});
+
 test('a persisted tier survives a proxy restart, the priority header is consumed by the proxy, and the low ladder is off by default', async () => {
 	const seeded = await start();
 	seeded.setUpstreamHeaders(H7('0.86'));

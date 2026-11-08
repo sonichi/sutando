@@ -12,6 +12,11 @@ separately. Stamping the rewritten model broke two consumers (PR #5275 review):
   - `check_core_request_rejections` reported the Opus seat's rejections as
     "none for this core's model".
 
+It also covers the same-tier handoff (review point 3): 7d resets while 5h takes
+tier 3 over. The proxy kept rewriting but saved nothing, so the record still said
+the EXPIRED 7d window held the tier and `check_quota_model_fallback` reported it
+"cleared".
+
 This test crosses the language boundary on purpose: it runs the REAL proxy with
 its REAL writers (tests/fixtures/fallback-attribution-driver.ts) and reads the
 file it wrote with the REAL Python consumers, so a drift on either side fails.
@@ -52,9 +57,10 @@ def _load_health_check():
     return m
 
 
-def _drive(out: Path, rejections: int = 5) -> dict:
-    """Run the real proxy through one rewrite; return what the upstream received."""
-    run = subprocess.run([str(TSX), str(DRIVER), str(out), str(rejections)],
+def _drive(out: Path, mode: str = "5") -> dict:
+    """Run the real proxy through one scenario; return what the upstream received.
+    `mode` is a rejection count, or `handoff`."""
+    run = subprocess.run([str(TSX), str(DRIVER), str(out), mode],
                          cwd=REPO, capture_output=True, text=True, timeout=120)
     if run.returncode != 0:
         raise AssertionError(f"driver failed ({run.returncode}):\n{run.stderr[-2000:]}")
@@ -127,6 +133,45 @@ class TestFallbackAttribution(unittest.TestCase):
         effective = ledger[-1]["effective_model"]
         self.assertIn(f"served as {effective}", check["detail"],
                       "the owner is told the rejected request actually ran on the fallback model")
+
+
+@unittest.skipUnless(_HAVE_TSX or os.environ.get("CI"), "needs node_modules/.bin/tsx (run npm ci)")
+class TestSameTierHandoff(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not _HAVE_TSX:
+            raise AssertionError("CI without node_modules/.bin/tsx: this guard would not run")
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.out = Path(cls._tmp.name) / "quota-state.json"
+        cls.sent = _drive(cls.out, "handoff")
+        cls.state = json.loads(cls.out.read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_the_proxy_kept_rewriting_through_the_handoff(self):
+        # Control: the tier really held, so "cleared" would be a false report.
+        self.assertTrue(all(m != REQUESTED for m in self.sent["sent"][1:]), self.sent["sent"])
+
+    def test_the_saved_state_names_the_window_that_holds_the_tier_now(self):
+        fb = self.state["fallback"]
+        self.assertEqual(fb["tier"], 3)
+        self.assertEqual(fb["windows"]["5h"]["tier"], 3)
+        self.assertEqual(fb["windows"]["7d"]["tier"], 1)
+        self.assertEqual(fb["fired"]["window"], "5h")
+        self.assertIn("5h", fb["reason"])
+
+    def test_the_health_check_does_not_call_a_live_fallback_cleared(self):
+        hc = _load_health_check()
+        root = Path(self._tmp.name) / "ws"
+        hc.WORKSPACE_DIR = root
+        target = hc.status_read_path("quota-state.json", root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.out.read_text())
+        check = hc.check_quota_model_fallback()
+        self.assertEqual(check["status"], "warn", check.get("detail"))
+        self.assertNotIn("cleared", check["detail"])
 
 
 if __name__ == "__main__":
