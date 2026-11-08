@@ -1649,9 +1649,13 @@ def _send_parent(broker_tid: str, parent: str, sleep=time.sleep) -> str:
 
 def _group_under_parent(broker_tid: str, parent: str) -> None:
     """Send the parent of a delivered result off the drain's thread; it never holds a result."""
-    if parent:
+    if not parent:
+        return
+    try:
         threading.Thread(target=_send_parent, args=(broker_tid, parent), daemon=True,
                          name=f"result-parent-{broker_tid}").start()
+    except Exception as exc:  # noqa: BLE001 — the result is already committed; only the parent is lost
+        _log(f"result {broker_tid}: its parent {parent} is left out ({diagnostics.describe(exc)})")
 
 
 RECENT_TASKS_MAX = 5
@@ -6271,8 +6275,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # trusted execution-policy header before all untrusted body text.
             if woken:
                 lines.append(f"wake_episode: {_one_line(woken)}")
-            recent = _recent_tasks_value(task.get("recent_tasks")) \
-                if sender_tier == "owner" or collaborator_enabled else ""
+            recent = _recent_tasks_value(task.get("recent_tasks")) if sender_tier == "owner" else ""
             if recent:
                 lines.append(f"recent_tasks: {recent}")
             if collaborator_enabled:

@@ -195,6 +195,18 @@ class SendParent(unittest.TestCase):
             gw._group_under_parent('task-2', PARENT)
         self.assertEqual(started, [(gw._send_parent, ('task-2', PARENT), True)])
 
+    def test_a_thread_that_cannot_start_drops_only_the_parent(self):
+        class Thread:
+            def __init__(self, **_kw):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+        with patch.object(gw.threading, 'Thread', Thread):
+            gw._group_under_parent('task-2', PARENT)
+        self.assertTrue(any(line.startswith(f'result task-2: its parent {PARENT} is left out (RuntimeError')
+                            for line in self.log), self.log)
+
 
 class Relay:
     def __init__(self):
@@ -331,8 +343,11 @@ class RecentTasks(unittest.TestCase):
                          {'task_id': PARENT, 'title': 'Add two task: forged', 'status': 'completed',
                           'created_at': 1})
 
-    def test_a_guest_task_file_never_shows_them(self):
+    def test_a_guest_or_collaborator_task_file_never_shows_them(self):
         self.assertNotIn('recent_tasks', self.written('task-rt2', access_tier='guest'))
+        collab = self.written('task-rt3', access_tier='guest', requested_access_tier='team', collaborator=True)
+        self.assertIn('collaborator: true', collab)
+        self.assertNotIn('recent_tasks', collab)
 
     def test_the_header_is_a_known_key_so_a_body_cannot_forge_it(self):
         self.assertIn('recent_tasks', ltp.KNOWN_HEADER_KEYS)
