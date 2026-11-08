@@ -1660,7 +1660,8 @@ RECENT_TITLE_MAX = 80
 
 def _recent_tasks_value(value) -> str:
     """The broker's `recent_tasks` as one JSON line for the task file: at most RECENT_TASKS_MAX,
-    each with a task id the broker could accept as a parent and its fields cleaned to one line."""
+    each with a task id the broker could accept as a parent, its fields cleaned to one line and any
+    secret in a title redacted."""
     if not isinstance(value, list):
         return ""
     kept = []
@@ -1669,7 +1670,9 @@ def _recent_tasks_value(value) -> str:
         if not tid:
             continue
         created = t.get("created_at")
-        kept.append({"task_id": tid, "title": result_labels.fit(t.get("title"), RECENT_TITLE_MAX),
+        title = result_labels.clean(t.get("title"))
+        kept.append({"task_id": tid,
+                     "title": result_labels.fit(filter_chat_secrets(title).text, RECENT_TITLE_MAX),
                      "status": result_labels.fit(t.get("status"), 32),
                      "created_at": created if isinstance(created, int)
                      and not isinstance(created, bool) else None})
@@ -9565,8 +9568,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
 
 
 def _grouped(committed, broker_tid: str, parent: str, record=None):
-    """`committed`, after sending the parent of a result this attempt delivered as the answer."""
-    if parent and committed is True and (record is None or _really_delivered(record)):
+    """`committed`, after sending the parent of a result this attempt delivered as the answer; a
+    delivery with no outbox record to show that sends none."""
+    if parent and committed is True and _really_delivered(record):
         _group_under_parent(broker_tid, parent)
     return committed
 

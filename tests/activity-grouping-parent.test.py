@@ -281,6 +281,7 @@ class Delivery(unittest.TestCase):
         gw._grouped(True, 'task-2', PARENT, {'status': 'DELIVERED', 'provider_ref': 'settled:closed'})
         gw._grouped('kept', 'task-2', PARENT)
         gw._grouped(False, 'task-2', PARENT)
+        gw._grouped(True, 'task-2', PARENT, None)
         self.assertEqual(self.grouped, [])
         self.assertIs(gw._grouped(True, 'task-2', PARENT, {'status': 'DELIVERED'}), True)
         self.assertEqual(self.grouped, [('task-2', PARENT)])
@@ -299,6 +300,8 @@ class RecentTasks(unittest.TestCase):
         self.assertEqual(got[0]['created_at'], 1700000000)
         self.assertIsNone(json.loads(gw._recent_tasks_value([{'task_id': 't', 'created_at': True}]))[0]
                           ['created_at'])
+        leaked = json.loads(gw._recent_tasks_value([{'task_id': 't', 'title': 'Rotate ghp_' + 'a' * 36}]))
+        self.assertNotIn('ghp_' + 'a' * 36, leaked[0]['title'])
         for empty in (None, [], 'x', [{'title': 'no id'}]):
             self.assertEqual(gw._recent_tasks_value(empty), '')
 
