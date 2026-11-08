@@ -224,36 +224,54 @@ def fence_episode(socket):
     return f"guard:{stamp.st_ino}:{stamp.st_mtime_ns}"
 
 
-def replace_unreadable_guard(socket):
-    """Recovery only: a guard with no lockable mutex file has no live holder, so its shape is replaced."""
+def _repair_guard(socket):
+    """Recovery only: a guard with no lockable mutex has no live holder, so its shape is replaced. The new
+    mutex is locked before it is published, so no send is admitted; returns it, or None if a rival repair won."""
     guard = guard_path(socket)
     mutex = guard / "mutex"
-    if mutex.is_file():
-        return
-    if mutex.is_dir() and not mutex.is_symlink():
-        shutil.rmtree(mutex)
-    elif mutex.is_symlink() or mutex.exists():
-        mutex.unlink()
-    if guard.is_dir():
-        mutex.touch()
-    elif guard.is_symlink() or guard.exists():
-        guard.unlink()
+    home = guard if guard.is_dir() else Path(tempfile.mkdtemp(prefix=guard.name + ".", dir=guard.absolute().parent))
+    fd, name = tempfile.mkstemp(prefix=".mutex-", dir=home)
+    held = os.fdopen(fd, "ab")
+    try:
+        _lock_fd(held.fileno())
+        if home == guard and mutex.is_dir() and not mutex.is_symlink():
+            shutil.rmtree(mutex)
+        elif home == guard and mutex.is_symlink():
+            mutex.unlink()
+        os.link(name, home / "mutex")
+        if home != guard:
+            link = home.with_name(home.name + ".link")
+            link.symlink_to(home)
+            os.replace(link, guard)
+    except FileExistsError:
+        held.close()
+        return None
+    except BaseException:
+        held.close()
+        if home != guard:
+            shutil.rmtree(home, ignore_errors=True)
+        raise
+    finally:
+        Path(name).unlink(missing_ok=True)
+    return held
 
 
 def recover_guard(socket, episode=None):
-    """Settle the fence; given `episode`, only that fence. Compared under the lock, except that a
-    guard with no lockable mutex has none to take: it is compared before the repair admits senders."""
-    matched = episode is None
+    """Settle the fence; given `episode`, only that fence: compared under the lock or, for a guard
+    with no lockable mutex, before the repair that publishes its mutex already locked."""
     if not (guard_path(socket) / "mutex").is_file():
-        if not matched and fence_episode(socket) != episode:
+        if episode is not None and fence_episode(socket) != episode:
             return FENCE_CHANGED
-        matched = True
-        replace_unreadable_guard(socket)
+        held = _repair_guard(socket)
+        if held is None:
+            return BUSY
+        with held:
+            return finish_guard(socket, completed=True)
     with prepare_guard(socket).open("ab") as stream:
         rc = _lock_fd(stream.fileno())
         if rc == BUSY:
             return rc
-        if not matched and fence_episode(socket) != episode:
+        if episode is not None and fence_episode(socket) != episode:
             return FENCE_CHANGED
         return finish_guard(socket, completed=True)
 

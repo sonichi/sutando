@@ -456,6 +456,93 @@ check("with no guard there is no fence to approve", recover_script("recover-epis
       tpk.FENCE_CHANGED)
 check("and none is created", os.path.lexists(tpk.guard_path(sock_n)), False)
 
+
+def sender_rc(s):
+    """A real second process trying to enter the guard, as a sender does."""
+    code = ("import sys, tmux_pane_keys as t; s = sys.argv[1]; "
+            "m = t.prepare_guard(s).open('ab'); sys.exit(t.acquire_guard(s, m.fileno()))")
+    return subprocess.run([sys.executable, "-c", code, str(s)], cwd=REPO / "src", capture_output=True, timeout=30).returncode
+
+
+# The moment a repair's mutex becomes visible, a sender is already turned away.
+real_link, real_replace = os.link, os.replace
+for make in (no_mutex, mutex_directory, dangling, plain_file, link_to_a_file):
+    n = make.__name__
+    sock_r, guard_r = tmp / f"race-{n}.sock", tpk.guard_path(tmp / f"race-{n}.sock")
+    make(guard_r)
+    ep, seen = tpk.fence_episode(sock_r), []
+
+    def watching(real):
+        def call(*a, **kw):
+            done = real(*a, **kw)
+            if not seen and (guard_r / "mutex").is_file():
+                seen.append(sender_rc(sock_r))
+            return done
+        return call
+
+    with mock.patch.object(os, "link", watching(real_link)), mock.patch.object(os, "replace", watching(real_replace)):
+        got = tpk.recover_guard(sock_r, ep)
+    check(f"{n}: a sender arriving as the mutex appears is turned away", seen, [tpk.BUSY])
+    check(f"{n}: and the approved fence is settled", (got, tpk.fence_status(sock_r)), (0, "clear"))
+    check(f"{n}: and a later sender gets in", sender_rc(sock_r), 0)
+
+sock_l = tmp / "race-rival-repair.sock"
+no_mutex(tpk.guard_path(sock_l))
+ep_l = tpk.fence_episode(sock_l)
+
+
+def rival(src, dst):
+    Path(dst).touch()
+    return real_link(src, dst)
+
+
+with mock.patch.object(os, "link", rival):
+    check("a rival repair that gets there first leaves this one busy", tpk.recover_guard(sock_l, ep_l), tpk.BUSY)
+check("and no scratch mutex is left behind", list(tpk.guard_path(sock_l).glob(".mutex-*")), [])
+
+# Recovery's exits in this process, through the command line that reports them.
+def main_rc(*argv):
+    with mock.patch.object(sys, "argv", ["tmux_pane_keys.py", *argv]), contextlib.redirect_stderr(io.StringIO()) as err:
+        return tpk._main(), err.getvalue()
+
+
+sock_x = tmp / "main-no-guard.sock"
+check("no guard names no fence", tpk.fence_episode(sock_x), "no-guard")
+got, msg = main_rc("recover-episode", str(sock_x), "x")
+check("a refusal says nothing was cleared", (got, "nothing was cleared" in msg), (tpk.FENCE_CHANGED, True))
+check("an approval naming no fence is refused", main_rc("recover-episode", str(sock_x))[0], tpk.FENCE_CHANGED)
+
+sock_t = tmp / "main-ticket.sock"
+ticket_t = claimed_ticket(sock_t, "main-t")
+check("another ticket is refused under the lock", main_rc("recover-episode", str(sock_t), "other")[0], tpk.FENCE_CHANGED)
+check("and the ticket's record survives", tpk.fence_episode(sock_t), str(ticket_t))
+check("its own ticket clears", main_rc("recover-episode", str(sock_t), str(ticket_t))[0], 0)
+
+sock_h = tmp / "main-held.sock"
+with tpk.prepare_guard(sock_h).open("ab") as holder:
+    tpk._lock_fd(holder.fileno())
+    got, msg = main_rc("recover", str(sock_h))
+check("recovery refuses a live holder", (got, "busy" in msg), (tpk.BUSY, True))
+check("plain recover works once it is free", main_rc("recover", str(sock_h))[0], 0)
+
+sock_d = tmp / "main-dangling-mutex.sock"
+tpk.prepare_guard(sock_d)
+(tpk.guard_path(sock_d) / "mutex").unlink()
+(tpk.guard_path(sock_d) / "mutex").symlink_to(tmp / "main-mutex-gone")
+ep_d = tpk.fence_episode(sock_d)
+check("a dangling mutex link is another episode's to repair", main_rc("recover-episode", str(sock_d), "other")[0],
+      tpk.FENCE_CHANGED)
+check("its own episode repairs it", (main_rc("recover-episode", str(sock_d), ep_d)[0], tpk.fence_status(sock_d)), (0, "clear"))
+
+sock_e, guard_e = tmp / "main-repair-fails.sock", tpk.guard_path(tmp / "main-repair-fails.sock")
+plain_file(guard_e)
+with mock.patch.object(os, "link", side_effect=OSError("no links here")):
+    got, msg = main_rc("recover", str(sock_e))
+check("a repair that fails reports recovery is still required", (got, "recovery required" in msg), (tpk.UNCERTAIN, True))
+check("and leaves the guard and no scratch directory",
+      (guard_e.is_file(), [x.name for x in tmp.glob(guard_e.name + ".*")]), (True, []))
+
+
 out, _, req = card(pool(tmp / "unfenced.sock"), IDLE)
 check("a card with no fence offers no clear button", wc.FENCE_ACTION in [a.id for a in req.actions], False)
 
