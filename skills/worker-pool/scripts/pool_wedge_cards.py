@@ -222,7 +222,8 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
                      "attempt and why it was refused."]
         subject.update(cause=[cause] if cause else [])
         req = choice_request(
-            "\n".join(body), actions, f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
+            "\n".join(body), actions,
+            f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}" + (f":after:{replacing}" if replacing else ""),
             subject, runtime=runtime, title=f"{seat} · tasks not delivered", device=device,
             kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_FROZEN:
@@ -267,9 +268,9 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             runtime=runtime, title=f"{seat} · {abn.kind}: {cause}", device=device,
             kind="choice" if via_proxy else "core-blocked", turn_on_action=via_proxy)
     manager = manager or manager_for(workspace)
+    made = manager.create(req)
     if replacing:
         manager.expire(replacing)
-    made = manager.create(req)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
 
 
@@ -358,8 +359,11 @@ def drive_fence_clears(workspace, *, runner=subprocess.run, routed=proxy_routed,
                 continue
             outcome = {tmux_pane_keys.FENCE_CHANGED: "changed", tmux_pane_keys.BUSY: "refused"}.get(rc, "failed")
         _note(manager, r.id, fence_cleared=False, fence_outcome=outcome)
-        made = raise_card(workspace, subj.get("worker_id"), ps.CARD_UNDELIVERED, runner=runner, routed=routed,
-                          manager=manager, note=FENCE_RETRY_NOTES[outcome], cause="pane-key-fence", replacing=r.id)
+        try:
+            made = raise_card(workspace, subj.get("worker_id"), ps.CARD_UNDELIVERED, runner=runner, routed=routed,
+                              manager=manager, note=FENCE_RETRY_NOTES[outcome], cause="pane-key-fence", replacing=r.id)
+        except OSError:
+            made = {"outcome": "indeterminate"}  # not saved: this card stays as the debt
         if made.get("outcome") not in ("carded", "indeterminate"):
             manager.expire(r.id)
         out[r.id] = outcome

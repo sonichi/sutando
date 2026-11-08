@@ -377,6 +377,29 @@ press(m, retry, wc.FENCE_ACTION)
 check("pressing it clears the fence", wc.drive_fence_clears(ws_f, manager=m), {retry.id: "cleared"})
 check("and the fence reads clear", tpk.fence_status(sock), "clear")
 
+# The successor could not be saved, or the swap stopped halfway: the debt survives, and one card results.
+sock, ws_f, req, m = fenced_card("fence-store-fails")
+press(m, req, wc.FENCE_ACTION)
+with mock.patch.object(m, "create", side_effect=OSError("no space")):
+    out_store = wc.drive_fence_clears(ws_f, runner=Runner(rc=125), manager=m)
+check("a successor that cannot be saved still reports failed", out_store, {req.id: "failed"})
+check("and the old card is kept", [c.id for c in m.active()], [req.id])
+check("and the fence stands", tpk.fence_status(sock), "uncertain")
+r = Runner(rc=0)
+with mock.patch.object(m, "expire", side_effect=OSError("stopped")):
+    check("the next sweep saves it, with no second recovery",
+          (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({req.id: "failed"}, []))
+successors = [c for c in m.active() if c.id != req.id]
+check("the swap stopped halfway: exactly one successor exists", len(successors), 1)
+r = Runner(rc=0)
+check("the sweep after that only finishes the swap",
+      (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({req.id: "failed"}, []))
+check("the old card is closed, and no second successor appeared",
+      (m.get(req.id).status, [c.id for c in m.active()]), (STATUS_EXPIRED, [successors[0].id]))
+press(m, successors[0], wc.FENCE_ACTION)
+check("pressing the successor clears the fence", wc.drive_fence_clears(ws_f, manager=m), {successors[0].id: "cleared"})
+check("and the fence reads clear", tpk.fence_status(sock), "clear")
+
 # A marker-only fence keeps its identity through housekeeping, and a later marker is another fence.
 sock_m = tmp / "fence-marker-only.sock"
 tpk.prepare_guard(sock_m)
@@ -542,6 +565,33 @@ check("a repair that fails reports recovery is still required", (got, "recovery 
 check("and leaves the guard and no scratch directory",
       (guard_e.is_file(), [x.name for x in tmp.glob(guard_e.name + ".*")]), (True, []))
 
+
+class RecoveryWontRun(Runner):
+    def __call__(self, argv, **kw):
+        if "recover-episode" in argv:
+            raise OSError("cannot start")
+        return super().__call__(argv, **kw)
+
+
+sock, ws_f, req, m = fenced_card("fence-cannot-run")
+press(m, req, wc.FENCE_ACTION)
+check("a recovery that cannot start reports failed", wc.drive_fence_clears(ws_f, runner=RecoveryWontRun(), manager=m),
+      {req.id: "failed"})
+check("and the owner has a live card", offered_again(m, "recovery itself failed"), (1, True, True))
+
+sock, ws_f, req, m = fenced_card("fence-no-episode")
+press(m, req, wc.FENCE_ACTION)
+wc._note(m, req.id, fence_episode=None)
+r = Runner()
+check("a card naming no fence runs no recovery", (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()),
+      ({req.id: "changed"}, []))
+
+sock, ws_f, req, m = fenced_card("fence-pane-moved-on")
+press(m, req, wc.FENCE_ACTION)
+r = Runner(rc=125)
+r.pane = "compiling the world\n"
+check("the pane is no longer idle: reported as failed", wc.drive_fence_clears(ws_f, runner=r, manager=m), {req.id: "failed"})
+check("and no card is owed for a seat that has moved on", (m.get(req.id).status, m.active()), (STATUS_EXPIRED, []))
 
 out, _, req = card(pool(tmp / "unfenced.sock"), IDLE)
 check("a card with no fence offers no clear button", wc.FENCE_ACTION in [a.id for a in req.actions], False)
