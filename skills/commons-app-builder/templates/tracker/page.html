@@ -113,17 +113,19 @@
   // redraw must not re-enable a control whose write is still in flight.
   let busy = false, snapshot = null;
 
+  // Resolved into locals and returned, so an older overlapping render cannot overwrite a newer
+  // one. personId rejects until the viewer allows the page: show "?" rather than "not yours".
   const whose = async (snap) => {
-    // personId rejects until the viewer allows the page: show "?" rather than "not yours".
-    mineById = new Map();
-    consentKnown = true;
+    const mine = new Map();
     for (const row of snap.rows) {
       try {
         const who = await art.personId(row.cells['Created by']);
-        mineById.set(row.id, who && art.me && who === art.me.id);
-      } catch (e) { consentKnown = false; break; }
+        mine.set(row.id, !!(who && art.me && who === art.me.id));
+      } catch (e) { return { mineById: new Map(), consentKnown: false }; }
     }
+    return { mineById: mine, consentKnown: true };
   };
+  let generation = 0;
 
   const draw = (snap) => {
     clearNotes();
@@ -218,9 +220,13 @@
   };
 
   const render = async (snap) => {
+    const gen = ++generation;                          // a newer render supersedes this one
     snapshot = snap;
     if (!snap) { clearNotes(); $('list').textContent = ''; $('sub').textContent = ''; show('bad', 'The Tracker database was removed from this room.'); $('add').disabled = true; return; }
-    await whose(snap);
+    const who = await whose(snap);
+    if (gen !== generation) return;                    // superseded while resolving ownership
+    mineById = who.mineById;
+    consentKnown = who.consentKnown;
     draw(snap);
   };
 

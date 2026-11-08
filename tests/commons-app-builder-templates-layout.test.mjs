@@ -169,15 +169,17 @@ for (const [name, fixture] of Object.entries(FIXTURES)) {
   const host = join(dir, `${name}-host.html`);
   writeFileSync(inner, wired, 'utf8');
   writeFileSync(host, hostPage(`${name}.html`), 'utf8');
+  // A failed LAUNCH is retried once (seen locally, 1 in ~15 runs); a layout assertion is not.
+  const launch = () => execFileSync(browser, [
+    '--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run',
+    '--disable-extensions', '--hide-scrollbars', '--allow-file-access-from-files',
+    '--virtual-time-budget=2500', '--dump-dom', `file://${host}`,
+  ], { encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'ignore'] });
   let dom;
   try {
-    dom = execFileSync(browser, [
-      '--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run',
-      '--disable-extensions', '--hide-scrollbars', '--allow-file-access-from-files',
-      '--virtual-time-budget=2500', '--dump-dom', `file://${host}`,
-    ], { encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'ignore'] });
+    try { dom = launch(); } catch { dom = launch(); }
   } catch (e) {
-    failures.push(`${name}: browser failed: ${String(e.message).split('\n')[0]}`);
+    failures.push(`${name}: browser failed twice: ${String(e.message).split('\n')[0]}`);
     continue;
   }
   const err = /<title>ERR ([^<]*)/.exec(dom);

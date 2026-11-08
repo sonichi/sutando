@@ -139,7 +139,9 @@
     const game = rows.reduce((m, r) => Math.max(m, Number(r.cells.Game) || 1), 1);
     const moves = rows
       .filter((r) => (Number(r.cells.Game) || 1) === game)
-      .filter((r) => Number(r.cells.Row) >= 1 && Number(r.cells.Row) <= 3 && Number(r.cells.Col) >= 1 && Number(r.cells.Col) <= 3);
+      // Integers only: Row 1.5 would index a non-element property, count as a move, and pass
+      // the turn without a visible mark.
+      .filter((r) => [r.cells.Row, r.cells.Col].every((v) => Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 3));
     const cells = new Array(9).fill('');
     let placed = 0;
     moves.forEach((r) => {

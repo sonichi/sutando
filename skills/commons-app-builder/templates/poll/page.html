@@ -109,17 +109,20 @@
 
   // Who wrote each vote. personId rejects until the viewer allows the page, and then the page
   // cannot tell its own vote from anyone else's: it shows "?" rather than claiming none.
+  // Resolved into locals and returned: renders overlap (each awaits personId row by row), so
+  // writing shared state here would let a slower, older render overwrite a newer one.
   const findMine = async (snap) => {
-    myRow = null;
-    consentKnown = true;
+    let mine = null;
     // The LAST of the viewer's rows, so "your vote" is the one the tally counts.
     for (const row of snap.rows) {
       try {
         const who = await art.personId(row.cells['Created by']);
-        if (who && art.me && who === art.me.id) myRow = row;
-      } catch (e) { consentKnown = false; myRow = null; return; }
+        if (who && art.me && who === art.me.id) mine = row;
+      } catch (e) { return { myRow: null, consentKnown: false }; }
     }
+    return { myRow: mine, consentKnown: true };
   };
+  let generation = 0;
 
   const lockChoices = () => {
     [...$('choices').children].forEach((el) => { el.disabled = true; });
@@ -206,7 +209,11 @@
         // from a second row into an edit of the voter's own.
         let commentResult = null;
         const r = await save(async () => {
-          if (snapshot) await findMine(snapshot);
+          if (snapshot) {
+            const who = await findMine(snapshot);
+            myRow = who.myRow;
+            consentKnown = who.consentKnown;
+          }
           if (myRow) return db.write(id, myRow.id, 'Choice', o.name);
           const values = { Choice: o.name };
           if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
@@ -234,9 +241,13 @@
   };
 
   const render = async (snap) => {
+    const gen = ++generation;                          // a newer render supersedes this one
     snapshot = snap;
     if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }
-    await findMine(snap);
+    const who = await findMine(snap);
+    if (gen !== generation) return;                    // superseded while resolving ownership
+    myRow = who.myRow;
+    consentKnown = who.consentKnown;
     draw(snap);
   };
 

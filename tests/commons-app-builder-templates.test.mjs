@@ -975,6 +975,98 @@ for (const [template, opts, field, typed] of [
   check('tracker/successful-add-clears-the-box', () => assert.equal(r.byId.get('title').value, ''));
 }
 
+/* ========== Codex review of 39b4dcb4: overlapping renders, integer coordinates ===== */
+/* Mounts a template whose personId is SLOW while `slow.on` is true, so a render started then
+ * finishes after a later one. */
+const mountWithSlowPersonId = (template, opts) => {
+  const slow = { on: true };
+  const base = fakeArtifact(opts);
+  const fast = base.art.personId;
+  base.art.personId = async (cell) => {
+    if (slow.on) await new Promise((ok) => setTimeout(ok, 60));
+    return fast(cell);
+  };
+  let fire = null;
+  base.art.db.onChange = (d, fn) => { fire = fn; return () => {}; };
+  const html = readFileSync(join(TPL, template, 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  return { ...dom, ...base, slow, fire: (snap) => fire(snap) };
+};
+const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+
+/* poll: an older render that resolves last must not overwrite the newer snapshot's result. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  const r = mountWithSlowPersonId('poll', pollOpts({ rows }));
+  await settle(4);                                   // the initial render is stuck in personId
+  r.slow.on = false;
+  r.fire({ id: 'd1', name: 'Poll — Votes', props: POLL_PROPS,
+    rows: [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Coffee', 'Created by': ['@me:x'] } }] });
+  await settle(10);                                  // the newer render finishes first
+  await wait(120);                                   // then the older one resolves
+  await settle(10);
+  check('poll/older-render-does-not-overwrite-newer', () => {
+    assert.match(r.byId.get('sub').textContent, /you voted Coffee/);
+    const coffee = r.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent));
+    assert.match(coffee.textContent, /your vote/);
+  });
+}
+/* tracker: a render still resolving when the database is removed must not bring the page back. */
+{
+  const rows = [{ id: 'r1', cells: { Item: 'Mend fence', Status: 'Requested', 'Created by': ['@me:x'] } }];
+  const r = mountWithSlowPersonId('tracker', trackerOpts({ rows }));
+  await settle(4);                                   // the initial render is stuck in personId
+  r.fire(null);                                      // the database is removed meanwhile
+  await settle(4);
+  await wait(120);                                   // the stale render resolves after removal
+  await settle(10);
+  check('tracker/removal-wins-over-a-stale-render', () => {
+    assert.match(r.body.textContent, /was removed from this room/);
+    assert.equal(r.byId.get('add').disabled, true, 'Add stays disabled');
+    assert.ok(!/Mend fence/.test(r.byId.get('list').textContent), 'the old rows are not redrawn');
+  });
+}
+/* tracker: same ordering rule as poll, on the "yours" marker. */
+{
+  const rows = [{ id: 'r1', cells: { Item: 'Old', Status: 'Requested', 'Created by': ['@other:x'] } }];
+  const r = mountWithSlowPersonId('tracker', trackerOpts({ rows }));
+  await settle(4);
+  r.slow.on = false;
+  r.fire({ id: 'd1', name: 'Tracker — Items', props: TRACKER_PROPS,
+    rows: [{ id: 'r2', cells: { Item: 'New', Status: 'Requested', 'Created by': ['@me:x'] } }] });
+  await settle(10);
+  await wait(120);
+  await settle(10);
+  check('tracker/older-render-does-not-overwrite-newer', () => {
+    const list = r.byId.get('list').textContent;
+    assert.match(list, /New/);
+    assert.ok(!/Old/.test(list), 'the superseded snapshot is not drawn: ' + list);
+    assert.match(list, /Added by you/);
+  });
+}
+/* turn-game: a fractional coordinate is not a move, so it cannot pass the turn invisibly. */
+{
+  const rows = [{ id: 'm1', cells: { Game: 1, Seat: 'X', Row: 1.5, Col: 1 } }];
+  const r = await run('turn-game', gameOpts({ rows, state: SEATED }));
+  check('game/fractional-row-is-not-a-move', () => {
+    assert.match(r.byId.get('sub').textContent, /0 moves/);
+    assert.match(r.byId.get('status').textContent, /Your turn as X/);
+    assert.ok(r.byId.get('board').children.every((c) => c.textContent === ''), 'no mark drawn');
+  });
+}
+{
+  const rows = [{ id: 'm1', cells: { Game: 1, Seat: 'X', Row: 2, Col: '2.0' } }];
+  const r = await run('turn-game', gameOpts({ rows, state: SEATED }));
+  check('game/integer-valued-string-still-counts', () =>
+    assert.equal(r.byId.get('board').children[4].textContent, 'X'));
+}
+
 console.log(failures.length
   ? `FAIL commons-app-builder templates: ${failures.length} failed\n  ${failures.join('\n  ')}`
   : `all passed — commons-app-builder templates: ${passed} checks`);
