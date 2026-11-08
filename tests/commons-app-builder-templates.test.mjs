@@ -1170,6 +1170,64 @@ for (const [template, opts] of [['tracker', trackerOpts({ rows: [] })], ['planne
     assert.match(meta('Due yesterday').className, /\bover\b/));
 }
 
+/* ============ Codex review of 71317680: replay stops at the win; __proto__ keys ===== */
+/* turn-game: X completes the bottom row; an O row appended afterwards completes the top row.
+ * The winner is the player who finished first, and the later row is not replayed. */
+{
+  const rows = [
+    mv('m1', 1, 'X', 3, 1), mv('m2', 1, 'O', 1, 1), mv('m3', 1, 'X', 3, 2),
+    mv('m4', 1, 'O', 1, 2), mv('m5', 1, 'X', 3, 3),   // X wins the bottom row here
+    mv('m6', 1, 'O', 1, 3),                           // appended afterwards: must not count
+  ];
+  const r = await run('turn-game', gameOpts({ rows, state: SEATED }));
+  check('game/winner-is-whoever-finished-first', () =>
+    assert.match(r.byId.get('status').textContent, /^X wins\.$/));
+  check('game/moves-after-the-win-are-not-replayed', () => {
+    assert.equal(r.byId.get('board').children[2].textContent, '', 'the appended O is not drawn');
+    assert.match(r.byId.get('sub').textContent, /5 moves/);
+  });
+}
+/* poll: an option named __proto__ is counted like any other name. */
+{
+  const props = [
+    { id: 't', name: 'Voter', type: 'title' },
+    { id: 'c', name: 'Choice', type: 'select', options: [{ name: '__proto__' }, { name: 'constructor' }, { name: 'Tea' }] },
+    { id: 'm', name: 'Comment', type: 'text' },
+    { id: 'b', name: 'Created by', type: 'created_by' },
+  ];
+  const rows = [
+    { id: 'r1', cells: { Voter: 'A', Choice: '__proto__', 'Created by': ['@a:x'] } },
+    { id: 'r2', cells: { Voter: 'B', Choice: '__proto__', 'Created by': ['@b:x'] } },
+    { id: 'r3', cells: { Voter: 'C', Choice: 'constructor', 'Created by': ['@c:x'] } },
+    { id: 'r4', cells: { Voter: 'D', Choice: 'Tea', 'Created by': ['@d:x'] } },
+  ];
+  const r = await run('poll', { dbName: 'Poll — Votes', props, rows });
+  check('poll/proto-named-option-is-counted', () => {
+    assert.match(r.byId.get('sub').textContent, /^4 votes/);
+    const text = r.byId.get('results').textContent;
+    assert.match(text, /__proto__.*2.*50%/s, text.slice(0, 160));
+    assert.match(text, /constructor.*1.*25%/s);
+  });
+}
+/* tracker: a status named __proto__ gets a real chip and does not crash the sort. */
+{
+  const props = TRACKER_PROPS.map((p) => (p.name === 'Status'
+    ? { ...p, options: [{ name: '__proto__', group: 'todo' }, { name: 'Done', group: 'done' }] }
+    : p));
+  const rows = [{ id: 'r1', cells: { Item: 'Odd status', Status: '__proto__' } },
+                { id: 'r2', cells: { Item: 'Normal', Status: 'Done' } }];
+  const r = await run('tracker', { dbName: 'Tracker — Items', props, rows });
+  check('tracker/proto-named-status-renders', () => {
+    const list = r.byId.get('list').textContent;
+    assert.match(list, /Odd status/);
+    assert.match(list, /__proto__/);
+    const chip = r.byId.get('list').all().find((e) => /^chip /.test(e.className || ''));
+    assert.match(chip.className, /^chip (todo|doing|done)$/, chip.className);
+  });
+  check('tracker/proto-named-status-counts', () =>
+    assert.match(r.byId.get('counts').textContent, /__proto__: 1/));
+}
+
 console.log(failures.length
   ? `FAIL commons-app-builder templates: ${failures.length} failed\n  ${failures.join('\n  ')}`
   : `all passed — commons-app-builder templates: ${passed} checks`);

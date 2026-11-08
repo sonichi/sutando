@@ -182,7 +182,8 @@
   const itemList = (rows, flat) => {
     const ul = flat ? document.createDocumentFragment() : document.createElement('ul');
     if (!flat) ul.className = 'items';
-    const order = { Morning: 0, Afternoon: 1, Evening: 2 };
+    // Indexed by an option name the schema controls, so a null prototype (see tracker).
+    const order = Object.assign(Object.create(null), { Morning: 0, Afternoon: 1, Evening: 2 });
     rows.slice().sort((a, b) => (order[a.cells.Slot] ?? 9) - (order[b.cells.Slot] ?? 9)).forEach((row) => {
       const li = document.createElement('li');
       li.className = 'it';

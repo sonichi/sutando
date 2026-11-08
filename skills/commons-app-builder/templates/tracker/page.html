@@ -106,7 +106,10 @@
     }
   };
 
-  const GROUP = { Requested: 'todo', Working: 'doing', Blocked: 'doing', Done: 'done' };
+  // Null prototypes: these are indexed by option names, which the room's schema controls, and
+  // a plain object would answer for '__proto__' and 'constructor'.
+  const GROUP = Object.assign(Object.create(null),
+    { Requested: 'todo', Working: 'doing', Blocked: 'doing', Done: 'done' });
   // Due dates are calendar dates in the reader's zone; toISOString() is UTC and would mark an
   // item overdue hours early west of Greenwich.
   const today = () => {
@@ -151,7 +154,7 @@
     if (!titleProp) show('bad', 'This database has no title column, so items cannot be named.');
     if (!consentKnown) show('warn', 'Allow the page to see who is who, and "yours" will fill in.');
 
-    const counts = {};
+    const counts = Object.create(null);
     snap.rows.forEach((r) => { const s = r.cells.Status || '—'; counts[s] = (counts[s] || 0) + 1; });
     $('counts').textContent = snap.rows.length
       ? Object.keys(counts).map((k) => k + ': ' + counts[k]).join('  ·  ')
@@ -167,7 +170,7 @@
       list.appendChild(li);
       return;
     }
-    const order = { Blocked: 0, Working: 1, Requested: 2, Done: 3 };
+    const order = Object.assign(Object.create(null), { Blocked: 0, Working: 1, Requested: 2, Done: 3 });
     const rows = snap.rows.slice().sort((a, b) =>
       (order[a.cells.Status] ?? 9) - (order[b.cells.Status] ?? 9) ||
       String(a.cells.Due || '9999').localeCompare(String(b.cells.Due || '9999')));
@@ -182,7 +185,7 @@
       name.textContent = (titleProp && row.cells[titleProp]) || 'Untitled';
       const chip = document.createElement('span');
       const st = row.cells.Status || '—';
-      chip.className = 'chip ' + (GROUP[st] || 'todo');
+      chip.className = 'chip ' + (typeof GROUP[st] === 'string' ? GROUP[st] : 'todo');
       chip.textContent = st;
       top.appendChild(name); top.appendChild(chip);
       li.appendChild(top);

@@ -140,13 +140,15 @@
     if (!options.length) { show('bad', 'The Choice column has no options yet, so there is nothing to vote on.'); return; }
 
     // One row per vote, one vote per voter: repeat rows from one person count once.
-    const tally = {};
+    // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of
+    // an own property, so votes for an option named that would vanish from the count.
+    const tally = Object.create(null);
     options.forEach((o) => { tally[o.name] = 0; });
     const votes = counted(snap.rows);
     let total = 0;
     votes.forEach((r) => {
       const c = r.cells.Choice;
-      if (c && Object.prototype.hasOwnProperty.call(tally, c)) { tally[c] += 1; total += 1; }
+      if (typeof c === 'string' && c in tally) { tally[c] += 1; total += 1; }
     });
     const ignored = snap.rows.length - votes.length;
 
