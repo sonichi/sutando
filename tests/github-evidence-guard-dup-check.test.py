@@ -6,6 +6,11 @@ and the core launcher registers the check. No network.
 
 Run:  python3 tests/github-evidence-guard-dup-check.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import builtins
 import contextlib
 import importlib.util
@@ -355,7 +360,7 @@ class Delegation(unittest.TestCase):
             gh = Path(d, "gh")
             gh.write_text("#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n")
             gh.chmod(0o755)
-            env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ['PATH']}")
+            env = isolated_child_env(PATH=f"{d}{os.pathsep}{os.environ['PATH']}")
             run = lambda cmd: subprocess.run([sys.executable, str(HOOK), "--dup-check", "--repo", str(root)],
                                              capture_output=True, text=True, env=env,
                                              input=json.dumps(bash(cmd, cwd=str(work))), timeout=60)
