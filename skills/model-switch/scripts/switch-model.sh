@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
+# switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH] [--launcher PATH]
 # Sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
 set -u
-MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""
+MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""; LAUNCHER=""; RELAUNCH=""
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --offline) OFFLINE=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
   --picker-dismiss-after) DISMISS_AFTER="${2:?}"; shift;;
-  --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
+  --session) SESSION="${2:?}"; shift;; --launcher) LAUNCHER="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
 esac; shift; done
@@ -33,6 +33,7 @@ CFG="$BRAIN/settings.json"
 [ -n "$SOCK" ] || SOCK="${DSOCK:-/tmp/sutando-tmux.sock}"
 [ -n "$SESSION" ] || SESSION="${DSESSION:-sutando-core}"
 [ -n "$STATE_DIR" ] || STATE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/state"
+[ -n "$LAUNCHER" ] || LAUNCHER="$REPO/src/agent/start-cli.sh"
 if [ -n "$DRY" ]; then
   echo "dry-run: would record $STATE_DIR/model-switch.json (previous read from $CFG), send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
 fi
@@ -52,10 +53,18 @@ case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecogni
 if [ "$RUNTIME" = "codex" ]; then
   echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
 fi
+# The launcher's own test for a running core: a `claude` process named for the session. A `pgrep -f`
+# also matched the tmux server, whose argv keeps the command that created the session.
+TMUX_SOCKET="$SOCK"; . "$REPO/src/agent/claude/cli/session-launch.sh"
+# Held for a provider limit with no core to type into: the pick goes to settings and the core is started.
+if [ -z "$OFFLINE" ] && ! claude_named_process_running \
+   && "$PY" "$REPO/src/core_limit_hold.py" held --workspace "$(dirname "$STATE_DIR")" > /dev/null 2>&1; then
+  OFFLINE=1; RELAUNCH=1
+fi
 # --offline: the core is down, so no CLI can take /model; write its settings for the next launch.
 # Refused while any core process for this session runs, which then owns its settings.
 if [ -n "$OFFLINE" ]; then
-  if pgrep -f "claude --name $SESSION( |$)" > /dev/null 2>&1; then
+  if claude_named_process_running; then
     echo "switch-model: refused --offline — a core is running for '$SESSION'; switch it live instead. Nothing changed." >&2; exit 9
   fi
   OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
@@ -85,8 +94,23 @@ print(f"OK {prev or '-'}")
 PYEOF
 )"
   case "$OUT" in OK*) ;; *) echo "switch-model: --offline could not write ($CFG): ${OUT#FAILED }" >&2; exit 1;; esac
-  echo "switched: model=$MODEL (was ${OUT#OK }); the core is down, so it takes effect at its next launch; record: $STATE_DIR/model-switch.json"
-  exit 0
+  if [ -z "$RELAUNCH" ]; then
+    echo "switched: model=$MODEL (was ${OUT#OK }); the core is down, so it takes effect at its next launch; record: $STATE_DIR/model-switch.json"
+    exit 0
+  fi
+  # The launcher's limit gate may run this script again for an owner's reply, so the lock goes first.
+  exec 9>&-
+  [ "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}" = "$SOCK" ] || export SUTANDO_TMUX_SOCKET="$SOCK"
+  [ "${SUTANDO_TMUX_SESSION:-sutando-core}" = "$SESSION" ] || export SUTANDO_TMUX_SESSION="$SESSION"
+  LOG="$STATE_DIR/.model-switch-launch.log"
+  bash "$LAUNCHER" < /dev/null > "$LOG" 2>&1; LRC=$?
+  if [ "$LRC" = 0 ]; then
+    echo "switched: model=$MODEL (was ${OUT#OK }); the core was paused for a provider limit, so it is starting on $MODEL now; record: $STATE_DIR/model-switch.json"
+    exit 0
+  fi
+  WHY="$(grep -m1 'not launched' "$LOG" 2>/dev/null | sed 's/.*not launched — //')"
+  echo "switch-model: set model=$MODEL for the next launch, but the core did not start (launcher rc=$LRC${WHY:+: $WHY}); log: $LOG" >&2
+  exit 10
 fi
 # Preflight the live pane before any write through the ONE sender
 # (scripts/tmux-send-line.sh): its --dry-run inspects the prompt under the

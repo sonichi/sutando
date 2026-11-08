@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-11-05"
+   "last_verified": "2026-11-07"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -522,8 +522,8 @@
     "maintainers"
    ],
    "status": "canonical",
-   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
-   "last_verified": "2026-10-22"
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the opt-in task-watch Mod",
+   "last_verified": "2026-11-06"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",

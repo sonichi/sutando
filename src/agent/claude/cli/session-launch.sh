@@ -62,9 +62,10 @@ claude_named_pids() {
   # in-session restart), the live process would otherwise be invisible.
   # `read -r pid _` tolerates procps -a's "pid cmdline" output too.
   pgrep -ax claude 2>/dev/null | while read -r pid _; do
-    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    args=" $(ps -p "$pid" -o args= 2>/dev/null || true) "
+    # The name is a whole token: `sutando-core` must not match `sutando-core-worker`.
     case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
+      *" --name $SESSION "*|*" --name=$SESSION "*) echo "$pid" ;;
     esac
   done
 }
@@ -346,6 +347,39 @@ add_skill_claude_plugins() {
   done < <(skill_manifest_claude_plugins "$REPO" "$PY")
 }
 
+# 0 when dotted release $1 is at least $2; any suffix after the numbers is ignored.
+claude_version_at_least() {
+  local IFS=. i
+  local -a a b
+  read -r -a a <<< "${1%%[!0-9.]*}"
+  read -r -a b <<< "${2%%[!0-9.]*}"
+  [ "${#a[@]}" -gt 0 ] && [ "${#b[@]}" -gt 0 ] || return 1
+  for i in 0 1 2 3; do
+    [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] 2>/dev/null && return 0
+    [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] 2>/dev/null && return 1
+  done
+  return 0
+}
+
+# With $1 = "1": --plugin-dir for the task-watch Mod and TASK_WATCH_MOD=1, gated on CLAUDE_BIN,
+# the claude the session's PATH resolves, which the launch then runs. Reads REPO.
+add_task_watch_mod() {
+  TASK_WATCH_MOD=""
+  CLAUDE_BIN=""
+  [ "${1:-}" = "1" ] || return 0
+  local dir="$REPO/src/agent/claude/task-watch-mod" min have
+  CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
+  case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
+  min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)"
+  have="$([ -n "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version 2>/dev/null | awk 'NR==1 {print $1}')"
+  if [ -z "$min" ] || [ -z "$have" ] || ! claude_version_at_least "$have" "$min"; then
+    echo "task-watch Mod: Claude Code ${have:-unknown} is not at least ${min:-unknown}; this session keeps the Monitor watcher" >&2
+    return 0
+  fi
+  SURFACE_ARGS+=(--plugin-dir "$dir")
+  TASK_WATCH_MOD=1
+}
+
 # Any installed skill's manifest.json "config" block, forwarded the same way
 # every other env var in a caller's own env-args array is. Set-ness wins, not
 # non-emptiness: an explicit empty value must not be re-filled from a
@@ -440,7 +474,7 @@ launch_claude_session() {
   claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do
