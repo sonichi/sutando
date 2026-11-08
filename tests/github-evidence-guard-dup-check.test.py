@@ -254,6 +254,133 @@ class Matching(Base):
         self.assertEqual((text, fake.calls, self.rows()), ("", [], []))
 
 
+class Edges(Base):
+    """Parser corners and every failure path still end in one line or a clean pass, never a raise."""
+
+    def test_parser_corners(self):
+        with mock.patch.object(dw._shell_scan, "segments", side_effect=ValueError("unbalanced")):
+            self.assertEqual(dw.triggers("git checkout -b feat/a", "/w"), [])
+        self.assertEqual([t["branch"] for t in dw.triggers("FOO=1; git checkout -b feat/a", "/w")], ["feat/a"])
+        self.assertEqual(dw.triggers("git push", "/w"), [])
+        (t,) = dw.triggers("gh pr review -R o/r --approve 9", "/w")
+        self.assertEqual((t["repo"], t["pr"]), ("o/r", 9))
+        (t,) = dw.triggers("gh pr review --approve", "/w")
+        self.assertIsNone(t["pr"])
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "body.md").write_text("Row rmqqqqrrrrssss here")
+            (t,) = dw.triggers("gh pr create -t x -F body.md", d)
+            self.assertIn("rmqqqqrrrrssss", t["body"])
+            (t,) = dw.triggers("gh pr create -t x -F missing.md", d)
+            self.assertEqual(t["body"].strip(), "")
+
+    def test_review_without_a_number_is_unknown(self):
+        text, _ = self.run_hook("gh pr review --approve -b ok", Fake({}))
+        self.assertIn("could not run (the reviewed PR is not named", text)
+
+    def test_review_of_a_missing_pr_is_unknown(self):
+        text, _ = self.run_hook("gh pr review 5 -R o/r --approve", Fake({"ro": []}))
+        self.assertIn("could not run (PR #5 not found in o/r)", text)
+
+    def test_nothing_to_search_prints_only_the_weak_line(self):
+        fake = Fake({})
+        text, _ = self.run_hook("git checkout -b feat/a", fake)
+        self.assertEqual(text, "No ticket id in the branch name, so the duplicate check is weaker.")
+        self.assertEqual(fake.gh_calls(), [])
+
+    def test_unreadable_local_diff_skips_file_overlap(self):
+        def run(cmd, **kw):
+            if cmd[:1] == ["git"] and "diff" in cmd:
+                return subprocess.CompletedProcess(cmd, 128, "", "bad revision")
+            return fake(cmd, **kw)
+        fake = Fake({}, branch="fix/rmabcdefghij12-x")
+        self.run_hook("gh pr create -t t -b b", run)
+        self.assertNotIn("ro=", " ".join(fake.query))
+
+    def test_git_and_gh_that_cannot_start(self):
+        def no_git(cmd, **kw):
+            if cmd[0] == "git":
+                raise OSError("no git")
+            return Fake()(cmd, **kw)
+        text, _ = self.run_hook("git checkout -b feat/a-b", no_git)
+        self.assertIn("could not run (no GitHub repository", text)
+
+        def no_gh(cmd, **kw):
+            if cmd[0] == "gh":
+                raise OSError("no gh")
+            return Fake()(cmd, **kw)
+        text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", no_gh)
+        self.assertIn("could not run (gh could not run: no gh)", text)
+
+    def test_unreadable_search_responses(self):
+        for out in ("not json", json.dumps({"data": None}), json.dumps({"errors": []})):
+            def run(cmd, out=out, **kw):
+                if cmd[0] == "gh":
+                    return subprocess.CompletedProcess(cmd, 0, out, "")
+                return Fake()(cmd, **kw)
+            text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", run)
+            self.assertIn("could not run (unreadable search response)", text, out)
+
+    def test_pr_diff_unavailable_or_out_of_time_is_no_function_signal(self):
+        self.assertIsNone(dw.pr_diff(Fake(), "o/r", 5, 0.0))
+
+        def broken(cmd, **kw):
+            raise OSError("gone")
+        self.assertIsNone(dw.pr_diff(broken, "o/r", 5, 2.0))
+        fail = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "HTTP 404")
+        self.assertIsNone(dw.pr_diff(fail, "o/r", 5, 2.0))
+
+    def test_ticket_hits_beyond_the_first_page_name_the_total(self):
+        nodes = [dict(pr(10 + i, f"t{i}", f"b{i}"), branch=f"b{i}") for i in range(3)]
+        found = {"ticket": nodes, "function": [], "keyword": [], "file_only": [], "ticket_total": 140}
+        text = dw.advice({"trigger": "branch", "branch": "x"}, "o/r", found, "repo:o/r is:pr rmabcdefghij12")
+        self.assertIn("... 140 PRs in total: gh search prs 'repo:o/r is:pr rmabcdefghij12'", text)
+
+    def test_no_repo_root_says_so(self):
+        self.assertIn("repo root not configured", dw.check("git checkout -b feat/a", "/w", None))
+
+    def test_unwritable_or_unresolvable_log_still_answers(self):
+        with mock.patch.object(dw, "log_path", side_effect=RuntimeError("no workspace")):
+            text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", Fake(fail=True))
+        self.assertIn("could not run", text)
+        self.assertEqual(self.rows(), [])
+
+    def test_log_path_resolves_through_the_workspace_helper(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import workspace_default
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value="/ws") as resolve:
+            self.assertEqual(self.real_log_path(REPO), Path("/ws/logs/dup-work.jsonl"))
+        resolve.assert_called_once_with(migrate=False)
+
+    real_log_path = staticmethod(dw.log_path)
+
+    def test_a_config_that_cannot_be_read_leaves_the_check_on(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import sutando_config
+        with mock.patch.object(sutando_config, "config_get", side_effect=RuntimeError("bad config")):
+            self.assertTrue(self.real_enabled(REPO))
+
+    real_enabled = staticmethod(dw.enabled)
+
+    def test_summary_in_process(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d, "s.jsonl")
+            log.write_text('{"verdict": "OK", "trigger": "branch", "elapsed_ms": 9}\nnot json\n')
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(dw.main(["--summary", "--log", str(log)]), 0)
+            self.assertIn("dup-work: 1 checks", out.getvalue())
+            self.assertIn("elapsed_ms p50 -  p95 -", dw.summarize(Path(d, "absent.jsonl")))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            dw.main([])
+
+    def test_main_reraises_for_a_non_trigger(self):
+        raw = json.dumps(bash("ls"))
+        with mock.patch.object(guard, "decide", side_effect=RuntimeError("boom")), \
+                mock.patch.object(sys, "argv", ["hook", *ARGV]), mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                self.assertRaises(RuntimeError):
+            guard.main()
+
+
 class Replay(Base):
     """The recorded incidents, as GitHub answered at the time (fixtures from the real PRs)."""
 
