@@ -56,9 +56,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from dotspace import LEGACY_SERVER
 
 
-# Union of both id alphabets: a token touching one of these on either side is a
-# different (longer) token, never this id. A trailing `.` or `:` is sentence
-# punctuation unless another id character follows it.
+# A token touching an id character is a different (longer) token, never this id;
+# a trailing `.` or `:` is sentence punctuation unless an id character follows.
 ID_CHARS = r"A-Za-z0-9._:@$+/=-"
 _ID_END = r"(?![A-Za-z0-9_@$+/=-])(?![.:][%s])" % ID_CHARS
 ACTOR_RE = re.compile(r"(?<![%s])ag2space:@[A-Za-z0-9._-]+:%s%s"
