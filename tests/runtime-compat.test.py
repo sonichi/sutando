@@ -821,6 +821,31 @@ class OwnerReply(OwnerReplyBase):
         self.assertEqual(self.ensure()[0], 0)
         self.assertIn("works now", (self.ws / "results" / task.name).read_text())
 
+    def test_a_claimed_reply_is_left_to_its_claimant(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        self.ensure(repair_fn=self.counting_repair)
+        claimed = self.ws / "tasks" / "task-123.claimed-core-A.txt"
+        claimed.write_text("id: task-123\nsource: ag2space\nchannel_id: !dm:x\n"
+                           "access_tier: owner\ntask: install compatible claude\n")
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], rc.EXIT_UNUSABLE)
+        self.assertEqual(self.repairs, 0)
+        self.assertTrue(claimed.exists())
+        self.assertEqual(list((self.ws / "results").glob("task-123*")), [])
+
+    def test_a_reply_is_answered_under_its_declared_id(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        fake_cli(self.bin1 / "claude", "2.1.0")
+        task = self.ws / "tasks" / "task-777.txt"
+        task.write_text("id: task-778\nsource: ag2space\nchannel_id: !dm:x\n"
+                        "access_tier: owner\ntask: retry now\n")
+        self.assertEqual(self.ensure()[0], 0)
+        from local_task_protocol import find_result
+        self.assertIn("works now", find_result(self.ws / "results", "task-778").read_text())
+        self.assertFalse(task.exists())
+        self.assertEqual(self.incident()["actions"][0]["task"], "task-778")
+
     def test_codex_login_dm_then_retry_now(self):
         fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="", login_rc=1)
         self.assertEqual(self.ensure("codex", enforce_auth=True)[0], rc.EXIT_LOGIN)

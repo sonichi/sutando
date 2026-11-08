@@ -935,8 +935,9 @@ class Incident:
         done = {"applied": True, "reply": self.rec["fixed_reply"]} if late else {}
         if got:
             self.rec["actions"] = self.entries + [
-                dict({"task": p.stem, "phrase": phrase, "at": int(self.clock())}, **done)
-                for p, phrase in got]
+                dict({"task": tid, "file": p.name, "phrase": phrase, "at": int(self.clock())},
+                     **done)
+                for p, tid, phrase in got]
             self._save()
 
     def record_consent(self, consent: dict) -> None:

@@ -65,17 +65,30 @@ def _mtime(path: Path) -> Optional[float]:
         return None
 
 
+def unclaimed_task_id(path: Path) -> Optional[str]:
+    """The canonical id of a live task no one has claimed or been assigned, else None."""
+    from task_archive import task_id_for, task_id_from_filename
+    stem = Path(path).name[:-4] if Path(path).name.endswith(".txt") else None
+    tid = task_id_for(Path(path))
+    if stem is None or tid is None:
+        return None
+    # A `.claimed-`/`.assigned-` name is held by a core, unless the header declares it as the id.
+    return tid if task_id_from_filename(Path(path).name) == stem or tid == stem else None
+
+
 def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
                      skip: Iterable[str] = (), since: Optional[float] = None
-                     ) -> Iterator[Tuple[Path, str]]:
-    """(task, phrase) for each unanswered owner task whose whole message is one phrase,
-    written at or after `since`, and quoting nothing or a message that asked for it."""
+                     ) -> Iterator[Tuple[Path, str, str]]:
+    """(task file, task id, phrase) for each unclaimed, unanswered owner task whose whole
+    message is one phrase, written at or after `since`, quoting nothing or a message
+    that asked for it."""
     wanted = {normalize(p): p for p in phrases}
     skip = set(skip)
     workspace = _ws(workspace)
     from local_task_protocol import find_result
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
-        if path.stem in skip or find_result(workspace / "results", path.stem) is not None:
+        tid = unclaimed_task_id(path)
+        if tid is None or tid in skip or find_result(workspace / "results", tid) is not None:
             continue
         if since is not None and (_mtime(path) or 0) < since:
             continue
@@ -84,7 +97,7 @@ def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
             continue
         phrase = wanted[normalize(got[1])]
         if _asks_for(got[0], phrase):
-            yield path, phrase
+            yield path, tid, phrase
 
 
 def queue_notice(workspace: Optional[Path], name: str, body: str) -> bool:
@@ -111,7 +124,7 @@ def finish(workspace: Optional[Path], entry: dict, mark: Callable[[str], None]) 
             write_text_whole(workspace / "results" / f"{task}.txt", entry["reply"].rstrip("\n") + "\n")
         mark("answered")
     if not entry.get("archived"):
-        live = workspace / "tasks" / f"{task}.txt"
+        live = workspace / "tasks" / Path(entry.get("file") or f"{task}.txt").name
         if live.exists():
             archive_file(live, "tasks", task, tasks_dir=workspace / "tasks" / "archive",
                          results_dir=workspace / "results" / "archive", log=lambda _m: None)
