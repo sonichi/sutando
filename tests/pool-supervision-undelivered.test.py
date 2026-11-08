@@ -349,6 +349,34 @@ check("pressing that card on the next sweep clears the fence", wc.drive_fence_cl
       {retry.id: "cleared"})
 check("and the fence reads clear", tpk.fence_status(sock), "clear")
 
+# The pane cannot be read when the replacement is due: the debt stays until a card exists.
+class UnreadPane(Runner):
+    def __call__(self, argv, **kw):
+        if "capture-pane" in argv:
+            return type("Done", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+        return super().__call__(argv, **kw)
+
+
+sock, ws_f, req, m = fenced_card("fence-pane-unread")
+press(m, req, wc.FENCE_ACTION)
+check("a failed recovery with an unread pane reports failed",
+      wc.drive_fence_clears(ws_f, runner=UnreadPane(rc=125), manager=m), {req.id: "failed"})
+check("no replacement exists, so the old card is kept", [c.id for c in m.active()], [req.id])
+check("and the fence still stands", tpk.fence_status(sock), "uncertain")
+r = UnreadPane(rc=0)
+check("still unread: still owed, and that press runs no second recovery",
+      (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries(), [c.id for c in m.active()]),
+      ({req.id: "failed"}, [], [req.id]))
+r = Runner(rc=0)
+check("the pane reads again: the replacement is raised, with no recovery",
+      (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({req.id: "failed"}, []))
+check("the old card is closed", m.get(req.id).status, STATUS_EXPIRED)
+check("and the owner has a live card, saying it failed", offered_again(m, "recovery itself failed"), (1, True, True))
+retry = m.active()[0]
+press(m, retry, wc.FENCE_ACTION)
+check("pressing it clears the fence", wc.drive_fence_clears(ws_f, manager=m), {retry.id: "cleared"})
+check("and the fence reads clear", tpk.fence_status(sock), "clear")
+
 # A marker-only fence keeps its identity through housekeeping, and a later marker is another fence.
 sock_m = tmp / "fence-marker-only.sock"
 tpk.prepare_guard(sock_m)

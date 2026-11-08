@@ -152,9 +152,9 @@ def _jump(session):
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
-               manager=None, note="", cause=None) -> dict:
-    """One card for this wedge episode, from the pane as it reads NOW. Types nothing. For a fence card
-    offered again, `note` says why and `cause` keeps it about the fence while a send holds the mutex."""
+               manager=None, note="", cause=None, replacing=None) -> dict:
+    """One card for this wedge episode, from the pane as it reads NOW. Types nothing. For a fence card offered
+    again, `note` says why, `cause` keeps it about the fence, and `replacing` closes only once this one exists."""
     from hitl.cards import choice_request
     from hitl.schema import Action
     socket, session = sup._open_tmux(workspace, worker_id)
@@ -267,6 +267,8 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             runtime=runtime, title=f"{seat} · {abn.kind}: {cause}", device=device,
             kind="choice" if via_proxy else "core-blocked", turn_on_action=via_proxy)
     manager = manager or manager_for(workspace)
+    if replacing:
+        manager.expire(replacing)
     made = manager.create(req)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
 
@@ -323,8 +325,8 @@ def _recover_fence(socket, episode, runner) -> int | None:
 
 
 def drive_fence_clears(workspace, *, runner=subprocess.run, routed=proxy_routed, manager=None) -> dict:
-    """Settle each pressed fence card, for the fence it was raised for and no other. Anything short of
-    cleared closes that card and raises a fresh one: the episode is already escalated, so nothing else would."""
+    """Settle each pressed fence card, for the fence it was raised for and no other. Anything short of cleared
+    replaces it with a fresh card; the episode is already escalated, so a replacement not yet made stays owed."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     out = {}
@@ -340,7 +342,10 @@ def drive_fence_clears(workspace, *, runner=subprocess.run, routed=proxy_routed,
             manager.resolve(r.id)
             out[r.id] = "already-clear"
             continue
-        if state != "uncertain":
+        owed = subj.get("fence_outcome")
+        if owed:
+            outcome = owed  # that press is spent: only its replacement card is still owed
+        elif state != "uncertain":
             outcome = "refused"
         elif not episode:
             outcome = "changed"
@@ -353,9 +358,10 @@ def drive_fence_clears(workspace, *, runner=subprocess.run, routed=proxy_routed,
                 continue
             outcome = {tmux_pane_keys.FENCE_CHANGED: "changed", tmux_pane_keys.BUSY: "refused"}.get(rc, "failed")
         _note(manager, r.id, fence_cleared=False, fence_outcome=outcome)
-        manager.expire(r.id)
-        raise_card(workspace, subj.get("worker_id"), ps.CARD_UNDELIVERED, runner=runner, routed=routed,
-                   manager=manager, note=FENCE_RETRY_NOTES[outcome], cause="pane-key-fence")
+        made = raise_card(workspace, subj.get("worker_id"), ps.CARD_UNDELIVERED, runner=runner, routed=routed,
+                          manager=manager, note=FENCE_RETRY_NOTES[outcome], cause="pane-key-fence", replacing=r.id)
+        if made.get("outcome") not in ("carded", "indeterminate"):
+            manager.expire(r.id)
         out[r.id] = outcome
     return out
 
