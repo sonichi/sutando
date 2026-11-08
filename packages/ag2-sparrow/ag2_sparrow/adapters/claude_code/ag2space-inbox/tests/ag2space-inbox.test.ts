@@ -1820,17 +1820,15 @@ test('a claim carries the hash of the text the Mod verified; a file swapped sinc
   const h = host(on, { swapOnClaim: { 'task-sw1': swapped } })
   h.files['/in/task-sw1.txt'] = first
   await arm($, h)
-  await h.clock.advance(1000)
-  const claimsSent = h.runs.filter((a: string[]) => a[1] === 'inbox' && a[2] === 'claim')
-  expect(claimsSent[0].slice(2)).toEqual(['claim', 'task-sw1', '--task-sha256', h.hash(first)])
-  expect(h.submitted.length).toBe(0)                    // parked: the text it verified is gone
-  expect(h.claims['task-sw1']).toBeUndefined()
   for (let i = 0; i < 60 && h.submitted.length === 0; i++) await h.clock.advance(1000)
+  // The first claim names the text first verified; the CLI parks it, and the next names the swapped text.
+  const claimsSent = h.runs.filter((a: string[]) => a[1] === 'inbox' && a[2] === 'claim').map(a => a.slice(2))
+  expect(claimsSent).toEqual([['claim', 'task-sw1', '--task-sha256', h.hash(first)],
+                              ['claim', 'task-sw1', '--task-sha256', h.hash(swapped)]])
+  expect(h.runs.filter((a: string[]) => a[0] === 'python3' && a[2].includes('hmac')).length).toBe(2)   // verified again
   expect(h.submitted.length).toBe(1)
-  expect(h.submitted[0]).toContain(swapped)             // verified again, then submitted as it now reads
+  expect(h.submitted[0]).toContain(swapped + '\nReply')  // submitted as it now reads
   expect(h.submitted[0]).not.toContain(first + '\nReply')
-  const last = h.runs.filter((a: string[]) => a[1] === 'inbox' && a[2] === 'claim').pop()!
-  expect(last.slice(2)).toEqual(['claim', 'task-sw1', '--task-sha256', h.hash(swapped)])
 })
 
 // '' when `ran` is exactly the pinned scenario set (cli-contract.ts CONTRACT_NAMES), else what differs.
