@@ -88,10 +88,12 @@
   let hintShown = false;
   const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
 
-  const DAY = 86400000;
   const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
   const parse = (s) => { const p = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ''); return p ? new Date(+p[1], +p[2] - 1, +p[3]) : null; };
-  const monday = (d) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const k = (x.getDay() + 6) % 7; return new Date(x.getTime() - k * DAY); };
+  // Calendar-day arithmetic throughout: adding 7 * DAY across a daylight-saving fallback lands
+  // at 23:00 the day before, and monday() then rounds back to the same week, so Next never moves.
+  const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+  const monday = (d) => addDays(d, -((d.getDay() + 6) % 7));
   const NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
   if (!db) {
@@ -134,7 +136,7 @@
     clearNotes();
     hintShown = false;
     const rows = snapshot.rows;
-    const end = new Date(start.getTime() + 6 * DAY);
+    const end = addDays(start, 6);
     $('range').textContent = iso(start) + ' → ' + iso(end);
     $('sub').textContent = rows.length + (rows.length === 1 ? ' item' : ' items') + ' in all';
 
@@ -142,7 +144,7 @@
     const week = $('week');
     week.textContent = '';
     for (let i = 0; i < 7; i += 1) {
-      const d = new Date(start.getTime() + i * DAY);
+      const d = addDays(start, i);
       const key = iso(d);
       const box = document.createElement('section');
       box.className = 'day' + (key === todayIso ? ' now' : '');
@@ -232,8 +234,8 @@
   db.onChange(id, render);
   try { render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
 
-  $('prev').onclick = () => setStart(new Date(start.getTime() - 7 * DAY));
-  $('next').onclick = () => setStart(new Date(start.getTime() + 7 * DAY));
+  $('prev').onclick = () => setStart(addDays(start, -7));
+  $('next').onclick = () => setStart(addDays(start, 7));
   $('thisWeek').onclick = () => setStart(new Date(nowMs()));
   window.addEventListener('hashchange', () => { start = weekStart(); paint(); });
 

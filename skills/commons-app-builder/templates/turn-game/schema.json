@@ -7,15 +7,46 @@
       "template": "blank",
       "role": "primary",
       "props": [
-        { "name": "Game", "type": "number", "note": "Bump this for a new game; the board replays the highest Game only." },
-        { "name": "Seat", "type": "select", "options": [{ "name": "X" }, { "name": "O" }] },
-        { "name": "Row", "type": "number" },
-        { "name": "Col", "type": "number" },
-        { "name": "Created by", "type": "created_by" }
+        {
+          "name": "Game",
+          "type": "number",
+          "note": "Bump this for a new game; the board replays the highest Game only."
+        },
+        {
+          "name": "Seat",
+          "type": "select",
+          "options": [
+            {
+              "name": "X"
+            },
+            {
+              "name": "O"
+            }
+          ]
+        },
+        {
+          "name": "Row",
+          "type": "number"
+        },
+        {
+          "name": "Col",
+          "type": "number"
+        },
+        {
+          "name": "Created by",
+          "type": "created_by"
+        }
       ],
       "views": [
-        { "layout": "table", "name": "All moves" },
-        { "layout": "board", "name": "By seat", "groupBy": "Seat" }
+        {
+          "layout": "table",
+          "name": "All moves"
+        },
+        {
+          "layout": "board",
+          "name": "By seat",
+          "groupBy": "Seat"
+        }
       ],
       "summon_policy": "owner"
     }
@@ -24,7 +55,8 @@
   "notes": [
     "Append-only: a move is a new row, never an edit of a board cell, so two players cannot overwrite each other.",
     "Seat claims live in artifact.state (seat.X / seat.O) because they are room state, not moves. A seat is a convenience, not enforcement: anyone can add a row in a table view.",
-    "Whose turn it is = move count of the current game. X plays on even counts, O on odd. The page never stores 'turn' as data.",
+    "Whose turn it is = move count of the current game, and the MARK follows the same rule: the replay assigns X on even moves and O on odd, and skips a row whose Seat disagrees. A row claiming the wrong seat is therefore ignored rather than drawn out of turn.",
+    "Moves replay in the snapshot's own order, which is the rows' insertion order. Do not sort by row id: ids begin with the writing client's clock, so skew would decide who reached a square first.",
     "An agent player writes its moves as rows in the same shape."
   ]
 }

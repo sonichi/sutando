@@ -486,6 +486,191 @@ const SEATED = { 'seat.X': { id: 'u1', name: 'Tester' }, 'seat.O': { id: 'u2', n
   check('game/database-missing-error', () => assert.match(r.text(), /database is missing from this room/));
 }
 
+/* ===================================== review fixes (sonichi, #6308) ===== */
+/* 1. poll: one vote per voter, counted from created_by — repeat rows count once. */
+{
+  const rows = [
+    { id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } },
+    { id: 'r2', cells: { Voter: 'Tester', Choice: 'Coffee', 'Created by': ['@me:x'] } },
+    { id: 'r3', cells: { Voter: 'Other', Choice: 'Tea', 'Created by': ['@other:x'] } },
+  ];
+  const r = await run('poll', pollOpts({ rows }));
+  check('poll/repeat-rows-count-once', () => {
+    assert.match(r.byId.get('sub').textContent, /^2 votes/);     // not 3
+    assert.match(r.text(), /1 extra row .*not counted/);
+  });
+  check('poll/latest-row-is-the-persons-vote', () => {
+    // r2 (Coffee) is this voter's last row, so Coffee has 1 and Tea has 1.
+    assert.match(r.text(), /Coffee.*1.*50%/s);
+    assert.match(r.text(), /Tea.*1.*50%/s);
+  });
+  check('poll/own-vote-is-the-latest', () => assert.match(r.byId.get('sub').textContent, /you voted Coffee/));
+}
+{
+  // A voter with no created_by (should not happen; the server stamps it) still counts once each.
+  const rows = [
+    { id: 'r1', cells: { Voter: 'A', Choice: 'Tea' } },
+    { id: 'r2', cells: { Voter: 'B', Choice: 'Tea' } },
+  ];
+  const r = await run('poll', pollOpts({ rows }));
+  check('poll/rows-without-created-by-count-separately', () =>
+    assert.match(r.byId.get('sub').textContent, /^2 votes/));
+}
+/* 2. poll: consent granted during the retry edits the voter's row, never adds a second. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  let allow = false;                                  // consent arrives mid-retry
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const calls = [];
+  let fire = null;
+  const snap = () => ({ id: 'd1', name: 'Poll — Votes', props: POLL_PROPS, rows });
+  const art = {
+    ready: Promise.resolve(),
+    me: { id: 'u1', name: 'Tester', kind: 'human' },
+    app: { id: 'a1', name: 'T', database: 'd1' },
+    now: () => Date.now(),
+    members: async () => [],
+    personId: async (cell) => {
+      if (!allow) throw new Error('page permission required');
+      return cell && cell[0] === '@me:x' ? 'u1' : null;
+    },
+    state: { get: async () => undefined, set: async () => ({ ok: true }), delete: async () => ({ ok: true }), on: () => () => {} },
+    emit: () => {}, on: () => () => {},
+    pages: { list: async () => [], read: async () => null },
+    db: {
+      list: async () => [{ id: 'd1', name: 'Poll — Votes' }],
+      read: async () => snap(),
+      // Before the viewer answers, the bridge refuses writes too: that is what makes save() retry.
+      write: async (...a) => { calls.push(['write', ...a]); return allow ? { ok: true } : { ok: false, reason: 'waiting for the viewer’s answer' }; },
+      createRow: async (...a) => { calls.push(['createRow', ...a]); return allow ? { ok: true, rowId: 'rX' } : { ok: false, reason: 'waiting for the viewer’s answer' }; },
+      onChange: (d, fn) => { fire = fn; return () => {}; },
+    },
+  };
+  const sandbox = { window: { artifact: art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  // Before consent the page cannot tell whose vote is whose.
+  check('poll/retry-starts-without-consent', () => assert.match(dom.body.textContent, /your vote: \?/));
+  const coffee = dom.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent));
+  const clicked = coffee.click();
+  await settle(4);
+  allow = true;                                        // the viewer answers the prompt
+  // save() waits 1500ms between attempts, so the retry needs real time, not microtask ticks.
+  await new Promise((ok) => setTimeout(ok, 1800));
+  await settle();
+  check('poll/consent-mid-retry-edits-not-duplicates', () => {
+    assert.ok(clicked);
+    assert.ok(calls.length >= 1, 'a call was made');
+    // Pre-consent attempts are refused by the bridge, so they create nothing. Once consent
+    // lands, ownership is re-resolved and the retry EDITS the voter's row.
+    assert.deepEqual(calls[calls.length - 1].slice(0, 4), ['write', 'd1', 'r1', 'Choice']);
+    const created = calls.filter((c) => c[0] === 'createRow');
+    assert.ok(created.length <= 1, 'at most the one refused attempt: ' + JSON.stringify(calls));
+  });
+}
+/* 3. poll: a second control cannot fire while the first write is pending. */
+{
+  let release = null;
+  const held = new Promise((r) => { release = r; });
+  const rows = [];
+  const base = fakeArtifact(pollOpts({ rows }));
+  const calls = base.calls;
+  base.art.db.createRow = async (...a) => { calls.push(['createRow', ...a]); await held; return { ok: true, rowId: 'r1' }; };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  const bs = dom.byId.get('choices').buttons();
+  bs[0].click();
+  await settle(3);
+  const second = bs[1].click();
+  await settle(3);
+  release({ ok: true });
+  await settle();
+  check('poll/sibling-controls-locked-while-writing', () => {
+    assert.equal(second, false, 'the sibling was disabled');
+    assert.equal(calls.filter((c) => c[0] === 'createRow').length, 1, JSON.stringify(calls));
+  });
+}
+/* 4. turn-game: a row claiming the wrong seat is skipped, not drawn out of turn. */
+{
+  const rows = [mv('m1', 1, 'X', 1, 1), mv('m2', 1, 'X', 2, 2)];   // second X on O's turn
+  const r = await run('turn-game', gameOpts({ rows, state: SEATED }));
+  check('game/out-of-turn-row-skipped', () => {
+    assert.equal(r.byId.get('board').children[0].textContent, 'X');
+    assert.equal(r.byId.get('board').children[4].textContent, '', 'the out-of-turn row is not drawn');
+    assert.match(r.byId.get('sub').textContent, /1 move/);
+    assert.match(r.byId.get('status').textContent, /Waiting for O/);
+  });
+}
+{
+  // A seatless row (a table-view row with no Seat) takes the turn it lands on.
+  const rows = [mv('m1', 1, 'X', 1, 1), { id: 'm2', cells: { Game: 1, Row: 2, Col: 2 } }];
+  const r = await run('turn-game', gameOpts({ rows, state: SEATED }));
+  check('game/seatless-row-takes-the-turn-it-lands-on', () => {
+    assert.equal(r.byId.get('board').children[4].textContent, 'O');
+    assert.match(r.byId.get('status').textContent, /Your turn as X/);
+  });
+}
+/* 5. turn-game: the board locks while a move is in flight. */
+{
+  let release = null;
+  const held = new Promise((r) => { release = r; });
+  const base = fakeArtifact(gameOpts({ rows: [], state: SEATED }));
+  const calls = base.calls;
+  base.art.db.createRow = async (...a) => { calls.push(['createRow', ...a]); await held; return { ok: true, rowId: 'r1' }; };
+  const html = readFileSync(join(TPL, 'turn-game', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  const cells = dom.byId.get('board').children;
+  cells[0].click();
+  await settle(3);
+  const second = cells[8].click();
+  await settle(3);
+  release({ ok: true });
+  await settle();
+  check('game/board-locked-while-a-move-is-in-flight', () => {
+    assert.equal(second, false);
+    assert.equal(calls.filter((c) => c[0] === 'createRow').length, 1, JSON.stringify(calls));
+  });
+}
+/* 6. planner: Next keeps advancing across a daylight-saving fallback. */
+{
+  // 2026-11-01 is the US fallback. Week of Mon 2026-10-26 must advance, not stick.
+  const r = await run('planner', plannerOpts({ rows: [], hash: 'week=2026-10-26' }));
+  check('planner/dst-start-week', () => assert.equal(r.byId.get('range').textContent, '2026-10-26 → 2026-11-01'));
+  r.byId.get('next').click();
+  await settle();
+  check('planner/next-advances-across-dst', () =>
+    assert.equal(r.byId.get('range').textContent, '2026-11-02 → 2026-11-08'));
+  r.byId.get('next').click();
+  await settle();
+  check('planner/next-advances-again-after-dst', () =>
+    assert.equal(r.byId.get('range').textContent, '2026-11-09 → 2026-11-15'));
+  r.byId.get('prev').click();
+  r.byId.get('prev').click();
+  await settle();
+  check('planner/prev-crosses-dst-back', () =>
+    assert.equal(r.byId.get('range').textContent, '2026-10-26 → 2026-11-01'));
+  check('planner/seven-days-across-dst', () => assert.equal(r.byId.get('week').children.length, 7));
+}
+
 console.log(failures.length
   ? `FAIL commons-app-builder templates: ${failures.length} failed\n  ${failures.join('\n  ')}`
   : `all passed — commons-app-builder templates: ${passed} checks`);

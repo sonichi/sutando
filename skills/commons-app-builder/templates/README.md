@@ -16,9 +16,18 @@ while the viewer has not answered the consent prompt, and ownership shown as `?`
 | Template | Use it when | Shape |
 | --- | --- | --- |
 | [`tracker/`](tracker/) | Work with an owner and a deadline: issues, chores, requests, a review queue. The one to pick when an **agent should do the work** on a row. | One database. `Status` drives a board; `Actor` + the database's summon policy hand a row to an agent, which writes back into `Outcome`. |
-| [`poll/`](poll/) | A decision to take: a vote, a preference, a show of hands, picking a date. | One row per vote. A person's own vote is found through `created_by`, so a tally cannot be forged by editing a text cell. Results are live. |
+| [`poll/`](poll/) | A decision to take: a vote, a preference, a show of hands, picking a date. | One row per vote, **one vote counted per person**: the tally groups by `created_by` and takes each person's latest row, so repeat rows cannot inflate a count. Results are live. |
 | [`planner/`](planner/) | Anything dated across a week: a rota, a schedule, a meal plan, a trip. | Dated rows plus a day part. Seven columns on a wide screen, one scrolling list of days on a phone. The week on screen is per viewer, in the hash. |
-| [`turn-game/`](turn-game/) | Two people taking turns: tic-tac-toe as shipped, and the shape for gomoku, checkers or any board game. | Append-only move rows. The board is replayed from the rows and whose turn it is follows from the move count, so two players never overwrite each other. |
+| [`turn-game/`](turn-game/) | Two people taking turns: tic-tac-toe as shipped, and the shape for gomoku, checkers or any board game. | Append-only move rows, replayed in insertion order. Both the turn **and each mark** follow the move count, so a row claiming the wrong seat is skipped rather than drawn out of turn. |
+
+### What they do not enforce
+
+A page is a convenience over a shared database, not a permission boundary. Anyone the room lets
+write can still open the table view and edit any row — change a vote's `Choice`, add a move, mark
+someone else's item done. What the templates *do* guarantee is that **authorship cannot be
+forged** (`created_by` is stamped by the server) and that the pages never present a forgeable
+field as identity. Say this plainly when you hand an app over, rather than implying the page
+controls who may do what.
 
 A sign-up sheet is the worked example in [GUIDE.md](../GUIDE.md), not a template here.
 For something with no obvious shape, read the "Patterns from apps that shipped" section.

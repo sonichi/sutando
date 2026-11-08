@@ -92,18 +92,30 @@
     }
   };
 
-  let titleProp = null, myRow = null, consentKnown = true, busy = false;
+  let titleProp = null, myRow = null, consentKnown = true, busy = false, snapshot = null;
+
+  // A voter's identity for counting. The created_by cell is account ids, stamped by the server,
+  // so one vote per person can be counted without the viewer's consent (personId needs it).
+  const voterKey = (cell) => (Array.isArray(cell) ? cell.join(',') : cell == null ? '' : String(cell));
+
+  // One vote per voter: their last row wins. Snapshot order is the rows' insertion order.
+  const counted = (rows) => {
+    const latest = new Map();
+    rows.forEach((r) => { latest.set(voterKey(r.cells['Created by']) || 'row:' + r.id, r); });
+    return [...latest.values()];
+  };
 
   // Who wrote each vote. personId rejects until the viewer allows the page, and then the page
   // cannot tell its own vote from anyone else's: it shows "?" rather than claiming none.
   const findMine = async (snap) => {
     myRow = null;
     consentKnown = true;
+    // The LAST of the viewer's rows, so "your vote" is the one the tally counts.
     for (const row of snap.rows) {
       try {
         const who = await art.personId(row.cells['Created by']);
-        if (who && art.me && who === art.me.id) { myRow = row; break; }
-      } catch (e) { consentKnown = false; return; }
+        if (who && art.me && who === art.me.id) myRow = row;
+      } catch (e) { consentKnown = false; myRow = null; return; }
     }
   };
 
@@ -115,22 +127,25 @@
     const options = (choice && choice.options) || [];
     if (!options.length) { show('bad', 'The Choice column has no options yet, so there is nothing to vote on.'); return; }
 
-    // One row per vote; a person's own vote is their created_by row.
+    // One row per vote, one vote per voter: repeat rows from one person count once.
     const tally = {};
     options.forEach((o) => { tally[o.name] = 0; });
-    let counted = 0;
-    snap.rows.forEach((r) => {
+    const votes = counted(snap.rows);
+    let total = 0;
+    votes.forEach((r) => {
       const c = r.cells.Choice;
-      if (c && Object.prototype.hasOwnProperty.call(tally, c)) { tally[c] += 1; counted += 1; }
+      if (c && Object.prototype.hasOwnProperty.call(tally, c)) { tally[c] += 1; total += 1; }
     });
+    const ignored = snap.rows.length - votes.length;
 
-    $('sub').textContent = counted + (counted === 1 ? ' vote' : ' votes') +
+    $('sub').textContent = total + (total === 1 ? ' vote' : ' votes') +
       (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');
     if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');
+    if (ignored > 0) show('warn', ignored + (ignored === 1 ? ' extra row' : ' extra rows') + ' from someone who already voted are not counted.');
 
     const res = $('results');
     res.textContent = '';
-    if (!counted) {
+    if (!total) {
       const li = document.createElement('li');
       li.className = 'res';
       li.textContent = 'No votes yet. Pick an option below to be first.';
@@ -151,13 +166,13 @@
           left.appendChild(you);
         }
         const right = document.createElement('span');
-        right.textContent = n + '  ·  ' + Math.round((n / counted) * 100) + '%';
+        right.textContent = n + '  ·  ' + Math.round((n / total) * 100) + '%';
         top.appendChild(left); top.appendChild(right);
         const track = document.createElement('div');
         track.className = 'track';
         const fill = document.createElement('div');
         fill.className = 'fill';
-        fill.style.width = Math.round((n / counted) * 100) + '%';
+        fill.style.width = Math.round((n / total) * 100) + '%';
         track.appendChild(fill);
         li.appendChild(top); li.appendChild(track);
         res.appendChild(li);
@@ -174,22 +189,27 @@
       b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);
       b.setAttribute('aria-label', 'Vote for ' + o.name);
       b.onclick = async () => {
+        if (busy) return;                                  // one vote in flight at a time
         busy = true;
-        b.disabled = true;
+        const all = [...box.children];
+        all.forEach((other) => { other.disabled = true; });
         const comment = $('comment').value.trim();
-        let r;
-        if (myRow) {
-          // Change the existing vote rather than adding a second row.
-          r = await save(() => db.write(id, myRow.id, 'Choice', o.name));
-          if (r.ok && comment) await save(() => db.write(id, myRow.id, 'Comment', comment));
-        } else {
+        // Ownership is resolved inside the retried call: consent granted mid-retry turns this
+        // from a second row into an edit of the voter's own.
+        const r = await save(async () => {
+          if (snapshot) await findMine(snapshot);
+          if (myRow) {
+            const w = await db.write(id, myRow.id, 'Choice', o.name);
+            if (w.ok && comment) await db.write(id, myRow.id, 'Comment', comment);
+            return w;
+          }
           const values = { Choice: o.name };
           if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
           if (comment) values.Comment = comment;
-          r = await save(() => db.createRow(id, values));
-        }
+          return db.createRow(id, values);
+        });
         busy = false;
-        b.disabled = false;
+        all.forEach((other) => { other.disabled = false; });
         if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');
       };
       box.appendChild(b);
@@ -197,6 +217,7 @@
   };
 
   const render = async (snap) => {
+    snapshot = snap;
     if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }
     await findMine(snap);
     draw(snap);

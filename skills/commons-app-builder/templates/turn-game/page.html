@@ -131,18 +131,24 @@
   let snapshot = null, titleProp = null, busy = false;
 
   const replay = (rows) => {
-    // Highest Game number only; the board is the replay of its moves in order.
+    // Highest Game number only; the board is the replay of its moves in the snapshot's own
+    // order, which is the rows' insertion order. Sorting by row id would let the writing
+    // clients' clock skew decide who reached a square first.
     const game = rows.reduce((m, r) => Math.max(m, Number(r.cells.Game) || 1), 1);
     const moves = rows
       .filter((r) => (Number(r.cells.Game) || 1) === game)
-      .filter((r) => Number(r.cells.Row) >= 1 && Number(r.cells.Row) <= 3 && Number(r.cells.Col) >= 1 && Number(r.cells.Col) <= 3)
-      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      .filter((r) => Number(r.cells.Row) >= 1 && Number(r.cells.Row) <= 3 && Number(r.cells.Col) >= 1 && Number(r.cells.Col) <= 3);
     const cells = new Array(9).fill('');
     let placed = 0;
     moves.forEach((r) => {
       const i = (Number(r.cells.Row) - 1) * 3 + (Number(r.cells.Col) - 1);
       if (cells[i]) return;                                  // first move to a square wins it
-      cells[i] = r.cells.Seat === 'O' ? 'O' : 'X';
+      // The mark follows the turn, not the row's Seat cell: a row claiming the wrong seat (a
+      // table-view edit, a second tab, the other player's tab) is skipped rather than drawn
+      // out of turn, so the board can never show two X moves in a row.
+      const expect = placed % 2 === 0 ? 'X' : 'O';
+      if (r.cells.Seat && r.cells.Seat !== expect) return;
+      cells[i] = expect;
       placed += 1;
     });
     let win = null, winner = '';
@@ -218,8 +224,10 @@
     box.appendChild(again);
 
     drawBoard(g.cells, g.win, async (i, b) => {
-      b.disabled = true;
+      if (busy) return;                                      // one move in flight at a time
       busy = true;
+      const cells = $('board').children;
+      [...cells].forEach((c) => { c.disabled = true; });
       const values = {
         Game: g.game,
         Seat: seat,
@@ -229,7 +237,10 @@
       if (titleProp) values[titleProp] = seat + ' r' + values.Row + 'c' + values.Col;
       const r = await save(() => db.createRow(id, values));
       busy = false;
-      if (!r.ok) { show('bad', r.reason || 'Your move was not saved.'); b.disabled = false; }
+      if (!r.ok) {
+        show('bad', r.reason || 'Your move was not saved.');
+        [...cells].forEach((c, n) => { c.disabled = !!g.cells[n]; });
+      }
     }, !over && !!seat && seat === g.turn && !busy);
 
     $('moves').textContent = over ? '' : (seat ? '' : 'Seats are a convenience: anyone with the table can still add a row.');
