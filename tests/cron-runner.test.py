@@ -359,6 +359,70 @@ def test_run_only_fires_launchd_entries():
         check(emitted2 == [], "no double-fire: persisted state suppresses re-emit")
 
 
+def test_run_skips_entry_marked_disabled():
+    # `"disabled": true` was read by health-check only, so the launchd runner
+    # kept emitting parked entries.
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        now = _epoch(2026, 7, 2, 6, 2)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "parked", "cron": "2 6 * * *", "prompt": "x",
+             "launchd": True, "disabled": True},
+            {"name": "parked-by-name-DISABLED", "cron": "2 6 * * *", "prompt": "x",
+             "launchd": True},
+            {"name": "live", "cron": "2 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({
+            "parked": _epoch(2026, 7, 2, 6, 1),
+            "parked-by-name-DISABLED": _epoch(2026, 7, 2, 6, 1),
+            "live": _epoch(2026, 7, 2, 6, 1),
+        }))
+        _mark_core_alive(root, now)
+        emitted = cr.run(now_epoch=now)
+        check(emitted == ["live"], "a disabled entry does not fire; the live one still does")
+        files = sorted(f.name for f in cr.TASKS_DIR.glob("task-cron-*.txt"))
+        check(len(files) == 1, "exactly one task file emitted, for the live entry")
+        check(all("parked" not in f for f in files), "no task file for a parked entry")
+
+
+def test_disabled_entry_boundary_advances_so_reenable_is_clean():
+    # Skipping without advancing state would leave `last` stale, so re-enabling
+    # an entry replays a slot from while it was off.
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        now = _epoch(2026, 7, 2, 6, 2)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "parked", "cron": "2 6 * * *", "prompt": "x",
+             "launchd": True, "disabled": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"parked": _epoch(2026, 7, 1, 6, 1)}))
+        _mark_core_alive(root, now)
+        emitted = cr.run(now_epoch=now)
+        state = json.loads(cr.STATE_FILE.read_text())
+        # Without the no-emit assertion this passes on the unfixed runner too:
+        # a fired entry advances the same boundary.
+        check(emitted == [], "parked entry emitted nothing")
+        check(state.get("parked") == now, "boundary advanced while parked")
+
+        # Re-enable: the entry is live again but its slot already passed, so the
+        # next tick in the same minute must not emit a catch-up fire.
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "parked", "cron": "2 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        emitted = cr.run(now_epoch=now)
+        check(emitted == [], "re-enabling does not replay the slot missed while parked")
+
+
 def test_run_skips_entry_missing_name_or_expr():
     # Line 183: `continue` for entries missing name or cron — defensive guard
     # against malformed crons.json entries (typo or partial write).

@@ -440,6 +440,27 @@ def test_minute_slots_health_and_install_edges():
         assert not (Path(td) / "home2").exists(), "an empty schedule must write no plist"
 
 
+def test_disabled_entries_get_no_durable_owner():
+    # `"disabled": true` is honoured by every scheduler, not health-check alone.
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "crons.json"
+        path.write_text(json.dumps([
+            {"execution": "codex-task", "name": "parked", "cron": "* * * * *",
+             "prompt": "x", "disabled": True},
+            {"execution": "codex-task", "name": "parked-DISABLED", "cron": "* * * * *",
+             "prompt": "x"},
+            {"execution": "codex-task", "name": "live", "cron": "* * * * *", "prompt": "x"},
+        ]))
+        assert [j["name"] for j in scheduler.load_jobs(path)] == ["live"]
+
+        # A parked canonical main-loop stays parked on the implicit path too.
+        path.write_text(json.dumps([
+            {"name": "main-loop", "cron": "0 0 31 2 *",
+             "prompt_skill": "proactive-loop", "disabled": True},
+        ]))
+        assert scheduler.load_jobs(path, include_main_loop=True) == []
+
+
 def test_missing_crons_json_means_no_jobs():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td) / "workspace"
@@ -514,6 +535,7 @@ def main():
         test_install_plist,
         test_minute_slots_health_and_install_edges,
         test_missing_crons_json_means_no_jobs,
+        test_disabled_entries_get_no_durable_owner,
         test_main_dispatch_and_error_handling,
     ]
     for test in tests:
