@@ -12,6 +12,9 @@ a card instead, through the engine's hitl store:
 - a frozen turn: the card offers "Send Escape". Nothing is typed unless the owner
   presses it, and `drive_escapes` re-reads the pane first: a pane that no longer
   shows the same frozen frame is refused and nothing is typed.
+- undelivered work behind the pane-keys fence: the card offers "Clear the send fence".
+  Nothing is cleared unless the owner presses it, and `drive_fence_clears` re-reads the
+  fence first: a send in flight is refused, and an already-clear fence only closes the card.
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ import tmux_pane_keys  # noqa: E402
 
 SOURCE = "pool-wedge"
 ESCAPE_ACTION = "send_escape"
+FENCE_ACTION = "clear_send_fence"
 PROXY_ACTION = "restart_credential_proxy"
 PROXY_LABEL = "com.sutando.credential-proxy"
 # What src/restart.sh runs for a launchd-supervised proxy; named, never run from here.
@@ -197,17 +201,21 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
                 f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
                 "its task appears not to have been delivered."]
+        actions = [_jump(session)]
         if cause == "pane-key-fence":
-            body += ["", f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
-                     "(docs/codex-core.md). Once no send can still be in flight, clear it with:",
-                     f"  python3 src/tmux_pane_keys.py recover {socket}",
-                     "The retained tasks are typed in on the notifier's next wake."]
+            body += ["", "Cause: an earlier automated send to this worker was interrupted, so it cannot be "
+                     "told whether those keys arrived, and sends stay blocked by the pane-keys fence "
+                     f"(docs/codex-core.md) until that is settled. If nothing is still typing into {session}, "
+                     "press Clear the send fence: the fence is checked again first, and the waiting tasks are "
+                     "typed in on the notifier's next wake. From a terminal, the same recovery is:",
+                     f"  python3 src/tmux_pane_keys.py recover {socket}"]
+            actions.insert(0, Action(id=FENCE_ACTION, kind="confirmation", label="Clear the send fence"))
         else:
             body += ["", f"Cause: not identified. The {session}-watcher session logs each delivery "
                      "attempt and why it was refused."]
         subject.update(cause=[cause] if cause else [])
         req = choice_request(
-            "\n".join(body), [_jump(session)], f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
+            "\n".join(body), actions, f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
             subject, runtime=runtime, title=f"{seat} · tasks not delivered", device=device,
             kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_FROZEN:
@@ -295,6 +303,41 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
         _note(manager, r.id, escape_sent=sent)
         (manager.resolve if sent else manager.expire)(r.id)
         out[r.id] = "sent" if sent else "failed"
+    return out
+
+
+def drive_fence_clears(workspace, *, runner=subprocess.run, manager=None) -> dict:
+    """Run the pane-keys recovery for each pressed fence card whose fence is still uncertain; a send in
+    flight is refused and nothing is cleared, and a fence already clear only closes the card."""
+    from hitl.schema import STATUS_IN_PROGRESS
+    manager = manager or manager_for(workspace)
+    out = {}
+    for r in manager.active():
+        subj = r.subject or {}
+        if (subj.get("source") != SOURCE or subj.get("wedge") != ps.CARD_UNDELIVERED
+                or r.status != STATUS_IN_PROGRESS or r.chosen_action != FENCE_ACTION):
+            continue
+        socket = (r.device or {}).get("socket")
+        state = tmux_pane_keys.fence_status(socket) if socket else "busy"
+        if state == "clear":
+            _note(manager, r.id, fence="already-clear")
+            manager.resolve(r.id)
+            out[r.id] = "already-clear"
+            continue
+        if state != "uncertain":
+            _note(manager, r.id, refused="a send was in flight; nothing was cleared")
+            manager.expire(r.id)
+            out[r.id] = "refused"
+            continue
+        recover = [sys.executable, str(Path(tmux_pane_keys.__file__).resolve()), "recover", str(socket)]
+        try:
+            cleared = runner(recover, capture_output=True, text=True,
+                             timeout=tmux_pane_keys.TIMEOUT_S).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            cleared = False
+        _note(manager, r.id, fence_cleared=cleared)
+        (manager.resolve if cleared else manager.expire)(r.id)
+        out[r.id] = "cleared" if cleared else "failed"
     return out
 
 

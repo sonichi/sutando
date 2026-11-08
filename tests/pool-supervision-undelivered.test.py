@@ -214,6 +214,63 @@ with mock.patch.object(rem.sup, "is_paused", return_value=True), \
     rem.apply(ws_p, str(REPO), {WID: ps.CARD_UNDELIVERED}, runner=Tmux(IDLE))
 check("a seat paused after the sweep is not carded", raised, [])
 
+# --- the owner clears the fence from the card (#6303) -------------------------------------
+from hitl.schema import ActionReply, STATUS_EXPIRED, STATUS_RESOLVED  # noqa: E402
+
+
+def fenced_card(name):
+    sock = tmp / f"{name}.sock"
+    tpk.prepare_guard(sock)
+    (tpk.guard_path(sock) / "mutex").unlink()
+    ws = pool(sock)
+    out, t, req = card(ws, IDLE)
+    return sock, ws, req, HitlManager(HitlStore(ws / "state" / "hitl" / "requirements"))
+
+
+def press(m, req, action_id):
+    m.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision, action_id=action_id,
+                               guard=req.guard))
+
+
+class Runner:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv))
+        return type("Done", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+sock, ws_f, req, m = fenced_card("fence-press")
+check("the fence card offers Clear the send fence", [a.id for a in req.actions][:1], [wc.FENCE_ACTION])
+check("and keeps the terminal recovery line", f"tmux_pane_keys.py recover {sock}" in req.message, True)
+check("it stays a core-blocked card, so reminders keep running", req.kind, "core-blocked")
+r = Runner()
+check("unpressed, nothing is cleared", (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.calls), ({}, []))
+press(m, req, wc.FENCE_ACTION)
+check("pressed on an uncertain fence, the real recovery runs and reports cleared",
+      wc.drive_fence_clears(ws_f, manager=m), {req.id: "cleared"})
+check("the fence then reads clear", tpk.fence_status(sock), "clear")
+check("and the card is resolved", m.get(req.id).status, STATUS_RESOLVED)
+
+sock, ws_f, req, m = fenced_card("fence-busy")
+press(m, req, wc.FENCE_ACTION)
+r = Runner()
+with mock.patch.object(wc.tmux_pane_keys, "fence_status", return_value="busy"):
+    out_busy = wc.drive_fence_clears(ws_f, runner=r, manager=m)
+check("a send in flight at press time is refused and nothing is run", (out_busy, r.calls), ({req.id: "refused"}, []))
+check("and the card expires", m.get(req.id).status, STATUS_EXPIRED)
+
+sock, ws_f, req, m = fenced_card("fence-cleared-meanwhile")
+press(m, req, wc.FENCE_ACTION)
+r = Runner()
+with mock.patch.object(wc.tmux_pane_keys, "fence_status", return_value="clear"):
+    out_clear = wc.drive_fence_clears(ws_f, runner=r, manager=m)
+check("a fence already clear only closes the card", (out_clear, r.calls), ({req.id: "already-clear"}, []))
+
+out, _, req = card(pool(tmp / "unfenced.sock"), IDLE)
+check("a card with no fence offers no clear button", wc.FENCE_ACTION in [a.id for a in req.actions], False)
+
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — undelivered work escalates")
 for f in fails:
     print("   ", f)
