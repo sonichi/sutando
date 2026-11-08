@@ -5949,7 +5949,8 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
     `recent_rejections` in quota-state.json; this probe reads only that ledger.
 
     The proxy serves every seat on the host, so the ledger mixes clients. Each
-    entry carries the request's `model`; when this core's own model is known
+    entry carries the request's `model` -- the model the seat ASKED for, even
+    when a fallback rewrite ran it on another (`effective_model`); when this core's own model is known
     (`SUTANDO_CORE_MODEL` or core-runtime.json), only entries for that model
     count toward the thresholds and the rest are reported as other clients'.
     When it is unknown, every entry counts and the detail says so, because a
@@ -6005,8 +6006,12 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
     in_hour = [p for p in mine if now - p[1] <= hour_sec]
     in_window = [p for p in mine if now - p[1] <= window_sec]
     age_min = int(max(now - last_t, 0) / 60)
-    what = (f"last: HTTP {last_entry.get('status')} {age_min}m ago, model={last_entry.get('model') or '?'} — "
-            f"{str(last_entry.get('snippet') or '')[:160]!r}")
+    # `model` is the seat's REQUESTED model (what attribution counts by); a fallback
+    # rewrite records what actually ran as `effective_model`, so name both (#5275).
+    served = last_entry.get("effective_model")
+    served_note = f" (served as {served})" if served and served != last_entry.get("model") else ""
+    what = (f"last: HTTP {last_entry.get('status')} {age_min}m ago, model={last_entry.get('model') or '?'}"
+            f"{served_note} — {str(last_entry.get('snippet') or '')[:160]!r}")
     remedy = ("; the CLI drops the fire and prints the error in the pane of the seat that was "
               "rejected, so run /usage-credits (or /model to switch) there")
     if len(in_hour) >= sustained:

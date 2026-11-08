@@ -371,6 +371,10 @@ export interface RejectionRecord {
 	// The proxy serves every seat on a host, so a rejection is attributable only
 	// by what the request carried: the model, the CLI's user-agent, the peer port.
 	model?: string;
+	// The model that actually ran, only when a fallback rewrite changed it.
+	// `model` stays the REQUESTED one: it is the seat's identity, and every
+	// consumer finds its seat by it.
+	effective_model?: string;
 	user_agent?: string;
 	peer_port?: number;
 }
@@ -392,12 +396,12 @@ function isRejectionRecord(x: unknown): x is RejectionRecord {
 }
 
 /** Append one rejection to a (possibly foreign/corrupt) prior ledger, keeping the newest `max`. */
-export interface LastRequest { model: string; at: string }
+export interface LastRequest { model: string; at: string; effective_model?: string }
 
 /** The model that last consumed quota through this proxy, carried across
  *  requests that name none (a non-messages call must not blank the tile). */
-export function withLastRequest(prev: unknown, model: string, at: string): LastRequest | undefined {
-	if (model) return { model, at };
+export function withLastRequest(prev: unknown, model: string, at: string, effectiveModel = ''): LastRequest | undefined {
+	if (model) return effectiveModel && effectiveModel !== model ? { model, at, effective_model: effectiveModel } : { model, at };
 	const old = (prev as { last_request?: unknown } | null)?.last_request;
 	if (old && typeof old === 'object' && typeof (old as LastRequest).model === 'string' && (old as LastRequest).model
 		&& typeof (old as LastRequest).at === 'string') return old as LastRequest;
@@ -445,7 +449,8 @@ export interface ProxyDeps {
 	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
-	updateQuotaState: (headers: Record<string, string>, model?: string) => void;
+	/** `model` is the REQUESTED model (the seat's identity); `effectiveModel` the one sent upstream. */
+	updateQuotaState: (headers: Record<string, string>, model?: string, effectiveModel?: string) => void;
 	recordRejection: (rej: RejectionRecord) => void;
 	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
@@ -651,8 +656,12 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			const requested = requestModel(body);
 			const decision = decideModel(requested, fallbackState, deps.fallbackConfig(), priority);
 			let sendBody: Buffer = body;
+			// What went upstream, exactly (the rewrite keeps a variant such as `[1m]`);
+			// "" when nothing was rewritten.
+			let effective = '';
 			if (decision.rewritten) {
 				sendBody = rewriteModel(body, decision.model);
+				effective = requestModel(sendBody);
 				headers['content-length'] = sendBody.length;
 				console.log(`${ts()} [Fallback] ${requested} → ${decision.model} (tier ${fallbackState?.tier ?? 1}${priority === 'low' ? ', low priority' : ''})`);
 			}
@@ -716,7 +725,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						}
 						if (Object.keys(quotaHeaders).length > 0) {
 							console.log(`${ts()} [Quota]`, quotaHeaders);
-							deps.updateQuotaState(quotaHeaders, requestModel(sendBody));
+							// Stamp the seat by what it ASKED for; a rewrite must not move its quota
+							// or its rejections onto another seat (#5275 review).
+							deps.updateQuotaState(quotaHeaders, requested, effective || undefined);
 							observeQuota(quotaHeaders);
 						}
 
@@ -762,12 +773,13 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							});
 							upRes.on('end', () => {
 								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
-								const model = requestModel(sendBody);
-								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
+								const model = requested;
+								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'}${effective ? ` (served as ${effective})` : ''} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
 									deps.recordRejection({
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
-										model, user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
+										model, ...(effective ? { effective_model: effective } : {}),
+										user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
 									});
 								} catch { /* best effort */ }
 							});
@@ -926,11 +938,11 @@ function recordCredentialState(state: CredentialState, detail = ''): void {
 
 /** The record one header-bearing response writes; it replaces the file. */
 export function quotaStateFromHeaders(
-	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string,
+	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string, effectiveModel = '',
 ): Record<string, unknown> {
 	// The header write replaces the file, so carry the rejection ledger across it.
 	const prevLedger = prev.recent_rejections;
-	const lastRequest = withLastRequest(prev, model, nowIso);
+	const lastRequest = withLastRequest(prev, model, nowIso, effectiveModel);
 	const state: Record<string, unknown> = {
 		available: true,
 		last_checked: nowIso,
@@ -968,9 +980,9 @@ export function quotaStateFromHeaders(
 	return state;
 }
 
-function updateQuotaState(headers: Record<string, string>, model = ''): void {
+function updateQuotaState(headers: Record<string, string>, model = '', effectiveModel = ''): void {
 	try {
-		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString()));
+		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString(), effectiveModel));
 	} catch { /* best effort */ }
 }
 

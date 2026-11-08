@@ -27,7 +27,7 @@ interface Seen { body: string; headers: IncomingMessage['headers'] }
 interface Harness {
 	port: number;
 	seen: Seen[];
-	quotaWrites: Array<[Record<string, string>, string | undefined]>;
+	quotaWrites: Array<[Record<string, string>, string | undefined, string | undefined]>;
 	recorded: FallbackState[];
 	notified: string[];
 	setUpstreamHeaders: (h: Record<string, string>) => void;
@@ -58,7 +58,7 @@ async function start(cfg: FallbackConfig = CFG, initial: FallbackState | null = 
 		refreshAccessToken: async () => null,
 		request: httpRequest as unknown as typeof httpsRequest,
 		upstreamUrl: new URL(`http://127.0.0.1:${upstreamPort}`),
-		updateQuotaState: (headers, model) => { h.quotaWrites.push([headers, model]); },
+		updateQuotaState: (headers, model, effective) => { h.quotaWrites.push([headers, model, effective]); },
 		recordRejection: () => {},
 		recordCredentialState: () => {},
 		now: () => NOW,
@@ -114,7 +114,12 @@ test('at 0.50 the request goes upstream unchanged; at 0.86 the next Fable reques
 	assert.strictEqual(JSON.parse(sent.body).model, 'claude-opus-5-5[1m]', 'rewritten to the tier-2 model, variant kept');
 	assert.deepStrictEqual(JSON.parse(sent.body).messages, [{ role: 'user', content: 'hi' }]);
 	assert.strictEqual(Number(sent.headers['content-length']), Buffer.byteLength(sent.body), 'content-length matches the rewritten body');
-	assert.strictEqual(h.quotaWrites.at(-1)?.[1], 'claude-opus-5-5[1m]', 'the quota stamp names the model that consumed quota');
+	// The stamp is the seat's identity, so it names what the seat ASKED for; the
+	// model that actually ran travels beside it (#5275 review: stamping the rewritten
+	// model moved an Opus seat's quota and rejections onto Sonnet).
+	assert.strictEqual(h.quotaWrites.at(-1)?.[1], 'claude-fable-5-1[1m]', 'the quota stamp names the requested model');
+	assert.strictEqual(h.quotaWrites.at(-1)?.[2], 'claude-opus-5-5[1m]', 'and carries the model that ran, variant kept');
+	assert.strictEqual(h.quotaWrites[0]?.[2], undefined, 'an unrewritten request carries no effective model');
 	assert.strictEqual(h.quotaWrites.at(-1)?.[0]['anthropic-ratelimit-unified-7d-utilization'], '0.86', 'response headers still update state');
 	assert.strictEqual(h.notified.length, 1, 'one DM per tier change, not per request');
 

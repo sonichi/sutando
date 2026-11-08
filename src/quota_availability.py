@@ -375,7 +375,12 @@ def seat_model(env: SeatEnv, workspace) -> Optional[str]:
 
 
 def record_model(quota: Any) -> Optional[str]:
-    """The model of the request that last refreshed the record, if it says."""
+    """The model the request that last refreshed the record ASKED for, if it says.
+
+    That is the seat's identity, so it is what `record_speaks_for_seat` compares.
+    When the credential proxy's fallback rewrote the request, the model that
+    actually ran is `last_request.effective_model` -- never compared here, or an
+    Opus seat served by Sonnet could never vouch for itself (#5275)."""
     payload = quota if isinstance(quota, dict) else {}
     last = payload.get("last_request")
     return _norm_model(last.get("model")) if isinstance(last, dict) else None
