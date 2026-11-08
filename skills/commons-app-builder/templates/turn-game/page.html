@@ -195,12 +195,16 @@
         if (busy) return;                              // one seat at a time: X then O must not claim both
         busy = true;
         [...box.children].forEach((el) => { el.disabled = true; });
+        let failed = null;
         try {
           await art.state.set('seat.' + s, { id: art.me.id, name: (art.me && art.me.name) || s });
           await readSeats();
-        } catch (e) { show('bad', e.message || 'The seat could not be taken.'); }
+        } catch (e) { failed = e.message || 'The seat could not be taken.'; }
         busy = false;
+        // Re-render first, then report: render() clears the notes, so showing it earlier
+        // would erase the message.
         if (snapshot) render(snapshot);
+        if (failed) show('bad', failed);
       };
       box.appendChild(b);
     });
@@ -213,10 +217,12 @@
         if (busy) return;
         busy = true;
         [...box.children].forEach((el) => { el.disabled = true; });
+        let failed = null;
         try { await art.state.delete('seat.' + seat); await readSeats(); }
-        catch (e) { show('bad', e.message || 'The seat could not be freed.'); }
+        catch (e) { failed = e.message || 'The seat could not be freed.'; }
         busy = false;
         if (snapshot) render(snapshot);
+        if (failed) show('bad', failed);
       };
       box.appendChild(leave);
     }

@@ -45,11 +45,16 @@ class El {
   set textContent(v) {
     const t = v == null ? '' : String(v);
     this.children = t === '' ? [] : [new Txt(t)];
+    // A real <select> loses its options when its content is replaced.
+    if (this.tagName === 'SELECT') this.options = [];
   }
   appendChild(node) {
     if (node && node.isFragment) { node.children.forEach((c) => this.appendChild(c)); return node; }
     this.children.push(node);
-    if (this.tagName === 'SELECT' && node.tagName === 'OPTION') this.options.push(node);
+    if (this.tagName === 'SELECT' && node.tagName === 'OPTION') {
+      this.options.push(node);
+      if (!this.value) this.value = node.value;      // the browser selects the first option
+    }
     return node;
   }
   setAttribute(k, v) { this.attrs[k] = String(v); }
@@ -1226,6 +1231,82 @@ for (const [template, opts] of [['tracker', trackerOpts({ rows: [] })], ['planne
   });
   check('tracker/proto-named-status-counts', () =>
     assert.match(r.byId.get('counts').textContent, /__proto__: 1/));
+}
+
+/* ================== Codex review of e1fb1724: stale options, lost errors ===== */
+/* tracker, planner: an option renamed or removed in the room leaves the picker. */
+{
+  const r = await run('tracker', trackerOpts({ rows: [] }));
+  check('tracker/picker-starts-with-every-status', () =>
+    assert.deepEqual(r.byId.get('status').options.map((o) => o.value),
+      ['Requested', 'Working', 'Done', 'Blocked']));
+  r.byId.get('status').value = 'Working';
+  const renamed = TRACKER_PROPS.map((p) => (p.name === 'Status'
+    ? { ...p, options: [{ name: 'Requested', group: 'todo' }, { name: 'In progress', group: 'doing' }] }
+    : p));
+  r.fire({ id: 'd1', name: 'Tracker — Items', props: renamed, rows: [] });
+  await settle(10);
+  check('tracker/renamed-status-replaces-the-stale-option', () => {
+    const values = r.byId.get('status').options.map((o) => o.value);
+    assert.deepEqual(values, ['Requested', 'In progress'], values.join(','));
+    assert.ok(!values.includes('Working'), 'the removed option is gone');
+  });
+  check('tracker/selection-falls-back-when-its-option-vanished', () =>
+    assert.equal(r.byId.get('status').value, 'Requested'));
+}
+{
+  const r = await run('planner', plannerOpts({ rows: [] }));
+  const renamed = PLANNER_PROPS.map((p) => (p.name === 'Slot'
+    ? { ...p, options: [{ name: 'Early' }, { name: 'Late' }] } : p));
+  r.fire({ id: 'd1', name: 'Planner — Items', props: renamed, rows: [] });
+  await settle(10);
+  check('planner/renamed-slot-replaces-the-stale-options', () =>
+    assert.deepEqual(r.byId.get('slot').options.map((o) => o.value), ['Early', 'Late']));
+}
+/* tracker: a surviving selection is kept across a redraw. */
+{
+  const r = await run('tracker', trackerOpts({ rows: [] }));
+  r.byId.get('status').value = 'Done';
+  r.fire();
+  await settle(10);
+  check('tracker/surviving-selection-is-kept', () => assert.equal(r.byId.get('status').value, 'Done'));
+}
+/* poll: a Choice column emptied of options clears the tally and the buttons. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'A', Choice: 'Tea', 'Created by': ['@a:x'] } }];
+  const r = await run('poll', pollOpts({ rows }));
+  check('poll/tally-shown-while-options-exist', () => assert.match(r.byId.get('results').textContent, /Tea/));
+  const emptied = POLL_PROPS.map((p) => (p.name === 'Choice' ? { ...p, options: [] } : p));
+  r.fire({ id: 'd1', name: 'Poll — Votes', props: emptied, rows });
+  await settle(10);
+  check('poll/emptied-options-clear-the-stale-tally', () => {
+    assert.equal(r.byId.get('results').textContent, '', 'results cleared');
+    assert.equal(r.byId.get('choices').children.length, 0, 'no votable buttons left');
+    assert.match(r.body.textContent, /no options yet/);
+  });
+}
+/* turn-game: a failed seat claim or release reports it — the post-save re-render clears notes,
+ * so the message has to be shown after it. This regressed when that re-render was added. */
+for (const [label, failing] of [['claim', 'set'], ['release', 'delete']]) {
+  const state = failing === 'delete' ? { 'seat.X': { id: 'u1', name: 'Tester' } } : {};
+  const base = fakeArtifact(gameOpts({ rows: [], state }));
+  base.art.state[failing] = async () => { throw new Error('storage refused the seat'); };
+  const html = readFileSync(join(TPL, 'turn-game', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  const btn = dom.byId.get('seats').buttons()
+    .find((b) => (failing === 'set' ? b.textContent === 'Play as X' : /^Leave seat/.test(b.textContent)));
+  assert.ok(btn, `the ${label} button exists`);
+  btn.click();
+  await settle(20);
+  check(`game/failed-seat-${label}-is-reported`, () =>
+    assert.match(dom.body.textContent, /storage refused the seat/, dom.body.textContent.slice(0, 160)));
 }
 
 console.log(failures.length

@@ -228,14 +228,18 @@
     const state = snap.props.find((p) => p.name === 'State');
     slotOpts = (slot && slot.options) || [];
     stateOpts = (state && state.options) || [];
+    // Rebuilt every render: an option renamed or removed in the room must not stay on offer.
     const sel = $('slot');
-    if (!sel.options.length) {
-      slotOpts.forEach((o) => {
-        const opt = document.createElement('option');
-        opt.value = o.name; opt.textContent = o.name;
-        sel.appendChild(opt);
-      });
-    }
+    const want = sel.value;
+    sel.textContent = '';
+    slotOpts.forEach((o) => {
+      const opt = document.createElement('option');
+      opt.value = o.name; opt.textContent = o.name;
+      sel.appendChild(opt);
+    });
+    sel.value = slotOpts.some((o) => o.name === want)
+      ? want
+      : (slotOpts[0] ? slotOpts[0].name : '');
     $('add').disabled = !titleProp || busy;
     if (!titleProp) show('bad', 'This database has no title column, so items cannot be named.');
     paint();

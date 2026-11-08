@@ -137,7 +137,14 @@
     titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
     const choice = snap.props.find((p) => p.name === 'Choice');
     const options = (choice && choice.options) || [];
-    if (!options.length) { show('bad', 'The Choice column has no options yet, so there is nothing to vote on.'); return; }
+    if (!options.length) {
+      // Clear first: a stale tally and buttons for removed options must not stay votable.
+      $('results').textContent = '';
+      $('choices').textContent = '';
+      $('sub').textContent = '';
+      show('bad', 'The Choice column has no options yet, so there is nothing to vote on.');
+      return;
+    }
 
     // One row per vote, one vote per voter: repeat rows from one person count once.
     // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of

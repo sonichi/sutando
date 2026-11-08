@@ -142,14 +142,18 @@
     titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
     const status = snap.props.find((p) => p.name === 'Status');
     statusOpts = (status && status.options) || [];
+    // Rebuilt every render: an option renamed or removed in the room must not stay on offer.
     const sel = $('status');
-    if (!sel.options.length) {
-      statusOpts.forEach((o) => {
-        const opt = document.createElement('option');
-        opt.value = o.name; opt.textContent = o.name;
-        sel.appendChild(opt);
-      });
-    }
+    const want = sel.value;
+    sel.textContent = '';
+    statusOpts.forEach((o) => {
+      const opt = document.createElement('option');
+      opt.value = o.name; opt.textContent = o.name;
+      sel.appendChild(opt);
+    });
+    sel.value = statusOpts.some((o) => o.name === want)
+      ? want
+      : (statusOpts[0] ? statusOpts[0].name : '');
     $('add').disabled = !titleProp || busy;
     if (!titleProp) show('bad', 'This database has no title column, so items cannot be named.');
     if (!consentKnown) show('warn', 'Allow the page to see who is who, and "yours" will fill in.');
