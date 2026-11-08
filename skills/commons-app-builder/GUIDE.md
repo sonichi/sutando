@@ -54,8 +54,8 @@ the whole call.
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
 | `now()`, `clock` | Estimated server time (`NaN` until the first sample). |
 
-The bridge allows 30 writes and 20 reads a minute per page, one watch per database, and 20 KB
-per write. A page's first write asks the viewer "may this page edit data in this room?". Until
+The bridge allows 30 writes and 20 reads a minute per page, one watch per database, and 20,000
+bytes per write. A page's first write asks the viewer "may this page edit data in this room?". Until
 they answer, writes are refused with "waiting for the viewer's answer", and `members()` and
 `personId()` reject with "page permission required". A "no" gives "not allowed by the viewer".
 Editing the page asks again.
