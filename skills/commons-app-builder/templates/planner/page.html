@@ -219,8 +219,9 @@
   };
 
   const render = (snap) => {
-    if (!snap) { clearNotes(); $('week').textContent = ''; $('sub').textContent = ''; show('bad', 'The Planner database was removed from this room.'); $('add').disabled = true; return; }
+    // Clear the snapshot on removal, or week navigation would redraw the deleted rows.
     snapshot = snap;
+    if (!snap) { clearNotes(); $('week').textContent = ''; $('unscheduled').textContent = ''; $('unscheduledTitle').hidden = true; $('sub').textContent = ''; show('bad', 'The Planner database was removed from this room.'); $('add').disabled = true; return; }
     titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
     const slot = snap.props.find((p) => p.name === 'Slot');
     const state = snap.props.find((p) => p.name === 'State');
@@ -260,8 +261,8 @@
     $('add').disabled = true;
     const r = await save(() => db.createRow(id, values));
     busy = false;
+    // No snapshot means the database is gone: leave Add disabled, as the removal left it.
     if (snapshot) render(snapshot);
-    else $('add').disabled = false;
     if (!r.ok) { show('bad', r.reason || 'The item was not saved.'); return; }
     // Clear only if the reader has not typed something new during the retry.
     if ($('title').value.trim() === text) $('title').value = '';

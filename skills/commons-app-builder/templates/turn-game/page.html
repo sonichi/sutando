@@ -163,8 +163,8 @@
   };
 
   const render = (snap) => {
-    if (!snap) { clearNotes(); $('board').textContent = ''; $('sub').textContent = ''; show('bad', 'The Moves database was removed from this room.'); return; }
-    snapshot = snap;
+    snapshot = snap;                                   // cleared on removal, so no redraw revives it
+    if (!snap) { clearNotes(); $('board').textContent = ''; $('seats').textContent = ''; $('status').textContent = ''; $('sub').textContent = ''; show('bad', 'The Moves database was removed from this room.'); return; }
     clearNotes();
     hintShown = false;
     titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
@@ -189,15 +189,18 @@
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = taken ? (s + ': ' + taken.name) : ('Play as ' + s);
-      b.disabled = !!taken || !!seat;
+      b.disabled = !!taken || !!seat || busy;
       b.setAttribute('aria-label', taken ? (s + ' is ' + taken.name) : ('Take seat ' + s));
       b.onclick = async () => {
-        b.disabled = true;
+        if (busy) return;                              // one seat at a time: X then O must not claim both
+        busy = true;
+        [...box.children].forEach((el) => { el.disabled = true; });
         try {
           await art.state.set('seat.' + s, { id: art.me.id, name: (art.me && art.me.name) || s });
           await readSeats();
-          render(snapshot);
-        } catch (e) { show('bad', e.message || 'The seat could not be taken.'); b.disabled = false; }
+        } catch (e) { show('bad', e.message || 'The seat could not be taken.'); }
+        busy = false;
+        if (snapshot) render(snapshot);
       };
       box.appendChild(b);
     });
@@ -205,10 +208,15 @@
       const leave = document.createElement('button');
       leave.type = 'button';
       leave.textContent = 'Leave seat ' + seat;
+      leave.disabled = busy;
       leave.onclick = async () => {
-        leave.disabled = true;
-        try { await art.state.delete('seat.' + seat); await readSeats(); render(snapshot); }
-        catch (e) { show('bad', e.message || 'The seat could not be freed.'); leave.disabled = false; }
+        if (busy) return;
+        busy = true;
+        [...box.children].forEach((el) => { el.disabled = true; });
+        try { await art.state.delete('seat.' + seat); await readSeats(); }
+        catch (e) { show('bad', e.message || 'The seat could not be freed.'); }
+        busy = false;
+        if (snapshot) render(snapshot);
       };
       box.appendChild(leave);
     }
@@ -218,7 +226,9 @@
     again.textContent = 'New game';
     again.disabled = !over || busy;
     again.onclick = async () => {
-      busy = true; again.disabled = true;
+      if (busy) return;
+      busy = true;
+      [...box.children].forEach((el) => { el.disabled = true; });
       const values = { Game: g.game + 1, Seat: 'X', Row: 0, Col: 0 };
       if (titleProp) values[titleProp] = 'Game ' + (g.game + 1) + ' start';
       const r = await save(() => db.createRow(id, values));

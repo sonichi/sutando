@@ -107,7 +107,13 @@
   };
 
   const GROUP = { Requested: 'todo', Working: 'doing', Blocked: 'doing', Done: 'done' };
-  const today = () => new Date(Number.isNaN(art.now()) ? Date.now() : art.now()).toISOString().slice(0, 10);
+  // Due dates are calendar dates in the reader's zone; toISOString() is UTC and would mark an
+  // item overdue hours early west of Greenwich.
+  const today = () => {
+    const d = new Date(Number.isNaN(art.now()) ? Date.now() : art.now());
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  };
   let titleProp = null, statusOpts = [], mineById = new Map(), consentKnown = true;
   // Pending writes are tracked here, NOT on the elements: a watch update redraws them, and a
   // redraw must not re-enable a control whose write is still in flight.
@@ -247,9 +253,9 @@
     const r = await save(() => db.createRow(id, values));
     busy = false;
     // Re-draw so the live controls carry the finished state, then clear only the fields the
-    // reader has not typed into since: a retry can last two minutes.
+    // reader has not typed into since: a retry can last two minutes. No snapshot means the
+    // database is gone, so Add stays disabled.
     if (snapshot) await render(snapshot);
-    else $('add').disabled = false;
     if (!r.ok) { show('bad', r.reason || 'The item was not saved.'); return; }
     if ($('title').value.trim() === text) $('title').value = '';
     if ($('due').value === due) $('due').value = '';

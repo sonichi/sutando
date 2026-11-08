@@ -2,6 +2,9 @@
  * the way GUIDE.md step 6 asks, and checks the data path of every control. Hermetic: a tiny DOM
  * shim, no jsdom, no network, no browser. Layout at 390px is NOT checked here — only a real
  * browser lays out CSS; the CSS contract is checked in the Python suite. */
+// Pin a zone with daylight saving and a negative UTC offset. CI runs in UTC, where the DST and
+// local-date cases would pass without testing anything.
+process.env.TZ = 'America/Los_Angeles';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
@@ -1065,6 +1068,106 @@ const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
   const r = await run('turn-game', gameOpts({ rows, state: SEATED }));
   check('game/integer-valued-string-still-counts', () =>
     assert.equal(r.byId.get('board').children[4].textContent, 'X'));
+}
+
+/* ===================== Codex review of aba958a7 + the audit it prompted ===== */
+/* turn-game: X then O before either write resolves must not seat one viewer twice. */
+{
+  let release = null;
+  const held = new Promise((ok) => { release = ok; });
+  const base = fakeArtifact(gameOpts({ rows: [], state: {} }));
+  const sets = [];
+  const store = new Map();
+  base.art.state.set = async (k, v) => { sets.push(k); await held; store.set(k, v); return { ok: true }; };
+  base.art.state.get = async (k) => store.get(k);
+  const html = readFileSync(join(TPL, 'turn-game', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  const seatButtons = () => dom.byId.get('seats').buttons();
+  seatButtons().find((b) => b.textContent === 'Play as X').click();
+  await settle(4);
+  const second = seatButtons().find((b) => b.textContent === 'Play as O');
+  const clicked = second ? second.click() : false;
+  release();
+  await settle(20);
+  check('game/one-viewer-cannot-claim-both-seats', () => {
+    assert.equal(clicked, false, 'the second seat button was refused');
+    assert.deepEqual(sets, ['seat.X'], 'only one seat written: ' + JSON.stringify(sets));
+  });
+}
+/* turn-game: a removed database stays removed. */
+{
+  const r = await run('turn-game', gameOpts({ rows: [mv('m1', 1, 'X', 1, 1)], state: SEATED }));
+  r.fire(null);
+  await settle();
+  check('game/removal-clears-the-board-and-seats', () => {
+    assert.match(r.body.textContent, /was removed from this room/);
+    assert.equal(r.byId.get('board').children.length, 0);
+    assert.equal(r.byId.get('seats').children.length, 0);
+  });
+}
+/* planner: navigating weeks after removal must not redraw the deleted rows. */
+{
+  const rows = [{ id: 'r1', cells: { Item: 'Dentist', Day: '2026-11-12', Slot: 'Morning', State: 'Planned' } }];
+  const r = await run('planner', plannerOpts({ rows }));
+  r.fire(null);
+  await settle();
+  r.byId.get('next').click();
+  r.byId.get('prev').click();
+  await settle();
+  check('planner/navigation-after-removal-stays-removed', () => {
+    assert.match(r.body.textContent, /was removed from this room/);
+    assert.ok(!/Dentist/.test(r.byId.get('week').textContent), 'deleted rows are not redrawn');
+    assert.equal(r.byId.get('add').disabled, true);
+  });
+}
+/* tracker, planner: a write that settles AFTER the database is removed must not re-enable Add. */
+for (const [template, opts] of [['tracker', trackerOpts({ rows: [] })], ['planner', plannerOpts({ rows: [] })]]) {
+  let release = null;
+  const held = new Promise((ok) => { release = ok; });
+  let fire = null;
+  const base = fakeArtifact(opts);
+  base.art.db.onChange = (d, fn) => { fire = fn; return () => {}; };
+  base.art.db.createRow = async (d, cells) => { base.calls.push(['createRow', d, cells]); await held; return { ok: true, rowId: 'r1' }; };
+  const html = readFileSync(join(TPL, template, 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: opts.hash || '' }, setTimeout, clearTimeout, Promise, Date, Number, Math,
+    String, Object, Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('title').value = 'In flight';
+  dom.byId.get('add').click();
+  await settle(4);
+  fire(null);                                        // removed while the write is pending
+  await settle(4);
+  release();
+  await settle(20);
+  check(`${template}/pending-write-after-removal-keeps-add-disabled`, () => {
+    assert.equal(dom.byId.get('add').disabled, true);
+    assert.match(dom.body.textContent, /was removed from this room/);
+  });
+}
+/* tracker: "today" is the reader's calendar day, not UTC's. At 19:00 in Los Angeles on Nov 11
+ * it is already Nov 12 in UTC; an item due Nov 11 is due today, not overdue. */
+{
+  const rows = [{ id: 'r1', cells: { Item: 'Due today', Status: 'Requested', Due: '2026-11-11' } },
+                { id: 'r2', cells: { Item: 'Due yesterday', Status: 'Requested', Due: '2026-11-10' } }];
+  const r = await run('tracker', trackerOpts({ rows, now: Date.parse('2026-11-12T03:00:00Z') }));
+  const meta = (name) => r.byId.get('list').children
+    .find((li) => li.textContent.includes(name)).children.find((c) => /\bmeta\b/.test(c.className));
+  check('tracker/due-today-is-not-overdue-west-of-utc', () =>
+    assert.ok(!/\bover\b/.test(meta('Due today').className), meta('Due today').className));
+  check('tracker/due-yesterday-is-overdue', () =>
+    assert.match(meta('Due yesterday').className, /\bover\b/));
 }
 
 console.log(failures.length
