@@ -24,7 +24,7 @@
     font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   h1 { font-size: 19px; margin: 0 0 2px; }
-  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }
   .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
   .note.bad { border-color: var(--bad); color: var(--bad); }
   .note.warn { border-color: var(--warn); color: var(--warn); }
@@ -38,15 +38,16 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button[disabled] { opacity: .55; cursor: not-allowed; }
   .items { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
-  .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
-  .top { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
-  .name { font-weight: 600; overflow-wrap: anywhere; }
+  .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .top { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
+  .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
   .chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
   .chip.todo { color: var(--todo); } .chip.doing { color: var(--doing); } .chip.done { color: var(--done); }
-  .meta { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  /* Outcome is agent-written text: a long URL, hash or token must wrap, not widen the page. */
+  .meta { color: var(--dim); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; min-width: 0; }
   .meta.over { color: var(--bad); }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  .mine { font-size: 12px; color: var(--dim); }
+  .mine { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
   .counts { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; color: var(--dim); font-size: 13px; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   @media (min-width: 640px) { .add { grid-template-columns: 2fr 1fr 1fr auto; align-items: start; } }

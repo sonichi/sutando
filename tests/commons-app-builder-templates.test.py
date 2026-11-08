@@ -132,6 +132,20 @@ for name in TEMPLATES:
         not re.search(r"(?<![-\w])width:\s*(?:[4-9]\d{2}|\d{4,})px", page),
     )
     check(f"{name}/inline-style-only", "<link" not in page and "src=" not in page)
+    # The dark block may only redefine colour variables. The layout suite renders one scheme;
+    # this is what makes that sufficient, since a declaration here could change box sizes.
+    dark = re.search(r"@media \(prefers-color-scheme: dark\)\s*\{(.*?)\n  \}", page, re.S)
+    check(f"{name}/has-a-dark-block", dark is not None)
+    if dark:
+        decls = re.findall(r"([a-zA-Z-]+)\s*:", dark.group(1))
+        non_vars = [d for d in decls if not d.startswith("--")]
+        check(f"{name}/dark-sets-only-colour-vars:{non_vars}", not non_vars)
+
+    # Text the page does not control - an agent's Outcome, an option name, a player's name -
+    # must wrap, or one long token scrolls the phone sideways (Codex review of 0e1a160c).
+    check(f"{name}/metadata-wraps", page.count("overflow-wrap: anywhere") >= 2)
+    check(f"{name}/subtitle-wraps", re.search(r"\.sub \{[^}]*overflow-wrap: anywhere", page) is not None)
+
     # Honest states: a consent hint, an error path and an empty state.
     check(f"{name}/consent-retry-text", "waiting for the viewer" in page)
     check(f"{name}/allow-hint", "Allow this page to edit data" in page)

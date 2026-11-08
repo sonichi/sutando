@@ -22,19 +22,21 @@
     font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   h1 { font-size: 19px; margin: 0 0 2px; }
-  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }
   .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
   .note.bad { border-color: var(--bad); color: var(--bad); }
   .note.warn { border-color: var(--warn); color: var(--warn); }
-  .choices { display: grid; gap: 10px; margin-bottom: 16px; }
+  .choices { display: grid; gap: 10px; margin-bottom: 16px; min-width: 0; }
   button {
     font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
     border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;
   }
   button[disabled] { opacity: .55; cursor: not-allowed; }
   button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }
+  /* Option names and voter names are other people's text: wrap rather than widen the page. */
+  button, .res, .resTop, .resTop span { overflow-wrap: anywhere; min-width: 0; }
   .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }
-  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
   .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }
   .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }
   .fill { height: 100%; background: var(--accent); }
@@ -119,6 +121,13 @@
     }
   };
 
+  const lockChoices = () => {
+    [...$('choices').children].forEach((el) => { el.disabled = true; });
+  };
+  const unlockChoices = () => {
+    [...$('choices').children].forEach((el) => { el.disabled = false; });
+  };
+
   const draw = (snap) => {
     clearNotes();
     hintShown = false;
@@ -191,26 +200,34 @@
       b.onclick = async () => {
         if (busy) return;                                  // one vote in flight at a time
         busy = true;
-        const all = [...box.children];
-        all.forEach((other) => { other.disabled = true; });
+        lockChoices();
         const comment = $('comment').value.trim();
         // Ownership is resolved inside the retried call: consent granted mid-retry turns this
         // from a second row into an edit of the voter's own.
+        let commentResult = null;
         const r = await save(async () => {
           if (snapshot) await findMine(snapshot);
-          if (myRow) {
-            const w = await db.write(id, myRow.id, 'Choice', o.name);
-            if (w.ok && comment) await db.write(id, myRow.id, 'Comment', comment);
-            return w;
-          }
+          if (myRow) return db.write(id, myRow.id, 'Choice', o.name);
           const values = { Choice: o.name };
           if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
           if (comment) values.Comment = comment;
           return db.createRow(id, values);
         });
+        // The comment is its own write with its own retry, so retrying it never rewrites Choice,
+        // and a refusal is reported instead of being dropped.
+        if (r.ok && comment && myRow) {
+          commentResult = await save(() => db.write(id, myRow.id, 'Comment', comment));
+        }
         busy = false;
-        all.forEach((other) => { other.disabled = false; });
+        // Re-draw from the current snapshot: a watch update during the write replaced the
+        // buttons, and re-enabling the detached ones would leave the live set stuck disabled.
+        if (snapshot) await render(snapshot);
+        else unlockChoices();
         if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');
+        else if (commentResult && !commentResult.ok) {
+          show('warn', 'Your vote was saved, but the comment was not: ' +
+            (commentResult.reason || 'refused') + '. Your text is still in the box.');
+        } else if (comment) $('comment').value = '';
       };
       box.appendChild(b);
     });

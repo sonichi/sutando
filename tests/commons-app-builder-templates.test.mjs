@@ -670,6 +670,123 @@ const SEATED = { 'seat.X': { id: 'u1', name: 'Tester' }, 'seat.O': { id: 'u2', n
   check('planner/seven-days-across-dst', () => assert.equal(r.byId.get('week').children.length, 7));
 }
 
+/* ============================== Codex review fixes (#6308 @ 0e1a160c) ==== */
+/* P2: a watch update during the save must not leave the live choices disabled. */
+{
+  const rows = [];
+  const base = fakeArtifact(pollOpts({ rows }));
+  // createRow delivers the new vote through the watch BEFORE acknowledging, which is the
+  // schedule that redraws the buttons while busy is still true.
+  base.art.db.createRow = async (d, cells) => {
+    base.calls.push(['createRow', d, cells]);
+    rows.push({ id: 'r1', cells: { ...cells, 'Created by': ['@me:x'] } });
+    base.fire();
+    await new Promise((ok) => setTimeout(ok, 0));
+    return { ok: true, rowId: 'r1' };
+  };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('choices').buttons()[0].click();   // vote Tea
+  await settle(40);
+  check('poll/watch-during-save-leaves-controls-usable', () => {
+    const bs = dom.byId.get('choices').buttons();
+    const labels = bs.map((b) => b.textContent + ':' + b.disabled);
+    // The voter's own choice stays disabled (it is already theirs); the OTHER must be clickable.
+    const other = bs.find((b) => /Coffee/.test(b.textContent));
+    assert.ok(other, 'the other choice is still rendered: ' + labels.join(', '));
+    assert.equal(other.disabled, false, 'not stuck disabled after the save: ' + labels.join(', '));
+  });
+  check('poll/watch-during-save-counts-the-vote', () =>
+    assert.match(dom.byId.get('sub').textContent, /1 vote/));
+}
+/* P2: a refused comment is retried on its own and reported, never silently dropped. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  const base = fakeArtifact(pollOpts({ rows }));
+  const seen = [];
+  base.art.db.write = async (d, row, prop, value) => {
+    seen.push([prop, value]);
+    base.calls.push(['write', d, row, prop, value]);
+    return prop === 'Comment' ? { ok: false, reason: 'not allowed by the viewer' } : { ok: true };
+  };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('comment').value = 'New comment';
+  dom.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await settle(40);
+  check('poll/refused-comment-is-reported', () => {
+    const text = dom.body.textContent;
+    assert.match(text, /comment was not/i, 'the refusal is shown: ' + text.slice(0, 200));
+    assert.match(text, /not allowed by the viewer/, 'with the reason');
+  });
+  check('poll/refused-comment-keeps-the-text', () =>
+    assert.equal(dom.byId.get('comment').value, 'New comment'));
+  check('poll/comment-retry-does-not-rewrite-choice', () => {
+    const choiceWrites = seen.filter(([prop]) => prop === 'Choice').length;
+    assert.equal(choiceWrites, 1, 'Choice written once: ' + JSON.stringify(seen));
+    assert.ok(seen.some(([prop]) => prop === 'Comment'), 'the comment was attempted');
+  });
+}
+/* A rate-limited comment retries (GUIDE's retryable reasons) instead of reporting at once. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  const base = fakeArtifact(pollOpts({ rows }));
+  let commentTries = 0;
+  base.art.db.write = async (d, row, prop, value) => {
+    base.calls.push(['write', d, row, prop, value]);
+    if (prop !== 'Comment') return { ok: true };
+    commentTries += 1;
+    return commentTries === 1 ? { ok: false, reason: 'rate limit' } : { ok: true };
+  };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('comment').value = 'Retry me';
+  dom.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await new Promise((ok) => setTimeout(ok, 1800));        // save() waits 1500ms between attempts
+  await settle();
+  check('poll/rate-limited-comment-retries', () => {
+    assert.equal(commentTries, 2, 'tried twice');
+    assert.ok(!/comment was not/i.test(dom.body.textContent), 'and is not reported as failed');
+  });
+  check('poll/rate-limited-comment-retry-does-not-rewrite-choice', () => {
+    const choiceWrites = base.calls.filter((c) => c[0] === 'write' && c[3] === 'Choice').length;
+    assert.equal(choiceWrites, 1, JSON.stringify(base.calls));
+  });
+}
+/* A comment that saves is cleared, so it is not sent twice by accident. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  const r = await run('poll', pollOpts({ rows }));
+  r.byId.get('comment').value = 'Good one';
+  r.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await settle(30);
+  check('poll/saved-comment-is-cleared', () => assert.equal(r.byId.get('comment').value, ''));
+  check('poll/saved-comment-is-written', () =>
+    assert.ok(r.calls.some((c) => c[0] === 'write' && c[3] === 'Comment' && c[4] === 'Good one'),
+      JSON.stringify(r.calls)));
+}
+
 console.log(failures.length
   ? `FAIL commons-app-builder templates: ${failures.length} failed\n  ${failures.join('\n  ')}`
   : `all passed — commons-app-builder templates: ${passed} checks`);

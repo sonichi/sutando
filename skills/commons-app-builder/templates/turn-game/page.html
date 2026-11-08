@@ -22,11 +22,13 @@
     font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   h1 { font-size: 19px; margin: 0 0 2px; }
-  .sub { color: var(--dim); font-size: 13px; margin-bottom: 10px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 10px; overflow-wrap: anywhere; }
   .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
   .note.bad { border-color: var(--bad); color: var(--bad); }
   .note.warn { border-color: var(--warn); color: var(--warn); }
-  .seats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .seats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; min-width: 0; }
+  /* A seat shows another player's display name: wrap it rather than widen the board. */
+  .seats button, .status { overflow-wrap: anywhere; min-width: 0; }
   button {
     font: inherit; color: inherit; min-height: 44px; min-width: 44px; border-radius: 10px;
     border: 1px solid var(--line); background: var(--card); padding: 0 12px; cursor: pointer;

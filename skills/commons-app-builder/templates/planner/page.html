@@ -22,7 +22,7 @@
     font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   h1 { font-size: 19px; margin: 0 0 2px; }
-  .sub { color: var(--dim); font-size: 13px; }
+  .sub { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
   .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin: 10px 0; font-size: 14px; }
   .note.bad { border-color: var(--bad); color: var(--bad); }
   .note.warn { border-color: var(--warn); color: var(--warn); }
@@ -37,13 +37,13 @@
   button[disabled] { opacity: .55; cursor: not-allowed; }
   .add { display: grid; gap: 8px; margin-bottom: 14px; }
   .week { display: grid; gap: 10px; }
-  .day { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .day { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; min-width: 0; }
   .day.now { background: var(--today); border-color: var(--accent); }
   .dayTop { display: flex; justify-content: space-between; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
   .dayName { font-weight: 600; color: var(--ink); }
   .items { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
-  .it { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
-  .itName { overflow-wrap: anywhere; }
+  .it { display: flex; gap: 8px; align-items: center; justify-content: space-between; min-width: 0; }
+  .itName { overflow-wrap: anywhere; min-width: 0; }
   .itName.done { text-decoration: line-through; color: var(--dim); }
   .slot { font-size: 12px; color: var(--dim); }
   .empty { color: var(--dim); font-size: 13px; }
