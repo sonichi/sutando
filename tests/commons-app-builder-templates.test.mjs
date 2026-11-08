@@ -15,6 +15,13 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TPL = join(ROOT, 'skills', 'commons-app-builder', 'templates');
 let passed = 0;
 const failures = [];
+// A page that throws inside an async handler produces an unhandled rejection, which would kill
+// the suite with a stack trace instead of a named failure. Record them and report at the end:
+// "the page threw and never recovered" is a result, not a crash.
+const unhandled = [];
+process.on('unhandledRejection', (e) => {
+  unhandled.push(e && e.message ? e.message : String(e));
+});
 const check = (name, fn) => {
   try { fn(); passed += 1; } catch (e) { failures.push(`${name}: ${e.message}`); }
 };
@@ -1309,6 +1316,144 @@ for (const [label, failing] of [['claim', 'set'], ['release', 'delete']]) {
     assert.match(dom.body.textContent, /storage refused the seat/, dom.body.textContent.slice(0, 160)));
 }
 
+/* ============== Codex review of e8058a2f: a throw must not lock the page ===== */
+/* A rejecting write (not a {ok:false} refusal — a real rejection) must still leave the page
+ * usable. The bridge documents write/createRow as never rejecting, but a page that trusts that
+ * is one bridge bug away from a dead UI. */
+const mountRejecting = (template, opts, method) => {
+  const base = fakeArtifact(opts);
+  base.art.db[method] = async () => { throw new Error('bridge blew up'); };
+  const html = readFileSync(join(TPL, template, 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: opts.hash || '' }, setTimeout, clearTimeout, Promise, Date, Number, Math,
+    String, Object, Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  return { ...dom, ...base };
+};
+for (const [template, opts] of [['tracker', trackerOpts({ rows: [] })], ['planner', plannerOpts({ rows: [] })]]) {
+  const r = mountRejecting(template, opts, 'createRow');
+  await settle();
+  r.byId.get('title').value = 'Boom';
+  r.byId.get('add').click();
+  await settle(30);
+  check(`${template}/a-rejected-write-does-not-lock-add`, () =>
+    assert.equal(r.byId.get('add').disabled, false, 'Add is usable again'));
+  check(`${template}/a-rejected-write-is-reported`, () =>
+    assert.match(r.body.textContent, /bridge blew up/));
+  // And a second attempt is actually possible.
+  r.byId.get('title').value = 'Again';
+  const second = r.byId.get('add').click();
+  await settle(20);
+  check(`${template}/a-second-attempt-is-possible`, () => assert.equal(second, true));
+}
+{
+  const r = mountRejecting('poll', pollOpts({ rows: [] }), 'createRow');
+  await settle();
+  r.byId.get('choices').buttons()[0].click();
+  await settle(30);
+  check('poll/a-rejected-vote-does-not-lock-the-choices', () => {
+    const stuck = r.byId.get('choices').buttons().filter((b) => b.disabled).length;
+    assert.equal(stuck, 0, 'no choice left disabled');
+  });
+  check('poll/a-rejected-vote-is-reported', () => assert.match(r.body.textContent, /bridge blew up/));
+}
+{
+  const r = mountRejecting('turn-game', gameOpts({ rows: [], state: SEATED }), 'createRow');
+  await settle();
+  r.byId.get('board').children[0].click();
+  await settle(30);
+  check('game/a-rejected-move-does-not-lock-the-board', () => {
+    const playable = r.byId.get('board').buttons().filter((c) => !c.disabled).length;
+    assert.equal(playable, 9, 'the board is usable again; playable=' + playable);
+  });
+  check('game/a-rejected-move-is-reported', () => assert.match(r.body.textContent, /bridge blew up/));
+}
+/* poll: the vote row deleted between a refused comment write and its retry — the case
+ * sonichi-dot reported as still reproducing. It must not throw, and must not lock the page. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  const base = fakeArtifact(pollOpts({ rows }));
+  let commentTries = 0;
+  base.art.db.write = async (d, row, prop, value) => {
+    base.calls.push(['write', d, row, prop, value]);
+    if (prop !== 'Comment') return { ok: true };
+    commentTries += 1;
+    if (commentTries === 1) {
+      rows.length = 0;                                 // the vote is deleted mid-retry
+      return { ok: false, reason: 'rate limit' };
+    }
+    return { ok: true };
+  };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('comment').value = 'A note';
+  dom.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await new Promise((ok) => setTimeout(ok, 1800));
+  await settle(20);
+  check('poll/vote-deleted-mid-comment-retry-does-not-lock', () => {
+    const stuck = dom.byId.get('choices').buttons().filter((b) => b.disabled).length;
+    assert.equal(stuck, 0, 'no choice left disabled');
+  });
+  check('poll/vote-deleted-mid-comment-retry-is-reported', () =>
+    assert.match(dom.body.textContent, /no longer in this room/));
+  check('poll/vote-deleted-mid-comment-retry-keeps-the-text', () =>
+    assert.equal(dom.byId.get('comment').value, 'A note'));
+}
+/* poll: a comment refused after the vote saved can be retried on its own. */
+{
+  const rows = [{ id: 'r1', cells: { Voter: 'Tester', Choice: 'Tea', 'Created by': ['@me:x'] } }];
+  const base = fakeArtifact(pollOpts({ rows }));
+  let fail = true;
+  base.art.db.write = async (d, row, prop, value) => {
+    base.calls.push(['write', d, row, prop, value]);
+    if (prop !== 'Comment') return { ok: true };
+    if (fail) return { ok: false, reason: 'not allowed by the viewer' };
+    rows[0].cells.Comment = value;
+    return { ok: true };
+  };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('comment').value = 'My note';
+  dom.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await settle(30);
+  check('poll/failed-comment-leaves-a-way-to-retry', () => {
+    const btn = dom.byId.get('saveComment');
+    assert.equal(btn.hidden, false, 'Save comment is offered');
+    assert.equal(btn.disabled, false, 'and is usable');
+    assert.equal(dom.byId.get('comment').value, 'My note', 'the text is kept');
+  });
+  fail = false;
+  dom.byId.get('saveComment').click();
+  await settle(30);
+  check('poll/retried-comment-saves-without-revoting', () => {
+    const comments = base.calls.filter((c) => c[3] === 'Comment');
+    assert.equal(comments.length, 2, 'the comment was written twice: ' + JSON.stringify(comments));
+    const choices = base.calls.filter((c) => c[3] === 'Choice');
+    assert.equal(choices.length, 1, 'and the vote was not recast');
+    assert.equal(dom.byId.get('comment').value, '', 'the box is cleared on success');
+  });
+}
+
+if (unhandled.length) {
+  failures.push(`a page threw and left its promise unhandled (so a control may be stuck): ${[...new Set(unhandled)].join('; ')}`);
+}
 console.log(failures.length
   ? `FAIL commons-app-builder templates: ${failures.length} failed\n  ${failures.join('\n  ')}`
   : `all passed — commons-app-builder templates: ${passed} checks`);

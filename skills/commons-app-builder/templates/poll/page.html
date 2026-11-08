@@ -45,7 +45,11 @@
     font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;
     border: 1px solid var(--line); background: var(--card); padding: 0 12px;
   }
-  @media (min-width: 640px) { .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); } }
+  .commentRow { display: grid; gap: 8px; min-width: 0; }
+  @media (min-width: 640px) {
+    .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .commentRow { grid-template-columns: 1fr auto; }
+  }
 </style>
 </head>
 <body>
@@ -54,7 +58,10 @@
 <div id="notes"></div>
 <ul class="results" id="results"></ul>
 <div class="choices" id="choices"></div>
-<input id="comment" placeholder="Add a comment (optional)" aria-label="Comment" autocomplete="off">
+<div class="commentRow">
+  <input id="comment" placeholder="Add a comment (optional)" aria-label="Comment" autocomplete="off">
+  <button type="button" id="saveComment" hidden>Save comment</button>
+</div>
 <script>
 (async () => {
   const art = window.artifact;
@@ -123,6 +130,29 @@
     return { myRow: mine, consentKnown: true };
   };
   let generation = 0;
+
+  // One place that writes the comment: re-resolves the voter's row on every attempt, because the
+  // row can be deleted between a refusal and its retry and a remembered id would throw.
+  const writeComment = (text) =>
+    save(async () => {
+      if (snapshot) {
+        const who = await findMine(snapshot);
+        myRow = who.myRow;
+        consentKnown = who.consentKnown;
+      }
+      if (!myRow) return { ok: false, reason: 'your vote is no longer in this room' };
+      return db.write(id, myRow.id, 'Comment', text);
+    });
+
+  // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried
+  // without casting the vote again.
+  const refreshSaveComment = () => {
+    const btn = $('saveComment');
+    const typed = $('comment').value.trim();
+    const saved = (myRow && myRow.cells.Comment) || '';
+    btn.hidden = !(consentKnown && myRow);
+    btn.disabled = busy || !typed || typed === saved;
+  };
 
   const lockChoices = () => {
     [...$('choices').children].forEach((el) => { el.disabled = true; });
@@ -200,6 +230,7 @@
       });
     }
 
+    refreshSaveComment();
     const box = $('choices');
     box.textContent = '';
     options.forEach((o) => {
@@ -214,31 +245,39 @@
         busy = true;
         lockChoices();
         const comment = $('comment').value.trim();
-        // Ownership is resolved inside the retried call: consent granted mid-retry turns this
-        // from a second row into an edit of the voter's own.
+        let r = { ok: false, reason: '' };
         let commentResult = null;
-        const r = await save(async () => {
-          if (snapshot) {
-            const who = await findMine(snapshot);
-            myRow = who.myRow;
-            consentKnown = who.consentKnown;
-          }
-          if (myRow) return db.write(id, myRow.id, 'Choice', o.name);
-          const values = { Choice: o.name };
-          if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
-          if (comment) values.Comment = comment;
-          return db.createRow(id, values);
-        });
-        // The comment is its own write with its own retry, so retrying it never rewrites Choice,
-        // and a refusal is reported instead of being dropped.
-        if (r.ok && comment && myRow) {
-          commentResult = await save(() => db.write(id, myRow.id, 'Comment', comment));
+        // try/finally: anything thrown in here must still clear busy and redraw, or every
+        // control stays disabled for good.
+        try {
+          // Ownership is resolved inside the retried call: consent granted mid-retry turns this
+          // from a second row into an edit of the voter's own.
+          r = await save(async () => {
+            if (snapshot) {
+              const who = await findMine(snapshot);
+              myRow = who.myRow;
+              consentKnown = who.consentKnown;
+            }
+            if (myRow) return db.write(id, myRow.id, 'Choice', o.name);
+            const values = { Choice: o.name };
+            if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
+            if (comment) values.Comment = comment;
+            return db.createRow(id, values);
+          });
+          // The comment is its own write with its own retry, so retrying it never rewrites
+          // Choice, and a refusal is reported instead of being dropped. The row is re-resolved
+          // on every attempt: it can be deleted between the refusal and the retry, and reading
+          // a remembered id would throw.
+          if (r.ok && comment) commentResult = await writeComment(comment);
+        } catch (e) {
+          if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };
+        } finally {
+          busy = false;
+          // Re-draw from the current snapshot: a watch update during the write replaced the
+          // buttons, and re-enabling the detached ones would leave the live set stuck disabled.
+          if (snapshot) await render(snapshot);
+          else unlockChoices();
         }
-        busy = false;
-        // Re-draw from the current snapshot: a watch update during the write replaced the
-        // buttons, and re-enabling the detached ones would leave the live set stuck disabled.
-        if (snapshot) await render(snapshot);
-        else unlockChoices();
         if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');
         else if (commentResult && !commentResult.ok) {
           show('warn', 'Your vote was saved, but the comment was not: ' +
@@ -262,6 +301,27 @@
 
   db.onChange(id, render);
   try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+
+  $('comment').addEventListener('input', refreshSaveComment);
+  $('saveComment').onclick = async () => {
+    if (busy) return;
+    const text = $('comment').value.trim();
+    if (!text) return;
+    busy = true;
+    refreshSaveComment();
+    let res = { ok: false, reason: '' };
+    try {
+      res = await writeComment(text);
+    } catch (e) {
+      res = { ok: false, reason: e.message || 'The comment was not saved.' };
+    } finally {
+      busy = false;
+      if (snapshot) await render(snapshot);
+      else refreshSaveComment();
+    }
+    if (!res.ok) show('bad', 'The comment was not saved: ' + (res.reason || 'refused') + '. Your text is still in the box.');
+    else if ($('comment').value.trim() === text) { $('comment').value = ''; refreshSaveComment(); }
+  };
 })();
 </script>
 </body>

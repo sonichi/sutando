@@ -219,10 +219,17 @@
           if (busy) return;
           busy = true;
           b.disabled = true;
-          const r = await save(() => db.write(id, row.id, 'Status', o.name));
-          busy = false;
-          if (snapshot) await render(snapshot);
-          else b.disabled = false;
+          // try/finally: a rejected write must still clear busy, or every control stays dead.
+          let r = { ok: false, reason: '' };
+          try {
+            r = await save(() => db.write(id, row.id, 'Status', o.name));
+          } catch (e) {
+            r = { ok: false, reason: e.message || 'The change was refused.' };
+          } finally {
+            busy = false;
+            if (snapshot) await render(snapshot);
+            else b.disabled = false;
+          }
           if (!r.ok) show('bad', r.reason || 'The change was refused.');
         };
         actions.appendChild(b);
@@ -257,12 +264,18 @@
     if (due) values.Due = due;
     busy = true;
     $('add').disabled = true;
-    const r = await save(() => db.createRow(id, values));
-    busy = false;
-    // Re-draw so the live controls carry the finished state, then clear only the fields the
-    // reader has not typed into since: a retry can last two minutes. No snapshot means the
-    // database is gone, so Add stays disabled.
-    if (snapshot) await render(snapshot);
+    let r = { ok: false, reason: '' };
+    try {
+      r = await save(() => db.createRow(id, values));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The item was not saved.' };
+    } finally {
+      busy = false;
+      // Re-draw so the live controls carry the finished state, then clear only the fields the
+      // reader has not typed into since: a retry can last two minutes. No snapshot means the
+      // database is gone, so Add stays disabled.
+      if (snapshot) await render(snapshot);
+    }
     if (!r.ok) { show('bad', r.reason || 'The item was not saved.'); return; }
     if ($('title').value.trim() === text) $('title').value = '';
     if ($('due').value === due) $('due').value = '';

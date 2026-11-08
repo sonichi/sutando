@@ -207,10 +207,16 @@
         busy = true;
         b.disabled = true;
         const want = done ? (stateOpts[0] && stateOpts[0].name) || 'Planned' : 'Done';
-        const r = await save(() => db.write(id, row.id, 'State', want));
-        busy = false;
-        if (snapshot) render(snapshot);
-        else b.disabled = false;
+        let r = { ok: false, reason: '' };
+        try {
+          r = await save(() => db.write(id, row.id, 'State', want));
+        } catch (e) {
+          r = { ok: false, reason: e.message || 'The change was refused.' };
+        } finally {
+          busy = false;
+          if (snapshot) render(snapshot);
+          else b.disabled = false;
+        }
         if (!r.ok) show('bad', r.reason || 'The change was refused.');
       };
       li.appendChild(left); li.appendChild(b);
@@ -264,10 +270,16 @@
     if (stateOpts.length) values.State = stateOpts[0].name;
     busy = true;
     $('add').disabled = true;
-    const r = await save(() => db.createRow(id, values));
-    busy = false;
-    // No snapshot means the database is gone: leave Add disabled, as the removal left it.
-    if (snapshot) render(snapshot);
+    let r = { ok: false, reason: '' };
+    try {
+      r = await save(() => db.createRow(id, values));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The item was not saved.' };
+    } finally {
+      busy = false;
+      // No snapshot means the database is gone: leave Add disabled, as the removal left it.
+      if (snapshot) render(snapshot);
+    }
     if (!r.ok) { show('bad', r.reason || 'The item was not saved.'); return; }
     // Clear only if the reader has not typed something new during the retry.
     if ($('title').value.trim() === text) $('title').value = '';

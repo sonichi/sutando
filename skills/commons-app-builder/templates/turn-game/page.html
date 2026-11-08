@@ -237,11 +237,17 @@
       [...box.children].forEach((el) => { el.disabled = true; });
       const values = { Game: g.game + 1, Seat: 'X', Row: 0, Col: 0 };
       if (titleProp) values[titleProp] = 'Game ' + (g.game + 1) + ' start';
-      const r = await save(() => db.createRow(id, values));
-      busy = false;
-      // A watch update during the write redrew these buttons with busy still true, so the live
-      // set must be redrawn now rather than the captured one re-enabled.
-      if (snapshot) render(snapshot);
+      let r = { ok: false, reason: '' };
+      try {
+        r = await save(() => db.createRow(id, values));
+      } catch (e) {
+        r = { ok: false, reason: e.message || 'The new game was not started.' };
+      } finally {
+        busy = false;
+        // A watch update during the write redrew these buttons with busy still true, so the
+        // live set must be redrawn now rather than the captured one re-enabled.
+        if (snapshot) render(snapshot);
+      }
       if (!r.ok) show('bad', r.reason || 'The new game was not started.');
     };
     box.appendChild(again);
@@ -258,9 +264,15 @@
         Col: (i % 3) + 1,
       };
       if (titleProp) values[titleProp] = seat + ' r' + values.Row + 'c' + values.Col;
-      const r = await save(() => db.createRow(id, values));
-      busy = false;
-      if (snapshot) render(snapshot);
+      let r = { ok: false, reason: '' };
+      try {
+        r = await save(() => db.createRow(id, values));
+      } catch (e) {
+        r = { ok: false, reason: e.message || 'Your move was not saved.' };
+      } finally {
+        busy = false;
+        if (snapshot) render(snapshot);
+      }
       if (!r.ok) show('bad', r.reason || 'Your move was not saved.');
     }, !over && !!seat && seat === g.turn && !busy);
 
