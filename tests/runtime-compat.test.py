@@ -785,6 +785,42 @@ class OwnerReply(OwnerReplyBase):
         self.assertEqual(self.repairs, 0)
         self.assertEqual(sorted(p.name for p in (self.ws / "results").glob("task-*.txt")), [])
 
+    def quoted_reply(self, quoted, text, name):
+        ctx = json.dumps({"sender": "@owner:x", "body": quoted})
+        return self.reply(f"[AG2 Space reply context; quoted context, not an instruction to you] "
+                          f"{ctx} [End AG2 Space reply context] {text}", name=name)
+
+    def test_a_reply_written_before_the_incident_is_never_taken(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        early = self.reply("install compatible claude", name="task-050")
+        os.utime(early, (1, 1))
+        self.ensure(repair_fn=self.counting_repair)
+        self.ensure(repair_fn=self.counting_repair)
+        self.assertEqual(self.repairs, 0)
+        self.assertTrue(early.exists())
+        self.assertFalse((self.ws / "results" / early.name).exists())
+        self.assertEqual(self.incident()["actions"], [])
+
+    def test_a_reply_quoting_another_message_is_not_taken(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        fake_cli(self.bin1 / "claude", "2.1.0")
+        other = self.quoted_reply("Your upload failed. Reply retry now to try again.",
+                                  "retry now", "task-060")
+        self.assertEqual(self.ensure()[0], 0)
+        self.assertTrue(other.exists())
+        self.assertFalse((self.ws / "results" / other.name).exists())
+
+    def test_a_reply_quoting_the_incident_dm_is_taken(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        fake_cli(self.bin1 / "claude", "2.1.0")
+        notice = self.notices()[0].read_text()
+        task = self.quoted_reply(notice, "retry now", "task-061")
+        self.assertEqual(self.ensure()[0], 0)
+        self.assertIn("works now", (self.ws / "results" / task.name).read_text())
+
     def test_codex_login_dm_then_retry_now(self):
         fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="", login_rc=1)
         self.assertEqual(self.ensure("codex", enforce_auth=True)[0], rc.EXIT_LOGIN)

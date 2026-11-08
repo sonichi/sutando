@@ -33,8 +33,8 @@ def normalize(text: str) -> str:
     return _TRAILING.sub("", " ".join((text or "").split()).lower())
 
 
-def owner_reply_text(path: Path) -> Optional[str]:
-    """The reply body of an owner-tier task, without quoted reply context; else None."""
+def owner_reply(path: Path) -> Optional[Tuple[Optional[dict], str]]:
+    """(the message it quotes, or None; the reply body) of an owner-tier task, else None."""
     from local_task_protocol import parse_task_headers_lenient, split_reply_context
     from policy.egress.result import resolve_access_tier
     if resolve_access_tier(path) != "owner":
@@ -43,12 +43,33 @@ def owner_reply_text(path: Path) -> Optional[str]:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    return split_reply_context(parse_task_headers_lenient(text).body)[1].strip()
+    quoted, body = split_reply_context(parse_task_headers_lenient(text).body)
+    return quoted, body.strip()
+
+
+def owner_reply_text(path: Path) -> Optional[str]:
+    """The reply body of an owner-tier task, without quoted reply context; else None."""
+    got = owner_reply(path)
+    return None if got is None else got[1]
+
+
+def _asks_for(quoted: Optional[dict], phrase: str) -> bool:
+    # A reply to some other message counts only when that message asked for this phrase.
+    return quoted is None or f'"{normalize(phrase)}"' in (quoted.get("body") or "").lower()
+
+
+def _mtime(path: Path) -> Optional[float]:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
-                     skip: Iterable[str] = ()) -> Iterator[Tuple[Path, str]]:
-    """(task, phrase) for each unanswered owner task whose whole message is one phrase."""
+                     skip: Iterable[str] = (), since: Optional[float] = None
+                     ) -> Iterator[Tuple[Path, str]]:
+    """(task, phrase) for each unanswered owner task whose whole message is one phrase,
+    written at or after `since`, and quoting nothing or a message that asked for it."""
     wanted = {normalize(p): p for p in phrases}
     skip = set(skip)
     workspace = _ws(workspace)
@@ -56,9 +77,14 @@ def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
         if path.stem in skip or find_result(workspace / "results", path.stem) is not None:
             continue
-        body = owner_reply_text(path)
-        if body is not None and normalize(body) in wanted:
-            yield path, wanted[normalize(body)]
+        if since is not None and (_mtime(path) or 0) < since:
+            continue
+        got = owner_reply(path)
+        if got is None or normalize(got[1]) not in wanted:
+            continue
+        phrase = wanted[normalize(got[1])]
+        if _asks_for(got[0], phrase):
+            yield path, phrase
 
 
 def queue_notice(workspace: Optional[Path], name: str, body: str) -> bool:

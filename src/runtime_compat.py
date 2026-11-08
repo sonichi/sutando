@@ -905,10 +905,10 @@ class Incident:
 
     def _open(self) -> None:
         if not self.open:
-            t = int(self.clock())
+            t = self.clock()
             self.rec = {"status": "open", "opened_at": t, "actions": self._unfinished(),
                         "notice_queued": False,
-                        "notice": f"proactive-runtime-compat-{self.runtime}-{t}.txt"}
+                        "notice": f"proactive-runtime-compat-{self.runtime}-{int(t)}.txt"}
             self._save()
 
     def notify(self, body: str) -> bool:
@@ -931,7 +931,7 @@ class Incident:
             return
         known = {e["task"] for e in self.entries}
         got = list(matching_replies(self.workspace, (install_phrase(self.runtime), RETRY_PHRASE),
-                                    skip=known))
+                                    skip=known, since=self.rec.get("opened_at")))
         done = {"applied": True, "reply": self.rec["fixed_reply"]} if late else {}
         if got:
             self.rec["actions"] = self.entries + [
