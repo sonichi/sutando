@@ -523,7 +523,6 @@ const SEATED = { 'seat.X': { id: 'u1', name: 'Tester' }, 'seat.O': { id: 'u2', n
   const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
   const dom = makeDom(html);
   const calls = [];
-  let fire = null;
   const snap = () => ({ id: 'd1', name: 'Poll — Votes', props: POLL_PROPS, rows });
   const art = {
     ready: Promise.resolve(),
@@ -544,7 +543,7 @@ const SEATED = { 'seat.X': { id: 'u1', name: 'Tester' }, 'seat.O': { id: 'u2', n
       // Before the viewer answers, the bridge refuses writes too: that is what makes save() retry.
       write: async (...a) => { calls.push(['write', ...a]); return allow ? { ok: true } : { ok: false, reason: 'waiting for the viewer’s answer' }; },
       createRow: async (...a) => { calls.push(['createRow', ...a]); return allow ? { ok: true, rowId: 'rX' } : { ok: false, reason: 'waiting for the viewer’s answer' }; },
-      onChange: (d, fn) => { fire = fn; return () => {}; },
+      onChange: () => () => {},
     },
   };
   const sandbox = { window: { artifact: art, addEventListener: () => {} }, document: dom.document,
