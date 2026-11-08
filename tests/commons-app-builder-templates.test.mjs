@@ -1451,6 +1451,91 @@ for (const [template, opts] of [['tracker', trackerOpts({ rows: [] })], ['planne
   });
 }
 
+/* ========= Chi's change at 1bafa08b: a THROWN comment write is reported and kept ===== */
+const mountPollWith = (rows, write) => {
+  const base = fakeArtifact(pollOpts({ rows }));
+  let fire = null;
+  base.art.db.onChange = (d, fn) => { fire = fn; return () => {}; };
+  base.art.db.write = (...a) => { base.calls.push(['write', ...a]); return write(...a); };
+  const html = readFileSync(join(TPL, 'poll', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  return { ...dom, ...base, fire: (snap) => fire(snap) };
+};
+const own = (id, choice, extra = {}) => ({ id, cells: { Voter: 'Tester', Choice: choice, 'Created by': ['@me:x'], ...extra } });
+
+/* After the vote saves, the Comment write REJECTS: the warn note shows and the text stays. */
+{
+  const r = mountPollWith([own('r1', 'Tea')], async (d, row, prop) => {
+    if (prop === 'Comment') throw new Error('bridge dropped the comment');
+    return { ok: true };
+  });
+  await settle();
+  r.byId.get('comment').value = 'Keep me';
+  r.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await settle(30);
+  check('poll/thrown-comment-after-vote-is-reported', () => {
+    assert.match(r.body.textContent, /vote was saved, but the comment was not/);
+    assert.match(r.body.textContent, /bridge dropped the comment/);
+  });
+  check('poll/thrown-comment-after-vote-keeps-the-text', () =>
+    assert.equal(r.byId.get('comment').value, 'Keep me'));
+  check('poll/thrown-comment-after-vote-leaves-save-comment', () => {
+    const b = r.byId.get('saveComment');
+    assert.equal(b.hidden, false);
+    assert.equal(b.disabled, false);
+  });
+}
+/* The same throw through the Save comment button. */
+{
+  const r = mountPollWith([own('r1', 'Tea')], async (d, row, prop) => {
+    if (prop === 'Comment') throw new Error('bridge dropped the comment');
+    return { ok: true };
+  });
+  await settle();
+  r.byId.get('comment').value = 'Keep me too';
+  r.byId.get('comment').dispatch('input');
+  r.byId.get('saveComment').click();
+  await settle(30);
+  check('poll/thrown-save-comment-is-reported-and-kept', () => {
+    assert.match(r.body.textContent, /comment was not saved: bridge dropped the comment/);
+    assert.equal(r.byId.get('comment').value, 'Keep me too');
+  });
+}
+/* sonichi-dot: a newer own-vote row arriving before the retry must NOT receive the older text.
+ * The retry stays on the row the vote was cast on. */
+{
+  const rows = [own('r1', 'Tea')];
+  let tries = 0;
+  const r = mountPollWith(rows, async (d, row, prop) => {
+    if (prop !== 'Comment') return { ok: true };
+    tries += 1;
+    if (tries === 1) {
+      // A newer vote of this viewer lands, with its own newer comment.
+      rows.push(own('r2', 'Coffee', { Comment: 'the newer comment' }));
+      r.fire({ id: 'd1', name: 'Poll — Votes', props: POLL_PROPS, rows: rows.slice() });
+      return { ok: false, reason: 'rate limit' };
+    }
+    return { ok: true };
+  });
+  await settle();
+  r.byId.get('comment').value = 'the older comment';
+  r.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await new Promise((ok) => setTimeout(ok, 1800));
+  await settle(30);
+  check('poll/comment-retry-stays-on-its-own-row', () => {
+    const commentWrites = r.calls.filter((c) => c[0] === 'write' && c[3] === 'Comment');
+    assert.ok(commentWrites.length >= 2, 'it retried: ' + JSON.stringify(commentWrites));
+    assert.ok(commentWrites.every((c) => c[2] === 'r1'), 'every attempt targets r1: ' + JSON.stringify(commentWrites));
+    assert.ok(!commentWrites.some((c) => c[2] === 'r2'), 'the newer row is never overwritten');
+  });
+}
+
 if (unhandled.length) {
   failures.push(`a page threw and left its promise unhandled (so a control may be stuck): ${[...new Set(unhandled)].join('; ')}`);
 }

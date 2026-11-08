@@ -131,17 +131,15 @@
   };
   let generation = 0;
 
-  // One place that writes the comment: re-resolves the voter's row on every attempt, because the
-  // row can be deleted between a refusal and its retry and a remembered id would throw.
-  const writeComment = (text) =>
+  // One place that writes the comment, to ONE row fixed when it was submitted. Each retry checks
+  // that row still exists rather than re-resolving "my vote": a newer vote arriving in between
+  // must not receive (and overwrite with) this older text, and a deleted one is reported.
+  const writeComment = (text, rowId) =>
     save(async () => {
-      if (snapshot) {
-        const who = await findMine(snapshot);
-        myRow = who.myRow;
-        consentKnown = who.consentKnown;
+      if (!rowId || (snapshot && !snapshot.rows.some((row) => row.id === rowId))) {
+        return { ok: false, reason: 'your vote is no longer in this room' };
       }
-      if (!myRow) return { ok: false, reason: 'your vote is no longer in this room' };
-      return db.write(id, myRow.id, 'Comment', text);
+      return db.write(id, rowId, 'Comment', text);
     });
 
   // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried
@@ -268,9 +266,14 @@
           // Choice, and a refusal is reported instead of being dropped. The row is re-resolved
           // on every attempt: it can be deleted between the refusal and the retry, and reading
           // a remembered id would throw.
-          if (r.ok && comment) commentResult = await writeComment(comment);
+          // A new vote carried the comment in its createRow; an edited one writes it separately,
+          // to the row the vote landed on.
+          if (r.ok && comment && myRow) commentResult = await writeComment(comment, myRow.id);
         } catch (e) {
+          // A throw after the vote saved belongs to the comment: record it, or the success
+          // branch below would clear the box and the comment would vanish without a word.
           if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };
+          else if (comment) commentResult = { ok: false, reason: e.message || 'refused' };
         } finally {
           busy = false;
           // Re-draw from the current snapshot: a watch update during the write replaced the
@@ -307,11 +310,12 @@
     if (busy) return;
     const text = $('comment').value.trim();
     if (!text) return;
+    const target = myRow ? myRow.id : null;          // fixed now; a retry never moves it
     busy = true;
     refreshSaveComment();
     let res = { ok: false, reason: '' };
     try {
-      res = await writeComment(text);
+      res = await writeComment(text, target);
     } catch (e) {
       res = { ok: false, reason: e.message || 'The comment was not saved.' };
     } finally {
