@@ -598,7 +598,12 @@ fi
 # provider limit is held until the reset or a backoff; any other death launches as before.
 if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
   _hold_rc=0
-  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
+  # The desktop host's card presenter, when this checkout runs under one; the gate names no host file.
+  _card_args=()
+  _app_dir="$(sutando_desktop_app_support "$REPO")"
+  [ -n "$_app_dir" ] && [ -f "$_app_dir/engine/local-card.py" ] && _card_args=(--card-entry "$_app_dir/engine/local-card.py")
+  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" \
+    ${_card_args[@]+"${_card_args[@]}"} 2>/dev/null)" || _hold_rc=$?
   if [ "$_hold_rc" = 75 ]; then
     echo "  ⏸ $SESSION not launched — ${_hold_line:-core paused: provider limit}" >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
