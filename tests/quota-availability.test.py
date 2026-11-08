@@ -544,7 +544,9 @@ class TestProbeRefreshesRecord(RecordFixture):
 
         with mock.patch.object(file_lock, "locked_file", spy):
             self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW, runner=self._runner([])))
-        self.assertEqual(seen, [qa.PROBE_MARK + ".lock"])
+        self.assertEqual(seen[0], qa.PROBE_MARK + ".lock")
+        self.assertNotIn(qa.PROBE_MARK, seen, "the marker itself is never the lock")
+        self.assertEqual(set(seen[1:]) - {qa.PROBE_LOG + ".lock"}, set(), "only the probe log's own lock follows")
 
     def test_at_most_one_probe_per_window_host_wide(self):
         calls = []
@@ -751,6 +753,31 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         qa._log_probe(self.ws, NOW, seat=SEAT, sent=1)
         self.assertEqual(len(self._log_lines()), 1)
         self.assertEqual((log.parent / (qa.PROBE_LOG + ".1")).stat().st_size, qa.PROBE_LOG_MAX_BYTES)
+
+    def test_a_second_writer_inside_a_rotation_loses_no_line_and_keeps_the_archive(self):
+        # The first rotation lets another writer run inside it; unlocked, that writer rotates too and
+        # the first writer's rename finds no file, so its line is lost (#6310 review).
+        import threading
+        log = self.ws / "logs" / qa.PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("x" * (qa.PROBE_LOG_MAX_BYTES - 1) + "\n")
+        real, second = os.replace, []
+
+        def replace_with_a_writer_inside(src, dst):
+            if not second:
+                second.append(threading.Thread(target=qa._log_probe, args=(self.ws, NOW + 1),
+                                               kwargs={"seat": "b", "sent": 1}))
+                second[0].start()
+                second[0].join(0.5)          # unlocked it finishes here; locked it waits for this writer
+            return real(src, dst)
+
+        with mock.patch.object(qa.os, "replace", replace_with_a_writer_inside):
+            qa._log_probe(self.ws, NOW, seat="a", sent=1)
+            second[0].join(10)
+        archive = log.with_name(qa.PROBE_LOG + ".1")
+        lines = log.read_text().splitlines()
+        self.assertEqual(sorted(ln.split(" ", 1)[1] for ln in lines), ["seat=a sent=1", "seat=b sent=1"])
+        self.assertEqual(archive.stat().st_size, qa.PROBE_LOG_MAX_BYTES, "the archive is the full old log")
 
     def test_the_re_read_stamp_is_the_records_own_time_not_the_logging_clock(self):
         # Production reads the record at one clock and logs at a later one; age-derived stamps drifted.

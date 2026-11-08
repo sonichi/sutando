@@ -479,18 +479,22 @@ def _log_probe(workspace, at: float, once: Optional[str] = None, **fields) -> No
     gate is on a fail-closed path and a log that cannot be written changes nothing."""
     stamp = datetime.fromtimestamp(at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = stamp + "".join(f" {k}={v}" for k, v in fields.items() if v is not None) + "\n"
+    from file_lock import locked_file
     try:
         log = Path(workspace) / "logs" / PROBE_LOG
         log.parent.mkdir(parents=True, exist_ok=True)
-        if once is not None and log.exists():
-            seat = fields.get("seat")
-            seat_tok = None if seat is None else f" seat={seat} "
-            if any(f" {once} " in ln + " " and (seat_tok is None or seat_tok in ln + " ") for ln in _log_tail(log)):
-                return
-        if log.exists() and log.stat().st_size >= PROBE_LOG_MAX_BYTES:
-            os.replace(log, log.with_name(PROBE_LOG + ".1"))
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        # Every notifier writes this file: the dedup, the rotation and the append are one step.
+        with locked_file(log.with_name(PROBE_LOG + ".lock")):
+            if once is not None and log.exists():
+                seat = fields.get("seat")
+                seat_tok = None if seat is None else f" seat={seat} "
+                if any(f" {once} " in ln + " " and (seat_tok is None or seat_tok in ln + " ")
+                       for ln in _log_tail(log)):
+                    return
+            if log.exists() and log.stat().st_size >= PROBE_LOG_MAX_BYTES:
+                os.replace(log, log.with_name(PROBE_LOG + ".1"))
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(line)
     except OSError:
         pass
 
