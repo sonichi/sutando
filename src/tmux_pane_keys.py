@@ -16,6 +16,7 @@ SCRIPT = Path(__file__).resolve().parent / "tmux-pane-keys.sh"
 TIMEOUT_S = 22
 BUSY = 75
 UNCERTAIN = 125
+FENCE_CHANGED = 3
 # Exit of a fenced action: 0 sent, 1 predicate false (the ticket ends .orphaned, nothing sent),
 # UNCERTAIN for a ticket neither sent nor orphaned, BUSY for another sender.
 WITHHELD = 1
@@ -206,6 +207,18 @@ def fence_status(socket):
         return "uncertain"
 
 
+def fence_episode(socket):
+    """Which interrupted send the fence stands for: its pending ticket, else the uncertain marker's time."""
+    guard = guard_path(socket)
+    try:
+        ticket = _pending_ticket(guard)
+        return str(ticket) if ticket is not None else f"uncertain:{(guard / 'uncertain').stat().st_mtime_ns}"
+    except FileNotFoundError:
+        return "no-record"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unreadable"
+
+
 def replace_unreadable_guard(socket):
     """Recovery only: a guard with no lockable mutex file has no live holder, so its shape is replaced."""
     guard = guard_path(socket)
@@ -264,12 +277,14 @@ def _main():
     try:
         if action == "run":
             rc = run_guarded(socket, args)
-        elif action == "recover":
+        elif action in ("recover", "recover-episode"):
             replace_unreadable_guard(socket)
             with prepare_guard(socket).open("ab") as stream:
                 rc = _lock_fd(stream.fileno())
                 if rc != BUSY:
-                    rc = finish_guard(socket, completed=True)
+                    # Under the lock: an approval given for one fence never settles a later one.
+                    changed = action == "recover-episode" and [fence_episode(socket)] != args[:1]
+                    rc = FENCE_CHANGED if changed else finish_guard(socket, completed=True)
         else:
             return 2
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -279,6 +294,8 @@ def _main():
         print("tmux-pane-keys: another sender is busy; retry later", file=sys.stderr)
     elif rc == UNCERTAIN:
         print(f"tmux-pane-keys: uncertain send; sends blocked by {guard_path(socket)} until recovery", file=sys.stderr)
+    elif rc == FENCE_CHANGED:
+        print("tmux-pane-keys: the fence changed since this recovery was approved; nothing was cleared", file=sys.stderr)
     return rc
 
 
