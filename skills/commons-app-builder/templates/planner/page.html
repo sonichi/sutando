@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Planner</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
+    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --today: #eef2ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
+      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --today: #1d2742;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  .sub { color: var(--dim); font-size: 13px; }
+  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin: 10px 0; font-size: 14px; }
+  .note.bad { border-color: var(--bad); color: var(--bad); }
+  .note.warn { border-color: var(--warn); color: var(--warn); }
+  .bar { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+  .bar .range { flex: 1; text-align: center; font-size: 14px; color: var(--dim); }
+  input, select, button {
+    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 0 12px;
+  }
+  button { min-width: 44px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  .add { display: grid; gap: 8px; margin-bottom: 14px; }
+  .week { display: grid; gap: 10px; }
+  .day { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .day.now { background: var(--today); border-color: var(--accent); }
+  .dayTop { display: flex; justify-content: space-between; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+  .dayName { font-weight: 600; color: var(--ink); }
+  .items { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  .it { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+  .itName { overflow-wrap: anywhere; }
+  .itName.done { text-decoration: line-through; color: var(--dim); }
+  .slot { font-size: 12px; color: var(--dim); }
+  .empty { color: var(--dim); font-size: 13px; }
+  @media (min-width: 900px) {
+    .week { grid-template-columns: repeat(7, 1fr); align-items: start; }
+    .add { grid-template-columns: 2fr 1fr 1fr auto; }
+  }
+</style>
+</head>
+<body>
+<h1>Planner</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="notes"></div>
+<div class="bar">
+  <button type="button" id="prev" aria-label="Previous week">‹</button>
+  <span class="range" id="range"></span>
+  <button type="button" id="next" aria-label="Next week">›</button>
+  <button type="button" id="thisWeek">This week</button>
+</div>
+<div class="add">
+  <input id="title" placeholder="What is planned?" aria-label="Item" autocomplete="off">
+  <input id="day" type="date" aria-label="Day">
+  <select id="slot" aria-label="Part of day"></select>
+  <button class="primary" id="add" disabled>Add</button>
+</div>
+<div class="week" id="week"></div>
+<h2 class="sub" id="unscheduledTitle" hidden>Unscheduled</h2>
+<ul class="items" id="unscheduled"></ul>
+<script>
+(async () => {
+  const art = window.artifact;
+  const db = art && art.db;
+  const $ = (id) => document.getElementById(id);
+  const notes = $('notes');
+  const show = (cls, text) => {
+    const el = document.createElement('div');
+    el.className = 'note ' + cls;
+    el.textContent = text;
+    notes.appendChild(el);
+  };
+  const clearNotes = () => { notes.textContent = ''; };
+  let hintShown = false;
+  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
+
+  const DAY = 86400000;
+  const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  const parse = (s) => { const p = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ''); return p ? new Date(+p[1], +p[2] - 1, +p[3]) : null; };
+  const monday = (d) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const k = (x.getDay() + 6) % 7; return new Date(x.getTime() - k * DAY); };
+  const NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+  if (!db) {
+    $('sub').textContent = 'Preview';
+    show('warn', 'Open this page in s.space to use it: this is a preview with no data.');
+    $('add').disabled = true;
+    return;
+  }
+  await art.ready;
+
+  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;
+  let dbs = [];
+  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }
+  const id = (art.app && art.app.database) || byName(dbs, 'Planner — Items');
+  if (!id) { $('sub').textContent = ''; show('bad', 'The "Planner — Items" database is missing from this room.'); $('add').disabled = true; return; }
+
+  const save = async (call) => {
+    const until = Date.now() + 120000;
+    for (;;) {
+      const r = await call();
+      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
+      hint('Allow this page to edit data in this room, and it will save.');
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  };
+
+  const nowMs = () => (Number.isNaN(art.now()) ? Date.now() : art.now());
+  // The week on screen is this viewer's own: the hash, never a shared row.
+  const weekStart = () => {
+    const h = /(\d{4}-\d{2}-\d{2})/.exec(location.hash || '');
+    return monday(parse(h && h[1]) || new Date(nowMs()));
+  };
+  let start = weekStart();
+  const setStart = (d) => { start = monday(d); location.hash = 'week=' + iso(start); paint(); };
+
+  let snapshot = null, titleProp = null, slotOpts = [], stateOpts = [];
+
+  const paint = () => {
+    if (!snapshot) return;
+    clearNotes();
+    hintShown = false;
+    const rows = snapshot.rows;
+    const end = new Date(start.getTime() + 6 * DAY);
+    $('range').textContent = iso(start) + ' → ' + iso(end);
+    $('sub').textContent = rows.length + (rows.length === 1 ? ' item' : ' items') + ' in all';
+
+    const todayIso = iso(new Date(nowMs()));
+    const week = $('week');
+    week.textContent = '';
+    for (let i = 0; i < 7; i += 1) {
+      const d = new Date(start.getTime() + i * DAY);
+      const key = iso(d);
+      const box = document.createElement('section');
+      box.className = 'day' + (key === todayIso ? ' now' : '');
+      const top = document.createElement('div');
+      top.className = 'dayTop';
+      const nm = document.createElement('span');
+      nm.className = 'dayName';
+      nm.textContent = NAMES[i] + ' ' + key.slice(5);
+      const cnt = document.createElement('span');
+      top.appendChild(nm); top.appendChild(cnt);
+      box.appendChild(top);
+      const mine = rows.filter((r) => r.cells.Day === key);
+      cnt.textContent = mine.length ? String(mine.length) : '';
+      if (!mine.length) {
+        const p = document.createElement('div');
+        p.className = 'empty';
+        p.textContent = 'Nothing planned';
+        box.appendChild(p);
+      } else {
+        box.appendChild(itemList(mine));
+      }
+      week.appendChild(box);
+    }
+
+    const loose = rows.filter((r) => !r.cells.Day);
+    $('unscheduledTitle').hidden = !loose.length;
+    const ul = $('unscheduled');
+    ul.textContent = '';
+    if (loose.length) ul.appendChild(itemList(loose, true));
+  };
+
+  const itemList = (rows, flat) => {
+    const ul = flat ? document.createDocumentFragment() : document.createElement('ul');
+    if (!flat) ul.className = 'items';
+    const order = { Morning: 0, Afternoon: 1, Evening: 2 };
+    rows.slice().sort((a, b) => (order[a.cells.Slot] ?? 9) - (order[b.cells.Slot] ?? 9)).forEach((row) => {
+      const li = document.createElement('li');
+      li.className = 'it';
+      const left = document.createElement('span');
+      left.className = 'itName' + (row.cells.State === 'Done' ? ' done' : '');
+      left.textContent = (titleProp && row.cells[titleProp]) || 'Untitled';
+      if (row.cells.Slot) {
+        const s = document.createElement('span');
+        s.className = 'slot';
+        s.textContent = '  ' + row.cells.Slot;
+        left.appendChild(s);
+      }
+      const b = document.createElement('button');
+      b.type = 'button';
+      const done = row.cells.State === 'Done';
+      b.textContent = done ? 'Undo' : 'Done';
+      b.setAttribute('aria-label', (done ? 'Mark not done: ' : 'Mark done: ') + left.textContent);
+      b.onclick = async () => {
+        b.disabled = true;
+        const want = done ? (stateOpts[0] && stateOpts[0].name) || 'Planned' : 'Done';
+        const r = await save(() => db.write(id, row.id, 'State', want));
+        b.disabled = false;
+        if (!r.ok) show('bad', r.reason || 'The change was refused.');
+      };
+      li.appendChild(left); li.appendChild(b);
+      ul.appendChild(li);
+    });
+    return ul;
+  };
+
+  const render = (snap) => {
+    if (!snap) { clearNotes(); $('week').textContent = ''; $('sub').textContent = ''; show('bad', 'The Planner database was removed from this room.'); $('add').disabled = true; return; }
+    snapshot = snap;
+    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
+    const slot = snap.props.find((p) => p.name === 'Slot');
+    const state = snap.props.find((p) => p.name === 'State');
+    slotOpts = (slot && slot.options) || [];
+    stateOpts = (state && state.options) || [];
+    const sel = $('slot');
+    if (!sel.options.length) {
+      slotOpts.forEach((o) => {
+        const opt = document.createElement('option');
+        opt.value = o.name; opt.textContent = o.name;
+        sel.appendChild(opt);
+      });
+    }
+    $('add').disabled = !titleProp;
+    if (!titleProp) show('bad', 'This database has no title column, so items cannot be named.');
+    paint();
+  };
+
+  db.onChange(id, render);
+  try { render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+
+  $('prev').onclick = () => setStart(new Date(start.getTime() - 7 * DAY));
+  $('next').onclick = () => setStart(new Date(start.getTime() + 7 * DAY));
+  $('thisWeek').onclick = () => setStart(new Date(nowMs()));
+  window.addEventListener('hashchange', () => { start = weekStart(); paint(); });
+
+  $('add').onclick = async () => {
+    const text = $('title').value.trim();
+    if (!text || !titleProp) return;
+    const values = {};
+    values[titleProp] = text;
+    if ($('day').value) values.Day = $('day').value;
+    if ($('slot').value) values.Slot = $('slot').value;
+    if (stateOpts.length) values.State = stateOpts[0].name;
+    $('add').disabled = true;
+    const r = await save(() => db.createRow(id, values));
+    $('add').disabled = false;
+    if (r.ok) { $('title').value = ''; } else { show('bad', r.reason || 'The item was not saved.'); }
+  };
+  $('title').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
+})();
+</script>
+</body>
+</html>

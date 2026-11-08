@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Poll</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
+    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --bar: #d8def8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
+      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --bar: #26314f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; }
+  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
+  .note.bad { border-color: var(--bad); color: var(--bad); }
+  .note.warn { border-color: var(--warn); color: var(--warn); }
+  .choices { display: grid; gap: 10px; margin-bottom: 16px; }
+  button {
+    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;
+  }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }
+  .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }
+  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }
+  .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }
+  .fill { height: 100%; background: var(--accent); }
+  .you { font-size: 12px; color: var(--dim); margin-left: 6px; }
+  input {
+    font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 0 12px;
+  }
+  @media (min-width: 640px) { .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); } }
+</style>
+</head>
+<body>
+<h1>Poll</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="notes"></div>
+<ul class="results" id="results"></ul>
+<div class="choices" id="choices"></div>
+<input id="comment" placeholder="Add a comment (optional)" aria-label="Comment" autocomplete="off">
+<script>
+(async () => {
+  const art = window.artifact;
+  const db = art && art.db;
+  const $ = (id) => document.getElementById(id);
+  const notes = $('notes');
+  const show = (cls, text) => {
+    const el = document.createElement('div');
+    el.className = 'note ' + cls;
+    el.textContent = text;
+    notes.appendChild(el);
+  };
+  const clearNotes = () => { notes.textContent = ''; };
+  let hintShown = false;
+  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
+
+  if (!db) {
+    $('sub').textContent = 'Preview';
+    show('warn', 'Open this page in s.space to vote: this is a preview with no data.');
+    return;
+  }
+  await art.ready;
+
+  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;
+  let dbs = [];
+  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }
+  const id = (art.app && art.app.database) || byName(dbs, 'Poll — Votes');
+  if (!id) { $('sub').textContent = ''; show('bad', 'The "Poll — Votes" database is missing from this room.'); return; }
+
+  const save = async (call) => {
+    const until = Date.now() + 120000;
+    for (;;) {
+      const r = await call();
+      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
+      hint('Allow this page to edit data in this room, and your vote will save.');
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  };
+
+  let titleProp = null, myRow = null, consentKnown = true, busy = false;
+
+  // Who wrote each vote. personId rejects until the viewer allows the page, and then the page
+  // cannot tell its own vote from anyone else's: it shows "?" rather than claiming none.
+  const findMine = async (snap) => {
+    myRow = null;
+    consentKnown = true;
+    for (const row of snap.rows) {
+      try {
+        const who = await art.personId(row.cells['Created by']);
+        if (who && art.me && who === art.me.id) { myRow = row; break; }
+      } catch (e) { consentKnown = false; return; }
+    }
+  };
+
+  const draw = (snap) => {
+    clearNotes();
+    hintShown = false;
+    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
+    const choice = snap.props.find((p) => p.name === 'Choice');
+    const options = (choice && choice.options) || [];
+    if (!options.length) { show('bad', 'The Choice column has no options yet, so there is nothing to vote on.'); return; }
+
+    // One row per vote; a person's own vote is their created_by row.
+    const tally = {};
+    options.forEach((o) => { tally[o.name] = 0; });
+    let counted = 0;
+    snap.rows.forEach((r) => {
+      const c = r.cells.Choice;
+      if (c && Object.prototype.hasOwnProperty.call(tally, c)) { tally[c] += 1; counted += 1; }
+    });
+
+    $('sub').textContent = counted + (counted === 1 ? ' vote' : ' votes') +
+      (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');
+    if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');
+
+    const res = $('results');
+    res.textContent = '';
+    if (!counted) {
+      const li = document.createElement('li');
+      li.className = 'res';
+      li.textContent = 'No votes yet. Pick an option below to be first.';
+      res.appendChild(li);
+    } else {
+      options.forEach((o) => {
+        const n = tally[o.name];
+        const li = document.createElement('li');
+        li.className = 'res';
+        const top = document.createElement('div');
+        top.className = 'resTop';
+        const left = document.createElement('span');
+        left.textContent = o.name;
+        if (consentKnown && myRow && myRow.cells.Choice === o.name) {
+          const you = document.createElement('span');
+          you.className = 'you';
+          you.textContent = '(yours)';
+          left.appendChild(you);
+        }
+        const right = document.createElement('span');
+        right.textContent = n + '  ·  ' + Math.round((n / counted) * 100) + '%';
+        top.appendChild(left); top.appendChild(right);
+        const track = document.createElement('div');
+        track.className = 'track';
+        const fill = document.createElement('div');
+        fill.className = 'fill';
+        fill.style.width = Math.round((n / counted) * 100) + '%';
+        track.appendChild(fill);
+        li.appendChild(top); li.appendChild(track);
+        res.appendChild(li);
+      });
+    }
+
+    const box = $('choices');
+    box.textContent = '';
+    options.forEach((o) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = (consentKnown && myRow && myRow.cells.Choice === o.name) ? o.name + ' — your vote' : o.name;
+      if (consentKnown && myRow && myRow.cells.Choice === o.name) b.className = 'chosen';
+      b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);
+      b.setAttribute('aria-label', 'Vote for ' + o.name);
+      b.onclick = async () => {
+        busy = true;
+        b.disabled = true;
+        const comment = $('comment').value.trim();
+        let r;
+        if (myRow) {
+          // Change the existing vote rather than adding a second row.
+          r = await save(() => db.write(id, myRow.id, 'Choice', o.name));
+          if (r.ok && comment) await save(() => db.write(id, myRow.id, 'Comment', comment));
+        } else {
+          const values = { Choice: o.name };
+          if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
+          if (comment) values.Comment = comment;
+          r = await save(() => db.createRow(id, values));
+        }
+        busy = false;
+        b.disabled = false;
+        if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');
+      };
+      box.appendChild(b);
+    });
+  };
+
+  const render = async (snap) => {
+    if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }
+    await findMine(snap);
+    draw(snap);
+  };
+
+  db.onChange(id, render);
+  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+})();
+</script>
+</body>
+</html>

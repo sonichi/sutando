@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turn game</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
+    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --win: #157f4b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
+      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --win: #5bd39b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 10px; }
+  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
+  .note.bad { border-color: var(--bad); color: var(--bad); }
+  .note.warn { border-color: var(--warn); color: var(--warn); }
+  .seats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  button {
+    font: inherit; color: inherit; min-height: 44px; min-width: 44px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 0 12px; cursor: pointer;
+  }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 360px; }
+  .cell {
+    aspect-ratio: 1 / 1; min-height: 88px; font-size: 34px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .cell.win { border-color: var(--win); color: var(--win); border-width: 2px; }
+  .status { margin: 12px 0; font-size: 15px; }
+  .status.turn { font-weight: 600; }
+  .moves { color: var(--dim); font-size: 13px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>Tic-tac-toe</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="notes"></div>
+<div class="seats" id="seats"></div>
+<div class="status" id="status"></div>
+<div class="board" id="board"></div>
+<div class="moves" id="moves"></div>
+<script>
+(async () => {
+  const art = window.artifact;
+  const db = art && art.db;
+  const $ = (id) => document.getElementById(id);
+  const notes = $('notes');
+  const show = (cls, text) => {
+    const el = document.createElement('div');
+    el.className = 'note ' + cls;
+    el.textContent = text;
+    notes.appendChild(el);
+  };
+  const clearNotes = () => { notes.textContent = ''; };
+  let hintShown = false;
+  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
+
+  const LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+
+  const drawBoard = (cells, winLine, onTap, enabled) => {
+    const board = $('board');
+    board.textContent = '';
+    for (let i = 0; i < 9; i += 1) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'cell' + (winLine && winLine.indexOf(i) >= 0 ? ' win' : '');
+      b.textContent = cells[i] || '';
+      const r = Math.floor(i / 3) + 1, c = (i % 3) + 1;
+      b.setAttribute('aria-label', cells[i] ? (cells[i] + ' at row ' + r + ', column ' + c) : ('Play row ' + r + ', column ' + c));
+      b.disabled = !enabled || !!cells[i];
+      if (onTap) b.onclick = () => onTap(i, b);
+      board.appendChild(b);
+    }
+  };
+
+  if (!db) {
+    $('sub').textContent = 'Preview';
+    show('warn', 'Open this page in s.space to play: this is a preview and taps do nothing.');
+    drawBoard(['X','O','X','','O','','','',''], null, null, false);
+    return;
+  }
+  await art.ready;
+
+  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;
+  let dbs = [];
+  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }
+  const id = (art.app && art.app.database) || byName(dbs, 'Game — Moves');
+  if (!id) { $('sub').textContent = ''; show('bad', 'The "Game — Moves" database is missing from this room.'); return; }
+
+  const save = async (call) => {
+    const until = Date.now() + 120000;
+    for (;;) {
+      const r = await call();
+      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
+      hint('Allow this page to edit data in this room, and your move will save.');
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  };
+
+  // Seats are room state, not moves.
+  let seats = { X: null, O: null };
+  const readSeats = async () => {
+    try {
+      seats = { X: (await art.state.get('seat.X')) || null, O: (await art.state.get('seat.O')) || null };
+    } catch (e) { seats = { X: null, O: null }; }
+  };
+  await readSeats();
+  if (art.state && art.state.on) art.state.on('*', async () => { await readSeats(); if (snapshot) render(snapshot); });
+
+  const mySeat = () => {
+    const me = art.me && art.me.id;
+    if (!me) return null;
+    if (seats.X && seats.X.id === me) return 'X';
+    if (seats.O && seats.O.id === me) return 'O';
+    return null;
+  };
+
+  let snapshot = null, titleProp = null, busy = false;
+
+  const replay = (rows) => {
+    // Highest Game number only; the board is the replay of its moves in order.
+    const game = rows.reduce((m, r) => Math.max(m, Number(r.cells.Game) || 1), 1);
+    const moves = rows
+      .filter((r) => (Number(r.cells.Game) || 1) === game)
+      .filter((r) => Number(r.cells.Row) >= 1 && Number(r.cells.Row) <= 3 && Number(r.cells.Col) >= 1 && Number(r.cells.Col) <= 3)
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    const cells = new Array(9).fill('');
+    let placed = 0;
+    moves.forEach((r) => {
+      const i = (Number(r.cells.Row) - 1) * 3 + (Number(r.cells.Col) - 1);
+      if (cells[i]) return;                                  // first move to a square wins it
+      cells[i] = r.cells.Seat === 'O' ? 'O' : 'X';
+      placed += 1;
+    });
+    let win = null, winner = '';
+    LINES.forEach((l) => {
+      if (!win && cells[l[0]] && cells[l[0]] === cells[l[1]] && cells[l[1]] === cells[l[2]]) { win = l; winner = cells[l[0]]; }
+    });
+    return { game, cells, placed, win, winner, turn: placed % 2 === 0 ? 'X' : 'O' };
+  };
+
+  const render = (snap) => {
+    if (!snap) { clearNotes(); $('board').textContent = ''; $('sub').textContent = ''; show('bad', 'The Moves database was removed from this room.'); return; }
+    snapshot = snap;
+    clearNotes();
+    hintShown = false;
+    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
+    const g = replay(snap.rows);
+    const seat = mySeat();
+    const full = g.placed >= 9;
+    const over = !!g.win || full;
+
+    $('sub').textContent = 'Game ' + g.game + '  ·  ' + g.placed + (g.placed === 1 ? ' move' : ' moves');
+    const st = $('status');
+    st.className = 'status' + (!over && seat === g.turn ? ' turn' : '');
+    if (g.win) st.textContent = g.winner + ' wins.';
+    else if (full) st.textContent = 'A draw.';
+    else if (!seat) st.textContent = 'Take a seat to play. ' + g.turn + ' is to move.';
+    else if (seat === g.turn) st.textContent = 'Your turn as ' + seat + '.';
+    else st.textContent = 'Waiting for ' + g.turn + '.';
+
+    const box = $('seats');
+    box.textContent = '';
+    ['X', 'O'].forEach((s) => {
+      const taken = seats[s];
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = taken ? (s + ': ' + taken.name) : ('Play as ' + s);
+      b.disabled = !!taken || !!seat;
+      b.setAttribute('aria-label', taken ? (s + ' is ' + taken.name) : ('Take seat ' + s));
+      b.onclick = async () => {
+        b.disabled = true;
+        try {
+          await art.state.set('seat.' + s, { id: art.me.id, name: (art.me && art.me.name) || s });
+          await readSeats();
+          render(snapshot);
+        } catch (e) { show('bad', e.message || 'The seat could not be taken.'); b.disabled = false; }
+      };
+      box.appendChild(b);
+    });
+    if (seat) {
+      const leave = document.createElement('button');
+      leave.type = 'button';
+      leave.textContent = 'Leave seat ' + seat;
+      leave.onclick = async () => {
+        leave.disabled = true;
+        try { await art.state.delete('seat.' + seat); await readSeats(); render(snapshot); }
+        catch (e) { show('bad', e.message || 'The seat could not be freed.'); leave.disabled = false; }
+      };
+      box.appendChild(leave);
+    }
+    const again = document.createElement('button');
+    again.type = 'button';
+    again.className = over ? 'primary' : '';
+    again.textContent = 'New game';
+    again.disabled = !over || busy;
+    again.onclick = async () => {
+      busy = true; again.disabled = true;
+      const values = { Game: g.game + 1, Seat: 'X', Row: 0, Col: 0 };
+      if (titleProp) values[titleProp] = 'Game ' + (g.game + 1) + ' start';
+      const r = await save(() => db.createRow(id, values));
+      busy = false;
+      if (!r.ok) { show('bad', r.reason || 'The new game was not started.'); again.disabled = false; }
+    };
+    box.appendChild(again);
+
+    drawBoard(g.cells, g.win, async (i, b) => {
+      b.disabled = true;
+      busy = true;
+      const values = {
+        Game: g.game,
+        Seat: seat,
+        Row: Math.floor(i / 3) + 1,
+        Col: (i % 3) + 1,
+      };
+      if (titleProp) values[titleProp] = seat + ' r' + values.Row + 'c' + values.Col;
+      const r = await save(() => db.createRow(id, values));
+      busy = false;
+      if (!r.ok) { show('bad', r.reason || 'Your move was not saved.'); b.disabled = false; }
+    }, !over && !!seat && seat === g.turn && !busy);
+
+    $('moves').textContent = over ? '' : (seat ? '' : 'Seats are a convenience: anyone with the table can still add a row.');
+  };
+
+  db.onChange(id, render);
+  try { render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+})();
+</script>
+</body>
+</html>

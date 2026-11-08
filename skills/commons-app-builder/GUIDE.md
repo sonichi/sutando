@@ -275,6 +275,15 @@ Request: "Build a Commons app: sign-ups for Saturday's cleanup, morning or after
 
    Report that the consent prompt and two-viewer sync were not tested.
 
+## Starter templates
+
+`templates/` holds four working apps to start from, each a `page.html` with its
+`schema.json`: a **tracker** (status, owner, due date, and an agent on a row), a **poll**
+(one row per vote, ownership through `created_by`), a **planner** (dated items in a week
+view) and a **two-player turn game** (append-only moves, the turn from the move count).
+`templates/README.md` says which to pick and how to create one. Copy and adapt rather than
+starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
+
 ## Patterns from apps that shipped
 
 - **Turn games** (Gomoku, Chinese checkers): a moves database, one row per move with

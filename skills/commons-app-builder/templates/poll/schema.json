@@ -1,0 +1,36 @@
+{
+  "app": "Poll",
+  "summary": "One row per vote. A person's own vote is found through created_by, so the tally cannot be forged by editing a text cell.",
+  "databases": [
+    {
+      "name": "Poll — Votes",
+      "template": "blank",
+      "role": "primary",
+      "props": [
+        {
+          "name": "Choice",
+          "type": "select",
+          "options": [
+            { "name": "Option A" },
+            { "name": "Option B" },
+            { "name": "Option C" }
+          ],
+          "note": "Rename and extend these to the real options with prop_update before anyone votes."
+        },
+        { "name": "Comment", "type": "text" },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All votes" },
+        { "layout": "board", "name": "By choice", "groupBy": "Choice" }
+      ],
+      "summon_policy": "owner"
+    }
+  ],
+  "agent_hook": "none",
+  "notes": [
+    "One vote per person is a page convenience, not enforcement: anyone can still add a row in a table view. Say so in the reply.",
+    "Authorship comes from created_by only. Never add a writable 'Voter' text or person column: it can be forged.",
+    "The title column holds the voter's display name for readability; the tally never trusts it."
+  ]
+}
