@@ -479,8 +479,8 @@ def _log_probe(workspace, at: float, once: Optional[str] = None, **fields) -> No
     gate is on a fail-closed path and a log that cannot be written changes nothing."""
     stamp = datetime.fromtimestamp(at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = stamp + "".join(f" {k}={v}" for k, v in fields.items() if v is not None) + "\n"
-    from file_lock import locked_file
     try:
+        from file_lock import locked_file
         log = Path(workspace) / "logs" / PROBE_LOG
         log.parent.mkdir(parents=True, exist_ok=True)
         # Every notifier writes this file: the dedup, the rotation and the append are one step.
@@ -495,7 +495,7 @@ def _log_probe(workspace, at: float, once: Optional[str] = None, **fields) -> No
                 os.replace(log, log.with_name(PROBE_LOG + ".1"))
             with log.open("a", encoding="utf-8") as fh:
                 fh.write(line)
-    except OSError:
+    except (OSError, ImportError):
         pass
 
 

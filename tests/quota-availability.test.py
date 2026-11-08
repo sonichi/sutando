@@ -531,6 +531,11 @@ class TestProbeRefreshesRecord(RecordFixture):
         qa._launch_detached(quick, env=dict(os.environ), timeout=10, cwd=str(self.ws)).wait(10)
         self.assertTrue(done.exists())
 
+    def test_a_lock_module_that_cannot_load_does_not_break_the_probe_log_promise(self):
+        with mock.patch.dict(sys.modules, {"file_lock": None}):
+            qa._log_probe(self.ws, NOW, result="sent")
+        self.assertFalse((Path(self.ws) / "logs" / qa.PROBE_LOG).exists())
+
     def test_the_marker_is_claimed_under_a_sibling_lock_not_the_marker_itself(self):
         # Locking creates its file; if the marker were the lock, its fresh mtime
         # would read as "probed a moment ago" and no probe could ever go out.
