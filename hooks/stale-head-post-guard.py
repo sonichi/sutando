@@ -46,7 +46,6 @@ REVIEWS_RE = re.compile(r"^/?repos/([^/{}\s]+)/([^/{}\s]+)/pulls/(\d+)/reviews/?
 PR_URL_RE = re.compile(r"^https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)(?:[/?#].*)?$")
 REPO_RE = re.compile(r"^(?:https?://github\.com/)?([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 CLAIM_RE = re.compile(r"(?i)(?:\b(?:at|head)|@)[ \t]+`?([0-9a-f]{7,40})\b`?")
-HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 FIELD_OPTS = ("--raw-field", "--field", "-f", "-F")
 PREFIX_WORDS = {"sudo", "command", "exec", "nohup", "time", "env", "then", "do", "else", "!", "{"}
@@ -63,19 +62,7 @@ class Post:
 
 def heredocs(cmd):
     """(command without heredoc bodies, [(opener line, body), ...])."""
-    out, docs, pending = [], [], []
-    for line in cmd.split("\n"):
-        if pending:
-            tag, opener, buf = pending[0]
-            if line.strip() == tag:
-                docs.append((opener, "\n".join(buf)))
-                pending.pop(0)
-            else:
-                buf.append(line)
-            continue
-        out.append(line)
-        pending.extend((m.group(2), line, []) for m in HEREDOC_RE.finditer(line))
-    return "\n".join(out), docs
+    return _shell_scan.heredocs(cmd)
 
 
 def _read(path, cwd):

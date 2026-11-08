@@ -674,3 +674,53 @@ string at a time, the same scope limit the other two hooks accept. Deploy is the
 per-node registration as `context-source-guard.py`'s "Deploy (per node)" section above
 (`PreToolUse` → `Bash` matcher, `$CLAUDE_CONFIG_DIR` awareness) — not done as part of
 landing this hook's source.
+
+## `github-evidence-guard.py --dup-check` (duplicate-work warning)
+
+Warns, **never blocks**, before work that an existing PR may already cover. The same
+`github-evidence-guard.py` file, registered a second time under `PreToolUse[Bash]` with
+`--dup-check --repo <checkout>`, runs only this check; its other registrations are unchanged.
+The policy lives beside it in `_dup_work.py`.
+
+Triggers: `git checkout -b|-B`, `git switch -c|-C|--create`, `git worktree add -b|-B`
+(`cd X &&` and `git -C X` are followed), `gh pr create`, and `gh pr review <n|url>`. Heredoc
+bodies are data, not commands. Every other Bash command returns on a substring match with no
+subprocess and no file read.
+
+Each trigger makes **one** `gh api graphql` read (5 s budget) carrying every search:
+
+- **Ticket ids**: `rm[a-z0-9]{10,14}` anywhere in the branch, title or body, and `#NNNN` in the
+  branch or title or after closes/fixes/resolves in the body. Searched in **every state**, in a
+  query of their own, and every hit is listed first.
+- **Keywords** from the branch name and title: open PRs, and PRs closed in the last 30 days. A
+  PR counts when at least half of the keywords, and at least two, appear in its title or branch.
+- **Files** (`pr create`: local `git diff --name-only origin/<base>...HEAD`; `pr review`: the
+  reviewed PR's files): the 25 most recently updated open PRs. For the top 3 by shared files,
+  `gh pr diff` is read within the same budget and the `@@` hunk-header functions compared.
+
+The output ranks ticket-id hits, then PRs changing the same function, then keyword hits.
+File-only overlap is printed only as a count, and only beside another hit. The PR itself and
+PRs from the same branch are excluded. A branch with no ticket id adds one line saying the
+check is weaker. A failed or timed-out read prints one line, `Duplicate-work check could not
+run (...)`, and logs UNKNOWN.
+
+Output is PreToolUse `additionalContext` (exit 0): advice the model reads while the command
+runs. This hook never emits `permissionDecision: deny`.
+
+One row per trigger goes to `<workspace>/logs/dup-work.jsonl` (`ts`, `trigger`, `repo`,
+`branch`, `pr`, `verdict` FLAG / OK / UNKNOWN, `ticket`, `function`, `keyword`, `file_only`,
+`elapsed_ms`). `python3 hooks/_dup_work.py --summary` prints counts by verdict and trigger and
+p50/p95 `elapsed_ms`. `env.DUP_WORK_CHECK: off` in `sutando.config.local.json` turns it off.
+
+**Known limits.** One command at a time: a branch made by a script, alias or another tool is
+not seen. Keyword matching is literal (a prefix of 4+ characters counts). The file comparison
+sees only the 25 most recently updated open PRs. Codex-core sessions do not load Claude hooks.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes the hook to
+`build-core-settings.mjs` (arg 9, after the stale-head guard), which registers it under
+`PreToolUse` with matcher `Bash` and command `python3 <hook> --dup-check --repo <checkout>`.
+For a non-core session, add the same entry by hand.
+
+Tests: `python3 tests/github-evidence-guard-dup-check.test.py`.
