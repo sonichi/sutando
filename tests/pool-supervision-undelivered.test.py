@@ -349,6 +349,85 @@ check("pressing that card on the next sweep clears the fence", wc.drive_fence_cl
       {retry.id: "cleared"})
 check("and the fence reads clear", tpk.fence_status(sock), "clear")
 
+# A marker-only fence keeps its identity through housekeeping, and a later marker is another fence.
+sock_m = tmp / "fence-marker-only.sock"
+tpk.prepare_guard(sock_m)
+(tpk.guard_path(sock_m) / "uncertain").touch()
+marker = tpk.fence_episode(sock_m)
+tpk.refresh_guard(sock_m)
+check("refresh_guard leaves the fence's identity alone", tpk.fence_episode(sock_m), marker)
+check("recovery naming it clears it", recover_script("recover-episode", str(sock_m), marker).returncode, 0)
+check("the marker-only fence reads clear", tpk.fence_status(sock_m), "clear")
+(tpk.guard_path(sock_m) / "uncertain").touch()
+check("a later marker is another fence", recover_script("recover-episode", str(sock_m), marker).returncode,
+      tpk.FENCE_CHANGED)
+check("and it stands", tpk.fence_status(sock_m), "uncertain")
+
+
+# Every unreadable shape: a refused approval repairs nothing, and the right one recovers it.
+def no_mutex(g):
+    tpk.prepare_guard(Path(str(g).removesuffix(".pane-keys-lock")))
+    (g / "mutex").unlink()
+
+
+def mutex_directory(g):
+    (g / "mutex").mkdir(parents=True)
+
+
+def dangling(g):
+    g.symlink_to(g.with_name(g.name + ".gone"))
+
+
+def plain_file(g):
+    g.write_text("x")
+
+
+def link_to_a_file(g):
+    g.with_name(g.name + ".f").write_text("x")
+    g.symlink_to(g.with_name(g.name + ".f"))
+
+
+def corrupt_pending(g):
+    tpk.prepare_guard(Path(str(g).removesuffix(".pane-keys-lock")))
+    (g / "pending.json").write_text("{")
+
+
+def oversized_pending(g):
+    tpk.prepare_guard(Path(str(g).removesuffix(".pane-keys-lock")))
+    (g / "pending.json").write_text("x" * 5000)
+
+
+def shape_of(g):
+    return g.is_symlink(), g.is_dir(), (g / "mutex").is_file(), (g / "mutex").is_dir()
+
+
+for make in (no_mutex, mutex_directory, dangling, plain_file, link_to_a_file, corrupt_pending, oversized_pending):
+    n = make.__name__
+    sock_s, guard_s = tmp / f"shape-{n}.sock", tpk.guard_path(tmp / f"shape-{n}.sock")
+    make(guard_s)
+    check(f"{n}: the fence stands", tpk.fence_status(sock_s), "uncertain")
+    ep, shape = tpk.fence_episode(sock_s), shape_of(guard_s)
+    check(f"{n}: another episode is refused", recover_script("recover-episode", str(sock_s), "other").returncode,
+          tpk.FENCE_CHANGED)
+    check(f"{n}: nothing was repaired", (tpk.fence_status(sock_s), shape_of(guard_s), tpk.fence_episode(sock_s)),
+          ("uncertain", shape, ep))
+    check(f"{n}: its own episode recovers", recover_script("recover-episode", str(sock_s), ep).returncode, 0)
+    check(f"{n}: and it reads clear", tpk.fence_status(sock_s), "clear")
+
+# Two missing-mutex fences are different fences.
+sock_a = tmp / "fence-missing-twice.sock"
+no_mutex(tpk.guard_path(sock_a))
+ep_a = tpk.fence_episode(sock_a)
+check("missing-mutex A is recovered by other means", recover_script("recover", str(sock_a)).returncode, 0)
+(tpk.guard_path(sock_a) / "mutex").unlink()
+check("A's approval is refused for B", recover_script("recover-episode", str(sock_a), ep_a).returncode,
+      tpk.FENCE_CHANGED)
+check("and B is not repaired", (tpk.guard_path(sock_a) / "mutex").exists(), False)
+sock_n = tmp / "fence-no-guard.sock"
+check("with no guard there is no fence to approve", recover_script("recover-episode", str(sock_n), "x").returncode,
+      tpk.FENCE_CHANGED)
+check("and none is created", os.path.lexists(tpk.guard_path(sock_n)), False)
+
 out, _, req = card(pool(tmp / "unfenced.sock"), IDLE)
 check("a card with no fence offers no clear button", wc.FENCE_ACTION in [a.id for a in req.actions], False)
 

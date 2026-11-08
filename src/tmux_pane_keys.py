@@ -208,15 +208,20 @@ def fence_status(socket):
 
 
 def fence_episode(socket):
-    """Which interrupted send the fence stands for: its pending ticket, else the uncertain marker's time."""
+    """Which interrupted send the fence stands for: its ticket, else the guard as it stands now.
+    Entries coming and going move that stamp; refresh_guard's touches and recovery setup do not."""
     guard = guard_path(socket)
     try:
         ticket = _pending_ticket(guard)
-        return str(ticket) if ticket is not None else f"uncertain:{(guard / 'uncertain').stat().st_mtime_ns}"
-    except FileNotFoundError:
-        return "no-record"
+        if ticket is not None:
+            return str(ticket)
     except (OSError, ValueError, KeyError, TypeError):
-        return "unreadable"
+        pass
+    try:
+        stamp = guard.stat() if guard.exists() else guard.lstat()
+    except OSError:
+        return "no-guard"
+    return f"guard:{stamp.st_ino}:{stamp.st_mtime_ns}"
 
 
 def replace_unreadable_guard(socket):
@@ -233,6 +238,24 @@ def replace_unreadable_guard(socket):
         mutex.touch()
     elif guard.is_symlink() or guard.exists():
         guard.unlink()
+
+
+def recover_guard(socket, episode=None):
+    """Settle the fence; given `episode`, only that fence. Compared under the lock, except that a
+    guard with no lockable mutex has none to take: it is compared before the repair admits senders."""
+    matched = episode is None
+    if not (guard_path(socket) / "mutex").is_file():
+        if not matched and fence_episode(socket) != episode:
+            return FENCE_CHANGED
+        matched = True
+        replace_unreadable_guard(socket)
+    with prepare_guard(socket).open("ab") as stream:
+        rc = _lock_fd(stream.fileno())
+        if rc == BUSY:
+            return rc
+        if not matched and fence_episode(socket) != episode:
+            return FENCE_CHANGED
+        return finish_guard(socket, completed=True)
 
 
 def run_guarded(socket, args):
@@ -277,14 +300,10 @@ def _main():
     try:
         if action == "run":
             rc = run_guarded(socket, args)
-        elif action in ("recover", "recover-episode"):
-            replace_unreadable_guard(socket)
-            with prepare_guard(socket).open("ab") as stream:
-                rc = _lock_fd(stream.fileno())
-                if rc != BUSY:
-                    # Under the lock: an approval given for one fence never settles a later one.
-                    changed = action == "recover-episode" and [fence_episode(socket)] != args[:1]
-                    rc = FENCE_CHANGED if changed else finish_guard(socket, completed=True)
+        elif action == "recover":
+            rc = recover_guard(socket)
+        elif action == "recover-episode":
+            rc = recover_guard(socket, args[0]) if args else FENCE_CHANGED
         else:
             return 2
     except (OSError, ValueError, KeyError, TypeError) as exc:
