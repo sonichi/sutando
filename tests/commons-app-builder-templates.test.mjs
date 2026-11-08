@@ -1536,6 +1536,60 @@ const own = (id, choice, extra = {}) => ({ id, cells: { Voter: 'Tester', Choice:
   });
 }
 
+/* ===== sonichi-dot at d50372e5: the target must span the Choice await too ===== */
+/* Hold the Choice write; while it is pending a newer own row r2 (with its own comment) arrives.
+ * The comment must go to r1, the row the Choice write edited — never to r2. */
+{
+  const rows = [own('r1', 'Tea')];
+  let release = null;
+  const held = new Promise((ok) => { release = ok; });
+  const r = mountPollWith(rows, async (d, row, prop) => {
+    if (prop === 'Choice') { await held; return { ok: true }; }
+    return { ok: true };
+  });
+  await settle();
+  r.byId.get('comment').value = 'older text';
+  r.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await settle(6);                                   // the Choice write is now pending
+  rows.push(own('r2', 'Coffee', { Comment: 'newer comment' }));
+  r.fire({ id: 'd1', name: 'Poll — Votes', props: POLL_PROPS, rows: rows.slice() });
+  await settle(10);                                  // the re-render moved myRow to r2
+  release();
+  await settle(30);
+  check('poll/comment-follows-the-row-the-choice-write-edited', () => {
+    const choice = r.calls.find((c) => c[3] === 'Choice');
+    const comment = r.calls.find((c) => c[3] === 'Comment');
+    assert.equal(choice[2], 'r1', 'the vote edited r1');
+    assert.ok(comment, 'the comment was written');
+    assert.equal(comment[2], 'r1', 'and to r1, not r2: ' + JSON.stringify(r.calls));
+  });
+}
+/* The voted row is DELETED during the Choice await: report it and keep the text, never clear. */
+{
+  const rows = [own('r1', 'Tea')];
+  let release = null;
+  const held = new Promise((ok) => { release = ok; });
+  const r = mountPollWith(rows, async (d, row, prop) => {
+    if (prop === 'Choice') { await held; return { ok: true }; }
+    return { ok: true };
+  });
+  await settle();
+  r.byId.get('comment').value = 'unsaved text';
+  r.byId.get('choices').buttons().find((b) => /Coffee/.test(b.textContent)).click();
+  await settle(6);
+  rows.length = 0;                                   // r1 is deleted while the vote is pending
+  r.fire({ id: 'd1', name: 'Poll — Votes', props: POLL_PROPS, rows: [] });
+  await settle(10);
+  release();
+  await settle(30);
+  check('poll/row-deleted-during-the-vote-reports-the-comment', () =>
+    assert.match(r.body.textContent, /no longer in this room/));
+  check('poll/row-deleted-during-the-vote-keeps-the-text', () =>
+    assert.equal(r.byId.get('comment').value, 'unsaved text'));
+  check('poll/row-deleted-during-the-vote-writes-no-comment', () =>
+    assert.ok(!r.calls.some((c) => c[3] === 'Comment'), JSON.stringify(r.calls)));
+}
+
 if (unhandled.length) {
   failures.push(`a page threw and left its promise unhandled (so a control may be stuck): ${[...new Set(unhandled)].join('; ')}`);
 }

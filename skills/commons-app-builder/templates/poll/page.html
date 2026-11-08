@@ -245,6 +245,9 @@
         const comment = $('comment').value.trim();
         let r = { ok: false, reason: '' };
         let commentResult = null;
+        // The row the Choice write actually edited, recorded inside that write. Reading myRow
+        // after the await would pick up whatever a re-render put there meanwhile.
+        let votedRowId = null;
         // try/finally: anything thrown in here must still clear busy and redraw, or every
         // control stays disabled for good.
         try {
@@ -256,7 +259,11 @@
               myRow = who.myRow;
               consentKnown = who.consentKnown;
             }
-            if (myRow) return db.write(id, myRow.id, 'Choice', o.name);
+            if (myRow) {
+              votedRowId = myRow.id;
+              return db.write(id, votedRowId, 'Choice', o.name);
+            }
+            votedRowId = null;
             const values = { Choice: o.name };
             if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';
             if (comment) values.Comment = comment;
@@ -267,8 +274,8 @@
           // on every attempt: it can be deleted between the refusal and the retry, and reading
           // a remembered id would throw.
           // A new vote carried the comment in its createRow; an edited one writes it separately,
-          // to the row the vote landed on.
-          if (r.ok && comment && myRow) commentResult = await writeComment(comment, myRow.id);
+          // to the row that write used. If that row is gone by now, writeComment reports it.
+          if (r.ok && comment && votedRowId) commentResult = await writeComment(comment, votedRowId);
         } catch (e) {
           // A throw after the vote saved belongs to the comment: record it, or the success
           // branch below would clear the box and the comment would vanish without a word.
