@@ -245,6 +245,54 @@ def locked_skill_folder(mod):
                 os.environ["SUTANDO_EXTERNAL_PLUGIN_DIRS"] = saved_ext
 
 
+def malformed_worker_manifests(mod):
+    """A bad declaration never prevents a later valid worker from loading."""
+    import tempfile
+    from unittest.mock import patch
+
+    print("── malformed worker manifests ──")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        manifests = []
+        for name in ("bad", "good"):
+            skill = root / name
+            skill.mkdir()
+            (skill / "loop.py").write_text("# worker\n", encoding="utf-8")
+            manifest = skill / "manifest.json"
+            manifests.append(manifest)
+            manifest.write_text(json.dumps({"supervised_worker": {
+                "name": name, "script": "loop.py",
+                "interpreter": {"config": "FIXTURE_WORKER_PYTHON"}},
+                "config": {"FIXTURE_WORKER_PYTHON": sys.executable}}), encoding="utf-8")
+        valid = manifests[0].read_text(encoding="utf-8")
+        original_is_file = Path.is_file
+        cases = [("non-object " + raw, raw, None) for raw in ("[]", "null", "42", '"text"')]
+        cases += [("script permission", valid, root / "bad" / "loop.py"),
+                  ("interpreter permission", valid, root / "bad-python")]
+        for label, body, denied in cases:
+            if label == "interpreter permission":
+                data = json.loads(body)
+                data["config"]["FIXTURE_WORKER_PYTHON"] = str(denied)
+                body = json.dumps(data)
+            manifests[0].write_text(body, encoding="utf-8")
+
+            def is_file(path):
+                if path == denied:
+                    raise PermissionError("fixture permission denied")
+                return original_is_file(path)
+
+            with patch.object(mod, "_skill_manifests", return_value=manifests), \
+                    patch.object(Path, "is_file", is_file), \
+                    patch.dict(os.environ, {"FIXTURE_WORKER_PYTHON": ""}):
+                try:
+                    specs, skipped = mod._skill_worker_specs()
+                except Exception as exc:
+                    check(label + " is contained", False, repr(exc))
+                    continue
+            check(label + " skips only the bad worker", [s.name for s in specs] == ["good"])
+            check(label + " records a reason", len(skipped) == 1 and "bad" in skipped[0], str(skipped))
+
+
 def main() -> int:
     mod = load()
     check("core names no concrete skill",
@@ -345,6 +393,7 @@ def main() -> int:
     outside_the_engine(mod)
     guarded_scan(mod)
     locked_skill_folder(mod)
+    malformed_worker_manifests(mod)
 
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all sparrowd skill-worker checks ok'}")
     return 1 if FAILS else 0

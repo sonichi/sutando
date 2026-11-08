@@ -82,6 +82,9 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
         except (OSError, ValueError) as exc:
             skipped.append(f"{skill_dir.name}: manifest unreadable ({exc})")
             continue
+        if not isinstance(data, dict):
+            skipped.append(f"{skill_dir.name}: manifest must be a JSON object")
+            continue
         decl = data.get("supervised_worker")
         if not isinstance(decl, dict):
             continue
@@ -94,8 +97,13 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
             continue
         # A manifest is attacker-adjacent (skills/trusted-capabilities installs
         # third-party skills), so the script must resolve inside its own skill.
-        script = (skill_dir / rel).resolve()
-        if not script.is_relative_to(skill_dir.resolve()) or not script.is_file():
+        try:
+            script = (skill_dir / rel).resolve()
+            valid_script = script.is_relative_to(skill_dir.resolve()) and script.is_file()
+        except (OSError, RuntimeError) as exc:
+            skipped.append(f"{name}: script inaccessible ({exc})")
+            continue
+        if not valid_script:
             skipped.append(f"{name}: script is not a file inside {skill_dir.name}/")
             continue
         interp = decl.get("interpreter")
@@ -113,7 +121,12 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
             skipped.append(f"{name}: no interpreter configured: set {key} in "
                            f"{manifest}{specs_needs}")
             continue
-        if not Path(py).is_file():
+        try:
+            valid_interpreter = Path(py).is_file()
+        except (OSError, TypeError, ValueError) as exc:
+            skipped.append(f"{name}: configured interpreter inaccessible ({exc})")
+            continue
+        if not valid_interpreter:
             skipped.append(f"{name}: configured interpreter does not exist: {py}")
             continue
         specs.append(WorkerSpec(name=name, argv=[py, str(script)], cwd=str(REPO)))
