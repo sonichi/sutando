@@ -30,9 +30,13 @@ export function limitState(record: unknown): LimitState {
 	if (overage !== 'allowed' && overage !== 'allowed_warning') return 'rejected';
 	const checked = typeof rec.last_checked === 'string' ? Date.parse(rec.last_checked) : NaN;
 	const ledger = Array.isArray(rec.recent_rejections) ? rec.recent_rejections : [];
-	for (const r of ledger) {
-		if (!r || typeof r !== 'object' || (r as LedgerEntry).status !== 429) continue;
-		const at = typeof (r as LedgerEntry).ts === 'string' ? Date.parse((r as LedgerEntry).ts) : NaN;
+	for (const raw of ledger) {
+		if (!raw || typeof raw !== 'object') continue;
+		// Bound to a local: `typeof (raw as LedgerEntry).ts` would not narrow the
+		// second assertion, since each one is a fresh expression.
+		const r = raw as LedgerEntry;
+		if (r.status !== 429) continue;
+		const at = typeof r.ts === 'string' ? Date.parse(r.ts) : NaN;
 		// An unordered 429 (either stamp unreadable) is not known to be older.
 		if (Number.isNaN(checked) || Number.isNaN(at) || at >= checked) return 'rejected';
 	}
