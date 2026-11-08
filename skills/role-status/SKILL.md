@@ -96,18 +96,18 @@ usable on its own for inspection, through the same resolver:
   every cited event id (`working_event_ids`, `blocked_items[].evidence_event_ids`)
   must be **owned** by that actor. Ownership is read only from the object
   following the single `EVIDENCE_JSON` marker line; an actor mentioned inside
-  another actor's `detail` owns nothing. A file with no marker falls back to
-  blank-line blocks, where an id is owned only when its block names exactly one
-  actor — a multi-actor block is ambiguous, its ids are owned by nobody, and its
-  actors still count toward the floor. On either path an event id claimed by
-  more than one actor is ambiguous the same way. Ids are whole tokens: an id
-  touching another id character on either side (`…:ag2.spacex`, `$abcd` inside
-  `$abcde`) is a different token and never matches.
+  another actor's `detail` owns nothing, and the object is JSON on one line, so
+  no event text can start a second marker line. A file with no marker owns no
+  event at all. An event id claimed by more than one record is ambiguous: owned
+  by nobody, while its actors still count toward the floor. Ids are whole
+  tokens: an id touching another id character on either side (`…:ag2.spacex`,
+  `$abcd` inside `$abcde`) is a different token and never matches; a trailing
+  `.` or `:` followed by a non-id character is punctuation and ends the id.
 - **Coverage.** `distinct verified actors ≥ ceil(min_coverage × actors_with_events)`,
   else refused. Duplicate rows for one actor count once. A file with event ids
   none of which resolves to an owner is exit 2, never an empty `[]` publish;
   only a file with no event ids at all (nobody working) answers `[]`.
 - **Fail closed.** A malformed marked object or two marker lines is exit 2,
-  never the block fallback and never a zero floor.
+  never a zero floor. A file with no marker but with event ids is exit 2.
 
 Tests: `tests/skills/role-status/`.

@@ -24,12 +24,12 @@ truncated or extended id never matches and a cited id must equal a whole token.
 Ownership comes from the object that follows the one line starting with
 `EVIDENCE_JSON` (`events[].actor_id` owns `events[].id`; an actor mentioned
 inside another actor's event text owns nothing). A marker whose object is
-malformed, or a second marker line, is "cannot answer" -- never the fallback and
-never a zero floor. Only evidence with no marker at all uses the block fallback:
-an event id is owned when its blank-line-delimited block names exactly ONE
-actor. On either path an id claimed by more than one actor is ambiguous -- owned
-by nobody (a citation is stripped as `ambiguous ownership`) while every claimant
-still counts toward the coverage floor.
+malformed, or a second marker line, is "cannot answer" -- never a zero floor.
+Evidence with no marker owns no event: if it carries an event id it is "cannot
+answer", and only with no event ids at all does it answer [] on a zero floor.
+An id claimed by more than one record is ambiguous -- owned by nobody (a
+citation is stripped as `ambiguous ownership`) while every claimant still counts
+toward the coverage floor.
 
 stdout carries
 `rows=<n> distinct_actors=<d> actors=<m> actors_with_events=<k> min_rows=<r>`
@@ -57,11 +57,13 @@ from dotspace import LEGACY_SERVER
 
 
 # Union of both id alphabets: a token touching one of these on either side is a
-# different (longer) token, never this id.
+# different (longer) token, never this id. A trailing `.` or `:` is sentence
+# punctuation unless another id character follows it.
 ID_CHARS = r"A-Za-z0-9._:@$+/=-"
-ACTOR_RE = re.compile(r"(?<![%s])ag2space:@[A-Za-z0-9._-]+:%s(?![%s])"
-                      % (ID_CHARS, re.escape(LEGACY_SERVER), ID_CHARS))
-EVENT_RE = re.compile(r"(?<![%s])ag2space-message:\$[A-Za-z0-9_+/=-]+(?![%s])" % (ID_CHARS, ID_CHARS))
+_ID_END = r"(?![A-Za-z0-9_@$+/=-])(?![.:][%s])" % ID_CHARS
+ACTOR_RE = re.compile(r"(?<![%s])ag2space:@[A-Za-z0-9._-]+:%s%s"
+                      % (ID_CHARS, re.escape(LEGACY_SERVER), _ID_END))
+EVENT_RE = re.compile(r"(?<![%s])ag2space-message:\$[A-Za-z0-9_+/=-]+%s" % (ID_CHARS, _ID_END))
 MARKER = "EVIDENCE_JSON"
 
 EXIT_OK = 0
@@ -126,7 +128,7 @@ class Evidence(NamedTuple):
 def resolve_claims(evidence: str, claims: Dict[str, Set[str]], ambiguous_ids: Set[str],
                    ambiguous_actors: Set[str], has_events: bool) -> Evidence:
     """An id with exactly one claimant is owned; with several it is ambiguous and
-    every claimant still sets the floor. One rule for both evidence shapes."""
+    every claimant still sets the floor."""
     owned: Ownership = {}
     for eid, claimants in claims.items():
         if eid in ambiguous_ids or len(claimants) > 1:
@@ -137,32 +139,12 @@ def resolve_claims(evidence: str, claims: Dict[str, Set[str]], ambiguous_ids: Se
     return Evidence(set(ACTOR_RE.findall(evidence)), owned, ambiguous_ids, ambiguous_actors, has_events)
 
 
-def owned_events_by_block(evidence: str) -> Evidence:
-    """Each blank-line-delimited block claims its event ids for the one actor it
-    names; a block naming several actors makes its ids ambiguous outright."""
-    claims: Dict[str, Set[str]] = {}
-    ambiguous_ids: Set[str] = set()
-    ambiguous_actors: Set[str] = set()
-    for block in re.split(r"\n\s*\n", evidence):
-        events = set(EVENT_RE.findall(block))
-        actors = set(ACTOR_RE.findall(block))
-        if not events or not actors:
-            continue
-        if len(actors) > 1:
-            ambiguous_ids.update(events)
-            ambiguous_actors.update(actors)
-            continue
-        for eid in events:
-            claims.setdefault(eid, set()).add(next(iter(actors)))
-    return resolve_claims(evidence, claims, ambiguous_ids, ambiguous_actors,
-                          EVENT_RE.search(evidence) is not None)
-
-
 def count_actors(evidence: str) -> Evidence:
-    """Ownership from the marked object when the evidence carries one, else by block."""
+    """Ownership comes only from the marked object; unmarked evidence owns nothing."""
     events = structured_events(evidence)
     if events is None:
-        return owned_events_by_block(evidence)
+        return Evidence(set(ACTOR_RE.findall(evidence)), {}, set(), set(),
+                        EVENT_RE.search(evidence) is not None)
     claims: Dict[str, Set[str]] = {}
     for e in events:
         actor, eid = e.get("actor_id"), e.get("id")
