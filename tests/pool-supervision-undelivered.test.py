@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -232,21 +233,61 @@ def press(m, req, action_id):
                                guard=req.guard))
 
 
-class Runner:
-    def __init__(self):
-        self.calls = []
+class Runner(Tmux):
+    """An idle pane, and a recovery that exits `rc` instead of running."""
+
+    def __init__(self, rc=0):
+        super().__init__(IDLE)
+        self.rc = rc
 
     def __call__(self, argv, **kw):
-        self.calls.append(list(argv))
-        return type("Done", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if "recover-episode" in argv:
+            self.calls.append(list(argv))
+            return type("Done", (), {"returncode": self.rc, "stdout": "", "stderr": ""})()
+        return super().__call__(argv, **kw)
+
+    def recoveries(self):
+        return [c for c in self.calls if "recover-episode" in c]
+
+
+def _real_with_idle_pane():
+    """The real recovery, and an idle pane for the card raised after it refuses."""
+    def run(argv, **kw):
+        if "recover-episode" in argv:
+            return subprocess.run(argv, **kw)
+        return Tmux(IDLE)(argv, **kw)
+    return run
+
+
+def offered_again(m, why):
+    """The one active card after a press that settled nothing: it still has the button, and says why."""
+    active = m.active()
+    return (len(active), wc.FENCE_ACTION in [a.id for a in active[0].actions] if active else None,
+            why in active[0].message if active else None)
+
+
+def recover_script(*args):
+    return subprocess.run([sys.executable, str(REPO / "src" / "tmux_pane_keys.py"), *args],
+                          capture_output=True, text=True, timeout=30)
+
+
+def claimed_ticket(sock, name):
+    """A send that claimed its ticket and never reported: the fence stands for this one."""
+    tpk.prepare_guard(sock)
+    d = tmp / f"tmux-pane-keys.{name}"
+    d.mkdir()
+    tpk.begin_guard(sock, d / "ticket")
+    (d / "ticket").rename(d / "ticket.claimed")
+    return d / "ticket"
 
 
 sock, ws_f, req, m = fenced_card("fence-press")
 check("the fence card offers Clear the send fence", [a.id for a in req.actions][:1], [wc.FENCE_ACTION])
 check("and keeps the terminal recovery line", f"tmux_pane_keys.py recover {sock}" in req.message, True)
 check("it stays a core-blocked card, so reminders keep running", req.kind, "core-blocked")
+check("it records the fence it was raised for", (req.subject or {}).get("fence_episode"), tpk.fence_episode(sock))
 r = Runner()
-check("unpressed, nothing is cleared", (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.calls), ({}, []))
+check("unpressed, nothing is cleared", (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({}, []))
 press(m, req, wc.FENCE_ACTION)
 check("pressed on an uncertain fence, the real recovery runs and reports cleared",
       wc.drive_fence_clears(ws_f, manager=m), {req.id: "cleared"})
@@ -258,15 +299,55 @@ press(m, req, wc.FENCE_ACTION)
 r = Runner()
 with mock.patch.object(wc.tmux_pane_keys, "fence_status", return_value="busy"):
     out_busy = wc.drive_fence_clears(ws_f, runner=r, manager=m)
-check("a send in flight at press time is refused and nothing is run", (out_busy, r.calls), ({req.id: "refused"}, []))
-check("and the card expires", m.get(req.id).status, STATUS_EXPIRED)
+check("a send in flight at press time is refused and no recovery runs",
+      (out_busy, r.recoveries()), ({req.id: "refused"}, []))
+check("and that card expires", m.get(req.id).status, STATUS_EXPIRED)
+check("but the owner is offered the button again", offered_again(m, "a send was in flight"), (1, True, True))
 
 sock, ws_f, req, m = fenced_card("fence-cleared-meanwhile")
 press(m, req, wc.FENCE_ACTION)
 r = Runner()
 with mock.patch.object(wc.tmux_pane_keys, "fence_status", return_value="clear"):
     out_clear = wc.drive_fence_clears(ws_f, runner=r, manager=m)
-check("a fence already clear only closes the card", (out_clear, r.calls), ({req.id: "already-clear"}, []))
+check("a fence already clear only closes the card", (out_clear, r.recoveries()), ({req.id: "already-clear"}, []))
+
+# An old approval never settles a newer send (the real guard, no fake recovery).
+sock, ws_f, req, m = fenced_card("fence-a-then-b")
+press(m, req, wc.FENCE_ACTION)
+check("fence A is recovered by other means", recover_script("recover", str(sock)).returncode, 0)
+ticket_b = claimed_ticket(sock, "b")
+check("a new interrupted send B stands", tpk.fence_status(sock), "uncertain")
+check("the old approval is refused for B", wc.drive_fence_clears(ws_f, runner=_real_with_idle_pane(), manager=m),
+      {req.id: "changed"})
+check("B's pending record survives", (tpk.guard_path(sock) / "pending.json").exists(), True)
+check("B's fence still stands", tpk.fence_status(sock), "uncertain")
+check("the new card is for B", (m.active()[0].subject or {}).get("fence_episode"), str(ticket_b))
+check("and says this is a newer send", offered_again(m, "newer interrupted send"), (1, True, True))
+
+# The compare is under the recovery lock: a fence that changes after the status probe is refused there too.
+sock_c = tmp / "fence-probe-race.sock"
+ticket_c = claimed_ticket(sock_c, "c")
+got = recover_script("recover-episode", str(sock_c), "/some/other/ticket")
+check("recover-episode for another fence exits FENCE_CHANGED", got.returncode, tpk.FENCE_CHANGED)
+check("and clears nothing", tpk.fence_episode(sock_c), str(ticket_c))
+check("recover-episode with no fence named refuses too", recover_script("recover-episode", str(sock_c)).returncode,
+      tpk.FENCE_CHANGED)
+check("for the fence it names, it clears", recover_script("recover-episode", str(sock_c), str(ticket_c)).returncode, 0)
+check("and the fence reads clear", tpk.fence_status(sock_c), "clear")
+
+# A failed recovery leaves the owner a live card, and the retry works.
+sock, ws_f, req, m = fenced_card("fence-recovery-fails")
+press(m, req, wc.FENCE_ACTION)
+check("a recovery that fails reports failed", wc.drive_fence_clears(ws_f, runner=Runner(rc=125), manager=m),
+      {req.id: "failed"})
+check("that card expires", m.get(req.id).status, STATUS_EXPIRED)
+check("the fence is still there", tpk.fence_status(sock), "uncertain")
+check("and the owner has a live card, saying it failed", offered_again(m, "recovery itself failed"), (1, True, True))
+retry = m.active()[0]
+press(m, retry, wc.FENCE_ACTION)
+check("pressing that card on the next sweep clears the fence", wc.drive_fence_clears(ws_f, manager=m),
+      {retry.id: "cleared"})
+check("and the fence reads clear", tpk.fence_status(sock), "clear")
 
 out, _, req = card(pool(tmp / "unfenced.sock"), IDLE)
 check("a card with no fence offers no clear button", wc.FENCE_ACTION in [a.id for a in req.actions], False)
