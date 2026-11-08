@@ -15,6 +15,8 @@ tests/agent_api_task_guard.test.py's harness:
 
 Run: `python3 tests/agent-api-guest-routes.test.py`
 """
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import json
 from unittest.mock import patch
@@ -225,14 +227,14 @@ def run() -> None:
         rdir.mkdir(parents=True, exist_ok=True)
 
         tid = post("/guest-task", {"task": "research"})._responses[0][1]["task_id"]
-        (rdir / f"{tid}.txt").write_text(secret)
+        publish_result(rdir / f"{tid}.txt", secret)
         live = agent_api.get_task_result(tid)["result"]
         check("a live team result is scanned before release", secret not in live)
 
         # Archive both halves exactly as task-bridge does, leaving nothing live.
         arc_r = rdir / "archive" / "2026-08"
         arc_r.mkdir(parents=True, exist_ok=True)
-        (arc_r / f"{tid}.txt").write_text(secret)
+        publish_result(arc_r / f"{tid}.txt", secret)
         (rdir / f"{tid}.txt").unlink()
         arc_t = Path(agent_api.TASK_DIR) / "archive" / "2026-08"
         arc_t.mkdir(parents=True, exist_ok=True)
@@ -244,7 +246,7 @@ def run() -> None:
 
         # No metadata at all: a Signal Room id is team by construction.
         orphan = "task-signal-9999999999999-deadbeef"
-        (arc_r / f"{orphan}.txt").write_text(secret)
+        publish_result(arc_r / f"{orphan}.txt", secret)
         check("a room result with no surviving task file is still scanned",
               secret not in agent_api.get_task_result(orphan)["result"])
 
@@ -252,7 +254,7 @@ def run() -> None:
         otid = "task-owner-passthrough"
         (Path(agent_api.TASK_DIR) / f"{otid}.txt").write_text(
             f"id: {otid}\naccess_tier: owner\ntask: x\n")
-        (rdir / f"{otid}.txt").write_text("owner plain text")
+        publish_result(rdir / f"{otid}.txt", "owner plain text")
         check("an owner result is returned unchanged",
               agent_api.get_task_result(otid)["result"] == "owner plain text")
 
@@ -264,7 +266,7 @@ def run() -> None:
 
         sys.modules["policy.egress.result"].resolve_access_tier = _explode
         try:
-            (rdir / f"{otid}.txt").write_text(secret)
+            publish_result(rdir / f"{otid}.txt", secret)
             withheld = agent_api.get_task_result(otid)["result"]
             check("a classifier failure withholds the body", secret not in withheld)
         finally:

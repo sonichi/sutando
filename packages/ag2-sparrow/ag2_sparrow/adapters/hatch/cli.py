@@ -40,6 +40,7 @@ from ...persisted_number import bounded_number
 from ...delivery_core import WITHDRAWN
 from ...proactive_routing import about_task_filename
 from ...result_markers import parse_markers
+from ...result_publish import stage_text, publish_staged
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, task_fields, valid_mxid
 
@@ -1154,19 +1155,15 @@ def _claim(result_dir: Path, tid: str) -> bool:
 
 def _publish_once(result_file: Path, body: str) -> bool:
     """Write `body` at `result_file` unless something already holds that name."""
-    fd, tmp = tempfile.mkstemp(dir=str(result_file.parent), prefix=f".{result_file.name}.")
+    tmp = stage_text(result_file, body, mode=0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(body)
-        os.chmod(tmp, 0o600)
-        os.link(tmp, result_file)
+        publish_staged(tmp, result_file, no_replace=True, pair_result=True)
         return True
     except FileExistsError:
         return False
     finally:
-        # After a successful link a failed cleanup must not read as an uncommitted answer.
         with contextlib.suppress(OSError):
-            Path(tmp).unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
 
 
 def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
@@ -1228,7 +1225,7 @@ def task_settled(result_dir: Path, tid: str) -> bool:
     instance = tid[len("task-"):].split("~", 1)[0] if "~" in tid else ""
     item = item_id(tid, instance)
     root = gateway_instance.outbox_root(result_dir, instance)
-    return ((result_dir / f"{tid}.txt").exists()
+    return (result_ready.read_ready_result(result_dir / f"{tid}.txt") is not None
             or (item is not None and outbox.item_status(root, item) is not None))
 
 

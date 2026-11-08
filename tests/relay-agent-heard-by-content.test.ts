@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 // A result returned through its open call counts as heard only when a spoken turn carries its content: an
 // unrelated sentence after the return ("Yes, I can hear you") is not it. Own process (the result watcher is process-wide).
 // Run: npx tsx --test --test-force-exit tests/relay-agent-heard-by-content.test.ts
@@ -62,7 +63,7 @@ describe('a returned result is heard only when the model says it', () => {
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'count the PRs merged in the last 3 days' });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Sixty-one pull requests merged in sonichi/sutando in the last three days.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'Sixty-one pull requests merged in sonichi/sutando in the last three days.');
 		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /Sixty-one/);
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected', 'returned, not yet heard');
 		modelSays('Yes, I can hear you.', 't1');
@@ -83,7 +84,7 @@ describe('a returned result is heard only when the model says it', () => {
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5617' });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 5617 is merged; it went in on Saturday.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 5617 is merged; it went in on Saturday.');
 		await Promise.race([call, tick(5_000)]);
 		modelSays('Pull request 5617 was merged on Saturday.', 't4');
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
@@ -96,7 +97,7 @@ describe('a returned result is heard only when the model says it', () => {
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'how many tasks are open in the tracker' });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The tracker lists 14 open items, 3 of them blocked.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'The tracker lists 14 open items, 3 of them blocked.');
 		await Promise.race([call, tick(5_000)]);
 		modelSays('Sure, what else can I do for you?', 't5');
 		await until(() => voiceTaskStore.get(id)?.delivery === undefined || notices.filter((n) => n.includes('14 open items')).length > 0, 6_000);

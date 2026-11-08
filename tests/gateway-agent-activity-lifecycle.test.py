@@ -10,6 +10,8 @@ Run: python3 tests/gateway-agent-activity-lifecycle.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import hashlib
 import json
 import stat
@@ -70,7 +72,7 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual((ctx["task_id"], ctx["execution_generation"], ctx["room_id"], ctx["worker_id"]),
                          (TID, 3, "!room:ag2.space", worker))
 
-        (self.bridges.ws / "results" / f"{TID}.txt").write_text("4")
+        publish_result(self.bridges.ws / "results" / f"{TID}.txt", "4")
         self.bridges.wait_for(lambda: self.relay.results, proc, "the result")
         result = self.relay.results[0]
         self.assertEqual((result["id"], result["body"], result["execution_generation"],
@@ -92,7 +94,7 @@ class Lifecycle(unittest.TestCase):
                   "body_sha256": hashlib.sha256(b"4").hexdigest()}
         with open(self.state / "room-actions.jsonl", "a") as fh:
             fh.write(json.dumps(intent) + "\n")
-        (self.bridges.ws / "results" / f"{TID}.txt").write_text("4\n")
+        publish_result(self.bridges.ws / "results" / f"{TID}.txt", "4\n")
         self.bridges.wait_for(lambda: self.relay.results, proc, "the result")
         result = self.relay.results[0]
         self.assertEqual((result.get("no_send"), result["status"]), (True, "completed"))
@@ -119,14 +121,14 @@ class Lifecycle(unittest.TestCase):
         proc = self.bridges.start()
         tasks, results = self.bridges.ws / "tasks", self.bridges.ws / "results"
         self.bridges.wait_for((tasks / f"{local}.txt").exists, proc, "generation 1 queued")
-        (results / f"{local}.txt").write_text("generation 1's answer")
+        publish_result(results / f"{local}.txt", "generation 1's answer")
         self.bridges.wait_for(lambda: stale, proc, "generation 1's answer refused as stale")
         self.bridges.wait_for(lambda: not (results / f"{local}.txt").exists(), proc, "generation 1 settled")
         self.relay.queue.append(_task(lease_id="lease-2"))
         self.bridges.wait_for((tasks / f"{local}~~2.txt").exists, proc, "generation 2 queued as its own run")
         self.assertIn("The earlier attempt's answer was never delivered", (tasks / f"{local}~~2.txt").read_text(),
                       "the core is told this is not a redelivery it already answered")
-        (results / f"{local}~~2.txt").write_text("generation 2's answer")
+        publish_result(results / f"{local}~~2.txt", "generation 2's answer")
         self.bridges.wait_for(lambda: self.relay.results, proc, "generation 2's answer")
         self.assertEqual([(r["execution_generation"], r["body"]) for r in self.relay.results],
                          [(2, "generation 2's answer")])
@@ -199,7 +201,7 @@ class Lifecycle(unittest.TestCase):
                 fh.write(json.dumps({"v": 2, "ts": 4e9, "turn_id": turn_id, "task_id": TID,
                                      "execution_generation": 1, "operation_id": f"op_{turn_id}_1",
                                      **r}) + "\n")
-        (self.bridges.ws / "results" / f"{TID}.txt").write_text("I asked the owner which one.")
+        publish_result(self.bridges.ws / "results" / f"{TID}.txt", "I asked the owner which one.")
         self.bridges.wait_for(lambda: self.relay.results, proc, "the waiting result")
         self.bridges.wait_for(lambda: (self.state / "turns" / f"{turn_id}.closed").exists(),
                               proc, "the first turn closed")
@@ -225,7 +227,7 @@ class Lifecycle(unittest.TestCase):
         self.assertNotEqual(turn.stem, first_turn, "a new turn")
         self.assertTrue(turn.stem.startswith(f"{TID}_g1_"), "at the same generation")
 
-        (self.bridges.ws / "results" / f"{WOKEN}.txt").write_text("Done: went with yes.")
+        publish_result(self.bridges.ws / "results" / f"{WOKEN}.txt", "Done: went with yes.")
         self.bridges.wait_for(lambda: len(self.relay.results) == 2, proc, "the woken result")
         final = self.relay.results[1]
         self.assertEqual((final["body"], final["status"], final["execution_generation"]),
@@ -263,7 +265,7 @@ class Lifecycle(unittest.TestCase):
         self.relay.queue.append(_task())
         proc = self.bridges.start()
         self.bridges.wait_for(lambda: self.relay.acks, proc, "the ack")
-        (self.bridges.ws / "results" / f"{TID}.txt").write_text("asked the owner")
+        publish_result(self.bridges.ws / "results" / f"{TID}.txt", "asked the owner")
         self.bridges.wait_for(lambda: self.relay.results, proc, "the first result")
         self.bridges.wait_for(lambda: not (self.bridges.ws / "tasks" / f"{TID}.txt").exists(),
                               proc, "the task archived")

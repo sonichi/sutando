@@ -9,6 +9,8 @@ Run: python3 tests/claude-task-notifier-gate.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import time
 import unittest
@@ -43,10 +45,12 @@ class EventDispatchTests(FakeTmuxHarness):
         # `[ -f results/<f> ]` treated an empty file as delivered regardless
         # of content; the shared module's READY walk rejects whitespace-only.
         self.write_task("task-c.txt")
-        (self.results_dir / "task-c.txt").write_text("")
+        publish_result(self.results_dir / "task-c.txt", "")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-c.txt")
                     return
@@ -63,7 +67,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.write_task("task-b.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-b.txt")
                     return
@@ -87,7 +93,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-stale.txt")
                     return
@@ -107,7 +115,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-fresh.txt")
                     return
@@ -128,7 +138,9 @@ class EventDispatchTests(FakeTmuxHarness):
 
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-c.txt")
                     return
@@ -174,7 +186,9 @@ class EventDispatchTests(FakeTmuxHarness):
 
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-i.txt")
                     return
@@ -199,7 +213,9 @@ class EventDispatchTests(FakeTmuxHarness):
 
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-k.txt")
                     return
@@ -256,7 +272,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.pane_file.write_text("⏺ I once saw a Connection error. Retrying was the fix.\n" + IDLE_FOOTER + "\n")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-prose.txt")
                     return
@@ -316,7 +334,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.pane_file.write_text("❯ Press up to edit queued messages\n" + BUSY_STATUS + "\n")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-q.txt")
                     return
@@ -356,7 +376,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.write_task("task-g.txt")
         import threading
         def _finish():
-            for _ in range(50):
+            for _ in range(150):
+                if not self.sendkeys_log.exists():
+                    return
                 if "ENTER" in self.sendkeys_log_text():
                     self.write_result("task-g.txt")
                     return

@@ -36,7 +36,7 @@ NOTIFIERS = {
                          'composer_holds_prompt() { return 1; }\n'),
     "codex": dict(script=REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh",
                   log="task-notifier.log",
-                  shipped=["submit_task", "has_result", "task_payload", "queue_head",
+                  shipped=["task_id_of", "assert_result_paired", "submit_task", "has_result", "task_payload", "queue_head",
                            "process_announced_queue", "log_notifier"],
                   stubs='wait_for_core_idle() { return 0; }\nmark_worker_stage() { return 0; }\n'
                         'workstream_context_file=""\nprepare_workstream_context() { return 0; }\n'
@@ -76,11 +76,15 @@ class InflightAbandonment(unittest.TestCase):
         fns = "\n".join(_function_text(n, text) for n in cfg["shipped"])
         # The core answers task-next at once; task-first plays the scenario under test.
         deliver = (
+            'answer() {\n'
+            '  local id="${1%.txt}"; id="${id#task-}"\n'
+            '  printf "task: %s\\nOK\\n" "$id" | "$NOTIFIER_PY" "$REPO/src/result_write.py" write "$1" --results-dir "$RESULTS_DIR" --receipts-dir "$RESULT_PAIRING_DIR" >/dev/null\n'
+            '}\n'
             'deliver_prompt() {\n'
             f'  printf "%s %s\\n" "$1" "$(date +%s)" >> {shlex.quote(str(submitted))}\n'
             '  if [ "$1" = task-first.txt ]; then\n'
             f'{on_first}\n'
-            '  else printf "OK\\n" > "$RESULTS_DIR/$1"; fi\n'
+            '  else answer "$1"; fi\n'
             '}\n'
         )
         harness = ('set -euo pipefail\n'
@@ -88,6 +92,7 @@ class InflightAbandonment(unittest.TestCase):
                    'tmux() { return 0; }\n'
                    + cfg["stubs"] + deliver + fns + '\nprocess_announced_queue\n')
         env = {"HOME": str(root), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "REPO":str(REPO), "RESULT_PAIRING_DIR":str(root / "state/result-pairing"),
                "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(DISPATCH),
                "RESULTS_DIR": str(results), "TASKS_DIR": str(tasks), "WORKSPACE_DIR": str(root),
                "PAYLOAD_DIR": str(payload), "INFLIGHT_DIR": str(root / "inflight"),
@@ -101,7 +106,7 @@ class InflightAbandonment(unittest.TestCase):
             self.fail(f"{runtime}: the queue was still held after {self.RUN_S}s; submitted: "
                       + (submitted.read_text() if submitted.exists() else "<none>"))
         elapsed = time.time() - start
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.returncode, int(runtime == "codex" and completion_timeout == 1), r.stderr)
         rows = [(ln.split()[0], float(ln.split()[1]))
                 for ln in (submitted.read_text().splitlines() if submitted.exists() else [])]
         log = (logs / cfg["log"])
@@ -124,7 +129,7 @@ class InflightAbandonment(unittest.TestCase):
     def test_result_published_then_deleted_after_archive_counts_as_answered(self):
         # The desktop poll: archive the task, then read and delete the result before any poll sees it.
         race = ('    mv "$TASKS_DIR/$1" "$TASKS_DIR/archive/$1"\n'
-                '    printf "OK\\n" > "$RESULTS_DIR/$1"\n'
+                '    answer "$1"\n'
                 '    rm -f "$RESULTS_DIR/$1"')
         for runtime in NOTIFIERS:
             with self.subTest(runtime=runtime):
@@ -133,7 +138,7 @@ class InflightAbandonment(unittest.TestCase):
 
     def test_a_present_payload_with_no_result_yet_still_waits(self):
         delay = 3
-        late = (f'    ( sleep {delay}; printf "OK\\n" > "$RESULTS_DIR/$1" ) &')
+        late = (f'    ( sleep {delay}; answer "$1" ) &')
         for runtime in NOTIFIERS:
             with self.subTest(runtime=runtime):
                 rows, log, _ = self._run(runtime, late)

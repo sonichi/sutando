@@ -16,6 +16,7 @@ Run: python3 tests/gateway-proactive-dispatch-revalidate.test.py
 """
 from __future__ import annotations
 
+
 import functools
 import json
 import sys
@@ -24,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
@@ -36,7 +38,7 @@ TID = "task-1761300000000"
 
 
 def land_result(lane):
-    (lane.results / f"{TID}.txt").write_text("the answer\n", encoding="utf-8")
+    publish_result(lane.results / f"{TID}.txt", "the answer\n", encoding="utf-8")
 
 
 def land_cancel(lane):

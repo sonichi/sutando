@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -62,22 +63,22 @@ describe('result watcher: [thread] is stripped for speech; a skip right after it
 	it('narrates without the marker, and archives [thread] + skip silently, as parse_markers and the broker do', async () => {
 		writeFileSync(join(TASK_DIR, 'task-foreign-thread-probe.txt'),
 			'id: task-foreign-thread-probe\nsource: ag2space\nchannel_id: !room:ag2.space\ntask: hi\n');
-		writeFileSync(join(RESULT_DIR, 'task-foreign-thread-probe.txt'), '[thread]\nanswer body\n');
-		writeFileSync(join(RESULT_DIR, 'proactive-thread-probe-1800000000000.txt'), '[thread]\nnudge body\n');
+		publishVerifiedResult(join(RESULT_DIR, 'task-foreign-thread-probe.txt'), '[thread]\nanswer body\n');
+		publishVerifiedResult(join(RESULT_DIR, 'proactive-thread-probe-1800000000000.txt'), '[thread]\nnudge body\n');
 		// parse_markers: a skip right after the leading markers is a skip.
 		const forms = { noSend: '[no-send]', replied: '[REPLIED]', deduped: '[deduped: task-other]' };
 		for (const [k, marker] of Object.entries(forms)) {
 			const id = `task-thread-then-${k}`;
 			_pendingTasksForTest.set(id, { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: k });
-			writeFileSync(join(RESULT_DIR, `${id}.txt`), `[thread]\n${marker}\nvisible ${k}\n`);
+			publishVerifiedResult(join(RESULT_DIR, `${id}.txt`), `[thread]\n${marker}\nvisible ${k}\n`);
 		}
 		_pendingTasksForTest.set('task-skip-then-thread', { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: 'c' });
-		writeFileSync(join(RESULT_DIR, 'task-skip-then-thread.txt'), '[no-send]\n[thread]\nhidden control\n');
+		publishVerifiedResult(join(RESULT_DIR, 'task-skip-then-thread.txt'), '[no-send]\n[thread]\nhidden control\n');
 		_pendingTasksForTest.set('task-dmonly-then-skip', { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: 'd' });
-		writeFileSync(join(RESULT_DIR, 'task-dmonly-then-skip.txt'), '[dm-only]\n[no-send]\nhidden dm\n');
+		publishVerifiedResult(join(RESULT_DIR, 'task-dmonly-then-skip.txt'), '[dm-only]\n[no-send]\nhidden dm\n');
 		// The delivery verdict: an owner's skip directly after [channel:] is a skip, as in the gateway.
 		_pendingTasksForTest.set('task-channel-then-skip', { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: 'e' });
-		writeFileSync(join(RESULT_DIR, 'task-channel-then-skip.txt'), '[channel: !r:s]\n[no-send]\nhidden redirect\n');
+		publishVerifiedResult(join(RESULT_DIR, 'task-channel-then-skip.txt'), '[channel: !r:s]\n[no-send]\nhidden redirect\n');
 		const spoken: string[] = [];
 		startResultWatcher((result: string) => { spoken.push(result); }, () => true);
 		const skipped = ['noSend', 'replied', 'deduped'].map(k => `task-thread-then-${k}.txt`)

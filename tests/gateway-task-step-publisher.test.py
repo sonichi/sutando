@@ -1,4 +1,5 @@
 """Owner ledger step publication: rate, filtering, envelope correlation and real HTTP transport."""
+
 import json
 import sys
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import
+from _helpers.paired_result import publish_result
 from _helpers.gateway_relay import Bridges, Relay
 
 gw, _ = isolate_then_import()
@@ -151,7 +153,7 @@ class Publisher(unittest.TestCase):
             gw._publish_task_steps_snapshot({"task-dev~task-a", "task-prod~task-a"})
             self.assertEqual(len(self.calls), 1)
             self.assertEqual(self.calls[0]["arguments"], {"summary": "Step two"})
-            (results / "task-dev~task-a.txt").write_text("done")
+            publish_result(results / "task-dev~task-a.txt", "done")
             self.clock += 10; self.row("Later")
             gw._publish_task_steps_snapshot({"task-dev~task-a"})
             self.assertEqual(len(self.calls), 1)
@@ -739,7 +741,7 @@ class Typed(unittest.TestCase):
             live.clear()
             self.assertFalse(seen["open_now"]("task-dev~task-a"), "retired from the outbound worker meanwhile")
             live.add("task-dev~task-a")
-            (results / "task-dev~task-a.txt").write_text("done")
+            publish_result(results / "task-dev~task-a.txt", "done")
             self.assertFalse(seen["open_now"]("task-dev~task-a"), "its result written meanwhile")
 
     def test_the_bridge_hands_the_host_hook_to_the_publisher(self):

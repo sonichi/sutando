@@ -34,6 +34,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+try:
+    from .result_write import (history_receipts, locked_file, receipt_attests,
+                               receipt_path, record_pairing, result_context, path_verifier)
+except ImportError:
+    from result_write import (history_receipts, locked_file, receipt_attests,
+                              receipt_path, record_pairing, result_context, path_verifier)
+
 DIRNAME = "undelivered"
 # `<task stem>-<unix seconds>.txt`; the stem may itself contain hyphens.
 _QUARANTINED = re.compile(r"^(?P<stem>.+)-(?P<epoch>\d+)\.txt$")
@@ -212,6 +219,7 @@ class RestoreOutcome(str, Enum):
     leaves the operator unable to tell whether they still have a problem."""
 
     RESTORED = "restored"
+    UNPAIRED = "unpaired"
     NOTHING_QUARANTINED = "nothing-quarantined"
     LIVE_RESULT_PRESENT = "live-result-present"
     # No atomic no-replace move on this platform: the body stays quarantined.
@@ -234,13 +242,42 @@ def restore(results_dir: Path, task_id: str,
     if not found:
         return RestoreOutcome.NOTHING_QUARANTINED, None
     target = canonical_result(results_dir, task_id)
-    try:
-        rename_noreplace(found[-1], target)
-    except FileExistsError as e:
-        if not no_primitive(e):
+    receipts, key = result_context(target)
+    with locked_file(receipt_path(receipts, key).with_suffix(".lock")):
+        if target.exists():
             return RestoreOutcome.LIVE_RESULT_PRESENT, target
-        return _restore_by_link(found[-1], target)
-    return RestoreOutcome.RESTORED, target
+        try:
+            body = found[-1].read_bytes().decode("utf-8")
+        except (OSError, UnicodeError):
+            return RestoreOutcome.UNPAIRED, found[-1]
+        if not (receipt_attests(receipts, key, body)
+                or receipt_attests(history_receipts(receipts, body), key, body)):
+            return RestoreOutcome.UNPAIRED, found[-1]
+        record_pairing(receipts, key, body)
+        try:
+            rename_noreplace(found[-1], target)
+        except FileExistsError as e:
+            if not no_primitive(e):
+                return RestoreOutcome.LIVE_RESULT_PRESENT, target
+            return _restore_by_link(found[-1], target)
+        return RestoreOutcome.RESTORED, target
+
+
+def rebind_verified(source: Path, target: Path, move=None) -> bool:
+    """Rebind an already verified quarantined reply to its caller-resolved delivery id."""
+    receipts, key = result_context(target)
+    with locked_file(receipt_path(receipts, key).with_suffix(".lock")):
+        if target.exists():
+            raise FileExistsError(str(target))
+        try:
+            body = source.read_bytes().decode("utf-8")
+        except (OSError, UnicodeError):
+            return False
+        if not path_verifier(source)(body):
+            return False
+        record_pairing(receipts, key, body)
+        (move or rename_noreplace)(source, target)
+        return True
 
 
 def _restore_by_link(quarantined: Path, target: Path) -> "tuple[RestoreOutcome, Optional[Path]]":

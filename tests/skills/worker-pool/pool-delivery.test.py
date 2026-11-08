@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Contract tests for skills/worker-pool/scripts/pool_delivery.py — a real filesystem, no mocks."""
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.paired_result import publish_result
 import json
 import os
 import subprocess
@@ -34,7 +39,7 @@ class Workspace:
 
     def result(self, task_id, text="done"):
         p = self.root / "results" / f"{task_id}.txt"
-        p.write_text(text, encoding="utf-8")
+        publish_result(p, text, encoding="utf-8")
         return p
 
     def flag(self, recipient, task_id):

@@ -1453,7 +1453,8 @@ m._team_guard_fns = broken
 m._owner_mention_disposition = lambda tid, raw: False
 (m.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 f = m.RESULTS_DIR / "task-canary.txt"
-f.write_text("a reply")
+from ag2_sparrow.result_publish import publish_text
+publish_text(f, "a reply", pair_result=True)
 m._quarantine_unsent(f, "task-canary", "item-1")
 print(json.dumps({"reason": m._guarded_result_body("task-canary", "a reply")[1]}))
 """)

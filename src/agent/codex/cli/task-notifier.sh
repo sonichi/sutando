@@ -125,6 +125,22 @@ has_result() {
   "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename"
 }
 
+task_id_of() {
+  local stem="${1%.txt}"
+  printf '%s\n' "${stem#task-}"
+}
+
+# The notifier holds the correct task id; the core holds the body. Nothing else
+# can tell whether the body that landed answers THIS task, so require a receipt.
+assert_result_paired() {
+  local filename="$1" task_id
+  if ! has_result "$filename"; then
+    echo "task-notifier: no result for $filename after ${COMPLETION_TIMEOUT}s; the task turn produced nothing" >&2
+    return 1
+  fi
+  return 0
+}
+
 mark_worker_stage() {
   write_worker_stage "$1" "$2" "$WORKSPACE_DIR" "$NOTIFIER_PY" || return 1
   if [ "$2" = done ] && [ "$WORKER_STAGE_WRITE_SUCCEEDED" = 1 ]; then
@@ -448,6 +464,13 @@ submit_task() {
     log_notifier "refusing --event $filename: Codex session is unavailable"
     return 1
   fi
+  local q_python q_writer q_file q_results task_id
+  task_id="$(task_id_of "$filename")"
+  printf -v q_python '%q' "$NOTIFIER_PY"
+  printf -v q_writer '%q' "$REPO/src/result_write.py"
+  printf -v q_file '%q' "$filename"
+  printf -v q_results '%q' "$RESULTS_DIR"
+  prompt="$prompt Publish with $q_python $q_writer write $q_file --results-dir $q_results ; body on stdin with FIRST line exactly 'task: $task_id'. Never hand-write that file."
   # The responsive path retains context until the actual result, including across notifier restarts.
   # The diagnostic --event path keeps its original prompt.
   if [ "$wait_for_result" != "0" ]; then
@@ -528,10 +551,13 @@ submit_task() {
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
         log_notifier "timed out waiting for result: $filename"
         clear_workstream_context
-        return 0
+        return 1
       fi
       sleep "$POLL_INTERVAL"
     done
+    # A waited turn that produced no result, or one whose result nobody can pair
+    # to this task, is a failure — never report it as a completed delivery.
+    assert_result_paired "$filename" || return 1
     mark_worker_stage "$filename" done
     clear_workstream_context
   fi

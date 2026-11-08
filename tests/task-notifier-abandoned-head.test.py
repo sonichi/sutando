@@ -10,6 +10,8 @@ Run: python3 tests/task-notifier-abandoned-head.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import os
 import re
 import shlex
@@ -65,11 +67,11 @@ class HeadAbandonedContract(unittest.TestCase):
         self.assertEqual(self._cli(self.payload), 1)
 
     def test_a_ready_result_is_not_abandoned_even_with_the_payload_gone(self):
-        (self.results / "task-a.txt").write_text("done\n")
+        publish_result(self.results / "task-a.txt", "done\n")
         self.assertFalse(head_abandoned(self.results, "task-a.txt", self.payload))
 
     def test_an_empty_placeholder_result_does_not_count_as_a_result(self):
-        (self.results / "task-a.txt").write_text("  \n")
+        publish_result(self.results / "task-a.txt", "  \n")
         self.assertTrue(head_abandoned(self.results, "task-a.txt", self.payload))
 
     def test_wrong_arity_is_a_usage_error_never_a_drop(self):
@@ -117,7 +119,7 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
             'log_notifier() { printf "%s\\n" "$*" >&2; }\n'
             # The core answers whatever is typed into it, so a typed head would not block here.
             f'submit_task() {{ echo "$1" >> {shlex.quote(str(submitted))}; '
-            f'printf "OK\\n" > "$RESULTS_DIR/$1"; }}\n'
+            f'printf "OK\\n" | "{sys.executable}" "{REPO / "src" / "result_publish.py"}" "$RESULTS_DIR/$1"; }}\n'
         )
         harness = (f'set -e\nqueue_dir={shlex.quote(str(queue))}\n' + stubs + fns
                    + '\nprocess_announced_queue\n')

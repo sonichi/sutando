@@ -207,7 +207,7 @@ class SchedulerTests(unittest.TestCase):
             (ws/"queue/task-a.txt").write_text("low")
             write(idle_record() if runtime is None else runtime, ws)
             script = Path(os.environ.get("PICKUP_TEST_NOTIFIER", REPO/"src/agent/codex/cli/task-notifier.sh")).read_text()
-            names = ["has_result", "task_payload", "log_notifier", "queue_head", "submit_task",
+            names = ["task_id_of", "has_result", "task_payload", "log_notifier", "queue_head", "submit_task",
                      "pickup_event", "finish_responsive_task", "reconcile_finished_pickups", "process_responsive_queue", "process_announced_queue"]
             functions = []
             for name in names:
@@ -233,6 +233,7 @@ deliver_prompt() {
 }
 ''' + '\n'.join(functions) + '\n' + scenario
             env = {"PATH":os.environ["PATH"], "HOME":temp, "WORKSPACE_DIR":temp,
+                   "REPO":str(REPO), "RESULT_PAIRING_DIR":str(ws/"state/result-pairing"),
                    "TASKS_DIR":str(ws/"tasks"), "RESULTS_DIR":str(ws/"results"), "queue_dir":str(ws/"queue"),
                    "PAYLOAD_DIR":str(ws/"payload"), "CONTEXT_DIR":str(ws/"context"),
                    "INFLIGHT_DIR":str(paths(ws)[0]), "YIELDED_DIR":str(paths(ws)[1]),
@@ -301,7 +302,7 @@ SUTANDO_INBOX_RESOLVER=enabled
 reconcile_finished_pickups
 [ -f "$INFLIGHT_DIR/task-a.txt" ]
 [ -f "$CONTEXT_DIR/task-a.txt" ]
-printf OK > "$RESULTS_DIR/task-a.txt"
+printf OK | "$NOTIFIER_PY" "$REPO/src/result_publish.py" --allow-undeliverable "$RESULTS_DIR/task-a.txt"
 reconcile_finished_pickups
 [ ! -e "$INFLIGHT_DIR/task-a.txt" ]
 [ ! -e "$CONTEXT_DIR/task-a.txt" ]
@@ -309,7 +310,7 @@ reconcile_finished_pickups
         self.assertEqual(sent, ["task-a.txt"])
 
     def test_actual_result_and_removed_payload_release_and_clear_receipts(self):
-        for action in ['printf OK > "$RESULTS_DIR/task-a.txt"', 'rm "$TASKS_DIR/task-a.txt"']:
+        for action in ['printf OK | "$NOTIFIER_PY" "$REPO/src/result_publish.py" --allow-undeliverable "$RESULTS_DIR/task-a.txt"', 'rm "$TASKS_DIR/task-a.txt"']:
             sent = self.run_scheduler('''process_announced_queue
 printf normal > "$queue_dir/task-b.txt"
 ''' + action + '''

@@ -98,7 +98,7 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
         """The only production consumer: a bare 'verdict on stdout' reproduces the defect."""
         text = (REPO / "src" / "discord-bridge.py").read_text()
         success = [ln for ln in text.splitlines()
-                   if "On SUCCESS" in ln and "results/task-{id}.txt" in ln]
+                   if "On SUCCESS" in ln and "RESULT PUBLICATION" in ln]
         self.assertTrue(success, "PR-REVIEW success instruction not found in the bridge")
         for ln in success:
             self.assertIn(_ANNOUNCE.strip(), ln,

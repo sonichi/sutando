@@ -7,6 +7,8 @@ read an idle worker as owing work. `task_disposition` settles it: pending or cla
 is owed; answered, archived or missing is not. The sweep then moves spent sentinels
 older than an hour out of the inbox, and leaves owed or young ones in place.
 """
+
+from _helpers.paired_result import publish_result
 import contextlib
 import importlib.util
 import io
@@ -79,7 +81,7 @@ check("(c) owed_task_ids names only it", sup.owed_task_ids(ws, WID), ["task-cccc
 check("(d) task claimed: owed", sup.work_outstanding(ws, WID), True)
 
 # (e) answered: the reply drained into results/archive/ settles it.
-(pd.results_dir(ws) / "archive" / "task-cccccccccccccccccc.txt").write_text("answered\n")
+publish_result(pd.results_dir(ws) / "archive" / "task-cccccccccccccccccc.txt", "answered\n")
 check("(e) claimed, then answered: not owed", sup.work_outstanding(ws, WID), False)
 
 # The bulk caller's hint skips only the result lookup; the task file still decides.
@@ -145,8 +147,8 @@ def shaped():
     (t / "task-pending.txt").write_text("id: task-pending\n")
     (t / "task-claimed-core.claimed-core-1.txt").write_text("id: task-claimed-core\n")
     (t / "task-answered-noflag.txt").write_text("id: task-answered-noflag\n")
-    (res / "task-answered-noflag.txt").write_text("answered\n")
-    (res / "archive" / "task-answered-flag.txt").write_text("answered\n")
+    publish_result(res / "task-answered-noflag.txt", "answered\n")
+    publish_result(res / "archive" / "task-answered-flag.txt", "answered\n")
     pd.mark_done(w, WID, "task-answered-flag", published=True)
     (t / "archive" / "2026-11" / "task-archived.txt").write_text("id: task-archived\n")
     (t / "task-live-and-archived.txt").write_text("id: task-live-and-archived\n")

@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 import { describe, it, after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -236,8 +237,8 @@ describe('the drain: a plain result of a room-bound task is posted in its room, 
 		setVoiceRoomVerifier(vouchForVerifiedOnly);
 		writeFileSync(join(TASK_DIR, `${plainTask}.txt`), header(plainTask));
 		writeFileSync(join(TASK_DIR, `${privateTask}.txt`), header(privateTask));
-		writeFileSync(join(RESULT_DIR, `${plainTask}.txt`), 'Three listings under $2k.');
-		writeFileSync(join(RESULT_DIR, `${privateTask}.txt`), '[dm-only]\nThe mute bug is in the SDK.');
+		publishVerifiedResult(join(RESULT_DIR, `${plainTask}.txt`), 'Three listings under $2k.');
+		publishVerifiedResult(join(RESULT_DIR, `${privateTask}.txt`), '[dm-only]\nThe mute bug is in the SDK.');
 		startResultWatcher((result, note) => spoken.push({ result, note }), () => true);
 		assert.ok(await until(() => proactiveFor(plainTask).length > 0 && proactiveFor(privateTask).length > 0, 8000), `drain did not deliver both: ${readdirSync(RESULT_DIR).join(', ')}`);
 		assert.equal(_isDeliveredResult(`${plainTask}.txt`), true);

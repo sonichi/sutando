@@ -29,12 +29,27 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import shlex
 from pathlib import Path
 
 __all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "undeliverable_reason", "retired_path", "result_labels_for", "main"]
+           "undeliverable_reason", "retired_path", "result_labels_for", "main",
+           "publication_command", "publication_instruction"]
 
 STAGED_SUFFIX = ".tmp"
+
+
+def publication_command(path: str | Path) -> str:
+    """Shell command accepting a result body on stdin through the shared writer."""
+    return shlex.join([sys.executable, str(Path(__file__).resolve()), str(Path(path).absolute())])
+
+
+def publication_instruction(path: str | Path) -> str:
+    return ("\nRESULT PUBLICATION: pipe only the final body to `" + publication_command(path)
+            + "`. This applies to answers, fallback sentinels, and [no-send] markers. "
+            "Publish proactive bodies through the same command with their absolute result path. "
+            "The shared writer alone may update its pairing receipts under state/result-pairing; "
+            "this permits no other state access. Never publish a final result with raw redirection or mv.\n")
 
 
 def stage_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
@@ -71,10 +86,30 @@ def is_staged_for(name: str, target_name: str) -> bool:
             and all(c in "0123456789abcdef" for c in token))
 
 
-def publish_staged(tmp: str | Path, path: str | Path) -> Path:
+def publish_staged(tmp: str | Path, path: str | Path, *, _paired=False, no_replace=False, pair_result=False) -> Path:
     """Rename a staged file onto `path` and fsync the directory, so the name survives a crash."""
     target = Path(path)
-    os.replace(tmp, target)
+    if not _paired and target.suffix == ".txt" and (pair_result or any(
+            p.name == "results" for p in target.absolute().parents)):
+        try:
+            from .result_write import result_context, receipt_path, locked_file, record_pairing
+        except ImportError:
+            from result_write import result_context, receipt_path, locked_file, record_pairing
+        context = result_context(target)
+        if context and target.suffix == ".txt":
+            receipts, task_id = context
+            receipt = receipt_path(receipts, task_id)
+            body = Path(tmp).read_bytes().decode("utf-8")
+            with locked_file(receipt.with_suffix(".lock")):
+                if no_replace and target.exists():
+                    raise FileExistsError(str(target))
+                record_pairing(receipts, task_id, body, current=not any(p.name == "archive" or p.name.startswith("archive-") for p in target.parents))
+                return publish_staged(tmp, target, _paired=True, no_replace=no_replace)
+    if no_replace:
+        os.link(tmp, target)
+        os.unlink(tmp)
+    else:
+        os.replace(tmp, target)
     if os.name != "nt":
         dfd = os.open(target.parent, os.O_RDONLY)
         try:
@@ -105,11 +140,11 @@ def _clear_delegation(target: Path) -> None:
         pass
 
 
-def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
+def publish_text(path: str | Path, text: str, mode: int = 0o666, *, _paired=False, pair_result=False) -> Path:
     """Publish `text` at `path` whole: a reader sees the name absent or complete, never a prefix."""
     tmp = stage_text(path, text, mode)
     try:
-        return publish_staged(tmp, path)
+        return publish_staged(tmp, path, _paired=_paired, pair_result=pair_result)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -269,7 +304,7 @@ def main(argv: list[str]) -> int:
     dest = None if allow else retired_path(path, text)
     if dest is not None:
         # Nothing delivers a retired body, so it carries no Activity labels.
-        publish_text(dest, text)
+        publish_text(dest, text, pair_result=True)
         print(f"result_publish: published {Path(path).name} to {dest.parent} instead of results/: "
               "a cron task with no channel_id or chat_id has no bridge, so nothing would retire "
               "this skipped body from the live directory")
@@ -281,7 +316,7 @@ def main(argv: list[str]) -> int:
         if title is not None or outcome is not None:
             print("result_publish: warning: no result_labels module; published without "
                   "--title/--outcome", file=sys.stderr)
-        publish_text(path, text)
+        publish_text(path, text, pair_result=True)
         return 0
     labels, notes = result_labels_for(text, title, outcome)
     for note in notes:
@@ -291,7 +326,7 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001 — labels are optional; the result never waits on them
         print(f"result_publish: warning: published without --title/--outcome: {exc}",
               file=sys.stderr)
-    publish_text(path, text)
+    publish_text(path, text, pair_result=True)
     return 0
 
 

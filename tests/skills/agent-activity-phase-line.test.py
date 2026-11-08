@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -606,7 +607,7 @@ class Finished(unittest.TestCase):
         _rules(self.ws, "task-f", "Running a command", step="Run the tests")
         self.assertIsNotNone(pl.status_for(self.ws, "task-f"))
         (Path(self.ws) / "results").mkdir()
-        (Path(self.ws) / "results" / "task-f.txt").write_text("done")
+        publish_result(Path(self.ws) / "results" / "task-f.txt", "done")
         self.assertIsNone(pl.status_for(self.ws, "task-f"))
         self.assertIsNone(pl.published_status(self.ws, "task-f"))
         _rules(self.ws, "task-g", "Running a command", step="Run the tests")

@@ -46,6 +46,9 @@ KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake fr
 REAL_RUN = sm._run
 
 
+from ag2_sparrow.result_publish import publish_text  # noqa: E402
+
+
 def systemd_seam(fake):
     """`fake`, which reads argv without --no-ask-password, as the shared runner every command reaches."""
     def run(cmd, timeout=sm.TIMEOUT_S):
@@ -507,7 +510,7 @@ class HookScript(Base):
     def test_closed_item_leaves_the_woken_record(self):
         self.add_task("task-1784700000001", "$reply")
         self.run_script()
-        (self.results / "task-1784700000001.txt").write_text("[REPLIED]\n")
+        publish_text(self.results / "task-1784700000001.txt", "[REPLIED]\n", pair_result=True)
         self.reset()
         self.run_script()
         self.assertEqual(self.stored()["woken"], {})
@@ -548,7 +551,7 @@ class HookScript(Base):
 
     def test_closed_and_own_tasks_do_not_wake(self):
         self.add_task("task-1784700000001", "$done")
-        (self.results / "task-1784700000001.txt").write_text("[REPLIED]\n")
+        publish_text(self.results / "task-1784700000001.txt", "[REPLIED]\n", pair_result=True)
         self.add_task("task-1784700000002", "$mine", sender=AGENT)
         self.run_script()
         self.assertEqual(self.events_list(), ["STATE_SET", "SILENT"])
@@ -977,6 +980,17 @@ class HookTimeBudget(Base):
 
 
 class TaskFields(Base):
+    def test_unpaired_result_does_not_settle_or_hide_a_task(self):
+        tid = "task-1784700000001"
+        self.add_task(tid, "$m")
+        result = self.results / f"{tid}.txt"
+        result.write_text("unattested answer")
+        self.assertFalse(hatch_cli.task_settled(self.results, tid))
+        self.assertEqual(len(task_fields.list_open_tasks(self.tasks, self.results)), 1)
+        publish_text(result, "verified answer", pair_result=True)
+        self.assertTrue(hatch_cli.task_settled(self.results, tid))
+        self.assertEqual(task_fields.list_open_tasks(self.tasks, self.results), [])
+
     def test_helper_reads_headers_with_sparrows_parser(self):
         self.add_task("task-1784700000001", "$m", thread_root="$t")
         (self.tasks / "not-a-task.txt").write_text("task: x\n")
@@ -1034,7 +1048,7 @@ class TaskFields(Base):
 
     def test_closed_unreadable_and_unattested_tasks(self):
         self.add_task("task-1784700000001", "$closed", mtime=1000)
-        (self.results / "task-1784700000001.txt").write_text("[REPLIED]")
+        publish_text(self.results / "task-1784700000001.txt", "[REPLIED]", pair_result=True)
         self.add_task("task-1784700000002", "$open", tier="root", mtime=2000)
         (self.tasks / "task-bad id.txt").write_text("task: x\n")
         self.assertIsNone(task_fields.task_fields(self.tasks / "task-1784700000009.txt",
@@ -2515,7 +2529,7 @@ class Keepalive(Base):
         old = time.time() - 20 * 60
         self.add_task("task-1784700000001", "$own", sender=AGENT.upper(), mtime=old - 60)
         self.add_task("task-1784700000002", "$closed", mtime=old - 60)
-        (self.results / "task-1784700000002.txt").write_text("done\n")
+        publish_text(self.results / "task-1784700000002.txt", "done\n", pair_result=True)
         self.add_task("task-1784700000003", "$fresh", mtime=time.time() - 60)
         self.assertEqual(self.health()["condition"], "healthy",
                          "own, answered and fresh tasks are not waiting")
@@ -2554,7 +2568,7 @@ class Keepalive(Base):
         bound = 10 * 60
         since = time.time() - bound - 60
         task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
-        (self.results / hatch_cli._hold_notice(Path(), tid).name).write_text("[channel: !room:ag2.space]\nheld\n")
+        publish_text(self.results / hatch_cli._hold_notice(Path(), tid).name, "[channel: !room:ag2.space]\nheld\n", pair_result=True)
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-undelivered"))
         self.assertAlmostEqual(row["since"], since + bound, delta=1)
@@ -5248,7 +5262,7 @@ class Reply(Base):
         self.assertFalse(self.result_file.exists())
 
     def test_never_overwrites_an_existing_result(self):
-        self.result_file.write_text("earlier reply")
+        publish_text(self.result_file, "earlier reply", pair_result=True)
         r = self.reply(str(self.result_file), "--body", "hi")
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.result_file.read_text(), "earlier reply")
@@ -5261,7 +5275,7 @@ class Reply(Base):
 
     def test_a_reply_landing_after_the_check_is_never_replaced(self):
         def other_writer_lands(*_a):
-            self.result_file.write_text("the other call's reply")
+            publish_text(self.result_file, "the other call's reply", pair_result=True)
             return None
         with mock.patch.object(outbox, "item_status", side_effect=other_writer_lands):
             r = self.reply(str(self.result_file), "--body", "mine", "--wait", "0")
@@ -5998,7 +6012,7 @@ class Hold(Base):
                 self.assertTrue(self.lock_is_free(), "released whatever the outcome")
                 inode = inode or lock.stat().st_ino
                 self.assertEqual(lock.stat().st_ino, inode, "one lock file, never recreated")
-                self.result_file.write_text("done")  # answered: the next pass leaves this line alone
+                publish_text(self.result_file, "done", pair_result=True)  # answered: the next pass leaves this line alone
     def test_the_send_has_a_wall_clock_deadline_and_releases_the_lock(self):
         import http.server
         dribbled = threading.Event()
@@ -6467,7 +6481,7 @@ class Hold(Base):
     def test_a_refused_hold_leaves_a_line_an_earlier_hold_queued(self):
         self.add_task(self.TID, "$ev1")
         self.armed_mark()
-        self.notice.write_text(self.line())
+        publish_text(self.notice, self.line(), pair_result=True)
         swapped = iter([True, True])
         with mock.patch.object(hatch_cli, "_lane_snapshot", side_effect=lambda *a: (
                 (os.getpid(), "ag2.space", True) if next(swapped, False) else None)):
@@ -6498,7 +6512,7 @@ class Hold(Base):
                     task_hold.arm_notice(self.results, self.TID, token)
                 if setup.endswith("with marker"):
                     task_hold.place(self.results, self.TID)
-                self.notice.write_text(line)
+                publish_text(self.notice, line, pair_result=True)
                 posts = []
                 self.drain_pass(posts)
                 self.assertEqual(bool(posts), sent, self.statuses(self.notice))
@@ -6523,7 +6537,7 @@ class Hold(Base):
 
     def test_an_answered_item_is_not_held(self):
         self.add_task(self.TID, "$ev1")
-        self.result_file.write_text("done\n")
+        publish_text(self.result_file, "done\n", pair_result=True)
         r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
         self.assertIsNone(task_hold.read(self.results, self.TID))
@@ -6653,7 +6667,8 @@ class Hold(Base):
         self.add_task(self.TID, "$ev1")
         task_hold.mark_notice(self.results, self.TID)
         claimed = self.results / f"{self.notice.stem}.sending.4242"
-        claimed.write_text(self.line())
+        publish_text(self.notice, self.line(), pair_result=True)
+        self.notice.rename(claimed)
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
         self.assertFalse(self.notice.exists())
 
@@ -6730,7 +6745,8 @@ class Hold(Base):
         self.add_task(self.TID, "$ev1")
         task_hold.mark_notice(self.results, self.TID)
         claim = self.notice.with_suffix(".sending.4242")
-        claim.write_text(self.line())
+        publish_text(self.notice, self.line(), pair_result=True)
+        self.notice.rename(claim)
         real = hatch_cli.result_ready.read_ready_result
 
         def drain_hands_back(path):
@@ -7100,7 +7116,7 @@ class Hold(Base):
         def settled(result_dir, tid):
             calls.append(tid)
             if len(calls) == 3:  # hold's last check: the answer has just landed
-                self.result_file.write_text("done")
+                publish_text(self.result_file, "done", pair_result=True)
             return self.result_file.exists()
         with mock.patch.object(hatch_cli, "task_settled", side_effect=settled):
             r = self.hold(str(self.result_file))

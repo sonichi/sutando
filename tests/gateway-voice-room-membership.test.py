@@ -14,6 +14,7 @@ refused, the verified room is not.
 """
 from __future__ import annotations
 
+
 import json
 import os
 import subprocess
@@ -25,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -121,11 +123,11 @@ cdir.mkdir(parents=True)
     {"ts": int(time.time()), "channel": "discord", "summary": "t"}))
 # The task bridge's shape for a room-bound voice result (forwardVoiceResultToRoom).
 forged = rdir / "proactive-result-task-1700000000001-1800000001.to-ag2space.txt"
-forged.write_text(f"[channel: {FORGED_ROOM}]\nforged room body")
+publish_result(forged, f"[channel: {FORGED_ROOM}]\nforged room body")
 no_owner = rdir / "proactive-result-task-1700000000002-1800000002.to-ag2space.txt"
-no_owner.write_text(f"[channel: {NO_OWNER_ROOM}]\nowner-less room body")
+publish_result(no_owner, f"[channel: {NO_OWNER_ROOM}]\nowner-less room body")
 ok = rdir / "proactive-result-task-1700000000003-1800000003.to-ag2space.txt"
-ok.write_text(f"[channel: {OK_ROOM}]\nverified room body")
+publish_result(ok, f"[channel: {OK_ROOM}]\nverified room body")
 # The task bridge's binding questions, as it writes them.
 (cdir / f"k-forged{REQUEST_SUFFIX}").write_text(json.dumps({"room_id": FORGED_ROOM, "requested_at": time.time()}))
 (cdir / f"k-ok{REQUEST_SUFFIX}").write_text(json.dumps({"room_id": OK_ROOM, "requested_at": time.time()}))

@@ -12,6 +12,8 @@ Run: python3 tests/task-queue-counts-the-announcing-inbox.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import json
 import os
@@ -70,13 +72,13 @@ class Counts(unittest.TestCase):
         for tid in ("task-old-a", "task-old-b", "task-old-c"):
             _task(self.ws / "tasks" / f"{tid}.txt", tid)
             (self.inbox / f"{tid}.txt").write_text("")
-            (self.ws / "results" / f"{tid}.txt").write_text("done: answered earlier\n")
-        (self.ws / "results" / "task-mine-2.txt").write_text("   \n")      # empty placeholder: not ready
+            publish_result(self.ws / "results" / f"{tid}.txt", "done: answered earlier\n")
+        publish_result(self.ws / "results" / "task-mine-2.txt", "   \n")      # empty placeholder: not ready
         self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), sorted(
             ["task-mine.txt", "task-mine-2.txt", "task-old-a.txt", "task-old-b.txt", "task-old-c.txt"]))
         self.assertEqual(sorted(t["id"] for t in tq.pending(self.ws, self.inbox)), ["task-mine", "task-mine-2"])
         self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.inbox), 1)
-        (self.ws / "results" / "task-mine-2.txt").write_text("done: now answered\n")
+        publish_result(self.ws / "results" / "task-mine-2.txt", "done: now answered\n")
         self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.inbox), 0)
         # A renamed sentinel is not an entry at all, whichever suffix a future pruner picks.
         (self.inbox / "task-mine.txt").rename(self.inbox / "task-mine.accepted")
@@ -122,7 +124,7 @@ class Counts(unittest.TestCase):
             _task(tasks / f"{tid}.txt", tid)
         answer = results / "task-done.txt"
         for body, waiting, depth in ((" \n", "1", 2), ("done\n", "0", 1)):
-            answer.write_text(body)
+            publish_result(answer, body)
             for inbox_args in ((), ("--inbox", str(tasks))):
                 with self.subTest(body=body, inbox_args=inbox_args):
                     argv = ("waiting", "--task-file", str(tasks / "task-open.txt"), *inbox_args)
@@ -169,10 +171,13 @@ class ResolvedOncePerCall(unittest.TestCase):
         }
         for tid, path in layouts.items():
             self._sentinel(tid)
-            path.write_text("done\n")
+            live = r / f"{tid}.txt"
+            publish_result(live, "done\n")
+            if live != path:
+                live.rename(path)
         self._sentinel("task-placeholder")                      # live empty, archived ready
         (r / "task-placeholder.txt").write_text("  \n")
-        (r / "archive" / "task-placeholder.txt").write_text("done\n")
+        publish_result(r / "archive" / "task-placeholder.txt", "done\n")
         self._sentinel("task-open")                             # no result anywhere
         self._sentinel("task-blank")                            # only a whitespace placeholder
         (r / "task-blank.txt").write_text("\n")
@@ -196,7 +201,9 @@ class ResolvedOncePerCall(unittest.TestCase):
     def test_directory_listings_do_not_grow_with_the_inbox(self):
         r = self.ws / "results"
         for i in range(400):                                    # a flat archive far larger than the inbox
-            (r / "archive" / f"task-spent-{i}-1790000000.txt").write_text("done\n")
+            live = r / f"task-spent-{i}.txt"
+            publish_result(live, "done\n")
+            live.rename(r / "archive" / f"task-spent-{i}-1790000000.txt")
         for i in range(60):
             self._sentinel(f"task-spent-{i}")
         self._sentinel("task-open")
@@ -249,7 +256,7 @@ class EmitPassesTheInbox(unittest.TestCase):
             self.assertEqual(json.loads((ws / "state" / "task-queue.json").read_text())["depth"], 3)
             (ws / "results").mkdir()
             for tid in ("task-core-a", "task-core-b"):
-                (ws / "results" / f"{tid}.txt").write_text("done\n")
+                publish_result(ws / "results" / f"{tid}.txt", "done\n")
             r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual((r.returncode, r.stdout), (0, "END\n"), r.stderr)
             snap = json.loads((ws / "state" / "task-queue.json").read_text())

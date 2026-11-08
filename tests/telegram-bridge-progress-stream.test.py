@@ -14,6 +14,8 @@ from _helpers.hermetic_env import isolate_os_environ
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
+from _helpers.paired_result import publish_result
+
 import importlib.util
 import json
 import os
@@ -108,11 +110,20 @@ class PollProgressTest(unittest.TestCase):
         tg.poll_progress({tid: 555})  # posts placeholder
         self.assertIn(tid, tg._progress_msgs)
         # Result lands
-        (self.results / f"{tid}.txt").write_text("done!")
+        publish_result(self.results / f"{tid}.txt", "done!")
         tg.poll_progress({tid: 555})
         self.assertIn("deleteMessage", self._methods())
         self.assertNotIn(tid, tg._progress_msgs)
         self.assertNotIn(tid, tg.pending_task_tiers)
+
+    def test_unpaired_result_keeps_progress_pending(self):
+        tid = self._task_id(age_s=12)
+        tg.pending_task_tiers[tid] = "owner"
+        tg.poll_progress({tid: 555})
+        (self.results / f"{tid}.txt").write_text("unpaired")
+        tg.poll_progress({tid: 555})
+        self.assertNotIn("deleteMessage", self._methods())
+        self.assertIn(tid, tg._progress_msgs)
 
     def test_send_failure_marks_terminal_no_retry_spam(self):
         # If sendMessage fails (no message_id), the task is marked terminal so the

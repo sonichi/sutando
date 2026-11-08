@@ -19,6 +19,7 @@ Run: python3 tests/gateway-voice-outcome-contract.test.py
 """
 from __future__ import annotations
 
+
 import contextlib
 import json
 import os
@@ -30,6 +31,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -143,7 +145,7 @@ class _Bridge(unittest.TestCase):
         return tid
 
     def answer(self, tid: str, body: str) -> None:
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text(body)
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", body)
 
     def drain(self, *tids: str) -> "set[str]":
         inflight = set(tids)
@@ -394,7 +396,7 @@ class ReAskAndReport(_Bridge):
     def reask(self, broker_id: str = ASK_A) -> "tuple[str, str]":
         ask = self.serve(voice_ask(broker_id))
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt").write_text("")
+        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt", "")
         self.answer(ask, f"[deduped: {EMPTY_HOLDER}]")
         inflight = self.drain(ask)
         reask = self.reask_of(ask)
@@ -488,7 +490,7 @@ class NamedInstance(_Bridge):
     def test_a_fold_into_a_re_ask_strips_the_instance_and_the_hash(self):
         ask = self.serve(voice_ask(ASK_A))
         gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt").write_text("")
+        publish_result(gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt", "")
         self.answer(ask, f"[deduped: {EMPTY_HOLDER}]")
         self.drain(ask)
         reask = self.reask_of(ask)
@@ -536,7 +538,7 @@ class AfterARestart(unittest.TestCase):
         self.bridges.stop(first)
 
     def write_private_answer(self) -> None:
-        (self.ws / "results" / f"{ASK_A}.txt").write_text("[dm-only]\nYour 3pm is with Dana.")
+        publish_result(self.ws / "results" / f"{ASK_A}.txt", "[dm-only]\nYour 3pm is with Dana.")
 
     def test_a_private_answer_that_landed_while_the_bridge_was_down(self):
         self.serve_once()
@@ -569,8 +571,8 @@ class AfterARestart(unittest.TestCase):
 
     def test_a_fold_after_a_restart_still_sends_consolidated_into(self):
         self.serve_once(ASK_A, ASK_B)
-        (self.ws / "results" / f"{ASK_A}.txt").write_text("[REPLIED]")
-        (self.ws / "results" / f"{ASK_B}.txt").write_text(f"[deduped: {ASK_A}]")
+        publish_result(self.ws / "results" / f"{ASK_A}.txt", "[REPLIED]")
+        publish_result(self.ws / "results" / f"{ASK_B}.txt", f"[deduped: {ASK_A}]")
         # The holder's close is not accepted: a room-less holder whose own close is accepted
         # first is no longer verifiable, and the planner reports instead.
         self.relay.on_result = lambda p: (503, {"error": "busy"}) if p.get("id") == ASK_A else None

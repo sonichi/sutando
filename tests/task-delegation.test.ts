@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 /**
  * TaskDelegationService seam tests (step 4 / #1947).
  *
@@ -87,8 +88,8 @@ test('LocalTaskBackend result primitives mirror the watcher I/O', () => {
 	const taskDir = join(dir, 'tasks');
 	const resultDir = join(dir, 'results');
 	mkdirSync(taskDir); mkdirSync(resultDir);
-	writeFileSync(join(resultDir, 'task-b.txt'), 'B');
-	writeFileSync(join(resultDir, 'task-a.txt'), 'A');
+	publishVerifiedResult(join(resultDir, 'task-b.txt'), 'B');
+	publishVerifiedResult(join(resultDir, 'task-a.txt'), 'A');
 	writeFileSync(join(resultDir, 'notes.md'), 'ignored');
 	const archived: string[] = [];
 	const backend = new LocalTaskBackend(taskDir, resultDir,

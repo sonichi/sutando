@@ -21,6 +21,7 @@ Run: python3 tests/gateway-proactive-crash-receipt.test.py
 """
 from __future__ import annotations
 
+
 import json
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 HERE = Path(__file__).resolve().parent
@@ -127,7 +129,7 @@ def crash_while_settling() -> None:
     dead.wait()
     if claim_file.exists():
         data = json.loads(claim_file.read_text())
-        claim_file.write_text(json.dumps({**data, "pid": dead.pid, "start_usec": None,
+        publish_result(claim_file, json.dumps({**data, "pid": dead.pid, "start_usec": None,
                                           "claimed_at": data["claimed_at"] - 3600}))
     for c in lane.results.glob("proactive-5.sending.*"):
         c.rename(lane.results / "proactive-5.txt")

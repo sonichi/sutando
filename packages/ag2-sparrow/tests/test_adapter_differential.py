@@ -4,6 +4,7 @@ adapter_differential_driver.py runs each through its command line in fixed scena
 a restart, a pre-existing result, a 429, a timeout, a provider error, a full cap; a Codex restart that
 resumes its thread and a turn timeout). Every provider call, every result byte and every state
 file's real values must equal what the same driver recorded at the merge base.
+New pairing receipts are checked independently for every result, including existing fixtures.
 Run:
     python3 packages/ag2-sparrow/tests/test_adapter_differential.py
 """
@@ -17,6 +18,7 @@ import unittest
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PKG_ROOT))
 DRIVER = Path(__file__).resolve().parent / "adapter_differential_driver.py"
 
 # Recorded with this driver at the merge base named in the file (the previous head gives the same).
@@ -27,7 +29,10 @@ class DifferentialTest(unittest.TestCase):
     def run_driver(self, adapter):
         with tempfile.TemporaryDirectory() as base:
             env = dict(os.environ, PYTHONPATH=str(PKG_ROOT), TMPDIR="/tmp")  # a stable gettempdir() on every host
-            out = subprocess.run([sys.executable, str(DRIVER), adapter, base], env=env, capture_output=True,
+            command = [sys.executable]
+            if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+                command += ["-m", "coverage", "run", "--rcfile=" + str(PKG_ROOT.parents[1] / ".coveragerc")]
+            out = subprocess.run([*command, str(DRIVER), adapter, base], env=env, capture_output=True,
                                  text=True, timeout=180)
             self.assertEqual(out.returncode, 0, out.stderr)
             return json.loads(out.stdout)
@@ -39,7 +44,11 @@ class DifferentialTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 self.assertEqual(got[scenario]["provider"], want[scenario]["provider"], "every provider call")
                 self.assertEqual(got[scenario]["results"], want[scenario]["results"], "every result, byte for byte")
-                self.assertEqual(got[scenario]["state"], want[scenario]["state"], "every state file's values")
+                self.assertTrue(all(got[scenario]["pairing"].values()), got[scenario]["pairing"])
+                # Pairing storage is new; its evidence is checked above, separately from legacy state.
+                legacy_state = {k: v for k, v in got[scenario]["state"].items()
+                                if not k.startswith("result-pairing/")}
+                self.assertEqual(legacy_state, want[scenario]["state"], "every legacy state file's values")
                 self.assertEqual(got[scenario]["rc"], want[scenario]["rc"])
 
     def test_routine_is_unchanged(self):

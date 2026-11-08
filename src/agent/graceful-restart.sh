@@ -46,9 +46,9 @@ PREP_TASK="$WS/tasks/task-restart-prep-$RID.txt"
 retire_prep_task() {
   # The core answers the drain task in results/; no bridge collects a task the
   # orchestrator wrote, so the orchestrator is its consumer: log it, archive it.
-  local res="$WS/results/task-restart-prep-$RID.txt"
-  if [ -f "$res" ]; then
-    log "drain result: $(head -c 300 "$res" | tr '\n' ' ')"
+  local res="$WS/results/task-restart-prep-$RID.txt" body
+  if body="$("${SUTANDO_PY_BIN:-python3}" "$REPO/src/result_write.py" read "$res" 2>/dev/null)"; then
+    log "drain result: $(printf '%s' "$body" | head -c 300 | tr '\n' ' ')"
     mkdir -p "$WS/results/archive"
     mv "$res" "$WS/results/archive/" 2>/dev/null || log "drain result NOT archived (mv failed): $res"
   fi

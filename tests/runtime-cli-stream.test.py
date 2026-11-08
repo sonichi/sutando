@@ -11,7 +11,9 @@ Run: python3 tests/runtime-cli-stream.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -128,7 +130,7 @@ def drive():
     check(ok, "watch prints the subscribe banner")
     tid = submit("stream probe one")
     check(tid.startswith("task-"), "submit under watch returns a task id")
-    (Path(ENV["SUTANDO_RESULTS_DIR"]) / f"{tid}.txt").write_text(
+    publish_result(Path(ENV["SUTANDO_RESULTS_DIR"]) / f"{tid}.txt",
         "streamed result body")
     got, ok = read_lines_until(
         w, lambda ln: "streamed result body" in ln, timeout=25)
@@ -240,7 +242,7 @@ def drive():
             new = set(Path(ENV["SUTANDO_TASKS_DIR"]).glob("task-*.txt")) - before
             if new:
                 tid2 = sorted(new)[-1].stem
-                (Path(ENV["SUTANDO_RESULTS_DIR"]) / f"{tid2}.txt").write_text(
+                publish_result(Path(ENV["SUTANDO_RESULTS_DIR"]) / f"{tid2}.txt",
                     "chat reply body")
                 return
             time.sleep(0.3)

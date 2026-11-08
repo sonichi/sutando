@@ -1,3 +1,4 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 // The relay agent end to end, in its own process with one live runtime (the result watcher is
 // process-wide, so a second runtime would claim results meant for this one).
 // Run: npx tsx --test --test-force-exit tests/relay-agent-e2e.test.ts
@@ -63,7 +64,7 @@ describe('relay agent end to end', () => {
 		const call = relay.invoke('Execute tool: work', { task: 'draw a cat' });
 		await tick(0);
 		const before = sent.length;
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Here is the cat.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'Here is the cat.');
 		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
 		assert.match(out, /"draw a cat"[\s\S]*Here is the cat\./);
 		await tick(1_000);
@@ -73,10 +74,10 @@ describe('relay agent end to end', () => {
 
 	it('three requests the core answered in one result: all three named to the model, every row heard', async () => {
 		const ids = ['5308', '5309', '5310'].map((pr) => voiceTask(`check PR ${pr}`));
-		writeFileSync(join(TMP, 'results', `${ids[1]}.txt`), `[deduped: ${ids[0]}]`);
-		writeFileSync(join(TMP, 'results', `${ids[2]}.txt`), `[deduped: ${ids[0]}]`);
+		publishVerifiedResult(join(TMP, 'results', `${ids[1]}.txt`), `[deduped: ${ids[0]}]`);
+		publishVerifiedResult(join(TMP, 'results', `${ids[2]}.txt`), `[deduped: ${ids[0]}]`);
 		await until(() => ids.slice(1).every((id) => voiceTaskStore.get(id)?.answeredBy === ids[0]));
-		writeFileSync(join(TMP, 'results', `${ids[0]}.txt`), 'All three: 5308 merged; 5309 ready; 5310 blocked.');
+		publishVerifiedResult(join(TMP, 'results', `${ids[0]}.txt`), 'All three: 5308 merged; 5309 ready; 5310 blocked.');
 		const named = () => ['5308', '5309', '5310'].filter((pr) => sent.join('\n').includes(`"check PR ${pr}"`));
 		await until(() => named().length === 3 && ids.every(heard), 15_000);
 		assert.deepEqual(named(), ['5308', '5309', '5310'], 'every request named to the model');
@@ -89,7 +90,7 @@ describe('relay agent end to end', () => {
 		session.sessionManager.isActive = false;
 		const id = voiceTask('check PR 9999');
 		const copies = () => readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length;
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 9999 status.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 9999 status.');
 		await until(() => copies() === 1);
 		assert.equal(copies(), 1);
 		await until(() => voiceTaskStore.get(id)?.delivery === 'dm');
@@ -108,7 +109,7 @@ describe('relay agent end to end', () => {
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 7777' });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 7777 status.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 7777 status.');
 		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
 		assert.match(out, /delivered to the user separately/);
 		assert.doesNotMatch(out, /PR 7777 status/, 'not handed to a session nobody hears');
@@ -125,7 +126,7 @@ describe('relay agent end to end', () => {
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5167' });
 		await tick(0);
 		session.emit('speech.user_started');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 5167 is open.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 5167 is open.');
 		const out = await Promise.race([call, tick(5_000).then(() => 'timed out')]);
 		assert.match(out, /PR 5167 is open/, 'returned while the user is still speaking');
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected', 'handed over, not yet heard');
@@ -139,7 +140,7 @@ describe('relay agent end to end', () => {
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 6100' });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6100 is merged.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 6100 is merged.');
 		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6100 is merged/);
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected');
 		session.emit('session.reconnectBoundary', {} as never);
@@ -154,7 +155,7 @@ describe('relay agent end to end', () => {
 		session.emit('session.stateChange', { toState: 'RECONNECTING' } as never);
 		session.emit('session.stateChange', { toState: 'ACTIVE' } as never);
 		assert.equal(relay.isWaiting(id), true, 'a resumed connection still holds the call');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6200 is merged.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'PR 6200 is merged.');
 		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6200 is merged/, 'returned through the call');
 	});
 
@@ -167,7 +168,7 @@ describe('relay agent end to end', () => {
 		await tick(0);
 		const mine = () => voiceTaskRows().filter((r) => r.id === id);
 		assert.equal(voiceTaskCounts(mine()).pending, 1, 'queued: pending');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), '[no-send]');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), '[no-send]');
 		await until(() => voiceTaskStore.get(id)?.retired === true);
 		assert.equal(voiceTaskStore.get(id)?.retired, true);
 		assert.equal(mine()[0]?.retired, true);
@@ -178,8 +179,8 @@ describe('relay agent end to end', () => {
 		const [a, b] = ['5275', '5251'].map((pr) => voiceTask(`check PR ${pr}`));
 		const calls = [a, b].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 5275 is blocked on changes requested.');
-		writeFileSync(join(TMP, 'results', `${b}.txt`), 'PR 5251 is waiting for review.');
+		publishVerifiedResult(join(TMP, 'results', `${a}.txt`), 'PR 5275 is blocked on changes requested.');
+		publishVerifiedResult(join(TMP, 'results', `${b}.txt`), 'PR 5251 is waiting for review.');
 		const [first, second] = await Promise.all(calls.map((c) => Promise.race([c, tick(8_000).then(() => 'timed out')])));
 		assert.match(first, /PR 5275/);
 		assert.match(second, /PR 5251/, 'not held behind the first: Gemini schedules each with WHEN_IDLE');
@@ -193,8 +194,8 @@ describe('relay agent end to end', () => {
 		const [a, b] = ['7001', '7002'].map((pr) => voiceTask(`check PR ${pr}`));
 		const calls = [a, b].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 7001 status.');
-		writeFileSync(join(TMP, 'results', `${b}.txt`), 'PR 7002 status.');
+		publishVerifiedResult(join(TMP, 'results', `${a}.txt`), 'PR 7001 status.');
+		publishVerifiedResult(join(TMP, 'results', `${b}.txt`), 'PR 7002 status.');
 		await calls[0];
 		assert.match(await calls[1], /PR 7002/, 'returned at once, not queued behind the first');
 		await tick(700); // two reconcile passes before the model speaks
@@ -214,8 +215,8 @@ describe('relay agent end to end', () => {
 		assert.match(await oldCall, /delivered to the user separately/, 'the old call ends at the correction');
 		assert.equal(voiceTaskStore.get(old)?.supersededBy, fresh);
 		const before = sent.length;
-		writeFileSync(join(TMP, 'results', `${old}.txt`), 'PR 51167 does not exist.');
-		writeFileSync(join(TMP, 'results', `${fresh}.txt`), 'PR 5167 is blocked on review.');
+		publishVerifiedResult(join(TMP, 'results', `${old}.txt`), 'PR 51167 does not exist.');
+		publishVerifiedResult(join(TMP, 'results', `${fresh}.txt`), 'PR 5167 is blocked on review.');
 		assert.match(await freshCall, /PR 5167 is blocked/);
 		session.emit('turn.start');
 		session.emit('response.first_audio');
@@ -232,14 +233,18 @@ describe('relay agent end to end', () => {
 		const call = relay.invoke('Execute tool: work', {});
 		await tick(0);
 		const before = sent.length;
-		writeFileSync(join(TMP, 'results', `proactive-summary-${Date.now()}.txt`), 'CI failed on PR 5302 (lint).');
+		publishVerifiedResult(join(TMP, 'results', `proactive-summary-${Date.now()}.txt`), 'CI failed on PR 5302 (lint).');
 		await until(() => sent.slice(before).some((t) => t.includes('CI failed on PR 5302')));
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		session.emit('turn.end', { turnId: 't21' } as never);
 		assert.notEqual(voiceTaskStore.get(a)?.delivery, 'spoken', 'the task is not heard because a message mentioned its PR');
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 5302 waits for one approval.');
+		publishVerifiedResult(join(TMP, 'results', `${a}.txt`), 'PR 5302 waits for one approval.');
 		assert.match(await call, /waits for one approval/, 'its own answer comes back through its call');
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		session.emit('turn.end', { turnId: 't21-answer' } as never);
+		assert.equal(voiceTaskStore.get(a)?.delivery, 'spoken');
 	});
 
 	it('the core marks two requests deduped into a third before answering it: said once, all three named, nothing handed over again', async () => {
@@ -247,10 +252,10 @@ describe('relay agent end to end', () => {
 		const calls = [a, b, c].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
 		const before = sent.length;
-		writeFileSync(join(TMP, 'results', `${b}.txt`), `[deduped: ${a}]`);
-		writeFileSync(join(TMP, 'results', `${c}.txt`), `[deduped: ${a}]`);
+		publishVerifiedResult(join(TMP, 'results', `${b}.txt`), `[deduped: ${a}]`);
+		publishVerifiedResult(join(TMP, 'results', `${c}.txt`), `[deduped: ${a}]`);
 		await until(() => [b, c].every((id) => voiceTaskStore.get(id)?.answeredBy === a));
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'Three PRs: 5302 waits for review; 5229 needs a rebase; 5167 waits for you.');
+		publishVerifiedResult(join(TMP, 'results', `${a}.txt`), 'Three PRs: 5302 waits for review; 5229 needs a rebase; 5167 waits for you.');
 		const said = await calls[0];
 		for (const pr of ['5302', '5229', '5167']) assert.ok(said.includes(`"check PR ${pr}"`), `request ${pr} named to the model`);
 		for (const call of calls.slice(1)) assert.match(await call, /answered_together/);
@@ -267,12 +272,12 @@ describe('relay agent end to end', () => {
 		const calls = [a, b].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
 		const before = sent.length;
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'Both PRs: 6302 waits; 6229 needs a rebase.');
+		publishVerifiedResult(join(TMP, 'results', `${a}.txt`), 'Both PRs: 6302 waits; 6229 needs a rebase.');
 		assert.match(await calls[0], /Both PRs/);
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		session.emit('turn.end', { turnId: 't23' } as never);
-		writeFileSync(join(TMP, 'results', `${b}.txt`), `[deduped: ${a}]`);
+		publishVerifiedResult(join(TMP, 'results', `${b}.txt`), `[deduped: ${a}]`);
 		assert.match(await calls[1], /delivered to the user separately/, 'its call ends with nothing more to say');
 		assert.equal(voiceTaskStore.get(b)?.delivery, 'spoken');
 		await tick(1_200);
@@ -293,7 +298,7 @@ describe('relay agent end to end', () => {
 		session.emit('speech.user_ended');
 		await until(() => !!voiceTaskStore.get(id)?.notPickedNoticed, 3_000);
 		assert.ok(voiceTaskStore.get(id)?.notPickedNoticed, 'the notice is queued');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The fish is a safe choice.');
+		publishVerifiedResult(join(TMP, 'results', `${id}.txt`), 'The fish is a safe choice.');
 		await until(() => voiceTaskState(id) !== 'queued', 4_000);
 		// The model answers the user: the queue moves. The notice is no longer true and is dropped; the result goes.
 		session.emit('turn.start');

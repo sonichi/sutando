@@ -125,7 +125,8 @@ def find_ready_result(results_dir: "Path | str", task_id: str, *,
     the walk without re-stating what "ready" means.
     """
     for candidate in iter_result_candidates(Path(results_dir), task_id):
-        if reader(candidate) is not None:
+        body = reader(candidate, task_id=task_id) if reader is read_ready_result else reader(candidate)
+        if body is not None:
             return candidate
     return None
 
@@ -164,7 +165,8 @@ def has_ready_result(results_dir: "Path | str", filename: str, *,
     if since is not None:
         def reader(path):
             written = _mtime(path)
-            return None if written is not None and written < since else read_ready_result(path)
+            return None if written is not None and written < since else read_ready_result(
+                path, task_id=_task_id_for_filename(filename))
     return find_ready_result_for_filename(results_dir, filename, reader=reader) is not None
 
 
@@ -198,7 +200,8 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
     index = index_result_candidates(Path(results_dir), by_id)
     ready: set[str] = set()
     for task_id, candidates in index.items():
-        if any(reader(c) is not None for c in candidates):
+        if any((reader(c, task_id=task_id) if reader is read_ready_result else reader(c))
+               is not None for c in candidates):
             ready.update(by_id[task_id])
     return ready
 

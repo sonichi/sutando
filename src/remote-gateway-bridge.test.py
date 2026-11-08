@@ -30,6 +30,7 @@ from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
+from _helpers.paired_result import publish_result
 
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
@@ -183,7 +184,7 @@ def _test_owner_dm_room_upgraded(rtc) -> None:
     try:
         # (1) room_upgraded 400 twice: pending, never parked, owner notified once, second pass no POST.
         up = rtc.RESULTS_DIR / "proactive-up1.txt"
-        up.write_text("upgrade nudge\n")
+        publish_result(up, "upgrade nudge\n")
         STATE["force_room_400_body"] = upgraded
         n0 = len(STATE["room_posts"])
         rtc._post_proactive()
@@ -206,7 +207,7 @@ def _test_owner_dm_room_upgraded(rtc) -> None:
         rtc._ROUTING.update(owner_dm="!owner:example.org")
         # (2) any other 400 still parks as before, with no notify.
         other = rtc.RESULTS_DIR / "proactive-up2.txt"
-        other.write_text("bad nudge\n")
+        publish_result(other, "bad nudge\n")
         n_calls = len(calls)
         STATE["force_room_400_body"] = {"reason": "bad_request"}
         rtc._post_proactive()
@@ -214,7 +215,7 @@ def _test_owner_dm_room_upgraded(rtc) -> None:
               "a non-upgrade 400 still parks the nudge")
         # (3) a room-addressed nudge keeps today's behaviour: parked, no hold, no notify.
         routed = rtc.RESULTS_DIR / "proactive-up3.txt"
-        routed.write_text("[channel: !other:example.org]\nroom nudge\n")
+        publish_result(routed, "[channel: !other:example.org]\nroom nudge\n")
         STATE["force_room_400_body"] = upgraded
         rtc._post_proactive()
         check(not routed.exists() and undeliv("proactive-up3") and len(calls) == n_calls
@@ -268,7 +269,7 @@ def _test_owner_dm_upgrade_edges(rtc) -> None:
             return real_rename(self, target)
 
         up = rtc.RESULTS_DIR / "proactive-up4.txt"
-        up.write_text("race nudge\n")
+        publish_result(up, "race nudge\n")
         STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!n:example.org"}
         Path.rename = _rename
         rtc._post_proactive()
@@ -324,7 +325,7 @@ def _test_owner_dm_upgrade_notice_retry(rtc) -> None:
         rtc.OWNER_DM_UPGRADED_NOTIFY = _hook
         rtc._upgrade_hold_file().unlink(missing_ok=True)
         getattr(rtc, "_UPGRADE_NOTICES_SENT", set()).clear()
-        up.write_text("retry nudge\n")
+        publish_result(up, "retry nudge\n")
         STATE["force_room_400_body"] = upgraded
         n0 = len(STATE["room_posts"])
         rtc._post_proactive()  # pass 1: 400, hold recorded, the notice fails
@@ -382,7 +383,7 @@ def _test_owner_dm_upgrade_notice_once_per_pass(rtc) -> None:
         hold.unlink(missing_ok=True)
         rtc._UPGRADE_NOTICES_SENT.clear()
         for f in files:
-            f.write_text("pass nudge\n")
+            publish_result(f, "pass nudge\n")
         STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
         rtc._post_proactive()
         check(len(attempts) == 1 and json.loads(hold.read_text()).get("notice_attempts") == 1,
@@ -424,7 +425,7 @@ def _test_owner_dm_upgrade_legacy_hold(rtc) -> None:
         rtc._UPGRADE_NOTICES_SENT.clear()
         hold.write_text(json.dumps({"room": "!owner:example.org",
                                     "replacement": "!new:example.org", "at": 1.0}))
-        up.write_text("legacy nudge\n")
+        publish_result(up, "legacy nudge\n")
         STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
         n0 = len(STATE["room_posts"])
         rtc._post_proactive()
@@ -579,7 +580,7 @@ def main() -> int:
           and STATE["acks"][-1]["body"]["id"] == _maxid,
           "ack posts the WIRE id for the max-length task (no local-form refusal)")
     (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    (_grtc.RESULTS_DIR / f"{_mt}.txt").write_text("maxlen answer")
+    publish_result(_grtc.RESULTS_DIR / f"{_mt}.txt", "maxlen answer")
     _rb2 = len(STATE["results"])
     _mi = {_mt}
     _grtc._post_ready_results(_mi)
@@ -607,7 +608,7 @@ def main() -> int:
           and "DEV TASK" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text(),
           "dev task file serializes the LOCAL id (result filename follows it)")
     (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    (_grtc.RESULTS_DIR / "task-dev~task-COLLIDE.txt").write_text("dev answer")
+    publish_result(_grtc.RESULTS_DIR / "task-dev~task-COLLIDE.txt", "dev answer")
     _rb = len(STATE["results"])
     _grtc._post_ready_results({"task-dev~task-COLLIDE"})
     check(len(STATE["results"]) == _rb + 1
@@ -990,7 +991,7 @@ def main() -> int:
     # compatibility, so it must not rely on absence meaning owner.
     (rtc.TASKS_DIR / "task-MARK.txt").write_text(
         "id: task-MARK\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
+    publish_result(rtc.RESULTS_DIR / "task-MARK.txt", "[no-send]\n")
     rtc._post_ready_results({"task-MARK"})
     _posted = STATE["results"][_before:]
     check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
@@ -1005,7 +1006,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
         "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "task-TSKIP.txt",
         "[no-send] internal bookkeeping note that must not reach the wire\n")
     rtc._post_ready_results({"task-TSKIP"})
     _posted = STATE["results"][_before:]
@@ -1020,7 +1021,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
         "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "task-TREDIR.txt",
         "[channel: 12345678901234567] exfil attempt\n")
     _real_route_withheld_review = rtc._route_withheld_review
     rtc._route_withheld_review = lambda _path: True
@@ -1037,7 +1038,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
         "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
+    publish_result(rtc.RESULTS_DIR / "task-TDEXF.txt", _hostile + "\n")
     rtc._post_ready_results({"task-TDEXF"})
     _posted = STATE["results"][_before:]
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
@@ -1049,7 +1050,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
         "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
+    publish_result(rtc.RESULTS_DIR / "task-CORE1.txt", "core answer")
     STATE["force_results_503"] = True
     rtc._post_ready_results({"task-CORE1"})
     check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
@@ -1095,7 +1096,7 @@ def main() -> int:
                          "reason": "send-failed:permanent-masquerade-failure"}
     (rtc.TASKS_DIR / "task-DEAD1.txt").write_text(
         "id: task-DEAD1\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-DEAD1.txt").write_text("lost answer")
+    publish_result(rtc.RESULTS_DIR / "task-DEAD1.txt", "lost answer")
     _cap = _io.StringIO()
     with contextlib.redirect_stdout(_cap):
         rtc._post_ready_results({"task-DEAD1"})
@@ -1136,7 +1137,7 @@ def main() -> int:
     STATE["delivery"] = None
     (rtc.TASKS_DIR / "task-OLDB1.txt").write_text(
         "id: task-OLDB1\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-OLDB1.txt").write_text("answer")
+    publish_result(rtc.RESULTS_DIR / "task-OLDB1.txt", "answer")
     _cap = _io.StringIO()
     with contextlib.redirect_stdout(_cap):
         rtc._post_ready_results({"task-OLDB1"})
@@ -1164,7 +1165,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TSKIP2.txt").write_text(
         "id: task-TSKIP2\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TSKIP2.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "task-TSKIP2.txt",
         "[no-send] internal bookkeeping note that must not reach the wire\n")
     rtc._post_ready_results({"task-TSKIP2"})
     _posted = STATE["results"][_before:]
@@ -1176,7 +1177,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TREDIR2.txt").write_text(
         "id: task-TREDIR2\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TREDIR2.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "task-TREDIR2.txt",
         "[channel: 12345678901234567] exfil attempt\n")
     _real_route_withheld_review = rtc._route_withheld_review
     rtc._route_withheld_review = lambda _path: True
@@ -1193,7 +1194,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TDEXF2.txt").write_text(
         "id: task-TDEXF2\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TDEXF2.txt").write_text(_hostile + "\n")
+    publish_result(rtc.RESULTS_DIR / "task-TDEXF2.txt", _hostile + "\n")
     rtc._post_ready_results({"task-TDEXF2"})
     _posted = STATE["results"][_before:]
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
@@ -1205,7 +1206,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-TDMAL.txt").write_text(
         "id: task-TDMAL\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TDMAL.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "task-TDMAL.txt",
         "[deduped: ../../../etc/passwd]\n")
     _logged: list[str] = []
     _real_log = rtc._log
@@ -1239,7 +1240,7 @@ def main() -> int:
     _before = len(STATE["results"])
     (rtc.TASKS_DIR / "task-CORE2.txt").write_text(
         "id: task-CORE2\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-CORE2.txt").write_text("core answer")
+    publish_result(rtc.RESULTS_DIR / "task-CORE2.txt", "core answer")
     STATE["force_results_503"] = True
     rtc._post_ready_results({"task-CORE2"})
     check((rtc.RESULTS_DIR / "task-CORE2.txt").exists()
@@ -1294,11 +1295,12 @@ def main() -> int:
     check((rtc.RESULTS_DIR / "task-MONTH.txt").read_text().startswith("[no-send]"),
           "month-archive dedup drops a [no-send] result")
     rtc.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    (rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt").write_text("sent")
+    publish_result(rtc.RESULTS_DIR / "task-DONE2.txt", "sent")
+    (rtc.RESULTS_DIR / "task-DONE2.txt").rename(rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt")
     check(rtc._write_task({**TASK, "id": "task-DONE2"}) == ("task-DONE2", True)
           and not (rtc.TASKS_DIR / "task-DONE2.txt").exists(),
           "redelivery of archived-result task not re-queued")
-    (rtc.RESULTS_DIR / "task-DONE3.txt").write_text("real result pending\n")
+    publish_result(rtc.RESULTS_DIR / "task-DONE3.txt", "real result pending\n")
     (rtc.TASKS_DIR / "archive" / "task-DONE3.txt").write_text("handled")
     rtc._write_task({**TASK, "id": "task-DONE3"})
     check((rtc.RESULTS_DIR / "task-DONE3.txt").read_text() == "real result pending\n",
@@ -1309,7 +1311,7 @@ def main() -> int:
 
     # 3. result file → POST back + archive
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    (rtc.RESULTS_DIR / "task-MOCK1.txt").write_text("the reply\n")
+    publish_result(rtc.RESULTS_DIR / "task-MOCK1.txt", "the reply\n")
     # Delta, not an absolute count: marker results now POST too, so earlier
     # cases legitimately leave entries in STATE["results"].
     _rb3 = len(STATE["results"])
@@ -1325,7 +1327,7 @@ def main() -> int:
           "task file archived alongside the delivered result (no tasks/ pile-up)")
     # archive collision is best-effort: rename onto an occupied path (a dir
     # squatting on the destination) must not raise or block delivery
-    (rtc.RESULTS_DIR / "task-COLL.txt").write_text("reply\n")
+    publish_result(rtc.RESULTS_DIR / "task-COLL.txt", "reply\n")
     (rtc.TASKS_DIR / "task-COLL.txt").write_text("task body\n")
     (rtc.TASKS_DIR / "archive" / "task-COLL.txt").mkdir(parents=True)
     rtc._post_ready_results({"task-COLL"})
@@ -1335,7 +1337,7 @@ def main() -> int:
     # claimed-task shape (review repro): the core renames a queued task to
     # task-<id>.claimed-core-N.txt while processing — delivery must archive
     # THAT file, not just the bare name, or health-check keeps counting it
-    (rtc.RESULTS_DIR / "task-CLAIMED.txt").write_text("reply\n")
+    publish_result(rtc.RESULTS_DIR / "task-CLAIMED.txt", "reply\n")
     (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").write_text("task body\n")
     rtc._post_ready_results({"task-CLAIMED"})
     check(not (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").exists()
@@ -1349,7 +1351,7 @@ def main() -> int:
     rtc._save_inflight(set())
     check(rtc._load_inflight() == set(), "inflight cleared once empty")
     # and _post_ready_results persists the removal after a successful POST
-    (rtc.RESULTS_DIR / "task-MOCK2.txt").write_text("reply2\n")
+    publish_result(rtc.RESULTS_DIR / "task-MOCK2.txt", "reply2\n")
     rtc._save_inflight({"task-MOCK2"})
     rtc._post_ready_results({"task-MOCK2"})
     check("task-MOCK2" not in rtc._load_inflight(), "delivered task removed from persisted inflight")
@@ -1411,7 +1413,7 @@ def main() -> int:
         check(rtc.PROACTIVE_ROOM == _want, f"proactive room {_label}")
     rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP = _saved_room
     # Unset → no scan, files untouched (existing hosts unchanged).
-    (rtc.RESULTS_DIR / "proactive-t1.txt").write_text("nudge one\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t1.txt", "nudge one\n")
     rtc.PROACTIVE_ROOM = ""
     rtc._post_proactive()
     check((rtc.RESULTS_DIR / "proactive-t1.txt").exists() and not STATE["room_posts"],
@@ -1432,7 +1434,7 @@ def main() -> int:
     # A definite refusal (429) → claim restored to .txt; the outbox retries it once its
     # backoff is due, and nothing is archived meanwhile.
     _lane = rtc._delivery_core("proactive").backend
-    (rtc.RESULTS_DIR / "proactive-t2.txt").write_text("nudge two")
+    publish_result(rtc.RESULTS_DIR / "proactive-t2.txt", "nudge two")
     STATE["force_room_429"] = True
     rtc._post_proactive()
     STATE["force_room_429"] = False
@@ -1447,7 +1449,7 @@ def main() -> int:
     # A 502 or a 200 WITHOUT a delivery signal may have posted: parked to undelivered/, never
     # resent (the room send is not idempotent), and never archived as delivered.
     for _stem, _flag in (("proactive-t2a", "force_room_502"), ("proactive-t2b", "force_room_empty_200")):
-        (rtc.RESULTS_DIR / f"{_stem}.txt").write_text(f"nudge {_stem}")
+        publish_result(rtc.RESULTS_DIR / f"{_stem}.txt", f"nudge {_stem}")
         STATE[_flag] = True
         rtc._post_proactive()
         STATE[_flag] = False
@@ -1463,14 +1465,14 @@ def main() -> int:
     # is indistinguishable from a writer mid-flush, so it is re-queued rather
     # than unlinked (review blocker: the old code unlinked it silently, which
     # loses the body when the writer's flush lands after the claim).
-    (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("  \n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t3.txt", "  \n")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == 3 and (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
           "empty proactive file is re-queued, not sent and not destroyed")
 
     # The body the writer was still flushing wins: once it lands, the SAME file
     # delivers normally. This is the regression for the data-loss race.
-    (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("the late-flushed body")
+    publish_result(rtc.RESULTS_DIR / "proactive-t3.txt", "the late-flushed body")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == 4
           and STATE["room_posts"][-1]["body"] == "the late-flushed body"
@@ -1480,7 +1482,7 @@ def main() -> int:
     # Genuinely empty past the settle window → archived (not unlinked), so the
     # drop is auditable rather than silent.
     stale = rtc.RESULTS_DIR / "proactive-t3b.txt"
-    stale.write_text("   \n")
+    publish_result(stale, "   \n")
     posts_b4 = len(STATE["room_posts"])
     aged = time.time() - 3600            # an old file is NOT evidence of abandonment
     os.utime(stale, (aged, aged))
@@ -1502,7 +1504,7 @@ def main() -> int:
 
     # And its late flush still delivers — into the SAME inode that was never
     # moved. This is the data-loss race the removed horizon reintroduced.
-    stale.write_text("t3b late body")
+    publish_result(stale, "t3b late body")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == posts_b4 + 1
           and STATE["room_posts"][-1]["body"] == "t3b late body"
@@ -1515,7 +1517,7 @@ def main() -> int:
     # until this bridge restarts (review P1). Inject: the pre-claim peek succeeds,
     # only the post-claim read (on the `.sending.` name) raises.
     import pathlib as _pl
-    (rtc.RESULTS_DIR / "proactive-readfail.txt").write_text("nudge readfail\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-readfail.txt", "nudge readfail\n")
     _real_read_text = _pl.Path.read_text
 
     def _read_text_fail_on_claim(self, *a, **k):
@@ -1574,6 +1576,10 @@ def main() -> int:
     finally:
         fh.close()
     rtc._post_proactive()
+    check(stalled.exists() and len(STATE["room_posts"]) == posts_before,
+          "a raw late flush without pairing evidence remains pending")
+    publish_result(stalled, "late body that should reach the owner")
+    rtc._post_proactive()
     check(len(STATE["room_posts"]) == posts_before + 1
           and STATE["room_posts"][-1]["body"] == "late body that should reach the owner"
           and not stalled.exists(),
@@ -1583,7 +1589,7 @@ def main() -> int:
     # lands in results/undelivered/ so "given up on" is not confused with
     # "delivered".
     huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
-    huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
+    publish_result(huge, "x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
     posts_b4_huge = len(STATE["room_posts"])
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == posts_b4_huge and not huge.exists()
@@ -1594,14 +1600,14 @@ def main() -> int:
     # belongs to the Discord bridge — this consumer must not claim it, must
     # not post it, and must leave the .txt in place for the real consumer.
     foreign = rtc.RESULTS_DIR / "proactive-t5.txt"
-    foreign.write_text("[channel: 1504619109516841121]\nfor discord only\n")
+    publish_result(foreign, "[channel: 1504619109516841121]\nfor discord only\n")
     posts_before = len(STATE["room_posts"])
     rtc._post_proactive()
     check(foreign.exists() and len(STATE["room_posts"]) == posts_before,
           "[channel: <discord id>] nudge is skipped, unclaimed, un-posted")
     foreign.unlink()
     # …while a [channel: !room] marker redirects within this bridge's reach:
-    (rtc.RESULTS_DIR / "proactive-t6.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "proactive-t6.txt",
         "[channel: !other:example.org]\nrouted nudge\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!other:example.org"
@@ -1611,7 +1617,7 @@ def main() -> int:
     # parse_markers), so the full protocol holds on proactive files too:
     # [dm-only] ANYWHERE suppresses a [channel:] redirect (privacy guard) —
     # the nudge stays in the default owner room with both markers stripped.
-    (rtc.RESULTS_DIR / "proactive-t9.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "proactive-t9.txt",
         "[channel: !shared:example.org]\nprivate nudge\n[dm-only]\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!owner:example.org"
@@ -1619,7 +1625,7 @@ def main() -> int:
           "[dm-only] suppresses [channel:] — default room, both markers stripped")
     # Skip markers archive silently: nothing posted, file archived (protocol:
     # a [no-send] body is delivered nowhere by every consumer).
-    (rtc.RESULTS_DIR / "proactive-t10.txt").write_text("[no-send]\ninternal note\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t10.txt", "[no-send]\ninternal note\n")
     posts_b4_skip = len(STATE["room_posts"])
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == posts_b4_skip
@@ -1636,7 +1642,7 @@ def main() -> int:
     def _receipt(stem):
         return next((i for i in _ob.list_items(_rroot)
                      if str(i.get("item_id", "")).startswith(f"{stem}~")), {})
-    (rtc.RESULTS_DIR / "proactive-r1.txt").write_text("receipt nudge\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-r1.txt", "receipt nudge\n")
     rtc._post_proactive()
     _it = _receipt("proactive-r1")
     check(_it.get("status") == "DELIVERED"
@@ -1644,7 +1650,7 @@ def main() -> int:
           and _it.get("destination") == "!owner:example.org"
           and str(_it.get("provider_ref", "")).startswith("$evt-"),
           "delivered default-room nudge records a durable receipt with the room and event id")
-    (rtc.RESULTS_DIR / "proactive-r2.txt").write_text(
+    publish_result(rtc.RESULTS_DIR / "proactive-r2.txt",
         "[channel: !other:example.org]\nrouted receipt nudge\n")
     rtc._post_proactive()
     _it2 = _receipt("proactive-r2")
@@ -1652,7 +1658,7 @@ def main() -> int:
           "a routed nudge's receipt records the OVERRIDE room, not the default")
     # A failed POST must record NOTHING — a receipt is proof of delivery,
     # never of an attempt.
-    (rtc.RESULTS_DIR / "proactive-r3.txt").write_text("failing nudge\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-r3.txt", "failing nudge\n")
     STATE["force_room_429"] = True
     rtc._post_proactive()
     STATE["force_room_429"] = False
@@ -1680,7 +1686,7 @@ def main() -> int:
     rtc._STATE = Path(tempfile.mkdtemp(prefix="rtc-routing-"))  # the persisted reading lands here, never live state
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
-    (rtc.RESULTS_DIR / "proactive-t1b.txt").write_text("to the dm\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t1b.txt", "to the dm\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
@@ -1705,7 +1711,7 @@ def main() -> int:
     rtc.os.replace = _real_replace
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]  # the row lost its field
     rtc._ROUTING["next"] = 0.0
-    (rtc.RESULTS_DIR / "proactive-t1c.txt").write_text("still to the dm\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t1c.txt", "still to the dm\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "a row without owner_dm_room keeps the last owner DM reading, never the pin")
@@ -1734,7 +1740,7 @@ def main() -> int:
     rtc._routing_file().unlink()
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)  # a fresh bridge with no reading ever
     n_posts = len(STATE["room_posts"])
-    (rtc.RESULTS_DIR / "proactive-t1e.txt").write_text("owner-private, nowhere safe to go\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t1e.txt", "owner-private, nowhere safe to go\n")
     rtc._post_proactive()
     check(rtc.proactive_room() == "" and len(STATE["room_posts"]) == n_posts
           and (rtc.RESULTS_DIR / "proactive-t1e.txt").exists(),
@@ -1746,7 +1752,7 @@ def main() -> int:
           and rtc.resolve_destination(rtc.SELECTED_MEMBERS, recipients=["@a:x", "@b:x"]) == ["@a:x", "@b:x"]
           and rtc.resolve_destination(rtc.SYSTEM) == "!owner:example.org",
           "the resolver answers every audience from one place")
-    (rtc.RESULTS_DIR / "proactive-t1d.txt").write_text("[channel: !here:example.org]\nfor that room\n")
+    publish_result(rtc.RESULTS_DIR / "proactive-t1d.txt", "[channel: !here:example.org]\nfor that room\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!here:example.org",
           "a [channel:] redirect is the CURRENT_ROOM audience, untouched by the owner DM")
@@ -1763,7 +1769,7 @@ def main() -> int:
     check(rtc.proactive_room() == "!dm:example.org", "back under the bound identity, the persisted reading returns")
     check(rtc.GATEWAY_INSTANCE == "" and bool(rtc.PROACTIVE_ROOM), "precondition: the harness bridge is the primary, pin set")
     _inst = rtc.GATEWAY_INSTANCE; rtc.GATEWAY_INSTANCE = "dev"  # a named secondary: pin set AND a DM reading present
-    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1f.txt").write_text("the primary's nudge\n")
+    n_posts = len(STATE["room_posts"]); publish_result(rtc.RESULTS_DIR / "proactive-t1f.txt", "the primary's nudge\n")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
           "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
@@ -1797,13 +1803,13 @@ def main() -> int:
         _conn.unaddressed_owner, _conn.owns_unaddressed, rtc._log = _saved_conn
     _saved_owns = rtc.OWNS_UNADDRESSED
     rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True  # the record made this lane the primary
-    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1h.txt").write_text("nudge for the new primary\n")
+    n_posts = len(STATE["room_posts"]); publish_result(rtc.RESULTS_DIR / "proactive-t1h.txt", "nudge for the new primary\n")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == n_posts + 1 and STATE["room_posts"][-1]["room_id"] == "!dm:example.org"
           and not (rtc.RESULTS_DIR / "proactive-t1h.txt").exists(),
           "a named lane the record made primary delivers an unaddressed nudge to its owner DM")
     _coexist_nudge = rtc.RESULTS_DIR / "proactive-coexist-nudge.txt"
-    _coexist_nudge.write_text("existing nudge remains\n")
+    publish_result(_coexist_nudge, "existing nudge remains\n")
     _sidecar.write_text(_json.dumps({"task_id": "task-wedge-coexist", "seq": "s2", "step": "Run the suite",
                                      "phase": "Running tests", "phase_source": "rules", "at": time.time() - 3600}) + "\n")
     _wedge_status = rtc._ag2space_task_status("task-wedge-coexist")
@@ -1825,7 +1831,7 @@ def main() -> int:
           "another detector and delivery pass duplicates neither the wedge notice nor the nudge")
     _sidecar.unlink()
     rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _inst, lambda: False  # the unsuffixed bridge once a lane is primary
-    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1i.txt").write_text("not the legacy's\n")
+    n_posts = len(STATE["room_posts"]); publish_result(rtc.RESULTS_DIR / "proactive-t1i.txt", "not the legacy's\n")
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1i.txt").exists(),
           "the unsuffixed bridge leaves unaddressed nudges once a named lane is primary")
@@ -1856,7 +1862,7 @@ def main() -> int:
     def _target_vanishes(body):  # peek sees an explicit room; the post-claim re-read sees an unaddressed body
         _calls.append(1); return ("send", "!here:example.org" if len(_calls) == 1 else None, "rewritten after the peek")
     rtc._proactive_route = _target_vanishes
-    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1g.txt").write_text("[channel: !here:example.org]\nfor that room\n")
+    n_posts = len(STATE["room_posts"]); publish_result(rtc.RESULTS_DIR / "proactive-t1g.txt", "[channel: !here:example.org]\nfor that room\n")
     rtc._post_proactive()
     check(len(_calls) == 2 and len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1g.txt").exists(),
           "a secondary hands back a file whose target vanished after the claim, whatever DM it has read")
@@ -1877,7 +1883,7 @@ def main() -> int:
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
     gated = rtc.RESULTS_DIR / "proactive-t11.txt"
-    gated.write_text("discord owner's nudge\n")
+    publish_result(gated, "discord owner's nudge\n")
     posts_b4_gate = len(STATE["room_posts"])
     rtc._post_proactive()
     check(gated.exists() and len(STATE["room_posts"]) == posts_b4_gate,
@@ -1902,7 +1908,7 @@ def main() -> int:
     _dlog = rtc.WS / "logs" / "discord-bridge.log"
     _dlog.write_text("alive\n")                    # a recent liveness trace
     configured = rtc.RESULTS_DIR / "proactive-t11b.txt"
-    configured.write_text("discord owner's nudge, bridge merely down\n")
+    publish_result(configured, "discord owner's nudge, bridge merely down\n")
     os.utime(configured, (aged, aged))            # far past the grace window
     posts_b4_down = len(STATE["room_posts"])
     rtc._post_proactive()
@@ -1923,7 +1929,7 @@ def main() -> int:
     # the file's own age instead — young file held, old file released.
     _dlog.unlink()
     young = rtc.RESULTS_DIR / "proactive-t11d.txt"
-    young.write_text("no-trace bridge, young file\n")
+    publish_result(young, "no-trace bridge, young file\n")
     os.utime(young, (aged, aged))                  # past grace, far short of abandonment
     posts_b4_young = len(STATE["room_posts"])
     rtc._post_proactive()
@@ -1942,7 +1948,7 @@ def main() -> int:
     _slog = rtc.WS / "logs" / "slack-bridge.log"
     _slog.write_text("alive\n")
     slack_owned = rtc.RESULTS_DIR / "proactive-t11s.txt"
-    slack_owned.write_text("slack owner's nudge, bridge alive\n")
+    publish_result(slack_owned, "slack owner's nudge, bridge alive\n")
     os.utime(slack_owned, (aged, aged))
     posts_b4_slack = len(STATE["room_posts"])
     rtc._post_proactive()
@@ -1953,7 +1959,7 @@ def main() -> int:
     _slog.unlink()
     shutil.rmtree(_gate_cfg / "channels" / "slack")
     unowned = rtc.RESULTS_DIR / "proactive-t11t.txt"
-    unowned.write_text("slack owner's nudge, no slack bridge here\n")
+    publish_result(unowned, "slack owner's nudge, no slack bridge here\n")
     os.utime(unowned, (aged, aged))
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == posts_b4_slack + 1 and not unowned.exists(),
@@ -1967,7 +1973,7 @@ def main() -> int:
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "telegram", "summary": "hi"}))
     tg = rtc.RESULTS_DIR / "proactive-t11c.txt"
-    tg.write_text("telegram owner's nudge\n")
+    publish_result(tg, "telegram owner's nudge\n")
     os.utime(tg, (aged, aged))
     posts_b4_tg = len(STATE["room_posts"])
     rtc._post_proactive()
@@ -1981,7 +1987,7 @@ def main() -> int:
     # must never strand the first proactive message.
     _activity.unlink()
     fresh_install = rtc.RESULTS_DIR / "proactive-t12.txt"
-    fresh_install.write_text("first ever nudge\n")
+    publish_result(fresh_install, "first ever nudge\n")
     posts_b4_fresh = len(STATE["room_posts"])
     rtc._post_proactive()
     check(fresh_install.exists() and len(STATE["room_posts"]) == posts_b4_fresh,
@@ -1995,7 +2001,7 @@ def main() -> int:
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
     instant = rtc.RESULTS_DIR / "proactive-t13.txt"
-    instant.write_text("app owner's nudge\n")
+    publish_result(instant, "app owner's nudge\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["body"] == "app owner's nudge"
           and not instant.exists(),
@@ -2006,7 +2012,7 @@ def main() -> int:
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
     ungated = rtc.RESULTS_DIR / "proactive-t14.txt"
-    ungated.write_text("standalone nudge\n")
+    publish_result(ungated, "standalone nudge\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["body"] == "standalone nudge"
           and not ungated.exists(),
@@ -2030,7 +2036,7 @@ def main() -> int:
     # trusts it. It may have posted, so it is parked once and never sent again.
     check(not hasattr(rtc, "PROACTIVE_TRUST_OK"), "no trust-ok setting reaches the proactive drain")
     bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
-    bare_ok.write_text("bare-ok nudge\n")
+    publish_result(bare_ok, "bare-ok nudge\n")
     STATE["force_room_ok_only"] = True
     _posts_before = len(STATE["room_posts"])
     for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than any cap
@@ -2043,7 +2049,7 @@ def main() -> int:
           and not any(p.name.startswith("proactive-t15") for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "a bare {ok:true} is posted once, parked to undeliverable/, never archived")
     # A later send is unaffected by the parked one.
-    (rtc.RESULTS_DIR / "proactive-t2d.txt").write_text("nudge 2d")
+    publish_result(rtc.RESULTS_DIR / "proactive-t2d.txt", "nudge 2d")
     rtc._post_proactive()
     check(not (rtc.RESULTS_DIR / "proactive-t2d.txt").exists(),
           "post-park deliveries are unaffected by the parked file")
@@ -2052,9 +2058,9 @@ def main() -> int:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
     # (review blocker: bare .sending recovery could steal in-flight claims).
     dead_pid = 4194303  # above macOS/Linux default pid_max ranges — not alive
-    (rtc.RESULTS_DIR / f"proactive-t4.sending.{dead_pid}").write_text("orphan nudge")
+    publish_result(rtc.RESULTS_DIR / f"proactive-t4.sending.{dead_pid}", "orphan nudge")
     live = rtc.RESULTS_DIR / f"proactive-t7.sending.{os.getpid()}"
-    live.write_text("in-flight nudge")
+    publish_result(live, "in-flight nudge")
     rtc._recover_orphan_proactive()
     check((rtc.RESULTS_DIR / "proactive-t4.txt").exists(),
           "dead-owner .sending.<pid> claim recovered to .txt")
@@ -2063,7 +2069,7 @@ def main() -> int:
     live.unlink()
     # Legacy bare .sending (no owner info): fresh → left alone; aged → recovered.
     legacy = rtc.RESULTS_DIR / "proactive-t8.sending"
-    legacy.write_text("legacy orphan")
+    publish_result(legacy, "legacy orphan")
     rtc._recover_orphan_proactive()
     check(legacy.exists(), "fresh legacy .sending claim left alone (age guard)")
     old = time.time() - rtc._ORPHAN_MIN_AGE_S - 5
@@ -2073,7 +2079,7 @@ def main() -> int:
           "aged legacy .sending claim recovered")
     (rtc.RESULTS_DIR / "proactive-t8.txt").unlink()
     # Destined names ride the same pid-scoped recovery unchanged (#3113).
-    (rtc.RESULTS_DIR / f"proactive-t9.to-discord.sending.{dead_pid}").write_text("destined orphan")
+    publish_result(rtc.RESULTS_DIR / f"proactive-t9.to-discord.sending.{dead_pid}", "destined orphan")
     rtc._recover_orphan_proactive()
     check((rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").exists(),
           "dead-owner claim on a DESTINED name recovers with its tag intact")
@@ -2399,7 +2405,7 @@ def main() -> int:
     rtc.TASKS_DIR.mkdir(parents=True, exist_ok=True)
     rtc.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (rtc.TASKS_DIR / "task-PEND.txt").write_text("still pending")
-    (rtc.RESULTS_DIR / "task-RDY.txt").write_text("result waiting")
+    publish_result(rtc.RESULTS_DIR / "task-RDY.txt", "result waiting")
     inflight = {"task-GONE", "task-PEND", "task-RDY", "not!a!tid"}
     s1 = rtc._reconcile_abandoned(inflight, set())
     check(s1 == {"task-GONE"} and "task-GONE" in inflight,
@@ -2424,7 +2430,7 @@ def main() -> int:
     # a result landing between sightings rescues the id
     inflight2 = {"task-LATE"}
     s = rtc._reconcile_abandoned(inflight2, set())
-    (rtc.RESULTS_DIR / "task-LATE.txt").write_text("landed late")
+    publish_result(rtc.RESULTS_DIR / "task-LATE.txt", "landed late")
     s = rtc._reconcile_abandoned(inflight2, s)
     check("task-LATE" in inflight2, "reconcile: late-landing result rescues the id")
     (rtc.RESULTS_DIR / "task-LATE.txt").unlink()

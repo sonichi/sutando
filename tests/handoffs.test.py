@@ -7,6 +7,8 @@ paths. In process, so coverage sees it.
 
 Run: python3 tests/handoffs.test.py   (stdlib only)
 """
+
+from _helpers.paired_result import publish_result
 import contextlib
 import importlib.util
 import io
@@ -80,9 +82,9 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual((st["phase"], st["line"], st["handoffs"], st["holding"]),
                          ("Delegated", "Delegated: worker-a", 1, 1))
         (self.ws / "results").mkdir()
-        (self.ws / "results" / f"{CHILD}.txt").write_text("   \n")
+        publish_result(self.ws / "results" / f"{CHILD}.txt", "   \n")
         self.assertEqual(len(ho.open_handoffs(self.ws, PARENT)), 1, "a blank placeholder is not a result")
-        (self.ws / "results" / f"{CHILD}.txt").write_text("[no-send]\nok")
+        publish_result(self.ws / "results" / f"{CHILD}.txt", "[no-send]\nok")
         self.assertEqual(ho.open_handoffs(self.ws, PARENT), [])
         self.assertIsNone(ho.delegated_status(self.ws, PARENT))
         closed = [r for r in cl.read(workspace=self.ws) if r["kind"] == "handoff_closed"]
@@ -93,8 +95,8 @@ class Lifecycle(unittest.TestCase):
     def test_an_archived_ready_result_closes_it_behind_an_empty_live_placeholder(self):
         ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
         (self.ws / "results" / "archive").mkdir(parents=True)
-        (self.ws / "results" / f"{CHILD}.txt").write_text("")
-        (self.ws / "results" / "archive" / f"{CHILD}.txt").write_text("the answer")
+        publish_result(self.ws / "results" / f"{CHILD}.txt", "")
+        publish_result(self.ws / "results" / "archive" / f"{CHILD}.txt", "the answer")
         self.assertEqual(ho.open_handoffs(self.ws, PARENT), [])
 
     def test_the_deadline_is_the_oldest_holding_handoff_plus_the_cap(self):
@@ -110,7 +112,7 @@ class Lifecycle(unittest.TestCase):
     def test_concurrent_readers_close_a_handoff_exactly_once(self):
         ho.open_handoff(self.ws, PARENT, "pool", CHILD, "worker-a", holds=True)
         (self.ws / "results").mkdir()
-        (self.ws / "results" / f"{CHILD}.txt").write_text("ok")
+        publish_result(self.ws / "results" / f"{CHILD}.txt", "ok")
         ctx = multiprocessing.get_context("fork")
         procs = [ctx.Process(target=ho.open_handoffs, args=(self.ws, PARENT)) for _ in range(8)]
         for p in procs:

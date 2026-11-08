@@ -30,6 +30,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from delivery.readiness import read_ready_result
 from typing import Optional
 
 
@@ -131,7 +132,9 @@ def _write_result_mirror(vault: Path, result_path: Path) -> bool:
         return False
     mirror = vault / "Sutando" / "Agent" / "Tasks" / f"{task_id}.md"
     try:
-        result_body = result_path.read_text(encoding="utf-8", errors="replace").rstrip()
+        result_body = read_ready_result(result_path)
+        if result_body is None:
+            return False
     except FileNotFoundError:
         return False
 

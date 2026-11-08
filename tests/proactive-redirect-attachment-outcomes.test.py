@@ -32,6 +32,8 @@ import tempfile
 import time
 import types
 
+from _helpers.paired_result import publish_result
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 prior = os.environ.get("CLAUDE_CONFIG_DIR")
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-attach-outcomes-")
@@ -117,7 +119,7 @@ try:
     def run(body: str) -> str:
         sends.clear()
         f = results / "proactive-case.txt"
-        f.write_text(body)
+        publish_result(f, body)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             asyncio.run(one_pass())
@@ -166,7 +168,7 @@ try:
     (tasks / "question-attach.txt").write_text(
         "id: question-attach\naccess_tier: owner\ntask: probe\n")
     fb = results / "question-attach.txt"
-    fb.write_text(f"[channel: {TARGET}]\nbody\n[file: {refused}]\n")
+    publish_result(fb, f"[channel: {TARGET}]\nbody\n[file: {refused}]\n")
     aged = time.time() - 400          # past the 90s grace window
     os.utime(fb, (aged, aged))
     sends.clear()
@@ -184,7 +186,7 @@ try:
     (tasks / "question-empty.txt").write_text(
         "id: question-empty\naccess_tier: owner\ntask: probe\n")
     fe = results / "question-empty.txt"
-    fe.write_text(f"[channel: {TARGET}]\nbody\n[file: ]\n")
+    publish_result(fe, f"[channel: {TARGET}]\nbody\n[file: ]\n")
     os.utime(fe, (aged, aged))
     sends.clear()
     buf = io.StringIO()
@@ -200,7 +202,7 @@ try:
     # dm-fallback MISSING TASK: no originating task file anywhere, so the tier
     # read raises and falls to "guest"; the redirect must be dropped, not sent.
     fm = results / "question-missing.txt"
-    fm.write_text(f"[channel: {TARGET}]\nbody\n")
+    publish_result(fm, f"[channel: {TARGET}]\nbody\n")
     os.utime(fm, (aged, aged))
     sends.clear()
     buf = io.StringIO()

@@ -5,6 +5,11 @@ Real filesystem, the production writer and the production readers (holder_of,
 worker_holds, owned_task_ids), so a reader that starts looking inside archive/,
 or a writer that moves an open task's hold, fails here.
 """
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.paired_result import publish_result
 import contextlib
 import json
 import os
@@ -52,7 +57,7 @@ class Base(unittest.TestCase):
         (self.root / "tasks/archive" / f"{task_id}.txt").write_text(f"id: {task_id}\ntask: x\n")
 
     def answered(self, task_id):
-        (self.root / "results/archive" / f"{task_id}.txt").write_text("the reply\n")
+        publish_result(self.root / "results/archive" / f"{task_id}.txt", "the reply\n")
 
     def live_names(self):
         return sorted(n for n in os.listdir(self.inbox) if pd.parse_sentinel(n))

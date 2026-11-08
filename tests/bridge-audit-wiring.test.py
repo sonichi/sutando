@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from _helpers.hermetic_env import isolate_os_environ
 
+from _helpers.paired_result import publish_result
+
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
@@ -172,7 +174,7 @@ for _tid, _marker in (("task-loop-nosend", "[no-send]\n"),
     (db.TASKS_DIR).mkdir(parents=True, exist_ok=True)
     (db.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (db.TASKS_DIR / f"{_tid}.txt").write_text(f"id: {_tid}\ntask: t\n")
-    (db.RESULTS_DIR / f"{_tid}.txt").write_text(_marker)
+    publish_result(db.RESULTS_DIR / f"{_tid}.txt", _marker)
     db.pending_replies[_tid] = _FakeChannel()
 
 

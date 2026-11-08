@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / 'src'))
@@ -197,7 +198,7 @@ class Wedges(unittest.TestCase):
         self.check(100, [signal])
         self.check(120, [signal])
         result = self.ws / 'results' / 'task-a.txt'
-        result.write_text('Completed')
+        publish_result(result, 'Completed')
         self.assertEqual(self.check(180, [signal]), self.normal)
         self.assertEqual(self.notices(), [])
         result.unlink()
@@ -528,7 +529,7 @@ class Wedges(unittest.TestCase):
         self.check(160, [self.signal()])
         archive = self.ws / 'results' / 'archive'
         archive.mkdir()
-        (archive / 'task-a.txt').write_text('done')
+        publish_result(archive / 'task-a.txt', 'done')
         self.assertEqual(self.check(170, [self.signal()]), self.normal)
         self.assertFalse((root / 'task-a.json').exists())
 

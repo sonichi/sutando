@@ -53,7 +53,7 @@ signal.signal(signal.SIGTERM, term)
 while True:
     time.sleep(0.2)
 PYS
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_write.py" "$REPO/src/file_lock.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
   printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"

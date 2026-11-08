@@ -9,6 +9,7 @@ Run: python3 tests/gateway-agent-activity-hooks.test.py
 """
 from __future__ import annotations
 
+
 import ast
 import io
 import json
@@ -27,6 +28,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+from _helpers.paired_result import publish_result, publish_staged_result
 
 gw, _READS = isolate_then_import(env={"REMOTE_TASK_LIFECYCLE_V2": "1", "REMOTE_TASK_TURN_CONTEXT": "1"})
 assert gw._ATTEMPTS.take_ownership()
@@ -911,8 +913,16 @@ class Hooks(unittest.TestCase):
         tid = "task-reserve-fsync"
         body = _task(tid, lease_id="L2")
         calls = []
-        with mock.patch.object(gw.task_attempts.agent_turn, "_fsync_dir", side_effect=lambda d: (
-                calls.append(d), (_ for _ in ()).throw(OSError(5, "EIO")))[1]):
+        real_fsync = os.fsync
+        def fail_directory(fd):
+            import stat
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                calls.append(fd)
+                raise OSError(5, "EIO")
+            return real_fsync(fd)
+        with mock.patch.object(os, "fsync", side_effect=fail_directory), mock.patch.object(
+                gw.task_attempts.agent_turn, "_fsync_dir", side_effect=lambda d: (
+                    calls.append(d), (_ for _ in ()).throw(OSError(5, "EIO")))[1]):
             self.assertIsNone(gw._save_reserve(tid, f"{tid}~~2", "L2", body), "the first save's fsync failed")
             self.assertIsNone(gw._save_reserve(tid, f"{tid}~~2", "L2", body),
                               "the copy is there, but not durable: never named")
@@ -1353,7 +1363,7 @@ class Hooks(unittest.TestCase):
         seed_ack(tid, _ack(tid, 1))
         result = gw.RESULTS_DIR / f"{tid}.txt"
         result.parent.mkdir(parents=True, exist_ok=True)
-        result.write_text("answer")
+        publish_result(result, "answer")
         self.addCleanup(lambda: result.unlink(missing_ok=True))
         self.closed_by_beat(tid)
         self.assertEqual(self.controls(tid), [])
@@ -1432,7 +1442,7 @@ class Hooks(unittest.TestCase):
                                  "applied_terminal": False, "ts": time.time()}) + "\n")
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text("I asked which one.")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", "I asked which one.")
         wake = _task(tid, wake={"blocker_episode_id": "e1", "resolved_blockers": [
             {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "blue"}}]})
         during = {}
@@ -1521,7 +1531,7 @@ class Hooks(unittest.TestCase):
                                  "operation_id": f"op_{first}_9", "operation_status": "succeeded",
                                  "applied_execution_phase": "waiting_input", "active_blocker_count": 1,
                                  "applied_terminal": False, "ts": time.time()}) + "\n")
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text("I asked which one.")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", "I asked which one.")
         wake = _task(tid, wake={"blocker_episode_id": "e1", "resolved_blockers": [
             {"outcome": "answered", "answer": {"kind": "text", "text": "blue"}}]})
         inflight, admitted = {tid}, {}
@@ -1547,7 +1557,7 @@ class Hooks(unittest.TestCase):
         tid = "task-stale-disposed"
         self.assertIsNotNone(gw._write_task(_task(tid)))
         (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
-        (gw.RESULTS_DIR / "archive" / f"{tid}.txt").write_text("I asked which one.")
+        publish_result(gw.RESULTS_DIR / "archive" / f"{tid}.txt", "I asked which one.")
         with txn(tid) as t:
             t.finish()
         inflight, seen = {tid}, {}
@@ -1620,15 +1630,15 @@ class Hooks(unittest.TestCase):
         fake, ctl = self.stopped_by_a_beat(tid)
         self.assertTrue(gw._deliver_result_payload(tid, tid, "done anyway"))
         self.assertEqual(fake.posted("/v1/results")[0]["status"], "completed", "a finished reply is delivered")
-        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+        publish_result(gw.RESULTS_DIR / f"{ctl}.txt", "[no-send]")
         gw._post_task_beats({tid}, force=True)
         self.assertEqual(fake.posted("/cancel-ack"), [])
 
     def test_stop_then_finish_seen_by_the_control_task_first_still_sends_no_cancel_ack(self):
         tid = "task-stop-finish-2"
         fake, ctl = self.stopped_by_a_beat(tid)
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text("done anyway")
-        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", "done anyway")
+        publish_result(gw.RESULTS_DIR / f"{ctl}.txt", "[no-send]")
         gw._post_task_beats({tid}, force=True)
         self.assertEqual(fake.posted("/cancel-ack"), [])
         self.assertTrue(gw._deliver_result_payload(tid, tid, "done anyway"))
@@ -1638,7 +1648,7 @@ class Hooks(unittest.TestCase):
     def test_stop_then_stop_sends_only_the_cancel_ack(self):
         tid = "task-stop-stop"
         fake, ctl = self.stopped_by_a_beat(tid)
-        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+        publish_result(gw.RESULTS_DIR / f"{ctl}.txt", "[no-send]")
         gw._post_task_beats({tid}, force=True)
         self.assertEqual(fake.posted("/cancel-ack")[0]["cancel_requested_generation"], 1)
         self.assertTrue(gw._deliver_result_payload(tid, tid, "late"), "a later result settles")
@@ -1648,8 +1658,8 @@ class Hooks(unittest.TestCase):
         for i, (body, no_send) in enumerate([("[no-send]", True), ("  \n", False)]):
             tid = f"task-stop-nosend-{i}"
             fake, ctl = self.stopped_by_a_beat(tid)
-            (gw.RESULTS_DIR / f"{tid}.txt").write_text(body)
-            (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+            publish_result(gw.RESULTS_DIR / f"{tid}.txt", body)
+            publish_result(gw.RESULTS_DIR / f"{ctl}.txt", "[no-send]")
             gw._post_task_beats({tid}, force=True)
             self.assertEqual(fake.posted("/cancel-ack"), [], "an undelivered result is ruled by delivery")
             self.assertTrue(gw._deliver_result_payload(tid, tid, body, no_send=no_send))
@@ -1743,7 +1753,7 @@ class Hooks(unittest.TestCase):
         for d in (gw.TASKS_DIR, gw.RESULTS_DIR):
             (d / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
-        (gw.RESULTS_DIR / "archive" / f"{tid}.txt").write_text("I asked.")
+        publish_result(gw.RESULTS_DIR / "archive" / f"{tid}.txt", "I asked.")
         wake = {"blocker_episode_id": "e1", "resolved_blockers": [
             {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "yes"}}]}
         run = f"{tid}~~2"
@@ -1939,7 +1949,7 @@ class Hooks(unittest.TestCase):
     def test_a_real_result_written_first_is_never_replaced(self):
         tid = "task-raced"
         rfile = gw.RESULTS_DIR / f"{tid}.txt"
-        rfile.write_text("the real answer")
+        publish_result(rfile, "the real answer")
         self.addCleanup(lambda: rfile.unlink(missing_ok=True))
         self.assertIsNone(gw._write_if_absent(rfile, gw.DISPATCH_LOST_RESULT))
         self.assertEqual(rfile.read_text(), "the real answer")
@@ -2016,7 +2026,7 @@ class Hooks(unittest.TestCase):
         for d in (gw.TASKS_DIR / "archive", gw.RESULTS_DIR / "archive"):
             d.mkdir(exist_ok=True)
         (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
-        (gw.RESULTS_DIR / "archive" / f"{tid}.txt").write_text("I asked.")
+        publish_result(gw.RESULTS_DIR / "archive" / f"{tid}.txt", "I asked.")
         return {**task, "wake": {"blocker_episode_id": "e1", "resolved_blockers": [
             {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "b"}}]}}
 
@@ -2043,7 +2053,7 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._post_task_ack(run, durable=True))
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / f"{run}.txt").rename(gw.TASKS_DIR / "archive" / f"{run}.txt")
-        (gw.RESULTS_DIR / f"{run}.txt").write_text("went with b")
+        publish_result(gw.RESULTS_DIR / f"{run}.txt", "went with b")
         inflight = {run}
         with self.failing_save("relay-wake-episodes"):
             gw._post_ready_results(inflight)
@@ -2077,7 +2087,7 @@ class Hooks(unittest.TestCase):
                 fake = self.use(FakeGateway(**{"/v1/results": break_it, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
                 self.assertTrue(gw._post_task_ack(run, durable=True))
                 (gw.TASKS_DIR / f"{run}.txt").rename(gw.TASKS_DIR / "archive" / f"{run}.txt")
-                (gw.RESULTS_DIR / f"{run}.txt").write_text("went with b")
+                publish_result(gw.RESULTS_DIR / f"{run}.txt", "went with b")
                 inflight = {run}
                 gw._post_ready_results(inflight)
                 self.assertEqual(len(fake.posted("/v1/results")), 1)
@@ -2111,7 +2121,7 @@ class Hooks(unittest.TestCase):
                 fake = self.use(FakeGateway(**{"/v1/results": break_it, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
                 self.assertTrue(gw._post_task_ack(run, durable=True))
                 (gw.TASKS_DIR / f"{run}.txt").rename(gw.TASKS_DIR / "archive" / f"{run}.txt")
-                (gw.RESULTS_DIR / f"{run}.txt").write_text("went with b")
+                publish_result(gw.RESULTS_DIR / f"{run}.txt", "went with b")
                 inflight = {run}
                 gw._post_ready_results(inflight)
                 broken_bytes = None if path.is_dir() else path.read_bytes()
@@ -2142,7 +2152,7 @@ class Hooks(unittest.TestCase):
     def ran(self, tid):
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text("done")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", "done")
 
     def posted_once_under_its_generation(self, fake, tid, inflight):
         gw._post_ready_results(inflight)
@@ -2411,7 +2421,7 @@ class Hooks(unittest.TestCase):
     def test_an_answer_the_core_writes_before_the_owed_failure_posts_as_its_answer(self):
         tid = "task-owed-raced"
         fake = self.owed_failure(tid)
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text("the real answer")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", "the real answer")
         gw._post_task_beats({tid}, force=True)
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), "the real answer")
         gw._post_ready_results({tid})
@@ -2562,7 +2572,7 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._take_served_task(dict(task), inflight, []))
         self.assertTrue(gw._post_task_ack(tid, durable=True))
         self.ran(tid)
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text("I asked.")
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", "I asked.")
         gw._post_ready_results(inflight)
         wake = {"blocker_episode_id": "e1", "resolved_blockers": [
             {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "b"}}]}
@@ -2570,7 +2580,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual(gw._write_task({**task, "wake": wake}), (run, True))   # its in-flight save is lost
         self.assertTrue(gw._post_task_ack(run, durable=True))
         self.ran(run)
-        (gw.RESULTS_DIR / f"{run}.txt").write_text("went with b")
+        publish_result(gw.RESULTS_DIR / f"{run}.txt", "went with b")
         inflight = set()                                                        # restart
         gw._close_stale_turns(inflight)
         gw._post_ready_results(inflight)
@@ -2618,7 +2628,7 @@ class Hooks(unittest.TestCase):
     def test_a_core_answer_in_the_failure_results_own_words_is_the_cores(self):
         tid = "task-owed-collision"
         fake = self.owed_failure(tid)
-        (gw.RESULTS_DIR / f"{tid}.txt").write_text(gw.DISPATCH_LOST_RESULT)   # the core wins, same words
+        publish_result(gw.RESULTS_DIR / f"{tid}.txt", gw.DISPATCH_LOST_RESULT)   # the core wins, same words
         gw._post_task_beats({tid}, force=True)
         gw._post_ready_results({tid})
         post = [p for p in fake.posted("/v1/results") if p["id"] == tid]
@@ -2630,8 +2640,8 @@ class Hooks(unittest.TestCase):
         self.owed_failure(tid)
         gw._post_task_beats({tid}, force=True)
         tmp = gw.RESULTS_DIR / f".{tid}.core"
-        tmp.write_text("the core's answer")
-        os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")                        # the core's own file, same name
+        publish_result(tmp, "the core's answer")
+        publish_staged_result(tmp, gw.RESULTS_DIR / f"{tid}.txt")                        # the core's own file, same name
         (gw.TASKS_DIR / "archive" / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.txt")
         self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
         self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
@@ -2675,8 +2685,8 @@ class Hooks(unittest.TestCase):
                                      "the earlier run's claimed result may still be sent: the switch waits")
                 else:
                     tmp = gw.RESULTS_DIR / f".{tid}.core"
-                    tmp.write_text("the core's answer")
-                    os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")
+                    publish_result(tmp, "the core's answer")
+                    publish_staged_result(tmp, gw.RESULTS_DIR / f"{tid}.txt")
                 release.set()
                 drain.join(10)
                 self.assertTrue(gw._post_task_ack(tid, durable=True, lease_id="L2"), "held, it let go: the switch goes")
@@ -2752,7 +2762,7 @@ class Hooks(unittest.TestCase):
         self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
         self.assertTrue(gw._post_task_ack(run, durable=True))
         self.ran(run)
-        (gw.RESULTS_DIR / f"{run}.txt").write_text("went with b")
+        publish_result(gw.RESULTS_DIR / f"{run}.txt", "went with b")
         mode = gw.RESULTS_DIR.stat().st_mode
         self.addCleanup(os.chmod, gw.RESULTS_DIR, mode)
         os.chmod(gw.RESULTS_DIR, 0)
@@ -2922,7 +2932,7 @@ class Hooks(unittest.TestCase):
         self.beat_error(tid, "task_cancelled")
         ctl = gw._ATTEMPTS.get(tid)["stop_ctl"]
         (gw.TASKS_DIR / f"{ctl}.txt").unlink()
-        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")               # the core ran the Stop
+        publish_result(gw.RESULTS_DIR / f"{ctl}.txt", "[no-send]")               # the core ran the Stop
         self.addCleanup(lambda: (gw.RESULTS_DIR / f"{ctl}.txt").unlink(missing_ok=True))
         saved = gw._ATTEMPTS.path.read_bytes()
         self.addCleanup(lambda: gw._ATTEMPTS.path.write_bytes(saved))
@@ -2974,7 +2984,7 @@ class Hooks(unittest.TestCase):
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / "task-h8.txt").rename(gw.TASKS_DIR / "archive" / "task-h8.txt")
         (gw.RESULTS_DIR / "archive").mkdir(exist_ok=True)
-        (gw.RESULTS_DIR / "archive" / "task-h8.txt").write_text("I asked.")
+        publish_result(gw.RESULTS_DIR / "archive" / "task-h8.txt", "I asked.")
         self.assertTrue(gw._result_disposed("task-h8"), "the first attempt's copy says done")
 
         wake = {"blocker_episode_id": "e1", "resolved_blockers": [
@@ -3025,7 +3035,7 @@ class Hooks(unittest.TestCase):
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / "task-h8c.txt").rename(gw.TASKS_DIR / "archive" / "task-h8c.txt")
         (gw.RESULTS_DIR / "archive").mkdir(exist_ok=True)
-        (gw.RESULTS_DIR / "archive" / "task-h8c.txt").write_text("I asked.")
+        publish_result(gw.RESULTS_DIR / "archive" / "task-h8c.txt", "I asked.")
         wake = {"blocker_episode_id": "e1", "resolved_blockers": [
             {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "yes"}}]}
         run = "task-h8c~~2"
@@ -3076,7 +3086,7 @@ class Hooks(unittest.TestCase):
         (gw.TASKS_DIR / f"{tid}.txt").write_text(gw.task_attempts.cancel_task_text(
             "task-x", tid, "2026-10-26T00:00:00Z", "test"))
         result = gw.RESULTS_DIR / f"{tid}.txt"
-        result.write_text("[no-send]")
+        publish_result(result, "[no-send]")
         old = time.time() - gw.ORPHAN_GRACE_S - 60
         os.utime(result, (old, old))
         fake = self.use(FakeGateway())
@@ -3102,8 +3112,8 @@ class Hooks(unittest.TestCase):
 
     def core_writes(self, tid, text):
         tmp = gw.RESULTS_DIR / f".{tid}.core"
-        tmp.write_text(text)
-        os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")
+        publish_result(tmp, text)
+        publish_staged_result(tmp, gw.RESULTS_DIR / f"{tid}.txt")
 
     def unpatched(self):
         mock.patch.stopall()
@@ -3784,6 +3794,14 @@ class Hooks(unittest.TestCase):
         self.core_writes(a, "A's answer")
         inflight = {a, b}
         mock.patch.object(gw, "DELIVERY_PASS_WAIT_S", 0.5).start()
+        workers, start_delivery = {}, gw._start_delivery
+
+        def start_and_track(items, *args):
+            worker = start_delivery(items, *args)
+            for tid, _path, _body, _generation in items:
+                workers[tid] = worker
+            return worker
+        mock.patch.object(gw, "_start_delivery", side_effect=start_and_track).start()
         drain = threading.Thread(target=gw._post_ready_results, args=(inflight,))
         drain.start()
         self.assertTrue(stalled.wait(5))
@@ -3807,6 +3825,8 @@ class Hooks(unittest.TestCase):
         finally:
             release.set()
         drain.join(60)
+        workers[a].join(60)  # The bounded scan may return before its independent send finishes.
+        self.assertFalse(workers[a].is_alive())
         self.assertEqual(gw._ATTEMPTS.get(a), {}, "A settles once its send returns")
         del fakes
 

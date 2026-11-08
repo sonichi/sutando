@@ -607,7 +607,7 @@ chmod +x "$stub20"
       cp "$f" "$TMP/ws20.task"
       # The core-side half of the contract: answer the drain task in results/.
       mkdir -p "$WS20/results"
-      printf 'nothing in flight (test)\n' > "$WS20/results/$(basename "$f")"
+      printf 'nothing in flight (test)\n' | python3 "$REPO/src/result_publish.py" --allow-undeliverable "$WS20/results/$(basename "$f")"
       break
     fi
     touch "$WS20/state/cores/$HOST.alive"; sleep 0.5

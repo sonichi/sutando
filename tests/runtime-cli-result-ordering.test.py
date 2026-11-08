@@ -6,7 +6,9 @@ State and sockets follow TMPDIR; publications are synthetic local results.
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+from _helpers.paired_result import publish_result, publish_staged_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -180,9 +182,9 @@ class ResultOrderingCliTests(unittest.TestCase):
     def publish(self, name, body, ns):
         path = self.results / f"{name}.txt"
         staged = self.results / f".{name}.tmp"
-        staged.write_text(body)
+        publish_result(staged, body)
         os.utime(staged, ns=(ns, ns))
-        staged.replace(path)
+        publish_staged_result(staged, path)
         return path.stat().st_mtime_ns
 
     def pause_daemon(self):

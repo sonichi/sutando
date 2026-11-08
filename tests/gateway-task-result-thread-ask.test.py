@@ -23,6 +23,7 @@ Run: python3 tests/gateway-task-result-thread-ask.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import os
@@ -34,6 +35,7 @@ from urllib.parse import quote
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -108,7 +110,7 @@ class Harness:
 
     def run(self, tid: str, body: str, tier: str = "owner") -> set:
         self.task(tid, tier)
-        (self.mod.RESULTS_DIR / f"{tid}.txt").write_text(body, encoding="utf-8")
+        publish_result(self.mod.RESULTS_DIR / f"{tid}.txt", body, encoding="utf-8")
         inflight = {tid}
         self.mod._post_ready_results(inflight)
         return inflight
@@ -206,7 +208,7 @@ def main() -> int:
     h = Harness()
     (h.ws / "state" / "last-owner-activity.json").write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "t"}))
-    (h.mod.RESULTS_DIR / "proactive-1.txt").write_text(f"[channel: {ROOM}]\n[thread]\nnudge\n")
+    publish_result(h.mod.RESULTS_DIR / "proactive-1.txt", f"[channel: {ROOM}]\n[thread]\nnudge\n")
     h.mod._post_proactive()
     posts = [c[2] for c in h.calls if c[1] == "/v1/room" and (c[2] or {}).get("op") == "message"]
     p = posts[0] if posts else {}

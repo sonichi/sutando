@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-One entry per agent-facing module. 5 without a usable header comment.
+One entry per agent-facing module. 7 without a usable header comment.
 
 ## `src/`
 
@@ -201,6 +201,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`repo_root.sh`** — Resolve the DURABLE repo that supplies the running `src/` code.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
+- **`result-read.ts`** — Read a result through the shared receipt and readiness verifier.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
 - **`result_channel_key.py`** — Alias of `delivery.channel_key` (phase-1a restructure); one transition window.
 - **`result_labels.py`** — A result's Activity labels: the `<name>.meta.json` side file beside `<name>.txt` in results/.
@@ -208,6 +209,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_publish.py`** — One publisher for every `results/` body: staged beside the target, fsynced, renamed whole.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
+- **`result_write.py`** — Validate a task-id echo, then publish a result and content-bound receipt.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
@@ -254,8 +256,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
 - **`system_load.py`** — Sustained system load: one reading per health-check pass, a warning only when the last K passes all ran above a ratio of the core count, the top CPU users, and their cause.
-- **`task-bridge.ts`** — Voice → Claude Code session bridge.
-- **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
+- **`task-bridge.ts`** — _(no header comment)_
+- **`task-delegation.ts`** — _(no header comment)_
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.

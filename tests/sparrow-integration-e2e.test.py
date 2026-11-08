@@ -26,6 +26,7 @@ Run: python3 tests/sparrow-integration-e2e.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import os
@@ -35,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -174,7 +176,7 @@ def main() -> int:
     # ── 3. result returned ONCE ─────────────────────────────────────────────
     print("\n3. RESULT — core produces a result; bridge POSTs it once, archives")
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    (rtc.RESULTS_DIR / "task-E2E1.txt").write_text("the reply to the probe\n")
+    publish_result(rtc.RESULTS_DIR / "task-E2E1.txt", "the reply to the probe\n")
     rtc._post_ready_results({"task-E2E1"})
     real_results = [r for r in STATE["results"] if not str(r.get("body", "")).startswith("[no-send]")]
     check(len(STATE["results"]) == 1 and STATE["results"][0]["id"] == "task-E2E1",

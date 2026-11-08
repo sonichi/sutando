@@ -32,7 +32,9 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -294,7 +296,7 @@ def check_real_code_honors_the_marker() -> None:
     its own pass so the fence-call signal is unambiguous per file."""
     box1 = Path(tempfile.mkdtemp(prefix="proactive-behavioral-nosend-"))
     nosend = box1 / "proactive-behavioral-nosend.txt"
-    nosend.write_text("[no-send]\nInternal, must never reach a send attempt.")
+    publish_result(nosend, "[no-send]\nInternal, must never reach a send attempt.")
     delivered, calls = _run_proactive_pass(_load(BRIDGE), box1)
     if nosend.stem in delivered:
         fail(
@@ -310,7 +312,7 @@ def check_real_code_honors_the_marker() -> None:
 
     box2 = Path(tempfile.mkdtemp(prefix="proactive-behavioral-ordinary-"))
     ordinary = box2 / "proactive-behavioral-ordinary.txt"
-    ordinary.write_text("Good morning! Here is your briefing.")
+    publish_result(ordinary, "Good morning! Here is your briefing.")
     delivered2, calls2 = _run_proactive_pass(_load(BRIDGE), box2)
     if ordinary.stem not in delivered2:
         fail(
@@ -329,8 +331,8 @@ def check_real_code_honors_the_marker() -> None:
     tasks = Path(tempfile.mkdtemp(prefix="dmfallback-behavioral-tasks-"))
     fb_nosend = results / "question-behavioral-nosend.txt"
     fb_ordinary = results / "question-behavioral-ordinary.txt"
-    fb_nosend.write_text("[no-send]\nInternal, must never reach dm-result.py.")
-    fb_ordinary.write_text("Here is your answer.")
+    publish_result(fb_nosend, "[no-send]\nInternal, must never reach dm-result.py.")
+    publish_result(fb_ordinary, "Here is your answer.")
     _age_past_grace(fb_nosend, fb_ordinary)
     calls = _run_dm_fallback_pass(db2, results, tasks)
     argvs = [" ".join(a) for a in calls]
@@ -357,7 +359,7 @@ def check_mutation_makes_it_fail() -> None:
     mdb = _load_mutated()
     box = Path(tempfile.mkdtemp(prefix="proactive-mutated-"))
     nosend = box / "proactive-mutated-nosend.txt"
-    nosend.write_text("[no-send]\nInternal, must never reach a send attempt.")
+    publish_result(nosend, "[no-send]\nInternal, must never reach a send attempt.")
     _delivered, calls = _run_proactive_pass(mdb, box)
     if calls == ["drop"]:
         fail(
@@ -371,7 +373,7 @@ def check_mutation_makes_it_fail() -> None:
     results = Path(tempfile.mkdtemp(prefix="dmfallback-mutated-results-"))
     tasks = Path(tempfile.mkdtemp(prefix="dmfallback-mutated-tasks-"))
     fb_nosend = results / "question-mutated-nosend.txt"
-    fb_nosend.write_text("[no-send]\nInternal, must never reach dm-result.py.")
+    publish_result(fb_nosend, "[no-send]\nInternal, must never reach dm-result.py.")
     _age_past_grace(fb_nosend)
     calls = _run_dm_fallback_pass(mdb2, results, tasks)
     argvs = [" ".join(a) for a in calls]

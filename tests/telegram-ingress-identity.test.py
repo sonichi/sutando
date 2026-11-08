@@ -12,6 +12,8 @@ from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
+from _helpers.paired_result import publish_result
+
 # Before anything reads the environment; a --bridge child keeps the hermetic environment its harness built.
 isolate_os_environ(**(json.loads(Path(sys.argv[4]).read_text()) if sys.argv[1:2] == ["--bridge"] else {}))
 
@@ -267,7 +269,7 @@ class TelegramIngress(unittest.TestCase):
 
         result = h.results / task.name
         result_bytes = b"The synthetic notes are sorted.\n"
-        result.write_bytes(result_bytes)
+        publish_result(result, result_bytes.decode("utf-8"))
         h.tick(second, events2)
         archived_tasks = list((h.tasks / "archive").rglob(task.name))
         archived_results = list((h.results / "archive").rglob(task.name))
@@ -291,7 +293,7 @@ class TelegramIngress(unittest.TestCase):
                          f"chat_id: {h.chat}\n", "source_message_id: 401\n", "parent_message_id: 400\n",
                          "priority: normal\n", "Please sort the synthetic notes.",
                          "[forwarded from fixture_author]", "[Replying to @fixture_parent: Keep the order.]",
-                         "CONTEXT-FIRST", f"write result to results/{tid}.txt"):
+                         "CONTEXT-FIRST", "RESULT PUBLICATION", f"results/{tid}.txt"):
             self.assertIn(expected, original.decode())
         self.assertIn("timestamp: ", original.decode())
         self.assertIn("local_time: ", original.decode())
@@ -347,7 +349,7 @@ class TelegramIngress(unittest.TestCase):
         accepted = {h.tasks / f"{h.task_id(update)}.txt" for update in (fresh, same_text, other_chat)}
         self.assertEqual(set(h.tasks.rglob("task-*.txt")), original_records | accepted)
 
-        (h.results / legacy.name).write_text("Legacy answer")
+        publish_result(h.results / legacy.name, "Legacy answer")
         h.tick(proc, events)
         h.tick(proc, events)
         self.assertEqual([r["params"] for r in h.calls(events, "sendMessage")],

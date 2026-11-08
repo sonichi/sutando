@@ -32,6 +32,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from delivery.readiness import read_ready_result  # noqa: E402
 from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
@@ -346,7 +347,10 @@ def main():
         if len(sys.argv) < 3:
             print("Usage: python3 src/dm-result.py --file path", file=sys.stderr)
             sys.exit(1)
-        text = Path(sys.argv[2]).read_text().strip()
+        text = read_ready_result(Path(sys.argv[2]))
+        if text is None:
+            print("result not ready or unpaired", file=sys.stderr)
+            sys.exit(1)
     else:
         text = " ".join(sys.argv[1:])
 

@@ -643,11 +643,11 @@ def _finish(workspace: Path, entry: dict, now: float) -> None:
     """Complete a recorded action from its record alone: answer, lift, archive, each marked
     done in the record as it lands, so a replay skips it and never answers a second time."""
     import local_record
-    from local_task_protocol import find_result
+    from delivery.task_dispatch import has_ready_result
     task = entry["task"]
     if not entry.get("answered"):
         # Unmarked means a crash may have hit after the write: a copy live or archived is that write.
-        if find_result(workspace / "results", task) is None:
+        if not has_ready_result(workspace / "results", f"{task}.txt"):
             local_record.write_text_whole(workspace / "results" / f"{task}.txt", entry["reply"] + "\n")
         _mark(workspace, task, "answered")
     if not entry.get("lifted"):
@@ -683,7 +683,8 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         action = _owner_action(path, workspace, hold)
         if action is None:
             continue
-        if (workspace / "results" / path.name).exists():
+        from result_ready import read_ready_result
+        if read_ready_result(workspace / "results" / path.name) is not None:
             _archive_task(workspace, path)
             continue
         kind, model = action

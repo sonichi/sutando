@@ -12,6 +12,8 @@ Run: python3 tests/classifier-gate-cooldown.test.py
 """
 from __future__ import annotations
 
+
+from _helpers.paired_result import publish_result
 import json
 import sys
 import time
@@ -43,7 +45,7 @@ def make_workspace(tmp: Path, name: str) -> Path:
     (ws / "tasks" / f"{tid}.txt").write_text(
         f"id: {tid}\ntimestamp: 2026-08-30T00:00:00Z\nsource: chat\n"
         "access_tier: owner\ntask: sample work item\n")
-    (ws / "results" / f"{tid}.txt").write_text("done\n")
+    publish_result(ws / "results" / f"{tid}.txt", "done\n")
     return ws
 
 

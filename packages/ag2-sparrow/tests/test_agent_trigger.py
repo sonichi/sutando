@@ -188,7 +188,8 @@ def test_result_with_no_source_message_posts_top_level():
         for tid, body in (("task-1786000000070", "Hi all, I'm Sutando.\n"),
                           ("task-1786000000071", "[thread]\nHi all, I'm Sutando.\n")):
             tid, _ = m._write_task(_join_task(tid, access_tier="owner"))
-            (m.RESULTS_DIR / f"{tid}.txt").write_text(body, encoding="utf-8")
+            from ag2_sparrow.result_publish import publish_text
+            publish_text(m.RESULTS_DIR / f"{tid}.txt", body, pair_result=True)
             left = m._post_ready_results({tid})
             assert not (m.RESULTS_DIR / f"{tid}.txt").exists(), f"{tid} result not retired ({left})"
         assert len(posts) == 2, posts

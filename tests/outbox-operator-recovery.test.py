@@ -4,6 +4,7 @@ never manufacture a second delivery.
 
 Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
+
 import contextlib
 import hashlib
 import io
@@ -17,6 +18,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -245,7 +247,7 @@ class BodyExternalLane(unittest.TestCase):
             results, root = self._lane(td)
             archived = results / "archive" / "2026-10" / f"{ITEM}.txt"
             archived.parent.mkdir(parents=True)
-            archived.write_text("the reply", encoding="utf-8")
+            publish_result(archived, "the reply", encoding="utf-8")
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = outbox_cli.main(["--root", str(root), "--json", "requeue", ITEM])
@@ -274,7 +276,7 @@ class BodyExternalLane(unittest.TestCase):
             results, root = self._lane(td)
             (results / "archive").mkdir(parents=True)
             flat = results / "archive" / f"{ITEM}-1730000000.txt"
-            flat.write_text("the reply", encoding="utf-8")
+            publish_result(flat, "the reply", encoding="utf-8")
             self.assertIn(str(flat), outbox_cli.body_gone(root, ITEM))
 
     def test_a_live_or_quarantined_body_still_requeues(self):
@@ -282,7 +284,7 @@ class BodyExternalLane(unittest.TestCase):
             with self.subTest(where=where), TemporaryDirectory() as td:
                 results, root = self._lane(td)
                 live = results / f"{ITEM}.txt"
-                live.write_text("the reply", encoding="utf-8")
+                publish_result(live, "the reply", encoding="utf-8")
                 if where == "quarantined":
                     uq.place(live, results, ITEM, when=1700000000)
                 self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 0)
@@ -346,9 +348,26 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         results.mkdir()
         root = (results / ".outbox-test") if root_inside_results else Path(td) / "ob"
         _parked(root)
-        (results / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
+        publish_result(results / f"{ITEM}.txt", "the reply", encoding="utf-8")
         uq.place(results / f"{ITEM}.txt", results, f"{ITEM}", when=1700000000)
         return root, results
+
+    def test_requeue_refuses_a_quarantined_body_without_pairing_proof(self):
+        with TemporaryDirectory() as td:
+            results = Path(td) / "results"
+            results.mkdir()
+            root = results / ".outbox-test"
+            _parked(root)
+            live = results / f"{ITEM}.txt"
+            live.write_text("the reply")
+            uq.place(live, results, ITEM, when=1700000000)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = outbox_cli.main(["--root", str(root), "--json", "requeue", ITEM])
+            self.assertEqual(code, 4)
+            self.assertIn("no matching receipt", json.loads(output.getvalue())["error"])
+            self.assertFalse(live.exists())
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
 
     def test_the_DEFAULT_requeue_restores_the_body(self):
         """The common path must not be the broken one. `--root` is required and
@@ -511,7 +530,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             root = results / ".outbox-dev"
             broker_id, local_id = "task-abc", "task-dev~task-abc"
             _parked(root, broker_id)
-            (results / f"{local_id}.txt").write_text("the reply", encoding="utf-8")
+            publish_result(results / f"{local_id}.txt", "the reply", encoding="utf-8")
             uq.place(results / f"{local_id}.txt", results, f"{local_id}", when=1700000000)
 
             # the local id addresses no record
@@ -550,9 +569,9 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             results = Path(td) / "results"; results.mkdir()
             self.assertEqual(uq.restore(results, ITEM)[0],
                              uq.RestoreOutcome.NOTHING_QUARANTINED)
-            (results / f"{ITEM}.txt").write_text("old", encoding="utf-8")
+            publish_result(results / f"{ITEM}.txt", "old", encoding="utf-8")
             uq.place(results / f"{ITEM}.txt", results, f"{ITEM}")
-            (results / f"{ITEM}.txt").write_text("newer", encoding="utf-8")
+            publish_result(results / f"{ITEM}.txt", "newer", encoding="utf-8")
             self.assertEqual(uq.restore(results, ITEM)[0],
                              uq.RestoreOutcome.LIVE_RESULT_PRESENT)
 
@@ -562,7 +581,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         with TemporaryDirectory() as td:
             results = Path(td) / "results"; results.mkdir()
             for body in ("first", "second"):
-                (results / f"{ITEM}.txt").write_text(body, encoding="utf-8")
+                publish_result(results / f"{ITEM}.txt", body, encoding="utf-8")
                 uq.place(results / f"{ITEM}.txt", results, f"{ITEM}")
             self.assertEqual(len(uq.find_quarantined(results, ITEM)), 2)
 
@@ -582,7 +601,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         """A reply already waiting to go is the one the user should get."""
         with TemporaryDirectory() as td:
             root, results = self._quarantined(td)
-            (results / f"{ITEM}.txt").write_text("newer", encoding="utf-8")
+            publish_result(results / f"{ITEM}.txt", "newer", encoding="utf-8")
             outbox_cli.main(["--root", str(root), "requeue", ITEM,
                              "--results-dir", str(results)])
             self.assertEqual(

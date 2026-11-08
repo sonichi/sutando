@@ -20,6 +20,7 @@ Run: python3 tests/gateway-lane-own-identity.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import os
@@ -29,6 +30,7 @@ import time
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 isolate_os_environ()
 
@@ -158,7 +160,7 @@ def drain(state: Path, results: Path, instance: str, whoami_answer, posts: list,
 def results_with(room: str) -> Path:
     results = Path(tempfile.mkdtemp(prefix="gw-lane-id-results-"))
     (results / "archive").mkdir()
-    (results / "proactive-1.txt").write_text(f"[channel: {room}]\nThe guard rewrite is done.\n")
+    publish_result(results / "proactive-1.txt", f"[channel: {room}]\nThe guard rewrite is done.\n")
     return results
 
 
@@ -223,17 +225,17 @@ def health_cases() -> None:
     got = hc.check_proactive_undelivered(results, now)
     check(got["status"] == "ok", f"f) empty results/: ok ({got['detail']})")
     fresh = results / "proactive-2.txt"
-    fresh.write_text("x")
+    publish_result(fresh, "x")
     os.utime(fresh, (now - 60, now - 60))
     check(hc.check_proactive_undelivered(results, now)["status"] == "ok", "f) a fresh file: ok")
     stuck = results / "proactive-ask-1.txt"
-    stuck.write_text("x")
+    publish_result(stuck, "x")
     os.utime(stuck, (now - 1800, now - 1800))
     got = hc.check_proactive_undelivered(results, now)
     check(got["status"] == "warn" and "1 proactive" in got["detail"] and "30 min" in got["detail"],
           f"f) a file unclaimed for 30 min warns ({got['detail']})")
     destined = results / "proactive-9.to-telegram.txt"
-    destined.write_text("x")
+    publish_result(destined, "x")
     os.utime(destined, (now - 1800, now - 1800))
     check("1 proactive" in hc.check_proactive_undelivered(results, now)["detail"],
           "f) a destined file is the stranded-destined probe's, not counted here")

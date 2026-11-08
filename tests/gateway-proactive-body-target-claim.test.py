@@ -19,6 +19,7 @@ Run: python3 tests/gateway-proactive-body-target-claim.test.py
 """
 from __future__ import annotations
 
+
 import importlib.util
 import json
 import os
@@ -28,6 +29,7 @@ import time
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.paired_result import publish_result
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -91,7 +93,7 @@ def run(body: str, last_active: str, passes: int = 2):
     mod._reenroll_identity = lambda: AGENT
     mod._ROUTING.update(owner_dm=OWNER_DM, loaded=True, next=time.time() + 3600)
     queued = ws / "results" / "proactive-1.txt"
-    queued.write_text(body, encoding="utf-8")
+    publish_result(queued, body, encoding="utf-8")
     gate_is_production = mod.PROACTIVE_CLAIM_GATE is mod._ag2space_proactive_claim_gate
     for _ in range(passes):
         mod._post_proactive()

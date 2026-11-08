@@ -82,18 +82,18 @@ def ready_body_of(data: bytes) -> str | None:
     return body or None
 
 
-def read_ready_result(path: str | Path) -> str | None:
+def read_ready_result(path: str | Path, attests=None, *, task_id=None) -> str | None:
     """Return the stripped body of `path`, or None when it is not ready.
 
     None covers missing, unreadable, empty-or-whitespace-only and still-being-
     written files. Callers skip on None and retry on a later pass — the file is
     not consumed, so a result that lands between passes is still delivered.
     """
-    ready = read_ready_result_with_identity(path)
+    ready = read_ready_result_with_identity(path, attests=attests, task_id=task_id)
     return ready.body if ready else None
 
 
-def read_ready_result_with_identity(path: str | Path) -> "ReadyResult | None":
+def read_ready_result_with_identity(path: str | Path, attests=None, *, task_id=None) -> "ReadyResult | None":
     """`read_ready_result` plus the identity of the bytes it returned."""
     p = Path(path)
     try:
@@ -110,5 +110,13 @@ def read_ready_result_with_identity(path: str | Path) -> "ReadyResult | None":
                 return None  # young and still growing
     except OSError:
         return None                     # missing or unreadable: readable again on a later pass
+    if attests is None:
+        try:
+            from .result_write import path_verifier
+        except ImportError:
+            from result_write import path_verifier
+        attests = path_verifier(p, task_id=task_id)
+    if not attests(data.decode("utf-8", errors="replace")):
+        return None
     body = ready_body_of(data)
     return ReadyResult(body, identity) if body is not None else None

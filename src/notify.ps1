@@ -29,7 +29,21 @@ if ($resp -and $resp.StatusCode -eq 426) {
     $ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $resultsDir = Join-Path $WORKSPACE 'results'
     New-Item -ItemType Directory -Force -Path $resultsDir | Out-Null
-    Set-Content -Path (Join-Path $resultsDir "proactive-$ts.txt") -Value $Message -NoNewline
+    $temporary = Join-Path $resultsDir ('.notify-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.File]::WriteAllText($temporary, $Message, [Text.UTF8Encoding]::new($false))
+        . (Join-Path $REPO 'scripts/python-binary.ps1')
+        $publisherPython = Resolve-SutandoPython
+        $destination = Join-Path $resultsDir "proactive-$ts.txt"
+        $publisherArgs = @('-c', 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from result_publish import publish_text; publish_text(sys.argv[3], Path(sys.argv[2]).read_bytes().decode("utf-8"), pair_result=True)', $PSScriptRoot, $temporary, $destination)
+        if ($publisherPython -eq 'py') { $publisherArgs = @('-3') + $publisherArgs }
+        & $publisherPython @publisherArgs
+        if ($LASTEXITCODE -ne 0) { throw "Proactive publication failed (exit $LASTEXITCODE)" }
+    } catch {
+        Write-Warning "Voice notification could not be published: $_"
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
+    }
 }
 
 # 2. Discord DM — shared owner resolution, allowlist, chunking, and REST client.

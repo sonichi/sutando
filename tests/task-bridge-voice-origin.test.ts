@@ -1,6 +1,7 @@
+import { publishVerifiedResult } from '../src/result-read.js';
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -223,9 +224,9 @@ describe('the drain: a plain origin-bound result is written to its origin, a [dm
 		setVoiceSessionOrigin(origin('place-2', { verify: async () => true, dmOnlyNote: 'It went to the DM, not the place.' }));
 		const noted = await delegate('drain probe noted');
 		setVoiceSessionOrigin(null);
-		writeFileSync(join(RESULT_DIR, `${plain.taskId}.txt`), 'Three listings.');
-		writeFileSync(join(RESULT_DIR, `${priv.taskId}.txt`), '[dm-only]\nPrivate one.');
-		writeFileSync(join(RESULT_DIR, `${noted.taskId}.txt`), '[dm-only]\nPrivate two.');
+		publishVerifiedResult(join(RESULT_DIR, `${plain.taskId}.txt`), 'Three listings.');
+		publishVerifiedResult(join(RESULT_DIR, `${priv.taskId}.txt`), '[dm-only]\nPrivate one.');
+		publishVerifiedResult(join(RESULT_DIR, `${noted.taskId}.txt`), '[dm-only]\nPrivate two.');
 		startResultWatcher((result, note) => spoken.push({ result, note }), () => true);
 		assert.ok(await until(() => [plain, priv, noted].every(t => proactiveFor(t.taskId).length > 0), 8000), readdirSync(RESULT_DIR).join(', '));
 		assert.equal(readFileSync(join(RESULT_DIR, proactiveFor(plain.taskId)[0]), 'utf-8'), '[channel: place-1]\nThree listings.');
@@ -245,8 +246,8 @@ describe('the drain, connected: an origin that refuses at delivery keeps the res
 		setVoiceSessionOrigin(origin('place-thrown', { verify: async () => { throw new Error('verifier down'); }, dmOnlyNote: 'Kept to the DM.' }));
 		const thrown = await delegate('drain probe thrown at delivery');
 		setVoiceSessionOrigin(null);
-		writeFileSync(join(RESULT_DIR, `${refused.taskId}.txt`), 'For the place, refused.');
-		writeFileSync(join(RESULT_DIR, `${thrown.taskId}.txt`), 'For the place, thrown.');
+		publishVerifiedResult(join(RESULT_DIR, `${refused.taskId}.txt`), 'For the place, refused.');
+		publishVerifiedResult(join(RESULT_DIR, `${thrown.taskId}.txt`), 'For the place, thrown.');
 		assert.ok(await until(() => [refused, thrown].every(t => proactiveFor(t.taskId).length > 0), 8000), readdirSync(RESULT_DIR).join(', '));
 		for (const [t, body] of [[refused, 'For the place, refused.'], [thrown, 'For the place, thrown.']] as const) {
 			const files = proactiveFor(t.taskId);

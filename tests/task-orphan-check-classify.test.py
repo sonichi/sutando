@@ -26,6 +26,8 @@ Run: python3 tests/task-orphan-check-classify.test.py
 """
 from __future__ import annotations
 
+from _helpers.paired_result import publish_result
+
 import contextlib
 import importlib.util
 import io
@@ -248,7 +250,7 @@ class TestImportTask(ClassifyBase):
 
     def test_result_file_beats_everything(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 7200))
-        (self.ws.root / "results" / f"{IMPORT_ID}.txt").write_text("[no-send]\n")
+        publish_result(self.ws.root / "results" / f"{IMPORT_ID}.txt", "[no-send]\n")
         row = self.one()
         self.assertEqual(row["verdict"], "done")
         self.assertFalse(row["import"], "marker check runs before the import branch")
@@ -534,20 +536,20 @@ class TestOrdinaryTasks(ClassifyBase):
 
     def test_done_by_live_result(self):
         self.ws.task("task-1.txt", chat_task_text("task-1", NOW - 9999))
-        (self.ws.root / "results" / "task-1.txt").write_text("done\n")
+        publish_result(self.ws.root / "results" / "task-1.txt", "done\n")
         self.assertEqual(self.one()["verdict"], "done")
 
     def test_done_by_archived_result(self):
         self.ws.task("task-1.txt", chat_task_text("task-1", NOW - 9999))
         (self.ws.root / "results" / "archive" / "2026-09").mkdir(parents=True)
-        (self.ws.root / "results" / "archive" / "2026-09" / "task-1.txt").write_text("done\n")
+        publish_result(self.ws.root / "results" / "archive" / "2026-09" / "task-1.txt", "done\n")
         row = self.one()
         self.assertEqual(row["verdict"], "done")
         self.assertIn("archive", row["reason"])
 
     def test_done_by_proactive_marker_and_sending_variant(self):
         self.ws.task("task-1.txt", chat_task_text("task-1", NOW - 9999))
-        (self.ws.root / "results" / "proactive-task-1.txt").write_text("x\n")
+        publish_result(self.ws.root / "results" / "proactive-task-1.txt", "x\n")
         self.assertEqual(self.one()["verdict"], "done")
         (self.ws.root / "results" / "proactive-task-1.txt").rename(
             self.ws.root / "results" / "proactive-task-1.txt.sending")
@@ -725,7 +727,7 @@ class TestWorkerHeld(ClassifyBase):
     def test_result_file_beats_the_sentinel(self):
         self.held_task()
         self.sentinel("39041ce6", ".txt")
-        (self.ws.root / "results" / f"{self.HELD}.txt").write_text("answered\n")
+        publish_result(self.ws.root / "results" / f"{self.HELD}.txt", "answered\n")
         self.assertEqual(self.one()["verdict"], "done")
 
     def test_sentinel_check_runs_before_the_import_branch(self):
@@ -799,7 +801,7 @@ class TestLimitHeld(ClassifyBase):
 
     def test_a_result_still_wins_over_held(self):
         self._hold_then_resume("task-held-2")
-        (self.ws.root / "results" / "task-held-2.txt").write_text("answered\n")
+        publish_result(self.ws.root / "results" / "task-held-2.txt", "answered\n")
         self.assertEqual(self.one()["verdict"], "done")
 
     def test_unlisted_task_keeps_the_age_rule(self):

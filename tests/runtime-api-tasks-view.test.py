@@ -11,7 +11,9 @@ Run: python3 tests/runtime-api-tasks-view.test.py
 Exit: 0 on pass, 1 on fail.
 """
 
+
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.paired_result import publish_result
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -94,9 +96,9 @@ class TasksViewTests(unittest.TestCase):
     def test_get_result_no_id_returns_newest_runtime_api_only(self):
         import os
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / "task-rtapi-a.txt").write_text("older")
-        (self.results / "task-rtapi-b.txt").write_text("newer")
-        (self.results / "task-9999.txt").write_text("A ROOM RESULT")  # other channel
+        publish_result(self.results / "task-rtapi-a.txt", "older")
+        publish_result(self.results / "task-rtapi-b.txt", "newer")
+        publish_result(self.results / "task-9999.txt", "A ROOM RESULT")  # other channel
         os.utime(self.results / "task-rtapi-a.txt", (1000, 1000))
         os.utime(self.results / "task-rtapi-b.txt", (2000, 2000))
         os.utime(self.results / "task-9999.txt", (3000, 3000))  # newest overall
@@ -118,9 +120,9 @@ class TasksViewTests(unittest.TestCase):
     def test_list_results_runtime_api_only_newest_first(self):
         import os
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / "task-rtapi-a.txt").write_text("A" * 300)
-        (self.results / "task-rtapi-b.txt").write_text("B body")
-        (self.results / "task-8888.txt").write_text("room")  # other channel
+        publish_result(self.results / "task-rtapi-a.txt", "A" * 300)
+        publish_result(self.results / "task-rtapi-b.txt", "B body")
+        publish_result(self.results / "task-8888.txt", "room")  # other channel
         os.utime(self.results / "task-rtapi-a.txt", (1000, 1000))
         os.utime(self.results / "task-rtapi-b.txt", (2000, 2000))
         ids = [r["taskId"] for r in self.view.list_results()["results"]]
@@ -136,10 +138,10 @@ class TasksViewTests(unittest.TestCase):
         self.results.mkdir(parents=True, exist_ok=True)
         for i in range(3):
             f = self.results / f"task-rtapi-pending{i}.txt"
-            f.write_text("   ")                      # present but not an answer
+            publish_result(f, "   ")                      # present but not an answer
             os.utime(f, (9000 + i, 9000 + i))        # newest
         ready = self.results / "task-rtapi-answer.txt"
-        ready.write_text("READY ANSWER")
+        publish_result(ready, "READY ANSWER")
         os.utime(ready, (1000, 1000))                # oldest
         got = self.view.list_results(limit=2)
         self.assertEqual([r["taskId"] for r in got["results"]],
@@ -151,7 +153,7 @@ class TasksViewTests(unittest.TestCase):
         self.results.mkdir(parents=True, exist_ok=True)
         for i in range(3):
             f = self.results / f"task-rtapi-r{i}.txt"
-            f.write_text(f"ANSWER {i}")
+            publish_result(f, f"ANSWER {i}")
             os.utime(f, (5000 + i, 5000 + i))
         got = self.view.list_results(limit=2)
         self.assertEqual(len(got["results"]), 2)
@@ -183,7 +185,7 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(self.view.status(tid)["state"], "in_progress")
         # result lands → done (result presence wins)
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / f"{tid}.txt").write_text("did it")
+        publish_result(self.results / f"{tid}.txt", "did it")
         self.assertEqual(self.view.status(tid)["state"], "done")
 
     def test_status_waiting_for_states_from_hitl_lookup(self):
@@ -212,7 +214,7 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(view.status(tid)["state"], "pending")
         pending[tid] = ["approval"]
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / f"{tid}.txt").write_text("r")
+        publish_result(self.results / f"{tid}.txt", "r")
         self.assertEqual(view.status(tid)["state"], "done")
 
     def test_submit_stamps_instance_id_when_scoped(self):
@@ -239,9 +241,9 @@ class TasksViewTests(unittest.TestCase):
 
     def test_get_result_live_and_archived(self):
         self.results.mkdir(parents=True)
-        (self.results / "task-rtapi-a.txt").write_text("live result")
+        publish_result(self.results / "task-rtapi-a.txt", "live result")
         (self.results / "archive").mkdir()
-        (self.results / "archive" / "task-rtapi-b.txt").write_text("old result")
+        publish_result(self.results / "archive" / "task-rtapi-b.txt", "old result")
         self.assertEqual(self.view.get_result("task-rtapi-a")["result"],
                          "live result")
         self.assertEqual(self.view.get_result("task-rtapi-b")["result"],
@@ -253,8 +255,8 @@ class TasksViewTests(unittest.TestCase):
         # archive/<YYYY-MM>/ and gateway epoch-suffixed archive/<id>-<epoch>.txt
         month = self.results / "archive" / "2026-08"
         month.mkdir(parents=True)
-        (month / "task-rtapi-archive.txt").write_text("monthly result")
-        (self.results / "archive" / "task-rtapi-gateway-123.txt").write_text(
+        publish_result(month / "task-rtapi-archive.txt", "monthly result")
+        publish_result(self.results / "archive" / "task-rtapi-gateway-123.txt",
             "gateway result")
         self.assertEqual(self.view.get_result("task-rtapi-archive")["result"],
                          "monthly result")
@@ -267,17 +269,17 @@ class TasksViewTests(unittest.TestCase):
         Reading it would report another task's result, and done, for a task
         that never delivered — and would suppress its cancellation."""
         (self.results / "archive").mkdir(parents=True)
-        (self.results / "archive"
-         / "task-rtapi-target-longer-1785976425.txt").write_text("OTHER TASK")
+        publish_result(self.results / "archive"
+         / "task-rtapi-target-longer-1785976425.txt", "OTHER TASK")
         self.assertIsNone(self.view.get_result("task-rtapi-target"))
         self.assertNotEqual(self.view.status("task-rtapi-target")["state"], "done")
 
     def test_genuine_gateway_suffix_still_resolves_beside_the_longer_id(self):
         (self.results / "archive").mkdir(parents=True)
-        (self.results / "archive"
-         / "task-rtapi-target-longer-1785976425.txt").write_text("OTHER TASK")
-        (self.results / "archive"
-         / "task-rtapi-target-1785976425.txt").write_text("MINE")
+        publish_result(self.results / "archive"
+         / "task-rtapi-target-longer-1785976425.txt", "OTHER TASK")
+        publish_result(self.results / "archive"
+         / "task-rtapi-target-1785976425.txt", "MINE")
         self.assertEqual(self.view.get_result("task-rtapi-target")["result"],
                          "MINE")
         self.assertEqual(self.view.status("task-rtapi-target")["state"], "done")
@@ -302,7 +304,7 @@ class TasksViewTests(unittest.TestCase):
         (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-core-1.txt")
         c = self.view.submit("third")["taskId"]
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / f"{c}.txt").write_text("done")
+        publish_result(self.results / f"{c}.txt", "done")
         out = self.view.list_tasks()
         by_id = {t["taskId"]: t for t in out["tasks"]}
         self.assertEqual(set(by_id), {a, b, c})
@@ -331,7 +333,7 @@ class TasksViewTests(unittest.TestCase):
             stamp = 1000 + index / 10
             os.utime(self._task_file(tid), (stamp, stamp))
             if index % 2 == 0:
-                (self.results / f"{tid}.txt").write_text("done")
+                publish_result(self.results / f"{tid}.txt", "done")
             else:
                 eligible.insert(0, tid)
         for limit in (0, 1, 2, 3, 4, 200):
@@ -354,7 +356,7 @@ class TasksViewTests(unittest.TestCase):
         self.results.mkdir()
         for i in range(3):
             tid = self.view.submit(f"done {i}")["taskId"]
-            (self.results / f"{tid}.txt").write_text("ready")
+            publish_result(self.results / f"{tid}.txt", "ready")
         for limit in (0, 1, 3):
             self.assertEqual(self.view.list_tasks(limit=limit, unfinished_only=True),
                              {"tasks": []})
@@ -380,7 +382,7 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual({row["taskId"]: row["state"] for row in got["tasks"]}, expected)
         self.assertNotIn("truncated", got)
         for tid in expected:
-            (self.results / f"{tid}.txt").write_text("ready")
+            publish_result(self.results / f"{tid}.txt", "ready")
         self.assertEqual(self.view.list_tasks(unfinished_only=True), {"tasks": []})
 
     def test_list_tasks_disappearing_during_metadata_access(self):
@@ -416,7 +418,7 @@ class TasksViewTests(unittest.TestCase):
         task_id = self.view.submit("queued")["taskId"]
         result = self.results / f"{task_id}.txt"
         self.results.mkdir(exist_ok=True)
-        result.write_text("ready")
+        publish_result(result, "ready")
         real_stat = Path.stat
         for victim, scan in ((self._task_file(task_id), self.view.list_tasks),
                              (result, self.view.list_results)):
@@ -436,7 +438,7 @@ class TasksViewTests(unittest.TestCase):
         task_id = self.view.submit("finished")["taskId"]
         self.results.mkdir(exist_ok=True)
         victim = self.results / f"{task_id}.txt"
-        victim.write_text("ready")
+        publish_result(victim, "ready")
         real_stat = Path.stat
 
         def checked_stat(path, *args, **kwargs):
@@ -504,7 +506,7 @@ class TasksViewTests(unittest.TestCase):
 
     def test_cancel_done_task_is_noop_and_unknown_raises(self):
         self.results.mkdir(parents=True)
-        (self.results / "task-rtapi-done1.txt").write_text("r")
+        publish_result(self.results / "task-rtapi-done1.txt", "r")
         self.tasks.mkdir(parents=True, exist_ok=True)
         (self.tasks / "task-rtapi-done1.txt").write_text(
             "id: task-rtapi-done1\ntask: x\n")
@@ -549,7 +551,7 @@ class TasksViewIdempotencyTests(unittest.TestCase):
                     receipt.write_text(raw)
                     if state == "result-only":
                         self.results.mkdir(exist_ok=True)
-                        (self.results / f"{tid}.txt").write_text("done")
+                        publish_result(self.results / f"{tid}.txt", "done")
                     else:
                         destination = self.tasks / f"{tid}.txt"
                         if state == "claimed":
@@ -628,7 +630,7 @@ class TasksViewIdempotencyTests(unittest.TestCase):
     def test_result_only_receipt_never_requeues_completed_work(self):
         first = self.view.submit_idempotent("do it", idempotency_key="done-1")
         self.results.mkdir(parents=True)
-        (self.results / f"{first['taskId']}.txt").write_text("done")
+        publish_result(self.results / f"{first['taskId']}.txt", "done")
         self._public_tasks()[0].unlink()
 
         repeated = self.view.submit_idempotent("do it", idempotency_key="done-1")
@@ -638,7 +640,7 @@ class TasksViewIdempotencyTests(unittest.TestCase):
     def test_unready_result_evidence_also_prevents_requeue(self):
         first = self.view.submit_idempotent("do it", idempotency_key="writing-1")
         self.results.mkdir(parents=True)
-        (self.results / f"{first['taskId']}.txt").write_text("   ")
+        publish_result(self.results / f"{first['taskId']}.txt", "   ")
         self._public_tasks()[0].unlink()
 
         repeated = self.view.submit_idempotent("do it", idempotency_key="writing-1")
@@ -823,7 +825,7 @@ class TasksViewIdempotencyTests(unittest.TestCase):
                     "user_id: @owner:example.org\naccess_tier: owner\n"
                     "priority: normal\n")
                 self.results.mkdir(parents=True)
-                (self.results / destination.name).write_text("unrelated result")
+                publish_result(self.results / destination.name, "unrelated result")
                 raise FileExistsError(destination)
             return real_link(source, destination)
 
@@ -842,7 +844,7 @@ class TasksViewIdempotencyTests(unittest.TestCase):
             if destination.parent == self.tasks:
                 destination.write_bytes(Path(source).read_bytes())
                 self.results.mkdir(parents=True)
-                (self.results / destination.name).write_text("completed")
+                publish_result(self.results / destination.name, "completed")
                 destination.unlink()
                 raise FileExistsError(destination)
             return real_link(source, destination)
@@ -918,7 +920,7 @@ class DispatchTests(unittest.TestCase):
             d = self._dispatcher(base)
             tid = d.tasks.submit("keep this request")["taskId"]
             d.tasks.results_dir.mkdir()
-            (d.tasks.results_dir / f"{tid}.txt").write_text("ready")
+            publish_result(d.tasks.results_dir / f"{tid}.txt", "ready")
 
             def snapshot():
                 return {str(p.relative_to(base)): (p.read_bytes(), p.stat().st_ino,
@@ -1045,7 +1047,7 @@ print(json.dumps({"mode": mode, "at": time.time_ns()}))
                 self.assertEqual(task_file.read_bytes(), original)
                 if lifecycle == "completion":
                     (base / "results").mkdir()
-                    (base / "results" / f"{tid}.txt").write_text("done")
+                    publish_result(base / "results" / f"{tid}.txt", "done")
                     task_file.unlink()
                 else:
                     archive = base / "tasks" / "archive"
@@ -1142,7 +1144,7 @@ class TraversalGuardTests(unittest.TestCase):
             self.assertFalse(self.view.cancel(tid).get("ok"))
 
     def test_legit_ids_still_resolve(self):
-        (Path(self.tmp.name) / "results" / "task-rtapi-abc12.txt").write_text("hi")
+        publish_result(Path(self.tmp.name) / "results" / "task-rtapi-abc12.txt", "hi")
         out = self.view.get_result("task-rtapi-abc12")
         self.assertIn("hi", str(out))
 
@@ -1164,7 +1166,7 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.tasks, self.results = base / "tasks", base / "results"
         self.tasks.mkdir(parents=True)
         self.results.mkdir(parents=True)
-        (self.results / f"{self.FOREIGN}.txt").write_text(self.PRIVATE)
+        publish_result(self.results / f"{self.FOREIGN}.txt", self.PRIVATE)
         (self.tasks / f"{self.FOREIGN}.txt").write_text(
             f"id: {self.FOREIGN}\ntimestamp: 2026-08-23T00:00:00Z\n"
             "task: book the private clinic appointment\n"
@@ -1203,7 +1205,7 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         if isinstance(body, bytes):
             p.write_bytes(body)
         else:
-            p.write_text(body)
+            publish_result(p, body)
         return tid, p
 
     def test_empty_result_is_not_a_terminal_state(self):
@@ -1225,7 +1227,7 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
     def test_the_answer_landing_later_is_seen(self):
         tid, p = self._unready("")
         self.assertEqual(self.view.status(tid)["state"], "pending")
-        p.write_text("THE ANSWER\n")
+        publish_result(p, "THE ANSWER\n")
         self.assertEqual(self.view.status(tid)["state"], "done")
         self.assertEqual(self.view.get_result(tid)["result"], "THE ANSWER")
 
@@ -1233,15 +1235,15 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         tid, p = self._unready("  ")
         self.assertNotIn(tid,
                          [e["taskId"] for e in self.view.list_results()["results"]])
-        p.write_text("THE ANSWER\n")
+        publish_result(p, "THE ANSWER\n")
         self.assertIn(tid,
                       [e["taskId"] for e in self.view.list_results()["results"]])
 
     def test_unready_newest_does_not_mask_the_answer_behind_it(self):
         import os
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / "task-rtapi-old.txt").write_text("REAL ANSWER")
-        (self.results / "task-rtapi-new.txt").write_text("")
+        publish_result(self.results / "task-rtapi-old.txt", "REAL ANSWER")
+        publish_result(self.results / "task-rtapi-new.txt", "")
         os.utime(self.results / "task-rtapi-old.txt", (1000, 1000))
         os.utime(self.results / "task-rtapi-new.txt", (2000, 2000))
         got = self.view.get_result()
@@ -1250,7 +1252,7 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
 
     def test_positive_control_own_task_is_still_visible_everywhere(self):
         tid = self.view.submit("my own work")["taskId"]
-        (self.results / f"{tid}.txt").write_text("MY RESULT")
+        publish_result(self.results / f"{tid}.txt", "MY RESULT")
         self.assertEqual(self.view.get_result(tid)["result"], "MY RESULT")
         self.assertEqual(self.view.status(tid)["state"], "done")
         self.assertIsNotNone(self.view.details(tid))
@@ -1270,7 +1272,7 @@ class ResultOrderingTests(unittest.TestCase):
         for name, fraction in (("mu", 100_000_000), ("alpha", 500_000_000),
                                ("zeta", 900_000_000)):
             path = self.results / f"task-rtapi-{name}.txt"
-            path.write_text(f"{name} answer")
+            publish_result(path, f"{name} answer")
             ns = self.SECOND * 1_000_000_000 + fraction
             os.utime(path, ns=(ns, ns))
             self.ascending.append(path)
@@ -1282,7 +1284,7 @@ class ResultOrderingTests(unittest.TestCase):
         for name, body in (("task-rtapi-blank", " \n\t"),
                            ("task-foreign", "foreign answer")):
             path = self.results / f"{name}.txt"
-            path.write_text(body)
+            publish_result(path, body)
             os.utime(path, (self.SECOND + 1, self.SECOND + 1))
         real_glob = Path.glob
         blank = self.results / "task-rtapi-blank.txt"
@@ -1372,7 +1374,7 @@ class ArchivalRaceTests(unittest.TestCase):
         self.results.mkdir(parents=True)
         self.view = TasksView(self.tasks, self.results, "@me:example.org")
         self.f = self.results / "task-rtapi-race.txt"
-        self.f.write_text("READY BODY")
+        publish_result(self.f, "READY BODY")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1459,7 +1461,7 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         # The defect: the compound id is listed, no result is ever written under
         # it, and status() reads pending forever because the file does exist.
         self._write("task-rtapi-A1.assigned-core-2.txt", "task-rtapi-A1")
-        (self.results / "task-rtapi-A1.txt").write_text("the answer")
+        publish_result(self.results / "task-rtapi-A1.txt", "the answer")
 
         listed = [e["taskId"] for e in self.view.list_tasks()["tasks"]]
         self.assertEqual(listed, ["task-rtapi-A1"])
