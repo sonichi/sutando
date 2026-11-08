@@ -83,6 +83,15 @@ def item_id(tid: str, instance: str = "") -> "str | None":
     return broker if local_task_protocol.valid_task_id(broker) else None
 
 
+def _recent_tasks(headers: dict) -> "list | None":
+    """The bridge's `recent_tasks` header as a list; None when absent or not one."""
+    try:
+        value = json.loads(headers.get("recent_tasks") or "null")
+    except ValueError:
+        return None
+    return value if isinstance(value, list) and value else None
+
+
 def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") -> "dict | None":
     """`instance` None reads every instance's task."""
     tid = task_file.stem
@@ -114,6 +123,9 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
+    recent = _recent_tasks(h)
+    if recent is not None:
+        item["recent_tasks"] = recent
     if reply is not None:
         label = reply["label"]
         item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
