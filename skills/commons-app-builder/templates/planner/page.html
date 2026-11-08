@@ -130,6 +130,9 @@
   const setStart = (d) => { start = monday(d); location.hash = 'week=' + iso(start); paint(); };
 
   let snapshot = null, titleProp = null, slotOpts = [], stateOpts = [];
+  // Pending writes live here, not on the elements: a redraw must not re-enable a control whose
+  // write is still in flight.
+  let busy = false;
 
   const paint = () => {
     if (!snapshot) return;
@@ -197,11 +200,16 @@
       const done = row.cells.State === 'Done';
       b.textContent = done ? 'Undo' : 'Done';
       b.setAttribute('aria-label', (done ? 'Mark not done: ' : 'Mark done: ') + left.textContent);
+      b.disabled = busy;
       b.onclick = async () => {
+        if (busy) return;
+        busy = true;
         b.disabled = true;
         const want = done ? (stateOpts[0] && stateOpts[0].name) || 'Planned' : 'Done';
         const r = await save(() => db.write(id, row.id, 'State', want));
-        b.disabled = false;
+        busy = false;
+        if (snapshot) render(snapshot);
+        else b.disabled = false;
         if (!r.ok) show('bad', r.reason || 'The change was refused.');
       };
       li.appendChild(left); li.appendChild(b);
@@ -226,7 +234,7 @@
         sel.appendChild(opt);
       });
     }
-    $('add').disabled = !titleProp;
+    $('add').disabled = !titleProp || busy;
     if (!titleProp) show('bad', 'This database has no title column, so items cannot be named.');
     paint();
   };
@@ -240,6 +248,7 @@
   window.addEventListener('hashchange', () => { start = weekStart(); paint(); });
 
   $('add').onclick = async () => {
+    if (busy) return;                                  // one item in flight at a time
     const text = $('title').value.trim();
     if (!text || !titleProp) return;
     const values = {};
@@ -247,10 +256,15 @@
     if ($('day').value) values.Day = $('day').value;
     if ($('slot').value) values.Slot = $('slot').value;
     if (stateOpts.length) values.State = stateOpts[0].name;
+    busy = true;
     $('add').disabled = true;
     const r = await save(() => db.createRow(id, values));
-    $('add').disabled = false;
-    if (r.ok) { $('title').value = ''; } else { show('bad', r.reason || 'The item was not saved.'); }
+    busy = false;
+    if (snapshot) render(snapshot);
+    else $('add').disabled = false;
+    if (!r.ok) { show('bad', r.reason || 'The item was not saved.'); return; }
+    // Clear only if the reader has not typed something new during the retry.
+    if ($('title').value.trim() === text) $('title').value = '';
   };
   $('title').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
 })();

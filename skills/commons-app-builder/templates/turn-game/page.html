@@ -221,7 +221,10 @@
       if (titleProp) values[titleProp] = 'Game ' + (g.game + 1) + ' start';
       const r = await save(() => db.createRow(id, values));
       busy = false;
-      if (!r.ok) { show('bad', r.reason || 'The new game was not started.'); again.disabled = false; }
+      // A watch update during the write redrew these buttons with busy still true, so the live
+      // set must be redrawn now rather than the captured one re-enabled.
+      if (snapshot) render(snapshot);
+      if (!r.ok) show('bad', r.reason || 'The new game was not started.');
     };
     box.appendChild(again);
 
@@ -239,10 +242,8 @@
       if (titleProp) values[titleProp] = seat + ' r' + values.Row + 'c' + values.Col;
       const r = await save(() => db.createRow(id, values));
       busy = false;
-      if (!r.ok) {
-        show('bad', r.reason || 'Your move was not saved.');
-        [...cells].forEach((c, n) => { c.disabled = !!g.cells[n]; });
-      }
+      if (snapshot) render(snapshot);
+      if (!r.ok) show('bad', r.reason || 'Your move was not saved.');
     }, !over && !!seat && seat === g.turn && !busy);
 
     $('moves').textContent = over ? '' : (seat ? '' : 'Seats are a convenience: anyone with the table can still add a row.');

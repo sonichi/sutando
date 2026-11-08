@@ -227,7 +227,7 @@
         else if (commentResult && !commentResult.ok) {
           show('warn', 'Your vote was saved, but the comment was not: ' +
             (commentResult.reason || 'refused') + '. Your text is still in the box.');
-        } else if (comment) $('comment').value = '';
+        } else if (comment && $('comment').value.trim() === comment) $('comment').value = '';
       };
       box.appendChild(b);
     });

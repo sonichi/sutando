@@ -787,6 +787,194 @@ const SEATED = { 'seat.X': { id: 'u1', name: 'Tester' }, 'seat.O': { id: 'u2', n
       JSON.stringify(r.calls)));
 }
 
+/* ================= Codex re-review of 1ae40ceb: the same window, everywhere ==== */
+/* A fake whose write/createRow delivers a watch snapshot BEFORE acknowledging, which is the
+ * schedule that redraws controls while the save is still pending. */
+const withWatchDuringSave = (template, opts, mutate) => {
+  const base = fakeArtifact(opts);
+  const html = readFileSync(join(TPL, template, 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const wrap = (name) => {
+    const inner = base.art.db[name];
+    base.art.db[name] = async (...a) => {
+      base.calls.push([name, ...a]);
+      if (mutate) mutate(a);
+      base.fire();                                   // the watch lands first
+      await new Promise((ok) => setTimeout(ok, 0));
+      return name === 'createRow' ? { ok: true, rowId: 'rNew' } : { ok: true };
+    };
+    return inner;
+  };
+  wrap('createRow');
+  wrap('write');
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: opts.hash || '' }, setTimeout, clearTimeout, Promise, Date, Number, Math,
+    String, Object, Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  return { ...dom, ...base, text: () => dom.body.textContent };
+};
+
+/* turn-game: after a winning move and a New game, the controls must not be stuck. */
+{
+  const rows = [mv('m1', 1, 'X', 1, 1), mv('m2', 1, 'O', 2, 1), mv('m3', 1, 'X', 1, 2),
+                mv('m4', 1, 'O', 2, 2), mv('m5', 1, 'X', 1, 3)];
+  const r = withWatchDuringSave('turn-game', gameOpts({ rows, state: SEATED }),
+    ([, cells]) => { if (cells && cells.Game) rows.push({ id: 'm9', cells }); });
+  await settle();
+  const again = r.byId.get('seats').buttons().find((b) => b.textContent === 'New game');
+  again.click();
+  await settle(40);
+  check('game/new-game-not-stuck-after-a-watch-during-save', () => {
+    const live = r.byId.get('seats').buttons().find((b) => b.textContent === 'New game');
+    assert.ok(live, 'the button is still rendered');
+    // Game 2 is empty, so New game is correctly disabled now — what must NOT happen is the
+    // board staying locked for the player whose turn it is.
+    const cells = r.byId.get('board').buttons();
+    const playable = cells.filter((c) => !c.disabled).length;
+    assert.ok(playable > 0, 'X can move in the new game; playable=' + playable);
+  });
+}
+/* turn-game: a REFUSED move must leave the board usable — it is still that player's turn, so
+ * this is the case where the post-save redraw is observable (after a SUCCESSFUL move the board
+ * is legitimately locked for the mover either way, which is why that made a poor test). */
+{
+  const rows = [];
+  const base = fakeArtifact(gameOpts({ rows, state: SEATED }));
+  base.art.db.createRow = async (d, cells) => {
+    base.calls.push(['createRow', d, cells]);
+    base.fire();                                     // a redraw lands while busy is true
+    await new Promise((ok) => setTimeout(ok, 0));
+    return { ok: false, reason: 'not allowed by the viewer' };
+  };
+  const html = readFileSync(join(TPL, 'turn-game', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('board').children[0].click();
+  await settle(40);
+  check('game/refused-move-leaves-the-board-usable', () => {
+    const playable = dom.byId.get('board').buttons().filter((c) => !c.disabled).length;
+    assert.equal(playable, 9, 'still X to move on an empty board; playable=' + playable);
+  });
+  check('game/refused-move-is-reported', () =>
+    assert.match(dom.body.textContent, /not allowed by the viewer/));
+}
+
+/* tracker: a snapshot during a pending save must NOT re-enable Add, so a second click cannot
+ * queue a duplicate row. */
+{
+  const rows = [];
+  let release = null;
+  const held = new Promise((ok) => { release = ok; });
+  const base = fakeArtifact(trackerOpts({ rows }));
+  base.art.db.createRow = async (d, cells) => {
+    base.calls.push(['createRow', d, cells]);
+    base.fire();                                     // a redraw arrives mid-save
+    await held;
+    return { ok: true, rowId: 'r1' };
+  };
+  const html = readFileSync(join(TPL, 'tracker', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: '' }, setTimeout, clearTimeout, Promise, Date, Number, Math, String, Object,
+    Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('title').value = 'Only once';
+  dom.byId.get('add').click();
+  await settle(6);
+  check('tracker/add-stays-disabled-through-a-redraw', () =>
+    assert.equal(dom.byId.get('add').disabled, true));
+  const second = dom.byId.get('add').click();
+  await settle(6);
+  release({ ok: true });
+  await settle(20);
+  check('tracker/no-duplicate-row-from-a-second-click', () => {
+    assert.equal(second, false, 'the second click was refused');
+    assert.equal(base.calls.filter((c) => c[0] === 'createRow').length, 1, JSON.stringify(base.calls));
+  });
+  check('tracker/add-usable-again-after-the-save', () =>
+    assert.equal(dom.byId.get('add').disabled, false));
+}
+/* planner: the same guard on its Add. */
+{
+  const rows = [];
+  let release = null;
+  const held = new Promise((ok) => { release = ok; });
+  const base = fakeArtifact(plannerOpts({ rows }));
+  base.art.db.createRow = async (d, cells) => {
+    base.calls.push(['createRow', d, cells]);
+    base.fire();
+    await held;
+    return { ok: true, rowId: 'r1' };
+  };
+  const html = readFileSync(join(TPL, 'planner', 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: 'week=2026-11-09' }, setTimeout, clearTimeout, Promise, Date, Number, Math,
+    String, Object, Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get('title').value = 'Only once';
+  dom.byId.get('add').click();
+  await settle(6);
+  check('planner/add-stays-disabled-through-a-redraw', () =>
+    assert.equal(dom.byId.get('add').disabled, true));
+  const second = dom.byId.get('add').click();
+  await settle(6);
+  release({ ok: true });
+  await settle(20);
+  check('planner/no-duplicate-row-from-a-second-click', () => {
+    assert.equal(second, false);
+    assert.equal(base.calls.filter((c) => c[0] === 'createRow').length, 1, JSON.stringify(base.calls));
+  });
+}
+/* Text typed DURING a retry is never erased: the clear only fires if the box still holds what
+ * was submitted. */
+for (const [template, opts, field, typed] of [
+  ['tracker', trackerOpts({ rows: [] }), 'title', 'typed during the retry'],
+  ['planner', plannerOpts({ rows: [] }), 'title', 'typed during the retry'],
+]) {
+  const base = fakeArtifact({ ...opts, writeAnswers: [
+    { ok: false, reason: 'waiting for the viewer’s answer' }, { ok: true, rowId: 'r1' }] });
+  const html = readFileSync(join(TPL, template, 'page.html'), 'utf8');
+  const dom = makeDom(html);
+  const sandbox = { window: { artifact: base.art, addEventListener: () => {} }, document: dom.document,
+    location: { hash: opts.hash || '' }, setTimeout, clearTimeout, Promise, Date, Number, Math,
+    String, Object, Array, JSON, console, RegExp, Error };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(scriptOf(html)).runInContext(sandbox);
+  await settle();
+  dom.byId.get(field).value = 'first item';
+  dom.byId.get('add').click();
+  await settle(6);
+  dom.byId.get(field).value = typed;                 // the reader types while it retries
+  await new Promise((ok) => setTimeout(ok, 1800));
+  await settle();
+  check(`${template}/retry-does-not-erase-new-text`, () =>
+    assert.equal(dom.byId.get(field).value, typed));
+}
+/* And the ordinary case still clears. */
+{
+  const r = await run('tracker', trackerOpts({ rows: [] }));
+  r.byId.get('title').value = 'Clear me';
+  r.byId.get('add').click();
+  await settle(20);
+  check('tracker/successful-add-clears-the-box', () => assert.equal(r.byId.get('title').value, ''));
+}
+
 console.log(failures.length
   ? `FAIL commons-app-builder templates: ${failures.length} failed\n  ${failures.join('\n  ')}`
   : `all passed — commons-app-builder templates: ${passed} checks`);
