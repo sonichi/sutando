@@ -3,7 +3,8 @@
  *
  * GUIDE.md's phone-width rule is a layout property: the CSS-text checks in the Python suite
  * cannot see it, which is how a 1049px-wide tracker passed review once. This needs a browser,
- * so it SKIPS (exit 0, saying so) when none is found. Set CHROME_PATH to point at one.
+ * so it SKIPS (exit 0, saying so) when none is found. Set CHROME_PATH to point at one. It does
+ * run on GitHub's runners, which ship Chrome.
  * No network: the page is a local file and the templates inline all CSS and JS.
  *
  * The page is measured inside a 390px-wide iframe, not a sized window: --window-size is
@@ -31,7 +32,9 @@ const CANDIDATES = [
   '/usr/bin/chromium',
   '/usr/bin/chromium-browser',
 ].filter(Boolean);
-// CI has no browser, so this suite reports a visible SKIP there rather than a false pass.
+// GitHub's runners DO ship Chrome, so this runs in CI as well as locally (verified in the
+// node job's log at 1ae40ceb). Where no browser exists it reports a visible SKIP, never a
+// false pass.
 const browser = process.env.SKIP_BROWSER_TESTS ? null : CANDIDATES.find((p) => existsSync(p));
 if (!browser) {
   console.log('all passed — templates layout: SKIPPED, no browser (set CHROME_PATH to run; '
