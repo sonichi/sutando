@@ -26,6 +26,7 @@ import {
 	type DmGate, type DmKind, type FallbackConfig, type FallbackState, type Sample,
 } from './quota-fallback-policy.js';
 import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
+import { limitState } from './quota-limit-state.js';
 
 const PORT = 7846;
 const UPSTREAM = 'https://api.anthropic.com';
@@ -414,32 +415,7 @@ export function appendRejection(prev: unknown, rej: RejectionRecord, max: number
 	return list.slice(-max);
 }
 
-export type LimitState = 'allowed' | 'overage' | 'rejected';
-
-/** Same rule as `classify_limit_state` in src/quota_availability.py; both run
- *  tests/fixtures/quota-limit-state.parity.json. `overage` is served, not paused. */
-export function limitState(record: unknown): LimitState {
-	const rec = (record && typeof record === 'object' && !Array.isArray(record)) ? record as Record<string, unknown> : {};
-	const h = (rec.headers && typeof rec.headers === 'object' && !Array.isArray(rec.headers)) ? rec.headers as Record<string, unknown> : {};
-	const prefix = 'anthropic-ratelimit-unified-';
-	const limited = h[`${prefix}status`] === 'rejected' || Object.entries(h).some(([k, v]) => {
-		if (!k.startsWith(prefix) || !k.endsWith('-status')) return false;
-		const w = k.slice(prefix.length, -'-status'.length);
-		return w !== '' && w !== 'overage' && v === 'rejected';
-	});
-	if (!limited) return 'allowed';
-	const overage = h[`${prefix}overage-status`];
-	if (overage !== 'allowed' && overage !== 'allowed_warning') return 'rejected';
-	const checked = typeof rec.last_checked === 'string' ? Date.parse(rec.last_checked) : NaN;
-	const ledger = Array.isArray(rec.recent_rejections) ? rec.recent_rejections : [];
-	for (const r of ledger) {
-		if (!r || typeof r !== 'object' || (r as RejectionRecord).status !== 429) continue;
-		const at = typeof (r as RejectionRecord).ts === 'string' ? Date.parse((r as RejectionRecord).ts) : NaN;
-		// An unordered 429 (either stamp unreadable) is not known to be older.
-		if (Number.isNaN(checked) || Number.isNaN(at) || at >= checked) return 'rejected';
-	}
-	return 'overage';
-}
+export { limitState, type LimitState } from './quota-limit-state.js';
 
 export type CredentialState = 'ok' | 'exhausted';
 
@@ -517,10 +493,10 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		flushTimer.unref?.();
 	}
 
-	function observeQuota(quotaHeaders: Record<string, string>): void {
+	function observeQuota(quotaHeaders: Record<string, string>, httpStatus?: number): void {
 		const cfg = deps.fallbackConfig();
 		const nowMs = deps.now();
-		const obs = observationFromHeaders(quotaHeaders);
+		const obs = observationFromHeaders(quotaHeaders, httpStatus);
 		if (obs.u5 !== null) samples = pushSample(samples, { t: nowMs, u5: obs.u5, r5: obs.r5 }, cfg.projection5h.lookbackSec);
 		const prev = fallbackState;
 		const next = nextState(prev, obs, cfg, nowMs, samples);
@@ -728,7 +704,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							// Stamp the seat by what it ASKED for; a rewrite must not move its quota
 							// or its rejections onto another seat (#5275 review).
 							deps.updateQuotaState(quotaHeaders, requested, effective || undefined);
-							observeQuota(quotaHeaders);
+							observeQuota(quotaHeaders, upRes.statusCode);
 						}
 
 						if (upRes.statusCode === 401 && injectedToken && attempt === 0) {

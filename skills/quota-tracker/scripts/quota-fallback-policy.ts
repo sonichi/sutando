@@ -23,6 +23,8 @@
  * quota); it records a Codex runtime-switch request instead.
  */
 
+import { limitState } from './quota-limit-state.js';
+
 export type Level = 1 | 2 | 3;
 export type Priority = 'normal' | 'low';
 export type Window = '5h' | '7d';
@@ -138,16 +140,28 @@ function num(v: string | undefined): number | null {
 	return Number.isFinite(n) ? n : null;
 }
 
-/** The proxy's quota headers as one observation; absent headers are null. */
-export function observationFromHeaders(h: Record<string, string>): QuotaObservation {
+/** The proxy's quota headers as one observation; absent headers are null.
+ *
+ *  `status` is `rejected` only when the SHARED limit-state rule says so
+ *  (quota-limit-state.ts, the same rule the quota writer and its Python twin use):
+ *  a rejected window that overage is serving is `overage`, not `rejected`, so it
+ *  never asks for a runtime switch (#5275 review). `httpStatus` is this
+ *  response's own code: a 429 is the rejection evidence that rule wants. */
+export function observationFromHeaders(h: Record<string, string>, httpStatus?: number): QuotaObservation {
 	const status = h[`${RL}status`] ?? null;
-	const s5 = h[`${RL}5h-status`];
+	// One record for THIS response: its headers, and — when it was a 429 — that
+	// 429 as a ledger entry no older than the check, so the rule reads it as current.
+	const at = new Date(0).toISOString();
+	const verdict = limitState({
+		headers: h, last_checked: at,
+		recent_rejections: httpStatus === 429 ? [{ status: 429, ts: at }] : [],
+	});
 	return {
 		u5: num(h[`${RL}5h-utilization`]),
 		u7: num(h[`${RL}7d-utilization`]),
 		r5: h[`${RL}5h-reset`] ?? null,
 		r7: h[`${RL}7d-reset`] ?? null,
-		status: status === 'rejected' || s5 === 'rejected' ? 'rejected' : status,
+		status: verdict === 'allowed' ? status : verdict,
 	};
 }
 

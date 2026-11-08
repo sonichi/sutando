@@ -31,6 +31,7 @@ interface Harness {
 	recorded: FallbackState[];
 	notified: string[];
 	setUpstreamHeaders: (h: Record<string, string>) => void;
+	setUpstreamStatus: (code: number) => void;
 }
 
 // Projection off: these cases are about the rewrite plumbing, not the 5h fit.
@@ -38,19 +39,21 @@ const CFG: FallbackConfig = { ...DEFAULT_FALLBACK_CONFIG, projection5h: { ...DEF
 
 async function start(cfg: FallbackConfig = CFG, initial: FallbackState | null = null): Promise<Harness> {
 	let upstreamHeaders: Record<string, string> = {};
+	let upstreamStatus = 200;
 	const seen: Seen[] = [];
 	const upstreamPort = await listen(createHttpServer((req, res) => {
 		const chunks: Buffer[] = [];
 		req.on('data', (c) => chunks.push(c));
 		req.on('end', () => {
 			seen.push({ body: Buffer.concat(chunks).toString(), headers: req.headers });
-			res.writeHead(200, { 'content-type': 'application/json', ...upstreamHeaders });
+			res.writeHead(upstreamStatus, { 'content-type': 'application/json', ...upstreamHeaders });
 			res.end('{"ok":true}');
 		});
 	}));
 	const h: Harness = {
 		port: 0, seen, quotaWrites: [], recorded: [], notified: [],
 		setUpstreamHeaders: (x) => { upstreamHeaders = x; },
+		setUpstreamStatus: (code) => { upstreamStatus = code; },
 	};
 	const deps: Partial<ProxyDeps> = {
 		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
@@ -177,6 +180,34 @@ test('rejected: no model is swapped, the Codex runtime-switch request is recorde
 	assert.strictEqual(h.recorded.at(-1)?.tier, 1);
 	assert.strictEqual(h.notified.length, 1);
 	assert.match(h.notified[0], /Codex/);
+});
+
+// #5275 review point 2: a raw `rejected` is not an unavailable account. With HTTP 200
+// and overage allowed the request was SERVED on extra usage — the quota writer records
+// limit_state overage, available true — so asking for a runtime switch was wrong.
+const OVERAGE_SERVED = {
+	...H7('0.99'),
+	'anthropic-ratelimit-unified-status': 'rejected',
+	'anthropic-ratelimit-unified-7d-status': 'rejected',
+	'anthropic-ratelimit-unified-overage-status': 'allowed',
+};
+
+test('served on overage (HTTP 200, status rejected, overage allowed): no runtime switch, no Codex DM', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(OVERAGE_SERVED);
+	assert.strictEqual(await call(h.port, '{"model":"claude-fable-5-1","messages":[]}'), 200);
+	assert.strictEqual(await call(h.port, '{"model":"claude-fable-5-1","messages":[]}'), 200);
+	assert.strictEqual(h.recorded.at(-1)?.runtime_switch ?? null, null, 'overage is served, not paused');
+	assert.ok(!h.notified.some((l) => /Codex/.test(l)), `no runtime-switch DM, got ${JSON.stringify(h.notified)}`);
+});
+
+test('control: the same headers on a real 429 do request the runtime switch', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(OVERAGE_SERVED);
+	h.setUpstreamStatus(429);
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(h.recorded.at(-1)?.runtime_switch?.to, 'codex', 'an actual 429 is rejection evidence');
+	assert.ok(h.notified.some((l) => /Codex/.test(l)));
 });
 
 test('a persisted tier survives a proxy restart, the priority header is consumed by the proxy, and the low ladder is off by default', async () => {

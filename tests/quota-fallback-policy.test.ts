@@ -190,6 +190,17 @@ test('rejected: no model swap; a Codex runtime switch is requested once and with
 	assert.deepStrictEqual(back.runtime_switch, { to: 'claude', reason: 'window reset', at: new Date(T0 + 120_000).toISOString() });
 	assert.strictEqual(transitionLine(held, back, D), 'Claude quota allowed again — the Codex runtime-switch request has been withdrawn.');
 	assert.strictEqual(observationFromHeaders({ 'anthropic-ratelimit-unified-5h-status': 'rejected' }).status, 'rejected');
+	// #5275 review point 2: the switch decision uses the shared limit-state rule.
+	const overage = {
+		'anthropic-ratelimit-unified-status': 'rejected',
+		'anthropic-ratelimit-unified-7d-status': 'rejected',
+		'anthropic-ratelimit-unified-overage-status': 'allowed',
+	};
+	assert.notStrictEqual(observationFromHeaders(overage).status, 'rejected', 'served on overage is not rejected');
+	assert.notStrictEqual(observationFromHeaders(overage, 200).status, 'rejected', 'an explicit 200 neither');
+	assert.strictEqual(observationFromHeaders(overage, 429).status, 'rejected', 'a 429 is rejection evidence');
+	assert.strictEqual(observationFromHeaders({ ...overage, 'anthropic-ratelimit-unified-overage-status': 'rejected' }).status,
+		'rejected', 'overage exhausted too: rejected');
 	assert.strictEqual(observationFromHeaders({ 'anthropic-ratelimit-unified-status': 'allowed_warning' }).status, 'allowed_warning');
 });
 
