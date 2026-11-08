@@ -394,7 +394,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           // The claim admits the very text verified above: a file changed since is parked and verified again.
           const textHash = await sha256($, text)
           if (!textHash) { log(`${rid}: the task text hash could not be computed; retried next tick`); continue }
-          const claimed = await cli($, s, ['claim', rid])
+          const claimed = await cli($, s, ['claim', rid, '--task-sha256', textHash])
           if (claimed.hard) return
           if (!claimed.ok && claimed.data?.retry) {
             // A record write that failed closed intake: this scan ends before anything is submitted.
