@@ -6,7 +6,9 @@ comes from hooks/_merge_hold.py, and the core launcher registers the gate. No ne
 Run:  python3 tests/github-evidence-guard-merge-gate.test.py
 """
 import builtins
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -246,6 +248,11 @@ class Shadow(Gate):
         self.assertEqual((rows[0]["repo"], rows[0]["pr"]), ("o/r", 5))
         self.assertFalse(self.log.exists())
 
+    def test_shadow_does_not_record_an_override(self):
+        self.assertEqual(self.run_gate("SUTANDO_MERGE_HOLD_OVERRIDE='reviewer is away' gh pr merge 5 -R o/r",
+                                       Gh(HELD)), {})
+        self.assertEqual((self.rows()[0]["override"], self.log.exists()), (True, False))
+
     def test_shadow_logs_expired_as_its_own_verdict(self):
         mh.dt.datetime.now = lambda tz=None: mh._ts("2026-11-07T20:00:00Z")
         self.assertEqual(self.run_gate("gh pr merge 5 -R o/r", Gh(HELD)), {})
@@ -359,6 +366,20 @@ class Delegation(unittest.TestCase):
                                capture_output=True, text=True, timeout=30)
         self.assertEqual(p.returncode, 0)
         self.assertIn("elapsed_ms p50 400.0  p95 500.0", p.stdout)
+
+    def test_main_denies_a_merge_when_decide_raises(self):
+        for argv, raw, want in ((ARGV, json.dumps(bash("gh pr merge 5 -R o/r")), "deny"),
+                                (ARGV, json.dumps(bash("ls")), "raise"), ([], json.dumps(bash("gh pr merge 5")), "raise")):
+            out = io.StringIO()
+            with mock.patch.object(guard, "decide", side_effect=RuntimeError("boom")), \
+                    mock.patch.object(sys, "argv", ["hook", *argv]), mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                    contextlib.redirect_stdout(out):
+                try:
+                    guard.main()
+                    got = json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"]
+                except RuntimeError:
+                    got = "raise"
+            self.assertEqual(got, want, (argv, raw))
 
     def test_malformed_event_fails_closed_only_for_a_merge(self):
         run = lambda raw: subprocess.run([sys.executable, str(HOOK), *ARGV], capture_output=True, text=True,

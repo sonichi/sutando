@@ -5,7 +5,9 @@ one GraphQL query; the hold file lives in a temp dir.
 
 Run:  python3 tests/merge-hold.test.py
 """
+import contextlib
 import datetime as dt
+import io
 import importlib.util
 import json
 import os
@@ -263,15 +265,78 @@ class Policy(unittest.TestCase):
         self.assertEqual(seen["timeout"], 5)
 
 
+class Parser(unittest.TestCase):
+    def targets(self, cmd, cwd=None):
+        return [(t["repo"], t["pr"], t["node"], bool(t["problem"]), t["kind"]) for t in mh.merge_targets(cmd, cwd=cwd)]
+
+    def test_flag_forms_and_wrappers(self):
+        self.assertEqual(self.targets("gh pr merge 5 --repo=o/r"), [("o/r", 5, None, False, "pr-merge")])
+        self.assertEqual(self.targets("FOO=1; eval gh pr merge 6 -R o/r"), [("o/r", 6, None, False, "pr-merge")])
+        self.assertEqual(self.targets("env A=1 gh pr merge 7 -R o/r"), [("o/r", 7, None, False, "pr-merge")])
+        self.assertEqual(self.targets("sh -c"), [])
+
+    def test_api_shapes_that_are_not_merges(self):
+        for cmd in ("gh api", "gh api repos/o/r/pulls/5", "gh api graphql -F query=@/nonexistent/q.graphql -X GET"):
+            self.assertIn(self.targets(cmd), ([], [(None, None, None, True, "graphql")]), cmd)
+        self.assertEqual(self.targets("gh api repos/o/r/pulls/5"), [])
+
+    def test_unreadable_or_computed_graphql_is_a_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "bad.json").write_text("{not json")
+            self.assertEqual(self.targets("gh api graphql --input bad.json", cwd=d), [(None, None, None, True, "graphql")])
+            self.assertEqual(self.targets("gh api graphql --input -", cwd=d), [(None, None, None, True, "graphql")])
+        cmd = "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"$(id)\"}) { x } }'"
+        self.assertEqual(self.targets(cmd), [(None, None, None, True, "graphql-mergePullRequest")])
+        cmd = "gh api graphql -f query='mutation { mergePullRequest(input: {}) { x } }'"
+        self.assertEqual(self.targets(cmd), [(None, None, None, True, "graphql-mergePullRequest")])
+
+
+class Edges(unittest.TestCase):
+    def test_gh_that_cannot_run_is_a_gh_error(self):
+        orig = mh.subprocess.run
+        mh.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no gh"))
+        try:
+            with self.assertRaises(mh.GhError):
+                mh.run_gh(["api"])
+        finally:
+            mh.subprocess.run = orig
+
+    def test_an_unexpected_error_is_unknown(self):
+        def boom(args):
+            raise RuntimeError("surprise")
+        v = mh.check(TARGET, Path(tempfile.mkdtemp()) / "h.json", 4, gh=boom)
+        self.assertEqual((v["status"], "surprise" in v["reason"]), (mh.UNKNOWN, True))
+
+    def test_add_hold_keeps_the_room_url(self):
+        path = Path(tempfile.mkdtemp()) / "h.json"
+        self.assertEqual(mh.add_hold(path, R, N, "dave", url="https://room/x")["url"], "https://room/x")
+
+    def test_shadow_log_path_is_under_workspace_logs(self):
+        self.assertEqual(mh.shadow_log_path(REPO), mh.workspace(REPO) / "logs" / "merge-hold-shadow.jsonl")
+
+    def test_unreadable_mode_enforces(self):
+        d = Path(tempfile.mkdtemp())
+        saved = {n: getattr(mh, n) for n in ("gate_mode", "shadow_log_path", "state_path", "ttl_hours")}
+        mh.gate_mode = lambda root: (_ for _ in ()).throw(ImportError("no config"))
+        mh.shadow_log_path, mh.state_path, mh.ttl_hours = (lambda r: d / "s.jsonl"), (lambda r: d / "h.json"), (lambda r: 4)
+        try:
+            got = mh.gate("gh pr merge 5 --squash", None, str(d))
+        finally:
+            for n, f in saved.items():
+                setattr(mh, n, f)
+        self.assertEqual(got[0], "deny")
+        self.assertEqual(json.loads((d / "s.jsonl").read_text())["mode"], "enforce")
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
 
     def run_cli(self, *args):
-        p = subprocess.run([sys.executable, str(REPO / "hooks" / "_merge_hold.py"), R, str(N),
-                            "--state-file", str(self.d / "h.json"), *args],
-                           capture_output=True, text=True, timeout=30)
-        return p.returncode, p.stdout
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = mh.main([R, str(N), "--state-file", str(self.d / "h.json"), *args])
+        return rc, out.getvalue()
 
     def test_add_and_clear_hold(self):
         self.assertEqual(self.run_cli("--add-hold", "--who", "dave", "--note", "n")[0], 0)
@@ -286,6 +351,32 @@ class Cli(unittest.TestCase):
         (self.d / "h.json").write_text("{nope")
         self.assertEqual(self.run_cli("--add-hold", "--who", "dave")[0], 2)
         self.assertEqual((self.d / "h.json").read_text(), "{nope")
+
+    def test_check_prints_the_verdict(self):
+        orig = mh.run_gh
+        mh.run_gh = FakeGh([comment("alice", "2026-11-07T11:00:00Z", "re-reading")])
+        try:
+            rc, out = self.run_cli("--repo-root", str(REPO))
+        finally:
+            mh.run_gh = orig
+        self.assertIn(rc, (0, 1))
+        self.assertIn("o/r#6300", out)
+
+    def test_summary_and_missing_positionals(self):
+        log = self.d / "s.jsonl"
+        log.write_text(json.dumps({"verdict": "CLEAR", "elapsed_ms": 3}) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(mh.main(["--summary", "--log", str(log)]), 0)
+            self.assertEqual(mh.main(["--summary", "--log", str(self.d)]), 2)
+        self.assertIn("CLEAR    1", out.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            mh.main([])
+
+    def test_runs_as_a_script(self):
+        p = subprocess.run([sys.executable, str(REPO / "hooks" / "_merge_hold.py"), R, str(N), "--add-hold",
+                            "--state-file", str(self.d / "h.json")], capture_output=True, text=True, timeout=30)
+        self.assertEqual((p.returncode, p.stdout.strip()), (2, "REFUSED: --who is required"))
 
 
 if __name__ == "__main__":
