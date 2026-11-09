@@ -375,7 +375,10 @@ def task_body(text: str) -> str:
     return ""
 
 
-_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
+# The product's two spellings in the broker's markers; either opens or closes a block.
+_MARKER_PRODUCTS = ("AG2 Space", "s.space")
+_QUOTED_BLOCK = re.compile(
+    r"\[(?:AG2 Space|s\.space) (reply context|room metadata);([^\]\n]*)\]\s*")
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -396,8 +399,10 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
             record, end = _JSON_DECODER.raw_decode(rest, m.end())
         except ValueError:
             return None, text
-        tail, closer = rest[end:].lstrip(), f"[End AG2 Space {kind}]"
-        if not isinstance(record, dict) or not tail.startswith(closer):
+        tail = rest[end:].lstrip()
+        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
+                       if tail.startswith(f"[End {p} {kind}]")), None)
+        if not isinstance(record, dict) or closer is None:
             return None, text
         rest = tail[len(closer):].lstrip()
         if kind == "reply context":
