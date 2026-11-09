@@ -45,14 +45,19 @@ description is never sent: the page is the state, and a refine edits it rather t
 ## Who may ask, and for which room
 
 The fence is message text, so anyone who can put one in front of the agent could forge one. The
-agent therefore trusts the **task's own headers**, which the bridge writes, not the fence:
+agent therefore binds a request with things the fence cannot assert:
 
-- the task must be **owner-tier** (`access_tier: owner`);
-- the fence's `room_id` must equal the room the task came from: `source_room_id`, or
-  `channel_id` when that is absent.
+1. **It came from the owner's 1:1 DM with this agent.** The task file's own headers, which the
+   bridge writes, must say `access_tier: owner`, `channel_kind: dm`, `room_member_count: 2`, and
+   name the owner (`user_id`) among `room_members`. Only the owner can post there. The DM's other
+   member is taken as the agent.
+2. **The owner can aim the agent only at a room they are both in.** The plan's first room step is
+   `room.members.list` on the fence's `room_id`; it must show both the owner and the agent
+   joined, or the request is refused before anything is written.
 
-Anything else is refused before any Action runs. **The panel must send the private task from the
-target room**, so that room is the task's source room; a request for any other room is refused.
+The panel already sends the private task in that DM (cinny #3794), so nothing changes for it:
+`room_id` names the app's room, and the DM is where the request travels. A request that fails
+either check is refused with nothing written.
 
 Nothing is overwritten that is not this request's:
 

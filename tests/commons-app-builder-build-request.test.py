@@ -36,6 +36,9 @@ def check(name, cond):
 
 
 ROOM = "!abcDEF123:s.space"
+DM = "!ownerDM456:s.space"
+OWNER = "@owner:s.space"
+AGENT = "@owner.agent:s.space"
 # The room's own limit, fixed here: never br.WRITE_LIMIT, or a planner bug would move both.
 ROOM_LIMIT = 20_000
 PAGE = "html-k3m9x2qa"
@@ -48,7 +51,8 @@ class Refused(Exception):
 class FakeRoom:
     """Room Commons as the Actions present it, with the write limit enforced."""
 
-    def __init__(self, pages=(PAGE,), databases=None):
+    def __init__(self, pages=(PAGE,), databases=None, members=(OWNER, AGENT)):
+        self.members = list(members)
         self.pages = {k: "" for k in pages}
         self.databases = dict(databases or {})     # bare id -> {"name", "properties": [names], "views"}
         self.apps = {}
@@ -79,6 +83,8 @@ class FakeRoom:
             return {"version": 1, "format": "markdown", "content": content,
                     "sha256": hashlib.sha256(content.encode()).hexdigest(),
                     "bytes": len(content.encode())}
+        if action == "room.members.list":
+            return {"members": [{"user_id": m, "display_name": m} for m in self.members]}
         if action == "room.commons.pages.list":
             return {"pages": [{"kind": k, "surface": "html", "page_id": k[5:] or None,
                                "title": "Untitled", "folder_id": None} for k in self.pages],
@@ -133,8 +139,10 @@ class FakeRoom:
         raise Refused(f"unexpected action {action}")
 
 
-def task(*, tier="owner", channel=ROOM, source_room=None, headers=True, **fields):
-    """A task file as the bridge writes it: its headers, then the panel's text and fence."""
+def task(*, tier="owner", kind="dm", members=(OWNER, AGENT), count=None, user=OWNER,
+         headers=True, **fields):
+    """A task file as the bridge writes it for the panel's private task: the owner's 1:1 DM with
+    the agent, its headers, then the panel's text and fence."""
     body = {"v": 1, "request_id": "3f2b9c1e-7a4d-4e8b-9f61-2c5d8a0b7e14", "mode": "build",
             "description": "a sign-up sheet for Saturday's cleanup", "room_id": ROOM, "page": PAGE}
     body.update(fields)
@@ -142,11 +150,14 @@ def task(*, tier="owner", channel=ROOM, source_room=None, headers=True, **fields
     text = f"Build a Commons app\n\n```commons-app-build\n{json.dumps(body)}\n```"
     if not headers:
         return text
-    head = ["id: task-1", "source: ag2space"]
-    if channel:
-        head.append(f"channel_id: {channel}")
-    if source_room:
-        head.append(f"source_room_id: {source_room}")
+    head = ["id: task-1", "source: ag2space", f"channel_id: {DM}"]
+    if members is not None:
+        head.append("room_members: " + ", ".join(members))
+        head.append(f"room_member_count: {count if count is not None else len(members)}")
+    if kind:
+        head.append(f"channel_kind: {kind}")
+    if user:
+        head.append(f"user_id: {user}")
     head += ["priority: normal", f"access_tier: {tier}"]
     return "\n".join(head) + "\ntask: " + text
 
@@ -174,7 +185,9 @@ requests = [json.loads(b) for b in blocks if '"mode"' in b]
 replies = [json.loads(b) for b in blocks if '"status"' in b]
 check("spec-has-a-build-and-a-refine", {r["mode"] for r in requests} == {"build", "refine"})
 for r in requests:
-    framed = f"access_tier: owner\nchannel_id: {r['room_id']}\ntask: x\n\n```commons-app-build\n{json.dumps(r)}\n```"
+    framed = (f"channel_id: {DM}\nroom_members: {OWNER}, {AGENT}\nroom_member_count: 2\n"
+              f"channel_kind: dm\nuser_id: {OWNER}\naccess_tier: owner\n"
+              f"task: x\n\n```commons-app-build\n{json.dumps(r)}\n```")
     parsed = br.parse(framed)
     check(f"spec-example-parses-{r['mode']}", parsed["request_id"] == r["request_id"])
 check("spec-has-a-done-reply", any(r["status"] == "done" for r in replies))
@@ -318,7 +331,7 @@ for name, text, reason in [
     ("bad-template", task(template="game"), "`template`"),
     ("long-description", task(description="x" * 2001), "2000"),
     ("refine-without-app", task(mode="refine"), "`app_id` is required"),
-    ("bad-room", task(room_id="room1", channel="room1"), "`room_id`"),
+    ("bad-room", task(room_id="room1"), "`room_id`"),
     ("a-completion", "x\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"r\",\"status\":\"done\"}\n```", "completion"),
 ]:
     room = FakeRoom()
@@ -418,20 +431,38 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli-parse-checks-the-sender", cli("parse", str(tmp / "build.txt"))[0] == 0)
 
 # --------------------------------------------------------------------------- who may ask, and for where
+# (1) the request must come from the owner's 1:1 DM with the agent — the bridge's headers say so.
 for name, text, reason in [
     ("not-the-owner", task(tier="team"), "only the owner"),
     ("no-tier", task(tier=""), "only the owner"),
     ("pasted-fence-no-headers", task(headers=False), "only the owner"),
-    ("no-source-room", task(channel=None), "which room"),
-    ("aimed-at-another-room", task(room_id="!other:s.space"), "not the room this request came from"),
-    ("source-room-wins-over-channel", task(source_room="!other:s.space"), "not the room"),
+    ("from-a-group-room", task(kind="room", members=(OWNER, AGENT, "@x:s.space")), "private chat"),
+    ("dm-kind-but-three-members", task(members=(OWNER, AGENT, "@x:s.space")), "private chat"),
+    ("count-disagrees-with-members", task(count=5), "private chat"),
+    ("owner-not-in-the-dm", task(user="@mallory:s.space"), "private chat"),
+    ("no-user-id", task(user=None), "private chat"),
+    ("no-members-header", task(members=None), "private chat"),
 ]:
     room = FakeRoom()
     _, rep = reply_of(run(room, text))
     check(f"auth-{name}-refused", rep["status"] == "failed" and reason in rep["reason"])
     check(f"auth-{name}-touches-nothing", room.calls == [])
-_, rep = reply_of(run(FakeRoom(), task(channel="!dm:s.space", source_room=ROOM)))
-check("auth-source-room-is-the-trusted-one", rep["status"] == "done")
+check("auth-agent-is-the-dms-other-member", br.parse(task())["agent"] == AGENT
+      and br.parse(task())["owner"] == OWNER)
+# (2) the target room must have both the owner and the agent joined, checked before any write.
+for name, members, reason in [
+    ("owner-not-in-the-target-room", (AGENT, "@x:s.space"), "the owner is not in room"),
+    ("agent-not-in-the-target-room", (OWNER, "@x:s.space"), "the agent is not in room"),
+]:
+    room = FakeRoom(members=members)
+    _, rep = reply_of(run(room, task(template="poll")))
+    check(f"auth-{name}-refused", rep["status"] == "failed" and reason in rep["reason"])
+    check(f"auth-{name}-writes-nothing", room.write_sizes == [] and not room.databases and not room.apps)
+room = FakeRoom()
+_, rep = reply_of(run(room, task(template="poll")))
+check("auth-membership-is-the-first-room-step",
+      [a for a, _ in room.calls][:2] == ["commons.app_guide", "room.members.list"])
+check("auth-the-panels-real-shape-is-accepted", rep["status"] == "done")
 
 # --------------------------------------------------------------------------- nothing is overwritten
 room = FakeRoom()

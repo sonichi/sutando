@@ -70,19 +70,22 @@ def headers(text: str) -> Dict[str, str]:
     return out
 
 
-def authorize(meta: Dict[str, str], request: Dict[str, Any]) -> None:
-    """Only the owner asks, and only for the room the task came from.
+def authorize(meta: Dict[str, str]) -> Tuple[str, str]:
+    """The owner and agent, if the request came from the owner's 1:1 DM with this agent.
 
-    The fence is message text anyone could paste; the headers are the bridge's. A request whose
-    room is not the task's own would let a pasted fence aim the writes at another room.
+    The fence is message text anyone could paste; the headers are the bridge's. Only the owner can
+    post in that DM, so a request arriving there is the owner's. Which room it may aim at is
+    checked separately, against the room's live membership (plan's room.members.list step).
     """
     if meta.get("access_tier") != "owner":
         raise RequestError("only the owner can ask for a build")
-    trusted = meta.get("source_room_id") or meta.get("channel_id")
-    if not trusted:
-        raise RequestError("the task does not say which room it came from")
-    if trusted != request["room_id"]:
-        raise RequestError("`room_id` is not the room this request came from")
+    members = [m.strip() for m in meta.get("room_members", "").split(",") if m.strip()]
+    owner = meta.get("user_id", "")
+    if (meta.get("channel_kind") != "dm" or meta.get("room_member_count") != "2"
+            or len(members) != 2 or owner not in members):
+        raise RequestError("a build request must come from the owner's private chat with the agent")
+    agent = next(m for m in members if m != owner)
+    return owner, agent
 
 
 # --------------------------------------------------------------------------- the request
@@ -159,7 +162,7 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
 def parse(text: str) -> Dict[str, Any]:
     """The validated request, authorized against the task file's headers."""
     request = validate(extract(text))
-    authorize(headers(text), request)
+    request["owner"], request["agent"] = authorize(headers(text))
     return request
 
 
@@ -332,6 +335,9 @@ def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any
     room = request["room_id"]
     steps: List[Dict[str, Any]] = [
         {"action": "commons.app_guide", "read": True, "target_kind": "account", "arguments": {}},
+        # The owner can aim the agent only at a room they are both in.
+        {"action": "room.members.list", "read": True, "room_id": room, "arguments": {},
+         "expect_members": [request.get("owner"), request.get("agent")]},
         {"action": "room.commons.pages.list", "read": True, "room_id": room, "arguments": {},
          "expect_page": request["page"]},
     ]
@@ -432,6 +438,14 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
             if apps[app_id].get("page") != page:
                 raise ActionFailed(f"app {app_id} is not on page {page}")
             answers["$app_db"] = bare(apps[app_id].get("database"))
+        if step.get("expect_members"):
+            joined = {m.get("user_id") for m in result.get("members", [])}
+            owner, agent = step["expect_members"]
+            room_id = step.get("room_id")
+            if owner not in joined:
+                raise ActionFailed(f"the owner is not in room {room_id}")
+            if agent not in joined:
+                raise ActionFailed(f"the agent is not in room {room_id}")
         if step.get("expect_page"):
             kinds = {p.get("kind") for p in result.get("pages", [])}
             if step["expect_page"] not in kinds:

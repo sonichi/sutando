@@ -23,8 +23,9 @@ build or refine an app in a page it already created. [`BUILD_REQUEST.md`](BUILD_
 contract; follow it exactly, because the panel parses your reply.
 
 1. `python3 skills/commons-app-builder/scripts/build_request.py parse task.txt`, on the **whole
-   task file**: it checks the task is owner-tier and that the fence's room is the task's own room.
-   A malformed or unauthorized request prints the failed reply: send exactly that and stop.
+   task file**: it checks the task came from the owner's 1:1 DM with you (owner-tier, a two-person
+   DM naming the owner). A malformed or unauthorized request prints the failed reply: send exactly
+   that and stop. The plan's first room step then checks the owner and you are both in the room.
 2. **Build:** choose the template (the request's, else the closest, `templates/README.md`) and
    decide the adaptation the description needs — the app's name, the database's name, option
    lists, and any further page edit (pass the whole edited page as `html`).
