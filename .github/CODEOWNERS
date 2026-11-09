@@ -7,23 +7,24 @@
 # sort | uniq -c`. Full methodology and the areas considered and left out:
 # the "Sutando codeowners" doc (ww room) and its Product-core copy.
 #
-# GOVERNANCE: main requires code-owner review and the approval count set by its
-# ruleset (currently 1). GitHub's author-account self-approval restriction remains.
+# GOVERNANCE: main requires code-owner review + the approval count the main
+# ruleset sets (currently 1), no self-approval.
+# @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
+# singleton owner below is a hard block on their own PRs, and on anyone
+# else's if they're unavailable; the default recovery path is a bypass merge
+# by @sonichi or @qingyun-wu. A second name is added to a line only where
+# there's real, evidence-based signal for it (a genuine 2nd-place contributor,
+# same bar as every other line here) -- never invented purely to dodge the
+# self-approval/availability gate.
 #
-# @sonichi and @qingyun-wu are the only bypass actors (pull_request mode).
-# A singleton owner may block a PR; recovery remains a bypass merge by either.
-#
-# Additional owners normally require evidence of contribution. The explicit
-# owner-delegated exception is @sonichi-dot alongside @sonichi on the rules below.
-#
-# @sonichi and @sonichi-dot are controlled by the same person. @sonichi-dot is
-# an explicitly delegated code owner, not an independent human reviewer.
-#
-# Its eligible review may count, including on @sonichi-authored PRs, only where
-# repository rules permit; this declaration does not guarantee GitHub eligibility.
-#
-# Protected rules and required checks remain unchanged. This delegation does
-# not itself authorize approval of any individual PR.
+# Exception for @sonichi-dot only: @sonichi and @sonichi-dot are controlled by
+# the same person. The owner explicitly delegates code ownership to
+# @sonichi-dot on the rules below and permits its approval to count on
+# @sonichi-authored PRs. This is not independent human review.
+# All other owners remain subject to the policy above.
+# GitHub eligibility, protected rules and required checks still apply; this
+# declaration does not grant bypass privileges or authorize approval of any
+# individual PR.
 #
 # ROLLOUT: GitHub evaluates CODEOWNERS from the base branch, so once this
 # merges the gate applies to every open PR into main -- including ones opened
