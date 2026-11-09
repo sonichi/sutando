@@ -6,6 +6,10 @@
 #   SUTANDO_CODEX_HOME to the one home later steps use (empty when they must not write)
 #   and SUTANDO_CODEX_HOME_REFUSED=1 on a refusal.
 #   Returns 1 when the configuration cannot be read.
+#
+# sutando_codex_home_child <repo> <python> <home> <name>
+#   Prints the directory <name> in the prepared <home>, created if absent; returns 1 with a
+#   warning on any refusal or failure, and then nothing may be written below it.
 
 # shellcheck shell=bash
 sutando_codex_desktop_hosted() {
@@ -59,4 +63,15 @@ sutando_codex_home_prepare() {
   SUTANDO_CODEX_HOME_REFUSED=1
   echo "  ⚠ the configured Codex home was refused (exit $rc); not creating it, and nothing is written there" >&2
   return 0
+}
+
+sutando_codex_home_child() {
+  local repo="$1" py="$2" home="$3" name="$4" out=""
+  if [ -n "$py" ] && out="$("$py" "$repo/src/codex_home.py" child "$repo" "$home" "$name")" \
+      && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  echo "  ⚠ $home/$name was refused or could not be checked; nothing is written there" >&2
+  return 1
 }

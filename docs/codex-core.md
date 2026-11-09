@@ -96,7 +96,10 @@ The Codex implementation:
   and create nothing themselves; project trust, the host link and the reset timer are
   handed its one resolved home and skip when it is empty. A missing interpreter, a
   failing or silent checker, or a desktop env name other than `CODEX_HOME` (the only one
-  Codex reads) refuses. A non-desktop checkout is unchanged: its home is created as
+  Codex reads) refuses. `skills/install.sh` takes its `skills/` folder from the same
+  owner (`codex_home.py child`), which on a desktop host refuses a `skills` that is a
+  symlink or not a directory, so no skill is linked through it into another tree,
+  the owner's `~/.codex/skills` included. A non-desktop checkout is unchanged: its home is created as
   before and the effective home is the one Codex reads. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
   is refused as `owner-home` from its path alone, before anything is created. The
   spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink

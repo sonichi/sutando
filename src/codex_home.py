@@ -10,6 +10,10 @@ and then no later step may write there.
 Shell adapters call `prepare <repo>`, which prints three lines: the env name, the configured
 value, and the effective home (empty when refused). Exit 0 when the home may be used, 3
 when it was refused, 1 when the configuration cannot be read.
+
+`child <repo> <home> <name>` prints the directory `name` in a prepared home, creating it if
+absent. On a desktop host a `name` that is a symlink or not a directory is refused (exit 3),
+so a writer below it can never be led into another tree, the owner's included.
 """
 import argparse
 import os
@@ -79,11 +83,44 @@ def prepare(repo, home, environ=None):
     return env, value, value
 
 
+def child(repo, path, name, home):
+    """The directory `name` in the prepared Codex home `path`, created if absent.
+
+    Raises Refused on a desktop host when it is a symlink or not a directory, or the home
+    itself no longer passes the no-follow owner guard.
+    """
+    target = os.path.join(os.fspath(path), name)
+    if codex_host_instructions.host_instructions(repo) is None:
+        os.makedirs(target, exist_ok=True)
+        return target
+    try:
+        verdict = codex_host_instructions.ensure_child_dir(path, name, home)
+    except (OSError, ValueError) as exc:
+        raise Refused(f"{target}: {exc}") from None
+    if verdict != "ok":
+        raise Refused(f"{target} is a symlink or not a directory; nothing is written through it")
+    return target
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=["prepare"])
+    parser.add_argument("command", choices=["prepare", "child"])
     parser.add_argument("repo", type=Path)
+    parser.add_argument("home", nargs="?", help="child: the prepared Codex home")
+    parser.add_argument("name", nargs="?", help="child: the directory in it")
     args = parser.parse_args(argv)
+    if args.command == "child":
+        if not args.home or not args.name:
+            parser.error("child needs <home> <name>")
+        try:
+            print(child(args.repo, args.home, args.name, Path.home()))
+        except Refused as exc:
+            print(f"codex home: {exc}", file=sys.stderr)
+            return 3
+        except Exception as exc:  # noqa: BLE001 - any other failure refuses too
+            print(f"codex home: {exc}", file=sys.stderr)
+            return 1
+        return 0
     try:
         env, value, path = prepare(args.repo, Path.home())
     except Refused as exc:

@@ -108,13 +108,13 @@ if [ "$(bash "$CONFIG" core-runtime 2>/dev/null || true)" = "codex" ]; then
   . "$REPO/src/agent/codex/codex-home.sh"
   sutando_codex_home_prepare "$REPO" "$PY" || true
   echo ""
-  if [ -n "$SUTANDO_CODEX_HOME" ]; then
-    CODEX_TARGET="$SUTANDO_CODEX_HOME/skills"
+  if [ -n "$SUTANDO_CODEX_HOME" ] \
+      && CODEX_TARGET="$(sutando_codex_home_child "$REPO" "$PY" "$SUTANDO_CODEX_HOME" skills)"; then
     echo "Codex core runtime — linking into $CODEX_TARGET"
     link_skills "$CODEX_TARGET"
     echo ""
     echo "Installed. Skills available in the next Codex session."
   else
-    echo "Codex core runtime — the Codex home was refused; no skills linked there"
+    echo "Codex core runtime — the Codex home or its skills folder was refused; no skills linked there"
   fi
 fi

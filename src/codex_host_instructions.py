@@ -270,6 +270,30 @@ def open_home(codex_home, home):
     raise ValueError(f"{codex_home}: {status}")
 
 
+def ensure_child_dir(codex_home, name, home):
+    """Create, if absent, the directory `name` directly in an existing `codex_home`.
+
+    Returns "ok", or "invalid-child" when `name` is a symlink or not a directory; nothing is
+    followed. Raises like open_home, and ValueError for a `name` that is not one component.
+    """
+    if not name or name in (".", "..") or "/" in name or "\0" in name:
+        raise ValueError(f"{name!r}: not a single path component")
+    fd = open_home(codex_home, home)
+    try:
+        try:
+            os.mkdir(name, 0o755, dir_fd=fd)
+        except FileExistsError:
+            pass
+        try:
+            child = os.open(name, _DIR_FLAGS, dir_fd=fd)
+        except OSError:
+            return "invalid-child"
+        os.close(child)
+        return "ok"
+    finally:
+        os.close(fd)
+
+
 def ensure_linked(codex_home, repo, home):
     """Returns "no-host", "invalid-home", "owner-home", "overridden", "foreign", "dangling",
     "already-set" or "linked".

@@ -229,6 +229,76 @@ class Contract(Layout):
         self.assertEqual((rc, lines[:3]), (3, ["", "", ""]))
 
 
+class Child(Layout):
+    """`child` hands a writer a directory in the prepared home that leads nowhere else."""
+
+    def prepared(self, **kw):
+        self.checkout(**kw)
+        return self.prepare()[2]
+
+    def test_a_missing_child_is_created_in_the_app_home(self):
+        path = self.prepared()
+        self.assertEqual(codex_home.child(self.repo, path, "skills", self.home),
+                         str(self.app_home / "skills"))
+        self.assertTrue((self.app_home / "skills").is_dir())
+
+    def test_a_child_linked_into_the_owner_tree_is_refused_writing_nothing(self):
+        path = self.prepared()
+        (self.owner / "skills").mkdir(parents=True)
+        (self.app_home / "skills").symlink_to(self.owner / "skills")
+        for target in (self.owner / "skills", self.root / "elsewhere"):
+            with self.subTest(target=target.name):
+                before = self.tree()
+                with self.assertRaises(codex_home.Refused):
+                    codex_home.child(self.repo, path, "skills", self.home)
+                self.assertEqual(self.tree(), before)
+            (self.app_home / "skills").unlink()
+            (self.app_home / "skills").symlink_to(self.root / "elsewhere")
+
+    def test_a_child_that_is_a_file_or_a_bad_name_is_refused(self):
+        path = self.prepared()
+        (self.app_home / "skills").write_text("x")
+        for name in ("skills", "../x", "a/b", ".."):
+            with self.subTest(name=name), self.assertRaises(codex_home.Refused):
+                codex_home.child(self.repo, path, name, self.home)
+
+    def test_a_home_now_led_into_the_owner_tree_is_refused(self):
+        path = self.prepared()
+        shutil.rmtree(self.app_home)
+        self.owner.mkdir()
+        self.app_home.symlink_to(self.owner)
+        with self.assertRaises(codex_home.Refused):
+            codex_home.child(self.repo, path, "skills", self.home)
+        self.assertFalse(os.path.lexists(self.owner / "skills"))
+
+    def test_a_non_desktop_checkout_is_unchanged(self):
+        self.checkout(desktop=False)
+        target = self.home / ".codex"
+        self.assertEqual(codex_home.child(self.repo, target, "skills", self.home),
+                         str(target / "skills"))
+        self.assertTrue((target / "skills").is_dir())
+
+    def test_cli_exit_codes(self):
+        path = self.prepared()
+        out = subprocess.run([sys.executable, str(self.repo / "src" / "codex_home.py"), "child",
+                              str(self.repo), path, "skills"], env=self.env(),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, str(self.app_home / "skills")))
+        (self.app_home / "skills").rmdir()
+        (self.app_home / "skills").symlink_to(self.root)
+        out = subprocess.run([sys.executable, str(self.repo / "src" / "codex_home.py"), "child",
+                              str(self.repo), path, "skills"], env=self.env(),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual((out.returncode, out.stdout), (3, ""))
+        self.assertIn("symlink or not a directory", out.stderr)
+        with patch.object(codex_home, "child", side_effect=RuntimeError("boom")), \
+                patch.object(Path, "home", return_value=self.home), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(codex_home.main(["child", str(self.repo), path, "skills"]), 1)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            codex_home.main(["child", str(self.repo)])
+
+
 class ShellAdapter(Layout):
     SNIPPET = ('. "$R/src/agent/codex/codex-home.sh"; sutando_codex_home_prepare "$R" $PYARG; '
                'echo "rc=$? home=[$SUTANDO_CODEX_HOME] refused=[$SUTANDO_CODEX_HOME_REFUSED] '
@@ -271,6 +341,23 @@ class ShellAdapter(Layout):
                 self.assertIn("not creating it", out.stderr)
                 self.assertFalse(os.path.lexists(self.app_home))
         self.assertEqual(self.tree(), before)
+
+    def test_the_child_adapter_prints_only_an_explicit_answer(self):
+        self.checkout()
+        self.prepare()
+        snippet = ('. "$R/src/agent/codex/codex-home.sh"; '
+                   'p="$(sutando_codex_home_child "$R" "$PY" "$H" skills)"; echo "rc=$? p=[$p]"')
+        out = self.bash(snippet, R=str(self.repo), PY=sys.executable, H=str(self.app_home))
+        self.assertIn(f"rc=0 p=[{self.app_home / 'skills'}]", out.stdout, out.stderr)
+        silent = self.root / "silent-python"
+        silent.write_text("#!/bin/sh\nexit 0\n")
+        silent.chmod(0o755)
+        for name, py in (("no-python", ""), ("no-output", str(silent)),
+                         ("erroring", str(self.root / "none"))):
+            with self.subTest(python=name):
+                out = self.bash(snippet, R=str(self.repo), PY=py, H=str(self.app_home))
+                self.assertIn("rc=1 p=[]", out.stdout, out.stderr)
+                self.assertIn("nothing is written there", out.stderr)
 
     def test_a_non_desktop_checkout_without_python_is_unchanged(self):
         self.checkout(desktop=False)
@@ -324,8 +411,22 @@ class StartupSteps(Layout):
                         CLAUDE_CONFIG_DIR=str(self.workspace / ".claude-sutando"),
                         SUTANDO_CORE_RUNTIME="codex")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("the Codex home was refused; no skills linked there", out.stdout)
+        self.assertIn("was refused; no skills linked there", out.stdout)
         self.assertFalse(os.path.lexists(self.app_home))
+
+    def test_skills_install_never_follows_a_skills_link_into_the_owner_tree(self):
+        self.checkout()
+        self.app_home.mkdir()
+        (self.owner / "skills").mkdir(parents=True)
+        (self.app_home / "skills").symlink_to(self.owner / "skills")
+        out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),
+                        CLAUDE_CONFIG_DIR=str(self.workspace / ".claude-sutando"),
+                        SUTANDO_CORE_RUNTIME="codex")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("was refused; no skills linked there", out.stdout)
+        self.assertEqual(os.listdir(self.owner / "skills"), [])
+        self.assertTrue((self.app_home / "skills").is_symlink(), "left in place, not replaced")
+        self.assertTrue((self.workspace / ".claude-sutando" / "skills" / "tutorial").is_symlink())
 
     def test_skills_install_on_a_normal_desktop_links_into_the_app_home(self):
         self.checkout()
