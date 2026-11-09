@@ -123,6 +123,12 @@ if [ -n "$PY" ] && [ -x "$PY" ]; then
   [ -n "$WORKER_PY" ] && [ -x "$WORKER_PY" ] || WORKER_PY=""
 fi
 ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
+# The seat's s-space MCP proxy mints as the worker's own agent through this resolver; the token
+# stays in the vault, and with no resolver the proxy refuses rather than act as the core's agent.
+MCP_WORKER_CREDENTIAL="$("${WORKER_PY:-python3}" "$REPO/scripts/connections.py" worker-mcp-credential-argv \
+  --worker "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" --repo "$REPO" --python "$WORKER_PY" 2>/dev/null)" \
+  || { MCP_WORKER_CREDENTIAL=""; echo "  ⚠ no MCP credential resolver for this worker; its s-space MCP tools will refuse" >&2; }
+ENV_ARGS+=(-e "AG2_MCP_WORKER_CREDENTIAL=$MCP_WORKER_CREDENTIAL")
 # Forward the embedder-provided default workspace for the same reason as
 # above (tmux takes the server env, not this shell's).
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")

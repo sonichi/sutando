@@ -44,7 +44,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               proactive_destination, should_claim_proactive)
+                               lane_claims_proactive, proactive_destination,
+                               should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
@@ -299,7 +300,10 @@ def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
 
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
-    no other bridge will ever take (see _routed_bridge_still_owns)."""
+    no other bridge will ever take (see _routed_bridge_still_owns). A file a pool
+    worker's session stamped is that worker's own lane's, never a core lane's."""
+    if not lane_claims_proactive(path.name):
+        return False
     if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
         return False
     dest = proactive_destination(path.name)
@@ -500,25 +504,25 @@ def _lane_worker() -> str:
     return worker
 
 
-def _worker_lane_claims_nothing(path: Path) -> bool:
-    """A worker's own lane is reply-only: it shares results/ with the core's lanes, so a proactive
-    file there is the core's, and posting it would speak as the worker."""
-    return False
+def _worker_lane_claim_gate(worker: str):
+    """A worker's own lane shares results/ with the core's lanes: it claims only the proactive files
+    its worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent."""
+    return lambda path: lane_claims_proactive(path.name, worker)
 
 
 def _install_worker_lane(worker: str) -> None:
     """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
-    and it claims no proactive file."""
-    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE
+    and the only proactive files it claims and owns are the ones that worker's session wrote."""
+    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE
     TASK_ADDRESSEE = lambda: worker  # noqa: E731
-    PROACTIVE_CLAIM_GATE = _worker_lane_claims_nothing
+    PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
     _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
-         "and it posts no proactive messages")
+         "and it posts only the proactive files that worker's session writes")
     _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821

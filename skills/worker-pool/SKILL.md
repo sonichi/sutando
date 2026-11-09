@@ -137,13 +137,18 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 (`src/connections.py`, "a pool worker's own identity"). That row runs a lane of its own:
 - It answers only what is addressed to that agent.
 - It hands every task it queues to the worker (`requested_worker`).
-- It posts nothing proactively.
-- It never becomes primary.
+- It posts only the proactive files its worker's session writes (`proactive-<ts>.by-<worker>.txt`,
+  stamped by `result_publish.py`), into its own agent's owner DM; nothing the core's session wrote.
+- It never becomes primary, and owns no unaddressed message or owner card.
 
 The core owns that identity's lifecycle and its lane; the worker's session uses it. From the worker's seat, room
 clients (`room_ops.py`, `notify.py`, the room-database adapters) act as the worker's own agent in rooms on its
 server, through the one resolver (`connections.acting_identity`, see `docs/connections.md`, "In a pool worker's
-session"). A task a core lane routed to the worker is still answered as the core's agent.
+session"). A task a core lane routed to the worker is still answered as the core's agent. The seat's
+`s-space` MCP tools mint as the worker's agent too: the launcher exports `AG2_MCP_WORKER_CREDENTIAL`, the
+argv of `scripts/connections.py worker-mcp-credential`, which hands the desktop's MCP proxy the worker's vault
+token in memory; with no resolver the proxy refuses rather than act as the core (a Codex seat's proxy inherits
+no environment and does not take this path yet).
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"

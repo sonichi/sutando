@@ -2167,6 +2167,53 @@ def acting_identity(rows: list, room_id: Optional[str], worker: str,
     return mine
 
 
+class NoWorkerCredential(ConnectionsError):
+    """A pool worker's session has no credential of its own to act with; `reason` is one of
+    WORKER_CREDENTIAL_REASONS. The core's credential is never the answer."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+WORKER_CREDENTIAL_REASONS = ("no_worker", "no_identity", "disabled", "no_token")
+# The worker seat's s-space MCP proxy runs this argv to mint as the worker's own agent (see
+# `mcp_worker_credential_argv`): the token comes from the vault to the proxy's memory, never a file.
+MCP_WORKER_CREDENTIAL_ENV = "AG2_MCP_WORKER_CREDENTIAL"
+
+
+def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
+                          environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
+    """What a worker session's MCP proxy mints with: `worker`'s own enabled identity row and its token,
+    resolved as every room client resolves one (`connection_credential`: the vault's, by its
+    `token_ref`). `{worker, lane, server, agent_id, relay, bearer}`, `bearer` being the secret half.
+    Refused with NoWorkerCredential for no worker, no row, a disabled or parked row, or no token;
+    the core's rows are never read, so the core's credential is never answered."""
+    if not worker or not WORKER_RE.match(worker):
+        raise NoWorkerCredential("no_worker", "this session names no pool worker")
+    row = worker_identity(worker, workspace)
+    if row is None:
+        raise NoWorkerCredential("no_identity", f"worker {worker} has no identity of its own")
+    if row.get("disabled") or row.get("parked"):
+        raise NoWorkerCredential("disabled", f"worker {worker}'s identity {row['instance']} is not enabled")
+    try:
+        gateway_url, token = connection_credential(row, environ, vault=vault)
+    except NoConnectionForRoom as e:
+        raise NoWorkerCredential("no_token", str(e)) from None
+    mxid = str(row.get("agent_mxid") or "").strip()
+    return {"worker": worker, "lane": str(row["instance"]), "server": str(row["server"]),
+            "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
+            "relay": (gateway_url_of(token) or gateway_url).rstrip("/"),
+            "bearer": secret_of(token) if gateway_url_of(token) else token.strip()}
+
+
+def mcp_worker_credential_argv(worker: str, repo: Path, python: str = "") -> list:
+    """The argv a worker seat's MCP proxy runs for `worker_mcp_credential` (`MCP_WORKER_CREDENTIAL_ENV`
+    carries it JSON-encoded): the seat's own interpreter when the launcher resolved one, else python3."""
+    return [python or "python3", str(Path(repo) / "scripts" / "connections.py"), "worker-mcp-credential",
+            "--worker", worker]
+
+
 def worker_lane_named(name: str, workspace: Optional[Path] = None) -> bool:
     """Whether `name` is a pool worker's own lane, by its instance or its channel dir. Such a lane
     has no channel env file: its token lives in the vault alone (`connection_credential` reads it)."""

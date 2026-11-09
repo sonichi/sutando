@@ -52,6 +52,11 @@
                                reason when it did not start
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
+  worker-mcp-credential [--worker ID]
+                               one JSON line a worker seat's MCP proxy mints with: the worker's own
+                               identity and its vault token (stdout only; exit 1 refused, the core's never)
+  worker-mcp-credential-argv --worker ID --repo DIR [--python PY]
+                               the JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
   enabled                      each row a bridge serves (neither disabled nor parked), one instance per
                                line ('' = the legacy bridge); exit 1 when there is none
@@ -309,6 +314,25 @@ def cmd_enabled(args) -> int:
     return 0 if rows else 1
 
 
+def cmd_worker_mcp_credential(args) -> int:
+    """One JSON line a worker seat's MCP proxy mints with (`connections.worker_mcp_credential`); the
+    only command here that prints a secret, to stdout alone, for the proxy's memory. Exit 1 refused."""
+    worker = args.worker or connections.session_worker()
+    try:
+        cred = connections.worker_mcp_credential(worker, workspace=args.workspace)
+    except connections.NoWorkerCredential as e:
+        print(f"worker-mcp-credential: refused, {e.reason}: {e.detail}", file=sys.stderr)
+        return 1
+    print(json.dumps(cred, sort_keys=True))
+    return 0
+
+
+def cmd_worker_mcp_credential_argv(args) -> int:
+    """The JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL (no secret, no vault read)."""
+    print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python)))
+    return 0
+
+
 def cmd_launch_plan(args) -> int:
     for e in connections.launch_plan(os.environ, workspace=args.workspace):
         print(f"{e['instance']}\t{e['token_ref']}\t{e['channel_dir']}\t{1 if e['primary'] else 0}")
@@ -363,6 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_update_token)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
+    s = sub.add_parser("worker-mcp-credential"); s.add_argument("--worker", default="")
+    s.set_defaults(fn=cmd_worker_mcp_credential)
+    s = sub.add_parser("worker-mcp-credential-argv"); s.add_argument("--worker", required=True)
+    s.add_argument("--repo", type=Path, required=True); s.add_argument("--python", default="")
+    s.set_defaults(fn=cmd_worker_mcp_credential_argv)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
     return p
