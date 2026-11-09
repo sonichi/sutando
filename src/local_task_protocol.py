@@ -183,6 +183,8 @@ KNOWN_HEADER_KEYS = (
     "lane",
     # The question episode a woken task resumes: its file is a new turn of an id answered before.
     "wake_episode",
+    # The agent's earlier tasks in this room, as the broker served them: parent candidates.
+    "recent_tasks",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
