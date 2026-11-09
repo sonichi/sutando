@@ -1834,8 +1834,8 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     a refused stop (`BridgeStillRunning`, `BridgeLeaseIndeterminate`) and `PromoteConflict` (the
     primary moved, or the row to park was removed or parked, while it waited) re-raise after the
     rollback: the primary flag (never over a newer move) and a cleared `parked` flag are restored,
-    a bridge this call started is stopped and one it stopped is started again, and the old bridge was never touched
-    (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
+    a bridge this call started is stopped and one it stopped is started again, the lanes are synced to
+    the restored record, and the old bridge was never touched (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
     Idempotent: on the current primary it only starts the bridge if it is down. The row carries
     `previous` (the parked instance, None when nothing was parked), `kept` (the old owner left
     running, None when there was none or it was parked), `stopped_pid`, `legacy_stopped_pid`,
@@ -1875,6 +1875,7 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
         with locked_file(_lock_path(workspace), create_mode=0o600):
             _undo_promote(_read_record(record_path(workspace)), **undo)
         _restart_secondary(undo, start_kw)
+        _refresh_mcp_lanes(workspace, environ, vault)
         raise
     path = record_path(workspace)
     failure = None
@@ -1905,6 +1906,7 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
             _write(path, rec)
     if failure is not None:
         _restart_secondary(undo, start_kw)
+        _refresh_mcp_lanes(workspace, environ, vault)
         raise failure
     # The lanes follow the committed record, not the launch: `start` synced them while the old
     # owner was still unparked, and parking it above is a change no launch follows.
