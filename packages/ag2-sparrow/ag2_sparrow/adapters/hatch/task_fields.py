@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-from ... import gateway_instance, local_task_protocol, task_hold
+from ... import agent_triggers, gateway_instance, local_task_protocol, task_hold
 from ...task_io import attested_headers
 
 SNIPPET_MAX = 500
@@ -106,6 +106,9 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         "channel_kind": kind if kind in CHANNEL_KINDS else None,
         "event_id": _field(h, "source_message_id"),
         "thread_root": _field(h, "thread_root"),
+        # Which AgentTrigger raised the task; None (no header) reads as a message.
+        "event_type": agent_triggers.event_type_value(_field(h, "event_type")),
+        "playbook": agent_triggers.playbook_value(_field(h, "playbook")),
         "sender": _field(h, "user_id"),
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,

@@ -8,6 +8,8 @@ This module is the one owner of that vocabulary:
 - EVENT_PLAYBOOKS maps each known event_type to its default playbook id.
 - event_type_value / trigger_id_value / playbook_value sanitize the wire values
   (None = drop the header); the remote-gateway bridge writes only what they pass.
+  Any well-formed event_type passes, known or not, so a new platform event reaches
+  the core with its body; only playbook resolution is restricted.
 - resolve_playbook picks the skill a task runs: the task's own playbook when it is
   an allowed playbook (a registry value, or a skill whose manifest.json sets
   `"playbook": true`) with skills/<id>/SKILL.md, else the event's registry default,
@@ -34,6 +36,9 @@ EVENT_PLAYBOOKS = {
     "room.joined": "room-onboard",
 }
 EVENT_TYPES = frozenset(EVENT_PLAYBOOKS)
+# A well-formed event type: two to four dotted lowercase segments, e.g. "commons.summon".
+EVENT_TYPE_RE = re.compile(r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,31}){1,3}")
+EVENT_TYPE_MAX = 64
 # A playbook header may name only these, or a skill that opts in with `"playbook": true`.
 REGISTRY_PLAYBOOKS = frozenset(EVENT_PLAYBOOKS.values())
 
@@ -44,8 +49,9 @@ _TRIGGER_ID_RE = re.compile(r"[A-Za-z0-9._:@!|=+/-]{1,256}")
 
 
 def event_type_value(value) -> Optional[str]:
-    """The value when it is a known event type, else None (dropped, not defaulted)."""
-    return value if isinstance(value, str) and value in EVENT_TYPES else None
+    """The value when it is a well-formed event type (known or not), else None (dropped)."""
+    ok = isinstance(value, str) and len(value) <= EVENT_TYPE_MAX and EVENT_TYPE_RE.fullmatch(value)
+    return value if ok else None
 
 
 def trigger_id_value(value) -> Optional[str]:
@@ -59,9 +65,8 @@ def playbook_value(value) -> Optional[str]:
 
 
 def default_playbook(event_type) -> Optional[str]:
-    """The registry's playbook for a known event type, else None."""
-    known = event_type_value(event_type)
-    return EVENT_PLAYBOOKS[known] if known else None
+    """The registry's playbook for a known event type, else None (an unknown type has none)."""
+    return EVENT_PLAYBOOKS.get(event_type) if event_type_value(event_type) else None
 
 
 def is_playbook(skills_root: Path, playbook) -> bool:
