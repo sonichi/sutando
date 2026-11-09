@@ -6437,9 +6437,16 @@ def _task_archived(tid: str) -> bool:
     return (archive / f"{tid}.txt").exists() or next(archive.glob(f"*/{tid}.txt"), None) is not None
 
 
+def _staged_live(tid: str) -> bool:
+    """An `ack_first` entry that will still run: its staged file exists and it is neither refused nor ending."""
+    entry = (_load_held() or {}).get(tid)
+    return (_held_entry_ok(tid, entry) and entry.get("refused") is not True
+            and entry.get("ending") is not True and (_held_dir() / entry["staged"]).exists())
+
+
 def _task_held(tid: str) -> bool:
     """Is this local task still held here: queued, claimed, staged, archived or answered?"""
-    return (_task_pending(tid) or tid in (_load_held() or {}) or _task_archived(tid)
+    return (_task_pending(tid) or _staged_live(tid) or _task_archived(tid)
             or (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid))
 
 

@@ -157,6 +157,23 @@ def main():
     check("a copy of an archived or answered first task is still settled",
           not (rgb.TASKS_DIR / "task-V2.txt").exists() and not (rgb.TASKS_DIR / "task-W2.txt").exists()
           and (rgb.RESULTS_DIR / "task-V2.txt").read_text() == rgb.GATEWAY_REDELIVERY_RESULT)
+    # 2c. An ack_first entry holds only while it is live: staged file present, not refused, not ending.
+    def staged_then(n, change):
+        first, copy = f"task-H{n}a", f"task-H{n}b"
+        on_lane("", first, hold=True, source_message_id=f"$held{n}", task="held", **room)
+        entry = (rgb._load_held() or {}).get(first)
+        if entry is not None:
+            change(first, entry)
+        on_lane("", copy, source_message_id=f"$held{n}", task="held", **room)
+        return entry is not None, (rgb.TASKS_DIR / f"{copy}.txt").exists()
+    live = staged_then(1, lambda tid, e: None)
+    check("a copy of a live staged ack_first task is settled", live == (True, False), repr(live))
+    refused = staged_then(2, lambda tid, e: rgb._put_held(tid, {**e, "refused": True}))
+    check("a copy of a refused ack_first entry is queued", refused == (True, True), repr(refused))
+    ending = staged_then(3, lambda tid, e: rgb._put_held(tid, {**e, "ending": True}))
+    check("a copy of an ending ack_first entry is queued", ending == (True, True), repr(ending))
+    gone = staged_then(4, lambda tid, e: (rgb._held_dir() / e["staged"]).unlink())
+    check("a copy of an ack_first entry whose staged file is gone is queued", gone == (True, True), repr(gone))
     acks, real_post = [], rgb._post_task_ack
     rgb._post_task_ack = lambda tid, durable, lease, dropped=None: acks.append(tid) or True
     try:
