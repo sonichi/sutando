@@ -2882,13 +2882,31 @@ def _exited_while_waited(pid: int) -> bool:
     # poll() returns None unchecked while the reaper's wait() holds the Popen's waitpid lock.
     waitid = getattr(os, "waitid", None)
     if waitid is None:
-        return os.name != "nt" and _ps_zombie(pid)
+        return os.name != "nt" and (_ps_zombie(pid) or _no_longer_our_child(pid))
     try:
         return waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
     except ChildProcessError:  # the reaper has already collected it
         return True
     except OSError:
         return False
+
+
+def _no_longer_our_child(pid: int) -> bool:
+    """Whether our child's pid is gone from the kernel or now names another parent's process (reaped,
+    then reused); False when either probe cannot answer."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+    try:
+        out = subprocess.run([ps, "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    ppid = out.strip()
+    return ppid.isdigit() and int(ppid) != os.getpid()
 
 
 def _zombie(pid: int) -> bool:
