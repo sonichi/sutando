@@ -99,12 +99,15 @@ SHIM = ("def launchd_exit", "def run_launchd", "signal.signal(sig, forward)")
 OWNED_STEPS = {"adapters/claude_code/hold.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/cli.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/launcher.py": HOLDER_STEPS + SHIM,
-               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM}
+               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM,
+               "adapters/openclaw/cli.py": HOLDER_STEPS + WORDS + SHIM}
 LAUNCHER_SIDE = tuple(OWNED_STEPS)
 DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supervise_child("),
              "adapters/claude_code/cli.py": ("cm.holder_words(", "cm.occupancy_line(", "cm.run_child_argv("),
              "adapters/codex/connect_cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
-                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
+                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv("),
+             "adapters/openclaw/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
+                                         "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
 
 
 def direct_imports(text, steps):
@@ -117,7 +120,7 @@ def direct_imports(text, steps):
 
 # One owner, connect_bridge: the agent bridge's launch env, its unit or declaration, and connect's
 # redemption into the seat. Neither -local adapter builds any of them itself.
-BRIDGE_ADAPTERS = ("claude_code", "codex")
+BRIDGE_ADAPTERS = ("claude_code", "codex", "openclaw")
 BRIDGE_CALLS = {"seat_bridge_environ", "write_bridge_declaration", "remove_bridge_declaration", "render_supervisor",
                 "start_supervisor", "stop_supervisor", "write_seat_credentials", "write_seat", "redeem_code",
                 "read_code", "relay_problem", "code_problem"}
@@ -127,7 +130,9 @@ BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.wire_
                                                     "cb.host_problem(", "cb.agent_root("),
                     "adapters/claude_code/shape.py": ("bridge_shape(LOCAL)",),
                     "adapters/codex/connect_cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
-                                                      "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)")}
+                                                      "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)"),
+                    "adapters/openclaw/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
+                                                 "cb.agent_root(", "cb.bridge_shape(local)")}
 
 
 def bridge_builders(tree):
