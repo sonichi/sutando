@@ -196,7 +196,7 @@ python3 skills/worker-pool/scripts/pool_identity.py retire-remote <worker> [--lo
 server and prints a pass/fail table: the approval gate, the agent's provenance and name, the redeem and each way
 it must be refused, the worker answering a mention, the retirement, and a scan of the workspace, the session
 transcripts, the shell history and the core's and worker's tmux scrollback for the token, the claim secrets and
-the core's own credential (expected only in its env file). The scan compares in the process and prints places
+the core's own credential (expected only in its own configured env file). The scan compares in the process and prints places
 and counts only, and first has to find a control value it plants in the workspace's own logs. Its `--help` says
 what a run creates on the server.
 

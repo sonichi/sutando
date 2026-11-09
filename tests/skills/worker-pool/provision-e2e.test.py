@@ -299,6 +299,31 @@ class EachRuleHasACheckThatFails(Base):
         self.assertEqual(rows[e2e.SECOND], (e2e.PASS, "refused (http 409 claim_redeemed)"))
         self.assertLess(max(naps), 10, "nothing waited for a window")
 
+    def test_a_server_error_or_a_missing_route_is_not_a_refusal(self):
+        for status, code in ((503, "UNAVAILABLE"), (404, "NOT_FOUND"), (302, "")):
+            self.setUp()
+            answered = []
+
+            def broken(method, url, status=status, code=code, answered=answered, **kw):
+                real = self.backend.request(method, url, **kw)
+                if url.endswith("/redeem") and real[0] != 200:
+                    answered.append(real[0])
+                    return status, {}, {"code": code} if code else {}
+                return real
+            rows, rc, text = self.go(request=broken)
+            negative = (e2e.WRONG_SECRET, e2e.NO_CREDENTIAL, e2e.SECOND, e2e.OTHER_CALLER, e2e.EXPIRED)
+            self.assertEqual({rows[n][0] for n in negative}, {e2e.INCOMPLETE}, text)
+            self.assertEqual(rows[e2e.WRONG_SECRET][1], f"not a refusal: the server answered http {status} {code}".rstrip())
+            self.assertEqual((rc, len(answered)), (3, 5), "five refusals were asked for and none is certified")
+
+    def test_a_missing_credential_must_be_refused_as_unauthenticated(self):
+        def conflict(method, url, **kw):
+            real = self.backend.request(method, url, **kw)
+            return (409, {}, {"code": "claim_redeemed"}) if url.endswith("/redeem") and not kw.get("bearer") else real
+        rows, _, _ = self.go("--single-claim", request=conflict)
+        self.assertEqual(rows[e2e.NO_CREDENTIAL], (e2e.INCOMPLETE, "not a refusal: the server answered http 409 "
+                                                                   "claim_redeemed"))
+
     def test_provenance_the_server_does_not_expose_is_incomplete_not_a_pass(self):
         self.backend.bugs.add("hide_provenance")
         rows, rc, _ = self.go("--single-claim")
@@ -470,19 +495,42 @@ class LeakScan(Base):
         self.assertEqual(rows[e2e.LEAKS][1], f"1 places hold a secret: worker token x1 in {self.ws / 'logs' / 'redeem.log'}")
         self.assertEqual([n for n, (s, _) in rows.items() if s == e2e.FAIL], [e2e.LEAKS])
 
-    def test_the_cores_own_credential_is_a_leak_anywhere_but_its_env_file(self):
-        channel = self.ws / ".claude-sutando" / "channels" / "fixture"
+    def test_the_cores_own_credential_is_a_leak_anywhere_but_its_own_configured_env_file(self):
+        channel = self.ws / ".claude-sutando" / "channels" / "alpha-fixture-net-ag2space"
         channel.mkdir(parents=True)
         (channel / ".env").write_text(f"REMOTE_TASK_TOKEN='{BASE_URL}|{CORE_SECRET}'\n")
         os.symlink(self.tmp.name, self.ws / "state" / "link-out")
         rows, rc, text = self.go("--single-claim")
         self.assertEqual(rows[e2e.LEAKS], (e2e.PASS, "0 hits for 3 secrets in 6 files, 2 tmux sessions "
                                                      "(1 links not followed)"), text)
-        self.setUp()
-        (self.ws / "logs" / "bridge.log").write_text(f"Authorization: Bearer {CORE_SECRET}\n")
-        rows, rc, _ = self.go("--single-claim")
-        self.assertEqual(rows[e2e.LEAKS], (e2e.FAIL, f"1 places hold a secret: core credential x1 in "
-                                                     f"{self.ws / 'logs' / 'bridge.log'}"))
+        for place in ("results/leaked.env", "logs/bridge.log", ".claude-sutando/channels/another-lane/.env"):
+            self.setUp()
+            elsewhere = self.ws / place
+            elsewhere.parent.mkdir(parents=True, exist_ok=True)
+            elsewhere.write_text(f"REMOTE_TASK_TOKEN='{BASE_URL}|{CORE_SECRET}'\n")
+            rows, rc, _ = self.go("--single-claim")
+            self.assertEqual((rc, rows[e2e.LEAKS]), (1, (e2e.FAIL, "1 places hold a secret: core credential x1 in "
+                                                                   f"{elsewhere}")), "an env suffix exempts nothing")
+
+    def test_credential_files_that_cannot_be_resolved_exempt_nothing(self):
+        with unittest.mock.patch.object(C, "lane_channel_dir", side_effect=RuntimeError("no layout")):
+            self.assertEqual(e2e.credential_files({"instance": "alpha-fixture-net"}), set())
+        named = self.ws / "device.env"
+        named.write_text(f"REMOTE_TASK_TOKEN='{BASE_URL}|{CORE_SECRET}'\n")
+        with unittest.mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(named)}):
+            self.assertEqual(e2e.credential_files({"instance": ""}), {str(named.resolve())})
+
+    def test_a_directory_that_cannot_be_listed_leaves_the_scan_incomplete(self):
+        real = os.scandir
+
+        def locked(path):
+            if str(path).endswith("slug"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+        with unittest.mock.patch.object(os, "scandir", locked):
+            rows, rc, _ = self.go("--single-claim")
+        self.assertEqual((rc, rows[e2e.LEAKS][0]), (3, e2e.INCOMPLETE))
+        self.assertIn(f"unreadable {self.transcripts / 'slug'}", rows[e2e.LEAKS][1])
 
     def test_a_core_credential_too_short_to_search_for_leaves_the_scan_incomplete(self):
         self.backend.agents[CORE]["bearer"] = "tiny-cred"
@@ -596,7 +644,8 @@ class Scanner(unittest.TestCase):
 
     def test_a_clean_tree_has_no_hit(self):
         out = e2e.scan({"token": self.SECRET, "absent": ""}, [self.root, self.root / "no-such-dir"], {"pane": b"clean"})
-        self.assertEqual(out, {"hits": [], "files": 2, "unreadable": [], "links": []})
+        self.assertEqual(out, {"hits": [], "files": 2, "unreadable": [str(self.root / "no-such-dir")], "links": []},
+                         "a root that cannot be listed is not a clean one")
 
     def test_a_secret_split_across_read_chunks_is_still_found(self):
         (self.root / "logs" / "a.log").write_bytes(b"x" * 37 + self.SECRET.encode() + b"y" * 50 + self.SECRET.encode())
@@ -773,7 +822,7 @@ class Small(unittest.TestCase):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 64)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 68)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
         self.assertIs(subprocess.SubprocessError, e2e.subprocess.SubprocessError)
 

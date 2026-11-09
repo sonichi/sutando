@@ -9,7 +9,7 @@ there) and walks the whole flow for one live pool worker that has no agent of it
 `agent.create`, the claim redeem with its refusals, the worker answering a mention, `agent.retire`,
 and a scan of what this install writes (the workspace, the session transcripts, the core's and the
 worker's tmux scrollback, the shell history) for the secrets the run handled, the core's own
-credential included (expected only in its env file). It prints one table.
+credential included (expected only in its own configured env file). It prints one table.
 
 What a full run does on the server: it creates two agents (the worker's, and a second whose claim
 is left to expire) and retires both. Each `agent.create` and `agent.retire` may need the owner's
@@ -56,6 +56,7 @@ MIN_NEEDLE = 16
 UNSCANNED = ("projects",)
 SHELL_HISTORIES = (".zsh_history", ".bash_history")
 CHUNK = 1 << 20
+REFUSALS = (400, 401, 403, 409, 410, 422)
 DONE = ("succeeded", "success", "completed", "complete", "done", "ok", "executed")
 ENDED = ("denied", "rejected", "failed", "expired", "cancelled", "canceled")
 
@@ -256,11 +257,12 @@ def _chunks(path: Path) -> Iterable[bytes]:
             yield chunk
 
 
-def _files(root: Path, links: list) -> Iterable[Path]:
+def _files(root: Path, links: list, unreadable: list) -> Iterable[Path]:
     if root.is_file():
         yield root
         return
-    for folder, folders, names in os.walk(root, followlinks=False):
+    for folder, folders, names in os.walk(root, followlinks=False,
+                                          onerror=lambda e: unreadable.append(str(e.filename or root))):
         for name in folders + names:
             path = Path(folder) / name
             if path.is_symlink():
@@ -271,7 +273,8 @@ def _files(root: Path, links: list) -> Iterable[Path]:
 
 def scan(needles: Mapping[str, str], roots: Iterable[Path], texts: Mapping[str, bytes]) -> dict:
     """Search every regular file at or under `roots`, once each, and every named text for the needles,
-    in this process. Links are not followed, and are listed. Returns counts and places only:
+    in this process. Links are not followed, and are listed; a directory that cannot be listed is
+    unreadable, like a file that cannot be read. Returns counts and places only:
     {"hits": [(label, where, count)], "files": n, "unreadable": [where], "links": [where]}."""
     wanted = {label: value.encode("utf-8") for label, value in needles.items() if value}
     if not wanted or any(len(v) < MIN_NEEDLE for v in wanted.values()):
@@ -283,7 +286,7 @@ def scan(needles: Mapping[str, str], roots: Iterable[Path], texts: Mapping[str, 
         out["hits"] += [(label, where, n) for label, n in counts.items() if n]
 
     for root in roots:
-        for path in _files(root, out["links"]):
+        for path in _files(root, out["links"], out["unreadable"]):
             try:
                 stat = path.stat()
                 if (stat.st_dev, stat.st_ino) in seen:
@@ -334,15 +337,17 @@ def scan_roots(workspace: Path, extra: Iterable[Path] = ()) -> Tuple[list, list]
 
 
 def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, extra_roots, tmux_targets, tmux,
-               kept: Optional[Mapping[str, str]] = None) -> None:
+               kept: Optional[Mapping[str, Tuple[str, set]]] = None) -> None:
     """The two scan rows, from one pass: it looks for the run's secrets and for a control value planted
     in the workspace's own logs and in a text. A pass that misses the control proves nothing. `kept`
-    are credentials that live in an env file by design: a hit there is expected, anywhere else a leak."""
+    maps a credential's label to (its value, the files that hold it by design): a hit in one of those
+    files is expected, anywhere else a leak."""
     wanted = {label: value for label, value in needles.items() if value}
     required, scanned = scan_roots(workspace, extra_roots)
     missing = [str(r) for r in required if not r.is_dir()]
     texts, unscanned = {}, []
-    for label, value in (kept or {}).items():
+    kept = dict(kept or {})
+    for label, (value, _) in kept.items():
         if wanted and len(value.encode("utf-8")) >= MIN_NEEDLE:
             wanted[label] = value
         elif wanted:
@@ -379,7 +384,7 @@ def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, e
         report.set(LEAKS, SKIP, "the run produced no secret to look for")
         return
     hits = [(label, where, n) for label, where, n in result["hits"]
-            if label != CONTROL and not (label in (kept or {}) and where.endswith(".env"))]
+            if label != CONTROL and not (label in kept and str(Path(where).resolve()) in kept[label][1])]
     gaps = [f"missing {m}" for m in missing] + unscanned + [f"unreadable {u}" for u in result["unreadable"]]
     summary = f"{result['files'] - 1} files, {len(texts)} tmux sessions"
     if result["links"]:
@@ -391,6 +396,23 @@ def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, e
         report.set(LEAKS, INCOMPLETE, f"0 hits in {summary}, but not everything was scanned: {'; '.join(gaps)}")
     else:
         report.set(LEAKS, PASS, f"0 hits for {len(wanted)} secrets in {summary}")
+
+
+def credential_files(row: Mapping[str, object]) -> set:
+    """The env files a core lane's credential is kept in by design: its channel directory's, the
+    launch-key file and the launcher-named device file. Empty when they cannot be resolved, so that
+    a hit anywhere then counts as a leak."""
+    try:
+        from channel_credentials import CHANNEL
+        from channel_env_resolve import candidates, device_env, resolve_launch_key_env
+        from util_paths import claude_home_path
+        home, instance = claude_home_path("channels"), str(row.get("instance") or "")
+        source = connections.lane_channel_dir(instance) if instance else CHANNEL
+        files = candidates(home / source) + [device_env(source), device_env(CHANNEL),
+                                             resolve_launch_key_env(home, CHANNEL)]
+        return {str(Path(f).resolve()) for f in files if f}
+    except Exception:  # noqa: BLE001 - an unresolvable layout exempts nothing
+        return set()
 
 
 # ── the flow ─────────────────────────────────────────────────────────────────
@@ -426,10 +448,16 @@ class Flow:
             self.hold(f"token from extra redeem {len(self.needles)}", str(body.get("bearer") or ""))
         return status, body
 
-    def refusal(self, name: str, status: int, body: Mapping[str, object]) -> None:
+    def refusal(self, name: str, status: int, body: Mapping[str, object], expected=REFUSALS) -> None:
+        """A refusal is one of the client-error statuses a server answers a bad redeem with. A token is a
+        failure; any other answer (a server error, a missing route, a redirect) proves nothing."""
         said = f"http {status} {pp.error_code(body)}".rstrip()
-        self.report.set(name, FAIL if status == 200 else PASS,
-                        "the server delivered a token" if status == 200 else f"refused ({said})")
+        if status == 200:
+            self.report.set(name, FAIL, "the server delivered a token")
+        elif status in expected:
+            self.report.set(name, PASS, f"refused ({said})")
+        else:
+            self.report.set(name, INCOMPLETE, f"not a refusal: the server answered {said}")
 
     def create(self, label: str, key_sha256: str) -> Tuple[str, dict, str]:
         operation_id = f"provision-e2e-{uuid.uuid4().hex}"
@@ -459,7 +487,7 @@ class Flow:
         self.gateway, token = connections.connection_credential(self.core, vault=self.vault)
         self.core_bearer = pp.bearer_of(token)
         self.known.append(self.core_bearer)
-        self.kept[CORE_CREDENTIAL] = self.core_bearer
+        self.kept[CORE_CREDENTIAL] = (self.core_bearer, credential_files(self.core))
         self.actions = Actions(self.gateway, self.core_bearer, self.request, self.known)
         begun = pp.begin(wid, role=args.role or str(row.get("label") or ""), workspace=self.ws, vault=self.vault,
                          lane=str(self.core["instance"]))
@@ -484,7 +512,7 @@ class Flow:
         self.created.append(agent_a)
         self.provenance(agent_a, env_a, label)
         self.refusal(WRONG_SECRET, *self.redeem_once(self.core_bearer, claim_a, secrets.token_hex(32)))
-        self.refusal(NO_CREDENTIAL, *self.redeem_once("", claim_a, secret_a))
+        self.refusal(NO_CREDENTIAL, *self.redeem_once("", claim_a, secret_a), expected=(401, 403))
         worker_bearer = self.redeem(wid, claim_a, agent_a)
         if not worker_bearer:
             return
