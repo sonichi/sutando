@@ -46,6 +46,7 @@ WORKER_AGENT = "@owner-desk-reviewer.agent:alpha-fixture.net"
 SECOND_AGENT = "@owner-desk-reviewer-x.agent:alpha-fixture.net"
 BASE_URL = "https://chat.alpha-fixture.net"
 ROOM = "!room:alpha-fixture.net"
+CORE_SECRET = "c0de" * 12
 CLAIM_KEY = "AG2_PROVISION_CLAIM_" + W.upper()
 WORKER_REF = "AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET_7C700E11"
 TMUX = [("core", "sock", "sutando-core"), ("worker", "sock", "sutando-worker-x")]
@@ -59,11 +60,11 @@ class Base(H.Base):
         self.vault = provision_fake.recording(H.FakeVault)()
         self.backend = provision_fake.FakeBackend(mode=self.mode)
         self.backend.auto_approve = True
-        self.backend.add_agent(CORE, "secret-alpha")
+        self.backend.add_agent(CORE, CORE_SECRET)
         self.backend.rooms[ROOM] = []
         self.backend.members[ROOM] = {CORE, WORKER_AGENT}
         self.backend.responders.add(WORKER_AGENT)
-        self.add(H.TOKEN_A, fetch=H.agents(CORE))
+        self.add(f"{BASE_URL}|{CORE_SECRET}", fetch=H.agents(CORE))
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live", "label": "Reviewer"}}, "bindings": {}}))
         self.transcripts = self.ws / ".claude-sutando" / "projects"
@@ -130,7 +131,7 @@ class FullRun(Base):
         self.assertEqual(rows[e2e.OTHER_CALLER][1], "refused (http 403 claim_not_yours)")
         self.assertEqual(rows[e2e.EXPIRED][1], "refused (http 410 claim_expired)")
         self.assertEqual(rows[e2e.RETIRED][1], "whoami answered http 401")
-        self.assertEqual(rows[e2e.LEAKS][1], "0 hits for 3 secrets in 5 files, 2 tmux sessions")
+        self.assertEqual(rows[e2e.LEAKS][1], "0 hits for 4 secrets in 5 files, 2 tmux sessions")
         self.assertTrue(self.backend.agents[WORKER_AGENT]["deleted"] and self.backend.agents[SECOND_AGENT]["deleted"])
         self.assertEqual(sorted(self.vault.store), ["AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET"], "only the core's secret")
         self.assertIsNone(C.worker_identity(W, self.ws))
@@ -469,6 +470,28 @@ class LeakScan(Base):
         self.assertEqual(rows[e2e.LEAKS][1], f"1 places hold a secret: worker token x1 in {self.ws / 'logs' / 'redeem.log'}")
         self.assertEqual([n for n, (s, _) in rows.items() if s == e2e.FAIL], [e2e.LEAKS])
 
+    def test_the_cores_own_credential_is_a_leak_anywhere_but_its_env_file(self):
+        channel = self.ws / ".claude-sutando" / "channels" / "fixture"
+        channel.mkdir(parents=True)
+        (channel / ".env").write_text(f"REMOTE_TASK_TOKEN='{BASE_URL}|{CORE_SECRET}'\n")
+        os.symlink(self.tmp.name, self.ws / "state" / "link-out")
+        rows, rc, text = self.go("--single-claim")
+        self.assertEqual(rows[e2e.LEAKS], (e2e.PASS, "0 hits for 3 secrets in 6 files, 2 tmux sessions "
+                                                     "(1 links not followed)"), text)
+        self.setUp()
+        (self.ws / "logs" / "bridge.log").write_text(f"Authorization: Bearer {CORE_SECRET}\n")
+        rows, rc, _ = self.go("--single-claim")
+        self.assertEqual(rows[e2e.LEAKS], (e2e.FAIL, f"1 places hold a secret: core credential x1 in "
+                                                     f"{self.ws / 'logs' / 'bridge.log'}"))
+
+    def test_a_core_credential_too_short_to_search_for_leaves_the_scan_incomplete(self):
+        self.backend.agents[CORE]["bearer"] = "tiny-cred"
+        record = json.loads(C.record_path(self.ws).read_text())
+        self.vault.store[record["connections"][0]["token_ref"]] = f"{BASE_URL}|tiny-cred"
+        rows, rc, _ = self.go("--single-claim")
+        self.assertEqual((rc, rows[e2e.LEAKS][0]), (3, e2e.INCOMPLETE))
+        self.assertIn("core credential is too short to search for", rows[e2e.LEAKS][1])
+
     def test_a_claim_secret_in_a_transcript_or_a_tmux_pane_is_found(self):
         def leaky_tmux(socket, session):
             secret = next(v for v in self.vault.ever if re.fullmatch(r"[0-9a-f]{64}", v))
@@ -573,7 +596,7 @@ class Scanner(unittest.TestCase):
 
     def test_a_clean_tree_has_no_hit(self):
         out = e2e.scan({"token": self.SECRET, "absent": ""}, [self.root, self.root / "no-such-dir"], {"pane": b"clean"})
-        self.assertEqual(out, {"hits": [], "files": 2, "unreadable": []})
+        self.assertEqual(out, {"hits": [], "files": 2, "unreadable": [], "links": []})
 
     def test_a_secret_split_across_read_chunks_is_still_found(self):
         (self.root / "logs" / "a.log").write_bytes(b"x" * 37 + self.SECRET.encode() + b"y" * 50 + self.SECRET.encode())
@@ -602,7 +625,8 @@ class Scanner(unittest.TestCase):
             return real(path)
         with unittest.mock.patch.object(e2e, "_chunks", locked):
             out = e2e.scan({"token": self.SECRET}, [self.root], {})
-        self.assertEqual(out, {"hits": [], "files": 1, "unreadable": [str(self.root / "logs" / "a.log")]})
+        self.assertEqual((out["hits"], out["files"], out["unreadable"]), ([], 1, [str(self.root / "logs" / "a.log")]))
+        self.assertCountEqual(out["links"], [str(self.root / "logs" / "linked-dir"), str(self.root / "logs" / "dangling")])
         os.symlink(Path(outside.name) / "elsewhere.log", self.root / "logs" / "linked-file")
         self.assertEqual(e2e.scan({"token": self.SECRET}, [self.root], {})["hits"], [], "a linked file is not read")
 
@@ -749,7 +773,7 @@ class Small(unittest.TestCase):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 62)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 64)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
         self.assertIs(subprocess.SubprocessError, e2e.subprocess.SubprocessError)
 

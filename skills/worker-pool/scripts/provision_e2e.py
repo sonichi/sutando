@@ -8,7 +8,8 @@ Acts as the core's own agent on the server at --base-url (the core must already 
 there) and walks the whole flow for one live pool worker that has no agent of its own yet:
 `agent.create`, the claim redeem with its refusals, the worker answering a mention, `agent.retire`,
 and a scan of what this install writes (the workspace, the session transcripts, the core's and the
-worker's tmux scrollback, the shell history) for the secrets the run handled. It prints one table.
+worker's tmux scrollback, the shell history) for the secrets the run handled, the core's own
+credential included (expected only in its env file). It prints one table.
 
 What a full run does on the server: it creates two agents (the worker's, and a second whose claim
 is left to expire) and retires both. Each `agent.create` and `agent.retire` may need the owner's
@@ -68,6 +69,7 @@ MENTION = "worker answers a mention as its own agent"
 RETIRED, LOCAL_GONE = "retired agent's old token is rejected", "keychain item and connection row are gone"
 CLEANUP = "second agent retired (cleanup)"
 CONTROL, LEAKS = "leak scan finds a planted secret", "no token or claim secret in logs, tasks, results, transcripts, tmux"
+CORE_CREDENTIAL = "core credential"
 CHECKS = (CREATE, PROVENANCE, NAMING, WRONG_SECRET, NO_CREDENTIAL, REDEEM, NO_STORE, SECRET_GONE, WHOAMI, SECOND,
           OTHER_CALLER, EXPIRED, MENTION, RETIRED, LOCAL_GONE, CLEANUP, CONTROL, LEAKS)
 
@@ -254,32 +256,34 @@ def _chunks(path: Path) -> Iterable[bytes]:
             yield chunk
 
 
-def _files(root: Path) -> Iterable[Path]:
+def _files(root: Path, links: list) -> Iterable[Path]:
     if root.is_file():
         yield root
         return
-    for folder, _, names in os.walk(root, followlinks=False):
-        for name in names:
+    for folder, folders, names in os.walk(root, followlinks=False):
+        for name in folders + names:
             path = Path(folder) / name
-            if path.is_file() and not path.is_symlink():
+            if path.is_symlink():
+                links.append(str(path))
+            elif name in names and path.is_file():
                 yield path
 
 
 def scan(needles: Mapping[str, str], roots: Iterable[Path], texts: Mapping[str, bytes]) -> dict:
     """Search every regular file at or under `roots`, once each, and every named text for the needles,
-    in this process. Links are not followed. Returns counts and places only:
-    {"hits": [(label, where, count)], "files": n, "unreadable": [where]}."""
+    in this process. Links are not followed, and are listed. Returns counts and places only:
+    {"hits": [(label, where, count)], "files": n, "unreadable": [where], "links": [where]}."""
     wanted = {label: value.encode("utf-8") for label, value in needles.items() if value}
     if not wanted or any(len(v) < MIN_NEEDLE for v in wanted.values()):
         raise ValueError(f"every needle must be at least {MIN_NEEDLE} bytes: a shorter one matches by chance")
-    out = {"hits": [], "files": 0, "unreadable": []}
+    out = {"hits": [], "files": 0, "unreadable": [], "links": []}
     seen = set()
 
     def record(where: str, counts: Mapping[str, int]) -> None:
         out["hits"] += [(label, where, n) for label, n in counts.items() if n]
 
     for root in roots:
-        for path in _files(root):
+        for path in _files(root, out["links"]):
             try:
                 stat = path.stat()
                 if (stat.st_dev, stat.st_ino) in seen:
@@ -329,13 +333,20 @@ def scan_roots(workspace: Path, extra: Iterable[Path] = ()) -> Tuple[list, list]
     return required, scanned + [Path.home() / name for name in SHELL_HISTORIES]
 
 
-def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, extra_roots, tmux_targets, tmux) -> None:
+def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, extra_roots, tmux_targets, tmux,
+               kept: Optional[Mapping[str, str]] = None) -> None:
     """The two scan rows, from one pass: it looks for the run's secrets and for a control value planted
-    in the workspace's own logs and in a text. A pass that misses the control proves nothing."""
+    in the workspace's own logs and in a text. A pass that misses the control proves nothing. `kept`
+    are credentials that live in an env file by design: a hit there is expected, anywhere else a leak."""
     wanted = {label: value for label, value in needles.items() if value}
     required, scanned = scan_roots(workspace, extra_roots)
     missing = [str(r) for r in required if not r.is_dir()]
     texts, unscanned = {}, []
+    for label, value in (kept or {}).items():
+        if wanted and len(value.encode("utf-8")) >= MIN_NEEDLE:
+            wanted[label] = value
+        elif wanted:
+            unscanned.append(f"{label} is too short to search for")
     for name, socket, session in tmux_targets:
         try:
             texts[f"tmux:{name}"] = tmux(socket, session)
@@ -367,9 +378,12 @@ def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, e
     if not wanted:
         report.set(LEAKS, SKIP, "the run produced no secret to look for")
         return
-    hits = [hit for hit in result["hits"] if hit[0] != CONTROL]
+    hits = [(label, where, n) for label, where, n in result["hits"]
+            if label != CONTROL and not (label in (kept or {}) and where.endswith(".env"))]
     gaps = [f"missing {m}" for m in missing] + unscanned + [f"unreadable {u}" for u in result["unreadable"]]
     summary = f"{result['files'] - 1} files, {len(texts)} tmux sessions"
+    if result["links"]:
+        summary += f" ({len(result['links'])} links not followed)"
     if hits:
         places = "; ".join(f"{label} x{n} in {where}" for label, where, n in hits)
         report.set(LEAKS, FAIL, f"{len(hits)} places hold a secret: {places}")
@@ -391,6 +405,7 @@ class Flow:
     def __init__(self, args, report: Report, known: list, needles: dict, *, request, vault, preview, sleep, clock,
                  say=_say):
         self.args, self.report, self.known, self.needles = args, report, known, needles
+        self.kept: dict = {}
         self.request, self.vault, self.preview, self.sleep, self.clock = request, vault, preview, sleep, clock
         self.mine = pp._vault(vault)
         self.say = lambda text: say(pp.scrub(text, known))
@@ -444,6 +459,7 @@ class Flow:
         self.gateway, token = connections.connection_credential(self.core, vault=self.vault)
         self.core_bearer = pp.bearer_of(token)
         self.known.append(self.core_bearer)
+        self.kept[CORE_CREDENTIAL] = self.core_bearer
         self.actions = Actions(self.gateway, self.core_bearer, self.request, self.known)
         begun = pp.begin(wid, role=args.role or str(row.get("label") or ""), workspace=self.ws, vault=self.vault,
                          lane=str(self.core["instance"]))
@@ -674,7 +690,7 @@ def run(args, *, request=None, vault=None, preview=None, sleep=time.sleep, clock
     for agent in flow.created:
         report.note(f"left on the server: {agent} (retire it with agent.retire, or delete it as the owner)")
     leak_check(report, needles, Path(args.workspace), extra_roots=[Path(p) for p in args.scan_root],
-               tmux_targets=[] if args.no_tmux else list(tmux_targets), tmux=tmux)
+               tmux_targets=[] if args.no_tmux else list(tmux_targets), tmux=tmux, kept=flow.kept)
     if args.no_tmux and report.status(LEAKS) == PASS:
         report.set(LEAKS, INCOMPLETE, report.rows[LEAKS][1] + "; tmux scrollback not scanned (--no-tmux)")
     out(report.render())
