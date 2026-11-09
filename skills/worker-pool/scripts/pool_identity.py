@@ -10,10 +10,19 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] show <worker>
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
     python3 pool_identity.py [--workspace WS] remove <worker>
+    python3 pool_identity.py [--workspace WS] provision-begin <worker> [--role ROLE] [--lane INSTANCE]
+    python3 pool_identity.py [--workspace WS] provision-finish <worker> --claim-id ID [--lane INSTANCE] [--no-start]
+    python3 pool_identity.py [--workspace WS] provision-abort <worker>
+    python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
+
+The `provision-*` verbs need no pasted token (pool_provision.py): `provision-begin` prints the
+SHA-256 the `agent.create` Action takes and a suggested label, `provision-finish` redeems the claim
+that Action returns and prints the agent id and a status. `retire-remote` removes the identity once
+its server rejects the token. Each prints one JSON line and never a secret.
 """
 from __future__ import annotations
 
@@ -27,6 +36,7 @@ _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
 import connections
+import pool_provision
 import pool_roster as pr
 from workspace_default import resolve_workspace
 
@@ -118,6 +128,48 @@ def cmd_remove(args, ws: Path) -> int:
     return 0
 
 
+def cmd_provision_begin(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    row = ((pr.load_roster(ws) or {}).get("workers") or {}).get(wid) or {}
+    out = pool_provision.begin(wid, role=args.role or str(row.get("label") or ""), workspace=ws, lane=args.lane)
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def cmd_provision_finish(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    out = pool_provision.finish(wid, args.claim_id, workspace=ws, lane=args.lane)
+    try:
+        launch = None if args.no_start else connections.start_added(
+            out["row"], repo=args.repo or _REPO, logs_dir=args.logs_dir or ws / "logs", workspace=ws)
+    except connections.ConnectionsError as e:
+        launch = {"ok": False, "reason": str(e)}
+    started = launch is None or bool(launch.get("ok"))
+    if not started:
+        print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
+    print(json.dumps({"agent_id": out["agent_id"], "status": "ok" if started else "stored_lane_not_started"},
+                     sort_keys=True))
+    return 0 if started else 1
+
+
+def cmd_provision_abort(args, ws: Path) -> int:
+    pool_provision.abort(pr.resolve_label(pr.load_roster(ws) or {}, args.worker))
+    print(json.dumps({"status": "aborted"}))
+    return 0
+
+
+def cmd_retire_remote(args, ws: Path) -> int:
+    roster = pr.load_roster(ws) or {}
+    try:
+        out = pool_provision.retire(pr.resolve_label(roster, args.worker), workspace=ws,
+                                    local_anyway=args.local_anyway)
+    except pool_provision.NotRetired as e:
+        print(f"pool_identity: {e}", file=sys.stderr)
+        return 3
+    print(json.dumps(out, sort_keys=True))
+    return 0 if out["status"] in ("retired", "no_identity") else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pool_identity", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -132,6 +184,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo", type=Path, required=True); s.add_argument("--logs-dir", type=Path, required=True)
     s.set_defaults(fn=cmd_rotate)
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
+    s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
+    s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
+    s = sub.add_parser("provision-finish"); s.add_argument("worker"); s.add_argument("--claim-id", required=True)
+    s.add_argument("--lane", default=None); s.add_argument("--no-start", action="store_true")
+    s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
+    s.set_defaults(fn=cmd_provision_finish)
+    s = sub.add_parser("provision-abort"); s.add_argument("worker"); s.set_defaults(fn=cmd_provision_abort)
+    s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
+    s.set_defaults(fn=cmd_retire_remote)
     return p
 
 
@@ -146,7 +207,7 @@ def main(argv=None) -> int:
     except connections.Refusal as e:
         print(f"pool_identity: refused ({e.CODE}): {e}", file=sys.stderr)
         return 1
-    except connections.ConnectionsError as e:
+    except (connections.ConnectionsError, pool_provision.ProvisionError) as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         return 1
 

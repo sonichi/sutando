@@ -21,6 +21,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
 - `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
+- `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
+- `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
 - `worker_identity.py` — worker / session / incarnation records.
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
@@ -154,6 +156,46 @@ the launch and the record disagree, or neither can say, the lane refuses to star
 
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
 itself stays on its server until the owner deletes it there.
+
+### Creating the agent without a pasted token
+
+The core can create a worker's agent itself, so nobody pastes a token. The server side is the `agent.create`
+account Action and a claim it returns. The token never passes through a model: only these scripts and the secret
+vault hold it. Use this path only when the owner asked for the worker to have its own agent.
+
+1. `pool_identity.py provision-begin <worker>` makes a one-time secret, keeps it only in the secret vault and
+   prints one JSON line: `claim_key_sha256` (the secret's SHA-256) and a suggested `label`, `<core>-<role>`.
+2. Call the account Action `agent.create` with `label`, `claim_key_sha256` and an `operation_id`. It answers with
+   `agent_id` and `claim_id`, never a token. If it is held for the owner's approval, tell the owner in one line and
+   wait. If it fails with `approval_required`, the server has no approval path yet: run `provision-abort` and stop.
+3. `pool_identity.py provision-finish <worker> --claim-id <claim_id>` redeems the claim as the core's own agent,
+   with the core's lane credential and the secret, and saves the answered token as the worker's connection, the
+   same row and vault key `add` writes. It prints the agent id and a status and starts the lane.
+
+```bash
+python3 skills/worker-pool/scripts/pool_identity.py provision-begin <worker> [--role ROLE] [--lane INSTANCE]
+python3 skills/worker-pool/scripts/pool_identity.py provision-finish <worker> --claim-id <claim id>
+python3 skills/worker-pool/scripts/pool_identity.py provision-abort <worker>
+python3 skills/worker-pool/scripts/pool_identity.py retire-remote <worker> [--local-anyway]
+```
+
+- The secret is deleted when `provision-finish` ends, whether it worked or not, so a failed finish starts again
+  from `provision-begin`. A failure names what failed (the HTTP status and the server's error code) and never
+  echoes a secret. A claim lives five minutes.
+- If the redeem worked but the token could not be confirmed or saved, the message names the agent: it now has a
+  token nobody holds, so retire it and provision again.
+- The claim is bound to the core that created it and to the secret. Without `--lane` the core's lane is the app's
+  signed-in one, else the primary; pass the same lane to both verbs when the Action ran on another.
+- To retire, call the account Action `agent.retire` with the `agent_id` first, then `retire-remote`. It removes the
+  lane, the row and the vault secret only once the gateway rejects the stored token, and exits 3 with nothing
+  removed while the token still works. `--local-anyway` removes them regardless and exits 1: tell the owner the
+  agent is still live on its server.
+
+`provision_e2e.py --base-url https://<gateway> --worker <worker> [--room ROOM]` runs all of this against one
+server and prints a pass/fail table: the approval gate, the agent's provenance and name, the redeem and each way
+it must be refused, the worker answering a mention, the retirement, and a scan of the workspace, the session
+transcripts and the core's and worker's tmux scrollback for the token and the claim secrets. The scan compares in
+the process and prints places and counts only. Its `--help` says what a run creates on the server.
 
 ## Binding a room to an existing worker
 
