@@ -15,6 +15,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import connect_common as cm, task_io  # noqa: E402
@@ -79,7 +84,7 @@ class Work:
         oc._prepare(a)
         a.work_abs = a.work = str(self.root)
         oc._paths(a, str(self.root))
-        a.child_env = dict(os.environ, PYTHONPATH=str(PKG_ROOT), STUB_LOG=str(self.log),
+        a.child_env = isolated_child_env(PYTHONPATH=str(PKG_ROOT), STUB_LOG=str(self.log),
                            STUB_STATE=str(self.stub_state), STUB_LOAD="1")
         return a
 
