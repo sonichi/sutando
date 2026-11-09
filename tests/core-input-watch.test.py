@@ -1575,6 +1575,34 @@ class TestStyledPermissionCaretRow(unittest.TestCase):
         self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Down", "Down", "Enter"])
 
 
+class TestStyledWriteFileDialog(unittest.TestCase):
+    """#5544 verification: a Write dialog asks "Do you want to create", which no permission
+    signature names, so only its caret row makes it a gate; lose it and the card is Open terminal."""
+
+    STYLED = (
+        " Create file\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " notes/plan.md\n"
+        "   1 # Plan\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " Do you want to create plan.md?\n"
+        " \x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. \x1b[38;5;153mYes\x1b[39m\n"
+        "   \x1b[38;5;246m2. \x1b[39mYes, allow all edits during this session (shift+tab)\n"
+        "   \x1b[38;5;246m3. \x1b[39mNo\n"
+        "\n"
+        " \x1b[38;5;246mEsc to cancel · Tab to amend\x1b[39m\n")
+
+    def test_the_write_card_offers_yes_that_types_into_the_dialog(self):
+        from hitl import tui_gate
+        plain = _mod._ANSI_SGR.sub("", self.STYLED)
+        state, detail, prompt, kind = compose_state(plain, "idle", True, styled_pane=self.STYLED)
+        req = tui_gate.requirement_for(state, kind, prompt, "s", detail, "fallback")
+        self.assertEqual(req.kind, "permission")
+        self.assertEqual([a.label for a in req.actions], ["No", "Yes", "Open terminal"])
+        req.chosen_action = "allow"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Enter"])
+
+
 class TestEnsureTmuxOnPath(unittest.TestCase):
     """Mini-verified 2026-07-14: a detached spawn without Homebrew on PATH made bare
     `tmux` fail → healthy core mis-read as crashed. The monitor must self-heal PATH."""
