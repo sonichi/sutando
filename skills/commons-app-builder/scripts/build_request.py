@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""The build-request envelope the s.space panel sends, and the Action plan that answers it.
+
+The panel sends one private agent task: a line of English, then a ```commons-app-build fence
+holding the request (BUILD_REQUEST.md is the spec). This module parses and validates it, turns it
+into the ordered Room Commons Actions that build or refine the app with every page write at most
+WRITE_LIMIT bytes, and formats the one completion the panel waits for. Choosing and adapting the
+page is the agent's judgement; transport, chunking, dedupe and the reply shape are exact here.
+
+Usage:
+  build_request.py parse  <task.txt>                       -> the request as JSON, or exit 1
+  build_request.py plan   <task.txt> [--adapt adapt.json]  -> the Action plan as JSON
+  build_request.py chunks <page.html>                      -> chunk byte sizes, one per line
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+FENCE = "commons-app-build"
+VERSION = 1
+WRITE_LIMIT = 20_000            # bytes per page write: the bridge's per-write cap, kept on every write
+DESCRIPTION_MAX = 2_000
+TEMPLATES = ("tracker", "poll", "planner", "turn-game")
+MODES = ("build", "refine")
+
+_FENCE_RE = re.compile(r"```" + re.escape(FENCE) + r"[ \t]*\n(.*?)\n```", re.S)
+_PAGE_RE = re.compile(r"^html(-[a-z0-9]{8})?$")          # the client's own PAGE_RE (appsModel.ts)
+_ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
+# A bare database id: the backend's DATABASE pattern (actions/commons/reads.py) without "db:".
+_DB_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,119}$")
+_APP_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,80}$")
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TEMPLATE_DIR = SKILL_DIR / "templates"
+
+
+class RequestError(ValueError):
+    """A malformed request. The message is the completion's reason, so keep it short and plain."""
+
+
+# --------------------------------------------------------------------------- the request
+
+def extract(text: str) -> Dict[str, Any]:
+    """The fenced JSON object in a task's text. A completion (it has "status") is not a request."""
+    blocks = _FENCE_RE.findall(text or "")
+    if not blocks:
+        raise RequestError(f"no ```{FENCE} block in the task")
+    if len(blocks) > 1:
+        raise RequestError(f"more than one ```{FENCE} block in the task")
+    try:
+        data = json.loads(blocks[0])
+    except json.JSONDecodeError as error:
+        raise RequestError(f"the {FENCE} block is not JSON ({error.msg})") from None
+    if not isinstance(data, dict):
+        raise RequestError(f"the {FENCE} block is not a JSON object")
+    if "status" in data and "mode" not in data:
+        raise RequestError("this is a completion, not a request")
+    return data
+
+
+def validate(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The request with only the known keys; unknown keys are ignored, as the spec promises."""
+    def text(key: str, required: bool = True) -> Optional[str]:
+        value = data.get(key)
+        if value is None or value == "":
+            if required:
+                raise RequestError(f"`{key}` is missing")
+            return None
+        if not isinstance(value, str):
+            raise RequestError(f"`{key}` is not a string")
+        return value
+
+    if data.get("v") != VERSION:
+        raise RequestError(f"`v` must be {VERSION}")
+    request_id = text("request_id")
+    try:
+        uuid.UUID(request_id)
+    except ValueError:
+        raise RequestError("`request_id` is not a uuid") from None
+    mode = text("mode")
+    if mode not in MODES:
+        raise RequestError("`mode` must be build or refine")
+    description = text("description")
+    if len(description) > DESCRIPTION_MAX:
+        raise RequestError(f"`description` is over {DESCRIPTION_MAX} characters")
+    room_id = text("room_id")
+    if not _ROOM_RE.match(room_id):
+        raise RequestError("`room_id` is not a room id")
+    # The panel always creates the page; an absent one is malformed, never ours to create.
+    page = text("page")
+    if not _PAGE_RE.match(page):
+        raise RequestError("`page` must be html or html-<id>")
+    database = text("database", required=False)
+    if database is not None:
+        if database.startswith("db:"):
+            raise RequestError("`database` must be the bare id, not db:<id>")
+        if not _DB_RE.match(database):
+            raise RequestError("`database` is not a database id")
+    template = text("template", required=False)
+    if template is not None and template not in TEMPLATES:
+        raise RequestError("`template` must be one of " + ", ".join(TEMPLATES))
+    app_id = text("app_id", required=False)
+    if mode == "refine" and app_id is None:
+        raise RequestError("`app_id` is required to refine")
+    if app_id is not None and not _APP_RE.match(app_id):
+        raise RequestError("`app_id` is not an app id")
+    return {"v": VERSION, "request_id": request_id, "mode": mode, "description": description,
+            "room_id": room_id, "page": page, "database": database, "template": template,
+            "app_id": app_id}
+
+
+def parse(text: str) -> Dict[str, Any]:
+    return validate(extract(text))
+
+
+def request_id_of(text: str) -> Optional[str]:
+    """The request_id even of a malformed request, so its failure can still be matched."""
+    try:
+        value = extract(text).get("request_id")
+    except RequestError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+# --------------------------------------------------------------------------- the template
+
+_PICK = (
+    ("turn-game", r"\b(game|tic[- ]?tac|turn|board game|gomoku|checkers|chess|connect four)\b"),
+    ("poll", r"\b(poll|vote|voting|survey|choose|pick (one|a)|preference|which (day|option))\b"),
+    ("planner", r"\b(plan|planner|week|weekly|schedule|rota|calendar|itinerary|meal)\b"),
+    ("tracker", r"\b(track|tracker|task|todo|to-do|issue|bug|request|queue|chore|status)\b"),
+)
+
+
+def pick_template(description: str, requested: Optional[str] = None) -> str:
+    """The requested template, else the first whose words the description uses, else tracker."""
+    if requested:
+        return requested
+    lower = description.lower()
+    for name, pattern in _PICK:
+        if re.search(pattern, lower):
+            return name
+    return "tracker"
+
+
+def load_template(name: str) -> Tuple[str, Dict[str, Any]]:
+    folder = TEMPLATE_DIR / name
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    schema = json.loads((folder / "schema.json").read_text(encoding="utf-8"))
+    return page, schema
+
+
+def _html_escape(value: str) -> str:
+    return (value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def adapt(page: str, schema: Dict[str, Any], adaptation: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """The template renamed for this app: its title, its database's name, and option lists.
+
+    adaptation: {"app_name", "database_name", "options": {"<prop>": ["<option>", ...]}}, each
+    optional. Anything beyond this is the agent's own edit, passed whole as adaptation["html"].
+    """
+    schema = json.loads(json.dumps(schema))
+    db = next(d for d in schema["databases"] if d.get("role") == "primary")
+    old_db_name = db["name"]
+    app_name = (adaptation.get("app_name") or schema.get("app") or "App").strip()
+    new_db_name = (adaptation.get("database_name")
+                   or f"{app_name} — {old_db_name.split(' — ', 1)[-1]}").strip()
+    db["name"] = new_db_name
+    for prop in db.get("props", []):
+        renamed = (adaptation.get("options") or {}).get(prop.get("name"))
+        if renamed and prop.get("options"):
+            groups = [o.get("group") for o in prop["options"]]
+            prop["options"] = [
+                dict({"name": name}, **({"group": groups[min(i, len(groups) - 1)]}
+                                        if groups[min(i, len(groups) - 1)] else {}))
+                for i, name in enumerate(renamed)
+            ]
+    if adaptation.get("html"):
+        return adaptation["html"], schema
+    safe = _html_escape(app_name)
+    page = re.sub(r"<title>[^<]*</title>", f"<title>{safe}</title>", page, count=1)
+    page = re.sub(r"<h1>[^<]*</h1>", f"<h1>{safe}</h1>", page, count=1)
+    # The page finds its database by this exact name in a single-quoted JS string (GUIDE step 3).
+    js = new_db_name.replace("\\", "\\\\").replace("'", "\\'")
+    page = page.replace(f"'{old_db_name}'", f"'{js}'")
+    return page, schema
+
+
+# --------------------------------------------------------------------------- the writes
+
+def chunks(html: str, limit: int = WRITE_LIMIT) -> List[str]:
+    """The page cut into pieces of at most `limit` UTF-8 bytes, joined back exactly.
+
+    Cuts fall on a line break where one is near, so each step of the live preview ends on a whole
+    line; never inside a character.
+    """
+    if limit < 4:
+        raise ValueError("limit is too small to hold a character")
+    data = html.encode("utf-8")
+    out: List[str] = []
+    start = 0
+    while start < len(data):
+        end = min(start + limit, len(data))
+        if end < len(data):
+            newline = data.rfind(b"\n", start, end)
+            if newline > start + limit // 2:
+                end = newline + 1
+            while end > start and (data[end] & 0xC0) == 0x80:   # step back off a continuation byte
+                end -= 1
+        out.append(data[start:end].decode("utf-8"))
+        start = end
+    return out
+
+
+def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any]],
+         app_name: str) -> List[Dict[str, Any]]:
+    """The Room Commons Actions, in order. `$db` is the bare id a database step answers; `$app`
+    is the app an apps step answers. Every page write is at most WRITE_LIMIT bytes."""
+    room = request["room_id"]
+    steps: List[Dict[str, Any]] = [
+        {"action": "commons.app_guide", "read": True, "target_kind": "account", "arguments": {}},
+        {"action": "room.commons.pages.list", "read": True, "room_id": room, "arguments": {},
+         "expect_page": request["page"]},
+    ]
+    database = request.get("database")
+    if request["mode"] == "build" and schema is not None:
+        primary = next(d for d in schema["databases"] if d.get("role") == "primary")
+        if database is None:
+            steps.append({"action": "room.commons.pages.create", "room_id": room, "answers": "$db",
+                          "arguments": {"kind": "db", "title": primary["name"],
+                                        "template": "blank"}})
+            database = "$db"
+        else:
+            steps.append({"action": "room.commons.databases.list", "read": True, "room_id": room,
+                          "arguments": {}, "expect_database": database})
+        for prop in primary.get("props", []):
+            definition = {"name": prop["name"], "type": prop["type"]}
+            if prop.get("options"):
+                definition["options"] = [
+                    {k: v for k, v in option.items() if k in ("name", "group")}
+                    for option in prop["options"]]
+            steps.append({"action": "room.commons.databases.mutate", "room_id": room,
+                          "skip_if_present": prop["name"],
+                          "arguments": {"database": database, "op": "prop_add",
+                                        "property": definition}})
+        for view in primary.get("views", []):
+            settings = {k: v for k, v in view.items() if k in ("layout", "name", "groupBy", "dateBy")}
+            steps.append({"action": "room.commons.databases.mutate", "room_id": room,
+                          "arguments": {"database": database, "op": "view_add",
+                                        "view_settings": settings}})
+    pieces = chunks(page_html)
+    steps.append({"action": "room.commons.pages.replace", "room_id": room,
+                  "arguments": {"kind": request["page"], "mode": "whole", "new_text": pieces[0]}})
+    for piece in pieces[1:]:
+        steps.append({"action": "room.commons.pages.append", "room_id": room,
+                      "arguments": {"kind": request["page"], "text": piece}})
+    steps.append({"action": "room.commons.pages.read", "read": True, "room_id": room,
+                  "arguments": {"kind": request["page"]}, "expect_bytes": len(page_html.encode())})
+    if request["mode"] == "refine":
+        steps.append({"action": "room.commons.apps.update", "room_id": room, "answers": "$app",
+                      "arguments": {"app": request["app_id"], "page": request["page"]}})
+    else:
+        steps.append({"action": "room.commons.apps.create", "room_id": room, "answers": "$app",
+                      "arguments": {"name": app_name, "database": database,
+                                    "page": request["page"]}})
+    return steps
+
+
+# --------------------------------------------------------------------------- run and reply
+
+class ActionFailed(RuntimeError):
+    """An Action refused; its message becomes the completion's reason."""
+
+
+def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
+    """Runs the plan through `call(step) -> result`, substituting $db and $app as they are answered.
+
+    The agent drives the same steps through the s.space MCP; tests drive them through a fake room.
+    """
+    answers: Dict[str, Any] = {}
+
+    def fill(value: Any) -> Any:
+        if isinstance(value, str) and value in answers:
+            return answers[value]
+        if isinstance(value, dict):
+            return {k: fill(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [fill(v) for v in value]
+        return value
+
+    present: set = set()
+    for step in steps:
+        if step.get("skip_if_present") and step["skip_if_present"] in present:
+            continue
+        concrete = dict(step, arguments=fill(step["arguments"]))
+        result = call(concrete) or {}
+        if step.get("expect_page"):
+            kinds = {p.get("kind") for p in result.get("pages", [])}
+            if step["expect_page"] not in kinds:
+                raise ActionFailed(f"page {step['expect_page']} is not in this room")
+        if step.get("expect_database"):
+            # databases.list: databases[].database (maybe "db:"-prefixed), .properties[].name
+            dbs = {bare(d.get("database")): d for d in result.get("databases", [])}
+            found = dbs.get(bare(step["expect_database"]))
+            if not found:
+                raise ActionFailed(f"database {step['expect_database']} is not in this room")
+            present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
+        if (step.get("expect_bytes") is not None
+                and result.get("total_bytes") != step["expect_bytes"]):
+            raise ActionFailed("the page read back is not the page written")
+        if step.get("answers") == "$db":
+            answers["$db"] = bare(result.get("kind", ""))
+        if step.get("answers") == "$app":
+            answers["$app"] = result.get("id") or (result.get("app") or {}).get("id")
+    return answers
+
+
+def bare(database: Optional[str]) -> Optional[str]:
+    """A database id without the "db:" the Actions sometimes add; the envelope's form."""
+    if isinstance(database, str) and database.startswith("db:"):
+        return database[3:]
+    return database
+
+
+def completion(request_id: Optional[str], status: str, reason: str = "",
+               line: str = "", **found: Optional[str]) -> str:
+    """The panel's reply: one human line, a blank line, then the same fence with a status."""
+    body: Dict[str, Any] = {"v": VERSION, "request_id": request_id, "status": status,
+                            "reason": reason}
+    body.update({k: v for k, v in found.items() if v})
+    human = line or (f"Could not build the app: {reason}" if status == "failed" else "Done.")
+    return f"{human}\n\n```{FENCE}\n{json.dumps(body, ensure_ascii=False)}\n```"
+
+
+def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
+          adaptation: Optional[Dict[str, Any]] = None,
+          done: Optional[Dict[str, str]] = None) -> str:
+    """The whole answer to one task: parse, dedupe, plan, execute, reply. Never raises.
+
+    `done` maps a finished request_id to its completion; a resend gets that back and builds
+    nothing, so the panel's retry is safe.
+    """
+    adaptation = adaptation or {}
+    request_id = request_id_of(task_text)
+    try:
+        request = parse(task_text)
+    except RequestError as error:
+        return completion(request_id, "failed", str(error))
+    if done is not None and request["request_id"] in done:
+        return done[request["request_id"]]
+    try:
+        if request["mode"] == "refine":
+            if not adaptation.get("html"):
+                raise ActionFailed("refine needs the edited page")
+            page_html, schema, name = adaptation["html"], None, adaptation.get("app_name", "")
+        else:
+            template = pick_template(request["description"], request.get("template"))
+            raw_page, raw_schema = load_template(template)
+            page_html, schema = adapt(raw_page, raw_schema, adaptation)
+            name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
+        answers = execute(plan(request, page_html, schema, name), call)
+        database = request.get("database") or answers.get("$db")
+        app_id = answers.get("$app") or request.get("app_id")
+        verb = "Updated" if request["mode"] == "refine" else "Built"
+        what = f'"{name}"' if name else "the app"
+        line = f"{verb} {what} on page {request['page']}" + (f", database {database}." if database else ".")
+        reply = completion(request["request_id"], "done", "", line,
+                           page=request["page"], database=database, app_id=app_id)
+    except (ActionFailed, OSError, KeyError, ValueError) as error:
+        reply = completion(request["request_id"], "failed", str(error) or type(error).__name__)
+    if done is not None:
+        done[request["request_id"]] = reply
+    return reply
+
+
+# --------------------------------------------------------------------------- CLI
+
+def main(argv: List[str]) -> int:
+    if len(argv) < 2 or argv[0] not in ("parse", "plan", "chunks"):
+        print(__doc__.strip().splitlines()[-4:][0] if __doc__ else "", file=sys.stderr)
+        print("usage: build_request.py parse|plan|chunks <file> [--adapt adapt.json]", file=sys.stderr)
+        return 2
+    command, path = argv[0], argv[1]
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as error:
+        print(f"build_request: cannot read {path}: {error}", file=sys.stderr)
+        return 2
+    if command == "chunks":
+        for piece in chunks(text):
+            print(len(piece.encode("utf-8")))
+        return 0
+    try:
+        request = parse(text)
+    except RequestError as error:
+        print(completion(request_id_of(text), "failed", str(error)))
+        return 1
+    if command == "parse":
+        print(json.dumps(request, indent=2, ensure_ascii=False))
+        return 0
+    adaptation: Dict[str, Any] = {}
+    if "--adapt" in argv:
+        adaptation = json.loads(Path(argv[argv.index("--adapt") + 1]).read_text(encoding="utf-8"))
+    if request["mode"] == "refine":
+        page_html, schema, name = adaptation.get("html", ""), None, adaptation.get("app_name", "")
+        if not page_html:
+            print(completion(request["request_id"], "failed", "refine needs the edited page"))
+            return 1
+    else:
+        template = pick_template(request["description"], request.get("template"))
+        raw_page, raw_schema = load_template(template)
+        page_html, schema = adapt(raw_page, raw_schema, adaptation)
+        name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
+    print(json.dumps(plan(request, page_html, schema, name), indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
