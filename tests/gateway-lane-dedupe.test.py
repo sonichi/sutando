@@ -4,7 +4,8 @@
 Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
   1. the same event on two lanes queues one task; the second lane answers its own
      task id with the redelivery control result, so the broker settles it;
-  2. the same lane seeing the message again keeps today's behaviour;
+  2. the same lane seeing the message again: a redelivery or later run of the queued task is
+     unchanged, a second broker task with the same content is settled, an edit is queued;
   3. a task without source_message_id is never deduped; a hook or Summon task dedupes on its own fire
      or Summon identity, never on a message id;
   4. claims expire after the TTL;
@@ -112,9 +113,47 @@ def main():
     again = on_lane("", "task-A1", source_message_id="$ev1", **room)
     check("a same-lane redelivery of the queued task is unchanged",
           again is not None and again[0] == "task-A1" and not (rgb.RESULTS_DIR / "task-A1.txt").exists())
+    logs.clear()
     other = on_lane("", "task-A2", source_message_id="$ev1", **room)
-    check("the same lane is never deduped against itself",
-          other == ("task-A2", True) and (rgb.TASKS_DIR / "task-A2.txt").exists())
+    check("a second broker task for the same message and content on one lane is settled, not queued",
+          other == ("task-A2", True) and not (rgb.TASKS_DIR / "task-A2.txt").exists()
+          and (rgb.RESULTS_DIR / "task-A2.txt").read_text() == rgb.GATEWAY_REDELIVERY_RESULT, repr(other))
+    check("its log line names the task already holding it",
+          any("already queued as task-A1" in m for m in logs), repr(logs))
+    edited = on_lane("", "task-A3", source_message_id="$ev1", task="hello, edited", **room)
+    check("an edit of the same message (new content) on the same lane is queued",
+          edited == ("task-A3", True) and (rgb.TASKS_DIR / "task-A3.txt").exists(), repr(edited))
+    same = lane_dedupe.duplicate_reason
+    sd = tmp / "same-lane"
+    base = {"id": "task-R1", "task": "hi", "source_message_id": "$r1", **room}
+    same(sd, base, "")
+    check("a later run of the same broker task is not its own duplicate",
+          same(sd, {**base, "id": "task-R1~~2"}, "") is None)
+    check("a card click or picker press on one message is never folded by content",
+          same(sd, {**base, "id": "task-R2", "hitl_click": "true"}, "") is None
+          and same(sd, {**base, "id": "task-R3", "picker_command": "add"}, "") is None
+          and same(sd, {**base, "id": "task-R4", "event_type": "room.joined"}, "") is None)
+    check("the same content in another room is a different message",
+          same(sd, {**base, "id": "task-R5", "channel_id": "!other:x", "source_room_id": "!other:x"}, "") is None)
+    check("a different interaction type is not a copy",
+          same(sd, {**base, "id": "task-R6", "interaction_type": "reaction"}, "") is None)
+    check("a copy under another broker task id is",
+          (same(sd, {**base, "id": "task-R7"}, "") or "").startswith("lane dedupe:"))
+    check("a context task is never folded by content",
+          same(sd, {**base, "id": "task-R8", "hook": {"fire_id": "f9"}}, "") is None
+          and same(sd, {**base, "id": "task-R9", "hook": {"fire_id": "f9"}}, "") is None)
+    broken = tmp / "broken-content"
+    broken.write_text("x")
+    cw = []
+    check("an unusable store delivers the copy",
+          lane_dedupe.content_copy_of(broken / "s", "e", "", "", "c", "task-1", log=cw.append) is None
+          and lane_dedupe.content_copy_of(broken / "s", "e", "", "", "c", "task-2", log=cw.append) is None
+          and len(cw) == 1, repr(cw))
+    old = tmp / "content-ttl"
+    lane_dedupe.content_copy_of(old, "e", "", "", "c", "task-1", now=1000.0, ttl=60)
+    check("a content claim expires after the TTL",
+          lane_dedupe.content_copy_of(old, "e", "", "", "c", "task-2", now=1059.0, ttl=60) == "task-1"
+          and lane_dedupe.content_copy_of(old, "e", "", "", "c", "task-3", now=1061.0, ttl=60) is None)
 
     # 3. No message id, or a hook task: never deduped.
     on_lane("", "task-N1", **room)

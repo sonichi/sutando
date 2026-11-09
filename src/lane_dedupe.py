@@ -5,8 +5,12 @@ writing into the same workspace inbox. A Matrix event keeps its `event_id` on ev
 homeserver that sees it, so the same message can arrive once per lane. Before a lane queues
 a task, `claim_key` records `(room, source_message_id)` with the broker-attested tier in one
 SQLite store shared by every lane's bridge process; the same event at the same tier, already
-held by ANOTHER lane, is a duplicate. Lanes that disagree on the tier both deliver. The same lane
-seeing its own claim again is not a duplicate, so its own redelivery and retry semantics are kept.
+held by ANOTHER lane, is a duplicate. Lanes that disagree on the tier both deliver.
+
+On ONE lane, `content_copy_of` records which broker task first carried the message with a given
+content: a second broker task for the same message, tier and content is a duplicate, while a
+redelivery or a later run of the first task, and an edit (new content), are not. A card click,
+picker press or AgentTrigger task is never folded by content.
 
 Which lane answers is first-come unless the caller names the event's owner lanes (the lane whose
 agent the message addresses, else the primary): another lane then waits up to `OWNER_WAIT_S` for an
@@ -28,6 +32,8 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+
+from local_task_protocol import RUN_SEPARATOR
 
 STORE_NAME = "gateway-seen.sqlite3"
 # One agent's store, shared by its lanes only: keys leave the agent out, so two agents must never share one.
@@ -90,14 +96,74 @@ def _warn(log: Callable[[str], None], message: str) -> None:
         log(message)
 
 
+def _has_table(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
 def _ensure_schema(con: sqlite3.Connection) -> None:
     # Created only when absent: an IF NOT EXISTS create takes the write lock even as a no-op.
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'event_claims'").fetchone():
+    if _has_table(con, "event_claims"):
         return
     con.execute("CREATE TABLE event_claims (key TEXT PRIMARY KEY, event TEXT NOT NULL, "
                 "lane TEXT NOT NULL, tier TEXT NOT NULL, ts REAL NOT NULL)")
     con.execute("CREATE INDEX event_claims_ts ON event_claims (ts)")
     con.execute("CREATE INDEX event_claims_event ON event_claims (event)")
+
+
+def _ensure_content_schema(con: sqlite3.Connection) -> None:
+    if _has_table(con, "content_claims"):
+        return
+    con.execute("CREATE TABLE content_claims (key TEXT PRIMARY KEY, task TEXT NOT NULL, ts REAL NOT NULL)")
+    con.execute("CREATE INDEX content_claims_ts ON content_claims (ts)")
+
+
+# Each makes the task an action on the message rather than a reading of it.
+_ACTION_FIELDS = ("hitl_click", "picker_command", "picker_args", "event_type", "agent_trigger_id")
+
+
+def content_of(task: Mapping[str, object]) -> Optional[str]:
+    """Digest of what the task asks, or None when the task must never be folded by content."""
+    if _context_identity(task)[0] or any(f in task and task.get(f) is not None for f in _ACTION_FIELDS):
+        return None
+    shape = [str(task.get("interaction_type") or ""), str(task.get("task") or "")]
+    return hashlib.sha256(json.dumps(shape, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def task_identity(task: Mapping[str, object]) -> str:
+    """The broker task a local id names, whichever run of it this is."""
+    return str(task.get("id") or "").strip().split(RUN_SEPARATOR, 1)[0]
+
+
+def content_copy_of(state_dir: Path, event: str, lane: str, tier: str, content: str, task_id: str, *,
+                    now: Optional[float] = None, ttl: float = TTL_S,
+                    log: Callable[[str], None] = print) -> Optional[str]:
+    """The other task this lane already queued for (`event`, `tier`, `content`), else None after
+    recording `task_id` as its holder. Fails open like `claim_key`."""
+    now = time.time() if now is None else now
+    path = Path(state_dir) / STORE_NAME
+    key = hashlib.sha256(f"{event}\n{tier}\n{lane}\n{content}".encode("utf-8")).hexdigest()
+    con = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_S, isolation_level=None)
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            _ensure_content_schema(con)
+            con.execute("DELETE FROM content_claims WHERE ts <= ?", (now - ttl,))
+            row = con.execute("SELECT task FROM content_claims WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                con.execute("INSERT INTO content_claims (key, task, ts) VALUES (?, ?, ?)", (key, task_id, now))
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+        return None if row is None or str(row[0]) == task_id else str(row[0])
+    except (sqlite3.Error, OSError) as exc:
+        _warn(log, f"lane dedupe: store {path} unusable ({type(exc).__name__}: {exc}); delivering without the guard")
+        return None
+    finally:
+        if con is not None:
+            con.close()
 
 
 def claim_key(state_dir: Path, event: str, lane: str, tier: str = "", *, now: Optional[float] = None,
@@ -179,7 +245,7 @@ def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
     """One log line naming both lanes when another lane already took this message at the same
     tier, else None; lanes that disagree on the tier both deliver, with one WARNING. With
     `owner_lanes` not naming `lane`, an owner's claim within `wait_s` (`OWNER_WAIT_S`) makes this one the duplicate; `defer` raises
-    OwnerPending instead of waiting."""
+    OwnerPending instead of waiting. On this lane, another broker task with the same content is a duplicate too."""
     event = key_of(task)
     if event is None:
         return None
@@ -199,6 +265,12 @@ def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
     if holder is not None:
         return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
                 f"was already taken by lane {lane_label(holder)}; settled as a redelivery")
+    content, task_id = content_of(task), task_identity(task)
+    if content is not None and task_id:
+        earlier = content_copy_of(state_dir, event, lane, tier, content, task_id, now=now, log=log)
+        if earlier is not None:
+            return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
+                    f"was already queued as {earlier} with the same content; settled as a redelivery")
     if disagreeing:
         seen = ", ".join(f"lane {lane_label(a)} as {b or 'none'}" for a, b in disagreeing)
         log(f"WARNING lane dedupe: message {task.get('source_message_id')} attested as "
