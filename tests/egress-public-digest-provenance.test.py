@@ -13,13 +13,17 @@ Run: python3 tests/egress-public-digest-provenance.test.py
 """
 
 import hashlib
+import importlib
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 import secret_scanner
 from chat_secret_filter import filter_chat_secrets
@@ -166,6 +170,68 @@ class Masking(unittest.TestCase):
         fetch = Fetch()
         self.assertEqual(guard(f"All good. {RUN_URL}", fetch), f"All good. {RUN_URL}")
         self.assertEqual(fetch.calls, [])
+
+
+class HelperContract:
+    """Run against the src module and its vendored ag2-sparrow copy."""
+
+    mod = None
+
+    def test_verifies_only_a_published_cited_digest(self):
+        body = review_body()
+        self.assertEqual(self.mod.verified_public_digests(body, SOURCES, Fetch()), {DIGEST})
+        self.assertEqual(self.mod.verified_public_digests(body, (), Fetch()), frozenset())
+        rejected = [Fetch(run_record(app="x")), Fetch(run_record(name="x")),
+                    Fetch(run_record(repo="x")), Fetch(run_record(digest=OTHER_HEX)),
+                    Fetch(record=["not", "a", "run"]), Fetch(error=OSError("offline"))]
+        for fetch in rejected:
+            self.assertEqual(self.mod.verified_public_digests(body, SOURCES, fetch), frozenset())
+        for other in (review_body(cite=False), "no digest here " + RUN_URL):
+            self.assertEqual(self.mod.verified_public_digests(other, SOURCES, Fetch()), frozenset())
+        self.assertEqual(self.mod.verified_public_digests(
+            body, (("someone/else", CHECK),), Fetch()), frozenset())
+
+    def test_mask_round_trips(self):
+        body = f'{{"k": "{DIGEST}"}}'
+        masked, restore = self.mod.mask_digests(body, {DIGEST})
+        self.assertNotIn(DIGEST, masked)
+        self.assertEqual(restore(masked), body)
+        planted = body + " verified-public-digest-0-end"
+        unchanged, keep = self.mod.mask_digests(planted, {DIGEST})
+        self.assertEqual((unchanged, keep("x")), (planted, "x"))
+
+    def test_configured_sources_reads_only_well_formed_entries(self):
+        listed = [{"repo": "Example-Org/Example-Repo", "check_name": CHECK},
+                  {"repo": "", "check_name": CHECK}, {"repo": "a/b"}, "not-a-dict"]
+        with mock.patch("sutando_config.load_config",
+                        return_value={"egress": {"verified_digest_sources": listed}}):
+            self.assertEqual(self.mod.configured_sources(REPO), SOURCES)
+        with mock.patch("sutando_config.load_config",
+                        return_value={"egress": {"verified_digest_sources": "x"}}):
+            self.assertEqual(self.mod.configured_sources(REPO), ())
+        with mock.patch("sutando_config.load_config", side_effect=ValueError("bad")):
+            self.assertEqual(self.mod.configured_sources(REPO), ())
+
+    def test_gh_fetch_reads_the_api_path(self):
+        done = subprocess.CompletedProcess([], 0, stdout='{"name": "x"}', stderr="")
+        with mock.patch.object(self.mod.subprocess, "run", return_value=done) as run:
+            self.assertEqual(self.mod.gh_fetch("repos/a/b/check-runs/1"), {"name": "x"})
+        self.assertEqual(run.call_args.args[0], ["gh", "api", "repos/a/b/check-runs/1"])
+
+
+class SrcHelper(HelperContract, unittest.TestCase):
+    mod = public_digest
+
+
+class VendoredHelper(HelperContract, unittest.TestCase):
+    mod = importlib.import_module("ag2_sparrow.public_digest")
+
+
+class FilterWithoutTheHelper(unittest.TestCase):
+    def test_missing_helper_masks_nothing(self):
+        with mock.patch.dict(sys.modules, {"policy.egress.public_digest": None}):
+            result = filter_chat_secrets(review_body(), public_digests=frozenset({DIGEST}))
+        self.assertIn("Hex High Entropy String", result.secret_types)
 
 
 if __name__ == "__main__":

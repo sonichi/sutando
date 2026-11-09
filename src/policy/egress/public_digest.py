@@ -42,10 +42,7 @@ Fetch = Callable[[str], dict]
 def configured_sources(repo_root) -> tuple:
     """`egress.verified_digest_sources` as ((owner/repo, check name), ...); empty on any error."""
     try:
-        try:
-            from sutando_config import load_config
-        except ImportError:
-            return ()
+        from sutando_config import load_config
         listed = (load_config(Path(repo_root)).get("egress") or {}).get(
             "verified_digest_sources")
     except Exception:
