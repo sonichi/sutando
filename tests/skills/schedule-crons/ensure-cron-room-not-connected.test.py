@@ -11,7 +11,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from _helpers.hermetic_env import hermetic_env  # noqa: E402
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "skills" / "schedule-crons" / "ensure-cron-room.py"
