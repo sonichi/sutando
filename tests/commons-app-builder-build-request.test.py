@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import re
+import tempfile
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -117,6 +118,8 @@ class FakeRoom:
             return {"kind": args["kind"], "surface": "html", "title": "x", "text": text,
                     "offset": 0, "next_offset": None, "total_bytes": len(text.encode()),
                     "content_hash": "sha256:" + hashlib.sha256(text.encode()).hexdigest()}
+        if action == "room.commons.apps.list":
+            return {"apps": [dict(a) for a in self.apps.values()]}
         if action == "room.commons.apps.create":
             app = self._id("a")
             self.apps[app] = {"id": app, "name": args["name"], "database": br.bare(args["database"]),
@@ -130,12 +133,22 @@ class FakeRoom:
         raise Refused(f"unexpected action {action}")
 
 
-def task(**fields):
+def task(*, tier="owner", channel=ROOM, source_room=None, headers=True, **fields):
+    """A task file as the bridge writes it: its headers, then the panel's text and fence."""
     body = {"v": 1, "request_id": "3f2b9c1e-7a4d-4e8b-9f61-2c5d8a0b7e14", "mode": "build",
             "description": "a sign-up sheet for Saturday's cleanup", "room_id": ROOM, "page": PAGE}
     body.update(fields)
     body = {k: v for k, v in body.items() if v is not None}
-    return f"Build a Commons app\n\n```commons-app-build\n{json.dumps(body)}\n```"
+    text = f"Build a Commons app\n\n```commons-app-build\n{json.dumps(body)}\n```"
+    if not headers:
+        return text
+    head = ["id: task-1", "source: ag2space"]
+    if channel:
+        head.append(f"channel_id: {channel}")
+    if source_room:
+        head.append(f"source_room_id: {source_room}")
+    head += ["priority: normal", f"access_tier: {tier}"]
+    return "\n".join(head) + "\ntask: " + text
 
 
 def reply_of(text):
@@ -145,13 +158,13 @@ def reply_of(text):
     return text.split("\n", 1)[0], json.loads(m.group(1))
 
 
-def run(room, text, adaptation=None, done=None):
+def run(room, text, adaptation=None, ledger=None):
     def call(step):
         try:
             return room.call(step)
         except Refused as error:
             raise br.ActionFailed(str(error)) from None
-    return br.build(text, call, adaptation, done)
+    return br.build(text, call, adaptation, ledger)
 
 
 # --------------------------------------------------------------------------- the literal examples
@@ -161,7 +174,8 @@ requests = [json.loads(b) for b in blocks if '"mode"' in b]
 replies = [json.loads(b) for b in blocks if '"status"' in b]
 check("spec-has-a-build-and-a-refine", {r["mode"] for r in requests} == {"build", "refine"})
 for r in requests:
-    parsed = br.parse(f"x\n\n```commons-app-build\n{json.dumps(r)}\n```")
+    framed = f"access_tier: owner\nchannel_id: {r['room_id']}\ntask: x\n\n```commons-app-build\n{json.dumps(r)}\n```"
+    parsed = br.parse(framed)
     check(f"spec-example-parses-{r['mode']}", parsed["request_id"] == r["request_id"])
 check("spec-has-a-done-reply", any(r["status"] == "done" for r in replies))
 for r in replies:
@@ -268,12 +282,27 @@ out = run(FakeRoom(), task(mode="refine", request_id="11111111-2222-4333-8444-55
 check("refine-without-an-edited-page-fails", reply_of(out)[1]["status"] == "failed")
 
 # --------------------------------------------------------------------------- dedupe on request_id
-room, done = FakeRoom(), {}
-a = run(room, task(template="poll"), None, done)
-n = len(room.calls)
-b = run(room, task(template="poll", description="something else entirely"), None, done)
-check("resend-answers-the-same-completion", a == b)
-check("resend-builds-nothing", len(room.calls) == n and len(room.apps) == 1)
+with tempfile.TemporaryDirectory() as ledger_dir:
+    ledger = br.Ledger(Path(ledger_dir))
+    room = FakeRoom()
+    a = run(room, task(template="poll"), None, ledger)
+    n = len(room.calls)
+    b = run(room, task(template="poll", description="something else entirely"), None, ledger)
+    check("resend-answers-the-same-completion", a == b)
+    check("resend-builds-nothing", len(room.calls) == n and len(room.apps) == 1)
+    # A NEW Ledger on the same folder, as after a restart: still remembered.
+    c = run(room, task(template="poll"), None, br.Ledger(Path(ledger_dir)))
+    check("dedupe-survives-a-restart", c == a and len(room.calls) == n)
+    check("dedupe-is-on-disk-under-a-room-folder", len(list(Path(ledger_dir).glob("*/*.json"))) == 1)
+# Without a ledger the empty-page check still stops a second build, and before ANY write: no
+# second database, no second app, nothing left half-made.
+room = FakeRoom()
+run(room, task(template="poll"))
+dbs, apps, writes = len(room.databases), len(room.apps), len(room.write_sizes)
+_, rep = reply_of(run(room, task(template="poll")))
+check("second-build-without-a-ledger-is-refused", rep["status"] == "failed" and "not empty" in rep["reason"])
+check("second-build-writes-nothing", (len(room.databases), len(room.apps), len(room.write_sizes))
+      == (dbs, apps, writes))
 
 # --------------------------------------------------------------------------- malformed requests
 for name, text, reason in [
@@ -289,7 +318,7 @@ for name, text, reason in [
     ("bad-template", task(template="game"), "`template`"),
     ("long-description", task(description="x" * 2001), "2000"),
     ("refine-without-app", task(mode="refine"), "`app_id` is required"),
-    ("bad-room", task(room_id="room1"), "`room_id`"),
+    ("bad-room", task(room_id="room1", channel="room1"), "`room_id`"),
     ("a-completion", "x\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"r\",\"status\":\"done\"}\n```", "completion"),
 ]:
     room = FakeRoom()
@@ -360,7 +389,9 @@ with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
     (tmp / "build.txt").write_text(task(template="poll"), encoding="utf-8")
     (tmp / "bad.txt").write_text(task(page=""), encoding="utf-8")
-    (tmp / "refine.txt").write_text(task(mode="refine", app_id="a1"), encoding="utf-8")
+    (tmp / "refine.txt").write_text(task(mode="refine", app_id="a1",
+                                         request_id="66666666-7777-4888-8999-aaaaaaaaaaaa"),
+                                    encoding="utf-8")
     (tmp / "adapt.json").write_text(json.dumps({"app_name": "Votes", "html": "<p>edited</p>"}), encoding="utf-8")
     (tmp / "page.html").write_text("x\n" * 30_000, encoding="utf-8")
 
@@ -368,20 +399,141 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli-parse-ok", code == 0 and json.loads(out)["page"] == PAGE)
     code, out = cli("parse", str(tmp / "bad.txt"))
     check("cli-parse-malformed-prints-the-failed-reply", code == 1 and '"status": "failed"' in out)
-    code, out = cli("plan", str(tmp / "build.txt"))
+    led = str(tmp / "ledger")
+    code, out = cli("plan", str(tmp / "build.txt"), "--ledger", led)
     steps = json.loads(out)
     check("cli-plan-build", code == 0 and steps[0]["action"] == "commons.app_guide"
           and steps[-1]["action"] == "room.commons.apps.create")
-    code, out = cli("plan", str(tmp / "refine.txt"), "--adapt", str(tmp / "adapt.json"))
+    code, out = cli("plan", str(tmp / "refine.txt"), "--adapt", str(tmp / "adapt.json"), "--ledger", led)
     steps = json.loads(out)
     check("cli-plan-refine", code == 0 and steps[-1]["action"] == "room.commons.apps.update"
           and not any(s["action"] == "room.commons.databases.mutate" for s in steps))
-    code, out = cli("plan", str(tmp / "refine.txt"))
+    code, out = cli("plan", str(tmp / "refine.txt"), "--ledger", led)
     check("cli-plan-refine-needs-the-page", code == 1 and "refine needs the edited page" in out)
     code, out = cli("chunks", str(tmp / "page.html"))
     sizes = [int(n) for n in out.split()]
     check("cli-chunks", code == 0 and len(sizes) == 3 and max(sizes) <= ROOM_LIMIT)
     check("cli-usage", cli("frobnicate", "x")[0] == 2 and cli()[0] == 2)
     check("cli-unreadable-file", cli("parse", str(tmp / "absent.txt"))[0] == 2)
+    check("cli-parse-checks-the-sender", cli("parse", str(tmp / "build.txt"))[0] == 0)
+
+# --------------------------------------------------------------------------- who may ask, and for where
+for name, text, reason in [
+    ("not-the-owner", task(tier="team"), "only the owner"),
+    ("no-tier", task(tier=""), "only the owner"),
+    ("pasted-fence-no-headers", task(headers=False), "only the owner"),
+    ("no-source-room", task(channel=None), "which room"),
+    ("aimed-at-another-room", task(room_id="!other:s.space"), "not the room this request came from"),
+    ("source-room-wins-over-channel", task(source_room="!other:s.space"), "not the room"),
+]:
+    room = FakeRoom()
+    _, rep = reply_of(run(room, text))
+    check(f"auth-{name}-refused", rep["status"] == "failed" and reason in rep["reason"])
+    check(f"auth-{name}-touches-nothing", room.calls == [])
+_, rep = reply_of(run(FakeRoom(), task(channel="!dm:s.space", source_room=ROOM)))
+check("auth-source-room-is-the-trusted-one", rep["status"] == "done")
+
+# --------------------------------------------------------------------------- nothing is overwritten
+room = FakeRoom()
+room.pages[PAGE] = "<p>somebody's existing page</p>"
+_, rep = reply_of(run(room, task(template="poll")))
+check("build-refuses-a-non-empty-page", rep["status"] == "failed" and "not empty" in rep["reason"])
+check("build-left-the-page-alone", room.pages[PAGE] == "<p>somebody's existing page</p>")
+check("build-refused-before-any-write", room.write_sizes == [])
+room = FakeRoom(pages=(PAGE, "html"))
+room.pages["html"] = "<h1>the room's main page</h1>"
+_, rep = reply_of(run(room, task(template="poll", page="html")))
+check("build-refuses-the-main-page-with-content", rep["status"] == "failed"
+      and room.pages["html"] == "<h1>the room's main page</h1>")
+# Refine: the app must be in this room and on this page.
+room = FakeRoom(pages=(PAGE, "html-other001"))
+built = reply_of(run(room, task(template="tracker"), {"app_name": "Chores"}))[1]
+room.pages["html-other001"] = "<p>another app</p>"
+_, rep = reply_of(run(room, task(mode="refine", request_id="22222222-3333-4444-8555-666666666666",
+                                   description="x", app_id=built["app_id"], page="html-other001"),
+                         {"html": "<p>hijack</p>"}))
+check("refine-refuses-a-page-the-app-is-not-on", rep["status"] == "failed" and "not on page" in rep["reason"])
+check("refine-left-the-other-page-alone", room.pages["html-other001"] == "<p>another app</p>")
+_, rep = reply_of(run(room, task(mode="refine", request_id="33333333-4444-4555-8666-777777777777",
+                                   description="x", app_id="a9999999"), {"html": "<p>x</p>"}))
+check("refine-refuses-an-app-not-in-the-room", rep["status"] == "failed" and "not in this room" in rep["reason"])
+
+# --------------------------------------------------------------------------- refine reports the database
+room = FakeRoom()
+built = reply_of(run(room, task(template="poll"), {"app_name": "Votes"}))[1]
+line, rep = reply_of(run(room, task(mode="refine", request_id="44444444-5555-4666-8777-888888888888",
+                                      description="bigger buttons", app_id=built["app_id"]),
+                         {"html": room.pages[PAGE].replace("44px", "56px"), "app_name": "Votes"}))
+check("refine-reply-has-all-three-ids", rep["status"] == "done" and rep.get("page") == PAGE
+      and rep.get("app_id") == built["app_id"] and rep.get("database") == built["database"])
+check("refine-reply-database-is-bare", not str(rep.get("database", "db:")).startswith("db:"))
+
+# --------------------------------------------------------------------------- a failure mid-write says so
+class FailsOnAppend(FakeRoom):
+    def call(self, step):
+        if step["action"] == "room.commons.pages.append":
+            raise Refused("429: rate limited")
+        return super().call(step)
+
+_, rep = reply_of(run(FailsOnAppend(), task(), {"html": big, "app_name": "Big"}))
+check("mid-write-failure-says-partly-written", rep["status"] == "failed"
+      and "partly written" in rep["reason"] and "429" in rep["reason"])
+_, rep = reply_of(run(FakeRoom(pages=()), task()))
+check("failure-before-any-write-does-not-say-partly", "partly" not in rep["reason"])
+
+# --------------------------------------------------------------------------- the ledger itself
+with tempfile.TemporaryDirectory() as d:
+    led = br.Ledger(Path(d))
+    rid = "55555555-6666-4777-8888-999999999999"
+    check("ledger-first-claim", led.claim(ROOM, rid, now=1000.0) == ("claimed", None))
+    check("ledger-second-claim-is-busy", led.claim(ROOM, rid, now=1001.0) == ("busy", None))
+    check("ledger-abandoned-claim-is-taken-over",
+          led.claim(ROOM, rid, now=1000.0 + br.CLAIM_TTL_S + 1) == ("claimed", None))
+    led.record(ROOM, rid, "the reply")
+    check("ledger-recorded-reply-is-returned", led.claim(ROOM, rid) == ("done", "the reply"))
+    check("ledger-is-keyed-per-room", led.claim("!another:s.space", rid) == ("claimed", None))
+    try:
+        led.claim(ROOM, "../../etc/passwd")
+        check("ledger-refuses-a-non-uuid-id", False)
+    except ValueError:
+        check("ledger-refuses-a-non-uuid-id", True)
+
+# --------------------------------------------------------------------------- the agent's path dedupes too
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    led_dir = str(tmp / "ledger")
+    (tmp / "t.txt").write_text(task(template="poll"), encoding="utf-8")
+    code1, out1 = cli("plan", str(tmp / "t.txt"), "--ledger", led_dir)
+    check("cli-plan-claims-the-request", code1 == 0 and json.loads(out1)[0]["action"] == "commons.app_guide")
+    code2, _ = cli("plan", str(tmp / "t.txt"), "--ledger", led_dir)
+    check("cli-plan-again-while-building-is-busy", code2 == 4)
+    code3, out3 = cli("reply", str(tmp / "t.txt"), "--ledger", led_dir, "--status", "done",
+                      "--page", PAGE, "--database", "db:d7k2m9x1", "--app-id", "a1", "--line", "Built it.")
+    _, rec = reply_of(out3)
+    check("cli-reply-records-and-prints", code3 == 0 and rec["status"] == "done"
+          and rec["database"] == "d7k2m9x1" and out3.startswith("Built it."))
+    code4, out4 = cli("plan", str(tmp / "t.txt"), "--ledger", led_dir)
+    check("cli-plan-after-a-reply-returns-the-recorded-reply", code4 == 3 and out4.strip() == out3.strip())
+    check("cli-reply-needs-a-status", cli("reply", str(tmp / "t.txt"), "--ledger", led_dir)[0] == 2)
+    (tmp / "nofence.txt").write_text("hello", encoding="utf-8")
+    check("cli-reply-needs-a-request-id", cli("reply", str(tmp / "nofence.txt"), "--ledger", led_dir,
+                                              "--status", "done")[0] == 2)
+    check("cli-adapt-without-a-value-is-usage", cli("plan", str(tmp / "t.txt"), "--ledger", led_dir,
+                                                     "--adapt")[0] == 2)
+
+# --------------------------------------------------------------------------- refine is deduped too
+with tempfile.TemporaryDirectory() as d:
+    led = br.Ledger(Path(d))
+    room = FakeRoom()
+    built = reply_of(run(room, task(template="poll"), {"app_name": "Votes"}, led))[1]
+    refine = task(mode="refine", request_id="77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+                  description="bigger buttons", app_id=built["app_id"])
+    edited = room.pages[PAGE].replace("44px", "56px")
+    first = run(room, refine, {"html": edited, "app_name": "Votes"}, led)
+    n, writes = len(room.calls), len(room.write_sizes)
+    again = run(room, refine, {"html": "<p>a different edit</p>", "app_name": "Votes"}, led)
+    check("refine-resend-gets-the-same-reply", again == first and reply_of(first)[1]["status"] == "done")
+    check("refine-resend-writes-nothing", len(room.calls) == n and len(room.write_sizes) == writes
+          and room.pages[PAGE] == edited)
 
 print(f"commons-app-builder build request: {len(passed)} passed")
