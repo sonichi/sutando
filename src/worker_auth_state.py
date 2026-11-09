@@ -36,6 +36,10 @@ clears the state:
 - `idle_since_sign_in(pane)` is True when "Login successful" is the newest thing on a
   Claude pane: no turn ran, finished or was submitted after it.
 
+"Login successful" counts only as /login's own result row (`  ⎿  Login successful`, or at
+column 0 once the frame scrolled) with no agent output before it in its turn; the words
+in a tool result, the agent's prose or a quoted prompt are not a sign-in.
+
 A watcher re-arm or a task-status row is not readable from the pane, so that
 evidence belongs to the pool sweep, not to this reading.
 """
@@ -49,7 +53,10 @@ from typing import List, Optional, Tuple
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from cli_wedge import needs_login_line  # noqa: E402 — the one banner grammar
 
-LOGGED_IN_AGAIN = re.compile(r"^login successful\b", re.I)
+# /login's own result row: "  ⎿  Login successful", or that row at column 0 once the
+# frame has scrolled. Indented text without the glyph is prose or a quoted prompt.
+LOGGED_IN_AGAIN = re.compile(r"login successful\.?", re.I)
+_RESULT_ROW = re.compile(r"^(?:\s*⎿|\S)")
 # The completed-turn line ("✻ Worked for 0s", "✻ Cooked for 1m 3s · done 12:32 PM"); the
 # spinner reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 TURN_DONE = re.compile(
@@ -108,9 +115,18 @@ def _real_turn(rows, done: int) -> bool:
     return any(_ran(r, None) for r in rows[_turn_start(rows, done) + 1:done])
 
 
+def _sign_in_row(rows, i: int, runtime: Optional[str] = None) -> bool:
+    """Row `i` is the CLI's /login result: the whole row says so, in result-row form, and
+    no agent output or tool call precedes it in its turn (that would make it quoted)."""
+    core, raw = rows[i]
+    if not (LOGGED_IN_AGAIN.fullmatch(core) and _RESULT_ROW.match(raw)):
+        return False
+    return not any(_ran(r, runtime) for r in rows[_turn_start(rows, i, runtime) + 1:i])
+
+
 def _signed_in_after(rows, idx: int, runtime: Optional[str] = None) -> bool:
     for j in range(idx + 1, len(rows)):
-        if LOGGED_IN_AGAIN.match(rows[j][0]) or _ran(rows[j], runtime):
+        if _sign_in_row(rows, j, runtime) or _ran(rows[j], runtime):
             return True
         if runtime != CODEX and TURN_DONE.match(rows[j][0]) and _real_turn(rows, j):
             return True
@@ -160,7 +176,7 @@ def authenticated_turn(pane: Optional[str], runtime: Optional[str] = None) -> bo
     rows = _rows(pane)
     if login_expired(pane, runtime) is not None:
         return False
-    if any(LOGGED_IN_AGAIN.match(c) for c, _r in rows):
+    if any(_sign_in_row(rows, i, runtime) for i in range(len(rows))):
         return True
     if runtime == CODEX:
         return any(_ran(r, runtime) and any(_is_prompt(c, runtime) for c, _x in rows[i + 1:])
@@ -174,7 +190,7 @@ def idle_since_sign_in(pane: Optional[str], runtime: Optional[str] = None) -> bo
     if runtime == CODEX:
         return False
     rows = _rows(pane)
-    last = max((i for i, (c, _r) in enumerate(rows) if LOGGED_IN_AGAIN.match(c)), default=None)
+    last = max((i for i in range(len(rows)) if _sign_in_row(rows, i, runtime)), default=None)
     if last is None:
         return False
     after = rows[last + 1:]

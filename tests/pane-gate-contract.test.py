@@ -1658,6 +1658,12 @@ class ALoginAfterTheLimitReleasesThePane(unittest.TestCase):
         v = self.classify(self.REFUSED + self.IDLE)
         self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
 
+    def test_the_words_in_a_quoted_prompt_do_not_release_the_limit(self):
+        quoted = "\u276f the worker said:\n  Login successful\n  is that enough?\n"
+        self.assertFalse(pg.signed_in_after_limit(self.REFUSED + quoted + self.IDLE))
+        v = self.classify(self.REFUSED + quoted + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
     def test_control_a_refusal_after_the_login_still_holds(self):
         v = self.classify(self.LOGIN + self.REFUSED + self.IDLE)
         self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
