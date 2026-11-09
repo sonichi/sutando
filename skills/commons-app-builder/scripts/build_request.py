@@ -489,7 +489,8 @@ def completion(request_id: Optional[str], status: str, reason: str = "",
                             "reason": reason}
     body.update({k: v for k, v in found.items() if v})
     human = line or (f"Could not build the app: {reason}" if status == "failed" else "Done.")
-    return f"{human}\n\n```{FENCE}\n{json.dumps(body, ensure_ascii=False)}\n```"
+    # Compact, as BUILD_REQUEST.md shows it, so the reply matches the spec byte for byte.
+    return f"{human}\n\n```{FENCE}\n{json.dumps(body, ensure_ascii=False, separators=(',', ':'))}\n```"
 
 
 def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],

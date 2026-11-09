@@ -195,6 +195,17 @@ for r in replies:
     check(f"spec-reply-keys-{r['status']}",
           {"v", "request_id", "status", "reason"} <= set(r) and "mode" not in r)
 
+# The reply the code produces IS the spec's literal reply, byte for byte (the panel was told so).
+done_lit = re.search(r"^(Built [^\n]*\n\n```commons-app-build\n[^\n]*\n```)", SPEC, re.M).group(1)
+d = json.loads(done_lit.split("```commons-app-build\n", 1)[1].rsplit("\n```", 1)[0])
+ours = br.completion(d["request_id"], "done", "", done_lit.split("\n", 1)[0],
+                     page=d["page"], database=d["database"], app_id=d["app_id"])
+check("reply-matches-the-spec-byte-for-byte", ours == done_lit)
+fail_lit = re.search(r"^(Could not build the app: [^\n]*\n\n```commons-app-build\n[^\n]*\n```)", SPEC, re.M).group(1)
+f = json.loads(fail_lit.split("```commons-app-build\n", 1)[1].rsplit("\n```", 1)[0])
+check("failed-reply-matches-the-spec-byte-for-byte",
+      br.completion(f["request_id"], "failed", f["reason"]) == fail_lit)
+
 # --------------------------------------------------------------------------- a build
 room = FakeRoom()
 out = run(room, task(template="poll"),
@@ -411,7 +422,7 @@ with tempfile.TemporaryDirectory() as tmp:
     code, out = cli("parse", str(tmp / "build.txt"))
     check("cli-parse-ok", code == 0 and json.loads(out)["page"] == PAGE)
     code, out = cli("parse", str(tmp / "bad.txt"))
-    check("cli-parse-malformed-prints-the-failed-reply", code == 1 and '"status": "failed"' in out)
+    check("cli-parse-malformed-prints-the-failed-reply", code == 1 and '"status":"failed"' in out)
     led = str(tmp / "ledger")
     code, out = cli("plan", str(tmp / "build.txt"), "--ledger", led)
     steps = json.loads(out)
