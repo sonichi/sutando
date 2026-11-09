@@ -35,7 +35,8 @@ _ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
 _DB_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,119}$")
 _APP_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,80}$")
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
+# The skill's own folder, for its templates/; not the workspace.
+SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 TEMPLATE_DIR = SKILL_DIR / "templates"
 
 

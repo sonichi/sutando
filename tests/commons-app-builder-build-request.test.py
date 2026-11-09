@@ -213,10 +213,19 @@ pieces = br.chunks(big)
 check("chunks-rejoin-exactly", "".join(pieces) == big)
 check("chunks-within-limit", all(len(p.encode()) <= ROOM_LIMIT for p in pieces))
 check("chunks-end-on-whole-lines", all(p.endswith("\n") for p in pieces[:-1]))
-odd = "\U0001F600" * 30_000                           # no line breaks, 4-byte characters only
+# 3-byte characters, no line breaks: 20,000 is not a multiple of 3, so a cut lands mid-character
+# and the chunker must step back (4-byte ones would not test it: 20,000 divides by 4).
+odd = "\u2603" * 20_000
+check("odd-test-really-cuts-mid-character", ROOM_LIMIT % 3 != 0)
 odd_pieces = br.chunks(odd)
 check("chunks-never-split-a-character", "".join(odd_pieces) == odd
       and all(len(p.encode()) <= ROOM_LIMIT for p in odd_pieces))
+check("chunks-step-back-to-a-whole-character", all(len(p.encode()) % 3 == 0 for p in odd_pieces))
+try:
+    br.chunks("abc", limit=3)
+    check("chunks-refuse-a-tiny-limit", False)
+except ValueError:
+    check("chunks-refuse-a-tiny-limit", True)
 room = FakeRoom()
 out = run(room, task(), {"html": big, "app_name": "Big"})
 _, rep = reply_of(out)
@@ -313,5 +322,66 @@ for name in br.TEMPLATES:
     res = cp.check(room.pages[PAGE])
     check(f"template-{name}-builds", rep["status"] == "done" and res["ok"])
     check(f"template-{name}-within-limit", max(room.write_sizes) <= ROOM_LIMIT)
+
+# --------------------------------------------------------------------------- more malformed shapes
+for name, text, reason in [
+    ("fence-holds-a-list", "x\n\n```commons-app-build\n[1, 2]\n```", "not a JSON object"),
+    ("non-string-field", task(description=7), "`description` is not a string"),
+    ("bad-db-id", task(database="has space"), "`database` is not a database id"),
+    ("bad-app-id", task(app_id="bad id!"), "`app_id` is not an app id"),
+]:
+    _, rep = reply_of(run(FakeRoom(), text))
+    check(f"malformed-{name}-fails", rep["status"] == "failed" and reason in rep["reason"])
+check("request-id-of-unreadable-is-none", br.request_id_of("no fence here") is None)
+
+# --------------------------------------------------------------------------- a bad read-back
+class LossyRoom(FakeRoom):
+    """Stores one byte short, so the read-back does not match what was written."""
+    def _write(self, kind, text, append):
+        super()._write(kind, text[:-1] if not append else text, append)
+
+_, rep = reply_of(run(LossyRoom(), task(template="poll")))
+check("read-back-mismatch-fails", rep["status"] == "failed" and "read back" in rep["reason"])
+
+# --------------------------------------------------------------------------- the command line
+import contextlib
+import io
+import tempfile
+
+
+def cli(*args):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        code = br.main(list(args))
+    return code, out.getvalue()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    (tmp / "build.txt").write_text(task(template="poll"), encoding="utf-8")
+    (tmp / "bad.txt").write_text(task(page=""), encoding="utf-8")
+    (tmp / "refine.txt").write_text(task(mode="refine", app_id="a1"), encoding="utf-8")
+    (tmp / "adapt.json").write_text(json.dumps({"app_name": "Votes", "html": "<p>edited</p>"}), encoding="utf-8")
+    (tmp / "page.html").write_text("x\n" * 30_000, encoding="utf-8")
+
+    code, out = cli("parse", str(tmp / "build.txt"))
+    check("cli-parse-ok", code == 0 and json.loads(out)["page"] == PAGE)
+    code, out = cli("parse", str(tmp / "bad.txt"))
+    check("cli-parse-malformed-prints-the-failed-reply", code == 1 and '"status": "failed"' in out)
+    code, out = cli("plan", str(tmp / "build.txt"))
+    steps = json.loads(out)
+    check("cli-plan-build", code == 0 and steps[0]["action"] == "commons.app_guide"
+          and steps[-1]["action"] == "room.commons.apps.create")
+    code, out = cli("plan", str(tmp / "refine.txt"), "--adapt", str(tmp / "adapt.json"))
+    steps = json.loads(out)
+    check("cli-plan-refine", code == 0 and steps[-1]["action"] == "room.commons.apps.update"
+          and not any(s["action"] == "room.commons.databases.mutate" for s in steps))
+    code, out = cli("plan", str(tmp / "refine.txt"))
+    check("cli-plan-refine-needs-the-page", code == 1 and "refine needs the edited page" in out)
+    code, out = cli("chunks", str(tmp / "page.html"))
+    sizes = [int(n) for n in out.split()]
+    check("cli-chunks", code == 0 and len(sizes) == 3 and max(sizes) <= ROOM_LIMIT)
+    check("cli-usage", cli("frobnicate", "x")[0] == 2 and cli()[0] == 2)
+    check("cli-unreadable-file", cli("parse", str(tmp / "absent.txt"))[0] == 2)
 
 print(f"commons-app-builder build request: {len(passed)} passed")
