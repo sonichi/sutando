@@ -280,5 +280,39 @@ class IdleSinceSignIn(unittest.TestCase):
         self.assertFalse(idle_since_sign_in(self.SIGNED_IN + FOOTER, "codex"))
 
 
+
+# The words quoted where /login's result row is not: a tool result, the agent's prose, a
+# multi-line prompt the owner typed. Each renders as Claude Code draws it.
+QUOTED_LOGIN = {
+    "tool result": "❯ check the auth log\n⏺ Bash(tail -1 auth.log)\n  ⎿  Login successful\n",
+    "assistant prose": "❯ did it work?\n● The CLI printed this line:\n  Login successful\n",
+    "quoted user message": "❯ the worker said:\n  Login successful\n  is that enough?\n",
+}
+
+
+class QuotedLoginSuccessfulIsNotASignIn(unittest.TestCase):
+    """Only /login's own result row ("  ⎿  Login successful", or that row at column 0 in
+    a scrolled frame) is a sign-in; the same words anywhere else prove nothing."""
+
+    def test_the_words_quoted_elsewhere_are_not_a_sign_in(self):
+        for name, quoted in QUOTED_LOGIN.items():
+            with self.subTest(name):
+                self.assertFalse(idle_since_sign_in(REFUSED + quoted + FOOTER))
+                self.assertFalse(idle_since_sign_in(quoted + FOOTER))
+                self.assertFalse(authenticated_turn(quoted + FOOTER))
+
+    def test_a_quoted_prompt_does_not_answer_a_refusal(self):
+        quoted = QUOTED_LOGIN["quoted user message"]
+        self.assertFalse(signed_in_since(quoted + FOOTER))
+        self.assertFalse(refusal_answered(REFUSED + quoted + FOOTER))
+        self.assertEqual(login_expired(REFUSED + quoted + FOOTER), EXPIRED)
+
+    def test_control_the_result_row_forms_still_count(self):
+        for row in ("❯ /login\n  ⎿  Login successful\n", "  ⎿  Login successful\n", "Login successful\n"):
+            with self.subTest(row):
+                self.assertTrue(idle_since_sign_in(REFUSED + row + FOOTER))
+                self.assertTrue(signed_in_since(row + FOOTER))
+                self.assertTrue(authenticated_turn(row + FOOTER))
+
 if __name__ == "__main__":
     unittest.main()
