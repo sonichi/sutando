@@ -576,7 +576,8 @@ answers before the rule above:
   key holds and its `agent_mxid`; with no room, the worker's only enabled row;
 - a room local state says is the core's stays with the core's rows: one where a core lane has a
   task open and the worker's lane has none (that task is answered as the core's agent), and a
-  core lane's own owner DM (`state/owner-routing[.<instance>].json`);
+  core lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a
+  launch-key alias its bridge runs as);
 - a disconnected row, a room on a server the worker has no row for, another worker's session
   and the core's session all fall through to the rule above. The core never acts as a worker's
   agent.

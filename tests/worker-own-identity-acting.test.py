@@ -70,8 +70,8 @@ def row(server, instance, gateway_url, agent, **extra):
     return r
 
 
-def rows(**own):
-    return [row("alpha-fixture.net", "alpha", ALPHA, CORE_AGENT, primary=True),
+def rows(core=None, **own):
+    return [row("alpha-fixture.net", "alpha", ALPHA, CORE_AGENT, primary=True, **(core or {})),
             row("beta-fixture.net", "beta", BETA, BETA_AGENT),
             row("alpha-fixture.net", OWN, ALPHA, OWN_AGENT, worker=W, **own)]
 
@@ -169,6 +169,28 @@ class TheCoresRooms(Base):
         self.owner_dm("alpha", CORE_AGENT, CORE_DM)
         self.assertEqual(self.instance(CORE_DM, SEAT), "alpha")
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
+
+    def test_a_core_bridge_running_under_a_launch_key_alias_keeps_both(self):
+        self.record(rows(core={"launch_keys": [C.token_ref_for("alias")]}))
+        for name in ("alpha", "alias"):
+            with self.subTest(owner_dm_written_as=name):
+                self.owner_dm(name, CORE_AGENT, CORE_DM)
+                self.assertEqual(self.instance(CORE_DM, SEAT), "alpha")
+                (self.ws / "state" / f"owner-routing.{name}.json").unlink()
+            with self.subTest(task_rooms_written_as=name):
+                self.open_task(name, ROOM)
+                self.assertEqual(self.instance(ROOM, SEAT), "alpha")
+                (self.ws / "state" / f"remote-task-rooms.{name}.json").unlink()
+        self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
+        self.assertEqual(C.task_agent_mxid("task-alias~abc123", self.ws), CORE_AGENT)
+
+    def test_an_alias_record_bound_to_another_agent_or_not_private_is_no_owner_dm(self):
+        self.record(rows(core={"launch_keys": [C.token_ref_for("alias")]}))
+        self.owner_dm("alias", "@someone:alpha-fixture.net", CORE_DM)
+        self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
+        (self.ws / "state" / "owner-routing.alias.json").write_text(json.dumps(
+            {"owner_dm": CORE_DM, "private": False, "identity": CORE_AGENT}))
+        self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
 
     def test_a_room_id_naming_no_server_follows_the_lane_that_holds_it(self):
         self.open_task(OWN, "!bare")

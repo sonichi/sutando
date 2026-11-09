@@ -1499,10 +1499,9 @@ def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     return bool(instance) and instance in [owner["instance"]] + alias_instances(owner)
 
 
-def _lane_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> str:
-    """The checked owner DM the row's bridge has on disk (state/owner-routing<suffix>.json: a private
-    room, bound to the row's agent when the row names one); "" when none. Every lane reads it alike."""
-    inst = str(row.get("instance") or "")
+def _owner_dm_as(row: Mapping[str, object], inst: str, workspace: Optional[Path]) -> str:
+    """The checked owner DM the row's bridge wrote while running as `inst` (state/owner-routing<suffix>.json:
+    a private room, bound to the row's agent when the row names one); "" when none."""
     path = _workspace(workspace) / "state" / f"owner-routing{'.' + inst if inst else ''}.json"
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
@@ -1515,7 +1514,14 @@ def _lane_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> str:
 
 
 def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
-    return bool(_lane_owner_dm(row, workspace))
+    """Whether the row's bridge has a checked owner DM on disk under its own instance. Every lane reads it alike."""
+    return bool(_owner_dm_as(row, str(row.get("instance") or ""), workspace))
+
+
+def _lane_owner_dms(row: Mapping[str, object], workspace: Optional[Path]) -> set:
+    """Every checked owner DM of the row's bridge, under its instance or a launch-key alias it runs as."""
+    names = [str(row.get("instance") or "")] + alias_instances(row)
+    return {dm for dm in (_owner_dm_as(row, inst, workspace) for inst in names) if dm}
 
 
 def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
@@ -2156,7 +2162,7 @@ def acting_identity(rows: list, room_id: Optional[str], worker: str,
     if mine is None or _lane_holds_room(mine, room_id, workspace):
         return mine
     core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
-    if any(_lane_holds_room(r, room_id, workspace) or _lane_owner_dm(r, workspace) == room_id for r in core):
+    if any(_lane_holds_room(r, room_id, workspace) or room_id in _lane_owner_dms(r, workspace) for r in core):
         return None
     return mine
 
