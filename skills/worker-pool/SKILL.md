@@ -138,6 +138,11 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 - It posts nothing proactively.
 - It never becomes primary.
 
+The core owns that identity's lifecycle and its lane; the worker's session uses it. From the worker's seat, room
+clients (`room_ops.py`, `notify.py`, the room-database adapters) act as the worker's own agent in rooms on its
+server, through the one resolver (`connections.acting_identity`, see `docs/connections.md`, "In a pool worker's
+session"). A task a core lane routed to the worker is still answered as the core's agent.
+
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
 python3 skills/worker-pool/scripts/pool_identity.py show <worker>
