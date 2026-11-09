@@ -37,8 +37,10 @@ contract; follow it exactly, because the panel parses your reply.
    nothing else. **Exit 4:** another run is building it; send nothing. Otherwise run the Actions
    through the s.space MCP in that order, substituting `$db` and `$app` as they are answered.
    After every step that has an `expect_…` key (room membership, the page, the empty page, the
-   app, the database), save its result and run `build_request.py check plan.json <n> result.json`;
-   on exit 1 stop and reply `failed` with the reason it printed.
+   app, the database, the first page write), save the tool's whole reply as it came back, wrapper
+   included, and run `build_request.py check plan.json <n> result.json`. On exit 1 stop and reply
+   `failed` with the reason it printed; a reply without what the check reads fails too. On exit 0
+   it prints `{"present": [...]}`: skip each later step whose `skip_if_present` is listed there.
 5. `build_request.py reply task.txt --status done|failed …` prints the reply and records it.
    Send exactly that to the private task, and nothing in the room. On any refusal reply `failed`
    with the Action's reason rather than retrying blindly.

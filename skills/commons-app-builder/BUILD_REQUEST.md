@@ -65,7 +65,10 @@ Nothing is overwritten that is not this request's:
 
 - a **build** writes only into an **empty** page — the page the panel just created. A page with
   any content is refused before anything is written, including the room's main page `html`. It
-  is read again right before the first page write, so a write in the room meanwhile is kept;
+  is read again right before the first page write, so a write in the room meanwhile is kept. The
+  backend has no conditional write, so a write in the instant between that read and the replace
+  is not prevented; the replace then reports the version it displaced, and the agent replies
+  `failed` naming that version, so nothing is lost;
 - a **refine** writes only into the page of the app it names: `app_id` must be in the room and on
   `page`, checked with `room.commons.apps.list` before anything is written.
 
@@ -77,10 +80,12 @@ Nothing is overwritten that is not this request's:
    page (`room.commons.apps.list`); and the database, if one was sent, exists
    (`room.commons.databases.list`). Any failure refuses the request with nothing written.
    `build_request.py check` makes each of these a pass or fail in code, not a reading of prose.
+   Each needs positive evidence: a read without the field it checks fails.
 3. **Build:** picks the template (the request's, else one matching the description), adapts it —
    the app's name, its database's name, option lists, and any further edit the description needs —
    creates the database with `room.commons.pages.create` `{kind: "db", template: "blank"}` when none
-   was sent, and adds the template's columns and views it lacks.
+   was sent, and adds the template's columns it lacks. The template's views go only into a
+   database it created: `databases.list` shows no views, so a chosen database keeps its own.
    **Refine:** reads the page, edits it to match the instruction, and changes no database.
 4. Writes the page with `room.commons.pages.replace` `{mode: "whole"}` then
    `room.commons.pages.append`, **every write at most 20,000 bytes** and cut at a line break, so the

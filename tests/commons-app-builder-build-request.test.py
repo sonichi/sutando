@@ -123,8 +123,11 @@ class FakeRoom:
             return {"ok": True}
         if action == "room.commons.pages.replace":
             assert args["mode"] == "whole"
+            displaced = bool(self.pages.get(args["kind"]))
             self._write(args["kind"], args["new_text"], append=False)
-            return {"kind": args["kind"], "mode": "whole"}
+            # writes.py PagesReplaceResult: the version holding the page as it was, None if empty.
+            return {"kind": args["kind"], "mode": "whole",
+                    "version_id": self._id("v").lower().ljust(10, "0")[:10] if displaced else None}
         if action == "room.commons.pages.append":
             self._write(args["kind"], args["text"], append=True)
             return {"kind": args["kind"], "appended_bytes": len(args["text"].encode())}
@@ -180,6 +183,11 @@ def task(*, tier="owner", kind="dm", user=OWNER, headers=True, stamp=True, layou
 def one_line(value):
     """The gateway's own flattening (remote_gateway_bridge._one_line)."""
     return " ".join(str(value).splitlines())
+
+
+def envelope_of(inner):
+    """A result as the MCP tool replies with it (room.action.read), wrapper and all."""
+    return {"status": "completed", "action": "x", "result": inner}
 
 
 def reply_of(text):
@@ -639,6 +647,18 @@ with tempfile.TemporaryDirectory() as tmp:
     joined = result("in.json", {"members": [{"user_id": OWNER}, {"user_id": AGENT}]})
     absent = result("out.json", {"members": [{"user_id": AGENT}]})
     check("check-owner-joined-passes", cli("check", str(tmp / "plan.json"), str(member_step), joined)[0] == 0)
+    wrapped = result("wrapped.json", envelope_of({"total_bytes": 500, "text": "x" * 500}))
+    check("check-the-tools-wrapped-reply-is-unwrapped",
+          cli("check", str(tmp / "plan.json"), str(empty_step), wrapped)[0] == 1)
+    check("check-an-empty-object-fails-closed",
+          cli("check", str(tmp / "plan.json"), str(empty_step), result("none.json", {}))[0] == 1)
+    given_db = br.plan(dict(br.parse(task(database="d1")), owner=OWNER), "<p>x</p>",
+                       br.load_template("poll")[1], "X")
+    db_idx = next(i for i, st in enumerate(given_db) if st.get("expect_database"))
+    (tmp / "db.json").write_text(json.dumps(given_db), encoding="utf-8")
+    code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs.json", envelope_of(
+        {"databases": [{"database": "db:d1", "properties": [{"name": "Choice"}]}]})))
+    check("check-prints-the-columns-already-there", code == 0 and json.loads(out)["present"] == ["Choice"])
     code, out = cli("check", str(tmp / "plan.json"), str(member_step), absent)
     check("check-owner-absent-fails", code == 1 and "the owner is not in room" in out)
     full = result("full.json", {"total_bytes": 9, "text": "<p>x</p>"})
@@ -657,6 +677,100 @@ with tempfile.TemporaryDirectory() as tmp:
         check("cli-parse-resolves-no-ledger", cli("parse", str(tmp / "t.txt"))[0] == 0)
     finally:
         br.default_ledger = real_default
+
+# --------------------------------------------------------------------------- every check needs positive evidence
+by_key = {k: next(st for st in steps if st.get(k)) for k in ("expect_member", "expect_page", "expect_empty")}
+refine_steps = br.plan(dict(br.parse(task(mode="refine", app_id="a1")), owner=OWNER), "<p>x</p>", None, "X")
+by_key["expect_app"] = next(st for st in refine_steps if st.get("expect_app"))
+db_steps = br.plan(dict(br.parse(task(database="d1")), owner=OWNER), "<p>x</p>",
+                   br.load_template("poll")[1], "X")
+by_key["expect_database"] = next(st for st in db_steps if st.get("expect_database"))
+good = {"expect_member": {"members": [{"user_id": OWNER}]},
+        "expect_page": {"pages": [{"kind": PAGE}]},
+        "expect_empty": {"total_bytes": 0, "text": ""},
+        "expect_app": {"apps": [{"id": "a1", "page": PAGE, "database": "db:d1"}]},
+        "expect_database": {"databases": [{"database": "db:d1", "properties": []}]}}
+for key, step in by_key.items():
+    br.verify(step, good[key])
+    br.verify(step, envelope_of(good[key]))           # the MCP tool's own reply, saved whole
+    check(f"evidence-{key}-passes-bare-and-wrapped", True)
+    for label, bad in (("missing", {}), ("null", None), ("list", []), ("error-only", {"error": "x"}),
+                       ("wrapped-empty", envelope_of({}))):
+        try:
+            br.verify(step, bad)
+            check(f"evidence-{key}-{label}-fails", False)
+        except br.ActionFailed:
+            check(f"evidence-{key}-{label}-fails", True)
+for label, value in (("string", "0"), ("bool", False), ("null", None)):
+    try:
+        br.verify(by_key["expect_empty"], {"total_bytes": value})
+        check(f"evidence-empty-total-bytes-{label}-fails", False)
+    except br.ActionFailed:
+        check(f"evidence-empty-total-bytes-{label}-fails", True)
+try:
+    br.verify(by_key["expect_empty"], envelope_of({"total_bytes": 500}))
+    check("evidence-wrapped-non-empty-page-fails", False)
+except br.ActionFailed as error:
+    check("evidence-wrapped-non-empty-page-fails", "not empty" in str(error))
+
+
+class HidesTheSize(FakeRoom):
+    """A read that answers without total_bytes: the reviewer's repro."""
+
+    def call(self, step):
+        result = super().call(step)
+        if step["action"] == "room.commons.pages.read":
+            result.pop("total_bytes")
+        return result
+
+
+room = HidesTheSize()
+room.pages[PAGE] = "<p>kept</p>"
+_, rep = reply_of(run(room, task(template="poll")))
+check("a-read-without-a-size-refuses", rep["status"] == "failed" and room.pages[PAGE] == "<p>kept</p>"
+      and room.write_sizes == [])
+
+
+class WrittenAtTheLastMoment(FakeRoom):
+    """Someone writes between the last empty read and the replace: the gap a read cannot close."""
+
+    def call(self, step):
+        if step["action"] == "room.commons.pages.replace":
+            self.pages[PAGE] = "<p>theirs</p>"
+        return super().call(step)
+
+
+room = WrittenAtTheLastMoment()
+_, rep = reply_of(run(room, task(template="poll")))
+check("a-displaced-page-is-reported-with-its-version", rep["status"] == "failed"
+      and "previous version is v" in rep["reason"] and "partly written" in rep["reason"])
+check("a-displaced-page-registers-no-app", not room.apps)
+check("refine-may-displace-its-own-page", next(
+    st for st in refine_steps if st["action"] == "room.commons.pages.replace")["expect_replaced_empty"] is False)
+check("a-chosen-database-gets-no-views", not any(
+    st["arguments"].get("op") == "view_add" for st in db_steps))
+check("a-new-database-gets-the-templates-views", any(
+    st["arguments"].get("op") == "view_add" for st in br.plan(
+        dict(br.parse(task()), owner=OWNER), "<p>x</p>", br.load_template("poll")[1], "X")))
+
+# --------------------------------------------------------------------------- the fence, decoded
+for name, text, want in [
+    ("backticks-in-the-description", task(description="use ``` fences"), "use ``` fences"),
+    ("one-line-with-a-trailing-word", task(raw='hi ```commons-app-build {"v":1,"request_id":'
+     '"3f2b9c1e-7a4d-4e8b-9f61-2c5d8a0b7e14","mode":"build","description":"d","room_id":"'
+     + ROOM + '","page":"' + PAGE + '"} ``` thanks'), "d"),
+]:
+    check(f"fence-{name}", br.parse(text)["description"] == want)
+for name, raw, reason in [
+    ("unclosed", '```commons-app-build {"v":1}', "not closed"),
+    ("two-fences", '```commons-app-build {} ``` ```commons-app-build {} ```', "more than one"),
+    ("not-json", "```commons-app-build {nope} ```", "not JSON"),
+]:
+    try:
+        br.extract(raw)
+        check(f"fence-{name}-refused", False)
+    except br.RequestError as error:
+        check(f"fence-{name}-refused", reason in str(error))
 
 # --------------------------------------------------------------------------- the agent's path dedupes too
 with tempfile.TemporaryDirectory() as tmp:

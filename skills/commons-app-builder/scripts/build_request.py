@@ -40,7 +40,7 @@ MODES = ("build", "refine")
 CLAIM_TTL_S = 30 * 60            # a claim nobody finished stops blocking a retry after this
 
 # The gateway flattens a task body onto one line, so the fence may be on one line too.
-_FENCE_RE = re.compile(r"```" + re.escape(FENCE) + r"\s(.*?)\s*```", re.S)
+_OPENER_RE = re.compile(r"```" + re.escape(FENCE) + r"\s")
 _PAGE_RE = re.compile(r"^html(-[a-z0-9]{8})?$")          # the client's own PAGE_RE (appsModel.ts)
 _ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
 # A bare database id: the backend's DATABASE pattern (actions/commons/reads.py) without "db:".
@@ -89,15 +89,21 @@ def authorize(meta: Dict[str, str]) -> str:
 
 def extract(text: str) -> Dict[str, Any]:
     """The fenced JSON object in a task's text. A completion (it has "status") is not a request."""
-    blocks = _FENCE_RE.findall(text or "")
-    if not blocks:
+    text = text or ""
+    openers = list(_OPENER_RE.finditer(text))
+    if not openers:
         raise RequestError(f"no ```{FENCE} block in the task")
-    if len(blocks) > 1:
+    if len(openers) > 1:
         raise RequestError(f"more than one ```{FENCE} block in the task")
+    # Decoded from the opener, so backticks inside a JSON string do not end the block.
+    start = openers[0].end()
+    start += len(text[start:]) - len(text[start:].lstrip())
     try:
-        data = json.loads(blocks[0])
+        data, end = json.JSONDecoder().raw_decode(text, start)
     except json.JSONDecodeError as error:
         raise RequestError(f"the {FENCE} block is not JSON ({error.msg})") from None
+    if not text[end:].lstrip().startswith("```"):
+        raise RequestError(f"the {FENCE} block is not closed")
     if not isinstance(data, dict):
         raise RequestError(f"the {FENCE} block is not a JSON object")
     if "status" in data and "mode" not in data:
@@ -390,7 +396,8 @@ def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any
                           "skip_if_present": prop["name"],
                           "arguments": {"database": database, "op": "prop_add",
                                         "property": definition}})
-        for view in primary.get("views", []):
+        # A database the panel chose keeps its own views: they cannot be listed to check first.
+        for view in primary.get("views", []) if request.get("database") is None else []:
             settings = {k: v for k, v in view.items() if k in ("layout", "name", "groupBy", "dateBy")}
             steps.append({"action": "room.commons.databases.mutate", "room_id": room,
                           "arguments": {"database": database, "op": "view_add",
@@ -401,8 +408,10 @@ def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any
         # would otherwise be replaced.
         steps.append({"action": "room.commons.pages.read", "read": True, "room_id": room,
                       "arguments": {"kind": request["page"]}, "expect_empty": True})
+    # A whole replace answers the version it displaced: a build must have displaced none.
     steps.append({"action": "room.commons.pages.replace", "room_id": room,
-                  "arguments": {"kind": request["page"], "mode": "whole", "new_text": pieces[0]}})
+                  "arguments": {"kind": request["page"], "mode": "whole", "new_text": pieces[0]},
+                  "expect_replaced_empty": request["mode"] == "build"})
     for piece in pieces[1:]:
         steps.append({"action": "room.commons.pages.append", "room_id": room,
                       "arguments": {"kind": request["page"], "text": piece}})
@@ -458,37 +467,48 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
 
 def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[str, Any]] = None,
            present: Optional[set] = None) -> None:
-    """Raises ActionFailed when a step's result fails the step's check; records what it answers."""
+    """Raises ActionFailed when a step's result fails the step's check; records what it answers.
+
+    Every check needs positive evidence: a result that lacks what the check reads fails it."""
     answers = {} if answers is None else answers
     present = set() if present is None else present
-    if step.get("expect_empty") and result.get("total_bytes"):
-        raise ActionFailed(f"page {step['arguments']['kind']} is not empty; "
-                           "a build only writes into a new page")
+    result = unwrap(result)
+    kind = step["arguments"].get("kind")
+    if step.get("expect_empty"):
+        size = result.get("total_bytes")
+        if type(size) is not int:
+            raise ActionFailed(f"could not tell whether page {kind} is empty")
+        if size:
+            raise ActionFailed(f"page {kind} is not empty; a build only writes into a new page")
+    if step.get("expect_replaced_empty") and result.get("version_id"):
+        raise ActionFailed(_partial(f"page {kind} had content when it was replaced; its previous "
+                                    f"version is {result['version_id']}", True))
     if step.get("expect_app"):
         app_id, page = step["expect_app"]
-        apps = {a.get("id"): a for a in result.get("apps", [])}
+        apps = {a.get("id"): a for a in _listed(result, "apps")}
         if app_id not in apps:
             raise ActionFailed(f"app {app_id} is not in this room")
         if apps[app_id].get("page") != page:
             raise ActionFailed(f"app {app_id} is not on page {page}")
         answers["$app_db"] = bare(apps[app_id].get("database"))
     if "expect_member" in step:
-        joined = {m.get("user_id") for m in result.get("members", [])}
+        joined = {m.get("user_id") for m in _listed(result, "members")}
         if not step["expect_member"] or step["expect_member"] not in joined:
             raise ActionFailed(f"the owner is not in room {step.get('room_id')}")
     if step.get("expect_page"):
-        kinds = {p.get("kind") for p in result.get("pages", [])}
+        kinds = {p.get("kind") for p in _listed(result, "pages")}
         if step["expect_page"] not in kinds:
             raise ActionFailed(f"page {step['expect_page']} is not in this room")
     if step.get("expect_database"):
         # databases.list: databases[].database (maybe "db:"-prefixed), .properties[].name
-        dbs = {bare(d.get("database")): d for d in result.get("databases", [])}
+        dbs = {bare(d.get("database")): d for d in _listed(result, "databases")}
         found = dbs.get(bare(step["expect_database"]))
         if not found:
             raise ActionFailed(f"database {step['expect_database']} is not in this room")
         present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
     if (step.get("expect_bytes") is not None
-            and result.get("total_bytes") != step["expect_bytes"]):
+            and (type(result.get("total_bytes")) is not int
+                 or result["total_bytes"] != step["expect_bytes"])):
         raise ActionFailed(_partial("the page read back is not the page written", True))
     if step.get("answers") == "$db":
         answers["$db"] = bare(result.get("kind", ""))
@@ -497,6 +517,22 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         answers["$app"] = result.get("id") or app.get("id")
         if app.get("database"):
             answers["$app_db"] = bare(app["database"])
+
+
+def unwrap(result: Any) -> Dict[str, Any]:
+    """The Action's own result, also when given as the MCP tool's {"status", "result"} reply."""
+    if isinstance(result, dict) and isinstance(result.get("result"), dict) and "status" in result:
+        result = result["result"]
+    if not isinstance(result, dict):
+        raise ActionFailed("the Action returned no result")
+    return result
+
+
+def _listed(result: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+    items = result.get(key)
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+        raise ActionFailed(f"the Action's result has no {key} list")
+    return items
 
 
 def _partial(reason: str, written: bool) -> str:
@@ -593,11 +629,15 @@ def _check(args: List[str]) -> int:
     except (OSError, ValueError, IndexError, TypeError) as error:
         print(f"build_request: cannot check: {error}", file=sys.stderr)
         return 2
+    answers: Dict[str, Any] = {}
+    present: set = set()
     try:
-        verify(step, result if isinstance(result, dict) else {})
+        verify(step, result, answers, present)
     except ActionFailed as error:
         print(str(error))
         return 1
+    # What later steps use: skip a prop_add whose skip_if_present name is listed here.
+    print(json.dumps({"present": sorted(present), "answers": answers}, ensure_ascii=False))
     return 0
 
 
