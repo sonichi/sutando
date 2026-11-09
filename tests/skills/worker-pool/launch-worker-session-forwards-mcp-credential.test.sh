@@ -52,5 +52,19 @@ check $? "the workspace named is the seat's SUTANDO_WORKSPACE_DIR"
 ! grep -q "no MCP credential resolver" "$TMP/err"
 check $? "the launcher composed the argv without a warning"
 
+# A compose failure must not read as "not a worker seat": the proxy treats `[]` as an opted-in seat
+# with no resolver and refuses to start, where an empty value would fall back to the core's seat.
+REAL_PY="$(command -v python3)"
+mkdir -p "$TMP/stub"
+printf '#!/bin/sh\ncase "$*" in *worker-mcp-credential-argv*) echo "connections: fixture refusal" >&2; exit 1;; esac\nexec %s "$@"\n' "$REAL_PY" > "$TMP/stub/python3"
+chmod +x "$TMP/stub/python3"
+# shellcheck disable=SC2046
+env -i HOME="$HOME" PATH="$TMP/stub:$STUB_PATH" $(cat "$TMP/plan") \
+    bash "$REPO/skills/worker-pool/scripts/launch-worker-session.sh" --print-env > "$TMP/fwd2" 2>"$TMP/err2"
+grep -qxF -- "AG2_MCP_WORKER_CREDENTIAL=[]" "$TMP/fwd2"
+check $? "a failed compose exports [] (an opted-in seat with no resolver), never an empty value"
+grep -q "no MCP credential resolver for this worker (connections: fixture refusal)" "$TMP/err2"
+check $? "the warning names the resolver's reason"
+
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
