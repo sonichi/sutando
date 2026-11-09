@@ -7,10 +7,12 @@ a task, `claim_key` records `(room, source_message_id)` with the broker-attested
 SQLite store shared by every lane's bridge process; the same event at the same tier, already
 held by ANOTHER lane, is a duplicate. Lanes that disagree on the tier both deliver.
 
-On ONE lane, `content_copy_of` records which broker task first carried the message with a given
-content: a second broker task for the same message, tier and content is a duplicate, while a
-redelivery or a later run of the first task, and an edit (new content), are not. A card click,
-picker press or AgentTrigger task is never folded by content.
+On ONE lane, `content_copy_of` records the message's latest content and the task that carried it:
+another broker task with that same content is a duplicate only while that task is still held here
+(queued, claimed, archived or answered, by the caller's `held`). A redelivery or later run of the
+first task, an edit (any content other than the latest, including a return to earlier text), and a
+copy whose first task was lost all pass. A card click, picker press, AgentTrigger, hook or Summon
+task is never folded by content.
 
 Which lane answers is first-come unless the caller names the event's owner lanes (the lane whose
 agent the message addresses, else the primary): another lane then waits up to `OWNER_WAIT_S` for an
@@ -111,10 +113,11 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
 
 
 def _ensure_content_schema(con: sqlite3.Connection) -> None:
-    if _has_table(con, "content_claims"):
+    if _has_table(con, "message_revisions"):
         return
-    con.execute("CREATE TABLE content_claims (key TEXT PRIMARY KEY, task TEXT NOT NULL, ts REAL NOT NULL)")
-    con.execute("CREATE INDEX content_claims_ts ON content_claims (ts)")
+    con.execute("CREATE TABLE message_revisions (key TEXT PRIMARY KEY, content TEXT NOT NULL, "
+                "task TEXT NOT NULL, ts REAL NOT NULL)")
+    con.execute("CREATE INDEX message_revisions_ts ON message_revisions (ts)")
 
 
 # Each makes the task an action on the message rather than a reading of it.
@@ -129,19 +132,29 @@ def content_of(task: Mapping[str, object]) -> Optional[str]:
     return hashlib.sha256(json.dumps(shape, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
-def task_identity(task: Mapping[str, object]) -> str:
+def task_identity(task_id: str) -> str:
     """The broker task a local id names, whichever run of it this is."""
-    return str(task.get("id") or "").strip().split(RUN_SEPARATOR, 1)[0]
+    return str(task_id or "").strip().split(RUN_SEPARATOR, 1)[0]
+
+
+def _is_held(held: Optional[Callable[[str], bool]], task_id: str, log: Callable[[str], None]) -> bool:
+    if held is None:
+        return True
+    try:
+        return bool(held(task_id))
+    except Exception as exc:  # noqa: BLE001 - an unreadable holder must not drop the copy
+        _warn(log, f"lane dedupe: holder check failed ({type(exc).__name__}); delivering the copy")
+        return False
 
 
 def content_copy_of(state_dir: Path, event: str, lane: str, tier: str, content: str, task_id: str, *,
-                    now: Optional[float] = None, ttl: float = TTL_S,
-                    log: Callable[[str], None] = print) -> Optional[str]:
-    """The other task this lane already queued for (`event`, `tier`, `content`), else None after
-    recording `task_id` as its holder. Fails open like `claim_key`."""
+                    held: Optional[Callable[[str], bool]] = None, now: Optional[float] = None,
+                    ttl: float = TTL_S, log: Callable[[str], None] = print) -> Optional[str]:
+    """The held task that last carried `content` for (`event`, `tier`) on this lane, else None after
+    recording `task_id` as the message's latest. `held` None counts every holder as held. Fails open."""
     now = time.time() if now is None else now
     path = Path(state_dir) / STORE_NAME
-    key = hashlib.sha256(f"{event}\n{tier}\n{lane}\n{content}".encode("utf-8")).hexdigest()
+    key = hashlib.sha256(f"{event}\n{tier}\n{lane}".encode("utf-8")).hexdigest()
     con = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,15 +162,21 @@ def content_copy_of(state_dir: Path, event: str, lane: str, tier: str, content: 
         con.execute("BEGIN IMMEDIATE")
         try:
             _ensure_content_schema(con)
-            con.execute("DELETE FROM content_claims WHERE ts <= ?", (now - ttl,))
-            row = con.execute("SELECT task FROM content_claims WHERE key = ?", (key,)).fetchone()
-            if row is None:
-                con.execute("INSERT INTO content_claims (key, task, ts) VALUES (?, ?, ?)", (key, task_id, now))
+            con.execute("DELETE FROM message_revisions WHERE ts <= ?", (now - ttl,))
+            row = con.execute("SELECT content, task FROM message_revisions WHERE key = ?", (key,)).fetchone()
+            earlier = None
+            if (row is not None and str(row[0]) == content
+                    and task_identity(str(row[1])) != task_identity(task_id)
+                    and _is_held(held, str(row[1]), log)):
+                earlier = str(row[1])
+            else:
+                con.execute("INSERT OR REPLACE INTO message_revisions (key, content, task, ts) VALUES (?, ?, ?, ?)",
+                            (key, content, task_id, now))
             con.execute("COMMIT")
         except BaseException:
             con.execute("ROLLBACK")
             raise
-        return None if row is None or str(row[0]) == task_id else str(row[0])
+        return earlier
     except (sqlite3.Error, OSError) as exc:
         _warn(log, f"lane dedupe: store {path} unusable ({type(exc).__name__}: {exc}); delivering without the guard")
         return None
@@ -241,11 +260,12 @@ class OwnerPending(Exception):
 def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
                      now: Optional[float] = None, log: Callable[[str], None] = print,
                      owner_lanes=(), wait_s: Optional[float] = None, sleep=None,
-                     defer: bool = False) -> Optional[str]:
+                     defer: bool = False, held: Optional[Callable[[str], bool]] = None) -> Optional[str]:
     """One log line naming both lanes when another lane already took this message at the same
     tier, else None; lanes that disagree on the tier both deliver, with one WARNING. With
     `owner_lanes` not naming `lane`, an owner's claim within `wait_s` (`OWNER_WAIT_S`) makes this one the duplicate; `defer` raises
-    OwnerPending instead of waiting. On this lane, another broker task with the same content is a duplicate too."""
+    OwnerPending instead of waiting. On this lane, another broker task with the latest content is a duplicate
+    while `held` says the task that carried it is still held here."""
     event = key_of(task)
     if event is None:
         return None
@@ -265,9 +285,9 @@ def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
     if holder is not None:
         return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
                 f"was already taken by lane {lane_label(holder)}; settled as a redelivery")
-    content, task_id = content_of(task), task_identity(task)
+    content, task_id = content_of(task), str(task.get("id") or "").strip()
     if content is not None and task_id:
-        earlier = content_copy_of(state_dir, event, lane, tier, content, task_id, now=now, log=log)
+        earlier = content_copy_of(state_dir, event, lane, tier, content, task_id, held=held, now=now, log=log)
         if earlier is not None:
             return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
                     f"was already queued as {earlier} with the same content; settled as a redelivery")

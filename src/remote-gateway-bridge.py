@@ -389,7 +389,8 @@ def _lane_dedupe_gate(task: dict):
     wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
     try:
         return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
-                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"],
+                                            held=_task_held)  # noqa: F821
     except lane_dedupe.OwnerPending:
         return INTAKE_DEFER  # noqa: F821
 
