@@ -3,8 +3,9 @@
 `pool_identity.py` verbs, against an in-process fake of the hosted backend's contract.
 
 - `begin` keeps the one-time secret in the vault and gives back only its SHA-256 and a label.
-- `finish` redeems as the core's own agent, saves the bearer as the worker's connection, deletes the
-  secret, and on every failure deletes it too and names the failure without a secret in it.
+- `finish` redeems as the core's own agent and saves the bearer as the worker's connection only when
+  the answer and the gateway both name the agent `agent.create` made. It deletes the secret however
+  it ends, an interrupt included, and names a failure without a secret in it.
 - `retire` removes the identity only once the gateway rejects its token.
 - The transport refuses cleartext and never follows a redirect.
 
@@ -74,7 +75,7 @@ class Base(H.Base):
         kw.setdefault("request", self.backend.request)
         kw.setdefault("preview", self.preview)
         kw.setdefault("sleep", self.backend.sleep)
-        return pp.finish(W, claim_id, workspace=self.ws, vault=self.vault, **kw)
+        return pp.finish(W, claim_id, kw.pop("agent", WORKER_AGENT), workspace=self.ws, vault=self.vault, **kw)
 
     def failure(self, claim_id, **kw):
         """The message of a `finish` that must fail; the pending secret must be gone afterwards."""
@@ -238,14 +239,12 @@ class Finish(Base):
         self.assertEqual(text, "the claim was not redeemed: http 403 [redacted]")
         self.begin()
         answer = {"relay_url": "https://chat.alpha-fixture.net", "bearer": "b" * 48, "agent_id": "b" * 48}
-        text = self.failure("apc_X", request=lambda *a, **k: (200, {}, answer),
-                            preview=lambda token: {"verified": True, "agent_mxid": "@x:alpha-fixture.net"})
+        text = self.failure("apc_X", request=lambda *a, **k: (200, {}, answer))
+        self.assertIn(f"answered for another agent than {WORKER_AGENT}", text)
         self.assertNotIn("b" * 48, text)
 
     def test_an_answer_that_is_incomplete_or_names_another_gateway_stores_nothing(self):
-        for answer, said in (({"bearer": "b" * 48, "agent_id": WORKER_AGENT}, "lacks a usable relay_url"),
-                             ({"relay_url": "https://chat.alpha-fixture.net", "bearer": "b" * 48,
-                               "agent_id": "spaces are not an id"}, "lacks a usable relay_url"),
+        for answer, said in (({"bearer": "b" * 48, "agent_id": WORKER_AGENT}, "lacks relay_url, bearer or agent_id"),
                              ({"relay_url": "https://evil.example.com", "bearer": "b" * 48,
                                "agent_id": WORKER_AGENT}, "a gateway that is not the core's")):
             self.begin()
@@ -254,15 +253,32 @@ class Finish(Base):
             self.assertIsNone(C.worker_identity(W, self.ws))
             self.assertNotIn(WORKER_REF, self.vault.store)
 
+    def test_only_the_agent_that_agent_create_made_is_ever_saved(self):
+        other = "@owner-elsewhere.agent:alpha-fixture.net"
+        self.backend.add_agent(other, "c" * 48)
+        for answered in ("agent-123", other, WORKER_AGENT):
+            self.begin()
+            answer = {"relay_url": "https://chat.alpha-fixture.net", "bearer": "c" * 48, "agent_id": answered}
+            text = self.failure("apc_X", request=lambda *a, **k: (200, {}, answer))
+            said = f"it names {other}" if answered == WORKER_AGENT else f"answered for another agent than {WORKER_AGENT}"
+            self.assertIn(said, text, "another agent of the same owner is never adopted as this worker")
+            self.assertIsNone(C.worker_identity(W, self.ws))
+            self.assertNotIn(WORKER_REF, self.vault.store)
+        for not_an_mxid in ("agent-123", "", "@no-server", "@bad id:alpha-fixture.net"):
+            self.begin()
+            before = len(self.backend.paths)
+            self.assertIn("must be the one agent.create returned", self.failure("apc_X", agent=not_an_mxid))
+            self.assertEqual(len(self.backend.paths), before, "nothing was asked of the server")
+
     def test_a_token_the_gateway_does_not_confirm_is_not_stored_and_the_orphan_is_named(self):
         agent, claim, _ = self.claim()
         text = self.failure(claim, preview=lambda token: {"verified": False, "error": "unreachable (resolution)"})
         self.assertIn(f"does not confirm the redeemed token is agent {agent}'s (unreachable (resolution))", text)
-        self.assertIn(f"Agent {agent} now has a token nobody holds: retire it and provision again", text)
+        self.assertIn(f"The claim's agent now has a token nobody holds: retire {agent} and provision again", text)
         self.assertNotIn(WORKER_REF, self.vault.store)
-        _, claim, _ = self.claim("desk-second")
+        second, claim, _ = self.claim("desk-second")
         other = dict(self.preview(H.TOKEN_A))
-        text = self.failure(claim, preview=lambda token: other)
+        text = self.failure(claim, agent=second, preview=lambda token: other)
         self.assertIn(f"it names {CORE}", text)
 
     def test_an_agent_held_by_another_owner_is_refused_by_the_connection_rules(self):
@@ -272,14 +288,46 @@ class Finish(Base):
         self.assertIn("refused (worker_owner_mismatch)", text)
         self.assertNotIn(WORKER_REF, self.vault.store)
 
-    def test_a_worker_that_gained_a_connection_meanwhile_keeps_it(self):
+    def test_a_worker_that_already_has_an_agent_is_refused_before_anything_is_redeemed(self):
         _, claim, _ = self.claim()
         self.finish(claim)
         kept = self.vault.store[WORKER_REF]
         self.vault.set(CLAIM_KEY, "1" * 64)
-        self.backend.claims[claim].update(key_sha256=pp.claim_hash("1" * 64), redeemed_at=None)
-        self.assertIn("already had a connection", self.failure(claim))
-        self.assertEqual(self.vault.store[WORKER_REF], kept)
+        before = len(self.backend.paths)
+        self.assertIn("already has an agent of its own; nothing was redeemed", self.failure(claim))
+        self.assertEqual((len(self.backend.paths), self.vault.store[WORKER_REF]), (before, kept))
+
+    def test_a_connection_that_appeared_during_the_redeem_keeps_its_own_token(self):
+        _, claim, _ = self.claim()
+        row = {"instance": "alpha-fixture-net-7c700e11"}
+        with unittest.mock.patch.object(C, "add_worker_identity", lambda *a, **k: (row, False)):
+            self.assertIn("already had a connection (alpha-fixture-net-7c700e11)", self.failure(claim))
+
+    def test_an_interrupt_during_the_redeem_still_deletes_the_secret(self):
+        _, claim, _ = self.claim()
+
+        def interrupted(*a, **k):
+            raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.finish(claim, request=interrupted)
+        self.assertNotIn(CLAIM_KEY, self.vault.store)
+        self.vault.fail_delete = True
+        self.begin()
+        with self.assertRaises(KeyboardInterrupt):
+            self.finish(claim, request=interrupted)
+
+    def test_a_secret_a_later_begin_wrote_is_not_the_one_deleted(self):
+        _, claim, first = self.claim()
+
+        def begun_again(method, url, **kw):
+            self.begin()
+            return self.backend.request(method, url, **kw)
+        self.finish(claim, request=begun_again)
+        self.assertNotIn(self.vault.store[CLAIM_KEY], (first, None), "the newer pending secret is kept")
+        with unittest.mock.patch.object(self.vault, "lookup", side_effect=[first, RuntimeError("locked")]):
+            with self.assertRaises(pp.ProvisionError):
+                self.finish("apc_X", request=lambda *a, **k: (404, {}, {}))
+        self.assertNotIn(CLAIM_KEY, self.vault.store, "a vault that cannot say is asked to delete all the same")
 
     def test_an_unexpected_error_and_a_secret_that_cannot_be_deleted_are_both_reported(self):
         self.begin()
@@ -458,7 +506,7 @@ class Verbs(Base):
 
     def test_finish_prints_the_agent_id_and_status_and_starts_the_lane(self):
         _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
-        rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim)
+        rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         self.assertEqual((rc, json.loads(out)), (0, {"agent_id": WORKER_AGENT, "status": "ok"}), err)
         self.assertEqual(self.started[0]["logs_dir"], self.ws / "logs")
         self.assertEqual(self.started[0]["repo"], ROOT)
@@ -467,7 +515,7 @@ class Verbs(Base):
     def test_finish_reports_a_lane_that_did_not_start_and_can_skip_starting(self):
         _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
         with unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": False, "reason": "no python"}):
-            rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim)
+            rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         self.assertEqual((rc, json.loads(out)["status"]), (1, "stored_lane_not_started"))
         self.assertIn("not started: no python", err)
         self.backend.agents[WORKER_AGENT]["deleted"] = True
@@ -478,19 +526,20 @@ class Verbs(Base):
         def refuses(row, **kw):
             raise C.LaunchFailed("no bridge script")
         with unittest.mock.patch.object(C, "start_added", refuses):
-            rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim)
+            rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         self.assertEqual((rc, json.loads(out)), (1, {"agent_id": WORKER_AGENT, "status": "stored_lane_not_started"}))
         self.assertIn("not started: no bridge script", err)
         self.backend.agents[WORKER_AGENT]["deleted"] = True
         self.assertEqual(self.run_cmd("retire-remote", "Reviewer")[0], 0)
         self.backend.agents.pop(WORKER_AGENT)
         _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
-        rc, out, _ = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--no-start")
+        rc, out, _ = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT, "--no-start")
         self.assertEqual((rc, json.loads(out)["status"], len(self.started)), (0, "ok", 0))
 
     def test_a_failed_finish_exits_1_names_the_failure_and_deletes_the_secret(self):
         self.begun()
-        rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", "apc_UNKNOWN")
+        rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", "apc_UNKNOWN", "--agent-id",
+                                    WORKER_AGENT)
         self.assertEqual((rc, out), (1, ""))
         self.assertEqual(err.strip(), "pool_identity: the claim was not redeemed: http 404 claim_not_found")
         self.assertNotIn(CLAIM_KEY, self.vault.store)
@@ -503,7 +552,7 @@ class Verbs(Base):
         rc, out, _ = self.run_cmd("retire-remote", "Reviewer")
         self.assertEqual((rc, json.loads(out)["status"]), (0, "no_identity"))
         _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
-        self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim)
+        self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         rc, out, err = self.run_cmd("retire-remote", "Reviewer")
         self.assertEqual((rc, out), (3, ""))
         self.assertIn("retire it there first (agent.retire); nothing removed", err)
@@ -516,7 +565,7 @@ class Verbs(Base):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 34)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 38)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
 
 

@@ -7,7 +7,8 @@
 Acts as the core's own agent on the server at --base-url (the core must already be connected
 there) and walks the whole flow for one live pool worker that has no agent of its own yet:
 `agent.create`, the claim redeem with its refusals, the worker answering a mention, `agent.retire`,
-and a scan of everything this install writes for the secrets the run handled. It prints one table.
+and a scan of what this install writes (the workspace, the session transcripts, the core's and the
+worker's tmux scrollback, the shell history) for the secrets the run handled. It prints one table.
 
 What a full run does on the server: it creates two agents (the worker's, and a second whose claim
 is left to expire) and retires both. Each `agent.create` and `agent.retire` may need the owner's
@@ -52,6 +53,7 @@ EXPIRY_MARGIN_S = 5
 MIN_NEEDLE = 16
 # The owner's own project trees: large, and nothing in this flow writes there.
 UNSCANNED = ("projects",)
+SHELL_HISTORIES = (".zsh_history", ".bash_history")
 CHUNK = 1 << 20
 DONE = ("succeeded", "success", "completed", "complete", "done", "ok", "executed")
 ENDED = ("denied", "rejected", "failed", "expired", "cancelled", "canceled")
@@ -311,36 +313,26 @@ def tmux_scrollback(socket: str, session: str, run=subprocess.run) -> bytes:
 
 
 def scan_roots(workspace: Path, extra: Iterable[Path] = ()) -> Tuple[list, list]:
-    """(what must exist, what is scanned). Scanned: everything in the workspace but the owner's own
-    project trees and links out of it, the config home's transcripts when they live elsewhere, and
-    `extra`. Must exist: the logs, results, tasks and transcripts a run always writes, and `extra`."""
+    """(what must exist, what is scanned). Must exist: the logs, results, tasks and transcripts a run
+    always writes, and `extra`. Scanned: those wherever they really are, everything else in the
+    workspace but the owner's own project trees and links out of it, the config home's transcripts
+    when they live elsewhere, and the shell's history files."""
     from util_paths import claude_home_path
     transcripts = workspace / ".claude-sutando" / "projects"
     required = [workspace / "logs", workspace / "results", workspace / "tasks", transcripts, *extra]
     scanned = sorted(p for p in workspace.iterdir() if p.name not in UNSCANNED and not p.is_symlink()) \
         if workspace.is_dir() else []
+    scanned += [r.resolve() for r in required]
     home = claude_home_path("projects")
     if home.resolve() != transcripts.resolve():
         scanned.append(home)
-    return required, scanned + list(extra)
+    return required, scanned + [Path.home() / name for name in SHELL_HISTORIES]
 
 
 def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, extra_roots, tmux_targets, tmux) -> None:
-    """The two scan rows: a control proving the scan finds a planted value, then the scan itself."""
-    canary = secrets.token_hex(32)
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "planted.log").write_text(f"token={canary}\n", encoding="utf-8")
-        control = scan({"canary": canary}, [Path(tmp)], {"pane": canary.encode()})
-    found = sorted(n for _, _, n in control["hits"])
-    if found != [1, 1]:
-        report.set(CONTROL, FAIL, "the scan did not find a value planted in a file and in a text")
-        report.set(LEAKS, INCOMPLETE, "not run: the scan cannot be trusted")
-        return
-    report.set(CONTROL, PASS, "found once in a planted file and once in a planted text")
+    """The two scan rows, from one pass: it looks for the run's secrets and for a control value planted
+    in the workspace's own logs and in a text. A pass that misses the control proves nothing."""
     wanted = {label: value for label, value in needles.items() if value}
-    if not wanted:
-        report.set(LEAKS, SKIP, "the run produced no secret to look for")
-        return
     required, scanned = scan_roots(workspace, extra_roots)
     missing = [str(r) for r in required if not r.is_dir()]
     texts, unscanned = {}, []
@@ -349,12 +341,38 @@ def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, e
             texts[f"tmux:{name}"] = tmux(socket, session)
         except (OSError, subprocess.SubprocessError) as e:
             unscanned.append(f"tmux:{name} ({e})")
-    result = scan(wanted, [r for r in scanned if r.exists()], texts)
+    canary = secrets.token_hex(32)
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = workspace / "logs"
+        planted = (logs if logs.is_dir() else Path(tmp)) / f".provision-e2e-control-{canary[:12]}.log"
+        try:
+            planted.write_text(f"token={canary}\n", encoding="utf-8")
+            real = planted.resolve()
+            result = scan({**wanted, CONTROL: canary}, [r for r in scanned + [Path(tmp)] if r.exists()],
+                          {**texts, CONTROL: canary.encode()})
+        except OSError as e:
+            result, real = {"hits": [], "files": 0, "unreadable": [f"the control file ({type(e).__name__})"]}, planted
+        finally:
+            try:
+                planted.unlink()
+            except OSError:
+                pass
+    control = sorted((where if where == CONTROL else str(Path(where).resolve()), n)
+                     for label, where, n in result["hits"] if label == CONTROL)
+    if control != sorted([(CONTROL, 1), (str(real), 1)]):
+        report.set(CONTROL, FAIL, f"the scan did not find a value planted in {planted.parent} and in a text")
+        report.set(LEAKS, INCOMPLETE, "not run: the scan cannot be trusted")
+        return
+    report.set(CONTROL, PASS, f"found once in {planted.parent} and once in a planted text")
+    if not wanted:
+        report.set(LEAKS, SKIP, "the run produced no secret to look for")
+        return
+    hits = [hit for hit in result["hits"] if hit[0] != CONTROL]
     gaps = [f"missing {m}" for m in missing] + unscanned + [f"unreadable {u}" for u in result["unreadable"]]
-    summary = f"{result['files']} files, {len(texts)} tmux sessions"
-    if result["hits"]:
-        places = "; ".join(f"{label} x{n} in {where}" for label, where, n in result["hits"])
-        report.set(LEAKS, FAIL, f"{len(result['hits'])} places hold a secret: {places}")
+    summary = f"{result['files'] - 1} files, {len(texts)} tmux sessions"
+    if hits:
+        places = "; ".join(f"{label} x{n} in {where}" for label, where, n in hits)
+        report.set(LEAKS, FAIL, f"{len(hits)} places hold a secret: {places}")
     elif gaps:
         report.set(LEAKS, INCOMPLETE, f"0 hits in {summary}, but not everything was scanned: {'; '.join(gaps)}")
     else:
@@ -518,7 +536,7 @@ class Flow:
                 self.redeem_headers = dict(headers)
             return status, headers, body
         try:
-            out = pp.finish(wid, claim_id, workspace=self.ws, vault=self.vault, lane=str(self.core["instance"]),
+            out = pp.finish(wid, claim_id, agent_id, workspace=self.ws, vault=self.vault, lane=str(self.core["instance"]),
                             request=recording, preview=self.preview, sleep=self.sleep)
         except pp.ProvisionError as e:
             self.report.set(REDEEM, FAIL, str(e))
@@ -647,11 +665,12 @@ def run(args, *, request=None, vault=None, preview=None, sleep=time.sleep, clock
         report.note(f"stopped: {e}")
     except Exception as e:  # noqa: BLE001 - whatever broke, the scan below still runs and nothing is echoed
         report.note(f"stopped: unexpected {type(e).__name__}")
-    try:
-        if flow.wid:
-            pp.abort(flow.wid, vault=vault)
-    except pp.ProvisionError as e:
-        report.note(f"cleanup: {e}")
+    finally:
+        try:
+            if flow.wid:
+                pp.abort(flow.wid, vault=vault)
+        except pp.ProvisionError as e:
+            report.note(f"cleanup: {e}")
     for agent in flow.created:
         report.note(f"left on the server: {agent} (retire it with agent.retire, or delete it as the owner)")
     leak_check(report, needles, Path(args.workspace), extra_roots=[Path(p) for p in args.scan_root],

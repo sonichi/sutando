@@ -11,7 +11,7 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
     python3 pool_identity.py [--workspace WS] remove <worker>
     python3 pool_identity.py [--workspace WS] provision-begin <worker> [--role ROLE] [--lane INSTANCE]
-    python3 pool_identity.py [--workspace WS] provision-finish <worker> --claim-id ID [--lane INSTANCE] [--no-start]
+    python3 pool_identity.py [--workspace WS] provision-finish <worker> --claim-id ID --agent-id MXID [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
 
@@ -21,8 +21,8 @@ a file, and never printed. `add` shows what the token's gateway says before anyt
 
 The `provision-*` verbs need no pasted token (pool_provision.py): `provision-begin` prints the
 SHA-256 the `agent.create` Action takes and a suggested label, `provision-finish` redeems the claim
-that Action returns and prints the agent id and a status. `retire-remote` removes the identity once
-its server rejects the token. Each prints one JSON line and never a secret.
+that Action returns, for the agent id it returns, and prints that id and a status. `retire-remote`
+removes the identity once its server rejects the token. Each prints one JSON line and never a secret.
 """
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def cmd_provision_begin(args, ws: Path) -> int:
 
 def cmd_provision_finish(args, ws: Path) -> int:
     wid = live_worker(ws, args.worker)
-    out = pool_provision.finish(wid, args.claim_id, workspace=ws, lane=args.lane)
+    out = pool_provision.finish(wid, args.claim_id, args.agent_id, workspace=ws, lane=args.lane)
     try:
         launch = None if args.no_start else connections.start_added(
             out["row"], repo=args.repo or _REPO, logs_dir=args.logs_dir or ws / "logs", workspace=ws)
@@ -187,7 +187,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
     s = sub.add_parser("provision-finish"); s.add_argument("worker"); s.add_argument("--claim-id", required=True)
-    s.add_argument("--lane", default=None); s.add_argument("--no-start", action="store_true")
+    s.add_argument("--agent-id", required=True); s.add_argument("--lane", default=None)
+    s.add_argument("--no-start", action="store_true")
     s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
     s.set_defaults(fn=cmd_provision_finish)
     s = sub.add_parser("provision-abort"); s.add_argument("worker"); s.set_defaults(fn=cmd_provision_abort)

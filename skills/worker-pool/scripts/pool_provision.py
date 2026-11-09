@@ -7,7 +7,8 @@ answered with a claim id, never a token. The three local steps around that call 
 - `begin` makes a one-time secret, keeps it only in the secret vault and hands back its SHA-256,
   which the Action takes as `claim_key_sha256`.
 - `finish` redeems the claim as the core's own agent, with the core's lane credential and that
-  secret, and saves the bearer the server answers with as the worker's connection.
+  secret, and saves the bearer the server answers with as the worker's connection, only when both
+  the answer and the gateway name the agent the Action created.
 - `retire` drops the worker's connection and its secret once the server has retired the agent.
 
 The secret is 32 random bytes as 64 hex characters; its hash is the SHA-256 of those characters.
@@ -43,7 +44,7 @@ REPLY_MAX = 64 * 1024
 REDEEM_ATTEMPTS = 3
 REDACTED = "[redacted]"
 _CODE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
-_ID_RE = re.compile(r"[A-Za-z0-9@._=:/+-]{1,255}")
+_MXID_RE = re.compile(r"@[A-Za-z0-9._=/+-]{1,200}:[A-Za-z0-9.-]{1,200}(:[0-9]{1,5})?")
 _LOOPBACK = ("localhost", "127.0.0.1", "::1")
 
 Reply = Tuple[int, dict, dict]  # (status, headers by lowercased name, JSON object body)
@@ -274,35 +275,41 @@ def _said(e: Exception) -> str:
     return f"refused ({e.CODE}): {e}" if isinstance(e, connections.Refusal) else str(e)
 
 
-def _redeem_and_save(worker: str, claim_id: str, known: list, *, workspace, vault, lane, request, preview,
-                     sleep) -> dict:
+def _redeem_and_save(worker: str, claim_id: str, expected: str, known: list, *, workspace, vault, lane, request,
+                     preview, sleep) -> dict:
     secret = held(_vault(vault), claim_key(worker))
     if not secret:
         raise ProvisionError(f"worker {worker} has no pending claim secret: run provision-begin first")
     known.append(secret)
+    if not _MXID_RE.fullmatch(expected or ""):
+        raise ProvisionError("the agent id must be the one agent.create returned (an @name:server id)")
+    if connections.worker_identity(worker, workspace) is not None:
+        raise ProvisionError(f"worker {worker} already has an agent of its own; nothing was redeemed")
     row = core_lane(workspace, lane)
     gateway, token = connections.connection_credential(row, vault=vault)
     known.append(bearer_of(token))
     body = redeem(gateway, bearer_of(token), claim_id, secret, request=request, sleep=sleep)
     relay_url, bearer, agent_id = (body.get(k) for k in ("relay_url", "bearer", "agent_id"))
-    if not all(isinstance(v, str) and v for v in (relay_url, bearer, agent_id)) or not _ID_RE.fullmatch(agent_id):
-        raise ProvisionError("the redeem answer lacks a usable relay_url, bearer or agent_id; nothing stored")
+    if not all(isinstance(v, str) and v for v in (relay_url, bearer, agent_id)):
+        raise ProvisionError("the redeem answer lacks relay_url, bearer or agent_id; nothing stored")
     known.append(bearer)
     try:
-        return _save(worker, f"{relay_url}|{bearer}", agent_id, gateway, known, workspace=workspace, vault=vault,
+        if agent_id != expected:
+            raise ProvisionError(f"the redeem answered for another agent than {expected}; nothing stored")
+        return _save(worker, f"{relay_url}|{bearer}", expected, gateway, workspace=workspace, vault=vault,
                      preview=preview)
     except (ProvisionError, connections.ConnectionsError) as e:
-        raise ProvisionError(f"{_said(e)}. Agent {agent_id} now has a token nobody holds: retire it and "
-                             "provision again") from None
+        raise ProvisionError(f"{_said(e)}. The claim's agent now has a token nobody holds: retire {expected} "
+                             "and provision again") from None
 
 
-def _save(worker: str, token: str, agent_id: str, gateway: str, known: list, *, workspace, vault, preview) -> dict:
+def _save(worker: str, token: str, expected: str, gateway: str, *, workspace, vault, preview) -> dict:
     if origin_of(connections.gateway_url_of(token)) != origin_of(gateway):
         raise ProvisionError("the redeem answer names a gateway that is not the core's; nothing stored")
     seen = (preview or connections.preview_connection)(token)
     mxid = str(seen.get("agent_mxid") or "") if seen.get("verified") else ""
-    if not mxid or (agent_id.startswith("@") and agent_id != mxid) or any(k in mxid for k in known):
-        raise ProvisionError(f"the gateway does not confirm the redeemed token is agent {agent_id}'s "
+    if mxid != expected:
+        raise ProvisionError(f"the gateway does not confirm the redeemed token is agent {expected}'s "
                              f"({seen.get('error') or 'it names ' + (mxid or 'no agent')}); nothing stored")
     saved, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
                                                      source="agent_link", preview=seen, workspace=workspace,
@@ -313,26 +320,43 @@ def _save(worker: str, token: str, agent_id: str, gateway: str, known: list, *, 
     return {"agent_id": mxid, "status": "ok", "row": saved}
 
 
-def finish(worker: str, claim_id: str, *, workspace: Optional[Path] = None, vault=None,
+def _forget(worker: str, vault, read: Optional[str]) -> str:
+    """Delete `worker`'s pending secret, unless a later `begin` replaced the one this call read.
+    '' when done, else what failed; it never raises, so it can run while an interrupt unwinds."""
+    try:
+        mine = _vault(vault)
+        try:
+            replaced = read is not None and held(mine, claim_key(worker)) not in (None, read)
+        except Exception:  # noqa: BLE001 - a vault that cannot say is asked to delete all the same
+            replaced = False
+        if not replaced:
+            mine.delete(claim_key(worker))
+        return ""
+    except Exception as e:  # noqa: BLE001
+        return f"the claim secret could not be deleted from the vault ({type(e).__name__})"
+
+
+def finish(worker: str, claim_id: str, agent_id: str, *, workspace: Optional[Path] = None, vault=None,
            lane: Optional[str] = None, request: Optional[Callable[..., Reply]] = None,
            preview: Optional[Callable[[str], dict]] = None,
            sleep: Callable[[float], None] = time.sleep) -> dict:
-    """Redeem `claim_id` with `worker`'s pending secret and the core's own lane credential, confirm
-    the answered bearer with its gateway, and save it as the worker's connection. The pending secret
-    is deleted whether this succeeds or fails; a failure says what failed and echoes no secret."""
+    """Redeem `claim_id` with `worker`'s pending secret and the core's own lane credential, and save
+    the answered bearer as the worker's connection once the answer and the gateway both name
+    `agent_id`, the agent `agent.create` returned. The pending secret is deleted however this ends,
+    an interrupt included; a failure says what failed and echoes no secret."""
     known: list = []
-    out, error = None, ""
+    out, error, left = None, "", ""
     try:
-        out = _redeem_and_save(worker, claim_id, known, workspace=workspace, vault=vault, lane=lane,
-                               request=request, preview=preview, sleep=sleep)
-    except (ProvisionError, connections.ConnectionsError) as e:
-        error = scrub(_said(e), known)
-    except Exception as e:  # noqa: BLE001 - an unexpected error's text is not ours to vouch for
-        error = f"unexpected {type(e).__name__}"
-    try:
-        _vault(vault).delete(claim_key(worker))
-    except Exception as e:  # noqa: BLE001
-        left = f"the claim secret could not be deleted from the vault ({type(e).__name__})"
+        try:
+            out = _redeem_and_save(worker, claim_id, agent_id, known, workspace=workspace, vault=vault, lane=lane,
+                                   request=request, preview=preview, sleep=sleep)
+        except (ProvisionError, connections.ConnectionsError) as e:
+            error = scrub(_said(e), known)
+        except Exception as e:  # noqa: BLE001 - an unexpected error's text is not ours to vouch for
+            error = f"unexpected {type(e).__name__}"
+    finally:
+        left = _forget(worker, vault, known[0] if known else None)
+    if left:
         error = f"{error}; {left}" if error else f"the worker's connection was saved, but {left}: run provision-abort"
     if error:
         raise ProvisionError(error)

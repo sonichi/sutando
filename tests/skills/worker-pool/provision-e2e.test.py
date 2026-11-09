@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import types
@@ -72,7 +73,11 @@ class Base(H.Base):
         (self.transcripts / "slug" / "session.jsonl").write_text('{"role": "assistant", "text": "done"}\n')
         self.preview = provision_fake.preview_through(self.backend, C)
         self.panes = {"core": b"$ pool_identity provision-begin\n", "worker": b"ready\n"}
+        self.home = self.ws.parent / (self.ws.name + "-home")
+        self.home.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, self.home, True)
         for patch in (unittest.mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0),
+                      unittest.mock.patch.object(e2e.Path, "home", lambda: self.home),
                       unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.ws / ".claude-sutando")})):
             patch.start()
             self.addCleanup(patch.stop)
@@ -125,7 +130,7 @@ class FullRun(Base):
         self.assertEqual(rows[e2e.OTHER_CALLER][1], "refused (http 403 claim_not_yours)")
         self.assertEqual(rows[e2e.EXPIRED][1], "refused (http 410 claim_expired)")
         self.assertEqual(rows[e2e.RETIRED][1], "whoami answered http 401")
-        self.assertRegex(rows[e2e.LEAKS][1], r"^0 hits for 3 secrets in \d+ files, 2 tmux sessions$")
+        self.assertEqual(rows[e2e.LEAKS][1], "0 hits for 3 secrets in 5 files, 2 tmux sessions")
         self.assertTrue(self.backend.agents[WORKER_AGENT]["deleted"] and self.backend.agents[SECOND_AGENT]["deleted"])
         self.assertEqual(sorted(self.vault.store), ["AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET"], "only the core's secret")
         self.assertIsNone(C.worker_identity(W, self.ws))
@@ -379,7 +384,8 @@ class Edges(Base):
     def test_a_worker_that_already_has_an_agent_is_not_provisioned_again(self):
         _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", pp.begin(
             W, role="Reviewer", workspace=self.ws, vault=self.vault)["claim_key_sha256"])
-        pp.finish(W, claim, workspace=self.ws, vault=self.vault, request=self.backend.request, preview=self.preview)
+        pp.finish(W, claim, WORKER_AGENT, workspace=self.ws, vault=self.vault, request=self.backend.request,
+                  preview=self.preview)
         rows, rc, text = self.go()
         self.assertIn("stopped: worker", text)
         self.assertIn("already has an agent of its own", text)
@@ -393,6 +399,15 @@ class Edges(Base):
         rows, rc, text = self.go(request=odd)
         self.assertIn("stopped: unexpected KeyError", text)
         self.assertEqual((rows[e2e.CONTROL][0], rows[e2e.LEAKS][0]), (e2e.PASS, e2e.PASS))
+        self.assertNotIn(CLAIM_KEY, self.vault.store)
+
+    def test_an_interrupted_run_still_forgets_the_pending_secret(self):
+        def interrupted(method, url, **kw):
+            if url.endswith("/mcp"):
+                raise KeyboardInterrupt()
+            return self.backend.request(method, url, **kw)
+        with self.assertRaises(KeyboardInterrupt):
+            self.go(request=interrupted)
         self.assertNotIn(CLAIM_KEY, self.vault.store)
 
     def test_a_cleanup_that_cannot_delete_the_secret_is_noted(self):
@@ -494,8 +509,48 @@ class LeakScan(Base):
     def test_a_scan_that_cannot_find_a_planted_value_is_not_trusted(self):
         with unittest.mock.patch.object(e2e, "count_in_stream", lambda chunks, needles: {k: 0 for k in needles}):
             rows, rc, _ = self.go("--single-claim")
-        self.assertEqual(rows[e2e.CONTROL], (e2e.FAIL, "the scan did not find a value planted in a file and in a text"))
+        self.assertEqual(rows[e2e.CONTROL], (e2e.FAIL, f"the scan did not find a value planted in {self.ws / 'logs'} "
+                                                       "and in a text"))
         self.assertEqual((rc, rows[e2e.LEAKS]), (1, (e2e.INCOMPLETE, "not run: the scan cannot be trusted")))
+        self.assertEqual(sorted(p.name for p in (self.ws / "logs").iterdir()), ["bridge.log"], "the control is removed")
+
+    def test_the_control_is_planted_in_the_workspaces_own_logs_so_a_scan_that_skips_them_fails(self):
+        rows, _, _ = self.go("--single-claim")
+        self.assertEqual(rows[e2e.CONTROL], (e2e.PASS, f"found once in {self.ws / 'logs'} and once in a planted text"))
+        self.setUp()
+        real = e2e.scan_roots
+        with unittest.mock.patch.object(e2e, "scan_roots", lambda ws, extra=(): (real(ws, extra)[0], [])):
+            rows, rc, _ = self.go("--single-claim")
+        self.assertEqual((rc, rows[e2e.CONTROL][0], rows[e2e.LEAKS][0]), (1, e2e.FAIL, e2e.INCOMPLETE),
+                         "a scan that reads none of the real places cannot pass")
+
+    def test_logs_that_cannot_take_the_control_file_fail_the_control(self):
+        if os.geteuid() == 0:
+            self.skipTest("root writes to a read-only directory")
+        os.chmod(self.ws / "logs", 0o500)
+        try:
+            rows, rc, _ = self.go("--single-claim")
+        finally:
+            os.chmod(self.ws / "logs", 0o700)
+        self.assertEqual((rc, rows[e2e.CONTROL][0], rows[e2e.LEAKS][0]), (1, e2e.FAIL, e2e.INCOMPLETE))
+
+    def test_logs_kept_behind_a_link_and_the_shell_history_are_scanned_too(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        (self.ws / "logs" / "bridge.log").unlink()
+        (self.ws / "logs").rmdir()
+        os.symlink(outside.name, self.ws / "logs")
+
+        def leaky_tmux(socket, session):
+            secret = next(v for v in self.vault.ever if re.fullmatch(r"[0-9a-f]{64}", v))
+            (Path(outside.name) / "bridge.log").write_text(f"claim {secret}\n")
+            (self.home / ".zsh_history").write_text(f": 1:0;echo {secret}\n")
+            return b"clean"
+        rows, rc, _ = self.go("--single-claim", tmux=leaky_tmux)
+        self.assertEqual((rows[e2e.CONTROL][0], rows[e2e.LEAKS][0]), (e2e.PASS, e2e.FAIL))
+        self.assertIn(f"claim secret x1 in {Path(outside.name).resolve() / 'bridge.log'}", rows[e2e.LEAKS][1])
+        self.assertIn(f"claim secret x1 in {self.home / '.zsh_history'}", rows[e2e.LEAKS][1])
+        self.assertEqual(list(Path(outside.name).glob(".provision-e2e-control-*")), [])
 
 
 class Scanner(unittest.TestCase):
@@ -621,13 +676,16 @@ class Wiring(Base):
         (self.ws / "conversation.log").write_text("hello\n")
         os.symlink(self.tmp.name, self.ws / "link-out")
         required, scanned = e2e.scan_roots(self.ws)
-        self.assertEqual(required, [self.ws / "logs", self.ws / "results", self.ws / "tasks", self.transcripts])
+        mine = [self.ws / "logs", self.ws / "results", self.ws / "tasks", self.transcripts]
+        self.assertEqual(required, mine)
         self.assertEqual(scanned, sorted([self.ws / ".claude-sutando", self.ws / "conversation.log", self.ws / "logs",
-                                          self.ws / "results", self.ws / "state", self.ws / "tasks"]))
+                                          self.ws / "results", self.ws / "state", self.ws / "tasks"])
+                         + [r.resolve() for r in mine] + [self.home / ".zsh_history", self.home / ".bash_history"])
         with tempfile.TemporaryDirectory() as home, unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": home}):
             required, scanned = e2e.scan_roots(self.ws, [Path("more")])
-            self.assertEqual((required[-1], scanned[-2:]), (Path("more"), [Path(home) / "projects", Path("more")]))
-        self.assertEqual(e2e.scan_roots(self.ws / "absent")[1], [self.transcripts], "only the config home's")
+            self.assertEqual((required[-1], scanned[-3]), (Path("more"), Path(home) / "projects"))
+            self.assertIn(Path("more").resolve(), scanned)
+        self.assertEqual(e2e.scan_roots(self.ws / "absent")[1][0], (self.ws / "absent" / "logs").resolve())
 
     def test_a_secret_anywhere_in_the_workspace_is_found_once_even_when_a_root_is_named_twice(self):
         secret = "5ec2e7" * 8
@@ -691,7 +749,7 @@ class Small(unittest.TestCase):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 58)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 62)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
         self.assertIs(subprocess.SubprocessError, e2e.subprocess.SubprocessError)
 

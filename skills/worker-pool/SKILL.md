@@ -168,19 +168,20 @@ vault hold it. Use this path only when the owner asked for the worker to have it
 2. Call the account Action `agent.create` with `label`, `claim_key_sha256` and an `operation_id`. It answers with
    `agent_id` and `claim_id`, never a token. If it is held for the owner's approval, tell the owner in one line and
    wait. If it fails with `approval_required`, the server has no approval path yet: run `provision-abort` and stop.
-3. `pool_identity.py provision-finish <worker> --claim-id <claim_id>` redeems the claim as the core's own agent,
-   with the core's lane credential and the secret, and saves the answered token as the worker's connection, the
-   same row and vault key `add` writes. It prints the agent id and a status and starts the lane.
+3. `pool_identity.py provision-finish <worker> --claim-id <claim_id> --agent-id <agent_id>` redeems the claim as
+   the core's own agent, with the core's lane credential and the secret. It saves the answered token as the
+   worker's connection, the same row and vault key `add` writes, only when the answer and the gateway both name
+   that `agent_id`. It prints the agent id and a status and starts the lane.
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py provision-begin <worker> [--role ROLE] [--lane INSTANCE]
-python3 skills/worker-pool/scripts/pool_identity.py provision-finish <worker> --claim-id <claim id>
+python3 skills/worker-pool/scripts/pool_identity.py provision-finish <worker> --claim-id <claim id> --agent-id <agent id>
 python3 skills/worker-pool/scripts/pool_identity.py provision-abort <worker>
 python3 skills/worker-pool/scripts/pool_identity.py retire-remote <worker> [--local-anyway]
 ```
 
-- The secret is deleted when `provision-finish` ends, whether it worked or not, so a failed finish starts again
-  from `provision-begin`. A failure names what failed (the HTTP status and the server's error code) and never
+- The secret is deleted when `provision-finish` ends, whether it worked, failed or was interrupted, so a failed
+  finish starts again from `provision-begin`. A failure names what failed (the HTTP status and the server's error code) and never
   echoes a secret. A claim lives five minutes.
 - If the redeem worked but the token could not be confirmed or saved, the message names the agent: it now has a
   token nobody holds, so retire it and provision again.
@@ -194,8 +195,9 @@ python3 skills/worker-pool/scripts/pool_identity.py retire-remote <worker> [--lo
 `provision_e2e.py --base-url https://<gateway> --worker <worker> [--room ROOM]` runs all of this against one
 server and prints a pass/fail table: the approval gate, the agent's provenance and name, the redeem and each way
 it must be refused, the worker answering a mention, the retirement, and a scan of the workspace, the session
-transcripts and the core's and worker's tmux scrollback for the token and the claim secrets. The scan compares in
-the process and prints places and counts only. Its `--help` says what a run creates on the server.
+transcripts, the shell history and the core's and worker's tmux scrollback for the token and the claim secrets.
+The scan compares in the process and prints places and counts only, and first has to find a control value it
+plants in the workspace's own logs. Its `--help` says what a run creates on the server.
 
 ## Binding a room to an existing worker
 
