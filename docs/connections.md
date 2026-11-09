@@ -566,6 +566,29 @@ and the tutorial page (`channel_credentials.room_env`), `ensure-cron-room.py` an
 from the primary's `state/owner-routing.<instance>.json`. `room_ops.py` verbs that name no room
 (`rooms`, `history`, `agents`, `resolve`, `events list|pull|stream`) act through the primary.
 
+### In a pool worker's session
+
+A pool worker that has its own agent (`pool_identity.py add`) acts as that agent from its own
+session. The seat names its worker in `SUTANDO_WORKER_ID`, and `connections.acting_identity`
+answers before the rule above:
+
+- a room on the server of the worker's own row resolves to that row, with the token its vault
+  key holds and its `agent_mxid`; with no room, the worker's only enabled row;
+- a room local state says is the core's stays with the core's rows: one where a core lane has a
+  task open and the worker's lane has none (that task is answered as the core's agent), and a
+  core lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a
+  launch-key alias its bridge runs as);
+- a disconnected row, a room on a server the worker has no row for, another worker's session
+  and the core's session all fall through to the rule above. The core never acts as a worker's
+  agent.
+
+A worker's row has no channel env file: its token is in the vault alone, so
+`channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
+
+`connections.task_agent_mxid(task_id)` names the agent a task is answered as: the agent of the
+lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
+task carries it as `agent`.
+
 ### MCP lanes for the s-space proxy
 
 The bundled MCP proxy serves its main descriptor and one extra lane per `*.json` in its lanes

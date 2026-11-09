@@ -6,7 +6,8 @@ exact after rotation, and the summary left at done.
 One owner: the agent-activity skill's CLI and the activity bus both write through here, so the
 lock, the rotation, the index and the summary cannot drift between them. Row shape is the contract
 the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done",
-"queue": {"depth","position"}?} — `queue` rides only on the queued row, from task_queue.position().
+"queue": {"depth","position"}?, "agent"?} — `queue` rides only on the queued row, from
+task_queue.position(); `agent` is the mxid the task is answered as, on a task a named lane queued.
 """
 from __future__ import annotations
 
@@ -164,6 +165,20 @@ def _pid_in_log(path: Path, pid: str) -> bool:
         return False
 
 
+def task_agent(task: dict | None, workspace: Path | None = None) -> str:
+    """The agent the row's task is answered as (`connections.task_agent_mxid`): a pool worker's own
+    agent on its lane's tasks, a secondary lane's on its own. "" when no named lane queued the task."""
+    tid = task.get("id") if isinstance(task, dict) else None
+    # Only a named lane's id carries `~`: every other row skips the import and the record read.
+    if not isinstance(tid, str) or "~" not in tid:
+        return ""
+    try:
+        import connections
+        return connections.task_agent_mxid(tid, workspace)
+    except Exception:  # noqa: BLE001 - a row is written whether or not its agent can be named
+        return ""
+
+
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
            audience: str | None = None, projection: str | None = None,
@@ -188,6 +203,9 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         rec["done"] = True
     if queue:
         rec["queue"] = queue
+    agent = task_agent(task, workspace)
+    if agent:
+        rec["agent"] = agent
     path = log_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     # One lock for the append AND the rotation; the log is opened only under it, so no writer holds
@@ -245,8 +263,9 @@ def summarize(done_rec: dict, entry: dict, workspace: Path | None = None) -> dic
     started = float(entry.get("started", done_rec["ts"]))
     summary = {"ts": done_rec["ts"], "started": started, "rows": max(int(entry.get("rows", 1)), 1),
                "days": day_range(started, done_rec["ts"]), "line": done_rec["line"], "task": done_rec["task"]}
-    if done_rec.get("room"):
-        summary["room"] = done_rec["room"]
+    for key in ("room", "agent"):
+        if done_rec.get(key):
+            summary[key] = done_rec[key]
     if done_rec.get("pid"):
         summary["pid"] = done_rec["pid"]
     sp = summaries_path(workspace)

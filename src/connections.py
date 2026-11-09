@@ -1499,19 +1499,29 @@ def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     return bool(instance) and instance in [owner["instance"]] + alias_instances(owner)
 
 
-def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
-    """Whether the row's bridge has a checked owner DM on disk (state/owner-routing<suffix>.json: a
-    private room, bound to the row's agent when the row names one). Every lane reads it alike."""
-    inst = str(row.get("instance") or "")
+def _owner_dm_as(row: Mapping[str, object], inst: str, workspace: Optional[Path]) -> str:
+    """The checked owner DM the row's bridge wrote while running as `inst` (state/owner-routing<suffix>.json:
+    a private room, bound to the row's agent when the row names one); "" when none."""
     path = _workspace(workspace) / "state" / f"owner-routing{'.' + inst if inst else ''}.json"
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return ""
     if not isinstance(rec, dict) or not rec.get("owner_dm") or rec.get("private") is not True:
-        return False
+        return ""
     agent = str(row.get("agent_mxid") or "")
-    return not agent or rec.get("identity") == agent
+    return str(rec["owner_dm"]) if not agent or rec.get("identity") == agent else ""
+
+
+def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge has a checked owner DM on disk under its own instance. Every lane reads it alike."""
+    return bool(_owner_dm_as(row, str(row.get("instance") or ""), workspace))
+
+
+def _lane_owner_dms(row: Mapping[str, object], workspace: Optional[Path]) -> set:
+    """Every checked owner DM of the row's bridge, under its instance or a launch-key alias it runs as."""
+    names = [str(row.get("instance") or "")] + alias_instances(row)
+    return {dm for dm in (_owner_dm_as(row, inst, workspace) for inst in names) if dm}
 
 
 def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
@@ -1631,17 +1641,23 @@ def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
     return next((dict(r) for r in rows if r["primary"]), None)
 
 
-def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None) -> Optional[dict]:
+def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None,
+                        environ: Optional[Mapping[str, str]] = None) -> Optional[dict]:
     """The row a room operation acts through: the row whose server equals the room ID's domain
     exactly; for an ID naming no domain, the one row whose bridge has a task open in it, else the
     primary; with no room, the primary. None keeps the caller's own single-connection
     resolution: fewer than two rows, no primary, or an unreadable record.
-    NoConnectionForRoom when the domain has no row, or its row is disconnected."""
+    NoConnectionForRoom when the domain has no row, or its row is disconnected.
+    In a pool worker's session (`session_worker`) that worker's own identity comes first
+    (`acting_identity`); every other caller acts through the install's own rows."""
     try:
-        # A room operation acts as the install's own agent, never as a worker's identity.
-        rows = _core_rows(_read(record_path(workspace)))
+        every = _read(record_path(workspace))
     except (SchemaError, OSError):
         return None
+    own = acting_identity(every, room_id, session_worker(environ), workspace)
+    if own is not None:
+        return dict(own)
+    rows = _core_rows(every)
     if len(rows) < 2:
         return None
     server = server_of_room(room_id or "")
@@ -1665,7 +1681,7 @@ def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
     """The agent identity a room operation acts as, from the row `connection_for_room` routes it to:
     the row's recorded `agent_mxid`, else AGENT_MXID in the row's channel env file, kept only when it
     names that row's server. None keeps the caller's own resolution; '' when the row names none."""
-    row = connection_for_room(room_id, workspace)
+    row = connection_for_room(room_id, workspace, environ)
     if row is None:
         return None
     environ = os.environ if environ is None else environ
@@ -1755,7 +1771,7 @@ def room_credential(room_id: Optional[str], *, workspace: Optional[Path] = None,
                     environ: Optional[Mapping[str, str]] = None, vault=None) -> "Optional[tuple[str, str]]":
     """(gateway_url, token) a room operation must use, or None to keep the caller's own resolution
     (see `connection_for_room`). NoConnectionForRoom names what is missing."""
-    row = connection_for_room(room_id, workspace)
+    row = connection_for_room(room_id, workspace, environ)
     return None if row is None else connection_credential(row, environ, vault=vault)
 
 
@@ -2122,6 +2138,69 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
     except (SchemaError, OSError):
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
+
+
+# A worker's seat names its worker here (the pool launchers export it); the core's names none.
+SESSION_WORKER_ENV = "SUTANDO_WORKER_ID"
+
+
+def session_worker(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The pool worker this process is a session of (`SESSION_WORKER_ENV`); "" for the core's."""
+    environ = os.environ if environ is None else environ
+    worker = str(environ.get(SESSION_WORKER_ENV) or "")
+    return worker if WORKER_RE.match(worker) else ""
+
+
+def acting_identity(rows: list, room_id: Optional[str], worker: str,
+                    workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row when its session acts through it in `room_id`, else None (the
+    core's rows): its enabled row on the room's server; with no room, its only enabled row. A room
+    local state says is the core's stays the core's: one where a core lane, and not the worker's,
+    has a task open (that task is answered as the core's agent), or a core lane's own owner DM."""
+    own = [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
+    if not room_id:
+        return own[0] if len(own) == 1 else None
+    server = server_of_room(room_id)
+    mine = next((r for r in own if server in _row_servers(r)), None) if server else next(
+        (r for r in own if _lane_holds_room(r, room_id, workspace)), None)
+    if mine is None or _lane_holds_room(mine, room_id, workspace):
+        return mine
+    core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
+    if any(_lane_holds_room(r, room_id, workspace) or room_id in _lane_owner_dms(r, workspace) for r in core):
+        return None
+    return mine
+
+
+def worker_lane_named(name: str, workspace: Optional[Path] = None) -> bool:
+    """Whether `name` is a pool worker's own lane, by its instance or its channel dir. Such a lane
+    has no channel env file: its token lives in the vault alone (`connection_credential` reads it)."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return False
+    return any(r.get("worker") and name in (r["instance"], lane_channel_dir(str(r["instance"]))) for r in rows)
+
+
+def task_lane(task_id: str) -> str:
+    """The named lane that queued `task_id` (`task-<instance>~<broker id>`); "" for any other id."""
+    first = str(task_id or "").partition("~~")[0]  # a later run is `<local id>~~<n>`
+    inst, sep, _ = first[len("task-"):].partition("~")
+    return inst if first.startswith("task-") and sep and INSTANCE_RE.match(inst) else ""
+
+
+def task_agent_mxid(task_id: str, workspace: Optional[Path] = None) -> str:
+    """The agent a task is answered as: the one the lane that queued it runs as (`task_lane`, by
+    slug or launch-key alias). "" for a task no named lane queued, or when the record names none."""
+    instance = task_lane(task_id)
+    if not instance:
+        return ""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return ""
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    mxid = str((row or {}).get("agent_mxid") or "").strip()
+    return mxid if _STRICT_MXID_RE.fullmatch(mxid) else ""
 
 
 class LaneIdentityUnknown(ConnectionsError):
