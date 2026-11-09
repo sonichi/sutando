@@ -150,7 +150,7 @@ def sent_at(body: str, workspace: Optional[Path] = None) -> Optional[float]:
 def card_pointer_body(title: str, host: str) -> str:
     """A pointer to the card, never a decision surface: no options, nothing a reply answers."""
     return (f"[dm-only]\nA question from the {host} core is waiting for you as a decision card in your "
-            "AG2 Space DM, and it may not have arrived there.\n\n"
+            "s.space DM, and it may not have arrived there.\n\n"
             f"\u201c{' '.join(neutralize_markers(title or '').split())}\u201d\n\n"
             "Open that card to choose; a reply to this message does not answer it.\n")
 

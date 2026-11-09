@@ -196,7 +196,7 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
 
 CHAINS = ("discord", "ag2space", "slack")
 
-HEADER = """# D1 identity/state census — Discord / AG2 Space / Slack
+HEADER = """# D1 identity/state census — Discord / s.space / Slack
 
 Strangler Slice 1 (read-only): the 7 delivery identities and 7 structural
 facts of each chain's DM round trip, side by side, anchored to code. Generated

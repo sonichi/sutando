@@ -256,11 +256,11 @@ class PayloadTest(unittest.TestCase):
         self.assertEqual(re.findall(r"`(mcp__ag2_space__\w+)`", allowed.group(1)),
                          ["mcp__ag2_space__ag2_whoami", "mcp__ag2_space__room_actions_describe",
                           "mcp__ag2_space__room_action_execute"])
-        forbidden = prompt[allowed.end():prompt.index("Post with the AG2 Space connector")]
+        forbidden = prompt[allowed.end():prompt.index("Post with the s.space connector")]
         for tool in ("room_list", "room_inspect", "room_action_read", "relay_token_issue", "agent_link",
                      "agent_unlink"):
             self.assertIn("`%s`" % tool, forbidden)
-        self.assertIn("or any other AG2 Space connector tool", forbidden)
+        self.assertIn("or any other s.space connector tool", forbidden)
         self.assertIn("Claude Code's own tools (shell, files, web, subagents, skills)", prompt)
 
     def test_session_prompt_pins_the_message_count(self):

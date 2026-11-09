@@ -1,4 +1,4 @@
-"""Which AG2 Space gateway credential wins when sources disagree: the one owner of that precedence.
+"""Which s.space gateway credential wins when sources disagree: the one owner of that precedence.
 
 Every source is read by the caller, at its own I/O edge (the environment, the channel .env files it
 knows, a token file, a vault read), and handed in as plain values or a callable; this module reads

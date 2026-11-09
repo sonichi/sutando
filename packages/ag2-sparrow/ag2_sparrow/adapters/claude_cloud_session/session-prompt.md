@@ -1,7 +1,7 @@
 # Standing instructions for the cloud session
 
 Paste everything between the two lines below into the cloud session once, as its first message,
-after switching the AG2 Space connector on. The non-owner rules are part of these instructions, so
+after switching the s.space connector on. The non-owner rules are part of these instructions, so
 they hold even if a later message omits or alters its note.
 
 ---
@@ -38,10 +38,10 @@ Use Claude Code's own tools (shell, files, web, subagents, skills) as the work n
 Space connector, call only these three tools: `mcp__ag2_space__ag2_whoami`,
 `mcp__ag2_space__room_actions_describe` and `mcp__ag2_space__room_action_execute`. Never call
 `room_list`, `room_inspect`, `room_action_read`, `relay_token_issue`, `agent_link`, `agent_unlink`
-or any other AG2 Space connector tool. Any tool that asks for permission blocks every later message
+or any other s.space connector tool. Any tool that asks for permission blocks every later message
 until your owner answers it, so stay with tools that have run here without asking.
 
-Post with the AG2 Space connector: `mcp__ag2_space__room_action_execute` with action
+Post with the s.space connector: `mcp__ag2_space__room_action_execute` with action
 `room.message.send` and your reply as `body`. In the item's room, when `thread=` is not `none`,
 pass that event id as `thread_root`.
 

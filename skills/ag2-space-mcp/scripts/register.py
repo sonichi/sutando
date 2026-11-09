@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register the AG2 Space MCP server for this Sutando install, without the desktop app.
+"""Register the s.space MCP server for this Sutando install, without the desktop app.
 
 ag2-sparrow-mcp (packages/ag2-sparrow/ag2_sparrow/mcp_auth.py) owns discovery, the mint
 rules and the token helper. This finds the core's agent credential and adds that entry.
@@ -57,7 +57,7 @@ def main(argv: Optional[list] = None, load: Callable[[Path], object] = load_mcp_
     env_file = Path(args.env_file) if args.env_file else resolve_channel_env(claude_home_path("channels"), SOURCE)
     if env_file is None:
         print(f"no agent credential found under {claude_home_path('channels', SOURCE)}. Connect an agent in "
-              "AG2 Space, then save its token there as REMOTE_TASK_TOKEN='<relay-url>|<secret>'.", file=sys.stderr)
+              "s.space, then save its token there as REMOTE_TASK_TOKEN='<relay-url>|<secret>'.", file=sys.stderr)
         return 1
     if loose_permissions(env_file):
         print(f"warning: {env_file} is accessible by other users; run chmod 600 on it", file=sys.stderr)

@@ -260,7 +260,8 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- dismiss: Leave the current Zoom meeting. Use when user says "dismiss", "leave zoom", "end meeting", "leave the call".',
 		'- switch_mode: Switch between "active" (normal) and "meeting" (transcribes the meeting into notes). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode".',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
-		...instantTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
+		// The first sentence ends at a period before whitespace: a dot inside a name (s.space) is not one.
+		...instantTools.map(t => `- ${t.name}: ${(t.description as string).split(/\.(?=\s|$)/)[0]}. Instant.`),
 		...(coreDocumentedSkills.length > 0 ? [
 			'',
 			'DELEGATABLE SKILLS (call via work — core runs these, not voice-inline):',

@@ -1,4 +1,4 @@
-"""Credential variables a room client reads, taken from the AG2 Space channel env file.
+"""Credential variables a room client reads, taken from the `ag2space` channel env file.
 
 A desktop install keeps the agent's relay token and URL in the channel env file, which a skill's
 own process may not have sourced. `channel_credentials(names)` returns the listed variables from

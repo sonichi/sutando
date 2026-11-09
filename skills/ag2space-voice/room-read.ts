@@ -248,7 +248,7 @@ export function createRoomIndex(deps: { client: () => McpClient | null; log?: (m
 export function roomIndexContextLines(index: RoomIndex): string[] {
 	const names = index.rooms().map(r => r.name);
 	if (!names.length) return [];
-	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A name the user says that is one of these exactly (ignoring case) is that room — never swap it for a similar one ("triage system" is not "Sutando Triage"). A room name you hear is often misheard: only when it is none of these exactly, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is. When you read back an action, say the room\'s name as listed.`];
+	return [`ROOMS: s.space rooms you can read with read_room: ${names.join(' | ')}. A name the user says that is one of these exactly (ignoring case) is that room — never swap it for a similar one ("triage system" is not "Sutando Triage"). A room name you hear is often misheard: only when it is none of these exactly, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is. When you read back an action, say the room\'s name as listed.`];
 }
 
 export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean; in_thread_of?: string; reactions?: string[]; from_last?: number; system?: boolean }
@@ -762,7 +762,7 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'read_room',
 		description:
-			'Read the recent messages of an AG2 Space room, right now (about a second). ' +
+			'Read the recent messages of an s.space room, right now (about a second). ' +
 			'Call it when the user asks what is new in a room, what was said there lately, or whether someone replied or posted something there. ' +
 			'For what was said about a particular PR, topic or person — which may be far back — call search_room instead, then read_room with `around` = a hit\'s event_id to read the discussion around it. ' +
 			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
@@ -793,7 +793,7 @@ export function createSearchRoomTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'search_room',
 		description:
-			'Search an AG2 Space room\'s messages for words, however far back, right now (a second or two). ' +
+			'Search an s.space room\'s messages for words, however far back, right now (a second or two). ' +
 			'Call it when the user asks what was said in a room about a particular PR, issue, topic or person ("what was the review of 5473 in Sutando Triage", "what did Chi say about the guest line"), or about something from earlier than the latest messages — never answer such a question from memory or from an earlier answer; search every time. ' +
 			'Pass `query` = the words to find (a PR number, a name, a phrase), `room` = the room name as spoken or as listed in ROOMS; leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, hits:[{at, from, text, event_id}]} newest first, each a snippet around the match — answer from them in a sentence or two; to read the whole discussion around a hit, call read_room with `around` = its event_id. ' +
@@ -832,7 +832,7 @@ export function createSearchCommonsTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'search_commons',
 		description:
-			'Search an AG2 Space room\'s Commons — its documents (Doc pages), HTML pages, database rows and sheet rows — for words, right now (a few seconds). ' +
+			'Search an s.space room\'s Commons — its documents (Doc pages), HTML pages, database rows and sheet rows — for words, right now (a few seconds). ' +
 			'Call it when the user asks about a room\'s documents, pages, notes, plans, tables or records ("is there a doc about X in <room>", "what does the design page say", "what is in the todo table") — never answer from memory; search every time. ' +
 			'For what was said in the room\'s chat, use search_room instead. ' +
 			'Pass `query` = the words to find, `room` = the room name as listed in ROOMS; leave `room` out for the room this session is in. ' +
@@ -860,7 +860,7 @@ export function createReadPageTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'read_page',
 		description:
-			'Read one page of an AG2 Space room\'s Commons — a document or HTML page found by search_commons — right now (a few seconds). ' +
+			'Read one page of an s.space room\'s Commons — a document or HTML page found by search_commons — right now (a few seconds). ' +
 			'Pass `kind` exactly as the search hit gave it (e.g. "markdown-4m8ay3mg"), and `room` = the same room; leave `room` out for the room this session is in. ' +
 			`Returns {ok:true, room, title, text, more} — the page's text, cut after ${ROOM_PAGE_MAX_CHARS} characters (more:true when there is more); summarize it in a few sentences, never read it out. ` +
 			'Errors: "no_page" — the kind is not a page kind; "NOT_FOUND" — no such page; ' + ROOM_NAME_ERRORS +
@@ -884,7 +884,7 @@ export function createWritePageTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'write_page',
 		description:
-			'Write a note into an AG2 Space room\'s Commons, where every member sees it: a new document page (`title` + `text`), or `text` appended to the end of an existing page (`kind` from a search_commons hit, or "markdown" for the room\'s main Doc). ' +
+			'Write a note into an s.space room\'s Commons, where every member sees it: a new document page (`title` + `text`), or `text` appended to the end of an existing page (`kind` from a search_commons hit, or "markdown" for the room\'s main Doc). ' +
 			'A comment or remark on a page ("leave a comment", "留言") is add_comment, not this: appended text becomes part of the page. ' +
 			'A LaTeX or Typst file or project (.tex, .typ) is not this either: a page written here is a plain Doc page. Use find_room_actions ("latex project", "typst") for it. ' +
 			WRITE_CONFIRMATION +
@@ -913,7 +913,7 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'add_comment',
 		description:
-			'Leave a comment on a page of an AG2 Space room\'s Commons, as the web client does — on the whole page, or on one passage of a document with `quote`. ' +
+			'Leave a comment on a page of an s.space room\'s Commons, as the web client does — on the whole page, or on one passage of a document with `quote`. ' +
 			'Call it when the user wants to comment, remark or 留言 on a document or page ("comment on the design doc: Susan has reviewed"). To change the page\'s own text, use write_page instead. ' +
 			'Pass `kind` from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, "html" for the main HTML page, or "readme"; `quote` = the exact passage to anchor to (Doc pages only), left out for a comment on the whole page. ' +
 			'To answer in an existing comment thread instead, pass `reply_to` = that comment\'s event_id and no kind. ' +
@@ -946,7 +946,7 @@ export function createSendMessageTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'send_message',
 		description:
-			'Send a message in an AG2 Space room\'s chat, as this agent, where every member reads it. ' +
+			'Send a message in an s.space room\'s chat, as this agent, where every member reads it. ' +
 			'Call it when the user wants something said or posted in a room ("tell Sutando Triage that …", "reply to Chi\'s message: …"). ' +
 			'Pass `text` = the message; `reply_to` = the event_id of the message it answers (from read_room or search_room), left out otherwise; `thread` = a thread root\'s event_id to post inside that thread. ' +
 			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
@@ -978,7 +978,7 @@ export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) 
 	return {
 		name: 'list_rooms',
 		description:
-			'List the AG2 Space rooms you can read, right now. Call it when the user asks which rooms you are in or can read, ' +
+			'List the s.space rooms you can read, right now. Call it when the user asks which rooms you are in or can read, ' +
 			'or when a room they name is not in the ROOMS line and may be newly joined. Returns {ok:true, rooms:[names]}; "unavailable" when the list cannot be fetched; "no_credential" or "credential_refused" when the connection needs reconnecting.',
 		parameters: z.object({}),
 		execution: 'inline',
@@ -1091,7 +1091,7 @@ export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'navigate_space',
 		description:
-			'Move the user\'s own screen in the AG2 Space app, as run_room_action room.commons.summon opens a page for them. ' +
+			'Move the user\'s own screen in the s.space app, as run_room_action room.commons.summon opens a page for them. ' +
 			'`to` "commons" shows the Commons list of a room — the entry list of its surfaces (Doc, Whiteboard, Sheet, Database…), the current room\'s or `room`\'s by name ("go to the Commons list", "打开 commons 列表", "show me what is in <room>\'s Commons"). Not this: "document list", "list of documents", "show me the docs", "文档列表" mean the Doc surface and its pages — run_room_action room.commons.summon with arguments_json {"kind": "markdown"} (no page); one document named, "open the Stevens doc", is a summon to that page. ' +
 			'"back" leaves the screen they are on, one step ("go back", "回去", "退出文档"), so page → list → room walks back the way they came. ' +
 			'Speech often hears "Commons" as "comments": "the list of room comments", "open the room comments", "go to the comments" with no document or thread named means the Commons list — call this with "commons", never list comment threads for it. ' +
@@ -1114,7 +1114,7 @@ export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
 }
 
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. A note the user wants written into a room\'s Commons ("write this down in <room>", "add to the design page: …") → call write_page at once, then say the title, text and room you wrote; a comment or 留言 on a page → add_comment the same way, never an appended line; something to say or post in a room\'s chat ("tell <room> that …", "reply to <person>: …") → send_message the same way, @-mentioning someone only when the user asked to. No read-back and no yes first: the call comes in the same turn as the request, and the confirmation after it. Never submit work to read, search or explain a room or its documents, or to write a note, a comment or a message into one; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again. To move the user\'s own screen — a room\'s Commons list, the entry list of its surfaces ("go to the Commons list", "commons 列表"; speech often hears Commons as "comments", so "the list of room comments" with no document named is this too) or one step back ("go back", "回去", "退出文档") → navigate_space at once, no confirmation. "Document list", "show me the docs", "文档列表" is the Doc surface with its pages, not the Commons list: run_room_action room.commons.summon with {"kind": "markdown"} and no page (the summon in OTHER AG2 SPACE ACTIONS); a document named is a summon to that page. A "no_credential" or "credential_refused" from any room tool means your AG2 Space connection needs the owner to reconnect it (re-run Connect in the AG2 Space app): say exactly that, not that the room is unavailable.';
+export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an s.space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. A note the user wants written into a room\'s Commons ("write this down in <room>", "add to the design page: …") → call write_page at once, then say the title, text and room you wrote; a comment or 留言 on a page → add_comment the same way, never an appended line; something to say or post in a room\'s chat ("tell <room> that …", "reply to <person>: …") → send_message the same way, @-mentioning someone only when the user asked to. No read-back and no yes first: the call comes in the same turn as the request, and the confirmation after it. Never submit work to read, search or explain a room or its documents, or to write a note, a comment or a message into one; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again. To move the user\'s own screen — a room\'s Commons list, the entry list of its surfaces ("go to the Commons list", "commons 列表"; speech often hears Commons as "comments", so "the list of room comments" with no document named is this too) or one step back ("go back", "回去", "退出文档") → navigate_space at once, no confirmation. "Document list", "show me the docs", "文档列表" is the Doc surface with its pages, not the Commons list: run_room_action room.commons.summon with {"kind": "markdown"} and no page (the summon in OTHER s.space ACTIONS); a document named is a summon to that page. A "no_credential" or "credential_refused" from any room tool means your s.space connection needs the owner to reconnect it (re-run Connect in the s.space app): say exactly that, not that the room is unavailable.';
 
 /** What the relay agent\'s turn check is told: a room question is the voice model\'s own, never a task for the core. */
-export const ROOM_TURN_CHECK_RULE = '- none: a question about an AG2 Space room\'s messages or documents — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means, whether the room has a doc, page, note or table about something and what it says — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. A note, comment or message the user wants written into a room — into its documents ("write this down in <room>", "add to the page", "comment on the doc", 留言) or its chat ("tell <room> that …", "reply to <person> in <room>") — is also the assistant\'s own (it asks for the text if it is missing, writes it, then says what it wrote): none, even while the text is still missing — never ask. Only another action (review a PR, merge, change code or settings, anything outside the room) is work.';
+export const ROOM_TURN_CHECK_RULE = '- none: a question about an s.space room\'s messages or documents — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means, whether the room has a doc, page, note or table about something and what it says — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. A note, comment or message the user wants written into a room — into its documents ("write this down in <room>", "add to the page", "comment on the doc", 留言) or its chat ("tell <room> that …", "reply to <person> in <room>") — is also the assistant\'s own (it asks for the text if it is missing, writes it, then says what it wrote): none, even while the text is still missing — never ask. Only another action (review a PR, merge, change code or settings, anything outside the room) is work.';

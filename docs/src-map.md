@@ -21,7 +21,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`activity_bus.py`** — ActivityCard is the UI projection of a durable TaskRun state machine; runtime instrumentation only enriches that state machine with observations.
 - **`activity_policy.py`** — Access tier → capabilities → audience policy → projection.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
-- **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
+- **`ag2space_links.py`** — Links a person clicks to open an s.space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
@@ -43,7 +43,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
 - **`channel_auth_exit.py`** — Exit contract for a channel bridge whose provider rejected its credential.
-- **`channel_credentials.py`** — Credential variables a room client reads, taken from the AG2 Space channel env file.
+- **`channel_credentials.py`** — Credential variables a room client reads, taken from the `ag2space` channel env file.
 - **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
@@ -110,7 +110,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`file_lock.py`** — Cross-platform advisory file-lock primitives for shared runtime state.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
-- **`gateway_credential_sources.py`** — Which AG2 Space gateway credential wins when sources disagree: the one owner of that precedence.
+- **`gateway_credential_sources.py`** — Which s.space gateway credential wins when sources disagree: the one owner of that precedence.
 - **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
 - **`gateway_sessions.py`** — The Discord bridge's record of when it opened new gateway sessions: one writer, the bridge.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
@@ -379,7 +379,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/channels/`
 
-- **`__init__.py`** — AG2 Space / Sutando channel adapters.
+- **`__init__.py`** — s.space / Sutando channel adapters.
 
 ## `src/channels/discord/`
 

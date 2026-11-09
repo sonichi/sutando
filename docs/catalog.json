@@ -20,7 +20,7 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, AG2 Space owner-mention tasks, ambient taskify provenance",
+   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, s.space collaborator opt-in, s.space owner-mention tasks, ambient taskify provenance",
    "last_verified": "2026-10-21"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
@@ -76,10 +76,10 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-11-07"
+   "last_verified": "2026-11-09"
   },
   "docs/census/d1-identity-census.md": {
-   "title": "D1 identity/state census — Discord / AG2 Space / Slack",
+   "title": "D1 identity/state census — Discord / s.space / Slack",
    "audience": [
     "contributors",
     "maintainers"
@@ -369,7 +369,7 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "the tutorial skill's two modes: the voice walkthrough and the AG2 Space Getting started page",
+   "canonical_for": "the tutorial skill's two modes: the voice walkthrough and the s.space Getting started page",
    "last_verified": "2026-10-30"
   },
   "docs/voice-agent-test-framework.md": {

@@ -33,7 +33,7 @@ Output is one JSON object on stdout. Exit codes: 0 ok; 1 a negative answer (no
 exact match, not every app connected, nothing claimed, the account not the
 wait's or unknown); 2 a setup problem to relay, not retry (not signed in,
 connectors disabled, unknown app, too many apps, bad arguments, not the owner's
-own AG2 Space task, cloud unreachable).
+own s.space task, cloud unreachable).
 
 A wait is `<workspace>/state/connect-waits/<wait-id>.json`. Claiming it is a
 rename to `<wait-id>.claimed`, so exactly one of the waiter, the deadline,
@@ -41,7 +41,7 @@ rename to `<wait-id>.claimed`, so exactly one of the waiter, the deadline,
 record keeps who claimed it and when, so `claim` and `status` can report that a
 room's request is already answered or being answered. The waiter writes one
 resume task, `tasks/task-connect-<wait-id>.txt`, which the core processes like
-any other. Only a live owner-tier AG2 Space task can record a wait, and one task
+any other. Only a live owner-tier s.space task can record a wait, and one task
 has at most one wait per room. A wait whose AG2 Cloud account is unknown never
 answers with data (outcome `unverified`), and waits of different accounts are
 never merged; a `connected` resume runs `verify-account` and `claim` reports each
@@ -687,7 +687,7 @@ def origin_owner(ws: Path, task: str) -> str:
     Anything else raises not_owner_task: only the owner's own request may arm an owner resume."""
 
     def refuse(why: str) -> Setup:
-        return Setup("not_owner_task", f"{task} {why}: connect waits are only for the owner's own AG2 Space requests.")
+        return Setup("not_owner_task", f"{task} {why}: connect waits are only for the owner's own s.space requests.")
 
     try:
         text = (ws / "tasks" / f"{task}.txt").read_text(encoding="utf-8")
@@ -699,7 +699,7 @@ def origin_owner(ws: Path, task: str) -> str:
     # The gateway writes source above the body and one-lines every value; any other
     # header line anywhere in the file counts against the task, never for it.
     if above_body.get("source") != ORIGIN_SOURCE or set(_header_values(text, "source")) != {ORIGIN_SOURCE}:
-        raise refuse("is not from AG2 Space")
+        raise refuse("is not from s.space")
     if _header_values(text, "collaborator"):
         raise refuse("is a collaborator task")
     tiers = {ltp.canonical_access_tier(v) for v in _header_values(text, "access_tier")}
