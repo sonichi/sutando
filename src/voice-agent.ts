@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, snapshotVoiceSessionOrigin, voiceTaskResultText } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -1049,9 +1049,10 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	const callEnd = createCallEndReporter({
 		sessionId: SESSION_ID,
 		items: () => sessionRef?.conversationContext.items ?? [],
+		origin: snapshotVoiceSessionOrigin,
 		onEnded: async (ended) => {
 			const { summary, transcript } = sessionEndTask(ended);
-			await submitVoiceSessionEndTask(summary, transcript);
+			await submitVoiceSessionEndTask(summary, transcript, ended.origin ?? null);
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
