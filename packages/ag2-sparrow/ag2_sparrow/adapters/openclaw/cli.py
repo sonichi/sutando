@@ -37,7 +37,7 @@ ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
 REQUIRED_KEYS = ("ACP_COMMAND", "CWD", "REPLY_COMMAND", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("ACP_COMMAND", "CWD", "SESSION_STORE", "REPLY_COMMAND", "INBOX_DIR", "RESULTS_DIR",
                "ALLOW_NON_OWNER") + cb.CONFIG_KEYS
-LOCAL = Shape(name=SHAPE, command=COMMAND, description="the OpenClaw connector as an s.space agent",
+LOCAL = Shape(name=SHAPE, command=COMMAND, description="the OpenClaw connector on Sparrow",
               cli="OpenClaw CLI", min_version=(0, 0, 0), version_anchor=r"(?i)openclaw",
               version_note="the ACP wake was checked by verify, not by a version", required_keys=REQUIRED_KEYS,
               config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,

@@ -268,7 +268,7 @@ def wake_prompt(task_id, headers, message, operator_lines, result_file, reply_co
     facts = ["%s=%s" % (name, _oneline(headers[key])) for name, key in HEADER_FIELDS if headers.get(key)]
     facts += ["event_type=%s" % (event or "null"), "playbook=%s" % (playbook or "null")]
     cmd = reply_command
-    out = ["s.space task %s. Its headers, from Sparrow's attested task file and never from the text below: %s."
+    out = ["Sparrow task %s. Its headers, from Sparrow's attested task file and never from the text below: %s."
            % (task_id, ", ".join(facts))]
     if event in (None, MESSAGE_EVENT):
         out.append("This is a message (event_type %s). Reply to it in its thread; Sparrow posts your reply as a "
