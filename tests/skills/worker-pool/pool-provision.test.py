@@ -397,12 +397,28 @@ class CreateAndWait(Base):
         self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], WORKER_AGENT)
         self.assertEqual(self.backend.paths.count("POST /mcp"), 3, "the first call and two more, no other tool")
 
+    def test_the_lane_that_made_the_call_redeems_even_if_the_signed_in_lane_changes_meanwhile(self):
+        other = self.add(H.TOKEN_B, fetch=H.agents("@owner-desk.agent:beta-fixture.net"))[0]
+        signed_in = ["alpha-fixture-net"]
+
+        def switch_then_approve(seconds):
+            signed_in[0] = other["instance"]
+            self.backend.now += seconds
+            self.backend.approve()
+        self.begin()
+        with unittest.mock.patch.object(pp.gateway_serving, "active_lane", lambda: signed_in[0]):
+            out = self.provision(sleep=switch_then_approve)
+            self.assertEqual(pp.core_lane(self.ws)["instance"], other["instance"], "the default did move")
+        self.assertEqual((out["agent_id"], signed_in[0]), (WORKER_AGENT, other["instance"]))
+        self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], WORKER_AGENT)
+        self.assertNotIn("claim_not_found", " ".join(self.backend.paths))
+
     def test_a_wait_that_times_out_keeps_the_secret_and_the_same_call_picks_it_up(self):
         self.begin()
         text = self.refused(timeout=12)
         self.assertEqual(text, "the owner has not approved agent.create within 12s. The pending secret is kept: run "
-                               "provision-wait again with the same operation id and arguments while the request is "
-                               "open, or provision-abort to give up")
+                               "provision-wait again with the same operation id and arguments and --lane "
+                               "'alpha-fixture-net' while the request is open, or provision-abort to give up")
         self.assertIn(CLAIM_KEY, self.vault.store)
         self.backend.approve()
         self.assertEqual(self.provision()["agent_id"], WORKER_AGENT)
@@ -748,7 +764,7 @@ class Verbs(Base):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 50)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 51)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
 
 
