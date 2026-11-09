@@ -4525,10 +4525,20 @@ class OwnChildWhileTheReaperHoldsItsLock(unittest.TestCase):
             self.assertIsNone(proc.poll(), "the race this covers: poll() cannot tell")
             self.assertTrue(C._exited(proc.pid))
 
+    def test_an_exit_confirmed_while_the_lock_is_held_leaves_the_registry(self):
+        proc = self.spawn("raise SystemExit(2)")
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        with proc._waitpid_lock:
+            self.assertTrue(C._exited(proc.pid))
+            self.assertNotIn(proc.pid, C._CHILDREN, "an exited child must not stay registered")
+        self.assertEqual(C._exit_code(proc), 2)
+        self.assertNotIn(proc.pid, C._CHILDREN)
+
     def test_a_running_child_reads_running_while_its_wait_lock_is_held(self):
         proc = self.spawn("import time; time.sleep(30)")
         with proc._waitpid_lock:
             self.assertFalse(C._exited(proc.pid))
+            self.assertIn(proc.pid, C._CHILDREN, "a running child stays registered")
 
     def test_its_rc_is_read_once_the_reaper_releases_the_lock(self):
         proc = self.spawn("raise SystemExit(2)")

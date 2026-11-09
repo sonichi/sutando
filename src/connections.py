@@ -2850,9 +2850,9 @@ def _exited(pid: int) -> bool:
     child = _CHILDREN.get(pid)
     waitid = getattr(os, "waitid", None)
     if child is not None:
-        if child.poll() is None:
-            # poll() also reads None while the reaper thread holds Popen's wait lock.
-            return waitid is not None and _waitid_exited(waitid, pid)
+        # poll() also reads None while the reaper thread holds Popen's wait lock.
+        if child.poll() is None and not (waitid is not None and _waitid_exited(waitid, pid)):
+            return False
         _CHILDREN.pop(pid, None)
         return True
     if waitid is not None:
