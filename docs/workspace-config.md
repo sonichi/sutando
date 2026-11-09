@@ -82,6 +82,18 @@ Sutando posts no macOS desktop notifications unless you opt in:
 
 Off by default. Only a JSON `true` turns them on; any other value, or a config that cannot be read, leaves them off. Every macOS sender asks the one reader: `resolve_macos_notifications()` in `src/sutando_config.py` (TypeScript: `resolveMacosNotifications()` in `src/sutando_config.ts`; shell: `bash scripts/sutando-config.sh macos-notifications`, used by `src/macos-notify.sh`). With it off, pending questions, bridge restarts, the agent shepherd and health alerts still reach you through your DM or the core's task queue; a banner that only acknowledged your own action (a context drop, a screen recording) is simply not shown.
 
+## Verified digests in Team results (`egress.verified_digest_sources`)
+
+A Team result that carries a 64-hex digest (for example a review package's SHA-256) is held, because the secret filters cannot tell a digest from a hex credential. The result is released only when the digest's provenance is verified by the guard itself:
+
+```json
+{ "egress": { "verified_digest_sources": [
+  { "repo": "owner/name", "check_name": "behavior-review-package" }
+] } }
+```
+
+The result must cite the check run by URL (`https://github.com/owner/name/runs/<id>`). The guard fetches that run with the host's `gh` credentials and masks a digest only if the run is in a listed repository, has the listed name, was created by GitHub Actions, and its own output states ``Assessment digest: `<digest>` ``. Everything else in the body is still scanned. Empty (the default), an unreachable GitHub, or any mismatch clears nothing. The rule lives in `src/policy/egress/public_digest.py`.
+
 ## Three common overrides
 
 ```json
