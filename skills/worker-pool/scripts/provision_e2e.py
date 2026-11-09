@@ -56,7 +56,8 @@ MIN_NEEDLE = 16
 UNSCANNED = ("projects",)
 SHELL_HISTORIES = (".zsh_history", ".bash_history")
 CHUNK = 1 << 20
-REFUSALS = (400, 401, 403, 409, 410, 422)
+# How a server refuses a redeem about the claim itself, and how it refuses one with no credential.
+CLAIM_REFUSALS, UNAUTHENTICATED = (400, 403, 409, 410, 422), (401, 403)
 DONE = ("succeeded", "success", "completed", "complete", "done", "ok", "executed")
 ENDED = ("denied", "rejected", "failed", "expired", "cancelled", "canceled")
 
@@ -448,16 +449,26 @@ class Flow:
             self.hold(f"token from extra redeem {len(self.needles)}", str(body.get("bearer") or ""))
         return status, body
 
-    def refusal(self, name: str, status: int, body: Mapping[str, object], expected=REFUSALS) -> None:
-        """A refusal is one of the client-error statuses a server answers a bad redeem with. A token is a
-        failure; any other answer (a server error, a missing route, a redirect) proves nothing."""
+    def refusal(self, name: str, status: int, body: Mapping[str, object],
+                caller: Optional[Tuple[str, str]] = None) -> None:
+        """Record a check that a redeem made as `caller` (bearer, agent; None for no credential) was
+        refused for the reason under test. A token is a failure. A refusal counts only as a status
+        that fits the reason, and only when the caller's own credential is accepted just after:
+        an authentication failure says nothing about the claim."""
         said = f"http {status} {pp.error_code(body)}".rstrip()
         if status == 200:
             self.report.set(name, FAIL, "the server delivered a token")
-        elif status in expected:
-            self.report.set(name, PASS, f"refused ({said})")
+        elif status not in (CLAIM_REFUSALS if caller else UNAUTHENTICATED):
+            self.report.set(name, INCOMPLETE, f"not a refusal of this kind: the server answered {said}")
+        elif caller and not self.accepted(*caller):
+            self.report.set(name, INCOMPLETE, f"refused ({said}), but the caller's own credential was not accepted "
+                                              "just after, so this says nothing about the claim")
         else:
-            self.report.set(name, INCOMPLETE, f"not a refusal: the server answered {said}")
+            self.report.set(name, PASS, f"refused ({said})")
+
+    def accepted(self, bearer: str, agent: str) -> bool:
+        status, _, body = self.request("GET", self.gateway.rstrip("/") + "/v1/whoami", bearer=bearer)
+        return status == 200 and body.get("agent_mxid") == agent
 
     def create(self, label: str, key_sha256: str) -> Tuple[str, dict, str]:
         operation_id = f"provision-e2e-{uuid.uuid4().hex}"
@@ -511,22 +522,27 @@ class Flow:
             return
         self.created.append(agent_a)
         self.provenance(agent_a, env_a, label)
-        self.refusal(WRONG_SECRET, *self.redeem_once(self.core_bearer, claim_a, secrets.token_hex(32)))
-        self.refusal(NO_CREDENTIAL, *self.redeem_once("", claim_a, secret_a), expected=(401, 403))
+        core = (self.core_bearer, str(self.core["agent_mxid"]))
+        self.refusal(WRONG_SECRET, *self.redeem_once(self.core_bearer, claim_a, secrets.token_hex(32)), caller=core)
+        self.refusal(NO_CREDENTIAL, *self.redeem_once("", claim_a, secret_a))
         worker_bearer = self.redeem(wid, claim_a, agent_a)
         if not worker_bearer:
+            for name in (WRONG_SECRET, NO_CREDENTIAL):
+                if report.status(name) == PASS:
+                    report.set(name, INCOMPLETE, f"{report.rows[name][1]}, but the claim was never redeemed, so it "
+                                                 "was not shown to be valid")
             return
         ask_again_at = self.second_redeem(claim_a, secret_a, worker_bearer)
-        claim_b = self.second_claim(second, worker_bearer)
+        claim_b = self.second_claim(second, worker_bearer, agent_a)
         self.mention(agent_a)
         if claim_b is not None:
             wait = max(0.0, claim_b[2] + EXPIRY_MARGIN_S - self.clock())
             self.say(f"waiting {int(wait)}s for the second claim to expire")
             self.sleep(wait)
-            self.refusal(EXPIRED, *self.redeem_once(self.core_bearer, claim_b[0], claim_b[1]))
+            self.refusal(EXPIRED, *self.redeem_once(self.core_bearer, claim_b[0], claim_b[1]), caller=core)
         if ask_again_at:
             self.sleep(max(0.0, ask_again_at - self.clock()))
-            self.refusal(SECOND, *self.redeem_once(self.core_bearer, claim_a, secret_a))
+            self.refusal(SECOND, *self.redeem_once(self.core_bearer, claim_a, secret_a), caller=core)
         self.retire(wid, agent_a, worker_bearer)
         for other in [a for a in self.created if a != agent_a]:
             state = self.retire_remote(other)
@@ -606,7 +622,7 @@ class Flow:
         """Record the second redeem; the time to ask once more when the server re-delivered instead."""
         status, body = self.redeem_once(self.core_bearer, claim_id, secret)
         if status != 200:
-            self.refusal(SECOND, status, body)
+            self.refusal(SECOND, status, body, caller=(self.core_bearer, str(self.core["agent_mxid"])))
             return 0.0
         if body.get("bearer") != worker_bearer:
             self.report.set(SECOND, FAIL, "a second, different token was minted")
@@ -614,7 +630,7 @@ class Flow:
         self.report.set(SECOND, INCOMPLETE, "re-delivered the same token; not asked again after the window")
         return self.redeemed_at + self.args.recollect_window
 
-    def second_claim(self, second, worker_bearer: str) -> Optional[Tuple[str, str, float]]:
+    def second_claim(self, second, worker_bearer: str, worker_agent: str) -> Optional[Tuple[str, str, float]]:
         """Settle the second create and try its claim as the new worker agent: (claim, secret, expiry)."""
         if second is None:
             for name in (OTHER_CALLER, EXPIRED, CLEANUP):
@@ -632,7 +648,8 @@ class Flow:
         if self.clock() >= expires:
             self.report.set(OTHER_CALLER, INCOMPLETE, "the second claim expired before it could be tried")
         else:
-            self.refusal(OTHER_CALLER, *self.redeem_once(worker_bearer, claim_b, secret_b))
+            self.refusal(OTHER_CALLER, *self.redeem_once(worker_bearer, claim_b, secret_b),
+                         caller=(worker_bearer, worker_agent))
         return claim_b, secret_b, expires
 
     def mention(self, agent_id: str) -> None:

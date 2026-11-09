@@ -314,7 +314,8 @@ class EachRuleHasACheckThatFails(Base):
             rows, rc, text = self.go(request=broken)
             negative = (e2e.WRONG_SECRET, e2e.NO_CREDENTIAL, e2e.SECOND, e2e.OTHER_CALLER, e2e.EXPIRED)
             self.assertEqual({rows[n][0] for n in negative}, {e2e.INCOMPLETE}, text)
-            self.assertEqual(rows[e2e.WRONG_SECRET][1], f"not a refusal: the server answered http {status} {code}".rstrip())
+            self.assertEqual(rows[e2e.WRONG_SECRET][1],
+                             f"not a refusal of this kind: the server answered http {status} {code}".rstrip())
             self.assertEqual((rc, len(answered)), (3, 5), "five refusals were asked for and none is certified")
 
     def test_a_missing_credential_must_be_refused_as_unauthenticated(self):
@@ -322,8 +323,29 @@ class EachRuleHasACheckThatFails(Base):
             real = self.backend.request(method, url, **kw)
             return (409, {}, {"code": "claim_redeemed"}) if url.endswith("/redeem") and not kw.get("bearer") else real
         rows, _, _ = self.go("--single-claim", request=conflict)
-        self.assertEqual(rows[e2e.NO_CREDENTIAL], (e2e.INCOMPLETE, "not a refusal: the server answered http 409 "
-                                                                   "claim_redeemed"))
+        self.assertEqual(rows[e2e.NO_CREDENTIAL], (e2e.INCOMPLETE, "not a refusal of this kind: the server answered "
+                                                                   "http 409 claim_redeemed"))
+
+    def test_an_authentication_failure_does_not_certify_a_claim_rule(self):
+        def unauthenticated(method, url, **kw):
+            real = self.backend.request(method, url, **kw)
+            return (401, {}, {"code": "AGENT_CREDENTIAL_UNKNOWN"}) if url.endswith("/redeem") and real[0] != 200 else real
+        rows, rc, text = self.go(request=unauthenticated)
+        claim_rules = (e2e.WRONG_SECRET, e2e.SECOND, e2e.OTHER_CALLER, e2e.EXPIRED)
+        self.assertEqual({rows[n] for n in claim_rules}, {(e2e.INCOMPLETE, "not a refusal of this kind: the server "
+                                                          "answered http 401 AGENT_CREDENTIAL_UNKNOWN")}, text)
+        self.assertEqual((rc, rows[e2e.NO_CREDENTIAL][0]), (3, e2e.PASS), "only the missing credential is that")
+
+    def test_a_refusal_while_the_callers_credential_is_not_accepted_says_nothing_about_the_claim(self):
+        def credential_lapsed(method, url, **kw):
+            if url.endswith("/v1/whoami") and kw.get("bearer") == CORE_SECRET and self.backend.now > 1_800_000_200:
+                return 401, {}, {"code": "AGENT_CREDENTIAL_STALE"}
+            return self.backend.request(method, url, **kw)
+        rows, rc, _ = self.go(request=credential_lapsed)
+        self.assertEqual(rows[e2e.EXPIRED], (e2e.INCOMPLETE, "refused (http 410 claim_expired), but the caller's own "
+                                             "credential was not accepted just after, so this says nothing about "
+                                             "the claim"))
+        self.assertEqual((rc, rows[e2e.WRONG_SECRET][0], rows[e2e.OTHER_CALLER][0]), (3, e2e.PASS, e2e.PASS))
 
     def test_provenance_the_server_does_not_expose_is_incomplete_not_a_pass(self):
         self.backend.bugs.add("hide_provenance")
@@ -337,6 +359,9 @@ class Edges(Base):
     def test_a_redeem_that_fails_stops_the_run_and_names_the_agent_left_behind(self):
         rows, rc, text = self.go(preview=lambda token: {"verified": False, "error": "auth_rejected"})
         self.assertEqual((rc, rows[e2e.REDEEM][0], rows[e2e.WHOAMI][0]), (1, e2e.FAIL, e2e.SKIP))
+        self.assertEqual(rows[e2e.WRONG_SECRET], (e2e.INCOMPLETE, "refused (http 403 claim_secret_mismatch), but the "
+                                                  "claim was never redeemed, so it was not shown to be valid"))
+        self.assertEqual(rows[e2e.NO_CREDENTIAL][0], e2e.INCOMPLETE)
         self.assertIn("now has a token nobody holds", rows[e2e.REDEEM][1])
         self.assertIn(f"left on the server: {WORKER_AGENT}", text)
         self.assertNotIn(CLAIM_KEY, self.vault.store)
@@ -823,7 +848,7 @@ class Small(unittest.TestCase):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 68)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 70)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
         self.assertIs(subprocess.SubprocessError, e2e.subprocess.SubprocessError)
 
