@@ -11,7 +11,7 @@ judgment. It never calls anything itself and holds no state.
   outcome <write.json>                  done, wait (retry_after_s), stop or fail
 
 Each JSON file is a tool's whole reply as it came back, wrapper included. The backend holds
-the same rules (room-doc commons_feeds.write_plan): this script keeps a run from even asking
+the same rules (room-collab commons_feeds.write_plan): this script keeps a run from even asking
 for what the grant does not cover.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ import re
 import sys
 from urllib.parse import urlsplit
 
-# The catalogue the backend lists (room-doc commons_feeds.CATALOGUE) and, per kind, the one
+# The catalogue the backend lists (room-collab commons_feeds.CATALOGUE) and, per kind, the one
 # read-only connector action it maps to. A kind not here is never run.
 CALENDAR = "calendar.upcoming"
 GATED = {"gmail.threads_matching": "a mail feed waits for the consent dialog (C4 E5)"}

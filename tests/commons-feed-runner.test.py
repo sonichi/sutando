@@ -4,7 +4,7 @@
 Replies are in the shapes the runner is handed: room.commons.feeds.list's grants as core-api
 answers them (actions/commons/feeds.py on ag2space dev), Composio's GOOGLECALENDAR_EVENTS_LIST
 reply (wrapped as the MCP returns it), and core-api's error envelope for a refused write.
-The rows are held to the backend's own cell rules (room-doc commons_db_writes.normalize and
+The rows are held to the backend's own cell rules (room-collab commons_db_writes.normalize and
 commons_feeds._desired): a passing run is one the backend accepts. Hermetic."""
 from __future__ import annotations
 
