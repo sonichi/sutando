@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 
+from ... import held_start
 from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
@@ -41,7 +42,7 @@ NON_OWNER_SANDBOX = "read-only"
 NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
-HELD_WAIT_S = 30.0
+HELD_WAIT_S = held_start.WAIT_S
 
 
 def log(*a):
@@ -548,29 +549,10 @@ def serve_held(args, cwd_given):
     holder's record names this process as the consumer (a hand start with --held is refused). The
     process lives inside the held inode (fchdir on --root-fd) and names tasks/, results/ and state/
     relative to it: the pathname the launcher saw may be renamed or replaced, this inode cannot."""
-    try:
-        os.fchdir(args.root_fd)
-    except OSError as e:
-        sys.stderr.write("refusing to start: --root-fd %d is not the held root's directory (%s)\n" % (args.root_fd, e))
-        return 2
+    refused = held_start.enter(args.root_fd, HELD_WAIT_S, holder_consumer)
+    if refused is not None:
+        return refused
     args.work = "."     # the held inode, wherever its pathname goes
-    deadline = time.monotonic() + HELD_WAIT_S
-    while True:
-        consumer = holder_consumer(args.work)
-        if consumer and consumer.get("pid") == os.getpid():
-            # The record must name this incarnation (pid and start) and verify it alive: a stale record
-            # naming a reused pid, or one whose lineage cannot be read, serves nothing.
-            if consumer.get("live") is True and consumer.get("start") == start_time(os.getpid()):
-                break
-            why = ("a start time that is not this process's" if consumer.get("start") != start_time(os.getpid())
-                   else "liveness unknown" if consumer.get("live") is None else "liveness false")
-            sys.stderr.write("refusing to start: --held, but the holder of %s names this pid with %s, not verified\n"
-                             % (os.getcwd(), why))
-            return 2
-        if stop_requested() or time.monotonic() >= deadline:
-            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % os.getcwd())
-            return 2
-        time.sleep(0.05)
     args.inbox, args.results, args.state = "tasks", "results", "state"
     # The owner thread's cwd is a pathname by protocol: None here means the inode's current one, per turn.
     args.cwd = os.path.abspath(cwd_given) if cwd_given else None

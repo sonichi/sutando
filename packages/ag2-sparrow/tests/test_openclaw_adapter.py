@@ -156,6 +156,14 @@ class ConnectorTest(unittest.TestCase):
         self.assertTrue(self.w.result("task-1").startswith("[no-send]"))
         self.assertEqual(self.metrics()[0]["event_type"], "room.joined")
 
+    def test_a_summon_is_framed_as_an_event(self):
+        self.w.task("task-1", "STUB:TEXT Summoned to page P: review the plan.", event_type="commons.summon")
+        self.w.serve()
+        text = self.w.prompts()[0]["text"]
+        self.assertIn("event_type=commons.summon", text)
+        self.assertIn("raised by the platform event commons.summon", text)
+        self.assertTrue(self.w.result("task-1").startswith("[no-send]"))
+
     def test_mention_and_event_prompts_are_framed_differently(self):
         h = {"channel_id": "!r:s", "access_tier": "owner", "collaborator": "false"}
         mention = oc.wake_prompt("task-1", dict(h, event_type="room.mention"), "hi", [], "/w/results/task-1.txt", REPLY)

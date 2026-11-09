@@ -169,6 +169,21 @@ class SharedAgentBridge(unittest.TestCase):
                                                                     ("env key", "AGENT_CONNECT_TASK_DIR")])
 
 
+# One owner, held_start: how a connector run --held under a launcher enters the held root and waits to be attached.
+HELD_CONNECTORS = ("adapters/codex/codex_connector.py", "adapters/openclaw/openclaw_connector.py")
+HELD_OWNED = ("os.fchdir(", "holder_consumer(", "start_time(os.getpid())")
+
+
+class SharedHeldStart(unittest.TestCase):
+    def test_both_connectors_delegate_the_held_start_and_keep_no_copy(self):
+        for rel in HELD_CONNECTORS:
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            with self.subTest(module=rel):
+                self.assertIn("held_start.enter(args.root_fd, HELD_WAIT_S, holder_consumer)", text)
+                self.assertIn("HELD_WAIT_S = held_start.WAIT_S", text)
+                self.assertEqual([step for step in HELD_OWNED if step in text], [], "a copy of held_start's policy")
+
+
 class BoundaryTest(unittest.TestCase):
     def test_the_package_has_no_crossings(self):
         self.assertEqual(violations(PKG_ROOT), [])

@@ -31,18 +31,18 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import agent_triggers, result_labels, result_publish
+from ... import agent_triggers, held_start, result_labels, result_publish
 from ...relay_loop import count_arg
 from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
-                        release_lock, root_path, start_time, stop_requested)
+                        release_lock, root_path, stop_requested)
 from .acp_client import AUTH_REQUIRED, AcpClient, AcpError, AcpGone, AcpTimeout
 
 ANSWERED_DIR = "openclaw-answered"     # under state/: one O_EXCL claim per answered task
 SESSIONS_NAME = "sessions.json"
 TASK_NAME_RE = re.compile(r"task-[A-Za-z0-9._~-]{1,160}")
 MESSAGE_EVENT = "room.mention"
-HELD_WAIT_S = 30.0
+HELD_WAIT_S = held_start.WAIT_S
 NO_ANSWER = "[no-send] OpenClaw ended the turn without an answer"
 EVENT_NO_ANSWER = "[no-send] OpenClaw handled the event without posting"
 # Option kinds the ACP schema defines; option ids are the agent's own and change between releases.
@@ -546,23 +546,9 @@ def main(argv=None):
 def serve_held(args):
     """Under a launcher: start only once the holder's record names this very process, alive; then live in
     the held inode (fchdir), with tasks/, results/ and state/ relative to it."""
-    try:
-        os.fchdir(args.root_fd)
-    except OSError as e:
-        sys.stderr.write("refusing to start: --root-fd %d is not the held root (%s)\n" % (args.root_fd, e))
-        return 2
-    deadline = time.monotonic() + HELD_WAIT_S
-    while True:
-        consumer = holder_consumer(".")
-        if consumer and consumer.get("pid") == os.getpid():
-            if consumer.get("live") is True and consumer.get("start") == start_time(os.getpid()):
-                break
-            sys.stderr.write("refusing to start: --held, but the holder names this pid unverified\n")
-            return 2
-        if stop_requested() or time.monotonic() >= deadline:
-            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % os.getcwd())
-            return 2
-        time.sleep(0.05)
+    refused = held_start.enter(args.root_fd, HELD_WAIT_S, holder_consumer)
+    if refused is not None:
+        return refused
     _paths(args, ".")
     return exit_code(serve_locked(args))
 

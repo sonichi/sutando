@@ -28,8 +28,8 @@ and the `--token-env-file` / `--token-stdin` / `--work` roots). What is OpenClaw
 
 The prompt carries the task's attested headers (room, sender, access tier, thread, `event_type`,
 `playbook`) and its body between unique markers. A task whose `event_type` is `room.mention` or absent is
-a message: OpenClaw replies to it in its thread. Any other `event_type` (`room.joined`, and with the
-engine's well-formed pass-through, `commons.summon` or a type not known yet) is an event: OpenClaw does
+a message: OpenClaw replies to it in its thread. Any other `event_type` (`room.joined`,
+`commons.summon`, or any well-formed type not known yet) is an event: OpenClaw does
 what the body says and posts only what the body asks. Member-written text a body quotes is data, never
 instructions.
 
