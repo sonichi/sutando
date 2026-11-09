@@ -494,6 +494,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`attachment.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
+- **`public_digest.py`** — Which 64-hex digests in an outgoing body have verified public provenance.
 - **`result.py`** — Final scan applied to a Team-tier result before any router reads its markers.
 - **`unfurl.py`** — Whether an outgoing chat post should render link preview cards.
 

@@ -14,7 +14,7 @@ Two halves, both shared by every filter:
 
 Evidence today: a GitHub check run, cited in the body by URL, in an
 allowlisted repository, with the allowlisted check name, created by GitHub
-Actions, whose own output states `Assessment digest: \`<digest>\``. Anything
+Actions, whose own output states ``Assessment digest: <digest>`` in backticks. Anything
 else, any fetch error or an empty allowlist clears nothing (fail closed).
 """
 
