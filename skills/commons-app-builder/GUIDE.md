@@ -171,7 +171,8 @@ others; then use theirs. Each family has a dark, a mid and a light tone, named `
 | `yellow` | `#8A5911` | `#F0E345` | `#F4F6BA` |
 | `neutral` | `#1B1919` | `#B7B2AD` | `#F4F4F4` |
 
-Paste the matching custom properties (`--ss-<token>`) into the page:
+Each token is a CSS custom property with the `--ss-` prefix: token `red-dark` is `--ss-red-dark`,
+`neutral-light` is `--ss-neutral-light`, and so on for every token. Paste them into the page:
 
 ```css
 :root {
@@ -186,14 +187,17 @@ Paste the matching custom properties (`--ss-<token>`) into the page:
 
 When the request names no colours:
 
-- **Neutral for text and surfaces.** `neutral-dark` text on `neutral-light` or white surfaces;
-  `neutral-mid` for borders and secondary text.
+- **Neutral for text and surfaces.** `neutral-dark` text on `neutral-light` or white surfaces.
+  `neutral-mid` (about 2.1:1 on white) is only for borders, dividers, disabled states and large
+  text (24px and up), never body or secondary text. For secondary text use `neutral-dark` at a
+  smaller size or lighter weight, or the grey `#6B6560`: 5.7:1 on white and 5.2:1 on
+  `neutral-light`, so it meets 4.5:1 on both.
 - **One family as the accent**, chosen to suit the app; name it in your reply. Its `-dark` is
   accent text and icons, its `-mid` is highlights and buttons, its `-light` is tinted tiles and
   backgrounds. The app icon uses the same family.
 - **Check contrast.** Most `-mid` tones and `neutral-mid` are under 3:1 on white: never body
-  text. Label a `-mid` button in the family's `-dark` (or white on `red-mid` and `blue-mid`).
-  `green-dark` on `green-light` is about 4.2:1: large text and icons only.
+  or secondary text. Label a `-mid` button in the family's `-dark` (or white on `red-mid` and
+  `blue-mid`). `green-dark` on `green-light` is about 4.2:1: large text and icons only.
 - **Dark set:** `neutral-dark` surfaces, `neutral-light` text, the accent's `-light` for accents.
 
 **App icon.** Give every app an `icon` on its app record (`apps.create`, `apps.update` or
