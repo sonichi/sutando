@@ -10,10 +10,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "skills" / "schedule-crons" / "ensure-cron-room.py"
-GATEWAY_KEYS = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
-                "GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
 
 
 class NotConnected(unittest.TestCase):
@@ -22,8 +23,7 @@ class NotConnected(unittest.TestCase):
             # An empty --repo: no src/connections.py to route through and no .env to read.
             crons = Path(tmp) / "crons.json"
             crons.write_text('[{"name": "daily", "room": "auto"}]', encoding="utf-8")
-            env = {k: v for k, v in os.environ.items() if k not in GATEWAY_KEYS}
-            env.update({"HOME": tmp, "CLAUDE_CONFIG_DIR": os.path.join(tmp, "ccd")})
+            env = hermetic_env(home=tmp, CLAUDE_CONFIG_DIR=os.path.join(tmp, "ccd"))
             r = subprocess.run([sys.executable, str(SCRIPT), "--crons-file", str(crons), "--repo", tmp],
                                capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
