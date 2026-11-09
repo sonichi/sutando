@@ -209,6 +209,8 @@ this spec:
 - A flat illustration in that family's `-dark` and `-mid` tones: at most 3 colours with the
   tile, no text, no gradients.
 - Plain SVG shapes, a few hundred bytes.
+- Where a green tile carries initials or a glyph, ink them in `#136733` for contrast: 5.8:1 on
+  `green-light`.
 
 If the user asks for another icon (their own upload, an emoji, a different style), use that, and
 keep it when you update the app. The server checks only safety and format: a real SVG or PNG data
