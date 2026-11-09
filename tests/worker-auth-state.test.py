@@ -264,6 +264,16 @@ class IdleSinceSignIn(unittest.TestCase):
                      "⏺ Bash(ls)\n", REFUSED, "✻ Worked for 0s\n"):
             self.assertFalse(idle_since_sign_in(self.SIGNED_IN + tail + FOOTER), tail)
 
+    def test_the_live_effort_footer_row_is_not_agent_output(self):
+        # The idle frame captured from Claude Code v2.1.275, under a fresh sign-in.
+        live = ("                                            ● high · /effort\n"
+                "────────────────────────────────────────────────────────────────\n"
+                '❯ Try "refactor <filepath>"\n'
+                "────────────────────────────────────────────────────────────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+        self.assertTrue(idle_since_sign_in("Login successful\n" + live))
+        self.assertEqual(login_expired(REFUSED + live), EXPIRED)
+
     def test_no_sign_in_or_a_codex_pane_is_not_idle_since_one(self):
         self.assertFalse(idle_since_sign_in(REFUSED + FOOTER))
         self.assertFalse(idle_since_sign_in(""))

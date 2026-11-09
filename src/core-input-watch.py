@@ -1051,7 +1051,9 @@ def main():
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
         if isinstance(key, tuple) and time.time() - typed_at.get(kind, 0.0) < TYPED_ANSWER_COOLDOWN_S:
             key = None
+        sent = False
         if key and send_keys(a.socket, a.session, key):
+            sent = True
             answered_prompt = prompt
             last_answered = {"kind": kind, "key": key, "at": time.time()}
             if isinstance(key, tuple):
@@ -1064,8 +1066,9 @@ def main():
         elif follow_up:
             then, follow_up = follow_up_step(follow_up, state, time.time(), pane or "")
             if then:
-                send_keys(a.socket, a.session, then)
-        rkey = resume_step(state, pane or "", runtime, a.seat, resumed_at, time.time(), a.auto_answer)
+                sent = send_keys(a.socket, a.session, then)
+        # Typed input makes this capture stale: the boot prompt is judged on a fresh one.
+        rkey = None if sent else resume_step(state, pane or "", runtime, a.seat, resumed_at, time.time(), a.auto_answer)
         if rkey and send_keys(a.socket, a.session, rkey):
             resumed_at = time.time()
             last_answered = {"kind": "signed-in", "key": rkey, "at": resumed_at}

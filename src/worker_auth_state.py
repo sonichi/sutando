@@ -84,10 +84,11 @@ def _lines(pane: Optional[str]) -> List[str]:
 
 
 def _ran(row: Tuple[str, str], runtime: Optional[str]) -> bool:
-    core, raw = row
+    raw = row[1]
     if runtime == CODEX:
         return bool(_CODEX_RAN.match(raw)) and not _CODEX_BUSY.search(raw)
-    return bool(_RAN.match(core))
+    # Agent output starts at column 0; an indented bullet is a status row ("● high · /effort").
+    return bool(_RAN.match(raw))
 
 
 def _is_prompt(core: str, runtime: Optional[str]) -> bool:

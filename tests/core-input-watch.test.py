@@ -1516,6 +1516,20 @@ class TestResumeAfterSignIn(unittest.TestCase):
         again = self.SIGNED_IN.replace(_IDLE_FOOTER, _REFUSED_TURNS + _IDLE_FOOTER)
         self.assertEqual(self._ticks([self.SIGNED_IN, again, self.SIGNED_IN]), [self.BOOT])
 
+    def test_the_live_v2_1_275_idle_frame_after_a_sign_in_is_resumed(self):
+        live = "Login successful\n" + TestComposerText.LIVE_PLACEHOLDER_PANE
+        self.assertEqual(self._ticks([live]), [self.BOOT])
+
+    def test_one_capture_drives_one_actor_and_resume_waits_for_a_fresh_one(self):
+        # A pending model-switch follow-up and a sign-in on the same frame: the follow-up
+        # goes first; the boot prompt is judged again on the next capture.
+        both = "❯ /login\n  ⎿  Login successful\n" + _IDLE
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both, both])
+        self.assertEqual([k for _s, _x, k in sent],
+                         [("/model opus", "Enter"), ("continue", "Enter"), ("/startup", "Enter")])
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both])
+        self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
+
     def test_resume_step_skips_codex_and_honours_the_cooldown(self):
         rs = _mod.resume_step
         self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", None, 0.0), ("/startup", "Enter"))
