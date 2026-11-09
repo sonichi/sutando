@@ -9,6 +9,7 @@ answered with a JSON-RPC method-not-found error, so the agent is never left wait
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import queue
 import subprocess
@@ -63,30 +64,29 @@ class AcpClient:
 
     def _reader(self):
         try:
-            for line in self.p.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    m = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(m, dict):
-                    continue
-                if "method" not in m:
-                    q = self.pending.pop(m.get("id"), None)
-                    if q is not None:
-                        q.put(m)
-                elif "id" in m:
-                    self._answer_request(m)
-                else:
-                    self._notification(m)
-        except (OSError, ValueError):
-            pass
+            with contextlib.suppress(OSError, ValueError):
+                for line in self.p.stdout:
+                    self._dispatch(line)
         finally:
             self.gone.set()
             for q in list(self.pending.values()):
                 q.put(None)
+
+    def _dispatch(self, line):
+        try:
+            m = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(m, dict):
+            return
+        if "method" not in m:
+            q = self.pending.pop(m.get("id"), None)
+            if q is not None:
+                q.put(m)
+        elif "id" in m:
+            self._answer_request(m)
+        else:
+            self._notification(m)
 
     def _answer_request(self, m):
         method, rid, params = m.get("method"), m.get("id"), m.get("params") or {}
@@ -148,10 +148,8 @@ class AcpClient:
                          timeout)
 
     def close(self, grace=5.0):
-        try:
+        with contextlib.suppress(OSError):
             self.p.stdin.close()
-        except OSError:
-            pass
         try:
             self.p.wait(timeout=grace)
         except subprocess.TimeoutExpired:

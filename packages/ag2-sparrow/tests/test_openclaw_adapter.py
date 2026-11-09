@@ -4,6 +4,7 @@ permission policy, the prompt framing, the reply commands, and install/verify.
 No network and no real `openclaw`: `openclaw_stub_acp.py` stands in for `openclaw acp`. Run:
     python3 packages/ag2-sparrow/tests/test_openclaw_adapter.py
 """
+import argparse
 import contextlib
 import io
 import json
@@ -24,6 +25,9 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import connect_common as cm, task_io  # noqa: E402
 from ag2_sparrow.adapters.openclaw import cli, openclaw_connector as oc  # noqa: E402
+
+from ag2_sparrow.adapters.openclaw.acp_client import (AUTH_REQUIRED, AcpClient, AcpError, AcpGone,  # noqa: E402
+                                                     AcpTimeout)
 
 STUB = str(Path(__file__).resolve().parent / "openclaw_stub_acp.py")
 REPLY = shlex.join([sys.executable, "-m", "ag2_sparrow.adapters.openclaw.cli"])
@@ -443,6 +447,440 @@ class InstallVerifyTest(unittest.TestCase):
         self.assertIn("FAIL acp wake:", out)
         rc, out = self.verify("--no-probe")
         self.assertNotIn("acp wake", out)
+
+
+FAKE_AGENT = r"""
+import json, sys
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+send([1, 2])
+sys.stdout.write("\nnot json\n"); sys.stdout.flush()
+send({"jsonrpc": "2.0", "id": 999, "result": {}})
+send({"jsonrpc": "2.0", "id": 50, "method": "fs/read_text_file", "params": {}})
+send({"jsonrpc": "2.0", "id": 51, "method": "session/request_permission", "params": {}})
+send({"jsonrpc": "2.0", "method": "session/update", "params": {}})
+seen, init = [], None
+for line in sys.stdin:
+    m = json.loads(line)
+    seen.append(m)
+    if m.get("method") == "initialize":
+        init = m["id"]
+    if init is not None and {50, 51} <= {x.get("id") for x in seen}:
+        send({"jsonrpc": "2.0", "id": init, "result": {"seen": sorted(x.get("id") for x in seen)}})
+        init = None
+    elif m.get("method") == "boom":
+        send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32000, "message": "auth needed"}})
+    elif m.get("method") == "quit":
+        break
+"""
+
+
+def raise_(exc):
+    raise exc
+
+
+class AcpClientTest(unittest.TestCase):
+    def client(self, code=FAKE_AGENT, **kw):
+        return AcpClient([sys.executable, "-c", code], env=isolated_child_env(), **kw)
+
+    def test_noise_is_skipped_unknown_requests_are_refused_and_failing_handlers_never_hang(self):
+        c = self.client(on_permission=lambda p: raise_(RuntimeError("x")), on_update=lambda p: raise_(RuntimeError("y")))
+        try:
+            res = c.initialize(10)
+            self.assertEqual(res["seen"], [1, 50, 51], "both agent requests were answered")
+            self.assertEqual(c.unhandled["fs/read_text_file"], 1)
+            with self.assertRaises(AcpError) as e:
+                c.call("boom", {}, 10)
+            self.assertEqual(e.exception.code, -32000)
+            c.notify("quit", {})
+            self.assertTrue(c.gone.wait(10))
+            with self.assertRaises(AcpGone):
+                c.call("initialize", {}, 1)
+        finally:
+            c.close(2)
+
+    def test_a_dead_pipe_and_a_silent_agent_are_errors(self):
+        c = self.client("import time; time.sleep(30)")
+        try:
+            with self.assertRaises(AcpTimeout):
+                c.call("initialize", {}, 0.2)
+            c.p.stdin.close()
+            with self.assertRaises(AcpGone):
+                c.notify("x", {})
+        finally:
+            c.close(0.2)
+        self.assertIsNotNone(c.p.returncode)
+
+    def test_an_agent_ignoring_eof_and_term_is_killed(self):
+        c = AcpClient(["/bin/sh", "-c", "trap '' TERM; sleep 30"], stderr_path=os.devnull)
+        c.close(0.2)
+        self.assertIsNotNone(c.p.returncode)
+
+    def test_an_agent_dying_mid_call_is_gone(self):
+        c = self.client("import sys; sys.stdin.readline()")
+        try:
+            with self.assertRaises(AcpGone):
+                c.call("initialize", {}, 10)
+        finally:
+            c.close(1)
+
+    def test_a_command_that_cannot_start_raises_oserror(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(OSError):
+                AcpClient(["/nonexistent/acp"], stderr_path=os.path.join(d, "err"))
+
+
+class FakeClient:
+    """Scripted AcpClient: `plan` maps a method to a result dict or an exception to raise."""
+
+    def __init__(self, plan, calls):
+        self.plan, self.calls = plan, calls
+
+    def __call__(self, argv, **kw):
+        return self
+
+    def initialize(self, timeout):
+        return self.call("initialize", {}, timeout)
+
+    def call(self, method, params, timeout):
+        self.calls.append(method)
+        out = self.plan.get(method, {})
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    def notify(self, method, params):
+        self.calls.append(method)
+        raise AcpGone("closed")
+
+    def close(self, grace):
+        self.calls.append("close")
+
+
+class RunTurnTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+        self.store = self.w.root / "state" / "sessions.json"
+        self.store.write_text(json.dumps({"sessions": [{"room": "!r", "access_tier": "owner", "session_id": "old",
+                                                        "cwd": str(self.w.cwd)}]}))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def turn(self, plan):
+        calls = []
+        a = self.w.args()
+        c = oc.Connector(a, client_factory=FakeClient(dict({"initialize": {"agentCapabilities": {"loadSession": True}}},
+                                                           **plan), calls))
+        with contextlib.redirect_stderr(io.StringIO()):
+            status, text, detail, _ = c.run_turn("task-1", {"channel_id": "!r", "access_tier": "owner"}, "p",
+                                                 "/r/task-1.txt", True)
+        return status, detail, calls
+
+    def test_each_failure_is_one_status(self):
+        cases = [({"session/load": AcpGone("died")}, "gone"),
+                 ({"session/load": AcpTimeout("slow")}, "timeout"),
+                 ({"session/load": AcpError("no"), "session/new": {}}, "failed"),
+                 ({"session/load": {}, "session/prompt": AcpError("login", AUTH_REQUIRED)}, "failed"),
+                 ({"session/load": {}, "session/prompt": AcpError("bad")}, "failed"),
+                 ({"session/load": {}, "session/prompt": {"stopReason": "cancelled"}}, "cancelled"),
+                 ({"session/load": {}, "session/prompt": {"stopReason": "refusal"}}, "failed")]
+        for plan, want in cases:
+            with self.subTest(plan=plan):
+                status, detail, calls = self.turn(plan)
+                self.assertEqual(status, want, detail)
+                self.assertEqual(calls[-1], "close")
+        self.assertIn("not signed in", self.turn({"session/load": {}, "session/prompt": AcpError("x", AUTH_REQUIRED)})[1])
+        self.assertIn("no sessionId", self.turn({"session/load": AcpError("no"), "session/new": {}})[1])
+
+    def test_a_timed_out_prompt_is_cancelled_even_when_the_cancel_cannot_be_sent(self):
+        status, _, calls = self.turn({"session/load": {}, "session/prompt": AcpTimeout("slow")})
+        self.assertEqual(status, "timeout")
+        self.assertIn("session/cancel", calls)
+
+    def test_fallback_wording_per_status(self):
+        c = oc.Connector(self.w.args())
+        self.assertIn("stopped before answering", c.fallback_body({}, "gone", "", "died"))
+        self.assertIn("Partial reply:\npart", c.fallback_body({}, "timeout", "part", "900s"))
+        self.assertIn("(timeout: 900s)", c.fallback_body({"event_type": "room.joined"}, "timeout", "", "900s"))
+        self.assertEqual(c.fallback_body({}, "completed", " ", ""), oc.NO_ANSWER + "\n")
+
+
+class EntryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def main(self, *extra):
+        argv = ["--work", str(self.w.root), "--cwd", str(self.w.cwd), "--acp-command",
+                shlex.join([sys.executable, STUB]), "--reply-command", REPLY, "--poll", "0.01", *extra]
+        with contextlib.redirect_stderr(io.StringIO()):
+            return oc.main(argv)
+
+    def test_main_takes_the_lock_and_serves(self):
+        self.w.task("task-1", "STUB:TEXT hi")
+        with mock.patch.dict(os.environ, {"STUB_STATE": str(self.w.stub_state), "PYTHONPATH": str(PKG_ROOT)}):
+            self.assertEqual(self.main("--once", "1"), 0)
+        self.assertEqual(self.w.result("task-1"), "text from the stub\n")
+
+    def test_main_refuses_a_held_root(self):
+        owner = task_io.acquire_lock(str(self.w.root), "other")
+        try:
+            self.assertNotEqual(self.main("--once", "1"), 0)
+        finally:
+            task_io.release_lock(owner)
+
+    def test_an_idle_connector_exits_when_told(self):
+        self.assertEqual(self.main("--idle-exit", "0.05"), 0)
+
+    def test_an_empty_acp_command_is_refused(self):
+        a = oc.build_parser().parse_args(["--work", "w", "--reply-command", "r", "--acp-command", " "])
+        with self.assertRaises(SystemExit):
+            oc._prepare(a)
+
+    def held(self, consumer, fd=None):
+        fd = os.open(str(self.w.root), os.O_RDONLY) if fd is None else fd
+        here = os.getcwd()
+        try:
+            with mock.patch.object(oc, "holder_consumer", lambda w: consumer), mock.patch.object(oc, "HELD_WAIT_S", 0.1), \
+                    mock.patch.object(oc, "serve_locked", lambda a: 0):
+                return self.main("--held", "--root-fd", str(fd), "--once", "1")
+        finally:
+            os.chdir(here)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def test_held_starts_only_when_the_holder_names_this_process(self):
+        me = {"pid": os.getpid(), "live": True, "start": task_io.start_time(os.getpid())}
+        self.assertEqual(self.held(me), 0)
+        self.assertEqual(self.held(dict(me, live=None)), 2)
+        self.assertEqual(self.held(None), 2)
+        self.assertEqual(self.held(me, fd=987654), 2)
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                oc.main(["--work", "w", "--reply-command", "r", "--held"])
+
+
+class PolicyEdgeTest(unittest.TestCase):
+    def test_paths_and_unparsable_commands(self):
+        opts = PermissionTest.OPTS
+        decide = lambda tc, owner=True: oc.decide_permission({"toolCall": tc, "options": opts}, owner, "/w/cwd",  # noqa: E731
+                                                            REPLY, "/w/results/task-1.txt")[0]
+        self.assertTrue(decide({"rawInput": {"path": "/w/cwd/a.txt"}}))
+        self.assertFalse(decide({"rawInput": {"path": "/w/a.txt"}}))
+        self.assertFalse(decide({"rawInput": {"command": "ls"}}), "no path: refused")
+        self.assertFalse(decide({"rawInput": {"path": "/w/cwd/a\0b"}}), "unresolvable")
+        self.assertFalse(oc.is_reply_command("%s no-reply 'x" % REPLY, REPLY, "x"))
+        self.assertFalse(oc.is_reply_command("", REPLY, "x"))
+
+    def test_operator_lines_follow_the_body(self):
+        p = oc.wake_prompt("task-1", {"access_tier": "team"}, "hi", ["GUARDRAIL line"], "/r/task-1.txt", REPLY)
+        self.assertLess(p.index("hi\n</"), p.index("GUARDRAIL line"))
+
+    def test_release_of_an_absent_claim_is_quiet(self):
+        with tempfile.TemporaryDirectory() as d:
+            oc.release_answer(d, "task-1")
+
+
+class CliEdgeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+        self.w.task("task-1", "hi")
+        self.rf = str(self.w.root / "results" / "task-1.txt")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, argv, stdin=""):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out):
+            return cli.main(argv), out.getvalue()
+
+    def test_reply_bounds_and_failures(self):
+        self.assertEqual(self.run_cli(["reply", self.rf], "x" * (cli.REPLY_MAX_BYTES + 1))[0], cli.REPLY_USAGE)
+        self.assertEqual(self.run_cli(["no-reply", self.rf, "--reason", "r" * 300])[0], cli.REPLY_USAGE)
+        with mock.patch.object(oc, "publish_answer", lambda *a: raise_(OSError("disk"))):
+            self.assertEqual(self.run_cli(["reply", self.rf], "hi")[0], cli.REPLY_USAGE)
+        self.assertFalse(oc.is_answered(self.w.root / "state", "task-1"), "a failed write releases its claim")
+        rc, out = self.run_cli(["reply", self.rf, "--title", "t" * 80], "hi")
+        self.assertEqual(rc, 0)
+        self.assertIn("warning:", out)
+
+    def test_a_root_without_state_is_not_served(self):
+        (self.w.root / "state").rename(self.w.root / "elsewhere")
+        self.assertEqual(self.run_cli(["no-reply", self.rf])[0], cli.REPLY_USAGE)
+
+    def test_the_reply_command_is_found_beside_the_interpreter_then_on_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / cli.COMMAND
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            with mock.patch.object(cli.sysconfig, "get_path", lambda name: d):
+                self.assertEqual(cli.find_reply_command(), shlex.quote(str(exe)))
+            with mock.patch.object(cli.sysconfig, "get_path", lambda name: "/nonexistent"), \
+                    mock.patch.object(cli.shutil, "which", lambda name: str(exe)):
+                self.assertEqual(cli.find_reply_command(), shlex.quote(str(exe)))
+            with mock.patch.object(cli.sysconfig, "get_path", lambda name: "/nonexistent"), \
+                    mock.patch.object(cli.shutil, "which", lambda name: None):
+                self.assertIn("-m ag2_sparrow.adapters.openclaw.cli", cli.find_reply_command())
+
+    def test_small_pieces(self):
+        self.assertEqual(cli.acp_command(" ", None), ("", "--acp-command is empty"))
+        cfg = {"ACP_COMMAND": "/bin/openclaw acp", "CWD": "/", "REPLY_COMMAND": "r", "ALLOW_NON_OWNER": "1"}
+        self.assertIn("--allow-non-owner", cli.connector_argv(cfg, "/w", 3))
+        said, why = cli.probe(cfg, factory=lambda *a, **k: raise_(OSError("nope")))
+        self.assertIn("did not start", why)
+        with mock.patch.object(cm, "holder_words", lambda root, labels: "words %s" % (labels,)):
+            self.assertIn("launcher", cli.holder_words("/w"))
+        with mock.patch.object(cm, "list_jobs", lambda shape: 7):
+            self.assertEqual(cli.main(["list"]), 7)
+
+
+class Patches(contextlib.ExitStack):
+    def set(self, obj, **attrs):
+        for k, v in attrs.items():
+            self.enter_context(mock.patch.object(obj, k, v))
+        return self
+
+
+def quiet(fn, *a):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        return fn(*a), out.getvalue()
+
+
+class LifecycleDelegationTest(InstallVerifyTest):
+    """The supervised lifecycle is connect_common's and connect_bridge's: each verb hands them this shape."""
+
+    def args(self, **kw):
+        base = dict(work=None, token_env_file=None, token_stdin=False, agent=None, key=None, single=False,
+                    acp_command=None, profile=None, cwd=str(self.cwd), session_store=None, allow_non_owner=False,
+                    reply_command=None, argv=[], parser=None)
+        return argparse.Namespace(**dict(base, **kw))
+
+    def test_the_agents_own_root_from_its_token_file(self):
+        tok = Path(self.tmp.name) / "agent.env"
+        self.assertIn("pass --work", cli.resolve_root(self.args())[1])
+        self.assertIn("not for", cli.resolve_root(self.args(work="w", token_env_file="t"))[1].replace("is for", "not for"))
+        self.assertIn("is missing", cli.resolve_root(self.args(token_env_file=str(tok)))[1])
+        tok.write_text("x")
+        with Patches() as p:
+            p.set(cli.cb, install_identity=lambda f, b: "")
+            self.assertIn("agent id is unknown", cli.resolve_root(self.args(token_env_file=str(tok)))[1])
+        with Patches() as p:
+            p.set(cli.cb, install_identity=lambda f, b: "@a:x", seat_env=lambda f, a: ({}, ""),
+                  agent_root=lambda a: ("/agents/a", ""), supervised_seat_problem=lambda *a: "seat says no")
+            p.set(cli._dirs, bridge_host=lambda: "")
+            where, problem = cli.resolve_root(self.args(token_env_file=str(tok)))
+            self.assertEqual((where["root"], where["mode"], problem), ("/agents/a", cli.UNIT, ""))
+            p.set(cli._dirs, bridge_host=lambda: "pool")
+            self.assertEqual(cli.resolve_root(self.args(token_env_file=str(tok)))[1], "seat says no")
+
+    def test_install_wires_the_agents_bridge_through_connect_bridge(self):
+        seen = {}
+        where = {"root": str(self.work), "mode": cli.UNIT, "agent_id": "@a:x", "token_file": "/t.env"}
+        for wired, want in (("", 0), ("no unit", cm.EXIT_UNUSABLE)):
+            with Patches() as p:
+                p.set(cli, resolve_root=lambda a: (where, ""))
+                p.set(cli.cb, recorded_install_args=lambda *a: "", agent_arg_problem=lambda *a: "",
+                      under_agent_lock=lambda root, fn, *a, **k: (seen.update(orphan=k["orphan"]), fn())[1],
+                      wire_bridge_bound=lambda values, *a: (seen.update(values=values), wired)[1],
+                      session_flags=lambda a: [], orphan_bridge=lambda *a: "orphaned")
+                p.set(cm, agent_job=lambda shape, agent: (shape, ""), install_selector_problem=lambda *a: "",
+                      install=lambda *a, **k: 0)
+                rc, out = quiet(cli.install, self.args(token_env_file="/t.env"))
+                seen["orphaned"] = seen["orphan"]()
+            self.assertEqual(rc, want, out)
+        self.assertEqual(seen["values"]["AGENT_ID"], "@a:x")
+        self.assertEqual(seen["orphaned"], "orphaned")
+        with Patches() as p:
+            p.set(cli, resolve_root=lambda a: (where, ""))
+            p.set(cli.cb, recorded_install_args=lambda *a: "", agent_arg_problem=lambda *a: "")
+            p.set(cm, agent_job=lambda shape, agent: (None, "two jobs"))
+            self.assertEqual(quiet(cli.install, self.args(token_env_file="/t.env"))[0], cm.EXIT_UNUSABLE)
+        self.assertEqual(quiet(cli.install, self.args(work=str(self.work), cwd="/nonexistent/x"))[0], cm.EXIT_UNUSABLE)
+
+    def test_install_with_a_pasted_token_goes_through_connect_bridge(self):
+        seen = {}
+        with Patches() as p:
+            p.set(cli.cb, install_token_stdin=lambda args, shape, pre, inst, cmd, **k: (seen.update(pre=pre()), 0)[1],
+                  host_problem=lambda c: "")
+            self.assertEqual(cli.install(self.args(token_stdin=True, agent="@a:x")), 0)
+        self.assertEqual(seen["pre"], "", "the preflight finds openclaw on PATH")
+
+    def test_run_is_the_managers_and_hands_the_connector_to_the_holder_sequence(self):
+        self.assertEqual(quiet(cli.main, ["run"])[0], cm.EXIT_UNUSABLE, "refused without the unit's marker")
+        got = {}
+        with Patches() as p:
+            p.set(cm, job_from_env=lambda shape: (shape, ""), managed_problem=lambda shape: "",
+                  run_launchd=lambda argv, popen: (got.update(launchd=argv), 0)[1])
+            self.assertEqual(cli.main(["run", "--launchd"]), 0)
+        self.assertIn(cli.__name__, " ".join(map(str, got["launchd"])))
+        cfg = {"ACP_COMMAND": "%s acp" % self.openclaw, "CWD": str(self.cwd), "REPLY_COMMAND": REPLY,
+               "ROOT": str(self.work)}
+
+        class Op:
+            def __enter__(self):
+                return self
+
+            def release(self):
+                got["released"] = True
+
+        def hold(shape, root, state, prepare, spawn, supervise, kill, *a, **k):
+            owner = argparse.Namespace(root_fd=5)
+            ctx, _ = prepare(owner, root)
+            got["child"] = spawn(ctx)
+            return supervise("child")
+        with Patches() as p:
+            p.set(cli, selected=lambda a: (cli.LOCAL, ""), load_config=lambda local=None: (cfg, ""))
+            p.set(cli.task_io, make_dirs=lambda owner, dirs: None, root_path=lambda owner, root: root)
+            p.set(cm, operation_lock=lambda local: Op(), hold_and_supervise=hold,
+                  supervise_child=lambda child, state, *a: cm.EXIT_HELD, retired=lambda state, rc: rc)
+            rc = quiet(cli.run, argparse.Namespace(debug=True, launchd=False),
+                       lambda argv, **kw: (argv, kw["pass_fds"]))[0]
+        self.assertEqual(rc, cm.EXIT_CHILD_HELD, "the connector's own 75 is reported as 1")
+        self.assertTrue(got["released"])
+        argv, fds = got["child"]
+        self.assertEqual((argv[argv.index("--root-fd") + 1], fds), ("5", (5,)))
+        with Patches() as p:
+            p.set(cli, selected=lambda a: (cli.LOCAL, ""), load_config=lambda local=None: ({}, "no config"))
+            p.set(cm, operation_lock=lambda local: Op())
+            self.assertEqual(quiet(cli.run, argparse.Namespace(debug=True, launchd=False))[0], cm.EXIT_UNUSABLE)
+
+        class Busy:
+            def __enter__(self):
+                raise cm.Busy("in use")
+        with Patches() as p:
+            p.set(cli, selected=lambda a: (cli.LOCAL, ""))
+            p.set(cm, operation_lock=lambda local: Busy())
+            self.assertEqual(quiet(cli.run, argparse.Namespace(debug=True, launchd=False))[0], cm.EXIT_UNUSABLE)
+
+    def test_verify_and_uninstall_delegate_and_refuse_without_a_job(self):
+        with Patches() as p:
+            p.set(cli, selected=lambda a: (None, "no job"))
+            self.assertEqual(quiet(cli.verify, self.args())[0], cm.EXIT_UNUSABLE)
+            self.assertEqual(quiet(cli.uninstall, self.args())[0], cm.EXIT_UNUSABLE)
+        self.assertEqual(quiet(cli.main, ["verify"])[0], 1, "no config is a FAIL row")
+        seen = {}
+        with Patches() as p:
+            p.set(cli.cb, unwire_bridge=lambda cfg, cmd, bridge: seen.setdefault("unwired", cmd))
+            p.set(cm, uninstall=lambda local, before_free, token_file: before_free({}) and 0)
+            self.assertEqual(quiet(cli.main, ["uninstall"])[0], 0)
+        self.assertEqual(seen["unwired"], cli.COMMAND)
+        self.write_config()
+        cfg, _ = cli.load_config()
+        with Patches() as p:
+            p.set(cli, load_config=lambda local=None: (dict(cfg, BRIDGE=cli.UNIT, AGENT_ID="@a:x"), ""))
+            p.set(cli.cb, bridge_problem=lambda *a: "", relay_rows=lambda results, *a: results.append(True))
+            rc, out = quiet(cli.main, ["verify", "--no-probe"])
+        self.assertIn("PASS bridge: a connected bridge feeds", out)
+        self.assertIn("INFO agent: @a:x", out)
 
 
 if __name__ == "__main__":

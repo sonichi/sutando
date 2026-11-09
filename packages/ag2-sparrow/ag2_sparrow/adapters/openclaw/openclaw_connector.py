@@ -20,6 +20,7 @@ Stdlib only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -79,10 +80,8 @@ def is_answered(state_dir, task_id):
 
 
 def release_answer(state_dir, task_id):
-    try:
+    with contextlib.suppress(OSError):
         (answered_dir(state_dir) / task_id).unlink()
-    except OSError:
-        pass
 
 
 def publish_answer(result_file, body, title=None, outcome=None):
@@ -383,10 +382,8 @@ class Connector:
                 res = client.call("session/prompt", params, self.args.turn_timeout)
             except AcpTimeout:
                 log("turn timeout; session/cancel", session_id)
-                try:
+                with contextlib.suppress(AcpError):
                     client.notify("session/cancel", {"sessionId": session_id})
-                except AcpError:
-                    pass
                 return "timeout", turn.text, "not finished after %ss" % self.args.turn_timeout, turn
             stop = res.get("stopReason") or ""
             return ("completed" if stop in ("end_turn", "max_tokens", "max_turn_requests") else
@@ -531,12 +528,9 @@ def main(argv=None):
         if args.root_fd is None:
             build_parser().error("--held needs --root-fd")
         return serve_held(args)
+    owner = None
     try:
         owner = acquire_lock(args.work, "openclaw")
-    except LockRefused as e:
-        sys.stderr.write(e.line + "\n")
-        return e.code
-    try:
         make_dirs(owner, ("tasks", "results", "state"))
         args.work_abs = args.work = root_path(owner, args.work)
         _paths(args, args.work)
@@ -545,7 +539,8 @@ def main(argv=None):
         sys.stderr.write(e.line + "\n")
         return e.code
     finally:
-        release_lock(owner)
+        if owner is not None:
+            release_lock(owner)
 
 
 def serve_held(args):
