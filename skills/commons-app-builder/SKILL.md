@@ -23,20 +23,22 @@ build or refine an app in a page it already created. [`BUILD_REQUEST.md`](BUILD_
 contract; follow it exactly, because the panel parses your reply.
 
 1. `python3 skills/commons-app-builder/scripts/build_request.py parse task.txt`, on the **whole
-   task file**: it checks the task came from the owner's 1:1 DM with you (owner-tier, a two-person
-   DM naming the owner). A malformed or unauthorized request prints the failed reply: send exactly
-   that and stop. The plan's first room step then checks the owner and you are both in the room.
+   task file** as delivered (its stamp is checked): it checks the task came from the owner's DM
+   with you. A malformed or unauthorized request prints the failed reply: send exactly that and
+   stop. The plan's first room step then checks the owner is in the target room.
 2. **Build:** choose the template (the request's, else the closest, `templates/README.md`) and
    decide the adaptation the description needs — the app's name, the database's name, option
    lists, and any further page edit (pass the whole edited page as `html`).
    **Refine:** read the page with `room.commons.pages.read` and edit it to the instruction; pass
    it as `html`. Never rebuild from the description alone.
 3. Run `scripts/check_page.py` on the page you are about to write.
-4. `build_request.py plan task.txt --adapt adapt.json` claims the request and prints the Actions in
-   order. **Exit 3:** it was already answered; send the reply it printed, and nothing else.
-   **Exit 4:** another run is building it; send nothing. Otherwise run the Actions through the
-   s.space MCP in that order, substituting `$db` and `$app` as they are answered. The checks come
-   first: a build stops if the page is not empty, a refine if the app is not on that page.
+4. `build_request.py plan task.txt --adapt adapt.json > plan.json` claims the request and prints
+   the Actions in order. **Exit 3:** it was already answered; send the reply it printed, and
+   nothing else. **Exit 4:** another run is building it; send nothing. Otherwise run the Actions
+   through the s.space MCP in that order, substituting `$db` and `$app` as they are answered.
+   After every step that has an `expect_…` key (room membership, the page, the empty page, the
+   app, the database), save its result and run `build_request.py check plan.json <n> result.json`;
+   on exit 1 stop and reply `failed` with the reason it printed.
 5. `build_request.py reply task.txt --status done|failed …` prints the reply and records it.
    Send exactly that to the private task, and nothing in the room. On any refusal reply `failed`
    with the Action's reason rather than retrying blindly.

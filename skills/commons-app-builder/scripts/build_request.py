@@ -12,12 +12,15 @@ Usage (task.txt is the whole task file, headers included: they say who sent it a
   build_request.py plan   <task.txt> [--adapt adapt.json]  -> claims the request, prints the plan
   build_request.py reply  <task.txt> --status done|failed [--reason R] [--page P] [--database D]
                           [--app-id A] [--line L]          -> prints the reply and records it
+  build_request.py check  <plan.json> <n> <result.json>    -> exit 1 with the reason if step n's
+                                                              result fails its check; 0 if it passes
   build_request.py chunks <page.html>                      -> chunk byte sizes, one per line
 plan exits 3 printing the recorded reply when the request_id was already answered, and 4 when
 another run holds it. Add --ledger DIR to keep the record somewhere other than the workspace.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -36,7 +39,8 @@ TEMPLATES = ("tracker", "poll", "planner", "turn-game")
 MODES = ("build", "refine")
 CLAIM_TTL_S = 30 * 60            # a claim nobody finished stops blocking a retry after this
 
-_FENCE_RE = re.compile(r"```" + re.escape(FENCE) + r"[ \t]*\n(.*?)\n```", re.S)
+# The gateway flattens a task body onto one line, so the fence may be on one line too.
+_FENCE_RE = re.compile(r"```" + re.escape(FENCE) + r"\s(.*?)\s*```", re.S)
 _PAGE_RE = re.compile(r"^html(-[a-z0-9]{8})?$")          # the client's own PAGE_RE (appsModel.ts)
 _ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
 # A bare database id: the backend's DATABASE pattern (actions/commons/reads.py) without "db:".
@@ -46,6 +50,12 @@ _APP_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,80}$")
 # The skill's own folder, for its templates/; not the workspace.
 SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 TEMPLATE_DIR = SKILL_DIR / "templates"
+_SRC = Path(__file__).resolve().parents[3] / "src"  # lint-workspace-resolution: allow-repo-root
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+# Where the task-envelope key lives; None is the resolved workspace. Tests point it at a temp one.
+WORKSPACE: Optional[Path] = None
 
 
 class RequestError(ValueError):
@@ -54,38 +64,25 @@ class RequestError(ValueError):
 
 # --------------------------------------------------------------------------- who sent it
 
-_HEADER_RE = re.compile(r"^([a-z_]+): ?(.*)$")
-
-
 def headers(text: str) -> Dict[str, str]:
-    """The task file's own header lines, up to `task:`. They come from the bridge, not the sender."""
-    out: Dict[str, str] = {}
-    for line in (text or "").splitlines():
-        m = _HEADER_RE.match(line)
-        if not m:
-            break
-        if m.group(1) == "task":
-            break
-        out[m.group(1)] = m.group(2).strip()
-    return out
+    """The headers the bridge attests. The gateway writes some below `task:`; they count only when
+    the file declares that layout and its envelope stamp verifies (task_envelope)."""
+    from task_envelope import attested_task_headers  # noqa: PLC0415
+    return {k: str(v).strip() for k, v in attested_task_headers(text or "", WORKSPACE).headers.items()}
 
 
-def authorize(meta: Dict[str, str]) -> Tuple[str, str]:
-    """The owner and agent, if the request came from the owner's 1:1 DM with this agent.
+def authorize(meta: Dict[str, str]) -> str:
+    """The owner, if the request came from the owner's DM with this agent.
 
-    The fence is message text anyone could paste; the headers are the bridge's. Only the owner can
-    post in that DM, so a request arriving there is the owner's. Which room it may aim at is
-    checked separately, against the room's live membership (plan's room.members.list step).
+    The fence is message text anyone could paste; the attested headers are the bridge's. Which
+    room it may aim at is checked separately, against that room's live membership.
     """
     if meta.get("access_tier") != "owner":
         raise RequestError("only the owner can ask for a build")
-    members = [m.strip() for m in meta.get("room_members", "").split(",") if m.strip()]
     owner = meta.get("user_id", "")
-    if (meta.get("channel_kind") != "dm" or meta.get("room_member_count") != "2"
-            or len(members) != 2 or owner not in members):
+    if meta.get("channel_kind") != "dm" or not owner.startswith("@"):
         raise RequestError("a build request must come from the owner's private chat with the agent")
-    agent = next(m for m in members if m != owner)
-    return owner, agent
+    return owner
 
 
 # --------------------------------------------------------------------------- the request
@@ -162,7 +159,7 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
 def parse(text: str) -> Dict[str, Any]:
     """The validated request, authorized against the task file's headers."""
     request = validate(extract(text))
-    request["owner"], request["agent"] = authorize(headers(text))
+    request["owner"] = authorize(headers(text))
     return request
 
 
@@ -210,30 +207,52 @@ class Ledger:
         """("claimed", None), ("done", reply) or ("busy", None)."""
         now = time.time() if now is None else now
         path = self._path(room_id, request_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        for _ in range(2):
-            try:
-                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                entry = self.recorded(room_id, request_id) or {}
-                if entry.get("reply"):
+        with self._locked(path.parent):
+            if path.exists():
+                entry = self.recorded(room_id, request_id)
+                if entry and entry.get("reply"):
                     return "done", entry["reply"]
-                if now - float(entry.get("claimed_at", 0)) < CLAIM_TTL_S:
+                # Unreadable counts as busy until it ages out: only a dead claim is taken over.
+                started = entry.get("claimed_at") if entry else None
+                if not isinstance(started, (int, float)):
+                    started = path.stat().st_mtime
+                if now - started < CLAIM_TTL_S:
                     return "busy", None
-                path.unlink(missing_ok=True)       # an abandoned claim: take it over
-                continue
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"room_id": room_id, "request_id": request_id, "claimed_at": now}, fh)
+            self._write(path, {"room_id": room_id, "request_id": request_id, "claimed_at": now})
             return "claimed", None
-        return "busy", None
 
     def record(self, room_id: str, request_id: str, reply: str) -> None:
         path = self._path(room_id, request_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"room_id": room_id, "request_id": request_id, "reply": reply,
-                                   "answered_at": time.time()}), encoding="utf-8")
+        with self._locked(path.parent):
+            self._write(path, {"room_id": room_id, "request_id": request_id, "reply": reply,
+                               "answered_at": time.time()})
+
+    @staticmethod
+    def _locked(folder: Path):
+        """One room's claims and records, serialized across processes."""
+        folder.mkdir(parents=True, exist_ok=True)
+        return _FileLock(folder / ".lock")
+
+    @staticmethod
+    def _write(path: Path, entry: Dict[str, Any]) -> None:
+        """Whole or not at all: a reader never sees a half-written entry."""
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(entry), encoding="utf-8")
         os.replace(tmp, path)
+
+
+class _FileLock:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def __enter__(self):
+        self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
 
 
 # --------------------------------------------------------------------------- the template
@@ -335,9 +354,10 @@ def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any
     room = request["room_id"]
     steps: List[Dict[str, Any]] = [
         {"action": "commons.app_guide", "read": True, "target_kind": "account", "arguments": {}},
-        # The owner can aim the agent only at a room they are both in.
+        # The owner can aim the agent only at a room the owner is in (the agent's own calls
+        # fail in a room it is not in).
         {"action": "room.members.list", "read": True, "room_id": room, "arguments": {},
-         "expect_members": [request.get("owner"), request.get("agent")]},
+         "expect_member": request.get("owner")},
         {"action": "room.commons.pages.list", "read": True, "room_id": room, "arguments": {},
          "expect_page": request["page"]},
     ]
@@ -376,6 +396,11 @@ def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any
                           "arguments": {"database": database, "op": "view_add",
                                         "view_settings": settings}})
     pieces = chunks(page_html)
+    if request["mode"] == "build":
+        # Again, right before the first page write: a write in the room since the first read
+        # would otherwise be replaced.
+        steps.append({"action": "room.commons.pages.read", "read": True, "room_id": room,
+                      "arguments": {"kind": request["page"]}, "expect_empty": True})
     steps.append({"action": "room.commons.pages.replace", "room_id": room,
                   "arguments": {"kind": request["page"], "mode": "whole", "new_text": pieces[0]}})
     for piece in pieces[1:]:
@@ -427,47 +452,51 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
             raise ActionFailed(_partial(str(error), written)) from None
         if step["action"] in ("room.commons.pages.replace", "room.commons.pages.append"):
             written = True
-        if step.get("expect_empty") and result.get("total_bytes"):
-            raise ActionFailed(f"page {step['arguments']['kind']} is not empty; "
-                               "a build only writes into a new page")
-        if step.get("expect_app"):
-            app_id, page = step["expect_app"]
-            apps = {a.get("id"): a for a in result.get("apps", [])}
-            if app_id not in apps:
-                raise ActionFailed(f"app {app_id} is not in this room")
-            if apps[app_id].get("page") != page:
-                raise ActionFailed(f"app {app_id} is not on page {page}")
-            answers["$app_db"] = bare(apps[app_id].get("database"))
-        if step.get("expect_members"):
-            joined = {m.get("user_id") for m in result.get("members", [])}
-            owner, agent = step["expect_members"]
-            room_id = step.get("room_id")
-            if owner not in joined:
-                raise ActionFailed(f"the owner is not in room {room_id}")
-            if agent not in joined:
-                raise ActionFailed(f"the agent is not in room {room_id}")
-        if step.get("expect_page"):
-            kinds = {p.get("kind") for p in result.get("pages", [])}
-            if step["expect_page"] not in kinds:
-                raise ActionFailed(f"page {step['expect_page']} is not in this room")
-        if step.get("expect_database"):
-            # databases.list: databases[].database (maybe "db:"-prefixed), .properties[].name
-            dbs = {bare(d.get("database")): d for d in result.get("databases", [])}
-            found = dbs.get(bare(step["expect_database"]))
-            if not found:
-                raise ActionFailed(f"database {step['expect_database']} is not in this room")
-            present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
-        if (step.get("expect_bytes") is not None
-                and result.get("total_bytes") != step["expect_bytes"]):
-            raise ActionFailed(_partial("the page read back is not the page written", True))
-        if step.get("answers") == "$db":
-            answers["$db"] = bare(result.get("kind", ""))
-        if step.get("answers") == "$app":
-            app = result.get("app") or {}
-            answers["$app"] = result.get("id") or app.get("id")
-            if app.get("database"):
-                answers["$app_db"] = bare(app["database"])
+        verify(step, result, answers, present)
     return answers
+
+
+def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[str, Any]] = None,
+           present: Optional[set] = None) -> None:
+    """Raises ActionFailed when a step's result fails the step's check; records what it answers."""
+    answers = {} if answers is None else answers
+    present = set() if present is None else present
+    if step.get("expect_empty") and result.get("total_bytes"):
+        raise ActionFailed(f"page {step['arguments']['kind']} is not empty; "
+                           "a build only writes into a new page")
+    if step.get("expect_app"):
+        app_id, page = step["expect_app"]
+        apps = {a.get("id"): a for a in result.get("apps", [])}
+        if app_id not in apps:
+            raise ActionFailed(f"app {app_id} is not in this room")
+        if apps[app_id].get("page") != page:
+            raise ActionFailed(f"app {app_id} is not on page {page}")
+        answers["$app_db"] = bare(apps[app_id].get("database"))
+    if "expect_member" in step:
+        joined = {m.get("user_id") for m in result.get("members", [])}
+        if not step["expect_member"] or step["expect_member"] not in joined:
+            raise ActionFailed(f"the owner is not in room {step.get('room_id')}")
+    if step.get("expect_page"):
+        kinds = {p.get("kind") for p in result.get("pages", [])}
+        if step["expect_page"] not in kinds:
+            raise ActionFailed(f"page {step['expect_page']} is not in this room")
+    if step.get("expect_database"):
+        # databases.list: databases[].database (maybe "db:"-prefixed), .properties[].name
+        dbs = {bare(d.get("database")): d for d in result.get("databases", [])}
+        found = dbs.get(bare(step["expect_database"]))
+        if not found:
+            raise ActionFailed(f"database {step['expect_database']} is not in this room")
+        present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
+    if (step.get("expect_bytes") is not None
+            and result.get("total_bytes") != step["expect_bytes"]):
+        raise ActionFailed(_partial("the page read back is not the page written", True))
+    if step.get("answers") == "$db":
+        answers["$db"] = bare(result.get("kind", ""))
+    if step.get("answers") == "$app":
+        app = result.get("app") or {}
+        answers["$app"] = result.get("id") or app.get("id")
+        if app.get("database"):
+            answers["$app_db"] = bare(app["database"])
 
 
 def _partial(reason: str, written: bool) -> str:
@@ -551,11 +580,35 @@ def _flag(argv: List[str], name: str) -> Optional[str]:
     return argv[i + 1]
 
 
+def _check(args: List[str]) -> int:
+    """`check <plan.json> <n> <result.json>`: step n's check, in code; the agent writes nothing
+    until every read before the first write has passed it."""
+    if len(args) != 3:
+        print("usage: build_request.py check <plan.json> <n> <result.json>", file=sys.stderr)
+        return 2
+    try:
+        steps = json.loads(Path(args[0]).read_text(encoding="utf-8"))
+        step = steps[int(args[1])]
+        result = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+    except (OSError, ValueError, IndexError, TypeError) as error:
+        print(f"build_request: cannot check: {error}", file=sys.stderr)
+        return 2
+    try:
+        verify(step, result if isinstance(result, dict) else {})
+    except ActionFailed as error:
+        print(str(error))
+        return 1
+    return 0
+
+
 def main(argv: List[str]) -> int:
-    if len(argv) < 2 or argv[0] not in ("parse", "plan", "reply", "chunks"):
-        print("usage: build_request.py parse|plan|reply|chunks <file> [options]", file=sys.stderr)
+    if len(argv) < 2 or argv[0] not in ("parse", "plan", "reply", "check", "chunks"):
+        print("usage: build_request.py parse|plan|reply|check|chunks <file> [options]",
+              file=sys.stderr)
         return 2
     command, path = argv[0], argv[1]
+    if command == "check":
+        return _check(argv[1:])
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as error:
@@ -567,7 +620,7 @@ def main(argv: List[str]) -> int:
         return 0
     try:
         folder = _flag(argv, "--ledger")
-        ledger = Ledger(Path(folder) if folder else default_ledger())
+        ledger = (lambda: Ledger(Path(folder) if folder else default_ledger()))
         if command == "reply":
             try:
                 answered = parse(text)
@@ -583,7 +636,7 @@ def main(argv: List[str]) -> int:
                                _flag(argv, "--line") or "", page=_flag(argv, "--page"),
                                database=bare(_flag(argv, "--database")),
                                app_id=_flag(argv, "--app-id"))
-            ledger.record(answered["room_id"], request_id, reply)
+            ledger().record(answered["room_id"], request_id, reply)
             print(reply)
             return 0
         adapt_path = _flag(argv, "--adapt")
@@ -611,7 +664,7 @@ def main(argv: List[str]) -> int:
         raw_page, raw_schema = load_template(template)
         page_html, schema = adapt(raw_page, raw_schema, adaptation)
         name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
-    state, recorded = ledger.claim(request["room_id"], request["request_id"])
+    state, recorded = ledger().claim(request["room_id"], request["request_id"])
     if state == "done":
         print(recorded)
         return 3
