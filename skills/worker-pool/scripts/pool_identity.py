@@ -11,6 +11,8 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
     python3 pool_identity.py [--workspace WS] remove <worker>
     python3 pool_identity.py [--workspace WS] provision-begin <worker> [--role ROLE] [--lane INSTANCE]
+    python3 pool_identity.py [--workspace WS] provision-wait <worker> --operation-id ID --name NAME
+                                              [--display-name TEXT] [--role TEXT] [--timeout SECONDS] [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-finish <worker> --claim-id ID --agent-id MXID [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
@@ -19,10 +21,12 @@ TOKEN is the agent's access token from its settings page in AG2 Space. Leave it 
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
 
-The `provision-*` verbs need no pasted token (pool_provision.py): `provision-begin` prints the
-SHA-256 the `agent.create` Action takes and a suggested label, `provision-finish` redeems the claim
-that Action returns, for the agent id it returns, and prints that id and a status. `retire-remote`
-removes the identity once its server rejects the token. Each prints one JSON line and never a secret.
+The `provision-*` verbs need no pasted token (pool_provision.py). `provision-begin` prints the
+SHA-256 the `agent.create` Action takes and a suggested name. `provision-wait` makes that call as
+the core's own agent, asks again until the owner has approved it, and redeems the claim at once;
+`provision-finish` redeems a claim an earlier call already returned, for the agent id it returned.
+Both print the agent id and a status. `retire-remote` removes the identity once its server rejects
+the token. Each prints one JSON line and never a secret.
 """
 from __future__ import annotations
 
@@ -136,9 +140,8 @@ def cmd_provision_begin(args, ws: Path) -> int:
     return 0
 
 
-def cmd_provision_finish(args, ws: Path) -> int:
-    wid = live_worker(ws, args.worker)
-    out = pool_provision.finish(wid, args.claim_id, args.agent_id, workspace=ws, lane=args.lane)
+def _provisioned(args, ws: Path, out: dict) -> int:
+    """Start the new identity's lane and print the agent id and a status."""
     try:
         launch = None if args.no_start else connections.start_added(
             out["row"], repo=args.repo or _REPO, logs_dir=args.logs_dir or ws / "logs", workspace=ws)
@@ -150,6 +153,18 @@ def cmd_provision_finish(args, ws: Path) -> int:
     print(json.dumps({"agent_id": out["agent_id"], "status": "ok" if started else "stored_lane_not_started"},
                      sort_keys=True))
     return 0 if started else 1
+
+
+def cmd_provision_wait(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    return _provisioned(args, ws, pool_provision.provision(
+        wid, args.operation_id, args.name, display_name=args.display_name or "", role=args.role or "",
+        timeout=args.timeout, workspace=ws, lane=args.lane, say=lambda text: print(text, file=sys.stderr, flush=True)))
+
+
+def cmd_provision_finish(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    return _provisioned(args, ws, pool_provision.finish(wid, args.claim_id, args.agent_id, workspace=ws, lane=args.lane))
 
 
 def cmd_provision_abort(args, ws: Path) -> int:
@@ -186,11 +201,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
-    s = sub.add_parser("provision-finish"); s.add_argument("worker"); s.add_argument("--claim-id", required=True)
-    s.add_argument("--agent-id", required=True); s.add_argument("--lane", default=None)
-    s.add_argument("--no-start", action="store_true")
-    s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
-    s.set_defaults(fn=cmd_provision_finish)
+    s = sub.add_parser("provision-wait"); s.add_argument("worker"); s.add_argument("--operation-id", required=True)
+    s.add_argument("--name", required=True); s.add_argument("--display-name", default=None)
+    s.add_argument("--role", default=None)
+    s.add_argument("--timeout", type=float, default=pool_provision.APPROVAL_TIMEOUT_S)
+    s.set_defaults(fn=cmd_provision_wait)
+    f = sub.add_parser("provision-finish"); f.add_argument("worker"); f.add_argument("--claim-id", required=True)
+    f.add_argument("--agent-id", required=True); f.set_defaults(fn=cmd_provision_finish)
+    for s in (s, f):
+        s.add_argument("--lane", default=None); s.add_argument("--no-start", action="store_true")
+        s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
     s = sub.add_parser("provision-abort"); s.add_argument("worker"); s.set_defaults(fn=cmd_provision_abort)
     s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
     s.set_defaults(fn=cmd_retire_remote)

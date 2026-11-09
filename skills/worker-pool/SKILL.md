@@ -160,37 +160,49 @@ itself stays on its server until the owner deletes it there.
 ### Creating the agent without a pasted token
 
 The core can create a worker's agent itself, so nobody pastes a token. The server side is the `agent.create`
-account Action and a claim it returns. The token never passes through a model: only these scripts and the secret
-vault hold it. Use this path only when the owner asked for the worker to have its own agent.
+account Action, which needs the owner's approval and answers with a claim, never a token. The token never
+passes through a model: only these scripts and the secret vault hold it. Use this path only when the owner asked
+for the worker to have its own agent.
 
 1. `pool_identity.py provision-begin <worker>` makes a one-time secret, keeps it only in the secret vault and
-   prints one JSON line: `claim_key_sha256` (the secret's SHA-256) and a suggested `label`, `<core>-<role>`.
-2. Call the account Action `agent.create` with `label`, `claim_key_sha256` and an `operation_id`. It answers with
-   `agent_id` and `claim_id`, never a token. If it is held for the owner's approval, tell the owner in one line and
-   wait. If it fails with `approval_required`, the server has no approval path yet: run `provision-abort` and stop.
-3. `pool_identity.py provision-finish <worker> --claim-id <claim_id> --agent-id <agent_id>` redeems the claim as
-   the core's own agent, with the core's lane credential and the secret. It saves the answered token as the
-   worker's connection, the same row and vault key `add` writes, only when the answer and the gateway both name
-   that `agent_id`. It prints the agent id and a status and starts the lane.
+   prints one JSON line: `claim_key_sha256` (the secret's SHA-256) and a suggested `name`. The server names the
+   agent `@<owner>-<core>-<name>.agent`, so the name is the worker's role alone.
+2. `pool_identity.py provision-wait <worker> --operation-id <id> --name <name>` does the rest. It calls
+   `agent.create` as the core's own agent, asks again every 10 seconds with the same operation id until the
+   owner has approved it, then redeems the claim at once and saves the answered token as the worker's
+   connection, the same row and vault key `add` writes. It prints the agent id and a status and starts the lane.
+   Tell the owner in one line that an approval is waiting for them.
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py provision-begin <worker> [--role ROLE] [--lane INSTANCE]
+python3 skills/worker-pool/scripts/pool_identity.py provision-wait <worker> --operation-id <new id> --name <name> \
+    [--display-name TEXT] [--role TEXT] [--timeout SECONDS]
 python3 skills/worker-pool/scripts/pool_identity.py provision-finish <worker> --claim-id <claim id> --agent-id <agent id>
 python3 skills/worker-pool/scripts/pool_identity.py provision-abort <worker>
 python3 skills/worker-pool/scripts/pool_identity.py retire-remote <worker> [--local-anyway]
 ```
 
-- The secret is deleted when `provision-finish` ends, whether it worked, failed or was interrupted, so a failed
-  finish starts again from `provision-begin`. A failure names what failed (the HTTP status and the server's error code) and never
-  echoes a secret. A claim lives five minutes.
+- Nothing tells an agent that its held call was approved, and a claim lives five minutes from the moment the
+  agent exists. That is why `provision-wait` makes the call and the redeem itself. Let it make the call: the
+  same operation id with other arguments is refused (`operation_claimed`). If you already called `agent.create`
+  and hold its `agent_id` and `claim_id`, use `provision-finish` within those five minutes instead.
+- A wait that times out (15 minutes unless `--timeout`) keeps the secret, because the request may still be
+  approved: run `provision-wait` again with the same operation id and arguments, or `provision-abort`. A
+  refusal forgets the secret and names the reason. `approval_required` means the server cannot ask the owner
+  yet: stop, and a person adds the agent in the app. A core may create five agents an hour.
+- The redeemed token is saved only when the redeem answer and the gateway both name the agent `agent.create`
+  returned. The secret is deleted when the redeem ends, whether it worked, failed or was interrupted. A failure
+  names what failed (the HTTP status and the server's reason) and never echoes a secret.
 - If the redeem worked but the token could not be confirmed or saved, the message names the agent: it now has a
-  token nobody holds, so retire it and provision again.
+  token nobody holds, so retire it and provision again. A dead claim (`claim_expired`, `claim_burned`) needs the
+  same.
 - The claim is bound to the core that created it and to the secret. Without `--lane` the core's lane is the app's
-  signed-in one, else the primary; pass the same lane to both verbs when the Action ran on another.
-- To retire, call the account Action `agent.retire` with the `agent_id` first, then `retire-remote`. It removes the
-  lane, the row and the vault secret only once the gateway rejects the stored token, and exits 3 with nothing
-  removed while the token still works. `--local-anyway` removes them regardless and exits 1: tell the owner the
-  agent is still live on its server.
+  signed-in one, else the primary.
+- To retire, call the account Action `agent.retire` with the `agent_id` and an `operation_id` first (it needs the
+  owner's approval too; on `soft_delete_incomplete` call it again), then `retire-remote`. It removes the lane,
+  the row and the vault secret only once the gateway rejects the stored token, and exits 3 with nothing removed
+  while the token still works. `--local-anyway` removes them regardless and exits 1: tell the owner the agent is
+  still live on its server.
 
 `provision_e2e.py --base-url https://<gateway> --worker <worker> [--room ROOM]` runs all of this against one
 server and prints a pass/fail table: the approval gate, the agent's provenance and name, the redeem and each way

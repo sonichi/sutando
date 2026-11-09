@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """A pool worker's own agent, created by the core instead of pasted by a person: the local half.
 
-The core asks the server to create the worker's agent (the `agent.create` account Action) and is
-answered with a claim id, never a token. The three local steps around that call live here:
+The server creates the worker's agent when the core calls the `agent.create` account Action, and
+answers with a claim id, never a token. The local steps around that call live here:
 
 - `begin` makes a one-time secret, keeps it only in the secret vault and hands back its SHA-256,
   which the Action takes as `claim_key_sha256`.
-- `finish` redeems the claim as the core's own agent, with the core's lane credential and that
-  secret, and saves the bearer the server answers with as the worker's connection, only when both
-  the answer and the gateway name the agent the Action created.
+- `provision` makes the `agent.create` call as the core's own agent, asks again with the same
+  operation id until the owner's approval lets it run, and redeems the claim at once: a claim lives
+  five minutes from the moment its agent exists.
+- `finish` redeems a claim as the core's own agent, with the core's lane credential and that secret,
+  and saves the bearer the server answers with as the worker's connection, only when both the answer
+  and the gateway name the agent the Action created.
 - `retire` drops the worker's connection and its secret once the server has retired the agent.
 
-The secret is 32 random bytes as 64 hex characters; its hash is the SHA-256 of those characters.
-Nothing here returns, prints, logs or raises a secret or a token: callers get ids and status.
+The secret is 32 random bytes as 64 hex characters; its hash is the SHA-256 of those characters,
+the text the redeem body carries. Nothing here returns, prints, logs or raises a secret or a token:
+callers get ids and status.
 """
 from __future__ import annotations
 
@@ -39,6 +43,18 @@ CLAIM_KEY_PREFIX = "AG2_PROVISION_CLAIM_"
 REDEEM_PATH = "/api/v1/agents/provision-claims/{claim_id}/redeem"
 # A claim id goes into a URL path: only characters that cannot change the route.
 CLAIM_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+# The server's rule for an agent's name; its id becomes @<owner>-<core>-<name>.agent.
+NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?")
+DISCOVERY_PATH = "/v1/mcp/discovery"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_AUTH_CODE = "AUTHENTICATION_FAILED"
+# Each ask is one tool call against the agent's own per-minute budget on the server.
+POLL_S = 10
+APPROVAL_TIMEOUT_S = 900
+DONE = ("succeeded", "success", "completed", "complete", "done", "ok", "executed")
+ENDED = ("denied", "rejected", "failed", "expired", "cancelled", "canceled")
+# Refusals that mean "ask again with the same operation id", not "no".
+RETRY_REASONS = ("mint_failed", "soft_delete_incomplete")
 HTTP_TIMEOUT_S = 15
 REPLY_MAX = 64 * 1024
 REDEEM_ATTEMPTS = 3
@@ -110,10 +126,14 @@ def scrub(text: object, known: Iterable[str]) -> str:
 
 
 def error_code(body: Mapping[str, object]) -> str:
-    """The short error code an answer carries (`code`, `error`, or `error.code`); '' when it has none
-    of that shape. Free text is never taken: it is the server's to word."""
+    """The short reason an error answer carries: `details.reason` first (at the top or under `error`),
+    then `code`, `error` or `error.code`; '' when it has none of that shape. Free text is never
+    taken: it is the server's to word."""
     error = body.get("error")
-    for value in (body.get("code"), error, error.get("code") if isinstance(error, dict) else None):
+    nested = error if isinstance(error, dict) else {}
+    details = body.get("details") if isinstance(body.get("details"), dict) else nested.get("details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    for value in (reason, body.get("code"), error, nested.get("code")):
         if isinstance(value, str) and _CODE_RE.fullmatch(value):
             return value
     return ""
@@ -205,36 +225,26 @@ def core_lane(workspace: Optional[Path] = None, lane: Optional[str] = None, orig
     return row
 
 
-def _localpart(mxid: object) -> str:
-    return str(mxid or "").lstrip("@").partition(":")[0]
-
-
-def _slug(text: str) -> str:
-    return re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]", "-", text.lower())).strip("-")
-
-
-def suggested_label(core_row: Mapping[str, object], role: str) -> str:
-    """`<core>-<role>`. The server names an agent `<owner>-<label>.agent`, so this label yields
-    `<owner>-<core>-<role>`; the core's own label is its localpart without the owner and `.agent`."""
-    owner, core = _localpart(core_row.get("owner_mxid")), _localpart(core_row.get("agent_mxid"))
-    core = core[:-len(".agent")] if core.endswith(".agent") else core
-    core = core[len(owner) + 1:] if owner and core.startswith(owner + "-") else core
-    return _slug(f"{core}-{role}")
+def suggested_name(role: str) -> str:
+    """A name the server accepts for `role`: lowercase letters, digits and inner dashes, at most 32.
+    The server puts the owner and the core's own label in front of it, so it names the role alone."""
+    slug = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]", "-", role.lower())).strip("-")
+    return slug[:32].strip("-")
 
 
 def begin(worker: str, *, role: str, workspace: Optional[Path] = None, vault=None,
           lane: Optional[str] = None) -> dict:
     """Start provisioning `worker`'s agent: a fresh one-time secret goes into the vault, replacing any
-    earlier pending one, and only its SHA-256 and a suggested label come back."""
+    earlier pending one, and only its SHA-256 and a suggested name come back."""
     if connections.worker_identity(worker, workspace) is not None:
         raise ProvisionError(f"worker {worker} already has an agent of its own; retire it first")
-    row = core_lane(workspace, lane)
+    core_lane(workspace, lane)
     secret = secrets.token_hex(32)
     try:
         _vault(vault).set(claim_key(worker), secret)
     except Exception as e:  # noqa: BLE001 - the vault's error types vary; only the type is named
         raise ProvisionError(f"the claim secret could not be stored in the vault ({type(e).__name__})") from None
-    return {"claim_key_sha256": claim_hash(secret), "label": suggested_label(row, role or worker)}
+    return {"claim_key_sha256": claim_hash(secret), "name": suggested_name(role) or suggested_name(worker)}
 
 
 def abort(worker: str, *, vault=None) -> None:
@@ -265,6 +275,8 @@ def redeem(gateway_url: str, bearer: str, claim_id: str, secret: str, *,
             return body
         code = error_code(body)
         why = f"http {status}" + (f" {code}" if code else "")
+        if status == 410:
+            why += " (the claim is dead: retire the agent and create it again)"
         if status < 500:
             break
     raise ProvisionError(f"the claim was not redeemed: {why}")
@@ -361,6 +373,177 @@ def finish(worker: str, claim_id: str, agent_id: str, *, workspace: Optional[Pat
     if error:
         raise ProvisionError(error)
     return out
+
+
+# ── the Action call, as the core's own agent ─────────────────────────────────
+
+def find(value: object, key: str, depth: int = 4):
+    """The first value under `key` in a nested answer, shallowest first; None when absent. An
+    Action's result sits under `result`, its authority and audit beside it."""
+    level = [value]
+    for _ in range(depth):
+        nxt = []
+        for item in level:
+            if isinstance(item, dict):
+                if item.get(key) is not None:
+                    return item[key]
+                nxt += list(item.values())
+        level = nxt
+    return None
+
+
+def envelope(result: Mapping[str, object]) -> dict:
+    """A tool result's JSON: its structuredContent, else the last content text that is an object."""
+    if isinstance(result.get("structuredContent"), dict):
+        return dict(result["structuredContent"])
+    for item in reversed(result.get("content") or []):
+        try:
+            value = json.loads(item.get("text") or "")
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def approval_state(env: Mapping[str, object]) -> str:
+    """How an Action call stands: `done`; `held` (an approval is open for it); `fail_closed`
+    (`approval_required` and no approval was opened: the server cannot ask the owner yet); `retry`
+    (a refusal that says to ask again); `denied`; or `refused` (any other error)."""
+    status, reason = str(env.get("status") or "").lower(), error_code(env).lower()
+    if env.get("is_error"):
+        if "approval" in " ".join((status, reason, str(env.get("message") or "").lower())):
+            return "held" if find(env, "approval_id") else "fail_closed"
+        return "retry" if reason in RETRY_REASONS else "refused"
+    if isinstance(env.get("result"), dict) or status in DONE:
+        return "done"
+    if status in ENDED:
+        return "denied"
+    if find(env, "approval_id") or "approval" in status or "pending" in status:
+        return "held"
+    return "done"
+
+
+class Actions:
+    """Account and room Actions as one agent: a delegation minted from its lane credential, then one
+    tools/call per Action on the server's MCP endpoint. The lane credential goes to its own origin only."""
+
+    def __init__(self, gateway_url: str, bearer: str, request: Callable[..., Reply], known: list):
+        self.gateway, self.bearer, self.request, self.known = gateway_url, bearer, request, known
+        self._mcp_url = self._access = ""
+
+    def _connect(self) -> None:
+        status, _, body = self.request("GET", self.gateway.rstrip("/") + DISCOVERY_PATH, bearer=self.bearer)
+        mint_url, mcp_url = str(body.get("mint_url") or ""), str(body.get("mcp_url") or "")
+        if status != 200 or origin_of(mint_url) != origin_of(self.gateway) or not origin_of(mcp_url):
+            raise ProvisionError(f"MCP discovery answered http {status} with no mint endpoint on the gateway's "
+                                 "own origin")
+        status, _, body = self.request("POST", mint_url, bearer=self.bearer)
+        token = body.get("access_token")
+        if status != 200 or not isinstance(token, str) or not token:
+            raise ProvisionError(f"the access-token exchange answered http {status} {error_code(body)}".rstrip())
+        self.known.append(token)
+        self._mcp_url, self._access = mcp_url, token
+
+    def tool(self, name: str, arguments: dict) -> dict:
+        """One tools/call; the tool's answer, with `is_error` set on a tool error. A rejected
+        delegation is minted once more."""
+        for attempt in (0, 1):
+            if attempt or not self._access:
+                self._connect()
+            status, _, rpc = self.request(
+                "POST", self._mcp_url, bearer=self._access, headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+                payload={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": name, "arguments": arguments}})
+            result = rpc.get("result") if status == 200 else None
+            env = envelope(result) if isinstance(result, dict) else {}
+            if attempt == 0 and (status == 401 or env.get("code") == MCP_AUTH_CODE):
+                continue
+            break
+        if not isinstance(result, dict):
+            raise ProvisionError(f"the MCP endpoint answered http {status} to {name} without a result")
+        return {**env, "is_error": True} if result.get("isError") else env
+
+    def execute(self, action: str, arguments: dict, *, operation_id: str = "", room_id: str = "") -> dict:
+        payload = {"action": action, "arguments": arguments}
+        payload.update({"room_id": room_id} if room_id else {"target_kind": "account"})
+        if operation_id:
+            payload["operation_id"] = operation_id
+        return self.tool("room.action.execute", payload)
+
+    def read(self, action: str, arguments: dict, room_id: str) -> dict:
+        return self.tool("room.action.read", {"action": action, "room_id": room_id, "arguments": arguments})
+
+
+def settle(call: Callable[[], dict], *, timeout: float, sleep, clock, first: Optional[dict] = None,
+           waiting: Optional[Callable[[], None]] = None, poll: float = POLL_S) -> Tuple[str, dict]:
+    """(state, answer) of an Action call once it stops waiting. Nothing tells an agent that its held
+    call was approved, so `call` is made again (the same operation id and arguments return the same
+    operation) until it is done or refused, or `timeout` when that does not happen in time."""
+    env = call() if first is None else first
+    state = approval_state(env)
+    deadline = clock() + timeout
+    if state in ("held", "retry") and waiting:
+        waiting()
+    while state in ("held", "retry"):
+        if clock() >= deadline:
+            return "timeout", env
+        sleep(poll)
+        env = call()
+        state = approval_state(env)
+    return state, env
+
+
+def create_arguments(name: str, key_sha256: str, display_name: str = "", role: str = "") -> dict:
+    """`agent.create`'s arguments. The owner and the kind are never arguments: the server takes them
+    from the calling core."""
+    if not NAME_RE.fullmatch(name or ""):
+        raise ProvisionError("the name must be lowercase letters, digits and inner dashes, at most 32 characters")
+    out = {"name": name, "claim_key_sha256": key_sha256}
+    out.update({k: v for k, v in (("display_name", display_name), ("role", role)) if v})
+    return out
+
+
+def provision(worker: str, operation_id: str, name: str, *, display_name: str = "", role: str = "",
+              timeout: float = APPROVAL_TIMEOUT_S, workspace: Optional[Path] = None, vault=None,
+              lane: Optional[str] = None, request: Optional[Callable[..., Reply]] = None,
+              preview: Optional[Callable[[str], dict]] = None, sleep: Callable[[float], None] = time.sleep,
+              clock: Callable[[], float] = time.monotonic, say: Optional[Callable[[str], None]] = None) -> dict:
+    """Call `agent.create` for `worker` as the core's own agent, wait for the owner's approval by
+    asking again with the same `operation_id`, and redeem the claim as soon as the agent exists.
+    A wait that times out or is interrupted keeps the pending secret, because the request may still
+    be approved; a refusal forgets it, because nothing was created."""
+    known: list = []
+    try:
+        secret = held(_vault(vault), claim_key(worker))
+        if not secret:
+            raise ProvisionError(f"worker {worker} has no pending claim secret: run provision-begin first")
+        known.append(secret)
+        arguments = create_arguments(name, claim_hash(secret), display_name, role)
+        gateway, token = connections.connection_credential(core_lane(workspace, lane), vault=vault)
+        known.append(bearer_of(token))
+        actions = Actions(gateway, bearer_of(token), request or http_json, known)
+        state, env = settle(lambda: actions.execute("agent.create", arguments, operation_id=operation_id),
+                            timeout=timeout, sleep=sleep, clock=clock,
+                            waiting=lambda: say and say(f"waiting up to {int(timeout)}s for the owner to approve "
+                                                        "agent.create"))
+    except (ProvisionError, connections.ConnectionsError) as e:
+        raise ProvisionError(scrub(_said(e), known)) from None
+    if state == "timeout":
+        raise ProvisionError(f"the owner has not approved agent.create within {int(timeout)}s. The pending secret "
+                             "is kept: run provision-wait again with the same operation id and arguments while "
+                             "the request is open, or provision-abort to give up")
+    agent_id, claim_id = find(env, "agent_id"), find(env, "claim_id")
+    if state != "done" or not isinstance(agent_id, str) or not isinstance(claim_id, str):
+        left = _forget(worker, vault, secret)
+        why = {"fail_closed": "needs the owner's approval, which this server cannot ask for yet",
+               "denied": "was not approved", "refused": "was refused",
+               "done": "answered without an agent and a claim"}[state]
+        raise ProvisionError("; ".join(x for x in (
+            f"agent.create {why} ({scrub(error_code(env), known) or 'no reason given'}); nothing was created and "
+            "the pending secret is forgotten", left) if x))
+    return finish(worker, claim_id, agent_id, workspace=workspace, vault=vault, lane=lane, request=request,
+                  preview=preview, sleep=sleep)
 
 
 def retire(worker: str, *, workspace: Optional[Path] = None, vault=None,

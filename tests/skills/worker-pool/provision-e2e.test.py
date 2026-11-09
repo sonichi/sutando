@@ -65,7 +65,7 @@ class Base(H.Base):
         self.backend.rooms[ROOM] = []
         self.backend.members[ROOM] = {CORE, WORKER_AGENT}
         self.backend.responders.add(WORKER_AGENT)
-        self.add(f"{BASE_URL}|{CORE_SECRET}", fetch=H.agents(CORE))
+        self.add(f"{BASE_URL}/relay|{CORE_SECRET}", fetch=H.agents(CORE))
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live", "label": "Reviewer"}}, "bindings": {}}))
         self.transcripts = self.ws / ".claude-sutando" / "projects"
@@ -126,10 +126,10 @@ class FullRun(Base):
         self.assertEqual(rows[e2e.CREATE][1], "held for the owner's approval")
         self.assertEqual(rows[e2e.NAMING][1], WORKER_AGENT)
         self.assertIn("authority is approval", rows[e2e.PROVENANCE][1])
-        self.assertEqual(rows[e2e.WRONG_SECRET][1], "refused (http 403 claim_secret_mismatch)")
-        self.assertEqual(rows[e2e.NO_CREDENTIAL][1], "refused (http 401 AGENT_CREDENTIAL_UNKNOWN)")
+        self.assertEqual(rows[e2e.WRONG_SECRET][1], "refused (http 403 wrong_secret)")
+        self.assertEqual(rows[e2e.NO_CREDENTIAL][1], "refused (http 401 invalid_bearer)")
         self.assertEqual(rows[e2e.SECOND][1], "refused (http 409 claim_redeemed)")
-        self.assertEqual(rows[e2e.OTHER_CALLER][1], "refused (http 403 claim_not_yours)")
+        self.assertEqual(rows[e2e.OTHER_CALLER][1], "refused (http 404 claim_not_found)")
         self.assertEqual(rows[e2e.EXPIRED][1], "refused (http 410 claim_expired)")
         self.assertEqual(rows[e2e.RETIRED][1], "whoami answered http 401")
         self.assertEqual(rows[e2e.LEAKS][1], "0 hits for 4 secrets in 5 files, 2 tmux sessions")
@@ -174,7 +174,7 @@ class Gate(Base):
         rows, rc, text = self.go()
         got = self.results(rows)
         self.assertEqual(got[e2e.CREATE], e2e.PASS)
-        self.assertIn("fails closed with approval_required: the approval path is not deployed here", rows[e2e.CREATE][1])
+        self.assertIn("fails closed with approval_required: this server cannot ask the owner yet", rows[e2e.CREATE][1])
         skipped = [n for n in e2e.CHECKS if n not in (e2e.CREATE, e2e.CONTROL, e2e.LEAKS)]
         self.assertEqual({got[n] for n in skipped}, {e2e.SKIP})
         self.assertEqual((rc, got[e2e.CONTROL], got[e2e.LEAKS]), (3, e2e.PASS, e2e.PASS))
@@ -187,11 +187,22 @@ class Gate(Base):
         self.assertEqual((rc, rows[e2e.CREATE]), (0, (e2e.PASS, "ran at once under a delegation grant")), text)
         self.assertIn("authority is delegation", rows[e2e.PROVENANCE][1])
 
-    def test_a_grant_answer_without_its_result_is_read_from_the_operation(self):
-        self.backend.mode = "grant"
-        self.backend.bugs.add("thin_execute")
+    def test_a_held_call_answered_as_an_error_and_a_retire_that_must_be_called_again_still_pass(self):
+        self.backend.bugs |= {"held_as_error", "soft_delete_incomplete_once"}
         rows, rc, text = self.go()
         self.assertEqual((rc, set(self.results(rows).values())), (0, {e2e.PASS}), text)
+
+    def test_a_retire_that_does_not_say_the_bearer_was_revoked_is_not_a_retirement(self):
+        real = self.backend._run
+
+        def unrevoked(op, source, under):
+            real(op, source, under)
+            if op["action"] == "agent.retire":
+                op["result"]["bearer_revoked"] = False
+        self.backend._run = unrevoked
+        rows, rc, _ = self.go("--single-claim")
+        self.assertEqual((rc, rows[e2e.RETIRED]), (1, (e2e.FAIL, "agent.retire did not complete (done without "
+                                                                 "bearer_revoked)")))
 
     def test_a_create_that_needed_neither_or_was_refused_fails(self):
         self.backend.mode = "grant"
@@ -204,7 +215,7 @@ class Gate(Base):
     def test_an_agent_that_may_not_create_agents_is_refused(self):
         self.backend.agents[CORE]["kind"] = "acp"
         rows, rc, _ = self.go()
-        self.assertEqual((rc, rows[e2e.CREATE]), (1, (e2e.FAIL, "agent.create was refused (FORBIDDEN)")))
+        self.assertEqual((rc, rows[e2e.CREATE]), (1, (e2e.FAIL, "agent.create was refused (not_a_core)")))
         self.assertNotIn(CLAIM_KEY, self.vault.store)
 
     def test_a_denied_or_unanswered_approval_ends_the_run(self):
@@ -266,17 +277,30 @@ class EachRuleHasACheckThatFails(Base):
     def test_an_agent_named_or_recorded_wrongly(self):
         rows, failed = self.broken("flat_name", "--single-claim", "--room", "")
         self.assertEqual((failed, rows[e2e.NAMING][1]),
-                         ([e2e.NAMING], f"got @desk-reviewer.agent:alpha-fixture.net, expected {WORKER_AGENT}"))
+                         ([e2e.NAMING], f"got @reviewer.agent:alpha-fixture.net, expected {WORKER_AGENT}"))
+
+    def test_a_name_the_server_had_to_number_and_a_default_core_are_still_the_expected_id(self):
+        self.backend.add_agent(WORKER_AGENT, None)
+        rows, _, text = self.go("--single-claim", "--room", "")
+        self.assertEqual(rows[e2e.NAMING], (e2e.PASS, "@owner-desk-reviewer-2.agent:alpha-fixture.net"), text)
+        self.assertEqual(e2e.core_label({"owner_mxid": "@owner:x.net", "agent_mxid": "@owner.agent:x.net"}), "sutando")
+        self.assertEqual(e2e.core_label({"owner_mxid": "@owner:x.net", "agent_mxid": "@sutando-owner:x.net"}), "sutando")
 
     def test_an_agent_recorded_as_someone_elses_work(self):
         rows, failed = self.broken("wrong_creator", "--single-claim")
-        self.assertEqual(failed, [e2e.PROVENANCE, e2e.RETIRED])
-        self.assertEqual(rows[e2e.PROVENANCE][1], "created_by is not the core")
-        self.assertEqual(rows[e2e.RETIRED][1], "agent.retire did not complete (refused)")
-        self.setUp()
-        self.backend.bugs.add("wrong_creator")
-        text = self.go("--single-claim", "--label", "other", "--room", "")[2]
-        self.assertIn("left on the server: @owner-other.agent:alpha-fixture.net (retire it with agent.retire", text)
+        self.assertEqual((failed, rows[e2e.PROVENANCE][1]), ([e2e.PROVENANCE], "created_by is not the core"))
+
+    def test_a_retire_the_server_refuses_leaves_the_agent_named(self):
+        real = self.backend._execute
+
+        def not_yours(actor, args):
+            if args.get("action") == "agent.retire":
+                return self.backend._error(403, "not_created_by_actor")
+            return real(actor, args)
+        self.backend._execute = not_yours
+        rows, rc, text = self.go("--single-claim")
+        self.assertEqual((rc, rows[e2e.RETIRED]), (1, (e2e.FAIL, "agent.retire did not complete (refused)")))
+        self.assertIn(f"left on the server: {WORKER_AGENT} (retire it with agent.retire", text)
 
     def test_an_agent_missing_from_the_owners_listing_or_held_by_another_owner(self):
         rows, failed = self.broken("unlisted", "--single-claim")
@@ -286,7 +310,7 @@ class EachRuleHasACheckThatFails(Base):
     def test_an_agent_listed_under_another_owner_or_an_authority_nobody_granted(self):
         rows, failed = self.broken("wrong_owner", "--single-claim")
         self.assertIn(e2e.PROVENANCE, failed)
-        self.assertEqual(rows[e2e.PROVENANCE][1], "its owner is not the core's owner")
+        self.assertEqual(rows[e2e.PROVENANCE][1], "owner is not the core's owner")
         self.setUp()
         rows, failed = self.broken("odd_authority", "--single-claim")
         self.assertEqual((failed, rows[e2e.PROVENANCE][1]), ([e2e.PROVENANCE], "authority source is own"))
@@ -298,7 +322,7 @@ class EachRuleHasACheckThatFails(Base):
         self.backend.sleep = lambda seconds: naps.append(seconds) or real(seconds)
         rows, rc, _ = self.go("--single-claim", "--room", "")
         self.assertEqual(rows[e2e.SECOND], (e2e.PASS, "refused (http 409 claim_redeemed)"))
-        self.assertLess(max(naps), 10, "nothing waited for a window")
+        self.assertLess(max(naps), 100, "nothing waited for a window")
 
     def test_a_server_error_or_a_missing_route_is_not_a_refusal(self):
         for status, code in ((503, "UNAVAILABLE"), (404, "NOT_FOUND"), (302, "")):
@@ -314,8 +338,8 @@ class EachRuleHasACheckThatFails(Base):
             rows, rc, text = self.go(request=broken)
             negative = (e2e.WRONG_SECRET, e2e.NO_CREDENTIAL, e2e.SECOND, e2e.OTHER_CALLER, e2e.EXPIRED)
             self.assertEqual({rows[n][0] for n in negative}, {e2e.INCOMPLETE}, text)
-            self.assertEqual(rows[e2e.WRONG_SECRET][1],
-                             f"not a refusal of this kind: the server answered http {status} {code}".rstrip())
+            self.assertEqual(rows[e2e.WRONG_SECRET][1], f"not this refusal: the server answered http {status} {code}"
+                             .rstrip() + ", not http 403 wrong_secret")
             self.assertEqual((rc, len(answered)), (3, 5), "five refusals were asked for and none is certified")
 
     def test_a_missing_credential_must_be_refused_as_unauthenticated(self):
@@ -323,18 +347,27 @@ class EachRuleHasACheckThatFails(Base):
             real = self.backend.request(method, url, **kw)
             return (409, {}, {"code": "claim_redeemed"}) if url.endswith("/redeem") and not kw.get("bearer") else real
         rows, _, _ = self.go("--single-claim", request=conflict)
-        self.assertEqual(rows[e2e.NO_CREDENTIAL], (e2e.INCOMPLETE, "not a refusal of this kind: the server answered "
-                                                                   "http 409 claim_redeemed"))
+        self.assertEqual(rows[e2e.NO_CREDENTIAL], (e2e.INCOMPLETE, "not this refusal: the server answered http 409 "
+                                                                   "claim_redeemed, not http 401 invalid_bearer"))
 
-    def test_an_authentication_failure_does_not_certify_a_claim_rule(self):
+    def test_an_authentication_failure_or_another_rules_refusal_does_not_certify_a_claim_rule(self):
         def unauthenticated(method, url, **kw):
             real = self.backend.request(method, url, **kw)
-            return (401, {}, {"code": "AGENT_CREDENTIAL_UNKNOWN"}) if url.endswith("/redeem") and real[0] != 200 else real
+            refused = url.endswith("/redeem") and real[0] != 200
+            return (401, {}, {"code": "UNAUTHORIZED", "details": {"reason": "invalid_bearer"}}) if refused else real
         rows, rc, text = self.go(request=unauthenticated)
-        claim_rules = (e2e.WRONG_SECRET, e2e.SECOND, e2e.OTHER_CALLER, e2e.EXPIRED)
-        self.assertEqual({rows[n] for n in claim_rules}, {(e2e.INCOMPLETE, "not a refusal of this kind: the server "
-                                                          "answered http 401 AGENT_CREDENTIAL_UNKNOWN")}, text)
+        for name in (e2e.WRONG_SECRET, e2e.SECOND, e2e.OTHER_CALLER, e2e.EXPIRED):
+            self.assertEqual(rows[name], (e2e.INCOMPLETE, "not this refusal: the server answered http 401 "
+                                          "invalid_bearer, not http %d %s" % e2e.REFUSALS[name]), text)
         self.assertEqual((rc, rows[e2e.NO_CREDENTIAL][0]), (3, e2e.PASS), "only the missing credential is that")
+        self.setUp()
+
+        def always_expired(method, url, **kw):
+            real = self.backend.request(method, url, **kw)
+            refused = url.endswith("/redeem") and real[0] != 200
+            return (410, {}, {"details": {"reason": "claim_expired"}}) if refused else real
+        rows, rc, _ = self.go(request=always_expired)
+        self.assertEqual([n for n in e2e.REFUSALS if rows[n][0] == e2e.PASS], [e2e.EXPIRED], "one reason, one rule")
 
     def test_a_refusal_while_the_callers_credential_is_not_accepted_says_nothing_about_the_claim(self):
         def credential_lapsed(method, url, **kw):
@@ -350,8 +383,7 @@ class EachRuleHasACheckThatFails(Base):
     def test_provenance_the_server_does_not_expose_is_incomplete_not_a_pass(self):
         self.backend.bugs.add("hide_provenance")
         rows, rc, _ = self.go("--single-claim")
-        self.assertEqual(rows[e2e.PROVENANCE], (e2e.INCOMPLETE, "created_by is in neither the listing nor the "
-                                                                "Action's answer"))
+        self.assertEqual(rows[e2e.PROVENANCE], (e2e.INCOMPLETE, "the Action's answer names no created_by"))
         self.assertEqual(rc, 3)
 
 
@@ -359,7 +391,7 @@ class Edges(Base):
     def test_a_redeem_that_fails_stops_the_run_and_names_the_agent_left_behind(self):
         rows, rc, text = self.go(preview=lambda token: {"verified": False, "error": "auth_rejected"})
         self.assertEqual((rc, rows[e2e.REDEEM][0], rows[e2e.WHOAMI][0]), (1, e2e.FAIL, e2e.SKIP))
-        self.assertEqual(rows[e2e.WRONG_SECRET], (e2e.INCOMPLETE, "refused (http 403 claim_secret_mismatch), but the "
+        self.assertEqual(rows[e2e.WRONG_SECRET], (e2e.INCOMPLETE, "refused (http 403 wrong_secret), but the "
                                                   "claim was never redeemed, so it was not shown to be valid"))
         self.assertEqual(rows[e2e.NO_CREDENTIAL][0], e2e.INCOMPLETE)
         self.assertIn("now has a token nobody holds", rows[e2e.REDEEM][1])
@@ -367,7 +399,7 @@ class Edges(Base):
         self.assertNotIn(CLAIM_KEY, self.vault.store)
 
     def test_a_second_create_that_fails_or_expires_early_leaves_its_checks_incomplete(self):
-        self.backend.add_agent(SECOND_AGENT, "taken")
+        self.backend.CREATES_PER_HOUR = 1
         rows, rc, _ = self.go()
         self.assertEqual({rows[n] for n in (e2e.OTHER_CALLER, e2e.EXPIRED, e2e.CLEANUP)},
                          {(e2e.INCOMPLETE, "the second agent.create did not complete (refused)")})
@@ -434,7 +466,7 @@ class Edges(Base):
         self.assertIn("stopped: 'Reviewer' names more than one recipient", self.go()[2])
 
     def test_a_worker_that_already_has_an_agent_is_not_provisioned_again(self):
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", pp.begin(
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", pp.begin(
             W, role="Reviewer", workspace=self.ws, vault=self.vault)["claim_key_sha256"])
         pp.finish(W, claim, WORKER_AGENT, workspace=self.ws, vault=self.vault, request=self.backend.request,
                   preview=self.preview)
@@ -479,10 +511,10 @@ class McpClient(Base):
         return request
 
     def test_discovery_or_the_exchange_failing_stops_the_run(self):
-        _, rc, text = self.go(request=self.wrapped(lambda m, path, kw: (500, {}, {}) if path == e2e.DISCOVERY_PATH else None))
+        _, rc, text = self.go(request=self.wrapped(lambda m, path, kw: (500, {}, {}) if path == "/relay" + pp.DISCOVERY_PATH else None))
         self.assertIn("stopped: MCP discovery answered http 500", text)
         elsewhere = {"mint_url": "https://evil.example.com/mint", "mcp_url": BASE_URL + "/mcp"}
-        _, rc, text = self.go(request=self.wrapped(lambda m, path, kw: (200, {}, elsewhere) if path == e2e.DISCOVERY_PATH else None))
+        _, rc, text = self.go(request=self.wrapped(lambda m, path, kw: (200, {}, elsewhere) if path == "/relay" + pp.DISCOVERY_PATH else None))
         self.assertIn("with no mint endpoint on the gateway's own origin", text)
         self.assertNotIn("POST /mint", self.backend.paths)
         refused = (401, {}, {"code": "AGENT_CREDENTIAL_REVOKED"})
@@ -492,7 +524,7 @@ class McpClient(Base):
 
     def test_a_rejected_delegation_is_minted_once_more(self):
         for first in ((401, {}, {}), (200, {}, {"result": {"isError": True, "content": [
-                {"type": "text", "text": json.dumps({"code": e2e.MCP_AUTH_CODE})}]}})):
+                {"type": "text", "text": json.dumps({"code": pp.MCP_AUTH_CODE})}]}})):
             self.setUp()
             seen = []
 
@@ -797,29 +829,6 @@ class Wiring(Base):
 
 
 class Small(unittest.TestCase):
-    def test_find_reads_the_shallowest_value(self):
-        env = {"status": "ok", "result": {"agent_id": "@a:x", "authority": {"source": "approval", "agent_id": "@deep:x"}}}
-        self.assertEqual((e2e.find(env, "agent_id"), e2e.find(env, "source"), e2e.find(env, "absent")),
-                         ("@a:x", "approval", None))
-        self.assertIsNone(e2e.find({"a": {"b": {"c": {"d": {"e": 1}}}}}, "e"), "bounded depth")
-
-    def test_envelope_prefers_structured_content_then_the_last_json_text(self):
-        self.assertEqual(e2e.envelope({"structuredContent": {"a": 1}, "content": [{"text": '{"b": 2}'}]}), {"a": 1})
-        content = [{"text": '{"first": 1}'}, {"text": "Done."}, {"text": "[1]"}, {"no": "text"}, None]
-        self.assertEqual(e2e.envelope({"content": content}), {"first": 1})
-        self.assertEqual(e2e.envelope({}), {})
-
-    def test_approval_state(self):
-        for env, state in (({"status": "succeeded", "result": {"authority": {"approval_id": "ap_1"}}}, "done"),
-                           ({"status": "approval_required", "approval_id": "ap_1"}, "held"),
-                           ({"status": "pending"}, "held"),
-                           ({"is_error": True, "code": "approval_required"}, "fail_closed"),
-                           ({"is_error": True, "code": "UNAVAILABLE", "message": "Action approval coordination is "
-                                                                                 "not available"}, "fail_closed"),
-                           ({"is_error": True, "code": "FORBIDDEN"}, "refused"),
-                           ({"status": "denied"}, "denied"), ({"event_id": "$1"}, "done")):
-            self.assertEqual(e2e.approval_state(env), state, env)
-
     def test_expiry_reads_a_number_or_an_iso_time(self):
         self.assertEqual(e2e.expiry_of(1800000300), 1800000300.0)
         self.assertEqual(e2e.expiry_of("2027-01-15T08:05:00Z"), e2e.expiry_of("2027-01-15T08:05:00+00:00"))

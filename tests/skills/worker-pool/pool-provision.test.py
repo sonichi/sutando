@@ -66,10 +66,10 @@ class Base(H.Base):
     def begin(self, **kw):
         return pp.begin(W, role="Reviewer", workspace=self.ws, vault=self.vault, **kw)
 
-    def claim(self, label="desk-reviewer"):
+    def claim(self, name="reviewer"):
         """Begin, then have the backend create the agent: (agent id, claim id, the secret)."""
         begun = self.begin()
-        agent, claim = provision_fake.created(self.backend, CORE, label, begun["claim_key_sha256"])
+        agent, claim = provision_fake.created(self.backend, CORE, name, begun["claim_key_sha256"])
         return agent, claim, self.vault.store[CLAIM_KEY]
 
     def finish(self, claim_id, **kw):
@@ -92,13 +92,13 @@ class Base(H.Base):
 
 
 class Begin(Base):
-    def test_the_secret_stays_in_the_vault_and_only_its_hash_and_a_label_come_back(self):
+    def test_the_secret_stays_in_the_vault_and_only_its_hash_and_a_name_come_back(self):
         out = self.begin()
-        self.assertEqual(sorted(out), ["claim_key_sha256", "label"])
+        self.assertEqual(sorted(out), ["claim_key_sha256", "name"])
         secret = self.vault.store[CLAIM_KEY]
         self.assertRegex(secret, r"^[0-9a-f]{64}$")
         self.assertEqual(out["claim_key_sha256"], pp.claim_hash(secret))
-        self.assertEqual(out["label"], "desk-reviewer", "<core>-<role>, so the agent is <owner>-<core>-<role>")
+        self.assertEqual(out["name"], "reviewer", "the server puts <owner>-<core>- in front of it")
         self.assertNotIn(secret, json.dumps(out))
 
     def test_a_second_begin_replaces_the_pending_secret(self):
@@ -177,7 +177,8 @@ class Finish(Base):
         row = C.worker_identity(W, self.ws)
         self.assertEqual((row["worker"], row["agent_mxid"], row["token_ref"], row["primary"], row["added_by"]),
                          (W, WORKER_AGENT, WORKER_REF, False, "agent_link"))
-        self.assertEqual(self.vault.store[WORKER_REF], f"https://chat.alpha-fixture.net|{self.backend.bearer_of(agent)}")
+        self.assertEqual(self.vault.store[WORKER_REF],
+                         f"https://chat.alpha-fixture.net/relay|{self.backend.bearer_of(agent)}")
         self.assertNotIn(CLAIM_KEY, self.vault.store, "the claim secret is deleted on success")
         self.assertClean(json.dumps({k: v for k, v in out.items() if k != "row"}) + json.dumps(row))
         self.assertIn(f"POST /api/v1/agents/provision-claims/{claim}/redeem", self.backend.paths)
@@ -194,13 +195,18 @@ class Finish(Base):
         self.assertEqual(len([p for p in self.backend.paths if p.endswith("/redeem")]), 1)
         _, claim, _ = self.claim()
         self.backend.sleep(self.backend.CLAIM_TTL_S + 1)
-        self.assertEqual(self.failure(claim), "the claim was not redeemed: http 410 claim_expired")
+        self.assertEqual(self.failure(claim), "the claim was not redeemed: http 410 claim_expired (the claim is "
+                                              "dead: retire the agent and create it again)")
+        _, claim, _ = self.claim("second")
+        self.vault.set(CLAIM_KEY, "too short")
+        self.assertEqual(self.failure(claim, agent="@owner-desk-second.agent:alpha-fixture.net"),
+                         "the claim was not redeemed: http 400 invalid_secret")
 
     def test_a_wrong_secret_is_refused_and_five_burn_the_claim(self):
         _, claim, _ = self.claim()
         for _ in range(4):
             self.vault.set(CLAIM_KEY, "0" * 64)
-            self.assertIn("http 403 claim_secret_mismatch", self.failure(claim))
+            self.assertIn("http 403 wrong_secret", self.failure(claim))
         self.vault.set(CLAIM_KEY, "0" * 64)
         self.failure(claim)
         self.vault.set(CLAIM_KEY, "0" * 64)
@@ -239,7 +245,7 @@ class Finish(Base):
         text = self.failure("apc_X", request=lambda *a, **k: (403, {}, {"code": k["bearer"]}))
         self.assertEqual(text, "the claim was not redeemed: http 403 [redacted]")
         self.begin()
-        answer = {"relay_url": "https://chat.alpha-fixture.net", "bearer": "b" * 48, "agent_id": "b" * 48}
+        answer = {"relay_url": "https://chat.alpha-fixture.net/relay", "bearer": "b" * 48, "agent_id": "b" * 48}
         text = self.failure("apc_X", request=lambda *a, **k: (200, {}, answer))
         self.assertIn(f"answered for another agent than {WORKER_AGENT}", text)
         self.assertNotIn("b" * 48, text)
@@ -277,7 +283,7 @@ class Finish(Base):
         self.assertIn(f"does not confirm the redeemed token is agent {agent}'s (unreachable (resolution))", text)
         self.assertIn(f"The claim's agent now has a token nobody holds: retire {agent} and provision again", text)
         self.assertNotIn(WORKER_REF, self.vault.store)
-        second, claim, _ = self.claim("desk-second")
+        second, claim, _ = self.claim("second")
         other = dict(self.preview(H.TOKEN_A))
         text = self.failure(claim, agent=second, preview=lambda token: other)
         self.assertIn(f"it names {CORE}", text)
@@ -350,6 +356,124 @@ class Finish(Base):
         self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], WORKER_AGENT)
 
 
+class CreateAndWait(Base):
+    """`provision`: the create call, the wait for the owner's approval, and the redeem, in one go."""
+
+    def setUp(self):
+        super().setUp()
+        self.said, self.naps = [], []
+
+    def nap(self, approve_after=None, decision="approved"):
+        def sleep(seconds):
+            self.naps.append(seconds)
+            self.backend.now += seconds
+            if approve_after is not None and len(self.naps) == approve_after:
+                self.backend.approve(decision)
+        return sleep
+
+    def provision(self, operation_id="op-1", name="reviewer", **kw):
+        kw.setdefault("request", self.backend.request)
+        kw.setdefault("sleep", self.nap())
+        return pp.provision(W, operation_id, name, workspace=self.ws, vault=self.vault, preview=self.preview,
+                            clock=self.backend.clock, say=self.said.append, **kw)
+
+    def refused(self, **kw):
+        with self.assertRaises(pp.ProvisionError) as e:
+            self.provision(**kw)
+        self.assertClean(str(e.exception))
+        return str(e.exception)
+
+    def test_it_asks_again_until_the_owner_approves_then_redeems_at_once(self):
+        self.begin()
+        out = self.provision(sleep=self.nap(approve_after=2), display_name="Reviewer", role="reviews PRs")
+        self.assertEqual((out["agent_id"], out["status"], self.naps), (WORKER_AGENT, "ok", [10, 10]))
+        self.assertEqual(self.said, ["waiting up to 900s for the owner to approve agent.create"])
+        (op,) = self.backend.operations.values()
+        self.assertEqual(op["arguments"], {"name": "reviewer", "display_name": "Reviewer", "role": "reviews PRs",
+                                           "claim_key_sha256": op["arguments"]["claim_key_sha256"]})
+        (claim,) = self.backend.claims.values()
+        self.assertEqual(claim["redeemed_at"], self.backend.now, "redeemed in the same breath as the approval")
+        self.assertNotIn(CLAIM_KEY, self.vault.store)
+        self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], WORKER_AGENT)
+        self.assertEqual(self.backend.paths.count("POST /mcp"), 3, "the first call and two more, no other tool")
+
+    def test_a_wait_that_times_out_keeps_the_secret_and_the_same_call_picks_it_up(self):
+        self.begin()
+        text = self.refused(timeout=12)
+        self.assertEqual(text, "the owner has not approved agent.create within 12s. The pending secret is kept: run "
+                               "provision-wait again with the same operation id and arguments while the request is "
+                               "open, or provision-abort to give up")
+        self.assertIn(CLAIM_KEY, self.vault.store)
+        self.backend.approve()
+        self.assertEqual(self.provision()["agent_id"], WORKER_AGENT)
+        self.assertEqual(len(self.backend.operations), 1, "one agent, however often it was asked for")
+
+    def test_a_server_that_cannot_ask_the_owner_refuses_and_the_secret_is_forgotten(self):
+        self.backend.mode = "none"
+        self.begin()
+        self.assertEqual(self.refused(), "agent.create needs the owner's approval, which this server cannot ask for "
+                                         "yet (approval_required); nothing was created and the pending secret is "
+                                         "forgotten")
+        self.assertNotIn(CLAIM_KEY, self.vault.store)
+        self.assertEqual(list(self.backend.agents), [CORE])
+        self.begin()
+        self.vault.fail_delete = True
+        self.assertTrue(self.refused().endswith("; the claim secret could not be deleted from the vault (RuntimeError)"))
+
+    def test_a_denial_and_each_refusal_name_the_reason_and_forget_the_secret(self):
+        self.begin()
+        self.assertIn("agent.create was not approved (no reason given)", self.refused(sleep=self.nap(1, "denied")))
+        self.assertNotIn(CLAIM_KEY, self.vault.store)
+        self.begin()
+        self.assertIn("agent.create was refused (operation_claimed)", self.refused(name="another-name"))
+        self.backend.CREATES_PER_HOUR = 1
+        self.begin()
+        self.assertIn("agent.create was refused (rate_limited)", self.refused(operation_id="op-2"))
+        self.backend.agents[CORE]["created_by"] = "@owner-other.agent:alpha-fixture.net"
+        self.begin()
+        self.assertIn("agent.create was refused (worker_cannot_create)", self.refused(operation_id="op-3"))
+        self.assertNotIn(CLAIM_KEY, self.vault.store)
+
+    def test_a_held_call_answered_as_an_error_and_a_refusal_that_says_retry_are_waited_out(self):
+        self.backend.bugs.add("held_as_error")
+        self.begin()
+        self.assertEqual(self.provision(sleep=self.nap(approve_after=1))["agent_id"], WORKER_AGENT)
+        self.setUp()
+        self.backend.mode = "grant"
+        self.begin()
+        calls = []
+
+        def flaky(method, url, **kw):
+            if url.endswith("/mcp"):
+                calls.append(url)
+                if len(calls) == 1:
+                    retry = {"code": "UNAVAILABLE", "details": {"reason": "mint_failed"}}
+                    return 200, {}, {"result": {"isError": True, "structuredContent": retry}}
+            return self.backend.request(method, url, **kw)
+        self.assertEqual(self.provision(request=flaky)["agent_id"], WORKER_AGENT)
+        self.assertEqual((len(calls), self.naps), (2, [10]))
+
+    def test_what_stops_it_before_the_call_keeps_the_secret(self):
+        self.assertIn("no pending claim secret", self.refused())
+        self.begin()
+        self.assertIn("lowercase letters, digits and inner dashes", self.refused(name="Not A Name"))
+        self.assertIn("no single core connection", self.refused(lane="no-such-lane"))
+        text = self.refused(request=lambda method, url, **kw: (500, {}, {"code": kw.get("bearer") or "x"}))
+        self.assertEqual(text, "MCP discovery answered http 500 with no mint endpoint on the gateway's own origin")
+        self.assertIn(CLAIM_KEY, self.vault.store)
+        self.assertEqual(self.backend.operations, {})
+
+    def test_an_answer_without_an_agent_and_a_claim_is_not_redeemed(self):
+        self.begin()
+
+        def empty(method, url, **kw):
+            if url.endswith("/mcp"):
+                return 200, {}, {"result": {"structuredContent": {"result": {"owner_notified": True}}}}
+            return self.backend.request(method, url, **kw)
+        self.assertIn("agent.create answered without an agent and a claim (no reason given)", self.refused(request=empty))
+        self.assertNotIn("POST /api/v1/agents/provision-claims", " ".join(self.backend.paths))
+
+
 class Retire(Base):
     def provisioned(self):
         agent, claim, _ = self.claim()
@@ -410,11 +534,15 @@ class Transport(unittest.TestCase):
 
     def test_json_in_and_out_over_real_http_with_the_bearer_and_headers(self):
         claim_secret = "a" * 64
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", pp.claim_hash(claim_secret))
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", pp.claim_hash(claim_secret))
         with provision_fake.serve(self.backend) as base:
             status, headers, body = pp.http_json("POST", base + pp.REDEEM_PATH.format(claim_id=claim),
                                                  bearer="secret-alpha", payload={"secret": claim_secret})
             self.assertEqual((status, headers["cache-control"], body["agent_id"]), (200, "no-store", WORKER_AGENT))
+            again = pp.http_json("POST", base + pp.REDEEM_PATH.format(claim_id=claim), payload={"secret": claim_secret},
+                                 bearer="https://chat.alpha-fixture.net/relay|secret-alpha")
+            self.assertEqual((again[0], again[2]["bearer"]), (200, body["bearer"]), "the url|secret pair is accepted")
+            self.assertEqual(pp.http_json("GET", base + "/relay/v1/whoami", bearer="secret-alpha")[2], {"agent_mxid": CORE})
             self.assertEqual(pp.http_json("GET", base + "/v1/whoami", bearer="secret-alpha")[2], {"agent_mxid": CORE})
             self.assertEqual(pp.http_json("GET", base + "/v1/whoami")[0], 401)
             self.assertEqual(pp.http_json("POST", base + "/api/v1/mcp/agent-access-tokens", bearer="nope")[0], 401)
@@ -437,6 +565,9 @@ class Small(unittest.TestCase):
     def test_scrub_and_error_code(self):
         self.assertEqual(pp.scrub("a SECRET b SECRET", ["SECRET", ""]), "a [redacted] b [redacted]")
         self.assertEqual(pp.error_code({"code": "claim_expired"}), "claim_expired")
+        self.assertEqual(pp.error_code({"code": "FORBIDDEN", "details": {"reason": "wrong_secret"}}), "wrong_secret")
+        self.assertEqual(pp.error_code({"error": {"code": "GONE", "details": {"reason": "claim_burned"}}}), "claim_burned")
+        self.assertEqual(pp.error_code({"code": "FORBIDDEN", "details": {"reason": "free text here"}}), "FORBIDDEN")
         self.assertEqual(pp.error_code({"error": "nope"}), "nope")
         self.assertEqual(pp.error_code({"error": {"code": "X.Y"}}), "X.Y")
         self.assertEqual(pp.error_code({"code": "free text is the server's"}), "")
@@ -452,11 +583,44 @@ class Small(unittest.TestCase):
         self.assertEqual(pp.claim_key("ab-12"), "AG2_PROVISION_CLAIM_AB_12")
         self.assertIsNone(pp.held(H.FakeVault(), "ABSENT"), "a vault with only get() reads absent as None")
 
-    def test_the_suggested_label_drops_the_owner_and_the_agent_suffix(self):
-        row = {"owner_mxid": "@owner:x.net", "agent_mxid": "@owner-desk.agent:x.net"}
-        self.assertEqual(pp.suggested_label(row, "Data Eng!"), "desk-data-eng")
-        self.assertEqual(pp.suggested_label({"owner_mxid": "@owner:x.net", "agent_mxid": "@sutando:x.net"}, "qa"),
-                         "sutando-qa")
+    def test_the_suggested_name_is_one_the_server_accepts(self):
+        self.assertEqual(pp.suggested_name("Data Eng!"), "data-eng")
+        long = pp.suggested_name("a very long role name that goes on - and on and on")
+        self.assertTrue(len(long) <= 32 and pp.NAME_RE.fullmatch(long), long)
+        self.assertEqual(pp.suggested_name("!!!"), "")
+        self.assertEqual(pp.create_arguments("data-eng", "a" * 64, role="PR shepherd"),
+                         {"name": "data-eng", "claim_key_sha256": "a" * 64, "role": "PR shepherd"})
+        for bad in ("", "Data", "-x", "x-", "a" * 33, "owner/kind"):
+            with self.assertRaises(pp.ProvisionError):
+                pp.create_arguments(bad, "a" * 64)
+
+    def test_find_reads_the_shallowest_value(self):
+        env = {"result": {"agent_id": "@a:x"}, "authority": {"source": "approval", "agent_id": "@deep:x"}}
+        self.assertEqual((pp.find(env, "agent_id"), pp.find(env, "source"), pp.find(env, "absent")),
+                         ("@a:x", "approval", None))
+        self.assertIsNone(pp.find({"a": {"b": {"c": {"d": {"e": 1}}}}}, "e"), "bounded depth")
+
+    def test_envelope_prefers_structured_content_then_the_last_json_text(self):
+        self.assertEqual(pp.envelope({"structuredContent": {"a": 1}, "content": [{"text": '{"b": 2}'}]}), {"a": 1})
+        content = [{"text": '{"first": 1}'}, {"text": "Done."}, {"text": "[1]"}, {"no": "text"}, None]
+        self.assertEqual(pp.envelope({"content": content}), {"first": 1})
+        self.assertEqual(pp.envelope({}), {})
+
+    def test_approval_state(self):
+        refused = {"is_error": True, "code": "FORBIDDEN"}
+        for env, state in (
+                ({"result": {"claim_id": "apc_1"}, "authority": {"source": "approval", "approval_id": "ap_1"}}, "done"),
+                ({"status": "succeeded"}, "done"), ({"event_id": "$1"}, "done"),
+                ({"status": "approval_required", "approval_id": "ap_1"}, "held"), ({"status": "pending"}, "held"),
+                ({**refused, "details": {"reason": "approval_required", "approval_reason": "agent_create"}}, "fail_closed"),
+                ({**refused, "details": {"reason": "approval_required", "approval_id": "ap_1"}}, "held"),
+                ({"is_error": True, "code": "UNAVAILABLE", "message": "Action approval coordination is not "
+                                                                      "available"}, "fail_closed"),
+                ({"is_error": True, "code": "UNAVAILABLE", "details": {"reason": "mint_failed"}}, "retry"),
+                ({"is_error": True, "code": "UNAVAILABLE", "details": {"reason": "soft_delete_incomplete"}}, "retry"),
+                ({**refused, "details": {"reason": "not_a_core"}}, "refused"),
+                ({"status": "denied"}, "denied")):
+            self.assertEqual(pp.approval_state(env), state, env)
 
     def test_the_real_vault_adapter_binds_to_the_secret_vault_module(self):
         calls = []
@@ -499,14 +663,14 @@ class Verbs(Base):
         self.assertEqual(len(out.splitlines()), 1)
         return json.loads(out)
 
-    def test_begin_prints_only_the_hash_and_the_label(self):
+    def test_begin_prints_only_the_hash_and_the_name(self):
         out = self.begun()
-        self.assertEqual(out, {"claim_key_sha256": pp.claim_hash(self.vault.store[CLAIM_KEY]), "label": "desk-reviewer"})
-        rc, text, _ = self.run_cmd("provision-begin", "Reviewer", "--role", "qa", "--lane", "alpha-fixture-net")
-        self.assertEqual((rc, json.loads(text)["label"]), (0, "desk-qa"))
+        self.assertEqual(out, {"claim_key_sha256": pp.claim_hash(self.vault.store[CLAIM_KEY]), "name": "reviewer"})
+        rc, text, _ = self.run_cmd("provision-begin", "Reviewer", "--role", "QA lead", "--lane", "alpha-fixture-net")
+        self.assertEqual((rc, json.loads(text)["name"]), (0, "qa-lead"))
 
     def test_finish_prints_the_agent_id_and_status_and_starts_the_lane(self):
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", self.begun()["claim_key_sha256"])
         rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         self.assertEqual((rc, json.loads(out)), (0, {"agent_id": WORKER_AGENT, "status": "ok"}), err)
         self.assertEqual(self.started[0]["logs_dir"], self.ws / "logs")
@@ -514,7 +678,7 @@ class Verbs(Base):
         self.assertNotIn(CLAIM_KEY, self.vault.store)
 
     def test_finish_reports_a_lane_that_did_not_start_and_can_skip_starting(self):
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", self.begun()["claim_key_sha256"])
         with unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": False, "reason": "no python"}):
             rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         self.assertEqual((rc, json.loads(out)["status"]), (1, "stored_lane_not_started"))
@@ -522,7 +686,7 @@ class Verbs(Base):
         self.backend.agents[WORKER_AGENT]["deleted"] = True
         self.assertEqual(self.run_cmd("retire-remote", "Reviewer")[0], 0)
         self.backend.agents.pop(WORKER_AGENT)
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", self.begun()["claim_key_sha256"])
 
         def refuses(row, **kw):
             raise C.LaunchFailed("no bridge script")
@@ -533,7 +697,7 @@ class Verbs(Base):
         self.backend.agents[WORKER_AGENT]["deleted"] = True
         self.assertEqual(self.run_cmd("retire-remote", "Reviewer")[0], 0)
         self.backend.agents.pop(WORKER_AGENT)
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", self.begun()["claim_key_sha256"])
         rc, out, _ = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT, "--no-start")
         self.assertEqual((rc, json.loads(out)["status"], len(self.started)), (0, "ok", 0))
 
@@ -545,6 +709,24 @@ class Verbs(Base):
         self.assertEqual(err.strip(), "pool_identity: the claim was not redeemed: http 404 claim_not_found")
         self.assertNotIn(CLAIM_KEY, self.vault.store)
 
+    def test_wait_makes_the_call_redeems_and_prints_the_agent_id_and_status(self):
+        self.backend.mode = "grant"
+        self.begun()
+        rc, out, err = self.run_cmd("provision-wait", "Reviewer", "--operation-id", "op-9", "--name", "reviewer",
+                                    "--display-name", "Reviewer", "--role", "reviews PRs")
+        self.assertEqual((rc, json.loads(out), err), (0, {"agent_id": WORKER_AGENT, "status": "ok"}, ""))
+        self.assertEqual(self.backend.operations["op-9"]["arguments"]["role"], "reviews PRs")
+        self.assertEqual(len(self.started), 1)
+
+    def test_wait_says_it_is_waiting_and_gives_up_at_the_timeout_keeping_the_secret(self):
+        self.begun()
+        rc, out, err = self.run_cmd("provision-wait", "Reviewer", "--operation-id", "op-9", "--name", "reviewer",
+                                    "--timeout", "0")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("waiting up to 0s for the owner to approve agent.create", err)
+        self.assertIn("pool_identity: the owner has not approved agent.create within 0s", err)
+        self.assertIn(CLAIM_KEY, self.vault.store)
+
     def test_abort_and_retire_remote(self):
         self.begun()
         rc, out, _ = self.run_cmd("provision-abort", "Reviewer")
@@ -552,7 +734,7 @@ class Verbs(Base):
         self.assertNotIn(CLAIM_KEY, self.vault.store)
         rc, out, _ = self.run_cmd("retire-remote", "Reviewer")
         self.assertEqual((rc, json.loads(out)["status"]), (0, "no_identity"))
-        _, claim = provision_fake.created(self.backend, CORE, "desk-reviewer", self.begun()["claim_key_sha256"])
+        _, claim = provision_fake.created(self.backend, CORE, "reviewer", self.begun()["claim_key_sha256"])
         self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
         rc, out, err = self.run_cmd("retire-remote", "Reviewer")
         self.assertEqual((rc, out), (3, ""))
@@ -566,7 +748,7 @@ class Verbs(Base):
 class Collected(unittest.TestCase):
     def test_every_test_in_this_file_is_above_the_runner(self):
         source = Path(__file__).read_text()
-        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 38)
+        self.assertEqual(len(re.findall(r"^    def test_", source, re.M)), 50)
         self.assertTrue(source.rstrip().endswith("unittest.main()"))
 
 

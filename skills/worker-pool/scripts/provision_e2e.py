@@ -12,9 +12,10 @@ worker's tmux scrollback, the shell history) for the secrets the run handled, th
 credential included (expected only in its own configured env file). It prints one table.
 
 What a full run does on the server: it creates two agents (the worker's, and a second whose claim
-is left to expire) and retires both. Each `agent.create` and `agent.retire` may need the owner's
-approval, and the run waits for the second claim's lifetime. `--single-claim` creates one agent
-and skips the expired-claim and different-caller checks.
+is left to expire) and retires both. Each `agent.create` and `agent.retire` needs the owner's
+approval, and the run waits for the second claim's five-minute lifetime. A core may create five
+agents an hour. `--single-claim` creates one agent and skips the expired-claim and different-caller
+checks. On a server that cannot ask the owner yet, the create is refused and the run stops there.
 
 No token and no claim secret is ever printed: they are compared in this process, and every line
 of output passes through a redaction of the values the run holds.
@@ -46,23 +47,17 @@ import pool_roster as pr
 from workspace_default import resolve_workspace
 
 PASS, FAIL, SKIP, INCOMPLETE = "PASS", "FAIL", "SKIP", "INCOMPLETE"
-DISCOVERY_PATH = "/v1/mcp/discovery"
-MCP_PROTOCOL_VERSION = "2025-06-18"
-MCP_AUTH_CODE = "AUTHENTICATION_FAILED"
-POLL_S = 3
+POLL_S = pp.POLL_S
 EXPIRY_MARGIN_S = 5
 MIN_NEEDLE = 16
 # The owner's own project trees: large, and nothing in this flow writes there.
 UNSCANNED = ("projects",)
 SHELL_HISTORIES = (".zsh_history", ".bash_history")
 CHUNK = 1 << 20
-# How a server refuses a redeem about the claim itself, and how it refuses one with no credential.
-CLAIM_REFUSALS, UNAUTHENTICATED = (400, 403, 409, 410, 422), (401, 403)
-DONE = ("succeeded", "success", "completed", "complete", "done", "ok", "executed")
-ENDED = ("denied", "rejected", "failed", "expired", "cancelled", "canceled")
+find, approval_state = pp.find, pp.approval_state
 
 CREATE, PROVENANCE, NAMING = "create is gated on approval", "agent exists with the expected provenance", \
-    "agent id is <owner>-<core>-<role>"
+    "agent id is <owner>-<core>-<name>"
 WRONG_SECRET, NO_CREDENTIAL = "redeem with a wrong secret fails", "redeem without a credential fails"
 REDEEM, NO_STORE = "redeem succeeds once", "redeem answer is marked no-store"
 SECRET_GONE, WHOAMI = "claim secret is deleted after the redeem", "stored token is the new agent's (whoami)"
@@ -72,6 +67,10 @@ RETIRED, LOCAL_GONE = "retired agent's old token is rejected", "keychain item an
 CLEANUP = "second agent retired (cleanup)"
 CONTROL, LEAKS = "leak scan finds a planted secret", "no token or claim secret in logs, tasks, results, transcripts, tmux"
 CORE_CREDENTIAL = "core credential"
+# The status and `details.reason` the server refuses each bad redeem with.
+REFUSALS = {WRONG_SECRET: (403, "wrong_secret"), NO_CREDENTIAL: (401, "invalid_bearer"),
+            SECOND: (409, "claim_redeemed"), OTHER_CALLER: (404, "claim_not_found"),
+            EXPIRED: (410, "claim_expired")}
 CHECKS = (CREATE, PROVENANCE, NAMING, WRONG_SECRET, NO_CREDENTIAL, REDEEM, NO_STORE, SECRET_GONE, WHOAMI, SECOND,
           OTHER_CALLER, EXPIRED, MENTION, RETIRED, LOCAL_GONE, CLEANUP, CONTROL, LEAKS)
 
@@ -109,119 +108,6 @@ class Report:
     def exit_code(self) -> int:
         statuses = [self.status(name) for name in CHECKS]
         return 1 if FAIL in statuses else (3 if SKIP in statuses or INCOMPLETE in statuses else 0)
-
-
-# ── Actions, as the core's agent ─────────────────────────────────────────────
-
-def find(value: object, key: str, depth: int = 4):
-    """The first value under `key` in a nested answer, shallowest first; None when absent. The
-    result of an Action may sit at the top or under `result` or `operation`."""
-    level = [value]
-    for _ in range(depth):
-        nxt = []
-        for item in level:
-            if isinstance(item, dict):
-                if item.get(key) is not None:
-                    return item[key]
-                nxt += list(item.values())
-        level = nxt
-    return None
-
-
-def envelope(result: Mapping[str, object]) -> dict:
-    """A tool result's JSON: its structuredContent, else the last content text that is an object."""
-    if isinstance(result.get("structuredContent"), dict):
-        return dict(result["structuredContent"])
-    for item in reversed(result.get("content") or []):
-        try:
-            value = json.loads(item.get("text") or "")
-        except (ValueError, AttributeError, TypeError):
-            continue
-        if isinstance(value, dict):
-            return value
-    return {}
-
-
-def approval_state(env: Mapping[str, object]) -> str:
-    """How an Action call stands: `done`, `held` (waiting on an approval), `fail_closed` (approval
-    is required and no approval was opened), `denied`, or `refused` (any other error)."""
-    status, code = str(env.get("status") or "").lower(), str(env.get("code") or "").lower()
-    if env.get("is_error"):
-        said = " ".join((status, code, str(env.get("message") or "").lower()))
-        return "fail_closed" if "approval" in said else "refused"
-    if status in DONE:
-        return "done"
-    if status in ENDED:
-        return "denied"
-    if find(env, "approval_id") or "approval" in status or "pending" in status:
-        return "held"
-    return "done"
-
-
-class Actions:
-    """Account and room Actions as one agent: a delegation minted from its lane credential, then one
-    tools/call per Action on the server's MCP endpoint. The lane credential goes to its own origin only."""
-
-    def __init__(self, gateway_url: str, bearer: str, request: Callable[..., pp.Reply], known: list):
-        self.gateway, self.bearer, self.request, self.known = gateway_url, bearer, request, known
-        self._mcp_url = self._access = ""
-
-    def _connect(self) -> None:
-        status, _, body = self.request("GET", self.gateway.rstrip("/") + DISCOVERY_PATH, bearer=self.bearer)
-        mint_url, mcp_url = str(body.get("mint_url") or ""), str(body.get("mcp_url") or "")
-        if status != 200 or pp.origin_of(mint_url) != pp.origin_of(self.gateway) or not pp.origin_of(mcp_url):
-            raise Halt(f"MCP discovery answered http {status} with no mint endpoint on the gateway's own origin")
-        status, _, body = self.request("POST", mint_url, bearer=self.bearer)
-        token = body.get("access_token")
-        if status != 200 or not isinstance(token, str) or not token:
-            raise Halt(f"the access-token exchange answered http {status} {pp.error_code(body)}".rstrip())
-        self.known.append(token)
-        self._mcp_url, self._access = mcp_url, token
-
-    def tool(self, name: str, arguments: dict) -> dict:
-        """One tools/call; the tool's answer, with `is_error` set on a tool error. A rejected
-        delegation is minted once more."""
-        for attempt in (0, 1):
-            if attempt or not self._access:
-                self._connect()
-            status, _, rpc = self.request(
-                "POST", self._mcp_url, bearer=self._access, headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
-                payload={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                         "params": {"name": name, "arguments": arguments}})
-            result = rpc.get("result") if status == 200 else None
-            env = envelope(result) if isinstance(result, dict) else {}
-            if attempt == 0 and (status == 401 or env.get("code") == MCP_AUTH_CODE):
-                continue
-            break
-        if not isinstance(result, dict):
-            raise Halt(f"the MCP endpoint answered http {status} to {name} without a result")
-        return {**env, "is_error": True} if result.get("isError") else env
-
-    def execute(self, action: str, arguments: dict, *, operation_id: str = "", room_id: str = "") -> dict:
-        payload = {"action": action, "arguments": arguments}
-        payload.update({"room_id": room_id} if room_id else {"target_kind": "account"})
-        if operation_id:
-            payload["operation_id"] = operation_id
-        return self.tool("room.action.execute", payload)
-
-    def read(self, action: str, arguments: dict, room_id: str) -> dict:
-        return self.tool("room.action.read", {"action": action, "room_id": room_id, "arguments": arguments})
-
-
-def settle(actions: Actions, first: dict, operation_id: str, *, timeout: float, sleep, clock) -> Tuple[str, dict]:
-    """(state, answer) of an Action call once it stops waiting: a held one is inspected until it is
-    done or denied, or `timeout` when the approval does not arrive in time."""
-    state = approval_state(first)
-    if state != "held":
-        return state, first
-    deadline = clock() + timeout
-    while clock() < deadline:
-        sleep(POLL_S)
-        env = actions.tool("operation.inspect", {"operation_id": operation_id})
-        state = approval_state(env)
-        if state != "held":
-            return state, env
-    return "timeout", first
 
 
 def expiry_of(value: object) -> Optional[float]:
@@ -399,6 +285,16 @@ def leak_check(report: Report, needles: Mapping[str, str], workspace: Path, *, e
         report.set(LEAKS, PASS, f"0 hits for {len(wanted)} secrets in {summary}")
 
 
+def core_label(row: Mapping[str, object]) -> str:
+    """The label the server reads from a core's id and puts in its workers' ids: `<label>` of
+    `@<owner>-<label>.agent`; `sutando` for the owner's default agent and the legacy form."""
+    owner = str(row.get("owner_mxid") or "").lstrip("@").partition(":")[0]
+    local = str(row.get("agent_mxid") or "").lstrip("@").partition(":")[0]
+    if owner and local.startswith(owner + "-") and local.endswith(".agent"):
+        return local[len(owner) + 1:-len(".agent")]
+    return "sutando"
+
+
 def credential_files(row: Mapping[str, object]) -> set:
     """The env files a core lane's credential is kept in by design: its channel directory's, the
     launch-key file and the launcher-named device file. Empty when they cannot be resolved, so that
@@ -452,14 +348,15 @@ class Flow:
     def refusal(self, name: str, status: int, body: Mapping[str, object],
                 caller: Optional[Tuple[str, str]] = None) -> None:
         """Record a check that a redeem made as `caller` (bearer, agent; None for no credential) was
-        refused for the reason under test. A token is a failure. A refusal counts only as a status
-        that fits the reason, and only when the caller's own credential is accepted just after:
-        an authentication failure says nothing about the claim."""
+        refused for the reason under test. A token is a failure. Only the status and reason the server
+        gives for that rule count, and only when the caller's own credential is accepted just after:
+        any other refusal says nothing about the rule."""
         said = f"http {status} {pp.error_code(body)}".rstrip()
         if status == 200:
             self.report.set(name, FAIL, "the server delivered a token")
-        elif status not in (CLAIM_REFUSALS if caller else UNAUTHENTICATED):
-            self.report.set(name, INCOMPLETE, f"not a refusal of this kind: the server answered {said}")
+        elif (status, pp.error_code(body)) != REFUSALS[name]:
+            want = "http %d %s" % REFUSALS[name]
+            self.report.set(name, INCOMPLETE, f"not this refusal: the server answered {said}, not {want}")
         elif caller and not self.accepted(*caller):
             self.report.set(name, INCOMPLETE, f"refused ({said}), but the caller's own credential was not accepted "
                                               "just after, so this says nothing about the claim")
@@ -470,20 +367,20 @@ class Flow:
         status, _, body = self.request("GET", self.gateway.rstrip("/") + "/v1/whoami", bearer=bearer)
         return status == 200 and body.get("agent_mxid") == agent
 
-    def create(self, label: str, key_sha256: str) -> Tuple[str, dict, str]:
+    def create(self, name: str, key_sha256: str) -> Tuple[Callable[[], dict], dict, str]:
+        """Ask for an agent: (the same call, to make again; its first answer; how that stands)."""
         operation_id = f"provision-e2e-{uuid.uuid4().hex}"
-        first = self.actions.execute("agent.create", {"label": label, "display_name": label,
-                                                      "claim_key_sha256": key_sha256}, operation_id=operation_id)
-        state = approval_state(first)
-        if state == "done" and not find(first, "claim_id"):
-            first = self.actions.tool("operation.inspect", {"operation_id": operation_id})
-        return operation_id, first, state
+        arguments = pp.create_arguments(name, key_sha256, role=self.args.role or "")
 
-    def approved(self, action: str, operation_id: str, first: dict) -> Tuple[str, dict]:
-        if approval_state(first) == "held":
-            self.say(f"waiting up to {int(self.args.approval_timeout)}s for the owner to approve {action}")
-        return settle(self.actions, first, operation_id, timeout=self.args.approval_timeout,
-                      sleep=self.sleep, clock=self.clock)
+        def call() -> dict:
+            return self.actions.execute("agent.create", arguments, operation_id=operation_id)
+        first = call()
+        return call, first, approval_state(first)
+
+    def approved(self, action: str, call: Callable[[], dict], first: dict) -> Tuple[str, dict]:
+        timeout = self.args.approval_timeout
+        return pp.settle(call, first=first, timeout=timeout, sleep=self.sleep, clock=self.clock, poll=POLL_S,
+                         waiting=lambda: self.say(f"waiting up to {int(timeout)}s for the owner to approve {action}"))
 
     def run(self) -> None:
         args, report = self.args, self.report
@@ -499,21 +396,21 @@ class Flow:
         self.core_bearer = pp.bearer_of(token)
         self.known.append(self.core_bearer)
         self.kept[CORE_CREDENTIAL] = (self.core_bearer, credential_files(self.core))
-        self.actions = Actions(self.gateway, self.core_bearer, self.request, self.known)
-        begun = pp.begin(wid, role=args.role or str(row.get("label") or ""), workspace=self.ws, vault=self.vault,
+        self.actions = pp.Actions(self.gateway, self.core_bearer, self.request, self.known)
+        begun = pp.begin(wid, role=str(row.get("label") or ""), workspace=self.ws, vault=self.vault,
                          lane=str(self.core["instance"]))
         self.wid = wid
         secret_a = self.hold("claim secret", pp.held(self.mine, pp.claim_key(wid)))
-        label = args.label or begun["label"]
-        op_a, first_a, state_a = self.create(label, begun["claim_key_sha256"])
+        name = args.name or begun["name"]
+        call_a, first_a, state_a = self.create(name, begun["claim_key_sha256"])
         if not self.gate(first_a, state_a):
             return
         second = None
         if not args.single_claim:
             secret_b = self.hold("second claim secret", secrets.token_hex(32))
-            op_b, first_b, _ = self.create(f"{label}-x", pp.claim_hash(secret_b))
-            second = (secret_b, op_b, first_b)
-        state_a, env_a = self.approved("agent.create", op_a, first_a)
+            call_b, first_b, _ = self.create(f"{name[:30].rstrip('-')}-x", pp.claim_hash(secret_b))
+            second = (secret_b, call_b, first_b)
+        state_a, env_a = self.approved("agent.create", call_a, first_a)
         agent_a, claim_a = str(find(env_a, "agent_id") or ""), str(find(env_a, "claim_id") or "")
         if state_a != "done" or not agent_a or not claim_a:
             report.set(PROVENANCE, FAIL, f"agent.create did not complete ({state_a}); no agent to check")
@@ -521,7 +418,7 @@ class Flow:
                 report.note("a second agent.create was requested and may still be approved: deny its card")
             return
         self.created.append(agent_a)
-        self.provenance(agent_a, env_a, label)
+        self.provenance(agent_a, env_a, name)
         core = (self.core_bearer, str(self.core["agent_mxid"]))
         self.refusal(WRONG_SECRET, *self.redeem_once(self.core_bearer, claim_a, secrets.token_hex(32)), caller=core)
         self.refusal(NO_CREDENTIAL, *self.redeem_once("", claim_a, secret_a))
@@ -552,8 +449,8 @@ class Flow:
         if state == "held":
             self.report.set(CREATE, PASS, "held for the owner's approval")
         elif state == "fail_closed":
-            self.report.set(CREATE, PASS, "fails closed with approval_required: the approval path is not "
-                                          "deployed here, so no later check could run")
+            self.report.set(CREATE, PASS, "fails closed with approval_required: this server cannot ask the owner "
+                                          "yet, so no later check could run")
         elif state == "done" and str(find(first, "source") or "").lower() in ("delegation", "grant"):
             self.report.set(CREATE, PASS, "ran at once under a delegation grant")
         elif state == "done":
@@ -562,20 +459,20 @@ class Flow:
             self.report.set(CREATE, FAIL, f"agent.create was {state} ({pp.error_code(first) or 'no code'})")
         return state in ("held", "done")
 
-    def provenance(self, agent_id: str, env: Mapping[str, object], label: str) -> None:
+    def provenance(self, agent_id: str, env: Mapping[str, object], name: str) -> None:
         status, _, body = self.request("GET", self.gateway.rstrip("/") + "/v1/agents", bearer=self.core_bearer)
         listed = body.get("agents") if status == 200 and isinstance(body.get("agents"), list) else []
         entry = next((a for a in listed if isinstance(a, dict) and a.get("id") == agent_id), None)
         wrong, unknown = [], []
         if entry is None:
             wrong.append(f"{agent_id} is not in the owner's agent listing (http {status})")
-        elif entry.get("owner") != self.core["owner_mxid"]:
-            wrong.append("its owner is not the core's owner")
-        creator = (entry or {}).get("created_by") or find(env, "created_by")
-        if creator is None:
-            unknown.append("created_by is in neither the listing nor the Action's answer")
-        elif creator != self.core["agent_mxid"]:
-            wrong.append("created_by is not the core")
+        for key, want, whose in (("owner", self.core["owner_mxid"], "the core's owner"),
+                                 ("created_by", self.core["agent_mxid"], "the core")):
+            got = find(env, key)
+            if got is None:
+                unknown.append(f"the Action's answer names no {key}")
+            elif got != want:
+                wrong.append(f"{key} is not {whose}")
         source = str(find(env, "source") or "").lower()
         if not source:
             unknown.append("the Action's answer names no authority source")
@@ -584,9 +481,12 @@ class Flow:
         self.report.set(PROVENANCE, FAIL if wrong else (INCOMPLETE if unknown else PASS),
                         "; ".join(wrong + unknown) or f"owner and created_by match; authority is {source}")
         owner = str(self.core["owner_mxid"]).lstrip("@").partition(":")[0]
-        expected = f"@{owner}-{label}.agent:{connections.server_of_mxid(str(self.core['agent_mxid']))}"
-        self.report.set(NAMING, PASS if agent_id == expected else FAIL,
-                        agent_id if agent_id == expected else f"got {agent_id}, expected {expected}")
+        server = connections.server_of_mxid(str(self.core["agent_mxid"]))
+        stem = f"@{owner}-{core_label(self.core)}-{name}"
+        named = agent_id.endswith(f".agent:{server}") and agent_id[:-len(f".agent:{server}")] in \
+            [stem] + [f"{stem}-{n}" for n in range(2, 10)]
+        self.report.set(NAMING, PASS if named else FAIL,
+                        agent_id if named else f"got {agent_id}, expected {stem}.agent:{server}")
 
     def redeem(self, wid: str, claim_id: str, agent_id: str) -> str:
         """The real redeem, through `pool_provision.finish`; the worker's bearer, '' when it failed."""
@@ -636,8 +536,8 @@ class Flow:
             for name in (OTHER_CALLER, EXPIRED, CLEANUP):
                 self.report.set(name, SKIP, "needs the second claim (run without --single-claim)")
             return None
-        secret_b, op_b, first_b = second
-        state, env = self.approved("agent.create", op_b, first_b)
+        secret_b, call_b, first_b = second
+        state, env = self.approved("agent.create", call_b, first_b)
         agent_b, claim_b = str(find(env, "agent_id") or ""), str(find(env, "claim_id") or "")
         if state != "done" or not agent_b or not claim_b:
             for name in (OTHER_CALLER, EXPIRED, CLEANUP):
@@ -691,8 +591,12 @@ class Flow:
 
     def retire_remote(self, agent_id: str) -> str:
         operation_id = f"provision-e2e-{uuid.uuid4().hex}"
-        first = self.actions.execute("agent.retire", {"agent_id": agent_id}, operation_id=operation_id)
-        state, _ = self.approved("agent.retire", operation_id, first)
+
+        def call() -> dict:
+            return self.actions.execute("agent.retire", {"agent_id": agent_id}, operation_id=operation_id)
+        state, env = self.approved("agent.retire", call, call())
+        if state == "done" and find(env, "bearer_revoked") is not True:
+            state = "done without bearer_revoked"
         if state == "done":
             self.created.remove(agent_id)
         return state
@@ -763,8 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--worker", required=True, help="a live pool worker (id or label) with no agent of its own")
     p.add_argument("--workspace", type=Path, default=None)
     p.add_argument("--lane", default=None, help="the core connection to act as, when --base-url matches several")
-    p.add_argument("--role", default=None, help="the role part of the agent's name (default: the worker's label)")
-    p.add_argument("--label", default=None, help="the whole label to ask for, instead of <core>-<role>")
+    p.add_argument("--name", default=None, help="the agent's name (default: from the worker's label); its id "
+                                                "becomes @<owner>-<core>-<name>.agent")
+    p.add_argument("--role", default=None, help="a line saying what the agent is for, stored with it")
     p.add_argument("--room", default="", help="a room the core is in, for the mention check: the run waits for you "
                                               "to invite the new agent there")
     p.add_argument("--single-claim", action="store_true", help="create one agent: skips the expired-claim and "
