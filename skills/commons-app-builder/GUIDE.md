@@ -195,6 +195,10 @@ When the request names no colours:
 - **One family as the accent**, chosen to suit the app; name it in your reply. Its `-dark` is
   accent text and icons, its `-mid` is highlights and buttons, its `-light` is tinted tiles and
   backgrounds. The app icon uses the same family.
+- **Keep brand colour small.** Brand colours go on the app icon and on small status markers
+  (dots), not on large fills, badges or link text. Body text, pills and links stay neutral:
+  white or `neutral-light` pills with a small status dot, `#6B6560` secondary text, links in
+  the text colour. One muted accent, `red-dark`, marks errors and blockers only.
 - **Check contrast.** Most `-mid` tones and `neutral-mid` are under 3:1 on white: never body
   or secondary text. Label a `-mid` button in the family's `-dark` (or white on `red-mid` and
   `blue-mid`). `green-dark` on `green-light` is about 4.2:1: large text and icons only.
