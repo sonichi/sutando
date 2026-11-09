@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracker</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
+    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e;
+    --todo: #6b7280; --doing: #2f5bea; --done: #157f4b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
+      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80;
+      --todo: #9aa0ab; --doing: #7d9bff; --done: #5bd39b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }
+  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
+  .note.bad { border-color: var(--bad); color: var(--bad); }
+  .note.warn { border-color: var(--warn); color: var(--warn); }
+  .add { display: grid; gap: 8px; margin-bottom: 14px; }
+  input, select, textarea, button {
+    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 0 12px;
+  }
+  textarea { padding: 10px 12px; min-height: 60px; }
+  button { min-height: 44px; min-width: 44px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  .items { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
+  .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .top { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
+  .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+  .chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+  .chip.todo { color: var(--todo); } .chip.doing { color: var(--doing); } .chip.done { color: var(--done); }
+  /* Outcome is agent-written text: a long URL, hash or token must wrap, not widen the page. */
+  .meta { color: var(--dim); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; min-width: 0; }
+  .meta.over { color: var(--bad); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .mine { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+  .counts { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; color: var(--dim); font-size: 13px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  @media (min-width: 640px) { .add { grid-template-columns: 2fr 1fr 1fr auto; align-items: start; } }
+</style>
+</head>
+<body>
+<h1>Tracker</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="notes"></div>
+<div class="counts" id="counts"></div>
+<div class="add">
+  <input id="title" placeholder="What needs doing?" aria-label="Item" autocomplete="off">
+  <select id="status" aria-label="Status"></select>
+  <input id="due" type="date" aria-label="Due date">
+  <button class="primary" id="add" disabled>Add item</button>
+</div>
+<ul class="items" id="list"></ul>
+<script>
+(async () => {
+  const art = window.artifact;
+  const db = art && art.db;
+  const $ = (id) => document.getElementById(id);
+  const notes = $('notes');
+  const show = (cls, text) => {
+    const el = document.createElement('div');
+    el.className = 'note ' + cls;
+    el.textContent = text;
+    notes.appendChild(el);
+  };
+  const clearNotes = () => { notes.textContent = ''; };
+  let hintShown = false;
+  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
+
+  if (!db) {
+    $('sub').textContent = 'Preview';
+    show('warn', 'Open this page in s.space to use it: this is a preview with no data.');
+    $('add').disabled = true;
+    return;
+  }
+  await art.ready;
+
+  // GUIDE step 3: never hard-code a database id.
+  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;
+  let dbs = [];
+  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }
+  const id = (art.app && art.app.database) || byName(dbs, 'Tracker — Items');
+  if (!id) { $('sub').textContent = ''; show('bad', 'The "Tracker — Items" database is missing from this room.'); $('add').disabled = true; return; }
+
+  const save = async (call) => {
+    const until = Date.now() + 120000;
+    for (;;) {
+      const r = await call();
+      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
+      hint('Allow this page to edit data in this room, and it will save.');
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  };
+
+  // Null prototypes: these are indexed by option names, which the room's schema controls, and
+  // a plain object would answer for '__proto__' and 'constructor'.
+  const GROUP = Object.assign(Object.create(null),
+    { Requested: 'todo', Working: 'doing', Blocked: 'doing', Done: 'done' });
+  // Due dates are calendar dates in the reader's zone; toISOString() is UTC and would mark an
+  // item overdue hours early west of Greenwich.
+  const today = () => {
+    const d = new Date(Number.isNaN(art.now()) ? Date.now() : art.now());
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  };
+  let titleProp = null, statusOpts = [], mineById = new Map(), consentKnown = true;
+  // Pending writes are tracked here, NOT on the elements: a watch update redraws them, and a
+  // redraw must not re-enable a control whose write is still in flight.
+  let busy = false, snapshot = null;
+
+  // Resolved into locals and returned, so an older overlapping render cannot overwrite a newer
+  // one. personId rejects until the viewer allows the page: show "?" rather than "not yours".
+  const whose = async (snap) => {
+    const mine = new Map();
+    for (const row of snap.rows) {
+      try {
+        const who = await art.personId(row.cells['Created by']);
+        mine.set(row.id, !!(who && art.me && who === art.me.id));
+      } catch (e) { return { mineById: new Map(), consentKnown: false }; }
+    }
+    return { mineById: mine, consentKnown: true };
+  };
+  let generation = 0;
+
+  const draw = (snap) => {
+    clearNotes();
+    hintShown = false;
+    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
+    const status = snap.props.find((p) => p.name === 'Status');
+    statusOpts = (status && status.options) || [];
+    // Rebuilt every render: an option renamed or removed in the room must not stay on offer.
+    const sel = $('status');
+    const want = sel.value;
+    sel.textContent = '';
+    statusOpts.forEach((o) => {
+      const opt = document.createElement('option');
+      opt.value = o.name; opt.textContent = o.name;
+      sel.appendChild(opt);
+    });
+    sel.value = statusOpts.some((o) => o.name === want)
+      ? want
+      : (statusOpts[0] ? statusOpts[0].name : '');
+    $('add').disabled = !titleProp || busy;
+    if (!titleProp) show('bad', 'This database has no title column, so items cannot be named.');
+    if (!consentKnown) show('warn', 'Allow the page to see who is who, and "yours" will fill in.');
+
+    const counts = Object.create(null);
+    snap.rows.forEach((r) => { const s = r.cells.Status || '—'; counts[s] = (counts[s] || 0) + 1; });
+    $('counts').textContent = snap.rows.length
+      ? Object.keys(counts).map((k) => k + ': ' + counts[k]).join('  ·  ')
+      : '';
+    $('sub').textContent = snap.rows.length + (snap.rows.length === 1 ? ' item' : ' items');
+
+    const list = $('list');
+    list.textContent = '';
+    if (!snap.rows.length) {
+      const li = document.createElement('li');
+      li.className = 'item';
+      li.textContent = 'Nothing tracked yet. Add the first item above.';
+      list.appendChild(li);
+      return;
+    }
+    const order = Object.assign(Object.create(null), { Blocked: 0, Working: 1, Requested: 2, Done: 3 });
+    const rows = snap.rows.slice().sort((a, b) =>
+      (order[a.cells.Status] ?? 9) - (order[b.cells.Status] ?? 9) ||
+      String(a.cells.Due || '9999').localeCompare(String(b.cells.Due || '9999')));
+
+    rows.forEach((row) => {
+      const li = document.createElement('li');
+      li.className = 'item';
+      const top = document.createElement('div');
+      top.className = 'top';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = (titleProp && row.cells[titleProp]) || 'Untitled';
+      const chip = document.createElement('span');
+      const st = row.cells.Status || '—';
+      chip.className = 'chip ' + (typeof GROUP[st] === 'string' ? GROUP[st] : 'todo');
+      chip.textContent = st;
+      top.appendChild(name); top.appendChild(chip);
+      li.appendChild(top);
+
+      const meta = document.createElement('div');
+      const bits = [];
+      if (row.cells.Due) bits.push('Due ' + row.cells.Due);
+      if (row.cells.Outcome) bits.push('Outcome: ' + row.cells.Outcome);
+      meta.className = 'meta' + (row.cells.Due && row.cells.Due < today() && st !== 'Done' ? ' over' : '');
+      meta.textContent = bits.join('  ·  ');
+      if (bits.length) li.appendChild(meta);
+
+      const mine = document.createElement('div');
+      mine.className = 'mine';
+      mine.textContent = consentKnown ? (mineById.get(row.id) ? 'Added by you' : '') : 'Added by ?';
+      if (mine.textContent) li.appendChild(mine);
+
+      const actions = document.createElement('div');
+      actions.className = 'row';
+      statusOpts.filter((o) => o.name !== st).forEach((o) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = o.name;
+        b.setAttribute('aria-label', 'Set ' + name.textContent + ' to ' + o.name);
+        b.disabled = busy;
+        b.onclick = async () => {
+          if (busy) return;
+          busy = true;
+          b.disabled = true;
+          // try/finally: a rejected write must still clear busy, or every control stays dead.
+          let r = { ok: false, reason: '' };
+          try {
+            r = await save(() => db.write(id, row.id, 'Status', o.name));
+          } catch (e) {
+            r = { ok: false, reason: e.message || 'The change was refused.' };
+          } finally {
+            busy = false;
+            if (snapshot) await render(snapshot);
+            else b.disabled = false;
+          }
+          if (!r.ok) show('bad', r.reason || 'The change was refused.');
+        };
+        actions.appendChild(b);
+      });
+      li.appendChild(actions);
+      list.appendChild(li);
+    });
+  };
+
+  const render = async (snap) => {
+    const gen = ++generation;                          // a newer render supersedes this one
+    snapshot = snap;
+    if (!snap) { clearNotes(); $('list').textContent = ''; $('sub').textContent = ''; show('bad', 'The Tracker database was removed from this room.'); $('add').disabled = true; return; }
+    const who = await whose(snap);
+    if (gen !== generation) return;                    // superseded while resolving ownership
+    mineById = who.mineById;
+    consentKnown = who.consentKnown;
+    draw(snap);
+  };
+
+  db.onChange(id, render);                 // subscribe, then read: no edit is missed between them
+  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+
+  $('add').onclick = async () => {
+    if (busy) return;                                  // one item in flight at a time
+    const text = $('title').value.trim();
+    if (!text || !titleProp) return;
+    const due = $('due').value;
+    const values = {};
+    values[titleProp] = text;
+    values.Status = $('status').value || (statusOpts[0] && statusOpts[0].name) || 'Requested';
+    if (due) values.Due = due;
+    busy = true;
+    $('add').disabled = true;
+    let r = { ok: false, reason: '' };
+    try {
+      r = await save(() => db.createRow(id, values));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The item was not saved.' };
+    } finally {
+      busy = false;
+      // Re-draw so the live controls carry the finished state, then clear only the fields the
+      // reader has not typed into since: a retry can last two minutes. No snapshot means the
+      // database is gone, so Add stays disabled.
+      if (snapshot) await render(snapshot);
+    }
+    if (!r.ok) { show('bad', r.reason || 'The item was not saved.'); return; }
+    if ($('title').value.trim() === text) $('title').value = '';
+    if ($('due').value === due) $('due').value = '';
+  };
+  $('title').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
+})();
+</script>
+</body>
+</html>
