@@ -210,8 +210,10 @@ When the request names no colours:
 
 **App icon.** Give every app an `icon` on its app record (`apps.create`, `apps.update` or
 `apps.scaffold`, where `describe` lists the argument). The value is a data URL
-(`data:image/svg+xml;base64,...` preferred, or a PNG) or a single emoji. By default, draw it to
-this spec:
+(`data:image/svg+xml;base64,...` preferred, or a PNG) or a single emoji; `null` on
+`apps.update` clears it. Don't draw the icon in the page header or anywhere inside the page:
+the client shows it in the app chrome (the Apps list, the top-bar pins and the page's tab).
+By default, draw it to this spec:
 
 - 64 by 64, corner radius 16, on a tile in the `-light` tone of the app's **accent family**.
 - A flat illustration in that family's `-dark` and `-mid` tones: at most 3 colours with the
