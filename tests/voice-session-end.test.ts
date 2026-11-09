@@ -13,7 +13,8 @@ for (const d of ['tasks', 'results', 'state']) mkdirSync(join(TMP, d), { recursi
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS } = await import('../src/voice-session-end.js');
-const { submitVoiceSessionEndTask } = await import('../src/task-bridge.js');
+const { submitVoiceSessionEndTask, setVoiceSessionOrigin, snapshotVoiceSessionOrigin, endVoiceClientSession, setVoiceTaskOriginResolver, voiceTaskOrigin, forwardOfflineVoiceResult } = await import('../src/task-bridge.js');
+const { roomOriginFromTaskHeader } = await import('../skills/ag2space-voice/room-binding.js');
 
 const item = (role: string, content: string, timestamp = 0) => ({ role, content, timestamp }) as never;
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
@@ -103,7 +104,7 @@ describe('the session-end task', () => {
 		assert.match(src, /onClientDisconnected: \(\) => \{\n\t\t\tcallEnd\.clientDisconnected\(\);/);
 		assert.match(src, /subscribe\('turn\.end', \(\) => callEnd\.collect\(\)\);/);
 		assert.match(src, /beforeConversationClear = \(\) => callEnd\.collect\(\);/);
-		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript\);/);
+		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript, ended\.origin \?\? null\);/);
 	});
 });
 
@@ -188,5 +189,109 @@ describe('a call ends when the user hangs up', () => {
 		c.r.clientDisconnected();
 		await tick(60);
 		assert.deepEqual(c.ended, []);
+	});
+});
+
+describe('the hang-up task carries the room the call was docked in', () => {
+	const ROOM = '!roomA:s.space';
+	const roomOrigin = (id: string) => ({
+		channel: 'ag2space', target: id, headers: { channel_kind: 'room', source_room_id: id },
+		contextLine: `room_context: ${id} — post there only what its members are meant to read`,
+	});
+	function call() {
+		let t = 1000;
+		const live: unknown[] = [];
+		const ended: Array<{ items: string[]; origin: unknown }> = [];
+		const r = createCallEndReporter({
+			sessionId: 's1', items: () => live as never, graceMs: 30, now: () => t,
+			origin: snapshotVoiceSessionOrigin,
+			onEnded: (s) => { ended.push({ items: s.items.map((i) => i.content), origin: s.origin ?? null }); },
+		});
+		const say = (role: string, content: string) => { t += 10; live.push(item(role, content, t)); };
+		// As the host does: the reporter hears the disconnect first, then the client's origin is released.
+		const hangUp = () => { r.clientDisconnected(); endVoiceClientSession(); };
+		return { r, live, ended, say, hangUp };
+	}
+	after(() => setVoiceSessionOrigin(null));
+
+	it('the room bound during the call is on the report after the disconnect released it', async () => {
+		const c = call();
+		c.r.clientConnected();
+		setVoiceSessionOrigin(roomOrigin(ROOM)); // the client announces its room after connecting
+		c.say('user', 'remind me Friday');
+		c.r.collect();
+		c.hangUp();
+		assert.equal(snapshotVoiceSessionOrigin(), null, 'the live origin is gone before the grace period ends');
+		await tick(60);
+		assert.equal(c.ended.length, 1);
+		assert.equal((c.ended[0].origin as { target: string }).target, ROOM);
+	});
+
+	it('a call that moved to the DM before hanging up reports no room', async () => {
+		const c = call();
+		setVoiceSessionOrigin(roomOrigin(ROOM));
+		c.r.clientConnected();
+		c.say('user', 'hello');
+		c.r.collect();
+		setVoiceSessionOrigin(null);
+		c.say('user', 'and now in the DM');
+		c.hangUp();
+		await tick(60);
+		assert.equal(c.ended[0].origin, null);
+	});
+
+	it('a call with no docked room reports none, and the next call does not inherit an earlier room', async () => {
+		const c = call();
+		setVoiceSessionOrigin(roomOrigin(ROOM));
+		c.r.clientConnected();
+		c.say('user', 'in the room');
+		c.hangUp();
+		await tick(60);
+		c.r.clientConnected();
+		c.say('user', 'undocked');
+		c.hangUp();
+		await tick(60);
+		assert.deepEqual(c.ended.map((e) => (e.origin as { target?: string } | null)?.target ?? null), [ROOM, null]);
+	});
+
+	it('at shutdown a call still attached reports its live room', async () => {
+		const c = call();
+		c.r.clientConnected();
+		setVoiceSessionOrigin(roomOrigin(ROOM));
+		c.say('user', 'in progress');
+		await c.r.pipeline.dispatch(input([...c.live], 'user_hangup')).report;
+		assert.equal((c.ended[0].origin as { target: string }).target, ROOM);
+		setVoiceSessionOrigin(null);
+	});
+
+	it('the task names the docked room as voice_room_id only; its delivery headers are the undocked ones', async () => {
+		const ROOM_ID = '!roomA:s.space';
+		const header = (body: string) => body.slice(0, body.indexOf('\ntask:') + 1);
+		const docked = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: x', 'user: hi', roomOrigin(ROOM_ID));
+		const h = header(readFileSync(join(TMP, 'tasks', `${docked}.txt`), 'utf-8'));
+		assert.match(h, new RegExp(`^voice_room_id: ${ROOM_ID}$`, 'm'));
+		assert.match(h, /^channel_id: local-voice$/m);
+		assert.match(h, /^source: voice$/m);
+		assert.match(h, /^priority: low$/m);
+		assert.doesNotMatch(h, /^(source_room_id|channel_kind):/m);
+		assert.doesNotMatch(readFileSync(join(TMP, 'tasks', `${docked}.txt`), 'utf-8'), /room_context:/);
+		await tick(2);
+		const plain = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: y', 'user: hi');
+		const plainBody = readFileSync(join(TMP, 'tasks', `${plain}.txt`), 'utf-8');
+		assert.match(plainBody, /^channel_id: local-voice$/m);
+		assert.doesNotMatch(plainBody, /^voice_room_id:/m);
+	});
+
+	it('its result is delivered as before: the room resolver finds no origin, and the offline result goes the owner-DM way', async () => {
+		setVoiceTaskOriginResolver(roomOriginFromTaskHeader);
+		try {
+			const id = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: z', 'user: hi', roomOrigin('!roomA:s.space'));
+			assert.equal(voiceTaskOrigin(id), null);
+			const file = await forwardOfflineVoiceResult(id, 'did the follow-up');
+			assert.match(file, /^proactive-result-task-\d+-\d+\.txt$/);
+			assert.doesNotMatch(file, /\.to-/);
+		} finally {
+			setVoiceTaskOriginResolver(null);
+		}
 	});
 });

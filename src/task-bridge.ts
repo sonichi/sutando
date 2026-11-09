@@ -367,6 +367,11 @@ export function getVoiceSessionOrigin(): VoiceSessionOrigin | null {
 	return _voiceSessionOrigin;
 }
 
+/** A copy of the live origin that a later rebind or adapter mutation cannot change. */
+export function snapshotVoiceSessionOrigin(): VoiceSessionOrigin | null {
+	return _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+}
+
 export function setVoiceTaskOriginResolver(resolver: VoiceTaskOriginResolver | null): void {
 	_voiceTaskOriginResolver = resolver;
 }
@@ -919,11 +924,14 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
-/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
-export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority.
+ *  A docked call's room rides as `voice_room_id`, metadata only: the result is delivered as an undocked one. */
+export async function submitVoiceSessionEndTask(summary: string, transcript: string, origin: VoiceSessionOrigin | null = null): Promise<string> {
 	const taskId = `task-${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const room = _usableOrigin(origin)?.target;
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low') +
+		(room ? `voice_room_id: ${room}\n` : '');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
 	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
 	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
@@ -1081,7 +1089,7 @@ const WORK_ORIGIN = Symbol('workOrigin');
 
 /** The task belongs to the origin, and the words, it was asked from, even if the session moves or the adapter mutates its record later. */
 export function captureWorkOrigin(): WorkOrigin {
-	const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+	const origin = snapshotVoiceSessionOrigin();
 	let recentAtAsk = '';
 	try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
 	return { origin, turns: captureVoiceTurns(), recentAtAsk };

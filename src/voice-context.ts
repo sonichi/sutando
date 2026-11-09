@@ -90,7 +90,7 @@ export function buildVoiceAgentContext(opts: { extraLines?: string[] } = {}): st
 	}
 
 	// Read recent phone call summaries (last 3 calls)
-	const callsFile = join(REPO_DIR, 'results', 'calls', 'calls.jsonl');
+	const callsFile = join(WORKSPACE_DIR, 'results', 'calls', 'calls.jsonl');
 	if (existsSync(callsFile)) {
 		try {
 			const callLines = readFileSync(callsFile, 'utf-8').trim().split('\n').filter(Boolean);
