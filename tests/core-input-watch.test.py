@@ -1422,7 +1422,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
 
-    def _ticks(self, panes, extra_args=()):
+    def _ticks(self, panes, extra_args=(), fail_keys=()):
         """Run main() across len(panes) real loop iterations (no --once): one
         capture() result per tick, time.sleep stubbed to stop once every pane
         has been consumed."""
@@ -1459,7 +1459,8 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
-                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
+                patch.object(_mod, "send_keys",
+                             lambda s, sess, k: sent.append((s, sess, k)) or k not in fail_keys), \
                 patch.object(_mod.time, "sleep", fake_sleep), \
                 patch.object(sys, "argv", argv):
             try:
@@ -1528,6 +1529,13 @@ class TestResumeAfterSignIn(unittest.TestCase):
         self.assertEqual([k for _s, _x, k in sent],
                          [("/model opus", "Enter"), ("continue", "Enter"), ("/startup", "Enter")])
         sent = self._ticks([_FABLE_REFUSED_MONITOR, both])
+        self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
+
+    def test_a_failed_follow_up_send_still_spends_the_capture(self):
+        # The follow-up's Enter failed: "continue" may sit staged in the composer, so the
+        # boot prompt must wait for a fresh capture instead of submitting "continue/startup".
+        both = "❯ /login\n  ⎿  Login successful\n" + _IDLE
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both], fail_keys=(("continue", "Enter"),))
         self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
 
     def test_resume_step_skips_codex_and_honours_the_cooldown(self):
