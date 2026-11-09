@@ -868,6 +868,30 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
         return []
 
 
+def settle_driven(manager, session, prompt, state):
+    """Resolve each driven card whose dialog has left the screen: its keys took, so a later
+    prompt, even an identical one, mints a new card instead of deduping onto the answered one."""
+    if manager is None:
+        return []
+    try:
+        from hitl import tui_gate
+        from hitl.schema import STATUS_IN_PROGRESS
+        done = []
+        for r in manager.active():
+            subj = r.subject or {}
+            if (subj.get("source") != _TUI_SOURCE or subj.get("session") != session
+                    or r.status != STATUS_IN_PROGRESS or not subj.get("driven_at")
+                    or tui_gate.limit_card(r)):
+                continue
+            if tui_gate.guard_for(session, prompt, state) != r.guard:
+                manager.resolve(r.id)
+                done.append(r.id)
+        return done
+    except Exception as exc:  # noqa: BLE001 — never let the settle take down the monitor
+        print(f"hitl settle failed: {exc}", file=_sys.stderr)
+        return []
+
+
 def drive_escalations(manager, session, prompt, state, send):
     """Realise a click as keys against the dialog on screen NOW, once; a dialog that
     changed since the click expires the card. Returns [(req_id, keys or None)]."""
@@ -1024,6 +1048,7 @@ def main():
             runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
+        seen_state, seen_prompt = state, prompt  # before the debounce masks a new dialog
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -1097,6 +1122,8 @@ def main():
         if a.chat_escalation:
             # A blank capture is no evidence either: "" is what a capture of an
             # emptied pane returns, and it must not resolve a card nobody answered.
+            if pane and pane.strip():
+                settle_driven(hitl, a.session, seen_prompt, seen_state)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
