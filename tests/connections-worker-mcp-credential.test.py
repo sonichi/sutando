@@ -125,9 +125,10 @@ class TheResolver(Base):
         self.assertEqual(self.credential(W)["acts_as"], "core")
 
     def test_the_argv_names_the_cli_in_the_repo_with_the_seats_interpreter(self):
-        argv = C.mcp_worker_credential_argv(W, Path("/repo"), "/py/bin/python3")
-        self.assertEqual(argv, ["/py/bin/python3", "/repo/scripts/connections.py", "worker-mcp-credential", "--worker", W])
-        self.assertEqual(C.mcp_worker_credential_argv(W, Path("/repo"))[0], "python3")
+        argv = C.mcp_worker_credential_argv(W, Path("/repo"), "/py/bin/python3", self.ws)
+        self.assertEqual(argv, ["/py/bin/python3", "/repo/scripts/connections.py", "--workspace", str(self.ws),
+                                "worker-mcp-credential", "--worker", W])
+        self.assertEqual(C.mcp_worker_credential_argv(W, Path("/repo"), workspace=self.ws)[0], "python3")
         self.assertEqual(C.MCP_WORKER_CREDENTIAL_ENV, "AG2_MCP_WORKER_CREDENTIAL")
 
 
@@ -183,10 +184,17 @@ class TheCli(Base):
         self.assertNotIn(CORE_SECRET, r.stderr + r.stdout, "the core's token is never the answer")
 
     def test_the_argv_command_prints_json_and_reads_no_vault(self):
-        r = self.run_cli("worker-mcp-credential-argv", "--worker", W, "--repo", str(ROOT), "--python", "/py", vault={})
+        r = self.run_cli("--workspace", str(self.ws), "worker-mcp-credential-argv", "--worker", W, "--repo", str(ROOT),
+                         "--python", "/py", vault={})
         self.assertEqual((r.returncode, r.stderr), (0, ""), r.stderr)
-        self.assertEqual(json.loads(r.stdout), ["/py", str(ROOT / "scripts" / "connections.py"), "worker-mcp-credential",
-                                                "--worker", W])
+        self.assertEqual(json.loads(r.stdout), ["/py", str(ROOT / "scripts" / "connections.py"), "--workspace", str(self.ws),
+                                                "worker-mcp-credential", "--worker", W])
+        # The argv it names runs with a scrubbed environment and still finds this workspace and vault.
+        argv = json.loads(r.stdout)
+        r = subprocess.run([sys.executable, "-c", self.RUNNER, *argv[1:]], capture_output=True, text=True, timeout=60,
+                           env={"HOME": os.environ.get("HOME", "/"), "PATH": os.environ.get("PATH", ""), "FAKE_VAULT": json.dumps(VAULT)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["bearer"], OWN_SECRET)
 
 
 if __name__ == "__main__":

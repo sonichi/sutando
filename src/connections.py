@@ -2229,11 +2229,13 @@ def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
             "bearer": secret_of(token) if gateway_url_of(token) else token.strip()}
 
 
-def mcp_worker_credential_argv(worker: str, repo: Path, python: str = "") -> list:
+def mcp_worker_credential_argv(worker: str, repo: Path, python: str = "",
+                               workspace: Optional[Path] = None) -> list:
     """The argv a worker seat's MCP proxy runs for `worker_mcp_credential` (`MCP_WORKER_CREDENTIAL_ENV`
-    carries it JSON-encoded): the seat's own interpreter when the launcher resolved one, else python3."""
-    return [python or "python3", str(Path(repo) / "scripts" / "connections.py"), "worker-mcp-credential",
-            "--worker", worker]
+    carries it JSON-encoded): the seat's own interpreter when the launcher resolved one, else python3, and
+    the workspace named outright, since the proxy runs it with a scrubbed environment."""
+    return [python or "python3", str(Path(repo) / "scripts" / "connections.py"), "--workspace",
+            str(_workspace(workspace)), "worker-mcp-credential", "--worker", worker]
 
 
 def worker_lane_named(name: str, workspace: Optional[Path] = None) -> bool:

@@ -126,7 +126,8 @@ ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
 # The seat's s-space MCP proxy mints as the worker's own agent through this resolver; the token
 # stays in the vault, and with no resolver the proxy refuses rather than act as the core's agent.
 _mcp_err="$(mktemp)"
-MCP_WORKER_CREDENTIAL="$("${WORKER_PY:-python3}" "$REPO/scripts/connections.py" worker-mcp-credential-argv \
+MCP_WORKER_CREDENTIAL="$("${WORKER_PY:-python3}" "$REPO/scripts/connections.py" \
+  ${SUTANDO_WORKSPACE_DIR:+--workspace "$SUTANDO_WORKSPACE_DIR"} worker-mcp-credential-argv \
   --worker "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" --repo "$REPO" --python "$WORKER_PY" 2>"$_mcp_err")" \
   || { MCP_WORKER_CREDENTIAL=""; echo "  ⚠ no MCP credential resolver for this worker ($(head -n 1 "$_mcp_err")); its s-space MCP tools will refuse" >&2; }
 rm -f "$_mcp_err"

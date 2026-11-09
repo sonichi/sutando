@@ -36,10 +36,19 @@ line = next(l for l in open(fwd) if l.startswith("AG2_MCP_WORKER_CREDENTIAL="))
 argv = json.loads(line.split("=", 1)[1])
 assert isinstance(argv, list) and all(isinstance(a, str) for a in argv), argv
 assert argv[1] == repo + "/scripts/connections.py", argv
-assert argv[2:] == ["worker-mcp-credential", "--worker", wid], argv
+assert argv[2] == "--workspace" and argv[3].startswith("/"), argv
+assert argv[4:] == ["worker-mcp-credential", "--worker", wid], argv
 assert argv[0], "an interpreter is named"
 PY
-check $? "the value is the JSON argv of worker-mcp-credential --worker <this worker> in this repo"
+check $? "the value is the JSON argv of worker-mcp-credential --worker <this worker> in this repo, naming the workspace"
+python3 - "$TMP/fwd" "$WS" <<'PY'
+import json, sys
+fwd, ws = sys.argv[1:]
+line = next(l for l in open(fwd) if l.startswith("AG2_MCP_WORKER_CREDENTIAL="))
+argv = json.loads(line.split("=", 1)[1])
+assert argv[3] == ws, (argv[3], ws)
+PY
+check $? "the workspace named is the seat's SUTANDO_WORKSPACE_DIR"
 ! grep -q "no MCP credential resolver" "$TMP/err"
 check $? "the launcher composed the argv without a warning"
 

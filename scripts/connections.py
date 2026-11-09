@@ -331,7 +331,7 @@ def cmd_worker_mcp_credential(args) -> int:
 
 def cmd_worker_mcp_credential_argv(args) -> int:
     """The JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL (no secret, no vault read)."""
-    print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python)))
+    print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python, args.workspace)))
     return 0
 
 
