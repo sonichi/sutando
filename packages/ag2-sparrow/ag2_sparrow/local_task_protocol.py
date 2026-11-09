@@ -242,6 +242,9 @@ KNOWN_HEADER_KEYS = (
     # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
     # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
+    # The room a voice call was docked in, on its session-end task. Metadata only: no
+    # bridge routes on it, so the task's result is delivered as an undocked one.
+    "voice_room_id",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it

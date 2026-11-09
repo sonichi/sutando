@@ -925,16 +925,15 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 }
 
 /** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority.
- *  A call docked in a room is addressed to that room as a work task asked there would be. */
+ *  A docked call's room rides as `voice_room_id`, metadata only: the result is delivered as an undocked one. */
 export async function submitVoiceSessionEndTask(summary: string, transcript: string, origin: VoiceSessionOrigin | null = null): Promise<string> {
 	const taskId = `task-${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const where = _usableOrigin(origin);
-	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, where).replace('priority: urgent', 'priority: low');
-	const guidance = where?.contextLine ? `\n${where.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
+	const room = _usableOrigin(origin)?.target;
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low') +
+		(room ? `voice_room_id: ${room}\n` : '');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
-	_rememberTaskOrigin(taskId, where);
-	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${guidance}${body}`);
+	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
 	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
 	return taskId;
 }

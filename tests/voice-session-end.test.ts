@@ -13,7 +13,8 @@ for (const d of ['tasks', 'results', 'state']) mkdirSync(join(TMP, d), { recursi
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS } = await import('../src/voice-session-end.js');
-const { submitVoiceSessionEndTask, setVoiceSessionOrigin, snapshotVoiceSessionOrigin, endVoiceClientSession } = await import('../src/task-bridge.js');
+const { submitVoiceSessionEndTask, setVoiceSessionOrigin, snapshotVoiceSessionOrigin, endVoiceClientSession, setVoiceTaskOriginResolver, voiceTaskOrigin, forwardOfflineVoiceResult } = await import('../src/task-bridge.js');
+const { roomOriginFromTaskHeader } = await import('../skills/ag2space-voice/room-binding.js');
 
 const item = (role: string, content: string, timestamp = 0) => ({ role, content, timestamp }) as never;
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
@@ -263,20 +264,34 @@ describe('the hang-up task carries the room the call was docked in', () => {
 		setVoiceSessionOrigin(null);
 	});
 
-	it('the task is addressed to the room as a work task asked there would be; with none it stays local-voice', async () => {
+	it('the task names the docked room as voice_room_id only; its delivery headers are the undocked ones', async () => {
+		const ROOM_ID = '!roomA:s.space';
 		const header = (body: string) => body.slice(0, body.indexOf('\ntask:') + 1);
-		const docked = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: x', 'user: hi', roomOrigin(ROOM));
-		const body = readFileSync(join(TMP, 'tasks', `${docked}.txt`), 'utf-8');
-		assert.match(header(body), new RegExp(`^channel_id: ${ROOM}$`, 'm'));
-		assert.match(header(body), new RegExp(`^source_room_id: ${ROOM}$`, 'm'));
-		assert.match(header(body), /^channel_kind: room$/m);
-		assert.match(header(body), /^source: voice$/m);
-		assert.match(header(body), /^priority: low$/m);
-		assert.match(body, /^task: VOICE_SESSION_ENDED: x\nroom_context: !roomA:s\.space/m);
+		const docked = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: x', 'user: hi', roomOrigin(ROOM_ID));
+		const h = header(readFileSync(join(TMP, 'tasks', `${docked}.txt`), 'utf-8'));
+		assert.match(h, new RegExp(`^voice_room_id: ${ROOM_ID}$`, 'm'));
+		assert.match(h, /^channel_id: local-voice$/m);
+		assert.match(h, /^source: voice$/m);
+		assert.match(h, /^priority: low$/m);
+		assert.doesNotMatch(h, /^(source_room_id|channel_kind):/m);
+		assert.doesNotMatch(readFileSync(join(TMP, 'tasks', `${docked}.txt`), 'utf-8'), /room_context:/);
 		await tick(2);
 		const plain = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: y', 'user: hi');
 		const plainBody = readFileSync(join(TMP, 'tasks', `${plain}.txt`), 'utf-8');
 		assert.match(plainBody, /^channel_id: local-voice$/m);
-		assert.doesNotMatch(plainBody, /^source_room_id:/m);
+		assert.doesNotMatch(plainBody, /^voice_room_id:/m);
+	});
+
+	it('its result is delivered as before: the room resolver finds no origin, and the offline result goes the owner-DM way', async () => {
+		setVoiceTaskOriginResolver(roomOriginFromTaskHeader);
+		try {
+			const id = await submitVoiceSessionEndTask('VOICE_SESSION_ENDED: z', 'user: hi', roomOrigin('!roomA:s.space'));
+			assert.equal(voiceTaskOrigin(id), null);
+			const file = await forwardOfflineVoiceResult(id, 'did the follow-up');
+			assert.match(file, /^proactive-result-task-\d+-\d+\.txt$/);
+			assert.doesNotMatch(file, /\.to-/);
+		} finally {
+			setVoiceTaskOriginResolver(null);
+		}
 	});
 });
