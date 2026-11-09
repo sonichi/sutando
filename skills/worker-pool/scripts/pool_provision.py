@@ -512,15 +512,20 @@ def provision(worker: str, operation_id: str, name: str, *, display_name: str = 
     """Call `agent.create` for `worker` as the core's own agent, wait for the owner's approval by
     asking again with the same `operation_id`, and redeem the claim as soon as the agent exists.
     A wait that times out or is interrupted keeps the pending secret, because the request may still
-    be approved; a refusal forgets it, because nothing was created."""
+    be approved; a refusal forgets it, because nothing was created. The core's lane is resolved
+    once, before the call, and the redeem uses that same lane however long the wait was."""
     known: list = []
+    pinned = lane
     try:
         secret = held(_vault(vault), claim_key(worker))
         if not secret:
             raise ProvisionError(f"worker {worker} has no pending claim secret: run provision-begin first")
         known.append(secret)
         arguments = create_arguments(name, claim_hash(secret), display_name, role)
-        gateway, token = connections.connection_credential(core_lane(workspace, lane), vault=vault)
+        row = core_lane(workspace, lane)
+        # The lane is chosen once: the claim can only be redeemed as the core that created it.
+        pinned = str(row["instance"])
+        gateway, token = connections.connection_credential(row, vault=vault)
         known.append(bearer_of(token))
         actions = Actions(gateway, bearer_of(token), request or http_json, known)
         state, env = settle(lambda: actions.execute("agent.create", arguments, operation_id=operation_id),
@@ -531,8 +536,8 @@ def provision(worker: str, operation_id: str, name: str, *, display_name: str = 
         raise ProvisionError(scrub(_said(e), known)) from None
     if state == "timeout":
         raise ProvisionError(f"the owner has not approved agent.create within {int(timeout)}s. The pending secret "
-                             "is kept: run provision-wait again with the same operation id and arguments while "
-                             "the request is open, or provision-abort to give up")
+                             f"is kept: run provision-wait again with the same operation id and arguments and "
+                             f"--lane '{pinned}' while the request is open, or provision-abort to give up")
     agent_id, claim_id = find(env, "agent_id"), find(env, "claim_id")
     if state != "done" or not isinstance(agent_id, str) or not isinstance(claim_id, str):
         left = _forget(worker, vault, secret)
@@ -542,7 +547,7 @@ def provision(worker: str, operation_id: str, name: str, *, display_name: str = 
         raise ProvisionError("; ".join(x for x in (
             f"agent.create {why} ({scrub(error_code(env), known) or 'no reason given'}); nothing was created and "
             "the pending secret is forgotten", left) if x))
-    return finish(worker, claim_id, agent_id, workspace=workspace, vault=vault, lane=lane, request=request,
+    return finish(worker, claim_id, agent_id, workspace=workspace, vault=vault, lane=pinned, request=request,
                   preview=preview, sleep=sleep)
 
 
