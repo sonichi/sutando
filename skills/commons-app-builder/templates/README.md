@@ -48,6 +48,13 @@ For something with no obvious shape, read the "Patterns from apps that shipped" 
    python3 skills/commons-app-builder/scripts/check_page.py page.html
    ```
 
+## From the panel
+
+The s.space panel can ask for one of these by name in a build request (`template`:
+`tracker`, `poll`, `planner` or `turn-game`); see [BUILD_REQUEST.md](../BUILD_REQUEST.md).
+`scripts/build_request.py` renames the app, its database and its options and writes the page in
+chunks of at most 20,000 bytes.
+
 ## What the tests cover
 
 - `tests/commons-app-builder-templates.test.mjs` runs every page against a fake
