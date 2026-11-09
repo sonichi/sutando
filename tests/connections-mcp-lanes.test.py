@@ -368,6 +368,71 @@ class Lifecycle(Base):
         self.assertIn("MCP lane sync failed (OSError)", "".join(logs.output))
 
 
+class LifecycleReconcile(Base):
+    """The lanes follow the committed record after every lifecycle change, launch or not: a row
+    promote parks loses its lane, and the legacy row unpark brings back regains it."""
+
+    def fixture_sync(self):
+        # The refresh the lifecycle runs is the real sync, aimed at this test's descriptor.
+        real = C.sync_mcp_lanes
+        return unittest.mock.patch.object(
+            C, "sync_mcp_lanes",
+            lambda ws, **kw: real(ws, environ={}, vault=self.vault, descriptor=self.main,
+                                  mcp_config=self.ws / "no-config.json", space_of=space_of))
+
+    def test_promote_with_park_drops_the_parked_owners_lane(self):
+        self.record([dict(DEV_S, primary=True), dict(S_SPACE, primary=False), LEGACY])
+        self.sync()
+        self.assertIn("conn-dev-s-space.json", self.names())
+        # The new primary's bridge starts and connects; the launch hook does not run here, so only
+        # the reconcile after the committed write can drop the parked row's lane.
+        with self.fixture_sync(), \
+                unittest.mock.patch.object(C, "start", return_value={"ok": True, "pid": 7, "lease": "held"}), \
+                unittest.mock.patch.object(C, "_await_connected", lambda *a, **k: None), \
+                unittest.mock.patch.object(C, "_connected_bridge", lambda *a, **k: 0), \
+                unittest.mock.patch.object(C, "_stop_row", lambda *a, **k: 0), \
+                unittest.mock.patch.object(C, "bridge_pid", lambda *a, **k: 0):
+            out = C.promote("s-space", repo=self.ws, logs_dir=self.ws, environ={}, workspace=self.ws,
+                            vault=self.vault, park=True)
+        self.assertEqual(out["previous"], "dev-s-space")
+        self.assertNotIn("conn-dev-s-space.json", self.names())
+        self.assertNotIn("conn-dev-s-space.env", self.names())
+        self.assertIn("conn-legacy.json", self.names(), "an unparked row keeps its lane")
+
+    def test_promote_of_the_legacy_row_with_park_drops_the_parked_owners_lane(self):
+        self.record([dict(DEV_S, primary=True), LEGACY])
+        self.sync()
+        self.assertIn("conn-dev-s-space.json", self.names())
+        with self.fixture_sync(), \
+                unittest.mock.patch.object(C, "_stop_row", lambda *a, **k: 0), \
+                unittest.mock.patch.object(C, "bridge_pid", lambda inst, *a, **k: 9 if inst == "" else 0):
+            out = C.promote("", repo=self.ws, logs_dir=self.ws, environ={}, workspace=self.ws,
+                            vault=self.vault, park=True)
+        self.assertEqual(out["previous"], "dev-s-space")
+        self.assertEqual([n for n in self.names() if n.startswith("conn-dev-s-space")], [])
+        self.assertIn("conn-legacy.json", self.names())
+
+    def test_park_then_unpark_of_the_legacy_row_brings_its_lane_back(self):
+        self.record([S_SPACE, LEGACY])
+        self.sync()
+        self.assertEqual(self.names(), ["conn-legacy.env", "conn-legacy.json"])
+        with unittest.mock.patch.object(C, "_stop_row", lambda *a, **k: 0):
+            C.park("", workspace=self.ws, kill=lambda *a: None)
+        self.assertEqual(self.names(), [], "parking drops it at once")
+        with self.fixture_sync():
+            out = C.unpark("", repo=self.ws, logs_dir=self.ws, environ={}, workspace=self.ws, vault=self.vault)
+        self.assertIsNone(out["launch"], "the legacy row gets no launch")
+        self.assertEqual(self.names(), ["conn-legacy.env", "conn-legacy.json"])
+
+    def test_a_failed_reconcile_never_fails_the_change(self):
+        self.record([S_SPACE, dict(LEGACY, parked=True)])
+        with unittest.mock.patch.object(C, "sync_mcp_lanes", side_effect=OSError("disk")), \
+                self.assertLogs("connections", "WARNING") as logs:
+            out = C.unpark("", repo=self.ws, logs_dir=self.ws, environ={}, workspace=self.ws, vault=self.vault)
+        self.assertNotIn("parked", out)
+        self.assertIn("MCP lane sync failed (OSError)", "".join(logs.output))
+
+
 class NoSecretLeaks(Base):
     def run_cli(self, *argv):
         import importlib.util

@@ -1842,7 +1842,7 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     `launch`, `changed` and `relaunch_needed` (the new primary's bridge runs without the room: one
     that was up under another launch and could not be relaunched)."""
     if not instance:
-        return _promote_legacy(workspace, kill, park)
+        return _promote_legacy(workspace, kill, park, environ=environ, vault=vault)
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("worker"):
@@ -1906,6 +1906,9 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     if failure is not None:
         _restart_secondary(undo, start_kw)
         raise failure
+    # The lanes follow the committed record, not the launch: `start` synced them while the old
+    # owner was still unparked, and parking it above is a change no launch follows.
+    _refresh_mcp_lanes(workspace, environ, vault)
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -1927,12 +1930,13 @@ def _connected_bridge(row: Mapping[str, object], workspace: Optional[Path]) -> i
     return pid if pid and sidecar.get("pid") == pid and sidecar.get("connected") and not _writer_gone(sidecar) else 0
 
 
-def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict:
+def _promote_legacy(workspace: Optional[Path], kill, park: bool = False, *,
+                    environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
     """`promote('')`: the engine never launches the legacy bridge, so it must already run
     (`LegacyBridgeNotRunning`); under one hold of the record lock flip, and under `park` stop the old
     owner's bridge and park its row. That bridge settled the proactive room when it started, so with a named
     primary then it runs without the room and the row carries `relaunch_needed`: its launchers
-    restart it (`bash src/restart.sh`)."""
+    restart it (`bash src/restart.sh`). The lanes are synced to the committed record after."""
     path = record_path(workspace)
     with locked_file(_lock_path(workspace), create_mode=0o600):
         rec = _read_record(path)
@@ -1952,6 +1956,8 @@ def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict
         for r in rec["rows"]:
             r["primary"] = r is row
         _write(path, rec)
+    # No launch follows the legacy flip, so nothing else would drop the parked owner's lane.
+    _refresh_mcp_lanes(workspace, environ, vault)
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -2011,7 +2017,8 @@ def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     """Clear the row's `parked` flag and, for a named row, `start` its bridge as a secondary (`launch`
     in the row; None for the legacy row, whose launchers resume it, and for a disabled one).
     Un-parking a row that is not parked only starts it. `''` also clears the parked legacy bridge
-    that has no row of its own (a bare `{"instance": ""}` comes back)."""
+    that has no row of its own (a bare `{"instance": ""}` comes back). The lanes are synced to the
+    committed record after: the legacy row gets no launch, so no launch would bring its lane back."""
     with _transaction(workspace) as rec:
         if not instance:
             rec[LEGACY_PARKED_KEY] = False
@@ -2023,6 +2030,7 @@ def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     out = dict(row)
     out["launch"] = start_added(row, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                                 vault=vault, spawn=spawn, python=python)
+    _refresh_mcp_lanes(workspace, environ, vault)
     return out
 
 
