@@ -192,17 +192,21 @@ When the request names no colours:
   text (24px and up), never body or secondary text. For secondary text use `neutral-dark` at a
   smaller size or lighter weight, or the grey `#6B6560`: 5.7:1 on white and 5.2:1 on
   `neutral-light`, so it meets 4.5:1 on both.
-- **One family as the accent**, chosen to suit the app; name it in your reply. Its `-dark` is
-  accent text and icons, its `-mid` is highlights and buttons, its `-light` is tinted tiles and
-  backgrounds. The app icon uses the same family.
-- **Keep brand colour small.** Brand colours go on the app icon and on small status markers
-  (dots), not on large fills, badges or link text. Body text, pills and links stay neutral:
-  white or `neutral-light` pills with a small status dot, `#6B6560` secondary text, links in
-  the text colour. One muted accent, `red-dark`, marks errors and blockers only.
+- **One accent family**, chosen to suit the app; name it in your reply. It goes in two places
+  only: the app icon (its `-light` is the tile, its `-dark` and `-mid` the illustration) and the
+  page's primary button (`-mid`). No tinted backgrounds, badges, filled pills or coloured links.
+  Red is reserved for errors and blockers, so don't pick red as the accent family.
+- **Neutral pills with a status dot.** Pills and labels are white or `neutral-light` with
+  `neutral-dark` text and a small status dot from one fixed set: done `green-dark`, in progress
+  or at risk `yellow-dark`, idle `neutral-mid`, blocked or error `red-dark`. The pill's text
+  names the status, so the dot is never the only cue. Links are in the text colour, underlined.
 - **Check contrast.** Most `-mid` tones and `neutral-mid` are under 3:1 on white: never body
-  or secondary text. Label a `-mid` button in the family's `-dark` (or white on `red-mid` and
-  `blue-mid`). `green-dark` on `green-light` is about 4.2:1: large text and icons only.
-- **Dark set:** `neutral-dark` surfaces, `neutral-light` text, the accent's `-light` for accents.
+  or secondary text. Label a `-mid` button in the family's `-dark` (or white on `blue-mid`).
+  `green-dark` on `green-light` is about 4.2:1: large text and icons only.
+- **Dark set:** `neutral-dark` surfaces, `neutral-light` text, `neutral-mid` secondary text
+  (8.3:1; `#6B6560` is 3.1:1 there). The icon and primary button keep their accent tones. Status
+  dots take the lighter tone: done `green-mid`, in progress or at risk `yellow-mid`, idle
+  `neutral-mid`, blocked or error `red-light` (`red-dark` is 1.6:1 on `neutral-dark`).
 
 **App icon.** Give every app an `icon` on its app record (`apps.create`, `apps.update` or
 `apps.scaffold`, where `describe` lists the argument). The value is a data URL
