@@ -250,6 +250,14 @@ class ChannelEnv(Base):
         self.assertEqual(rc, 1)
         self.assertIn("no channel dir", err)
 
+    def test_a_record_that_cannot_be_read_names_no_workers_lane(self):
+        with mock.patch.object(C, "worker_lane_named", side_effect=RuntimeError("no record")):
+            rc, err = self.run_main(OWN)
+        self.assertEqual(rc, 1)
+        self.assertIn("no channel dir", err)
+        C.record_path(self.ws).write_text("{")
+        self.assertFalse(C.worker_lane_named(OWN, self.ws))
+
     def test_with_a_room_the_workers_session_is_told_its_lane_has_no_file(self):
         with mock.patch.dict("os.environ", SEAT):
             rc, err = self.run_main("ag2space", "--room", ROOM)
