@@ -1492,6 +1492,40 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         ])
 
 
+class TestResumeAfterSignIn(unittest.TestCase):
+    """A /login on the core pane leaves the CLI idle with the refused /startup never re-run, so
+    nothing re-arms its watcher or crons; the monitor types the boot prompt once."""
+    _ticks = TestMainAutoAnswerWiring._ticks
+    SIGNED_IN = _REFUSED_TURNS + "❯ /login\n  ⎿  Login successful\n" + _IDLE_FOOTER
+    BOOT = ("/tmp/x.sock", "sutando-core", ("/startup", "Enter"))
+
+    def test_the_boot_prompt_is_typed_once_after_a_sign_in(self):
+        self.assertEqual(self._ticks([self.SIGNED_IN, self.SIGNED_IN]), [self.BOOT])
+
+    def test_a_turn_after_the_sign_in_is_not_re_prompted(self):
+        ran = self.SIGNED_IN.replace(_IDLE_FOOTER, _STARTUP_OK_TURN + _IDLE_FOOTER)
+        self.assertEqual(self._ticks([ran]), [])
+
+    def test_a_draft_a_seat_or_no_auto_answer_is_never_typed_into(self):
+        draft = self.SIGNED_IN.replace("❯ \n", "❯ half-typed reply\n")
+        self.assertEqual(self._ticks([draft]), [])
+        self.assertEqual(self._ticks([self.SIGNED_IN], ["--seat", "worker-1"]), [])
+        self.assertEqual(self._ticks([self.SIGNED_IN], ["--no-auto-answer"]), [])
+
+    def test_a_refused_boot_prompt_is_not_retyped_within_the_cooldown(self):
+        again = self.SIGNED_IN.replace(_IDLE_FOOTER, _REFUSED_TURNS + _IDLE_FOOTER)
+        self.assertEqual(self._ticks([self.SIGNED_IN, again, self.SIGNED_IN]), [self.BOOT])
+
+    def test_resume_step_skips_codex_and_honours_the_cooldown(self):
+        rs = _mod.resume_step
+        self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", None, 0.0), ("/startup", "Enter"))
+        self.assertIsNone(rs("idle-ready", self.SIGNED_IN, "codex", "", None, 0.0))
+        self.assertIsNone(rs("blocked-known", self.SIGNED_IN, None, "", None, 0.0))
+        self.assertIsNone(rs("idle-ready", self.SIGNED_IN, None, "", 0.0, 1.0))
+        self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", 0.0, _mod.TYPED_ANSWER_COOLDOWN_S + 1),
+                         ("/startup", "Enter"))
+
+
 class TestSendKeys(unittest.TestCase):
     """send_keys reports what tmux did: True only on a zero exit, False on a
     non-zero exit or when tmux cannot be run at all — never an exception."""

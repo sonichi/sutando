@@ -67,7 +67,7 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
-from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
+from worker_auth_state import authenticated_turn, idle_since_sign_in, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
@@ -191,6 +191,23 @@ TYPED_ANSWER_COOLDOWN_S = 600.0
 #: A re-type within this long of the last one continues its episode: a switch that did not
 #: take is re-typed each cooldown, and the owner hears about the episode once.
 TYPED_EPISODE_GAP_S = 2 * TYPED_ANSWER_COOLDOWN_S
+
+
+#: After a /login the core sits idle and nothing re-runs the boot ceremony its refused turn
+#: missed (watcher, crons); the boot prompt is idempotent, so it is typed once per sign-in.
+RESUME_AFTER_SIGN_IN = ("/startup", "Enter")
+
+
+def resume_step(state, pane, runtime, seat, resumed_at, now, enabled=True):
+    """The boot prompt to type now, or None: the core's own seat sits idle-ready with an
+    empty composer and nothing has run since "Login successful". Once per cooldown."""
+    if not enabled or seat or runtime == "codex" or state != "idle-ready":
+        return None
+    if resumed_at is not None and now - resumed_at < TYPED_ANSWER_COOLDOWN_S:
+        return None
+    if not _composer_is_empty(pane) or not idle_since_sign_in(pane, runtime):
+        return None
+    return RESUME_AFTER_SIGN_IN
 
 
 def typed_episode(prev_at, prev_episode, now):
@@ -979,6 +996,7 @@ def main():
     typed_at = {}
     typed_episodes = {}
     follow_up = None
+    resumed_at = None
     idle_ticks = 0
     login_since = None
     prev_pane = None
@@ -1047,6 +1065,10 @@ def main():
             then, follow_up = follow_up_step(follow_up, state, time.time(), pane or "")
             if then:
                 send_keys(a.socket, a.session, then)
+        rkey = resume_step(state, pane or "", runtime, a.seat, resumed_at, time.time(), a.auto_answer)
+        if rkey and send_keys(a.socket, a.session, rkey):
+            resumed_at = time.time()
+            last_answered = {"kind": "signed-in", "key": rkey, "at": resumed_at}
         dkey = dismiss_step(state_dir, a.session, state, kind, prompt, clock, time.time(), a.auto_answer)
         if dkey and send_keys(a.socket, a.session, dkey):
             self_opened_gate.clear(state_dir, a.session)
