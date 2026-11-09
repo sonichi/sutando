@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cli_wedge import live_banner_lines  # noqa: E402
-from worker_auth_state import (auth_expired, authenticated_turn, login_expired,  # noqa: E402
-                               login_refusal, refusal_answered, signed_in_since)
+from worker_auth_state import (auth_expired, authenticated_turn, idle_since_sign_in,  # noqa: E402
+                               login_expired, login_refusal, refusal_answered, signed_in_since)
 
 FOOTER = ("────────\n❯ \n────────\n"
           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
@@ -249,6 +249,35 @@ class CodexSignsInWithItsOwnGrammar(unittest.TestCase):
         for pane in (CODEX_IDLE, "› hi\n• Working (3m 02s • esc to interrupt)\n\n› \n" + CODEX_FOOTER,
                      "› hi\n• Done.\n" + CODEX_FOOTER):
             self.assertFalse(authenticated_turn(pane, "codex"), pane)
+
+
+class IdleSinceSignIn(unittest.TestCase):
+    """A /login that nothing has run after: the one frame the core monitor re-prompts on."""
+    SIGNED_IN = "❯ /login\n  ⎿  Login successful\n"
+
+    def test_a_sign_in_with_nothing_after_it_is_idle(self):
+        self.assertTrue(idle_since_sign_in(REFUSED + self.SIGNED_IN + FOOTER))
+        self.assertTrue(idle_since_sign_in(self.SIGNED_IN + FOOTER))
+
+    def test_anything_after_the_sign_in_ends_it(self):
+        for tail in (REAL, "❯ /startup\n", "❯ /startup\n✻ Perambulating… (3s)\n",
+                     "⏺ Bash(ls)\n", REFUSED, "✻ Worked for 0s\n"):
+            self.assertFalse(idle_since_sign_in(self.SIGNED_IN + tail + FOOTER), tail)
+
+    def test_the_live_effort_footer_row_is_not_agent_output(self):
+        # The idle frame captured from Claude Code v2.1.275, under a fresh sign-in.
+        live = ("                                            ● high · /effort\n"
+                "────────────────────────────────────────────────────────────────\n"
+                '❯ Try "refactor <filepath>"\n'
+                "────────────────────────────────────────────────────────────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+        self.assertTrue(idle_since_sign_in("Login successful\n" + live))
+        self.assertEqual(login_expired(REFUSED + live), EXPIRED)
+
+    def test_no_sign_in_or_a_codex_pane_is_not_idle_since_one(self):
+        self.assertFalse(idle_since_sign_in(REFUSED + FOOTER))
+        self.assertFalse(idle_since_sign_in(""))
+        self.assertFalse(idle_since_sign_in(self.SIGNED_IN + FOOTER, "codex"))
 
 
 if __name__ == "__main__":

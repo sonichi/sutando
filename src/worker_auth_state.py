@@ -33,6 +33,9 @@ clears the state:
   through this function, so the Console strip and the seat monitor never
   disagree about one pane.
 
+- `idle_since_sign_in(pane)` is True when "Login successful" is the newest thing on a
+  Claude pane: no turn ran, finished or was submitted after it.
+
 A watcher re-arm or a task-status row is not readable from the pane, so that
 evidence belongs to the pool sweep, not to this reading.
 """
@@ -81,10 +84,11 @@ def _lines(pane: Optional[str]) -> List[str]:
 
 
 def _ran(row: Tuple[str, str], runtime: Optional[str]) -> bool:
-    core, raw = row
+    raw = row[1]
     if runtime == CODEX:
         return bool(_CODEX_RAN.match(raw)) and not _CODEX_BUSY.search(raw)
-    return bool(_RAN.match(core))
+    # Agent output starts at column 0; an indented bullet is a status row ("● high · /effort").
+    return bool(_RAN.match(raw))
 
 
 def _is_prompt(core: str, runtime: Optional[str]) -> bool:
@@ -162,3 +166,19 @@ def authenticated_turn(pane: Optional[str], runtime: Optional[str] = None) -> bo
         return any(_ran(r, runtime) and any(_is_prompt(c, runtime) for c, _x in rows[i + 1:])
                    for i, r in enumerate(rows))
     return any(TURN_DONE.match(c) and _real_turn(rows, i) for i, (c, _r) in enumerate(rows))
+
+
+def idle_since_sign_in(pane: Optional[str], runtime: Optional[str] = None) -> bool:
+    """The CLI signed in ("Login successful") and nothing ran, finished or was submitted
+    after it. The bottom prompt row is the live composer, judged by the caller."""
+    if runtime == CODEX:
+        return False
+    rows = _rows(pane)
+    last = max((i for i, (c, _r) in enumerate(rows) if LOGGED_IN_AGAIN.match(c)), default=None)
+    if last is None:
+        return False
+    after = rows[last + 1:]
+    prompts = [i for i, (c, _r) in enumerate(after) if _is_prompt(c, runtime)]
+    history = after[:prompts[-1]] if prompts else after
+    return not any(_ran(r, runtime) or TURN_DONE.match(r[0]) or _is_prompt(r[0], runtime)
+                   or login_refusal(r[0]) for r in history)

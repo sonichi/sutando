@@ -1422,7 +1422,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
 
-    def _ticks(self, panes, extra_args=()):
+    def _ticks(self, panes, extra_args=(), fail_keys=()):
         """Run main() across len(panes) real loop iterations (no --once): one
         capture() result per tick, time.sleep stubbed to stop once every pane
         has been consumed."""
@@ -1459,7 +1459,8 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
-                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
+                patch.object(_mod, "send_keys",
+                             lambda s, sess, k: sent.append((s, sess, k)) or k not in fail_keys), \
                 patch.object(_mod.time, "sleep", fake_sleep), \
                 patch.object(sys, "argv", argv):
             try:
@@ -1490,6 +1491,61 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
             ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
             ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
         ])
+
+
+class TestResumeAfterSignIn(unittest.TestCase):
+    """A /login on the core pane leaves the CLI idle with the refused /startup never re-run, so
+    nothing re-arms its watcher or crons; the monitor types the boot prompt once."""
+    _ticks = TestMainAutoAnswerWiring._ticks
+    SIGNED_IN = _REFUSED_TURNS + "❯ /login\n  ⎿  Login successful\n" + _IDLE_FOOTER
+    BOOT = ("/tmp/x.sock", "sutando-core", ("/startup", "Enter"))
+
+    def test_the_boot_prompt_is_typed_once_after_a_sign_in(self):
+        self.assertEqual(self._ticks([self.SIGNED_IN, self.SIGNED_IN]), [self.BOOT])
+
+    def test_a_turn_after_the_sign_in_is_not_re_prompted(self):
+        ran = self.SIGNED_IN.replace(_IDLE_FOOTER, _STARTUP_OK_TURN + _IDLE_FOOTER)
+        self.assertEqual(self._ticks([ran]), [])
+
+    def test_a_draft_a_seat_or_no_auto_answer_is_never_typed_into(self):
+        draft = self.SIGNED_IN.replace("❯ \n", "❯ half-typed reply\n")
+        self.assertEqual(self._ticks([draft]), [])
+        self.assertEqual(self._ticks([self.SIGNED_IN], ["--seat", "worker-1"]), [])
+        self.assertEqual(self._ticks([self.SIGNED_IN], ["--no-auto-answer"]), [])
+
+    def test_a_refused_boot_prompt_is_not_retyped_within_the_cooldown(self):
+        again = self.SIGNED_IN.replace(_IDLE_FOOTER, _REFUSED_TURNS + _IDLE_FOOTER)
+        self.assertEqual(self._ticks([self.SIGNED_IN, again, self.SIGNED_IN]), [self.BOOT])
+
+    def test_the_live_v2_1_275_idle_frame_after_a_sign_in_is_resumed(self):
+        live = "Login successful\n" + TestComposerText.LIVE_PLACEHOLDER_PANE
+        self.assertEqual(self._ticks([live]), [self.BOOT])
+
+    def test_one_capture_drives_one_actor_and_resume_waits_for_a_fresh_one(self):
+        # A pending model-switch follow-up and a sign-in on the same frame: the follow-up
+        # goes first; the boot prompt is judged again on the next capture.
+        both = "❯ /login\n  ⎿  Login successful\n" + _IDLE
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both, both])
+        self.assertEqual([k for _s, _x, k in sent],
+                         [("/model opus", "Enter"), ("continue", "Enter"), ("/startup", "Enter")])
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both])
+        self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
+
+    def test_a_failed_follow_up_send_still_spends_the_capture(self):
+        # The follow-up's Enter failed: "continue" may sit staged in the composer, so the
+        # boot prompt must wait for a fresh capture instead of submitting "continue/startup".
+        both = "❯ /login\n  ⎿  Login successful\n" + _IDLE
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both], fail_keys=(("continue", "Enter"),))
+        self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
+
+    def test_resume_step_skips_codex_and_honours_the_cooldown(self):
+        rs = _mod.resume_step
+        self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", None, 0.0), ("/startup", "Enter"))
+        self.assertIsNone(rs("idle-ready", self.SIGNED_IN, "codex", "", None, 0.0))
+        self.assertIsNone(rs("blocked-known", self.SIGNED_IN, None, "", None, 0.0))
+        self.assertIsNone(rs("idle-ready", self.SIGNED_IN, None, "", 0.0, 1.0))
+        self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", 0.0, _mod.TYPED_ANSWER_COOLDOWN_S + 1),
+                         ("/startup", "Enter"))
 
 
 class TestSendKeys(unittest.TestCase):
