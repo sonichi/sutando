@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -27,6 +28,7 @@ from pathlib import Path
 
 from ... import _dirs, connect_bridge as cb, connect_common as cm, result_labels, task_io
 from ...connect_bridge import EXTERNAL, UNIT
+from ...result_markers import parse_markers
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
 from . import openclaw_connector as oc
 from .acp_client import AcpClient, AcpError
@@ -354,29 +356,48 @@ def _answer(args, body: "str | None", why: str) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return REPLY_USAGE
-    if not oc.claim_answer(task["state"], task["task_id"]):
-        print(f"NOT sent: {task['task_id']} is already answered; nothing written", file=sys.stderr)
-        return REPLY_ANSWERED
     try:
-        notes = oc.publish_answer(task["result_file"], body, getattr(args, "title", None), getattr(args, "outcome", None))
+        sent, notes = oc.answer_once(task["state"], task["task_id"], task["result_file"], body,
+                                     getattr(args, "title", None), getattr(args, "outcome", None))
     except OSError as e:
-        oc.release_answer(task["state"], task["task_id"])
         print(f"error: not written ({e}); run it again", file=sys.stderr)
         return REPLY_USAGE
+    if not sent:
+        print(f"NOT sent: {task['task_id']} is already answered; nothing written", file=sys.stderr)
+        return REPLY_ANSWERED
     for note in notes:
         print(f"warning: {note}", file=sys.stderr)
     print(f"queued: {Path(task['result_file']).name} {'closed with nothing posted' if body.startswith('[no-send]') else 'goes to its room'}; Sparrow delivers it")
     return REPLY_QUEUED
 
 
+def _read_draft(result_file: str) -> "tuple[str, str]":
+    """(the text of this task's draft, '') or ('', why): a regular file, never a link, read bounded."""
+    path = oc.draft_for(result_file)
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        return "", f"no reply draft at {path} ({e.strerror}); write the reply there first"
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return "", f"{path} is not a regular file"
+    with os.fdopen(fd, "rb") as f:
+        return f.read(REPLY_MAX_BYTES + 1).decode("utf-8", "replace"), ""
+
+
 def reply(args, stdin=None) -> int:
-    raw = (stdin or sys.stdin).read(REPLY_MAX_BYTES + 1)
+    if getattr(args, "draft", False):
+        raw, why = _read_draft(args.result_file)
+        if why:
+            return _answer(args, None, why)
+    else:
+        raw = (stdin or sys.stdin).read(REPLY_MAX_BYTES + 1)
     if len(raw.encode("utf-8")) > REPLY_MAX_BYTES:
         return _answer(args, None, f"the reply is over {REPLY_MAX_BYTES} bytes")
     if not raw.strip():
-        return _answer(args, None, "the reply on stdin is empty; to post nothing run no-reply")
-    if re.match(r"\s*\[(channel|no-send|deduped)", raw, re.IGNORECASE):
-        return _answer(args, None, "a reply may not start with a delivery marker")
+        return _answer(args, None, "the reply is empty; to post nothing run no-reply")
+    if parse_markers(raw).actions:
+        return _answer(args, None, "a reply may not carry a delivery marker (redirect, attachment, skip or thread)")
     return _answer(args, raw.rstrip("\n") + "\n", "")
 
 
@@ -434,6 +455,7 @@ def main(argv=None) -> int:
     sub.add_parser("list", help="each job installed here").set_defaults(func=list_cmd)
     a = sub.add_parser("reply", help="answer one task: the text on stdin becomes its reply")
     a.add_argument("result_file")
+    a.add_argument("--draft", action="store_true", help="read the reply from this task's draft file, not stdin")
     a.add_argument("--title", help="the Activity title (imperative, at most 60 characters)")
     a.add_argument("--outcome", help="the Activity outcome (past tense, at most 120 characters)")
     a.set_defaults(func=reply)

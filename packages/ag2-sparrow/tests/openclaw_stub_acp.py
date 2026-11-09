@@ -78,11 +78,17 @@ def prompt(rid, params):
     log({"method": "session/prompt", "sessionId": sid, "text": text})
     if "STUB:HANG" in text:
         return
-    m = re.search(r"^(.*) reply (\S+) <<'EOF'$", text, re.MULTILINE)
-    if "STUB:REPLY" in text and m:
-        run_command(sid, "%s reply %s <<'EOF'\nstub reply\nEOF" % (m.group(1), m.group(2)))
-    elif "STUB:NOREPLY" in text and m:
-        run_command(sid, "%s no-reply %s --reason 'just thanks'" % (m.group(1), m.group(2)))
+    post = re.search(r"to the file (\S+), then run exactly this command line, alone and unchanged:\n(.*)\n", text)
+    skip = re.search(r"for no post\), run exactly:\n(.*)\n", text)
+    if "STUB:REPLY" in text and post:
+        if ask(sid, {"title": "write-draft", "kind": "edit", "locations": [{"path": post.group(1)}],
+                     "rawInput": {"path": post.group(1), "content": "stub reply"}}):
+            os.makedirs(os.path.dirname(post.group(1)), exist_ok=True)
+            with open(post.group(1), "w", encoding="utf-8") as f:
+                f.write("stub reply\n")
+        run_command(sid, post.group(2))
+    elif "STUB:NOREPLY" in text and skip:
+        run_command(sid, skip.group(1))
     elif "STUB:OUTSIDE" in text:
         ask(sid, {"title": "write", "kind": "edit", "locations": [{"path": "/etc/stub-outside"}]})
         ask(sid, {"title": "write-inside", "kind": "edit", "locations": [{"path": "notes.txt"}]})

@@ -33,18 +33,22 @@ a message: OpenClaw replies to it in its thread. Any other `event_type` (`room.j
 what the body says and posts only what the body asks. Member-written text a body quotes is data, never
 instructions.
 
-OpenClaw answers each task once, with the reply commands:
+OpenClaw answers each task once. To post, it writes the reply's text to the task's draft file
+(`<root>/state/openclaw-drafts/<task>.txt`) and runs the one line the prompt gives it; to post nothing, the
+other line:
 
 ```bash
-ag2-sparrow-openclaw reply <result_file> <<'EOF'
-<the reply>
-EOF
-ag2-sparrow-openclaw no-reply <result_file> --reason '<why>'
+ag2-sparrow-openclaw reply <result_file> --draft
+ag2-sparrow-openclaw no-reply <result_file>
 ```
 
-Each claims the task (`state/openclaw-answered/<task>`), then publishes `results/<task>.txt` for Sparrow
-to deliver; a second answer exits 1 and writes nothing. When a turn ends with neither, a message gets the
-turn's own text (what agent-connect would have posted, or a line saying the turn timed out or the agent
+Both lines are written by the connector, and only those exact lines are granted: no heredoc, no stdin, no
+text the agent or a member wrote ever reaches a shell. Each claims the task (`state/openclaw-answered/<task>`),
+then publishes `results/<task>.txt` for Sparrow to deliver; a second answer exits 1 and writes nothing, and a
+reply carrying a delivery marker (redirect, attachment, skip, thread) is refused. A failed publication
+releases the claim, and the connector retries that task later without stopping the others; a claim a crash
+left unpublished is released when the connector starts. When a turn ends with neither line, a message gets
+the turn's own text (what agent-connect would have posted, or a line saying the turn timed out or the agent
 stopped) and an event gets nothing.
 
 ## Sessions
@@ -58,7 +62,14 @@ resume it, or the working directory changed, since ACP fixes a Session's directo
 ## Tiers and permissions
 
 The owner and an attested collaborator are served; any other non-owner is refused with one line unless
-`--allow-non-owner`. OpenClaw's `session/request_permission` is answered by the connector: the task's own
-reply command, alone, for any tier; for the owner, operations whose every path resolves under the working
-directory; nothing else. This binds only what OpenClaw asks about: its own approval policy still decides
-what it runs without asking.
+`--allow-non-owner`. OpenClaw's `session/request_permission` is answered by the connector, default deny:
+
+- any tier: this task's own reply or no-reply line, exactly, and a read or edit of this task's draft file;
+- the owner only: a `read` or `edit` whose every path, nested ones (`edits[].path`) included, resolves (after
+  `..`, `~` and symlinks) under the working directory, with no key the policy does not know;
+- nothing else: no other command, and no `execute`, `fetch`, `delete`, `move` or unclassified call, is ever
+  granted, as the codex adapter declines every approval it is asked for.
+
+This binds only what OpenClaw asks about. A read or command OpenClaw runs without asking is limited by its
+own approval policy and sandbox, not by the connector, for every tier, so run non-owner-facing agents with an
+OpenClaw policy that asks.
