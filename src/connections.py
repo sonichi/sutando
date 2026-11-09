@@ -2176,32 +2176,54 @@ class NoWorkerCredential(ConnectionsError):
         self.reason, self.detail = reason, detail
 
 
-WORKER_CREDENTIAL_REASONS = ("no_worker", "no_identity", "disabled", "no_token")
-# The worker seat's s-space MCP proxy runs this argv to mint as the worker's own agent (see
-# `mcp_worker_credential_argv`): the token comes from the vault to the proxy's memory, never a file.
+WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token")
+# Why a worker acts through the core's agent instead of one of its own (`worker_mcp_credential`'s `reason`).
+WORKER_ACTS_AS_CORE_REASONS = ("no_identity", "disabled")
+# The worker seat's s-space MCP proxy runs this argv to learn whose credential to mint with (see
+# `mcp_worker_credential_argv`): a token comes from the vault to the proxy's memory, never a file.
 MCP_WORKER_CREDENTIAL_ENV = "AG2_MCP_WORKER_CREDENTIAL"
+
+
+def worker_enabled_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row while a lane serves it (neither disabled nor parked), else None. The one
+    test of whether a worker acts as its own agent: its proactive notes are stamped for its lane and its
+    seat's MCP proxy mints with its token exactly when this answers a row; otherwise it acts as the core."""
+    row = worker_identity(worker, workspace)
+    return row if row is not None and not row.get("disabled") and not row.get("parked") else None
+
+
+def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
+                           workspace: Optional[Path] = None) -> str:
+    """The name this session publishes a proactive file under (`proactive_routing.stamp_worker`): stamped
+    with its worker when the session is a pool worker's that acts as its own agent
+    (`worker_enabled_identity`), so that worker's lane claims it; unchanged for the core's session and
+    for a worker acting through the core's agent, whose notes a core lane sends as before."""
+    from proactive_routing import stamp_worker
+    worker = session_worker(environ)
+    return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
                           environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
-    """What a worker session's MCP proxy mints with: `worker`'s own enabled identity row and its token,
-    resolved as every room client resolves one (`connection_credential`: the vault's, by its
-    `token_ref`). `{worker, lane, server, agent_id, relay, bearer}`, `bearer` being the secret half.
-    Refused with NoWorkerCredential for no worker, no row, a disabled or parked row, or no token;
-    the core's rows are never read, so the core's credential is never answered."""
+    """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent
+    (`worker_enabled_identity`) answers `acts_as: "worker"` with its row and token, resolved as every room
+    client resolves one (`connection_credential`: the vault's, by its `token_ref`):
+    `{worker, acts_as, lane, server, agent_id, relay, bearer}`, `bearer` the secret half. A worker with no
+    identity, or a disabled or parked one, answers `{worker, acts_as: "core", reason}`: it acts through the
+    core's agent, as its notes do. Refused with NoWorkerCredential for no worker or for an enabled identity
+    with no token; the core's rows are never read here, so the core's credential is never answered."""
     if not worker or not WORKER_RE.match(worker):
         raise NoWorkerCredential("no_worker", "this session names no pool worker")
-    row = worker_identity(worker, workspace)
+    row = worker_enabled_identity(worker, workspace)
     if row is None:
-        raise NoWorkerCredential("no_identity", f"worker {worker} has no identity of its own")
-    if row.get("disabled") or row.get("parked"):
-        raise NoWorkerCredential("disabled", f"worker {worker}'s identity {row['instance']} is not enabled")
+        reason = "disabled" if worker_identity(worker, workspace) is not None else "no_identity"
+        return {"worker": worker, "acts_as": "core", "reason": reason}
     try:
         gateway_url, token = connection_credential(row, environ, vault=vault)
     except NoConnectionForRoom as e:
         raise NoWorkerCredential("no_token", str(e)) from None
     mxid = str(row.get("agent_mxid") or "").strip()
-    return {"worker": worker, "lane": str(row["instance"]), "server": str(row["server"]),
+    return {"worker": worker, "acts_as": "worker", "lane": str(row["instance"]), "server": str(row["server"]),
             "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
             "relay": (gateway_url_of(token) or gateway_url).rstrip("/"),
             "bearer": secret_of(token) if gateway_url_of(token) else token.strip()}

@@ -53,8 +53,9 @@
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
   worker-mcp-credential [--worker ID]
-                               one JSON line a worker seat's MCP proxy mints with: the worker's own
-                               identity and its vault token (stdout only; exit 1 refused, the core's never)
+                               one JSON line for a worker seat's MCP proxy: the worker's own identity
+                               and vault token, or acts_as=core for a worker with no enabled identity
+                               (stdout only; exit 1 refused; the core's token never)
   worker-mcp-credential-argv --worker ID --repo DIR [--python PY]
                                the JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
@@ -315,8 +316,9 @@ def cmd_enabled(args) -> int:
 
 
 def cmd_worker_mcp_credential(args) -> int:
-    """One JSON line a worker seat's MCP proxy mints with (`connections.worker_mcp_credential`); the
-    only command here that prints a secret, to stdout alone, for the proxy's memory. Exit 1 refused."""
+    """One JSON line telling a worker seat's MCP proxy whose credential to mint with
+    (`connections.worker_mcp_credential`): the worker's own, with its secret, or `acts_as: core`. The only
+    command here that prints a secret, to stdout alone, for the proxy's memory. Exit 1 refused."""
     worker = args.worker or connections.session_worker()
     try:
         cred = connections.worker_mcp_credential(worker, workspace=args.workspace)

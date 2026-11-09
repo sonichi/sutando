@@ -127,19 +127,16 @@ def _helpers():
 
 
 def worker_published_path(path: str | Path, environ=None) -> Path:
-    """Where this session publishes `path`: a proactive file from a pool worker's session carries the
-    worker's stamp (`proactive_routing.stamp_worker`), so only that worker's own lane delivers it, as
-    its agent. The core's session, and every task result, publishes under the name given."""
+    """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
+    its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
+    worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
+    module without the engine's `connections`, and every task result publish under the name given."""
     path = Path(path)
     try:
-        from . import proactive_routing
-    except ImportError:
-        import proactive_routing
-    try:
         import connections
-    except ImportError:  # the package's copy of this module publishes for the core only
+    except ImportError:
         return path
-    return path.with_name(proactive_routing.stamp_worker(path.name, connections.session_worker(environ)))
+    return path.with_name(connections.session_proactive_name(path.name, environ))
 
 
 def _unrouted_cron_task(path: str | Path) -> str | None:

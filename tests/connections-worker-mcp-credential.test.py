@@ -89,25 +89,30 @@ class Base(unittest.TestCase):
 class TheResolver(Base):
     def test_the_workers_own_row_and_vault_token(self):
         cred = self.credential(W)
-        self.assertEqual(cred, {"worker": W, "lane": OWN, "server": "alpha-fixture.net", "agent_id": OWN_AGENT,
-                                "relay": ALPHA, "bearer": OWN_SECRET})
+        self.assertEqual(cred, {"worker": W, "acts_as": "worker", "lane": OWN, "server": "alpha-fixture.net",
+                                "agent_id": OWN_AGENT, "relay": ALPHA, "bearer": OWN_SECRET})
         self.assertNotEqual(cred["bearer"], CORE_SECRET)
+        self.assertEqual(C.worker_enabled_identity(W, self.ws)["instance"], OWN)
 
     def test_a_bare_secret_in_the_vault_keeps_the_rows_gateway_as_its_relay(self):
         VAULT[C.token_ref_for(OWN)] = OWN_SECRET
         cred = self.credential(W)
         self.assertEqual((cred["relay"], cred["bearer"]), (ALPHA, OWN_SECRET))
 
-    def test_the_cores_session_and_an_unknown_worker_are_refused(self):
+    def test_the_cores_session_is_refused(self):
         self.assertEqual(self.refused(""), "no_worker")
         self.assertEqual(self.refused("Not A Worker"), "no_worker")
-        self.assertEqual(self.refused(OTHER_W), "no_identity")
 
-    def test_a_disabled_or_parked_identity_is_refused(self):
-        self.record(rows(disabled=True))
-        self.assertEqual(self.refused(W), "disabled")
-        self.record(rows(parked=True))
-        self.assertEqual(self.refused(W), "disabled")
+    def test_a_worker_with_no_identity_of_its_own_acts_as_the_core_with_no_secret(self):
+        self.assertEqual(self.credential(OTHER_W), {"worker": OTHER_W, "acts_as": "core", "reason": "no_identity"})
+        self.assertIsNone(C.worker_enabled_identity(OTHER_W, self.ws))
+
+    def test_a_disabled_or_parked_identity_acts_as_the_core_too(self):
+        for extra in ({"disabled": True}, {"parked": True}):
+            with self.subTest(**extra):
+                self.record(rows(**extra))
+                self.assertEqual(self.credential(W), {"worker": W, "acts_as": "core", "reason": "disabled"})
+                self.assertIsNone(C.worker_enabled_identity(W, self.ws))
 
     def test_a_missing_token_is_refused_and_never_answered_with_the_cores(self):
         del VAULT[C.token_ref_for(OWN)]
@@ -117,7 +122,7 @@ class TheResolver(Base):
 
     def test_an_unreadable_record_reads_as_no_identity(self):
         C.record_path(self.ws).write_text("{not json")
-        self.assertEqual(self.refused(W), "no_identity")
+        self.assertEqual(self.credential(W)["acts_as"], "core")
 
     def test_the_argv_names_the_cli_in_the_repo_with_the_seats_interpreter(self):
         argv = C.mcp_worker_credential_argv(W, Path("/repo"), "/py/bin/python3")
@@ -161,14 +166,17 @@ class TheCli(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["lane"], OWN)
 
+    def test_a_worker_with_no_identity_gets_acts_as_core_and_no_secret_on_stdout(self):
+        r = self.cli("--worker", OTHER_W)
+        self.assertEqual((r.returncode, r.stderr), (0, ""), r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"worker": OTHER_W, "acts_as": "core", "reason": "no_identity"})
+        self.assertNotIn(CORE_SECRET, r.stdout)
+
     def test_a_refusal_is_exit_1_with_the_reason_and_no_secret_anywhere(self):
-        for args, environ, reason in (((), {}, "no_worker"), (("--worker", OTHER_W), {}, "no_identity")):
-            with self.subTest(reason=reason):
-                r = self.cli(*args, environ=environ)
-                self.assertEqual((r.returncode, r.stdout), (1, ""))
-                self.assertIn(f"refused, {reason}", r.stderr)
-                self.assertNotIn(OWN_SECRET, r.stderr)
-                self.assertNotIn(CORE_SECRET, r.stderr)
+        r = self.cli()
+        self.assertEqual((r.returncode, r.stdout), (1, ""))
+        self.assertIn("refused, no_worker", r.stderr)
+        self.assertNotIn(OWN_SECRET, r.stderr)
         r = self.cli("--worker", W, vault={C.token_ref_for("alpha"): ALPHA + "|" + CORE_SECRET})
         self.assertEqual((r.returncode, r.stdout), (1, ""))
         self.assertIn("refused, no_token", r.stderr)
