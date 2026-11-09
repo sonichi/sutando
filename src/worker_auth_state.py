@@ -63,6 +63,7 @@ TURN_DONE = re.compile(
     r"^✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?$")
 _SHORT = re.compile(r"[01]s")
 _PROMPT = re.compile(r"^❯")
+_COMMAND_PROMPT = re.compile(r"^[❯›»]\s*/")
 _RAN = re.compile(r"^[●⏺]")
 # Codex: a response or tool step is a `•` line at column 0; the spinner shares the glyph.
 CODEX = "codex"
@@ -121,7 +122,11 @@ def _sign_in_row(rows, i: int, runtime: Optional[str] = None) -> bool:
     core, raw = rows[i]
     if not (LOGGED_IN_AGAIN.fullmatch(core) and _RESULT_ROW.match(raw)):
         return False
-    return not any(_ran(r, runtime) for r in rows[_turn_start(rows, i, runtime) + 1:i])
+    start = _turn_start(rows, i, runtime)
+    # A visible prompt must be a command: under a plain message the row is a quote.
+    if start >= 0 and not _COMMAND_PROMPT.match(rows[start][0]):
+        return False
+    return not any(_ran(r, runtime) for r in rows[start + 1:i])
 
 
 def _signed_in_after(rows, idx: int, runtime: Optional[str] = None) -> bool:

@@ -1524,7 +1524,8 @@ class TestResumeAfterSignIn(unittest.TestCase):
     def test_the_words_quoted_outside_a_login_result_are_not_resumed(self):
         for quoted in ("❯ check the auth log\n⏺ Bash(tail -1 auth.log)\n  ⎿  Login successful\n",
                        "❯ did it work?\n● The CLI printed this line:\n  Login successful\n",
-                       "❯ the worker said:\n  Login successful\n  is that enough?\n"):
+                       "❯ the worker said:\n  Login successful\n  is that enough?\n",
+                       "❯ the worker printed:\n  ⎿ Login successful\n  was that enough?\n"):
             with self.subTest(quoted):
                 self.assertEqual(self._ticks([_REFUSED_TURNS + quoted + _IDLE_FOOTER]), [])
 
