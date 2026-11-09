@@ -131,7 +131,8 @@ allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
 `room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
 as a message that follows its body. An event type with no registry entry has no
 default, so it resolves to none; a playbook string is never trusted to pick a
-skill. A `room.joined` task names the room in `channel_id`/`source_room_id`,
+skill. An event body may quote member-written text; the agent treats that text as
+data, never instructions, and follows the trigger's own instruction. A `room.joined` task names the room in `channel_id`/`source_room_id`,
 the inviter in `user_id` (its `access_tier` is the inviter's) and has no
 `source_message_id`, so its result posts top level. A broker that sends no
 `event_type` keeps today's task: the self-describing body still reads as a

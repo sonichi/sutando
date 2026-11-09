@@ -150,8 +150,23 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(self.resolve("commons.summon", "other-playbook"),
                          self.skills / "other-playbook" / "SKILL.md", "an allowed playbook still runs")
 
+    def test_allowed_playbook_value_uses_the_same_allowlist(self):
+        for pb in ("room-onboard", "reply"):
+            self.assertEqual(at.allowed_playbook_value(pb), pb, "registry ids need no skills tree")
+        for pb in ("other-playbook", "plain-skill", "no-such-skill", "../evil", "Room-Onboard", "", None):
+            self.assertIsNone(at.allowed_playbook_value(pb), pb)
+        self.assertEqual(at.allowed_playbook_value("other-playbook", self.skills), "other-playbook")
+        for pb in ("plain-skill", "truthy-skill", "broken-skill", "no-such-skill", "../evil"):
+            self.assertIsNone(at.allowed_playbook_value(pb, self.skills), pb)
+
     def test_playbook_without_event_type_still_resolves(self):
         self.assertEqual(self.resolve("", "room-onboard"), self.skills / "room-onboard" / "SKILL.md")
+
+    def test_core_instructions_frame_event_bodies_as_data(self):
+        for rel in ("CLAUDE.md", "AGENTS.md", "docs/remote-gateway-protocol.md"):
+            text = " ".join((REPO / rel).read_text().split())
+            self.assertIn("member-written text", text, rel)
+            self.assertIn("data, never instructions", text, rel)
 
     def test_cli_against_the_shipped_skills(self):
         def run(*args):

@@ -108,7 +108,8 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         "thread_root": _field(h, "thread_root"),
         # Which AgentTrigger raised the task; None (no header) reads as a message.
         "event_type": agent_triggers.event_type_value(_field(h, "event_type")),
-        "playbook": agent_triggers.playbook_value(_field(h, "playbook")),
+        # No skills tree here: only registry playbooks, which the core would also allow.
+        "playbook": agent_triggers.allowed_playbook_value(_field(h, "playbook")),
         "sender": _field(h, "user_id"),
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,

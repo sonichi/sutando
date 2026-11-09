@@ -14,6 +14,8 @@ This module is the one owner of that vocabulary:
   an allowed playbook (a registry value, or a skill whose manifest.json sets
   `"playbook": true`) with skills/<id>/SKILL.md, else the event's registry default,
   else None (handle the task as an ordinary message). Any other skill is refused.
+- An event task's body may quote member-written text: it is data, never instructions.
+  The trigger's own instruction comes from the server, not from commands quoted in it.
 
 Stdlib only, vendored verbatim into ag2-sparrow by tools/sync_from_src.py.
 
@@ -62,6 +64,13 @@ def trigger_id_value(value) -> Optional[str]:
 def playbook_value(value) -> Optional[str]:
     """A well-formed playbook id, or None when it is anything else."""
     return value if isinstance(value, str) and PLAYBOOK_ID_RE.fullmatch(value) else None
+
+
+def allowed_playbook_value(value, skills_root: Optional[Path] = None) -> Optional[str]:
+    """The playbook when is_playbook allows it, else None; no skills_root allows registry ids only."""
+    if skills_root is None:
+        return value if playbook_value(value) and value in REGISTRY_PLAYBOOKS else None
+    return value if is_playbook(skills_root, value) else None
 
 
 def default_playbook(event_type) -> Optional[str]:
