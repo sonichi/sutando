@@ -158,9 +158,9 @@ board grouped by the status column if there is one.
   does it (step 5) or the reply says so.
 - Use real content, not filler. Check every number the page states.
 
-**Default look: the s.space palette.** These are the colour tokens for every app page. Each
-family has a dark, a mid and a light tone, named `<family>-dark`, `<family>-mid` and
-`<family>-light`:
+**Default look: the s.space palette.** Use these colours by default, unless the user asks for
+others; then use theirs. Each family has a dark, a mid and a light tone, named `<family>-dark`,
+`<family>-mid` and `<family>-light`:
 
 | Family | `-dark` | `-mid` | `-light` |
 | --- | --- | --- | --- |
@@ -197,14 +197,19 @@ When the request names no colours:
 - **Dark set:** `neutral-dark` surfaces, `neutral-light` text, the accent's `-light` for accents.
 
 **App icon.** Give every app an `icon` on its app record (`apps.create`, `apps.update` or
-`apps.scaffold`, where `describe` lists the argument). The value is a data URL:
-`data:image/svg+xml;base64,...` preferred, or a PNG.
+`apps.scaffold`, where `describe` lists the argument). The value is a data URL
+(`data:image/svg+xml;base64,...` preferred, or a PNG) or a single emoji. By default, draw it to
+this spec:
 
 - 64 by 64, corner radius 16, on a tile in the `-light` tone of the app's **accent family**.
 - A flat illustration in that family's `-dark` and `-mid` tones: at most 3 colours with the
   tile, no text, no gradients.
-- SVG only as plain shapes: no scripts, no external references and no `foreignObject`. The
-  server rejects them. Keep it a few hundred bytes.
+- Plain SVG shapes, a few hundred bytes.
+
+If the user asks for another icon (their own upload, an emoji, a different style), use that, and
+keep it when you update the app. The server checks only safety and format: a real SVG or PNG data
+URL within the size limit, with no scripts, event handlers, external references or
+`foreignObject`; or a single emoji.
 
 ```svg
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
@@ -219,7 +224,8 @@ This is a blue-family check box, for an app whose accent is blue. Base64-encode 
 prefix it with `data:image/svg+xml;base64,`.
 
 **Default icons.** A set of 20 default app icons drawn to this spec will live in
-`skills/commons-app-builder/icons/` (coming soon). Until then, draw one as above.
+`skills/commons-app-builder/icons/` (coming soon). Until then, draw one as above, or use the
+user's.
 
 ## 5. Agent hooks
 
