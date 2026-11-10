@@ -30,9 +30,8 @@ CALENDAR = "calendar.upcoming"
 GATED = {"gmail.threads_matching": "a mail feed waits for the consent dialog (C4 E5)"}
 CALENDAR_FIELDS = ("title", "start", "end", "location", "meeting_link", "attendee_count",
                    "organizer")
-# What each granted field is projected from: the selector is built from the grant's fields, so
-# an event's description, attendee addresses, its link (whose eid can encode the calendar's
-# address) and every field not granted are never fetched.
+# What each granted field is read from. The selector is built from the grant's fields, so
+# nothing else of an event (its description, attendees' addresses, its link) is ever fetched.
 CALENDAR_SOURCES = {
     "title": ("summary",), "start": ("start",), "end": ("end",), "location": ("location",),
     "meeting_link": ("hangoutLink", "conferenceData/entryPoints(entryPointType,uri)"),
