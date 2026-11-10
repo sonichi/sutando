@@ -30,12 +30,23 @@ CALENDAR = "calendar.upcoming"
 GATED = {"gmail.threads_matching": "a mail feed waits for the consent dialog (C4 E5)"}
 CALENDAR_FIELDS = ("title", "start", "end", "location", "meeting_link", "attendee_count",
                    "organizer")
-# Only what the fields can be projected from: an event's description, attendee addresses and
-# everything else are never fetched.
-CALENDAR_SELECTOR = ("items(id,status,summary,start,end,location,hangoutLink,"
-                     "conferenceData/entryPoints(entryPointType,uri),attendees(responseStatus),"
-                     "organizer(displayName,email),htmlLink)")
-SOURCE_HOSTS = {CALENDAR: ("calendar.google.com", "www.google.com")}
+# What each granted field is projected from: the selector is built from the grant's fields, so
+# an event's description, attendee addresses, its link (whose eid can encode the calendar's
+# address) and every field not granted are never fetched.
+CALENDAR_SOURCES = {
+    "title": ("summary",), "start": ("start",), "end": ("end",), "location": ("location",),
+    "meeting_link": ("hangoutLink", "conferenceData/entryPoints(entryPointType,uri)"),
+    "attendee_count": ("attendees(responseStatus)",),
+    "organizer": ("organizer(displayName,email)",),
+}
+
+
+def calendar_selector(fields: list) -> str:
+    parts = ["id", "status"]  # which item, and whether it was cancelled
+    for field in CALENDAR_FIELDS:
+        if field in fields:
+            parts += [p for p in CALENDAR_SOURCES[field] if p not in parts]
+    return f"items({','.join(parts)})"
 SCHEDULE_SLACK_MS = 60_000          # as the backend: a slot may land a minute early
 EVERY_MINUTES_MIN = 15
 ITEM_ID_MAX = 200
@@ -99,7 +110,8 @@ def calendar_call(grant: dict, now_ms: int) -> dict:
             "arguments": {"calendarId": "primary", "timeMin": start.strftime(stamp),
                           "timeMax": (start + datetime.timedelta(days=days)).strftime(stamp),
                           "singleEvents": True, "orderBy": "startTime", "showDeleted": False,
-                          "maxResults": grant["max_rows"], "fields": CALENDAR_SELECTOR}}
+                          "maxResults": grant["max_rows"],
+                          "fields": calendar_selector(grant.get("fields") or [])}}
 
 
 def due(me: str, replies: list, now_ms: int) -> dict:
@@ -230,9 +242,7 @@ def calendar_row(event: dict, fields: list) -> dict | None:
             raise Refused(f"{field!r} is not a calendar field")
         if every[field] is not None:
             row[field] = every[field]
-    source = _https(event.get("htmlLink"), SOURCE_HOSTS[CALENDAR])
-    if source is not None:
-        row["_source"] = {"url": source}
+    # No _source: the event's link (htmlLink, not fetched) can encode the calendar's address.
     return row
 
 

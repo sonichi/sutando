@@ -73,9 +73,19 @@ check("it reads the primary calendar only, over the granted window, at most max_
       args["calendarId"] == "primary" and args["timeMin"] == "2026-11-09T18:07:00Z"
       and args["timeMax"] == "2026-11-23T18:07:00Z" and args["maxResults"] == 200
       and args["singleEvents"] is True and args["showDeleted"] is False)
-check("it fetches only what the fields are projected from",
-      "description" not in args["fields"] and "attendees(responseStatus)" in args["fields"]
-      and "email)" not in args["fields"].split("attendees")[1].split(")")[0])
+# Review (Susan, blocker 2): the selector is the grant's, not the catalogue's. The default grant
+# (title, start, end, meeting_link) never fetches location, attendees or the organizer.
+check("it fetches only what the granted fields are projected from",
+      args["fields"] == "items(id,status,summary,start,end,hangoutLink,"
+                        "conferenceData/entryPoints(entryPointType,uri))")
+narrow = fr.due(ME, [(ROOM, listed(grant(fields=["title", "start"])))], NOW)["runs"][0]
+check("a grant of title and start fetches title and start, and nothing else of an event",
+      narrow["connector"]["arguments"]["fields"] == "items(id,status,summary,start)")
+wide = fr.due(ME, [(ROOM, listed(grant(fields=list(fr.CALENDAR_FIELDS))))], NOW)["runs"][0]
+check("only a grant of the organizer fetches the organizer, and never an event's link",
+      "organizer(displayName,email)" in wide["connector"]["arguments"]["fields"]
+      and "htmlLink" not in wide["connector"]["arguments"]["fields"]
+      and "description" not in wide["connector"]["arguments"]["fields"])
 check("the slot key is the same all through a slot",
       fr.slot_key("gabc123def", EVERY, slot) == fr.slot_key("gabc123def", EVERY, slot + 29 * 60_000)
       != fr.slot_key("gabc123def", EVERY, slot + 30 * 60_000))
@@ -150,13 +160,12 @@ check("the meeting link is the event's video link, https only",
       by["ev1"]["meeting_link"] == "https://meet.google.com/abc-defg-hij"
       and by["ev2"]["meeting_link"] == "https://zoom.us/j/1" and "meeting_link" not in by["ev4"])
 check("a row carries only granted fields: never the description, location or organizer",
-      all(set(r) <= {"_id", "_source", "title", "start", "end", "meeting_link"}
+      all(set(r) <= {"_id", "title", "start", "end", "meeting_link"}
           for r in out["rows"]) and "hunter2" not in json.dumps(out))
 check("a blank title is the placeholder, as the title column needs one",
       by["ev4"]["title"] == "(no title)")
-check("the source link is kept only on Google's own hosts",
-      by["ev1"]["_source"] == {"url": "https://www.google.com/calendar/event?eid=ev1"}
-      and "_source" not in by["ev2"])
+check("no row carries the event's link: Google's eid can encode the calendar's address",
+      all("_source" not in r for r in out["rows"]))
 check("every date cell fits the backend's date column",
       all(DATE_RE.match(r[f]) for r in out["rows"] for f in ("start", "end") if f in r))
 
