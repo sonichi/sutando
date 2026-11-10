@@ -100,6 +100,7 @@ claude_dir="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2
 if mcp_out="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/codex_worker_mcp.py" \
     --codex-home "${CODEX_HOME:-$HOME/.codex}" --claude-config-dir "$claude_dir")"; then
   [ -n "$mcp_out" ] || echo "launch-codex-worker-session: no s-space MCP server is registered; $SESSION has no s-space tools" >&2
+  case "$mcp_out" in *".enabled=false"*) echo "launch-codex-worker-session: the s-space MCP server registered is not one the worker can be passed to; it is off for $SESSION" >&2 ;; esac
   while IFS= read -r arg; do if [ -n "$arg" ]; then CODEX_ARGS+=("$arg"); fi; done <<< "$mcp_out"
 else
   # Fail closed: the home's own entry passes neither name through, so its proxy would act as the core.

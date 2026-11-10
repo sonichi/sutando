@@ -90,12 +90,30 @@ def overrides(entry) -> list:
     return ["-c", f"mcp_servers.{SERVER_KEY}={value}"]
 
 
+def home_registers(codex_home) -> bool:
+    """Whether the Codex home's own config names an `s-space` server in any form (stdio, url, ...)."""
+    try:
+        cfg = tomllib.loads((Path(codex_home) / "config.toml").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(cfg.get("mcp_servers"), dict) and SERVER_KEY in cfg["mcp_servers"]
+
+
+def seat_overrides(codex_home, claude_config_dir=None) -> list:
+    """The seat's `-c` arguments: the passthrough entry, else the home's own entry switched off, since
+    one the worker variables cannot reach would act as the core's agent."""
+    entry = registration(codex_home, claude_config_dir)
+    if entry is None and home_registers(codex_home):
+        return ["-c", f"mcp_servers.{SERVER_KEY}.enabled=false"]
+    return overrides(entry)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--codex-home", required=True)
     p.add_argument("--claude-config-dir", default="")
     a = p.parse_args(argv)
-    for arg in overrides(registration(a.codex_home, a.claude_config_dir or None)):
+    for arg in seat_overrides(a.codex_home, a.claude_config_dir or None):
         print(arg)
     return 0
 

@@ -107,6 +107,15 @@ class Registration(unittest.TestCase):
             self.assertEqual(M.main(["--codex-home", str(self.codex)]), 0)
         self.assertEqual(out.getvalue(), "")
 
+    def test_a_home_entry_the_worker_cannot_be_passed_to_is_switched_off(self):
+        (self.codex / "config.toml").write_text('[mcp_servers.s-space]\nurl = "https://mcp.example/v1"\n')
+        self.assertEqual(M.seat_overrides(self.codex, self.claude), ["-c", "mcp_servers.s-space.enabled=false"])
+        self.claude_json(CLAUDE_ENTRY)
+        self.assertEqual(seat_table(M.seat_overrides(self.codex, self.claude))["command"], "/a s/node")
+        (self.codex / "config.toml").write_text("not = [toml")
+        (self.claude / ".claude.json").unlink()
+        self.assertEqual(M.seat_overrides(self.codex, self.claude), [])
+
     def test_nothing_is_printed_when_no_config_registers_a_stdio_server(self):
         self.assertEqual(M.overrides(M.registration(self.codex, self.claude)), [])
         (self.codex / "config.toml").write_text("not = [toml")
@@ -118,11 +127,11 @@ class Registration(unittest.TestCase):
 class Launcher(unittest.TestCase):
     """The real launcher in a fake repo: tmux records its argv, the resolver compose is a stub."""
 
-    def launch(self, tmp, *, compose_ok=True, codex_toml=None, helper_fails=False, expect_rc=0):
+    def launch(self, tmp, *, compose_ok=True, codex_toml=None, helper_fails=False, expect_rc=0, claude_json=True):
         tmp = Path(tmp)
         root, home, ws, bin_dir = tmp / "repo", tmp / "home", tmp / "ws", tmp / "bin"
         for p in (home, ws, bin_dir, home / "codex", home / "claude"):
-            p.mkdir(parents=True)
+            p.mkdir(parents=True, exist_ok=True)
         for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
                     "skills/worker-pool/scripts/worker-mcp-credential.sh",
                     "skills/worker-pool/scripts/codex_worker_mcp.py",
@@ -142,7 +151,8 @@ class Launcher(unittest.TestCase):
         (root / "skills/worker-pool/scripts/worker-watcher-supervisor.sh").write_text("#!/bin/sh\nexit 0\n")
         if helper_fails:
             (root / "skills/worker-pool/scripts/codex_worker_mcp.py").write_text("import sys\nsys.exit(1)\n")
-        (home / "claude/.claude.json").write_text(json.dumps({"mcpServers": {"s-space": CLAUDE_ENTRY}}))
+        if claude_json:
+            (home / "claude/.claude.json").write_text(json.dumps({"mcpServers": {"s-space": CLAUDE_ENTRY}}))
         if codex_toml is not None:
             (home / "codex/config.toml").write_text(codex_toml)
         for name, body in {
@@ -192,6 +202,14 @@ class Launcher(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv, _ = self.launch(tmp, codex_toml=CODEX_TOML)
             self.assertEqual(self.seat(argv)["command"], "/c/node")
+
+    def test_a_url_entry_in_the_home_is_launched_switched_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, err = self.launch(tmp, codex_toml='[mcp_servers.s-space]\nurl = "https://mcp.example/v1"\n',
+                                    claude_json=False)
+            i = argv.index("mcp_servers.s-space.enabled=false")
+            self.assertEqual(argv[i - 1], "-c")
+            self.assertIn("it is off for worker-session", err)
 
     def test_an_override_that_cannot_be_composed_refuses_the_launch(self):
         # The home's own entry passes neither name through, so starting on it would take the core's seat.
