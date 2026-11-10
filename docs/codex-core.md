@@ -100,7 +100,7 @@ The Codex implementation:
   owner (`codex_home.py child`), which on a desktop host refuses a `skills` that is a
   symlink or not a directory, so no skill is linked through it into another tree,
   the owner's `~/.codex/skills` included. A non-desktop checkout is unchanged: its home is created as
-  before and the effective home is the one Codex reads. A `CODEX_HOME` that is, case-folded, any spelling of `~/.codex` or below
+  before and the effective home is the one Codex reads. A `CODEX_HOME` that is, case-folded and Unicode-normalized (as APFS compares names), any spelling of `~/.codex` or below
   is refused as `owner-home` from its path alone, before anything is created. The
   spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
   chain names, read textually whether or not the target exists; a chain of more than 32
@@ -108,7 +108,7 @@ The Codex implementation:
   one real directory at a time (`O_DIRECTORY|O_NOFOLLOW`, relative to the parent's
   descriptor). Before each step and before each directory it creates, it compares the
   open directory's identity with the owner's `~/.codex`, or, while that does not exist
-  yet, with its nearest existing ancestor plus the case-folded missing names. A match,
+  yet, with its nearest existing ancestor plus the missing names compared the same way. A match,
   or an identity it cannot read, refuses the link. That owner record is read again before
   every directory it creates and right before the link, and any change observed by the
   recheck refuses. The helper protects against pre-existing/stable aliases and owner-home

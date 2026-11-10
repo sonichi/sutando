@@ -482,6 +482,35 @@ class StartupSteps(Layout):
                 self.assertFalse(os.path.lexists(self.app_home / "skills" / "tutorial"))
                 self.assertFalse(os.path.exists(self.owner), "~/.codex stays dangling")
 
+    def test_skills_install_refuses_a_dangling_owner_alias_in_another_unicode_form(self):
+        nfc, nfd = "caf\u00e9", "cafe\u0301"
+        probe = self.root / nfc
+        probe.mkdir()
+        same_path = (self.root / nfd).exists()
+        probe.rmdir()
+        if not same_path:
+            self.skipTest("normalization-sensitive filesystem: NFC and NFD are different paths")
+        for configured, aliased in ((nfc, nfd), (nfd, nfc)):
+            with self.subTest(configured=ascii(configured)):
+                shutil.rmtree(self.root / "app-support", ignore_errors=True)
+                shutil.rmtree(self.root / configured, ignore_errors=True)
+                if os.path.lexists(self.owner):
+                    self.owner.unlink()
+                self.checkout()
+                self.app_home = self.root / configured / ".codex-sutando"
+                config = json.loads((self.repo / "sutando.config.json").read_text())
+                config["core_config_dirs"][1]["value"] = str(self.app_home)
+                (self.repo / "sutando.config.json").write_text(json.dumps(config))
+                alias = self.root / aliased / ".codex-sutando" / "skills" / "tutorial"
+                self.owner.symlink_to(alias)
+                out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),
+                                CLAUDE_CONFIG_DIR=str(self.workspace / ".claude-sutando"),
+                                SUTANDO_CORE_RUNTIME="codex")
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn("was refused; no skills linked there", out.stdout)
+                self.assertFalse(os.path.lexists(self.app_home / "skills" / "tutorial"))
+                self.assertFalse(os.path.exists(self.owner), "~/.codex stays dangling")
+
     def test_skills_install_on_a_normal_desktop_links_into_the_app_home(self):
         self.checkout()
         out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),

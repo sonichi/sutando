@@ -20,6 +20,7 @@ import errno
 import os
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 
 
@@ -49,6 +50,11 @@ def _parts(codex_home):
 _OWNER_LINK_HOPS = 32
 
 
+def _key(part):
+    """A path component as a case- and normalization-insensitive filesystem (APFS) compares it."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", part).casefold())
+
+
 def _owner_spellings(home):
     """Every path `~/.codex` names, created or not: `$HOME/.codex`, `realpath($HOME)/.codex`,
     and each target its symlink chain names, read textually; ValueError past 32 links, as
@@ -67,15 +73,15 @@ def _owner_spellings(home):
 
 
 def _lexically_owner(parts, home):
-    """True when `parts`, case-folded, are any spelling of `~/.codex`, below it or above it,
+    """True when `parts`, compared by `_key`, are any spelling of `~/.codex`, below it or above it,
     or the spellings cannot be read. The walk follows no link, so the path it opens is this one."""
-    folded = [p.casefold() for p in parts]
+    folded = [_key(p) for p in parts]
     try:
         spellings = _owner_spellings(home)
     except (ValueError, OSError):
         return True
     for spelled in spellings:
-        owner = [p.casefold() for p in spelled.split(os.sep) if p not in ("", ".")]
+        owner = [_key(p) for p in spelled.split(os.sep) if p not in ("", ".")]
         # Above too: any entry later made below `parts` could become the owner's home.
         if folded[:len(owner)] == owner or owner[:len(folded)] == folded:
             return True
@@ -107,7 +113,7 @@ def _at_owner(fd, anchor, missing, rest):
         return True
     if (st.st_dev, st.st_ino) != anchor:
         return False
-    return [p.casefold() for p in rest[:len(missing)]] == [p.casefold() for p in missing]
+    return [_key(p) for p in rest[:len(missing)]] == [_key(p) for p in missing]
 
 
 def _owner_moved(home, anchor, missing):

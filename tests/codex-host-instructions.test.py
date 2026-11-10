@@ -463,6 +463,27 @@ class OwnerGuard(Base):
                 self.assertEqual(self.link(codex_home=sibling), "linked")
         self.assertEqual(os.listdir(self.owner), [])
 
+    def test_the_lexical_guard_matches_another_unicode_form_of_the_owners_codex_home(self):
+        nfc, nfd = "caf\u00e9", "cafe\u0301"
+        for configured, aliased in ((nfc, nfd), (nfd, nfc)):
+            with self.subTest(configured=ascii(configured)):
+                if os.path.lexists(self.owner):
+                    self.owner.unlink()
+                self.owner.symlink_to(self.root / aliased / "app" / "skills" / "tutorial")
+                for below in ([], ["skills"], ["skills", "tutorial", "x"]):
+                    parts = chi._parts(self.root / configured / "app") + below
+                    self.assertTrue(chi._lexically_owner(parts, self.home), below)
+
+    def test_the_identity_layer_matches_a_missing_owner_in_another_unicode_form(self):
+        missing_owner = self.root / "cafe\u0301" / ".codex"
+        anchor, missing = chi._owner_anchor(missing_owner.parent.parent / "cafe\u0301")
+        fd = os.open(self.root, os.O_RDONLY)
+        try:
+            self.assertTrue(chi._at_owner(fd, anchor, missing, ["caf\u00e9", ".codex", "sub"]))
+            self.assertFalse(chi._at_owner(fd, anchor, missing, ["cafe", ".codex"]))
+        finally:
+            os.close(fd)
+
     def test_the_identity_layer_matches_a_missing_owner_by_case_folded_suffix(self):
         """The identity layer alone: reached when a path names ~/.codex by another route."""
         anchor, missing = chi._owner_anchor(self.home)
