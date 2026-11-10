@@ -138,6 +138,11 @@ class Add(Base):
         with self.assertRaises(dc.DeviceConnectError) as e:
             self.connect(fake, approve_after=None)
         self.assertIn("expired at", str(e.exception))
+        self.assertEqual(e.exception.status, "expired")
+        self.assertEqual(len(self.sent), 2, "the link, then the note that it lapsed")
+        self.assertTrue(self.sent[1].startswith("[dm-only]"))
+        self.assertIn("expired at", self.sent[1])
+        self.assertIn("Ask me for a new link", self.sent[1])
         self.assertIsNone(C.worker_identity(W, self.ws))
         self.assertNoSecret(fake, str(e.exception))
 
@@ -311,7 +316,7 @@ class Cli(Base):
         self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok"})
         self.assertNoSecret(fake, *out)
 
-    def run_cli(self, fake, during_wait=None, *, patch_start=True, extra=(), verb="add"):
+    def run_cli(self, fake, during_wait=None, *, patch_start=True, extra=(), verb="add", approve=True):
         real, out, starts = dc.connect, [], []
 
         def wired(worker, **kw):
@@ -319,7 +324,8 @@ class Cli(Base):
                 self.backend.sleep(s)
                 if during_wait is not None and not fake.approved:
                     during_wait()
-                fake.approve()
+                if approve:
+                    fake.approve()
             kw.update(request=fake.request, preview=self.preview, deliver=self.sent.append, vault=self.vault,
                       sleep=sleep, clock=self.backend.clock)
             return real(worker, **kw)
@@ -378,6 +384,12 @@ class Cli(Base):
             rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow"])
         self.assertEqual(rc, 2)
         self.assertIn("needs --label", err[-1])
+
+    def test_an_expired_link_prints_its_own_status(self):
+        rc, out, starts = self.run_cli(ConnectFake(self.backend, expires_in=60), during_wait=lambda: None,
+                                       approve=False)
+        self.assertEqual((rc, json.loads(out[-1]), starts), (1, {"status": "expired"}, []))
+        self.assertIn("Ask me for a new link", self.sent[-1])
 
     def test_a_pasted_token_still_needs_repo_and_logs_dir(self):
         with self.assertRaises(SystemExit):

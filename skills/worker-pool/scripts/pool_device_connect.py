@@ -107,7 +107,7 @@ def collect(base: str, pending: dict, *, request=pp.http_json, sleep=time.sleep,
         expired = time.strftime("%H:%M %Z", time.localtime(pending["expires_at"]))
         if status in (404, 410) or clock() > pending["expires_at"] + COLLECT_GRACE_S:
             raise DeviceConnectError(f"the approval link expired at {expired} without an approval; "
-                                     "nothing was saved, so start again for a new link")
+                                     "nothing was saved, so start again for a new link", status="expired")
         if status not in (0, 200, 202, 429, 503) and status < 500:
             raise DeviceConnectError(pp.scrub(f"the server refused the device connect (HTTP {status}"
                                               f"{', ' + pp.error_code(out) if pp.error_code(out) else ''})", known))
@@ -119,6 +119,13 @@ def approval_note(worker_label: str, label: str, verify_url: str, expires_at: fl
     return (f"[dm-only]\nApprove the agent \"{label}\" for pool worker {worker_label}: open this link "
             f"and approve it. It works until {until}.\n\n{verify_url}\n\nNothing is saved until you approve, "
             "and I check that the agent is yours before the worker uses it.")
+
+
+def expiry_note(worker_label: str, label: str, expires_at: float) -> str:
+    """The owner's DM once an unapproved link has lapsed: nothing changed, and how to get a new one."""
+    until = time.strftime("%H:%M %Z", time.localtime(expires_at))
+    return (f"[dm-only]\nThe approval link for agent \"{label}\" (pool worker {worker_label}) expired at {until} "
+            "before it was approved, so nothing was set up. Ask me for a new link whenever you are ready.")
 
 
 def send_to_owner(workspace: Path, text: str) -> str:
@@ -151,10 +158,16 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     pending = start(base, label, display_name, server=str(core.get("server") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
     note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"])
-    (deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text)))(note)
+    send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
+    send(note)
     say(f"approval link sent to the owner; it works until "
         f"{time.strftime('%H:%M %Z', time.localtime(pending['expires_at']))}")
-    got = collect(base, pending, request=request, sleep=sleep, clock=clock)
+    try:
+        got = collect(base, pending, request=request, sleep=sleep, clock=clock)
+    except DeviceConnectError as e:
+        if e.status == "expired":
+            send(expiry_note(worker_label or worker, label, pending["expires_at"]))
+        raise
     known.append(got["bearer"])
     token = f"{got['relay_url']}|{got['bearer']}"
     try:

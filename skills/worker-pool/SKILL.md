@@ -182,8 +182,8 @@ python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flo
 - `--label` names the agent (1-32 lowercase letters, digits, inner dashes); suggest the worker's role and let the
   owner confirm. It is required: without one the server would answer with the owner's own agent.
 - The core sends the owner the approval link in their DM, with the time it stops working (15 minutes), and waits.
-  Run it in the background; it prints one JSON line (`agent_id`, `status`) once the owner approved, or names the
-  expiry and saves nothing. Run it again for a new link.
+  Run it in the background; it prints one JSON line (`agent_id`, `status`) once the owner approved. An expired link
+  saves nothing, prints `{"status": "expired"}` and tells the owner in their DM; run it again for a new link.
 - The token is saved to the vault only when the gateway confirms it is the agent the poll named, not the core's own
   agent, on the core's server and owned by the core's owner. `rotate` must answer for the worker's existing agent.
   The device code and the token are never printed, logged or written to a file.
