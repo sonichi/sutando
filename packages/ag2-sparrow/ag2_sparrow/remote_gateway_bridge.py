@@ -1589,6 +1589,7 @@ def _guarded_result_labels(tid: str, generation=None) -> dict:
     `generation`; each kept only when the result guard passes it unchanged for the task's tier."""
     labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}",
                                 getattr(generation, "digest", None))
+    labels.pop(result_labels.PARENT_KEY, None)
     if not labels:
         return {}
     try:
@@ -1610,6 +1611,76 @@ def _guarded_result_labels(tid: str, generation=None) -> dict:
             _log(f"result {tid}: its {key} is left out: the result guard withheld it "
                  f"({verdict.reason or 'rewritten'})")
     return kept
+
+
+def _result_parent(tid: str, generation=None) -> str:
+    """The parent task id the side file names for the bytes of `generation`; "" when none."""
+    return result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}",
+                              getattr(generation, "digest", None)).get(result_labels.PARENT_KEY, "")
+
+
+# The broker labels a task only once it is closed, which the result POST may finish just after.
+PARENT_RETRY_S = (0, 2, 5, 10, 20, 30)
+
+
+def _send_parent(broker_tid: str, parent: str, sleep=time.sleep) -> str:
+    """Ask the broker to group `broker_tid` under `parent`: "applied", else why not. Only a task
+    not yet closed is tried again; any other refusal or failure drops the parent alone."""
+    path = f"/v1/tasks/{urllib.parse.quote(broker_tid, safe='')}/summary"
+    for delay in PARENT_RETRY_S:
+        sleep(delay)
+        try:
+            _req("POST", path, {result_labels.PARENT_KEY: parent}, timeout=10)
+        except urllib.error.HTTPError as e:
+            code, _ = task_attempts.http_error_code(e)
+            if code == "task_not_terminal":
+                continue
+            why = code or f"HTTP {e.code}"
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            why = diagnostics.describe(e)
+        else:
+            _log(f"result {broker_tid}: grouped under {parent}")
+            return "applied"
+        _log(f"result {broker_tid}: its parent {parent} is left out ({why})")
+        return why
+    _log(f"result {broker_tid}: its parent {parent} is left out (the task did not close in time)")
+    return "task_not_terminal"
+
+
+def _group_under_parent(broker_tid: str, parent: str) -> None:
+    """Send the parent of a delivered result off the drain's thread; it never holds a result."""
+    if not parent:
+        return
+    try:
+        threading.Thread(target=_send_parent, args=(broker_tid, parent), daemon=True,
+                         name=f"result-parent-{broker_tid}").start()
+    except Exception as exc:  # noqa: BLE001 — the result is already committed; only the parent is lost
+        _log(f"result {broker_tid}: its parent {parent} is left out ({diagnostics.describe(exc)})")
+
+
+RECENT_TASKS_MAX = 5
+RECENT_TITLE_MAX = 80
+
+
+def _recent_tasks_value(value) -> str:
+    """The broker's `recent_tasks` as one JSON line for the task file: at most RECENT_TASKS_MAX,
+    each with a task id the broker could accept as a parent, its fields cleaned to one line and any
+    secret in a title redacted."""
+    if not isinstance(value, list):
+        return ""
+    kept = []
+    for t in value[:RECENT_TASKS_MAX]:
+        tid = result_labels.parent(t.get("task_id")) if isinstance(t, dict) else ""
+        if not tid:
+            continue
+        created = t.get("created_at")
+        title = result_labels.clean(t.get("title"))
+        kept.append({"task_id": tid,
+                     "title": result_labels.fit(filter_chat_secrets(title).text, RECENT_TITLE_MAX),
+                     "status": result_labels.fit(t.get("status"), 32),
+                     "created_at": created if isinstance(created, int)
+                     and not isinstance(created, bool) else None})
+    return json.dumps(kept, ensure_ascii=False, separators=(",", ":")) if kept else ""
 
 
 def _archive_result_labels(stem: str) -> None:
@@ -2137,6 +2208,9 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected (path) -> bool: an owner-directed file this lane delivers although it owns no
+# unaddressed ones (a worker's lane, its worker's files). None: only `owns_unaddressed` decides.
+PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
@@ -2309,6 +2383,20 @@ def owns_unaddressed() -> bool:
     except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the launch-time rule
         _log_backoff(("owns-unaddressed", type(e).__name__), f"primary check failed ({diagnostics.describe(e)})")
         return not GATEWAY_INSTANCE
+
+
+def owner_directed_is_mine(path: Path) -> bool:
+    """Whether this lane delivers the owner-directed file `path`: the primary delivers every one
+    (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE)."""
+    if owns_unaddressed():
+        return True
+    if PROACTIVE_OWN_FILE is None:
+        return False
+    try:
+        return bool(PROACTIVE_OWN_FILE(path))
+    except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the primary-only rule
+        _log_backoff(("own-file", type(e).__name__), f"own-file check failed ({diagnostics.describe(e)})")
+        return False
 
 
 def proactive_room() -> str:
@@ -6207,6 +6295,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # trusted execution-policy header before all untrusted body text.
             if woken:
                 lines.append(f"wake_episode: {_one_line(woken)}")
+            recent = _recent_tasks_value(task.get("recent_tasks")) if sender_tier == "owner" else ""
+            if recent:
+                lines.append(f"recent_tasks: {recent}")
             if collaborator_enabled:
                 lines.append("collaborator: true")
                 if task.get("sensitive_data_filter") is False:
@@ -8346,8 +8437,8 @@ def _post_proactive() -> None:
             continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and not owns_unaddressed():
-            continue  # a secondary never owns unaddressed nudges
+        if route == "send" and peek_room is None and not owner_directed_is_mine(f):
+            continue  # a secondary owns no unaddressed nudge, only a file the host names as its own
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
@@ -8385,7 +8476,7 @@ def _post_proactive() -> None:
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
-                route == "send" and room_override is None and (not owns_unaddressed() or not proactive_room())):
+                route == "send" and room_override is None and (not owner_directed_is_mine(f) or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
             _hand_back(claim, f)
@@ -9382,6 +9473,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc.update(_result_contract(dm_only))
     # Activity labels ride the doc that carries dm_only; a broker without them ignores the keys.
     doc.update(_guarded_result_labels(tid, generation))
+    # Only a reply closes the task with this body; a no_send or a fold is grouped by nobody.
+    parent = "" if no_send or consolidated_into else _result_parent(tid, generation)
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
         doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
@@ -9408,6 +9501,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
     # The task's own result item only: a close of an id already accepted keeps today's policy.
     relay = relay and item_id == broker_tid
+    parent = parent if item_id == broker_tid else ""
     if relay:
         core = _delivery_core("relay")
     live = _live_source(disposal.pin_path(RESULTS_DIR, tid) if pinned else result_file, generation)
@@ -9436,7 +9530,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             if delivered_body_differs(core.backend.root, item_id, ruled):
                 _quarantine_unsent(result_file, tid, item_id, generation)
                 return False
-            return _committed(tid, broker_tid, claim, record)
+            return _grouped(_committed(tid, broker_tid, claim, record), broker_tid, parent, record)
         if relay:
             _reopen_relay_result(core, item_id, tid, record, result_file, generation)
             return False
@@ -9473,7 +9567,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid} {what} via DeliveryCore "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
-        return _committed(tid, broker_tid, claim, read_item(root, item_id) if root is not None else None)
+        record = read_item(root, item_id) if root is not None else None
+        return _grouped(_committed(tid, broker_tid, claim, record), broker_tid, parent, record)
     record = read_item(core.backend.root, item_id) or {}
     if record.get("status") == "PARKED":
         if relay:
@@ -9493,6 +9588,14 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     else:
         _log(line)
     return False
+
+
+def _grouped(committed, broker_tid: str, parent: str, record=None):
+    """`committed`, after sending the parent of a result this attempt delivered as the answer; a
+    delivery with no outbox record to show that sends none."""
+    if parent and committed is True and _really_delivered(record):
+        _group_under_parent(broker_tid, parent)
+    return committed
 
 
 def _lifecycle_of(broker_tid: str, claim) -> dict:
