@@ -23,6 +23,8 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
             for path in (home, workspace, bin_dir):
                 path.mkdir()
             for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
+                        "skills/worker-pool/scripts/worker-mcp-credential.sh",
+                        "skills/worker-pool/scripts/codex_worker_mcp.py",
                         "scripts/python-binary.sh", "src/agent/launch-path.sh"):
                 dest = root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
