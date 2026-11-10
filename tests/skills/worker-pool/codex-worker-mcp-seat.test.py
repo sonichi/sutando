@@ -127,7 +127,8 @@ class Registration(unittest.TestCase):
 class Launcher(unittest.TestCase):
     """The real launcher in a fake repo: tmux records its argv, the resolver compose is a stub."""
 
-    def launch(self, tmp, *, compose_ok=True, codex_toml=None, helper_fails=False, expect_rc=0, claude_json=True):
+    def launch(self, tmp, *, compose_ok=True, codex_toml=None, helper_fails=False, expect_rc=0, claude_json=True,
+               codex_home=True):
         tmp = Path(tmp)
         root, home, ws, bin_dir = tmp / "repo", tmp / "home", tmp / "ws", tmp / "bin"
         for p in (home, ws, bin_dir, home / "codex", home / "claude"):
@@ -142,8 +143,8 @@ class Launcher(unittest.TestCase):
         (root / "scripts/sutando-config.sh").write_text(
             '#!/bin/sh\ncase "$1" in\n'
             '  core-config-dir-env-name) printf "CODEX_HOME" ;;\n'
-            '  core-config-dir-value) printf "%s/codex" "$HOME" ;;\n'
-            '  claude-sutando-config-dir) printf "%s/claude" "$HOME" ;;\nesac\n')
+            + ('  core-config-dir-value) printf "%s/codex" "$HOME" ;;\n' if codex_home else "")
+            + '  claude-sutando-config-dir) printf "%s/claude" "$HOME" ;;\nesac\n')
         (root / "scripts/connections.py").write_text(
             "import json, sys\n"
             + ("sys.exit(print('connections: fixture refusal', file=sys.stderr) or 1)\n" if not compose_ok else "")
@@ -209,6 +210,12 @@ class Launcher(unittest.TestCase):
             folder = str(Path(tmp, "ws/wd").resolve())
             self.assertEqual(cfg["projects"], {folder: {"trust_level": "trusted"}})
             self.assertEqual(cfg["mcp_servers"]["s-space"]["command"], "/c/node", "the rest of the file is kept")
+
+    def test_without_a_sutando_codex_home_the_users_own_codex_config_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, err = self.launch(tmp, codex_home=False)
+            self.assertFalse(Path(tmp, "home/.codex/config.toml").exists())
+            self.assertIn("not recording trust in the user's own Codex config", err)
 
     def test_the_codex_homes_own_entry_wins(self):
         with tempfile.TemporaryDirectory() as tmp:

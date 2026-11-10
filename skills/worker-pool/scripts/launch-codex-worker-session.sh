@@ -97,7 +97,10 @@ CODEX_ARGS=(-C "$WORKING_DIR" --add-dir "$HOME" --sandbox danger-full-access
             -c check_for_update_on_startup=false)
 # Headless: Codex's trust prompt would hold the seat, and answering it trusts the whole enclosing repo.
 # Record the worker's own folder only; a `-c projects...` override does not answer the prompt.
-if ! trust_out="$("$WORKER_PY" "$REPO/src/codex_project_trust.py" --folder-only "${CODEX_HOME:-$HOME/.codex}" "$WORKING_DIR" 2>&1)"; then
+# With no Sutando Codex home the file would be the user's own ~/.codex config: leave that to them.
+if [ -z "${CODEX_HOME:-}" ]; then
+  echo "launch-codex-worker-session: no Sutando Codex home; not recording trust in the user's own Codex config, so $SESSION may wait on Codex's trust prompt" >&2
+elif ! trust_out="$("$WORKER_PY" "$REPO/src/codex_project_trust.py" --folder-only "$CODEX_HOME" "$WORKING_DIR" 2>&1)"; then
   echo "launch-codex-worker-session: could not record trust for $WORKING_DIR ($trust_out); $SESSION may wait on Codex's trust prompt" >&2
 fi
 # Codex passes a stdio MCP server only the variables its entry names: the seat's s-space entry names both.
