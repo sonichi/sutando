@@ -62,12 +62,12 @@ def start(base: str, label: str, display_name: str, *, server: str = "", request
     status, _, out = request("POST", base + START_PATH, payload=body)
     code, url = out.get("device_code"), out.get("verify_url")
     if status != 200 or not isinstance(code, str) or not code or not isinstance(url, str):
-        raise DeviceConnectError(f"s.space did not start a device connect (HTTP {status}"
+        raise DeviceConnectError(f"the server did not start a device connect (HTTP {status}"
                                  f"{', ' + pp.error_code(out) if pp.error_code(out) else ''})")
     url = urllib.parse.urljoin(base + "/", url)
     hosts = {pp.origin_of(base)} | ({pp.origin_of("https://" + server)} if server else set())
     if pp.origin_of(url) not in hosts or not url.startswith("https://") or code in url:
-        raise DeviceConnectError("the approval link s.space answered is not a link on its own host that is "
+        raise DeviceConnectError("the approval link the server answered is not a link on its own host that is "
                                  "safe to send; nothing was sent")
     ttl = _bounded(out.get("expires_in"), DEFAULT_TTL_S, 60, MAX_TTL_S)
     return {"device_code": code, "verify_url": url, "expires_at": clock() + ttl,
@@ -92,14 +92,14 @@ def collect(base: str, pending: dict, *, request=pp.http_json, sleep=time.sleep,
             raise DeviceConnectError(f"the approval link expired at {expired} without an approval; "
                                      "nothing was saved, so start again for a new link")
         if status not in (0, 200, 202, 429, 503) and status < 500:
-            raise DeviceConnectError(pp.scrub(f"s.space refused the device connect (HTTP {status}"
+            raise DeviceConnectError(pp.scrub(f"the server refused the device connect (HTTP {status}"
                                               f"{', ' + pp.error_code(out) if pp.error_code(out) else ''})", known))
 
 
 def approval_note(worker_label: str, label: str, verify_url: str, expires_at: float) -> str:
     """The owner's DM: what they approve, the link, and when it stops working."""
     until = time.strftime("%H:%M %Z", time.localtime(expires_at))
-    return (f"[dm-only]\nApprove the s.space agent \"{label}\" for pool worker {worker_label}: open this link "
+    return (f"[dm-only]\nApprove the agent \"{label}\" for pool worker {worker_label}: open this link "
             f"and approve it. It works until {until}.\n\n{verify_url}\n\nNothing is saved until you approve, "
             "and I check that the agent is yours before the worker uses it.")
 
@@ -128,7 +128,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     core = pp.core_lane(workspace, lane)
     base = (base or pp.origin_of(str(core["gateway_url"]))).rstrip("/")
     if pp.origin_of(base) != base:
-        raise DeviceConnectError("the connect base must be an https origin, such as https://chat.s.space")
+        raise DeviceConnectError("the connect base must be an https origin (scheme and host only)")
     pending = start(base, label, display_name, server=str(core.get("server") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
     note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"])
@@ -152,7 +152,7 @@ def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, 
     if pp.origin_of(connections.gateway_url_of(token)) != pp.origin_of(str(core["gateway_url"])):
         raise DeviceConnectError("the poll answer names a gateway that is not the core's")
     if agent_id == core.get("agent_mxid"):
-        raise DeviceConnectError("s.space answered with the core's own agent, not a new one for the worker")
+        raise DeviceConnectError("the server answered with the core's own agent, not a new one for the worker")
     if current is not None and agent_id != current.get("agent_mxid"):
         raise DeviceConnectError(f"a rotate must answer for {current.get('agent_mxid')}, not another agent")
     seen = (preview or connections.preview_connection)(token)
