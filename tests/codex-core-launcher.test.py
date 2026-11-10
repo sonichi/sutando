@@ -3115,6 +3115,28 @@ class CoreWindowRestartTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertEqual(self.panes(), before, "a second core must not be created")
 
+    def test_restart_keeps_a_bare_gateway_window_as_a_sibling(self):
+        # Desktop installs name the primary gateway window `gateway`, the secondary `gateway-<lane>`.
+        self.session_with(("core", [str(self.case.bin / "codex"), "-C", "old"]),
+                          ("gateway", ["exec sleep 300"]), ("gateway-s_dspace", ["sleep", "300"]))
+        stale = self.core()
+        siblings = [p for p in self.panes() if p["name"].startswith("gateway")]
+        result = self.case.run_launcher("--restart", env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for sibling in siblings:
+            self.assertIn(sibling, self.panes(), "a gateway pane did not survive the restart")
+        self.assertNotEqual(self.core()["wid"], stale["wid"])
+
+    def test_a_core_cli_under_the_bare_gateway_name_still_blocks_the_heal(self):
+        fake = Path(tempfile.mkdtemp()) / "claude"
+        fake.symlink_to(shutil.which("sleep"))
+        self.addCleanup(shutil.rmtree, fake.parent, True)
+        self.session_with(("monitor", ["sleep", "300"]), ("gateway", [str(fake), "300"]))
+        before = self.panes()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self.panes(), before, "a second core must not be created")
+
     def test_a_live_core_is_reused_not_healed(self):
         self.session_with(("core", [str(self.case.bin / "codex"), "-C", "live"]), ("gateway-x", ["sleep", "300"]))
         before = self.panes()
