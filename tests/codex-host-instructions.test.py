@@ -824,6 +824,51 @@ class OpenHome(Base):
                 chi.open_home(self.codex_home, self.home)
 
 
+class EnsureChildDir(Base):
+    def test_a_child_the_owners_codex_links_to_is_refused_unchanged(self):
+        self.codex_home.mkdir(parents=True)
+        self.owner.symlink_to(self.codex_home / "skills")
+        for existing in (False, True):
+            with self.subTest(skills_exists=existing):
+                if existing:
+                    (self.codex_home / "skills").mkdir(exist_ok=True)
+                before = self.tree()
+                with self.assertRaisesRegex(ValueError, "owner's Codex home"):
+                    chi.ensure_child_dir(self.codex_home, "skills", self.home)
+                self.assertEqual(self.tree(), before)
+
+    def test_a_child_matching_the_owners_identity_is_refused(self):
+        (self.codex_home / "skills").mkdir(parents=True)
+        anchor = os.stat(self.codex_home / "skills")
+        with patch.object(chi, "_owner_anchor", return_value=((anchor.st_dev, anchor.st_ino), [])):
+            with self.assertRaisesRegex(ValueError, "owner's Codex home"):
+                chi.ensure_child_dir(self.codex_home, "skills", self.home)
+
+    def test_a_missing_child_the_owner_would_become_is_refused_before_mkdir(self):
+        self.codex_home.mkdir(parents=True)
+        home = os.stat(self.codex_home)
+        before = self.tree()
+        with patch.object(chi, "_owner_anchor",
+                          return_value=((home.st_dev, home.st_ino), ["Skills"])):
+            with self.assertRaisesRegex(ValueError, "owner's Codex home"):
+                chi.ensure_child_dir(self.codex_home, "skills", self.home)
+        self.assertEqual(self.tree(), before)
+
+    def test_an_owner_identity_unreadable_after_the_open_fails_closed(self):
+        self.codex_home.mkdir(parents=True)
+        real = chi._owner_anchor(self.home)
+        before = self.tree()
+        with patch.object(chi, "_owner_anchor", side_effect=[real, OSError("denied")]):
+            with self.assertRaisesRegex(ValueError, "owner home unreadable"):
+                chi.ensure_child_dir(self.codex_home, "skills", self.home)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_plain_child_is_created(self):
+        self.codex_home.mkdir(parents=True)
+        self.assertEqual(chi.ensure_child_dir(self.codex_home, "skills", self.home), "ok")
+        self.assertTrue((self.codex_home / "skills").is_dir())
+
+
 class DesktopLayout(Base):
     COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh",
               "src/sutando_config.py", "sutando.config.json")

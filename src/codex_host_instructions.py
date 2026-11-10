@@ -274,12 +274,22 @@ def ensure_child_dir(codex_home, name, home):
     """Create, if absent, the directory `name` directly in an existing `codex_home`.
 
     Returns "ok", or "invalid-child" when `name` is a symlink or not a directory; nothing is
-    followed. Raises like open_home, and ValueError for a `name` that is not one component.
+    followed. Raises like open_home, ValueError for a `name` that is not one component, and
+    ValueError when the child is, or would be, the owner's `~/.codex`.
     """
     if not name or name in (".", "..") or "/" in name or "\0" in name:
         raise ValueError(f"{name!r}: not a single path component")
+    owned = ValueError(f"{codex_home}/{name}: is, or leads into, the owner's Codex home")
+    if _lexically_owner(_parts(codex_home) + [name], home):
+        raise owned
     fd = open_home(codex_home, home)
     try:
+        try:
+            anchor, missing = _owner_anchor(home)
+        except OSError as exc:
+            raise ValueError(f"{codex_home}: owner home unreadable ({exc})") from exc
+        if _at_owner(fd, anchor, missing, [name]):
+            raise owned
         try:
             os.mkdir(name, 0o755, dir_fd=fd)
         except FileExistsError:
@@ -288,7 +298,11 @@ def ensure_child_dir(codex_home, name, home):
             child = os.open(name, _DIR_FLAGS, dir_fd=fd)
         except OSError:
             return "invalid-child"
-        os.close(child)
+        try:
+            if _at_owner(child, anchor, missing, []):
+                raise owned
+        finally:
+            os.close(child)
         return "ok"
     finally:
         os.close(fd)

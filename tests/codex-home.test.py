@@ -445,6 +445,25 @@ class StartupSteps(Layout):
         self.assertTrue((self.app_home / "skills").is_symlink(), "left in place, not replaced")
         self.assertTrue((self.workspace / ".claude-sutando" / "skills" / "tutorial").is_symlink())
 
+    def test_skills_install_refuses_a_skills_child_the_owners_codex_aliases(self):
+        for existing in (False, True):
+            with self.subTest(skills_exists=existing):
+                shutil.rmtree(self.root / "app-support", ignore_errors=True)
+                if os.path.lexists(self.owner):
+                    self.owner.unlink()
+                self.checkout()
+                if existing:
+                    (self.app_home / "skills").mkdir(parents=True)
+                self.owner.symlink_to(self.app_home / "skills")
+                out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),
+                                CLAUDE_CONFIG_DIR=str(self.workspace / ".claude-sutando"),
+                                SUTANDO_CORE_RUNTIME="codex")
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn("was refused; no skills linked there", out.stdout)
+                self.assertEqual(os.path.lexists(self.app_home / "skills"), existing)
+                if existing:
+                    self.assertEqual(os.listdir(self.app_home / "skills"), [])
+
     def test_skills_install_on_a_normal_desktop_links_into_the_app_home(self):
         self.checkout()
         out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),
