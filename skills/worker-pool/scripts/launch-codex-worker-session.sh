@@ -102,7 +102,9 @@ if mcp_out="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/codex_worker_mcp.py
   [ -n "$mcp_out" ] || echo "launch-codex-worker-session: no s-space MCP server is registered; $SESSION has no s-space tools" >&2
   while IFS= read -r arg; do if [ -n "$arg" ]; then CODEX_ARGS+=("$arg"); fi; done <<< "$mcp_out"
 else
-  echo "launch-codex-worker-session: could not compose the seat's s-space MCP server; its tools may act as the core's agent" >&2
+  # Fail closed: the home's own entry passes neither name through, so its proxy would act as the core.
+  echo "launch-codex-worker-session: could not compose the seat's s-space MCP server; not starting $SESSION rather than let its tools act as the core's agent" >&2
+  exit 1
 fi
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
   codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"

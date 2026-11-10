@@ -96,7 +96,7 @@ class Registration(unittest.TestCase):
 class Launcher(unittest.TestCase):
     """The real launcher in a fake repo: tmux records its argv, the resolver compose is a stub."""
 
-    def launch(self, tmp, *, compose_ok=True, codex_toml=None):
+    def launch(self, tmp, *, compose_ok=True, codex_toml=None, helper_fails=False, expect_rc=0):
         tmp = Path(tmp)
         root, home, ws, bin_dir = tmp / "repo", tmp / "home", tmp / "ws", tmp / "bin"
         for p in (home, ws, bin_dir, home / "codex", home / "claude"):
@@ -118,6 +118,8 @@ class Launcher(unittest.TestCase):
             + "print(json.dumps(['/py', 'connections.py', 'worker-mcp-credential', '--worker', "
               "sys.argv[sys.argv.index('--worker') + 1]]))\n")
         (root / "skills/worker-pool/scripts/worker-watcher-supervisor.sh").write_text("#!/bin/sh\nexit 0\n")
+        if helper_fails:
+            (root / "skills/worker-pool/scripts/codex_worker_mcp.py").write_text("import sys\nsys.exit(1)\n")
         (home / "claude/.claude.json").write_text(json.dumps({"mcpServers": {"s-space": CLAUDE_ENTRY}}))
         if codex_toml is not None:
             (home / "codex/config.toml").write_text(codex_toml)
@@ -138,8 +140,9 @@ class Launcher(unittest.TestCase):
                "TMUX_STATE": str(tmp / "up"), "TMUX_ARGV": str(tmp / "argv.json")}
         r = subprocess.run(["bash", str(root / "skills/worker-pool/scripts/launch-codex-worker-session.sh")],
                            cwd=root, env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads((tmp / "argv.json").read_text()), r.stderr
+        self.assertEqual(r.returncode, expect_rc, r.stderr)
+        argv = tmp / "argv.json"
+        return (json.loads(argv.read_text()) if argv.exists() else None), r.stderr
 
     @staticmethod
     def exported(argv, name):
@@ -167,6 +170,16 @@ class Launcher(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv, _ = self.launch(tmp, codex_toml=CODEX_TOML)
             self.assertEqual(self.seat(argv)["command"], "/c/node")
+
+    def test_an_override_that_cannot_be_composed_refuses_the_launch(self):
+        # The home's own entry passes neither name through, so starting on it would take the core's seat.
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, err = self.launch(tmp, codex_toml=CODEX_TOML, helper_fails=True, expect_rc=1)
+            self.assertIsNone(argv, "no worker session was started")
+            self.assertIn("could not compose the seat's s-space MCP server", err)
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, _ = self.launch(tmp, codex_toml=CODEX_TOML)
+            self.assertEqual(self.seat(argv)["command"], "/c/node", "control: the same fixture launches")
 
     def test_a_failed_compose_still_exports_an_opted_in_seat_the_proxy_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:

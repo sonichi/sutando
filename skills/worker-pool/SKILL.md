@@ -152,7 +152,7 @@ argv of `scripts/connections.py worker-mcp-credential`, which hands the desktop'
 token in memory, or tells it `acts_as: core` for a worker with no enabled identity; with no resolver the proxy
 refuses rather than guess. A Codex seat's proxy inherits only the variables its entry names, so the Codex launcher
 starts it with the desktop's `s-space` registration (the Codex home's, else the Claude config dir's) plus `env_vars`
-naming `SUTANDO_WORKER_ID` and `AG2_MCP_WORKER_CREDENTIAL` (`codex_worker_mcp.py`).
+naming `SUTANDO_WORKER_ID` and `AG2_MCP_WORKER_CREDENTIAL` (`codex_worker_mcp.py`); if that cannot be composed the launcher refuses to start the seat.
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
