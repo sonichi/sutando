@@ -42,6 +42,8 @@ class ConnectFake:
         self.expires_in, self.link_with_code, self.link_host = expires_in, link_with_code, link_host
         self.codes, self.approved, self.started = {}, False, []
         self.bearer = None
+        self.start_status, self.interval, self.poll_script = 200, 3, []
+        self.relay_url, self.agent_id_answer = backend.origin + "/relay", None
 
     def approve(self):
         self.approved = True
@@ -50,12 +52,19 @@ class ConnectFake:
         origin, _, path = url.partition("://")[2].partition("/")
         if "/" + path == dc.START_PATH and method == "POST":
             self.started.append(dict(payload or {}))
+            if self.start_status != 200:
+                return self.start_status, {}, {"error": "rate_limited"}
             code = "dc-" + secrets.token_hex(16)
             self.codes[code] = self.backend.now + self.expires_in
             link = f"{self.link_host}/api/connect-page?code={code if self.link_with_code else 'U-' + code[-6:]}"
-            return 200, {}, {"device_code": code, "verify_url": link, "interval": 3, "expires_in": self.expires_in}
+            return 200, {}, {"device_code": code, "verify_url": link, "interval": self.interval, "expires_in": self.expires_in}
         if "/" + path == dc.POLL_PATH and method == "POST":
             code = (payload or {}).get("device_code")
+            if self.poll_script:
+                step = self.poll_script.pop(0)
+                if isinstance(step, Exception):
+                    raise step
+                return step, {}, {"error": "forbidden"}
             if code not in self.codes or self.backend.now > self.codes[code] + 30:
                 return 404, {}, {"error": "unknown_code"}
             if not self.approved:
@@ -64,8 +73,8 @@ class ConnectFake:
                 self.bearer = "bearer-" + secrets.token_hex(16)
                 self.backend.add_agent(self.agent, self.bearer, owner=self.owner)
             del self.codes[code]
-            return 200, {}, {"relay_url": self.backend.origin + "/relay", "bearer": self.bearer,
-                             "agent_id": self.agent}
+            return 200, {}, {"relay_url": self.relay_url, "bearer": self.bearer,
+                             "agent_id": self.agent_id_answer or self.agent}
         return self.backend.request(method, url, bearer=bearer, payload=payload, headers=headers, timeout=timeout)
 
 
@@ -160,6 +169,84 @@ class Add(Base):
         self.assertIn("rotate it instead", str(e.exception))
 
 
+class Edges(Base):
+    def refused(self, fake, text, **kw):
+        with self.assertRaises(dc.DeviceConnectError) as e:
+            self.connect(fake, **kw)
+        self.assertIn(text, str(e.exception))
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        self.assertNoSecret(fake, str(e.exception))
+        return e.exception
+
+    def test_a_start_the_server_refuses_names_its_status_and_reason(self):
+        fake = ConnectFake(self.backend)
+        fake.start_status = 429
+        self.refused(fake, "did not start a device connect (HTTP 429, rate_limited)")
+        self.assertEqual(self.sent, [])
+
+    def test_a_dropped_poll_is_asked_again_and_a_refused_one_ends_the_wait(self):
+        fake = ConnectFake(self.backend)
+        fake.poll_script = [dc.pp.TransportError("URLError")]
+        self.assertEqual(self.connect(fake)["status"], "ok")
+        fake = ConnectFake(self.backend, agent="@owner-desk-two.agent:alpha-fixture.net")
+        fake.poll_script = [403]
+        C.retire_worker_identity(W, workspace=self.ws, vault=self.vault)
+        self.refused(fake, "refused the device connect (HTTP 403, forbidden)")
+
+    def test_an_unreadable_interval_falls_back_to_the_floor(self):
+        fake = ConnectFake(self.backend)
+        fake.interval = "soon"
+        before = self.backend.now
+        self.connect(fake, approve_after=1)
+        self.assertEqual(self.backend.now - before, dc.MIN_INTERVAL_S)
+
+    def test_a_base_that_is_not_an_origin_is_refused(self):
+        self.refused(ConnectFake(self.backend), "must be an https origin", base="https://chat.alpha-fixture.net/x")
+
+    def test_a_poll_answer_without_a_valid_agent_id_or_on_another_gateway_is_not_saved(self):
+        fake = ConnectFake(self.backend)
+        fake.agent_id_answer = "not-an-mxid"
+        self.refused(fake, "names no agent id")
+        fake = ConnectFake(self.backend)
+        fake.relay_url = "https://other-fixture.net/relay"
+        self.refused(fake, "a gateway that is not the core's")
+
+    def test_a_token_the_gateway_does_not_confirm_is_not_saved(self):
+        self.preview = lambda token: {"verified": False, "authenticated": None, "error": "no listing"}
+        self.refused(ConnectFake(self.backend), "does not confirm the token is agent")
+
+    def test_a_save_the_connection_rules_refuse_is_named_without_a_secret(self):
+        def refuse(*a, **k):
+            raise C.ConnectionsError("vault unavailable")
+        with unittest.mock.patch.object(C, "add_worker_identity", refuse):
+            self.refused(ConnectFake(self.backend), "vault unavailable; the approved agent")
+
+    def test_an_identity_that_changes_during_the_wait_is_refused(self):
+        self.connect(ConnectFake(self.backend))
+        fake = ConnectFake(self.backend)
+
+        def sleep(seconds):
+            self.backend.sleep(seconds)
+            C.retire_worker_identity(W, workspace=self.ws, vault=self.vault)
+            fake.approve()
+        with self.assertRaises(dc.DeviceConnectError) as e:
+            dc.connect(W, label="reviewer", rotate=True, workspace=self.ws, vault=self.vault, request=fake.request,
+                       preview=self.preview, deliver=self.sent.append, sleep=sleep, clock=self.backend.clock)
+        self.assertEqual(e.exception.status, "identity_changed")
+
+    def test_by_default_the_link_is_queued_to_the_owner_s_dm(self):
+        fake = ConnectFake(self.backend)
+        fake.approve()
+        dc.connect(W, label="reviewer", workspace=self.ws, vault=self.vault, request=fake.request,
+                   preview=self.preview, sleep=self.backend.sleep, clock=self.backend.clock)
+        queued = list((self.ws / "results").glob("proactive-*worker-connect*.txt"))
+        self.assertEqual(len(queued), 1)
+        text = queued[0].read_text()
+        self.assertTrue(text.startswith("[dm-only]"))
+        self.assertIn("/api/connect-page?code=U-", text)
+        self.assertNoSecret(fake, text)
+
+
 class Rotate(Base):
     def test_rotate_replaces_the_secret_for_the_same_agent_only(self):
         first = ConnectFake(self.backend)
@@ -204,7 +291,7 @@ class Cli(Base):
         self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok"})
         self.assertNoSecret(fake, *out)
 
-    def run_cli(self, fake, during_wait=None):
+    def run_cli(self, fake, during_wait=None, *, patch_start=True, extra=(), verb="add"):
         real, out, starts = dc.connect, [], []
 
         def wired(worker, **kw):
@@ -216,11 +303,12 @@ class Cli(Base):
             kw.update(request=fake.request, preview=self.preview, deliver=self.sent.append, vault=self.vault,
                       sleep=sleep, clock=self.backend.clock)
             return real(worker, **kw)
+        recorder = (lambda row, **kw: starts.append(row) or {"ok": True}) if patch_start else C.start_added
         with unittest.mock.patch.object(dc, "connect", wired), \
-                unittest.mock.patch.object(C, "start_added", lambda row, **kw: starts.append(row) or {"ok": True}), \
+                unittest.mock.patch.object(C, "start_added", recorder), \
                 unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
-            rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow",
-                                     "--label", "reviewer"])
+            rc = pool_identity.main(["--workspace", str(self.ws), verb, "Reviewer", "--device-flow",
+                                     "--label", "reviewer", *extra])
         return rc, out, starts
 
     def test_a_worker_retired_during_the_approval_wait_gets_no_identity_and_no_lane(self):
@@ -228,7 +316,7 @@ class Cli(Base):
 
         def retire():
             pr.set_worker_state(self.ws, W, "retired", keep_bindings=True)
-            C.retire_worker_identity(W, workspace=self.ws)
+            C.retire_worker_identity(W, workspace=self.ws, vault=self.vault)
         fake = ConnectFake(self.backend)
         rc, out, starts = self.run_cli(fake, during_wait=retire)
         self.assertEqual(rc, 1, out)
@@ -242,6 +330,34 @@ class Cli(Base):
         rc, out, starts = self.run_cli(ConnectFake(self.backend))
         self.assertEqual((rc, json.loads(out[-1])["status"]), (0, "ok"))
         self.assertEqual([r["instance"] for r in starts], [C.worker_identity(W, self.ws)["instance"]])
+
+    def test_a_lane_that_does_not_start_is_reported_and_no_start_skips_it(self):
+        fake = ConnectFake(self.backend)
+        out = []
+
+        def broken(row, **kw):
+            raise C.ConnectionsError("bridge refused")
+        with unittest.mock.patch.object(C, "start_added", broken):
+            rc, out, _ = self.run_cli(fake, patch_start=False)
+        self.assertEqual((rc, json.loads(out[-1])["status"]), (1, "stored_lane_not_started"))
+        self.assertTrue(any("bridge refused" in line for line in out))
+        C.retire_worker_identity(W, workspace=self.ws, vault=self.vault)
+        rc, out, starts = self.run_cli(ConnectFake(self.backend, agent="@owner-desk-two.agent:alpha-fixture.net"),
+                                       extra=["--no-start"])
+        self.assertEqual((rc, json.loads(out[-1])["status"], starts), (0, "ok", []), out)
+
+    def test_rotate_through_the_cli_and_a_missing_label(self):
+        self.run_cli(ConnectFake(self.backend))
+        again = ConnectFake(self.backend)
+        self.backend.agents[NEW_AGENT]["bearer"] = again.bearer = "bearer-" + secrets.token_hex(16)
+        with unittest.mock.patch.object(C, "update_token", lambda instance, token, **kw: {"instance": instance}):
+            rc, out, starts = self.run_cli(again, verb="rotate")
+        self.assertEqual((rc, json.loads(out[-1]), starts), (0, {"agent_id": NEW_AGENT, "status": "rotated"}, []))
+        err = []
+        with unittest.mock.patch("builtins.print", lambda *a, **k: err.append(" ".join(map(str, a)))):
+            rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow"])
+        self.assertEqual(rc, 2)
+        self.assertIn("needs --label", err[-1])
 
     def test_a_pasted_token_still_needs_repo_and_logs_dir(self):
         with self.assertRaises(SystemExit):

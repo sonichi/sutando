@@ -196,9 +196,7 @@ def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, 
                                        logs_dir=logs_dir or Path(connections._workspace(workspace)) / "logs",
                                        workspace=workspace, vault=vault)
         return {"agent_id": agent_id, "status": "rotated", "row": row}
-    row, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
-                                                   source="agent_link", preview=seen, workspace=workspace,
-                                                   vault=vault)
-    if not created:
-        raise DeviceConnectError(f"worker {worker} already had a connection ({row['instance']})")
+    # `fenced` has just seen no identity for the worker, so this always creates one.
+    row, _ = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
+                                             source="agent_link", preview=seen, workspace=workspace, vault=vault)
     return {"agent_id": agent_id, "status": "ok", "row": row}
