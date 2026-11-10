@@ -509,15 +509,24 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None,
     """
     session = _resolve_session(session)
     ws = _workspace(workspace)
-    if stop_id and _allowed_stop_id(ws, session) == stop_id:
-        return None
-    reason = _refusal(ws, session)
-    if commit:
+    if not commit:
+        return None if stop_id and _allowed_stop_id(ws, session) == stop_id else _refusal(ws, session)
+    # Check, decision and record are one step per session: overlapping copies of the
+    # hook for one stop must not both read the previous stop before either records it.
+    gate = ledger_path(ws).with_name(_scoped_name(STOP_NAME, session))
+    try:
+        gate.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    with _writer_lock(gate):
+        if stop_id and _allowed_stop_id(ws, session) == stop_id:
+            return None
+        reason = _refusal(ws, session)
         if reason is None:
             mark_stop(ws, session, stop_id)
         else:
             spend_reminder(ws, session)
-    return reason
+        return reason
 
 
 def no_send_this_turn(workspace: Path | str | None = None, session: str | None = None) -> bool:

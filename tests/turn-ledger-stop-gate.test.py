@@ -669,6 +669,47 @@ def test_a_stop_that_names_no_transcript_is_judged_as_before() -> None:
         check("an unreadable transcript identifies nothing", _blocked(_hook_with(ws, payload)), "")
 
 
+def test_overlapping_copies_of_one_stop_are_serialised() -> None:
+    """The reviewer's interleaving: copy B has read the previous stop's id when copy A runs
+    whole. Unserialised, A moved the boundary and B, resuming, refused the same stop."""
+    import threading
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws, stop_id="earlier")
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_no_send("quiet on purpose", ws)
+        read, go, results = threading.Event(), threading.Event(), {}
+        real_read = turn_ledger._allowed_stop_id
+
+        def paused_read(ws_, session):
+            got = real_read(ws_, session)
+            if threading.current_thread().name == "B":
+                read.set()
+                go.wait(10)
+            return got
+
+        def run(name):
+            results[name] = turn_ledger.stop_gate(ws, stop_id="this-stop")
+
+        turn_ledger._allowed_stop_id = paused_read
+        try:
+            b = threading.Thread(target=run, args=("B",), name="B")
+            b.start()
+            read.wait(10)
+            a = threading.Thread(target=run, args=("A",), name="A")
+            a.start()
+            a.join(1.0)
+            a_waited = a.is_alive()
+            go.set()
+            b.join(10)
+            a.join(10)
+        finally:
+            turn_ledger._allowed_stop_id = real_read
+        check("the second copy waits for the first to finish", a_waited, "A ran its gate inside B's")
+        check("both copies let the same stop end", results == {"A": None, "B": None}, repr(results))
+        check("and no reminder is spent", not turn_ledger.reminder_spent(ws), "")
+
+
 def test_the_stop_id_in_process() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
@@ -697,6 +738,7 @@ def main() -> int:
         test_a_second_stop_hook_for_the_same_stop_gets_the_same_answer,
         test_a_stop_that_names_no_transcript_is_judged_as_before,
         test_the_stop_id_in_process,
+        test_overlapping_copies_of_one_stop_are_serialised,
         test_module_records_both_kinds,
         test_a_no_send_counts_for_this_turn_only,
         test_the_file_is_bounded_and_keeps_the_newest,
