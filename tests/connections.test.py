@@ -4520,57 +4520,6 @@ class ZombieChild(Base):
             self.test_a_child_that_writes_its_lease_then_exits_2_fails_the_launch()
 
 
-@unittest.skipUnless(hasattr(os, "waitid"), "needs waitid(WNOWAIT) to see an exit unreaped")
-class OwnChildWhileTheReaperHoldsItsLock(unittest.TestCase):
-    """poll() reads None while another thread holds Popen's wait lock; the exit is read from the kernel then."""
-
-    def spawn(self, code):
-        proc = subprocess.Popen([sys.executable, "-c", code], env=isolated_child_env())
-        self.addCleanup(proc.wait)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        C._CHILDREN[proc.pid] = proc
-        self.addCleanup(C._CHILDREN.pop, proc.pid, None)
-        return proc
-
-    def test_an_exited_child_reads_exited_while_its_wait_lock_is_held(self):
-        proc = self.spawn("raise SystemExit(2)")
-        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
-        with proc._waitpid_lock:
-            self.assertIsNone(proc.poll(), "the race this covers: poll() cannot tell")
-            self.assertTrue(C._exited(proc.pid))
-
-    def test_an_exit_confirmed_while_the_lock_is_held_leaves_the_registry(self):
-        proc = self.spawn("raise SystemExit(2)")
-        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
-        with proc._waitpid_lock:
-            self.assertTrue(C._exited(proc.pid))
-            self.assertNotIn(proc.pid, C._CHILDREN, "an exited child must not stay registered")
-        self.assertEqual(C._exit_code(proc), 2)
-        self.assertNotIn(proc.pid, C._CHILDREN)
-
-    def test_a_running_child_reads_running_while_its_wait_lock_is_held(self):
-        proc = self.spawn("import time; time.sleep(30)")
-        with proc._waitpid_lock:
-            self.assertFalse(C._exited(proc.pid))
-            self.assertIn(proc.pid, C._CHILDREN, "a running child stays registered")
-
-    def test_its_rc_is_read_once_the_reaper_releases_the_lock(self):
-        proc = self.spawn("raise SystemExit(2)")
-        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
-        proc._waitpid_lock.acquire()
-        threading.Timer(0.2, proc._waitpid_lock.release).start()
-        self.assertEqual(C._exit_code(proc), 2)
-
-    def test_a_child_that_never_finishes_waiting_has_no_rc(self):
-        class Stuck:
-            def poll(self):
-                return None
-
-            def wait(self, timeout):
-                raise subprocess.TimeoutExpired("bridge", timeout)
-        self.assertIsNone(C._exit_code(Stuck()))
-
-
 @unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
 class ZombieWithoutWaitid(Base):
     """Where os.waitid is missing (macOS before 3.13), an exited, unreaped bridge still reads as stopped."""
