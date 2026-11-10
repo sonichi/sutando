@@ -225,6 +225,9 @@ KNOWN_HEADER_KEYS = (
     # Broker attestation that the message @-mentioned the owner, not this agent;
     # the core reads it to keep out of the room, so the guard defangs a forged copy.
     "owner_mentioned",
+    # Who asked a relay task, which its `user_id` (the account it runs for) does not say.
+    # Bridge-written above task:, so the guard defangs a forged body copy.
+    "asked_by",
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",

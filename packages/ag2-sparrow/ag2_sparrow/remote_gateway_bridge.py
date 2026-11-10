@@ -2738,6 +2738,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The broker's word that the message mentioned the owner, not this agent.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "owner_mentioned",
+                # Who asked a relay task; its user_id is the account it runs for. Above "task"
+                # so the strict parser reads it, and the dedup fold checks it.
+                "asked_by",
                 # Commons hook-fire / Summon contexts, each one JSON line. Above "task":
                 # the agent's safe parser must see which hook or row change it serves.
                 "hook",
