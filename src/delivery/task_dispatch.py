@@ -34,6 +34,7 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py inflight-clear <inflight_dir> <filename>
     task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
     task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
+    task_dispatch.py partial-owner <partial_dir> <incarnation>   # composer text on stdin; prints a filename, exit 0/1
     task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
@@ -80,7 +81,7 @@ __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
-    "mark_partial_paste", "partial_paste_leftover",
+    "mark_partial_paste", "partial_paste_leftover", "partial_paste_owner",
     "announced_entry",
 ]
 
@@ -439,6 +440,30 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
     return rest or None
 
 
+def partial_paste_owner(partial_dir: "Path | str", incarnation: str, composer_text: str) -> "str | None":
+    """The task whose recorded leftover, live for the CURRENT incarnation, is exactly
+    `composer_text`, whitespace aside; None when no record matches.
+
+    A paste a notifier gave up on belongs to one task, but the next delivery may be for
+    another, or that task may have been answered another way, so nothing would ever try
+    that task again (#6346). Only text this notifier recorded as its own can match, so a
+    human draft never does; an empty composer, an unreadable incarnation or a record with
+    no text matches nothing.
+    """
+    want = "".join(composer_text.split())
+    if not want or not incarnation.strip():
+        return None
+    try:
+        names = sorted(p.name for p in Path(partial_dir).iterdir() if p.is_file() and not p.name.startswith("."))
+    except FileNotFoundError:
+        return None
+    for name in names:
+        text = partial_paste_leftover(partial_dir, name, incarnation)
+        if text is not None and "".join(text.split()) == want:
+            return name
+    return None
+
+
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename> [--task-file P]\n"
     "       task_dispatch.py wake-turn <tasks_dir> <filename>   # exit 0 a wake turn / 1 not\n"
@@ -456,7 +481,8 @@ _USAGE = (
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
     "       task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional\n"
-    "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1"
+    "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1\n"
+    "       task_dispatch.py partial-owner <partial_dir> <incarnation>   # composer text on stdin; prints a filename, exit 0/1"
 )
 
 
@@ -645,6 +671,20 @@ def _main(argv: list[str]) -> int:
         if text is None:
             return 1
         sys.stdout.write(text)
+        return 0
+    if cmd == "partial-owner":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            owner = partial_paste_owner(first, second, sys.stdin.read())
+        except OSError as exc:
+            # 2 = cannot decide; 1 would read as "not ours", which a caller also refuses on.
+            print(f"task_dispatch.py: partial-owner: cannot read the records ({exc})", file=sys.stderr)
+            return 2
+        if owner is None:
+            return 1
+        print(owner)
         return 0
     if cmd == "owned-by":
         if rest:

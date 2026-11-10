@@ -205,6 +205,65 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertIn("clear the composer", blocked[0])
         self.assertNotIn("press Enter", blocked[0], "Enter would submit the composer as it is")
 
+    SHORT = "task-short.txt"
+
+    def _abandoned_then(self, answer_first=True):
+        """#6346: the notifier gave up on LONG's paste, then LONG was answered another way (or not),
+        and SHORT is delivered next. Returns that delivery's run."""
+        self._pick_with_a_dropped_chunk()
+        if answer_first:
+            self.write_result(self.LONG)
+        self.write_task(self.SHORT)
+        before = len(self._chunks())
+        t = self._finish_on(self.SHORT, lambda log: "ENTER" in log)
+        r = self.run_event(self.SHORT, timeout=40)
+        t.join()
+        return r, before
+
+    def test_a_paste_abandoned_for_an_answered_task_is_cleared_for_the_next_one(self):
+        r, before = self._abandoned_then()
+        self.assertIn(f"abandoned for {self.LONG}; cleared it before delivering {self.SHORT}", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.sendkeys_log_text()
+        self.assertEqual(log.count("BSPACE "), 1, "the leftover was cleared exactly once")
+        self.assertEqual(log.count("ENTER"), 1, log)
+        self.assertEqual("".join(self._chunks()[before:]), self.expected_prompt(self.SHORT), "SHORT typed whole after")
+        self.assertFalse((self.tasks_dir.parent / "state" / "task-notifier-partial-paste" / self.LONG).exists(),
+                         "the abandoned paste's record goes with it")
+
+    def test_a_paste_abandoned_for_a_task_still_queued_is_cleared_too(self):
+        r, _before = self._abandoned_then(answer_first=False)
+        self.assertIn(f"abandoned for {self.LONG}", r.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1)
+
+    def test_an_owner_draft_is_still_refused_for_another_task(self):
+        self._pick_with_a_dropped_chunk()
+        self.write_result(self.LONG)
+        self.pane_file.write_text(_h.DRAFT_FOOTER + "\n")
+        self.write_task(self.SHORT)
+        r = self.run_event(self.SHORT, timeout=40)
+        self.assertNotIn("BSPACE", self.sendkeys_log_text())
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertIn("composer not empty", r.stderr)
+
+    def test_our_leftover_plus_owner_text_is_refused_for_another_task(self):
+        self._pick_with_a_dropped_chunk()
+        landed = self.expected_prompt(self.LONG).encode()[:sum(self._boundaries(self.LONG)[:self.LANDED])].decode()
+        self._set_composer(landed + " and the owner typed this")
+        self.write_task(self.SHORT)
+        r = self.run_event(self.SHORT, timeout=40)
+        self.assertNotIn("BSPACE", self.sendkeys_log_text())
+        self.assertIn("composer not empty", r.stderr)
+
+    def test_a_paste_abandoned_in_another_core_incarnation_is_refused_for_another_task(self):
+        self._pick_with_a_dropped_chunk()
+        self.pane_pid_file.write_text("9999")
+        self.write_task(self.SHORT)
+        r = self.run_event(self.SHORT, timeout=40)
+        self.assertNotIn("BSPACE", self.sendkeys_log_text())
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertIn("composer not empty", r.stderr)
+
     def test_a_prefix_not_on_a_chunk_boundary_is_refused(self):
         self._pick_with_a_dropped_chunk()
         # The next chunk landed short: our prefix plus part of a chunk is not a resume point.
