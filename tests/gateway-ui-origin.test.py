@@ -111,6 +111,29 @@ class WriterCarriesTheHandle(_Base):
         self.assertLess(rgb._TASK_FIELDS.index("ui_origin"), rgb._TASK_FIELDS.index("task"))
 
 
+class OwnerHintFollowsTheHandle(_Base):
+    def test_owner_task_with_a_handle_gets_the_hint(self):
+        text = self.write("uo-hint", ui_origin="uo-hint")
+        self.assertIn(rgb.UI_ORIGIN_NOTE + "\n", text)
+        self.assertLess(text.index("access_tier:"), text.index(rgb.UI_ORIGIN_NOTE))
+        self.assertIn("ui_request", rgb.UI_ORIGIN_NOTE)
+
+    def test_no_or_malformed_handle_gets_no_hint(self):
+        self.assertNotIn(rgb.UI_ORIGIN_NOTE, self.write("uo-nohint"))
+        self.assertNotIn(rgb.UI_ORIGIN_NOTE, self.write("uo-badhint", ui_origin="a b"))
+
+    def test_non_owner_task_gets_no_hint(self):
+        with patch.object(rgb, "_tier_for", lambda *_a: "team"):
+            text = self.write("uo-team", ui_origin="uo-team")
+        self.assertIn("access_tier: team", text)
+        self.assertNotIn(rgb.UI_ORIGIN_NOTE, text)
+
+    def test_hint_is_one_prose_line_not_a_header(self):
+        self.assertNotIn("\n", rgb.UI_ORIGIN_NOTE)
+        self.assertNotRegex(rgb.UI_ORIGIN_NOTE, r"^[A-Za-z_]+:")
+        self.assertEqual(attested_task_headers(self.write("uo-h1", ui_origin="h"), TMP).get("ui_origin"), "h")
+
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=2)
