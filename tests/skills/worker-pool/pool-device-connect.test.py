@@ -221,6 +221,26 @@ class Edges(Base):
         with unittest.mock.patch.object(C, "add_worker_identity", refuse):
             self.refused(ConnectFake(self.backend), "vault unavailable; the approved agent")
 
+    def test_a_pasted_identity_added_while_the_token_is_checked_is_not_overwritten_or_reported(self):
+        # The pasted-token add takes no roster lock, so it can land after the fence's own check.
+        other, real = "@owner-desk-pasted.agent:alpha-fixture.net", self.preview
+        pasted = self.backend.add_agent(other, "bearer-pasted")
+
+        def preview(token):
+            if C.worker_identity(W, self.ws) is None:
+                C.add_worker_identity(W, pasted, expected_server="alpha-fixture.net", preview=real(pasted),
+                                      workspace=self.ws, vault=self.vault)
+            return real(token)
+        self.preview = preview
+        starts = []
+        fake = ConnectFake(self.backend)
+        with self.assertRaises(dc.DeviceConnectError) as e:
+            self.connect(fake, start_lane=lambda row: starts.append(row))
+        self.assertIn("already had a connection", str(e.exception))
+        self.assertEqual(starts, [])
+        self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], other)
+        self.assertNoSecret(fake, str(e.exception))
+
     def test_an_identity_that_changes_during_the_wait_is_refused(self):
         self.connect(ConnectFake(self.backend))
         fake = ConnectFake(self.backend)
