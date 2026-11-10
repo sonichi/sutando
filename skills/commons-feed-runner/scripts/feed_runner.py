@@ -9,6 +9,7 @@ judgment. It never calls anything itself and holds no state.
   due     <me> <room_id>=<feeds.json>... the runs due now, one per active grant of mine
   rows    <run.json> <composio.json>    the feeds.write arguments for one run
   outcome <write.json>                  done, wait (retry_after_s), stop or fail
+  fail    <run.json> <connector.json>   the feeds.fail arguments for a run that could not write
 
 Each JSON file is a tool's whole reply as it came back, wrapper included. The backend holds
 the same rules (room-collab commons_feeds.write_plan): this script keeps a run from even asking
@@ -109,8 +110,12 @@ def due(me: str, replies: list, now_ms: int) -> dict:
             last = _ms(grant.get("last_run_at"))
             if grant.get("agent") != me:
                 continue  # another agent's grant: not this runner's, and not worth a line
+            moves = grant.get("you_may")
             if grant.get("status") != "active":
                 why = f"grant is {grant.get('status')}"
+            elif isinstance(moves, list) and "write" not in moves:
+                # The backend's own word for this caller (feeds.list you_may), when it gives one.
+                why = "the backend offers this agent no write on it"
             elif kind in GATED:
                 why = GATED[kind]
             elif kind != CALENDAR:
@@ -231,6 +236,30 @@ def rows(run: dict, reply) -> dict:
     return {"grant_id": run["grant_id"], "run_key": run["run_key"], "rows": out}
 
 
+# feeds.fail's closed codes: the app shows the error plainly, and nothing of the connector's
+# own text (an account, a token, a message) is ever passed on.
+FAIL_CODES = ("connector_not_connected", "connector_error", "connector_rate_limited",
+              "projection_error")
+
+
+def failure(run: dict, reply) -> dict:
+    """The room.commons.feeds.fail arguments for a run whose connector reply could not become
+    rows: why, as one of the closed codes, judged from the reply's shape and never quoted."""
+    text = json.dumps(reply).lower()
+    if "connect_required" in text or "not connected" in text or "no connected account" in text:
+        code = "connector_not_connected"
+    elif "rate limit" in text or "rate_limit" in text or "429" in text or "too many requests" in text:
+        code = "connector_rate_limited"
+    else:
+        try:
+            holder = _unwrap(reply, "items")
+        except Refused:
+            holder = None
+        failed = holder is None or holder.get("successful") is False or holder.get("error")
+        code = "connector_error" if failed else "projection_error"
+    return {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code}
+
+
 def outcome(reply) -> dict:
     """What a feeds.write reply means for the run and its task: done, wait (the backend's
     retry_after_s), stop (the grant is no longer active) or fail."""
@@ -278,7 +307,7 @@ def _read(path: str):
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome"):
+    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     now_ms = int(datetime.datetime.now(datetime.UTC).timestamp() * 1000)
@@ -292,6 +321,8 @@ def main(argv: list[str]) -> int:
             answer = rows(_read(argv[2]), _read(argv[3]))
         elif argv[1] == "outcome" and len(argv) == 3:
             answer = outcome(_read(argv[2]))
+        elif argv[1] == "fail" and len(argv) == 4:
+            answer = failure(_read(argv[2]), _read(argv[3]))
         else:
             print(__doc__.strip(), file=sys.stderr)
             return 2

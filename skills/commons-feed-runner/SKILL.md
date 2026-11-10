@@ -54,11 +54,16 @@ Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts
       and `operation_id` = the same key. An existing task for that key that is already closed
       means the slot was handled: go to the next run.
    2. `composio_exec` with `run.connector.toolkit`, `run.connector.action` and
-      `run.connector.arguments`, exactly. Save the whole reply to `connector.json`. A
-      `connect_required` answer: close the task `failed` with outcome "The calendar is not
-      connected" and tell the owner in your DM with them once a day at most.
-   3. `python3 $S/feed_runner.py rows run.json connector.json > write.json`. Exit 1: close the
-      task `failed` with the printed reason (it names no event content) and go on.
+      `run.connector.arguments`, exactly. Save the whole reply to `connector.json`.
+   3. `python3 $S/feed_runner.py rows run.json connector.json > write.json`. Exit 1 means the
+      run cannot write. Report why, so the app shows an error instead of old rows looking fresh:
+      `python3 $S/feed_runner.py fail run.json connector.json > fail.json`, then
+      `room.action.execute` `room.commons.feeds.fail` with the arguments in `fail.json` (a
+      closed code, never the connector's text), the task's `task_id` and
+      `execution_generation`, and `operation_id` = the run key + `:fail`. Close the task
+      `failed` with the outcome "The feed refresh could not read its source". For
+      `connector_not_connected`, also tell the owner in your DM with them, once a day at most,
+      that their account needs connecting. Then go on to the next run.
    4. `room.action.execute` `room.commons.feeds.write` in `run.room_id` with the arguments in
       `write.json`, `task_id` and `execution_generation` from step 1, and `operation_id` =
       the run key. Save the whole reply, success or refusal, to `result.json`.
@@ -66,7 +71,7 @@ Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts
       `outcome` (`room.task.update`). `wait` means the backend's schedule is ahead of yours;
       `stop` means the grant was revoked, paused or expired: there is nothing to do but close.
       `fail` carries a `reason` for your own log; the task outcome stays the generic line.
-   6. Delete `connector.json`, `write.json` and `result.json`.
+   6. Delete `connector.json`, `write.json`, `fail.json` and `result.json`.
 
 ## When C3 lands
 

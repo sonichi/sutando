@@ -222,4 +222,37 @@ with tempfile.TemporaryDirectory() as tmp:
     usage = subprocess.run([sys.executable, str(_SCRIPT), "nope"], capture_output=True, text=True)
     check("an unknown command prints the usage", usage.returncode == 2)
 
+# ---- fail ------------------------------------------------------------------------------
+
+for reply, code in (
+        ({"error": "connect_required: googlecalendar is not connected"}, "connector_not_connected"),
+        ({"data": {}, "successful": False, "error": "429 Too Many Requests"}, "connector_rate_limited"),
+        ({"data": {}, "successful": False, "error": "token for qy@x.com expired"}, "connector_error"),
+        ({"nothing": 1}, "connector_error"),
+        ({"data": {"items": [{"id": "e", "start": "not a date"}]}, "successful": True},
+         "projection_error")):
+    args = fr.failure(run, reply)
+    check(f"a failed run reports {code}",
+          args == {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code})
+    check(f"the {code} report quotes nothing of the connector's answer",
+          "qy@x.com" not in json.dumps(args) and "expired" not in json.dumps(args))
+check("every reported code is one feeds.fail takes", set(fr.FAIL_CODES) == {
+    "connector_not_connected", "connector_error", "connector_rate_limited", "projection_error"})
+
+offered = fr.due(ME, [(ROOM, listed(grant(you_may=["pause", "write", "fail"]),
+                                    grant(grant_id="gnowrite01", you_may=["pause"])))], NOW)
+check("a grant the backend offers no write on is skipped, one it does is run",
+      [r["grant_id"] for r in offered["runs"]] == ["gabc123def"]
+      and {s["grant_id"]: s["why"] for s in offered["skipped"]}["gnowrite01"]
+      == "the backend offers this agent no write on it")
+
+with tempfile.TemporaryDirectory() as tmp:
+    run_file, reply_file = Path(tmp) / "run.json", Path(tmp) / "connector.json"
+    run_file.write_text(json.dumps(run))
+    reply_file.write_text(json.dumps({"error": "connect_required"}))
+    out = subprocess.run([sys.executable, str(_SCRIPT), "fail", str(run_file), str(reply_file)],
+                         capture_output=True, text=True)
+    check("fail runs from the command line", out.returncode == 0
+          and json.loads(out.stdout)["code"] == "connector_not_connected")
+
 print(f"commons-feed-runner: {len(passed)} passed")
