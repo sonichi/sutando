@@ -33,7 +33,7 @@ def check(name: str, ok: bool) -> None:
 
 ME = "@owner-desk.agent:ag2.space"
 ROOM = "!hub:ag2.space"
-NOW = int(datetime.datetime(2026, 11, 9, 18, 7, tzinfo=datetime.UTC).timestamp() * 1000)
+NOW = int(datetime.datetime(2026, 11, 9, 18, 7, tzinfo=datetime.timezone.utc).timestamp() * 1000)
 EVERY = 30
 # The backend's cell rules for the columns a calendar feed has.
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$")
@@ -266,5 +266,22 @@ for reply, name in (({"code": "NOT_FOUND", "message": "no such action"}, "an unk
                     ({"nothing": 1}, "an unreadable reply")):
     check(f"{name} means a backend from before the report: log, never crash",
           fr.capable(reply) == {"report_failures": False})
+
+# ---- review (sonichi-dot): the envelope's own failure, and the Python floor ---------------
+
+failed_envelope = {"data": {"items": [], "kind": "calendar#events"}, "successful": False,
+                   "error": "token for qy@x.com expired"}
+for wrap, name in ((failed_envelope, "plain"),
+                   ({"content": [{"type": "text", "text": json.dumps(failed_envelope)}]}, "MCP")):
+    try:
+        fr.rows(run, wrap)
+        ok = False
+    except fr.Refused as exc:
+        ok = "qy@x.com" not in str(exc)
+    check(f"a failed {name} envelope is refused, never written as an empty feed", ok)
+    check(f"a failed {name} envelope is reported as a connector error",
+          fr.failure(run, wrap)["code"] == "connector_error")
+check("no 3.11-only datetime.UTC in the runner (Python 3.9 floor)",
+      "datetime.UTC" not in _SCRIPT.read_text())
 
 print(f"commons-feed-runner: {len(passed)} passed")

@@ -44,6 +44,10 @@ GRANT_ID_RE = re.compile(r"g[a-z0-9]{9}")
 URL_RE = re.compile(r"^https?://\S+$")
 
 
+# The datetime module's UTC constant is 3.11+; shipped skill scripts support Python 3.9.
+UTC = datetime.timezone.utc
+
+
 class Refused(Exception):
     """A reply this script cannot read, or a run it will not make: printed, exit 1."""
 
@@ -88,7 +92,7 @@ def calendar_call(grant: dict, now_ms: int) -> dict:
     days = query.get("window_days", 14)
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 60:
         raise Refused("window_days is 1 to 60")
-    start = datetime.datetime.fromtimestamp(now_ms / 1000, datetime.UTC)
+    start = datetime.datetime.fromtimestamp(now_ms / 1000, UTC)
     stamp = "%Y-%m-%dT%H:%M:%SZ"
     return {"toolkit": "googlecalendar", "action": "GOOGLECALENDAR_EVENTS_LIST",
             "arguments": {"calendarId": "primary", "timeMin": start.strftime(stamp),
@@ -168,7 +172,7 @@ def _when(value) -> str | None:
         return None
     if moment.tzinfo is None:
         return None
-    return moment.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%M")
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M")
 
 
 def _https(url, hosts=None) -> str | None:
@@ -178,6 +182,22 @@ def _https(url, hosts=None) -> str | None:
     if parts.scheme != "https" or (hosts is not None and parts.hostname not in hosts):
         return None
     return url
+
+
+def _envelope_failed(reply) -> bool:
+    """Whether the connector's envelope says the call failed. Composio puts `successful` and
+    `error` beside `data`, which holds `items`: read them where they are, never inside it."""
+    try:
+        envelope = _unwrap(reply, "successful")
+    except Refused:
+        envelope = None
+    if envelope is not None and (envelope.get("successful") is False or envelope.get("error")):
+        return True
+    try:
+        inner = _unwrap(reply, "items")
+    except Refused:
+        return False
+    return inner.get("successful") is False or bool(inner.get("error"))
 
 
 def calendar_row(event: dict, fields: list) -> dict | None:
@@ -219,10 +239,9 @@ def rows(run: dict, reply) -> dict:
     """The room.commons.feeds.write arguments for one run's connector reply."""
     if run.get("kind") != CALENDAR:
         raise Refused(f"no projection for {run.get('kind')!r}")
-    holder = _unwrap(reply, "items")
-    if holder.get("successful") is False or holder.get("error"):
-        raise Refused(f"the connector call failed: {holder.get('error') or 'unsuccessful'}")
-    items = holder["items"]
+    if _envelope_failed(reply):
+        raise Refused("the connector call failed")  # its own text may name the account
+    items = _unwrap(reply, "items")["items"]
     if not isinstance(items, list):
         raise Refused("the connector's items is not a list")
     out, seen = [], set()
@@ -253,10 +272,10 @@ def failure(run: dict, reply) -> dict:
         code = "connector_rate_limited"
     else:
         try:
-            holder = _unwrap(reply, "items")
+            _unwrap(reply, "items")
+            failed = _envelope_failed(reply)
         except Refused:
-            holder = None
-        failed = holder is None or holder.get("successful") is False or holder.get("error")
+            failed = True
         code = "connector_error" if failed else "projection_error"
     return {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code}
 
@@ -324,7 +343,7 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "capable"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    now_ms = int(datetime.datetime.now(datetime.UTC).timestamp() * 1000)
+    now_ms = int(datetime.datetime.now(UTC).timestamp() * 1000)
     try:
         if argv[1] == "due" and len(argv) >= 4:
             pairs = [arg.split("=", 1) for arg in argv[3:]]
