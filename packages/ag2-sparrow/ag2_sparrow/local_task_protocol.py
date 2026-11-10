@@ -245,6 +245,9 @@ KNOWN_HEADER_KEYS = (
     # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
     # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
+    # The broker's handle for the window the owner messaged from; the agent passes it to the
+    # ui_* MCP tools. Bridge-written above task:, so the guard defangs a forged body copy.
+    "ui_origin",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it

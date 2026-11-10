@@ -68,6 +68,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'event_type',
 	'agent_trigger_id',
 	'playbook',
+	'ui_origin',
 ];
 
 /** Alternation source for a header-line guard. Keys are plain

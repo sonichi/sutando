@@ -2719,6 +2719,8 @@ _heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
 
+# An opaque broker task id; anything else is dropped rather than written as a header.
+_UI_ORIGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,199}")
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
@@ -2748,6 +2750,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # AgentTrigger context, above "task" so the strict parser reads it: the event
                 # behind this task, its idempotency id and the playbook it names.
                 "event_type", "agent_trigger_id", "playbook",
+                # The UI-control handle, present only when the owner's message was stamped.
+                # Above "task" so the strict parser reads it and a body cannot claim it.
+                "ui_origin",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -6337,6 +6342,10 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f == "task_layout":
             lines.append("task_layout: mid")
+        elif f == "ui_origin":
+            uo = task.get(f)
+            if isinstance(uo, str) and _UI_ORIGIN_RE.fullmatch(uo):
+                lines.append(f"ui_origin: {uo}")
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
