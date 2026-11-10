@@ -6,6 +6,8 @@ the desktop's s-space entry plus `env_vars` naming the worker and its credential
 both into the session. A broken resolver still exports `[]`, which the proxy refuses to start on.
 """
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -84,6 +86,26 @@ class Registration(unittest.TestCase):
         self.claude_json({"command": odd, "args": [odd], "env": {"K": odd}})
         t = seat_table(M.overrides(M.registration(self.codex, self.claude)))
         self.assertEqual((t["command"], t["args"], t["env"]), (odd, [odd], {"K": odd}))
+
+    def test_booleans_and_numbers_keep_their_types_and_other_values_are_refused(self):
+        (self.codex / "config.toml").write_text(CODEX_TOML.replace(
+            "startup_timeout_sec = 30\n", "startup_timeout_sec = 2.5\nenabled = true\nrequired = false\n"))
+        t = seat_table(M.overrides(M.registration(self.codex)))
+        self.assertEqual((t["startup_timeout_sec"], t["enabled"], t["required"]), (2.5, True, False))
+        with self.assertRaises(ValueError):
+            M.overrides({"command": "/n", "args": [], "when": object()})
+
+    def test_the_cli_prints_one_argument_per_line_and_nothing_without_a_registration(self):
+        self.claude_json(CLAUDE_ENTRY)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(M.main(["--codex-home", str(self.codex), "--claude-config-dir", str(self.claude)]), 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(seat_table(lines)["command"], "/a s/node")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(M.main(["--codex-home", str(self.codex)]), 0)
+        self.assertEqual(out.getvalue(), "")
 
     def test_nothing_is_printed_when_no_config_registers_a_stdio_server(self):
         self.assertEqual(M.overrides(M.registration(self.codex, self.claude)), [])

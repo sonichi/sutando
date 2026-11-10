@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 try:
     import tomllib
-except ModuleNotFoundError:  # Python < 3.11: the launcher may resolve the system 3.9
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11: the launcher may resolve the system 3.9
     try:
         import tomli as tomllib
     except ModuleNotFoundError:
@@ -100,5 +100,5 @@ def main(argv=None) -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - exercised as a subprocess by the launcher tests
     sys.exit(main())
