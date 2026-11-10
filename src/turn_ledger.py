@@ -426,15 +426,28 @@ def last_stop_ts(workspace: Path | str | None = None, session: str | None = None
     return float(ts) if isinstance(ts, (int, float)) else None
 
 
-def mark_stop(workspace: Path | str | None = None, session: str | None = None) -> float:
-    """Record that a turn ended here; the next turn is measured from it."""
+def mark_stop(workspace: Path | str | None = None, session: str | None = None,
+              stop_id: str | None = None) -> float:
+    """Record that a turn ended here; the next turn is measured from it. `stop_id` names
+    the Stop event that ended it, so a second hook for that same event is recognised."""
     session = _resolve_session(session)
     now = time.time()
+    record = {"ts": now, "stop_id": stop_id} if stop_id else {"ts": now}
     try:
-        write_status(_scoped_name(STOP_NAME, session), {"ts": now}, _workspace(workspace))
+        write_status(_scoped_name(STOP_NAME, session), record, _workspace(workspace))
     except OSError:
         pass
     return now
+
+
+def _allowed_stop_id(ws: Path, session: str | None) -> str | None:
+    """The Stop event the last allowed turn ending was recorded for, if it named one."""
+    try:
+        raw = json.loads(status_read_path(_scoped_name(STOP_NAME, session), ws).read_text())
+    except (OSError, ValueError):
+        return None
+    sid = raw.get("stop_id") if isinstance(raw, dict) else None
+    return sid if isinstance(sid, str) and sid else None
 
 
 def begin_turn(workspace: Path | str | None = None, session: str | None = None) -> None:
@@ -472,7 +485,7 @@ ENDED_ON_A_MESSAGE_S = 20.0
 
 
 def stop_gate(workspace: Path | str | None = None, session: str | None = None,
-              commit: bool = True) -> str | None:
+              commit: bool = True, stop_id: str | None = None) -> str | None:
     """None when the turn may end; otherwise the reason it must not.
 
     Allowing a stop RECORDS it, so the decision and the next turn's starting
@@ -488,13 +501,20 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None,
     entries tagged for this session (or untagged) — see the module docstring's
     SESSION SCOPING note. No session anywhere reproduces the original
     shared-file, unfiltered behavior exactly.
+
+    `stop_id` names the Stop event. When the stop already allowed was this same event,
+    a second Stop hook registered for it (#6208: project and config-dir settings both
+    carry one) gets the same answer and writes nothing: judged afresh, it would find
+    the boundary the first one just moved and refuse the turn that already ended.
     """
     session = _resolve_session(session)
     ws = _workspace(workspace)
+    if stop_id and _allowed_stop_id(ws, session) == stop_id:
+        return None
     reason = _refusal(ws, session)
     if commit:
         if reason is None:
-            mark_stop(ws, session)
+            mark_stop(ws, session, stop_id)
         else:
             spend_reminder(ws, session)
     return reason
@@ -555,6 +575,11 @@ def main(argv: list[str]) -> int:
         i = args.index("--session")
         session = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
+    stop_id = None
+    if "--stop-id" in args:
+        i = args.index("--stop-id")
+        stop_id = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
     commit = "--commit" in args
     if commit:
         args.remove("--commit")
@@ -563,7 +588,7 @@ def main(argv: list[str]) -> int:
         begin_turn(ws, session)
         return 0
     if cmd == "stop-gate":
-        reason = stop_gate(ws, session, commit=commit)
+        reason = stop_gate(ws, session, commit=commit, stop_id=stop_id)
         if reason:
             print(reason)
             return 1
@@ -577,7 +602,7 @@ def main(argv: list[str]) -> int:
         record_no_send(" ".join(args[1:]), ws, session)
         return 0
     print(f"usage: {Path(__file__).name} [--workspace DIR] [--session ID] "
-          "turn-start | stop-gate [--commit] | send KIND TARGET | no-send REASON | no-send-this-turn",
+          "turn-start | stop-gate [--commit] [--stop-id ID] | send KIND TARGET | no-send REASON | no-send-this-turn",
           file=sys.stderr)
     return 2
 

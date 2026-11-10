@@ -355,7 +355,7 @@ fi
 # stdin at EOF) reports the same decision and records nothing.
 COMMIT=()
 # No EOF within 2s is a slow real writer, so that records the stop as before.
-if [ ! -t 0 ] && "$PYBIN" -c 'import json,os,select,sys,time
+if [ ! -t 0 ] && STOP_ID="$("$PYBIN" -c 'import json,os,select,sys,time
 buf, end = b"", time.monotonic() + 2
 while True:
     left = end - time.monotonic()
@@ -367,8 +367,20 @@ while True:
     buf += chunk
 try: d = json.loads(buf or b"{}")
 except ValueError: d = {}
-sys.exit(0 if isinstance(d, dict) and d.get("hook_event_name") == "Stop" else 1)' 2>/dev/null; then
+if not (isinstance(d, dict) and d.get("hook_event_name") == "Stop"):
+    sys.exit(1)
+try:
+    import hashlib
+    path = d["transcript_path"]
+    st = os.stat(path)
+    key = "|".join(map(str, (d.get("session_id"), path, st.st_size, st.st_mtime_ns)))
+    sys.stdout.write(hashlib.sha256(key.encode()).hexdigest()[:32])
+except Exception:
+    pass
+sys.exit(0)' 2>/dev/null)"; then
   COMMIT=(--commit)
+  # Which Stop event this is: a second copy of this hook for the same one gets the same answer (#6208).
+  [ -n "$STOP_ID" ] && COMMIT+=(--stop-id "$STOP_ID")
 fi
 STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate "${COMMIT[@]}" 2>/dev/null)"
 STOP_RC=$?
