@@ -7,8 +7,10 @@ of its own that answers only what is addressed to that agent, hands every task i
 worker, and posts nothing proactively. Retiring the worker (pool_manage retire) takes it away.
 
     python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME]
+    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] show <worker>
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
+    python3 pool_identity.py [--workspace WS] rotate <worker> --device-flow --label LABEL [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] remove <worker>
     python3 pool_identity.py [--workspace WS] provision-begin <worker> [--role ROLE] [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-wait <worker> --operation-id ID --name NAME
@@ -20,6 +22,11 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
+
+`--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
+device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
+approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
+saves the token in the vault. It prints one JSON line with the agent id and a status.
 
 The `provision-*` verbs need no pasted token (pool_provision.py). `provision-begin` prints the
 SHA-256 the `agent.create` Action takes and a suggested name. `provision-wait` makes that call as
@@ -40,6 +47,7 @@ _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
 import connections
+import pool_device_connect
 import pool_provision
 import pool_roster as pr
 from workspace_default import resolve_workspace
@@ -72,7 +80,25 @@ def preview_text(p: dict) -> str:
                      + ([f"error:   {p['error']}"] if p.get("error") else []))
 
 
+def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
+    wid = live_worker(ws, args.worker)
+    if not args.label:
+        print("pool_identity: --device-flow needs --label <the agent's name>", file=sys.stderr)
+        return 2
+    label = str(((pr.load_roster(ws) or {}).get("workers") or {}).get(wid, {}).get("label") or args.worker)
+    out = pool_device_connect.connect(
+        wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
+        workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
+        say=lambda text: print(text, file=sys.stderr, flush=True))
+    if rotate:
+        print(json.dumps({"agent_id": out["agent_id"], "status": out["status"]}, sort_keys=True))
+        return 0
+    return _provisioned(args, ws, out)
+
+
 def cmd_add(args, ws: Path) -> int:
+    if args.device_flow:
+        return cmd_device_flow(args, ws, rotate=False)
     wid = live_worker(ws, args.worker)
     token = read_token(args.token, f"Access token for {args.worker}'s own agent (hidden): ")
     preview = connections.preview_connection(token)
@@ -110,6 +136,8 @@ def cmd_show(args, ws: Path) -> int:
 
 
 def cmd_rotate(args, ws: Path) -> int:
+    if args.device_flow:
+        return cmd_device_flow(args, ws, rotate=True)
     row = connections.worker_identity(live_worker(ws, args.worker), ws)
     if row is None:
         print(f"pool_identity: {args.worker} has no agent of its own to rotate", file=sys.stderr)
@@ -190,14 +218,18 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--workspace", type=Path, default=None)
     sub = p.add_subparsers(dest="verb", required=True)
-    s = sub.add_parser("add"); s.add_argument("worker"); s.add_argument("token", nargs="?", default=None)
-    s.add_argument("--repo", type=Path, required=True); s.add_argument("--logs-dir", type=Path, required=True)
-    s.add_argument("--yes", action="store_true"); s.add_argument("--expected-server", default=None)
-    s.set_defaults(fn=cmd_add)
+    a = sub.add_parser("add"); a.add_argument("worker"); a.add_argument("token", nargs="?", default=None)
+    a.add_argument("--yes", action="store_true"); a.add_argument("--expected-server", default=None)
+    a.set_defaults(fn=cmd_add)
     s = sub.add_parser("show"); s.add_argument("worker"); s.set_defaults(fn=cmd_show)
-    s = sub.add_parser("rotate"); s.add_argument("worker"); s.add_argument("token", nargs="?", default=None)
-    s.add_argument("--repo", type=Path, required=True); s.add_argument("--logs-dir", type=Path, required=True)
-    s.set_defaults(fn=cmd_rotate)
+    r = sub.add_parser("rotate"); r.add_argument("worker"); r.add_argument("token", nargs="?", default=None)
+    r.set_defaults(fn=cmd_rotate)
+    for s in (a, r):
+        # A pasted token needs --repo and --logs-dir; --device-flow defaults them.
+        s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
+        s.add_argument("--device-flow", action="store_true"); s.add_argument("--label", default=None)
+        s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
+        s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
@@ -218,7 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.verb in ("add", "rotate") and not args.device_flow and (args.repo is None or args.logs_dir is None):
+        parser.error(f"{args.verb} with a token needs --repo and --logs-dir")
     ws = args.workspace if args.workspace is not None else resolve_workspace()
     try:
         return args.fn(args, Path(ws))

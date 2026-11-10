@@ -169,6 +169,25 @@ the launch and the record disagree, or neither can say, the lane refuses to star
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
 itself stays on its server until the owner deletes it there.
 
+### Giving a worker its own agent: the device-connect flow (the standard way)
+
+The core starts s.space's device-connect flow and the owner approves it in a browser; nobody pastes a token.
+Use it when the owner asked for the worker to have its own agent:
+
+```bash
+python3 skills/worker-pool/scripts/pool_identity.py add <worker> --device-flow --label <name> [--display-name TEXT] [--lane INSTANCE]
+python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flow --label <same name>
+```
+
+- `--label` names the agent (1-32 lowercase letters, digits, inner dashes); suggest the worker's role and let the
+  owner confirm. It is required: without one the server would answer with the owner's own agent.
+- The core sends the owner the approval link in their DM, with the time it stops working (15 minutes), and waits.
+  Run it in the background; it prints one JSON line (`agent_id`, `status`) once the owner approved, or names the
+  expiry and saves nothing. Run it again for a new link.
+- The token is saved to the vault only when the gateway confirms it is the agent the poll named, not the core's own
+  agent, on the core's server and owned by the core's owner. `rotate` must answer for the worker's existing agent.
+  The device code and the token are never printed, logged or written to a file.
+
 ### Creating the agent without a pasted token
 
 The core can create a worker's agent itself, so nobody pastes a token. The server side is the `agent.create`
