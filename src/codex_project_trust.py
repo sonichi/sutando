@@ -10,6 +10,8 @@ Only the launcher's own checkout is ever trusted, and an explicit choice already
 the file (trusted or untrusted) is left as it is.
 """
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -57,8 +59,26 @@ def ensure_folder_trusted(codex_home, folder):
     return _record(codex_home, Path(folder).resolve())
 
 
+@contextlib.contextmanager
+def _config_lock(config):
+    # Seats launched together each read, then replace, the one config.toml; locking the Codex home
+    # itself serializes them and leaves no lock file beside Codex's own.
+    config.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(config.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _record(codex_home, root):
     config = Path(codex_home) / "config.toml"
+    with _config_lock(config):
+        return _record_locked(config, root)
+
+
+def _record_locked(config, root):
     try:
         text = config.read_text()
     except FileNotFoundError:

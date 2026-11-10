@@ -88,6 +88,21 @@ class EnsureTrusted(unittest.TestCase):
         with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
             self.cpt.main([str(self.home), str(sub)])
 
+    def test_two_launches_at_once_both_keep_their_entry(self):
+        # Each process pauses between its read and its write, so an unlocked pair drops one entry.
+        racer = ("import sys, time; sys.path.insert(0, sys.argv[1]); import codex_project_trust as c; "
+                 "real = c.tomllib.loads; c.tomllib = type('T', (), {'loads': staticmethod("
+                 "lambda t: (time.sleep(0.5), real(t))[1])}); "
+                 "print(c.ensure_folder_trusted(sys.argv[2], sys.argv[3]))")
+        folders = [self.repo / name for name in ("one", "two")]
+        procs = []
+        for folder in folders:
+            folder.mkdir()
+            procs.append(subprocess.Popen([sys.executable, "-c", racer, str(REPO / "src"), str(self.home),
+                                           str(folder)], stdout=subprocess.PIPE, text=True))
+        self.assertEqual(sorted(p.communicate()[0].strip() for p in procs), ["trusted", "trusted"])
+        self.assertEqual(set(self.projects()), {str(f) for f in folders})
+
     def test_an_explicit_untrusted_choice_is_left_alone(self):
         self.home.mkdir()
         original = f'[projects."{self.repo}"]\ntrust_level = "untrusted"\n'
