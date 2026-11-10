@@ -298,6 +298,23 @@ class Child(Layout):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             codex_home.main(["child", str(self.repo)])
 
+    def test_main_child_exits_in_process(self):
+        path = self.prepared()
+        argv = ["child", str(self.repo), path, "skills"]
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(Path, "home", return_value=self.home), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(codex_home.main(argv), 0)
+        self.assertEqual(out.getvalue().strip(), str(self.app_home / "skills"))
+        (self.app_home / "skills").rmdir()
+        (self.app_home / "skills").symlink_to(self.root)
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(Path, "home", return_value=self.home), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(codex_home.main(argv), 3)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("symlink or not a directory", err.getvalue())
+
 
 class ShellAdapter(Layout):
     SNIPPET = ('. "$R/src/agent/codex/codex-home.sh"; sutando_codex_home_prepare "$R" $PYARG; '
