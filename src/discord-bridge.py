@@ -1814,6 +1814,23 @@ async def _silent_escalate_for_discord_state(message, user_task_text):
     return True
 
 
+# Under Discord's 2,000-character message limit, with the margin `_chunk_for_discord` keeps.
+MOD_ESCALATION_MAX_CHARS = 1900
+MOD_RATIONALE_MAX_CHARS = 500
+
+
+def _fit_lines(text, room):
+    """`text` cut at whole lines to at most `room` characters, saying how many were left out."""
+    if len(text) <= room:
+        return text
+    lines = text.split("\n")
+    for keep in range(len(lines) - 1, -1, -1):
+        cut = "\n".join(lines[:keep] + [f"\u2026 {len(lines) - keep} more line(s) not shown"])
+        if len(cut) <= room:
+            return cut
+    return text[:max(room, 0)]
+
+
 async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rationale, extras_md=""):
     """Shared escalation post template. Used by Rules 1/2/3-violates/5/6.
 
@@ -1854,14 +1871,15 @@ async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rati
             "Suspect message preview:",
             f"> {body_preview}" if body_preview else "> (no text content)",
             "",
-            f"LLM rationale: {llm_rationale}",
+            f"LLM rationale: {_fit_lines(str(llm_rationale), MOD_RATIONALE_MAX_CHARS)}",
         ]
+        cc_lines = ["", f"cc {' '.join(cfg['escalation_ccs'])}"] if cfg["escalation_ccs"] else []
         if extras_md:
+            # A message over Discord's limit is refused whole, so the extras give way, line by line.
+            room = MOD_ESCALATION_MAX_CHARS - len("\n".join(body_lines + [""] + cc_lines)) - 1
             body_lines.append("")
-            body_lines.append(extras_md.strip())
-        if cfg["escalation_ccs"]:
-            body_lines.append("")
-            body_lines.append(f"cc {' '.join(cfg['escalation_ccs'])}")
+            body_lines.append(_fit_lines(extras_md.strip(), room))
+        body_lines += cc_lines
         # Belt + suspenders: also use Discord's allowed_mentions to whitelist
         # ONLY the explicit cc user-ids; suppress @everyone/@here/@role and
         # any user mentions not in the cc list.
@@ -2194,16 +2212,16 @@ async def _repeat_offender_escalation(client_ref, suspect_message, verdict, extr
     struck = _mod_strike_tracker.add(guild_id, author.id, strike, now_s, cfg["window_s"], cfg["strikes"])
     if struck is None:
         return False, None
-    window = f"{cfg['window_s'] // 60} min" if cfg["window_s"] >= 60 else f"{cfg['window_s']} s"
+    window = f"{cfg['window_s'] // 60} min" if cfg["window_s"] % 60 == 0 else f"{cfg['window_s']} s"
     outcome = await _timeout_member(author, guild_id, cfg["timeout_s"],
                                     f"auto-mod: {len(struck)} messages deleted within {window}", now_s)
-    lines = [f"**Repeat offender** <@{author.id}>: {len(struck)} messages auto-deleted within {window}. "
-             "They are already deleted, so there is nothing to jump to:"]
+    # The outcome comes before the evidence: when the message must be cut, strikes go first.
+    lines = [f"**Repeat offender** <@{author.id}>: {len(struck)} messages auto-deleted within {window}.", outcome]
+    if extras_md:
+        lines += [extras_md]
+    lines += ["", "They are already deleted, so there is nothing to jump to:"]
     lines += [f"- {s['rule']} in `#{s['channel']}` at {time.strftime('%H:%M:%S UTC', time.gmtime(s['ts']))}: "
               f"\u201c{s['preview'] or '(no text content)'}\u201d" for s in struck]
-    lines += ["", outcome]
-    if extras_md:
-        lines += ["", extras_md]
     esc = await _post_mod_escalation(client_ref, suspect_message, f"{rule} \u00b7 repeat offender",
                                      verdict.get("rationale", ""), "\n".join(lines))
     return True, esc

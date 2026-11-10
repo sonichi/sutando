@@ -117,6 +117,8 @@ class Member:
             raise self.refuse
         self.timeouts.append((duration.total_seconds(), reason))
 
+    _timeout = timeout
+
 
 class Message:
     count = 0
@@ -251,6 +253,83 @@ mod_ch, client = fresh()
 for at in (1, 2, 3):
     delete(client, Message(other_guild_author, Channel()), now_s=at)
 check("a guild without repeat_offender is unaffected", other_guild_author.timeouts, [])
+
+# --- the combined escalation fits Discord's limit ------------------------------------------
+class LimitedChannel(Channel):
+    async def send(self, content, **kw):
+        if len(content) > 2000:
+            raise ValueError(f"400 Bad Request: {len(content)} characters")
+        return await super().send(content, **kw)
+
+
+write_access({"strikes": 20, "window_s": 600, "timeout_s": 3600},
+             escalation_cc_user_ids=["1022910063620390932", "1025828152183885925"])
+bridge._mod_strike_tracker = bridge._StrikeTracker()
+mod_ch = LimitedChannel("moderator-only", ESC_CH)
+client = types.SimpleNamespace(get_channel=lambda cid: mod_ch if cid == ESC_CH else None)
+spammer = Member(Guild())
+for at in range(20):
+    delete(client, Message(spammer, Channel("general"), content="x" * 100), now_s=1000 + at)
+check("at the largest strike count, every escalation is delivered", len(mod_ch.sent), 20)
+final = mod_ch.sent[-1]
+check(f"the combined one is within Discord's limit ({len(final)} chars)",
+      len(final) <= bridge.MOD_ESCALATION_MAX_CHARS, True)
+check("it keeps the timeout outcome", "Timed out until" in final, True)
+check("and says how many strike lines it left out", "more line(s) not shown" in final, True)
+check("and still cc's the moderators", "<@1025828152183885925>" in final, True)
+
+write_access({"strikes": 3, "window_s": 600, "timeout_s": 3600})
+mod_ch = LimitedChannel("moderator-only", ESC_CH)
+client = types.SimpleNamespace(get_channel=lambda cid: mod_ch if cid == ESC_CH else None)
+asyncio.run(bridge._post_mod_escalation(client, Message(spammer, Channel()), "rule_1", "r" * 5000))
+check("an oversized rationale is cut, so the escalation is still delivered",
+      (len(mod_ch.sent), len(mod_ch.sent[0]) <= 2000 if mod_ch.sent else None), (1, True))
+check("_fit_lines leaves short text alone", bridge._fit_lines("a\nb", 10), "a\nb")
+check("and cuts what has no line to spare", bridge._fit_lines("x" * 50, 10), "x" * 10)
+
+# --- the remaining paths -----------------------------------------------------------------------
+mod_ch, client = fresh()
+spammer = Member(Guild())
+for at in (1, 2, 3):
+    out = asyncio.run(bridge._action_delete_and_escalate(
+        client, Message(spammer, Channel()), {"rule_match": "rule_3", "confidence": 0.95, "rationale": "dupes"},
+        extras_md="(Rule 3: cross-channel duplicate violates server rules)"))
+check("a rule 3 deletion's note is carried into the combined escalation",
+      "(Rule 3: cross-channel duplicate violates server rules)" in mod_ch.sent[-1], True)
+
+mod_ch, client = fresh()
+left = Member(Guild())
+del Member.timeout  # a discord.User: the author left the server
+try:
+    for at in (1, 2, 3):
+        delete(client, Message(left, Channel()), now_s=at)
+finally:
+    Member.timeout = Member._timeout
+check("an author who left the server cannot be timed out, and the escalation says so",
+      "no longer a member of this server" in mod_ch.sent[-1], True)
+
+mod_ch, client = fresh()
+real_repeat = bridge._repeat_offender_escalation
+
+
+async def broken(*a, **kw):
+    raise RuntimeError("tracker exploded")
+
+
+bridge._repeat_offender_escalation = broken
+try:
+    deleted_ok, esc = delete(client, Message(Member(Guild()), Channel()), now_s=1)
+finally:
+    bridge._repeat_offender_escalation = real_repeat
+check("a failure in the strike handling still deletes and escalates as before",
+      (deleted_ok, len(mod_ch.sent), "repeat offender" in mod_ch.sent[-1]), (True, 1, False))
+
+write_access({"strikes": 3, "window_s": 90, "timeout_s": 3600})
+mod_ch, client = fresh()
+spammer = Member(Guild())
+for at in (1, 2, 3):
+    delete(client, Message(spammer, Channel()), now_s=at)
+check("a window that is not whole minutes is given in seconds", "within 90 s" in mod_ch.sent[-1], True)
 
 # --- configuration --------------------------------------------------------------------------
 write_access({})
