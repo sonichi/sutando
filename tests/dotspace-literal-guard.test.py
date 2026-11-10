@@ -68,6 +68,9 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "packages/ag2-sparrow/ag2_sparrow/adapters/claude_cloud_session/session_adapter.py": (
         "standing s.space instructions",
     ),
+    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": (
+        "looking at s.space in a window",
+    ),
     "packages/ag2-sparrow/ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/hooks.json": (
         "s.space inbox connector",
     ),
