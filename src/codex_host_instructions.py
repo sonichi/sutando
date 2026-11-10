@@ -67,8 +67,8 @@ def _owner_spellings(home):
 
 
 def _lexically_owner(parts, home):
-    """True when `parts`, case-folded, are any spelling of `~/.codex` or below, or the
-    spellings cannot be read. The walk follows no link, so the path it opens is this one."""
+    """True when `parts`, case-folded, are any spelling of `~/.codex`, below it or above it,
+    or the spellings cannot be read. The walk follows no link, so the path it opens is this one."""
     folded = [p.casefold() for p in parts]
     try:
         spellings = _owner_spellings(home)
@@ -76,7 +76,8 @@ def _lexically_owner(parts, home):
         return True
     for spelled in spellings:
         owner = [p.casefold() for p in spelled.split(os.sep) if p not in ("", ".")]
-        if folded[:len(owner)] == owner:
+        # Above too: any entry later made below `parts` could become the owner's home.
+        if folded[:len(owner)] == owner or owner[:len(folded)] == folded:
             return True
     return False
 

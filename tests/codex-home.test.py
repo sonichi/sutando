@@ -464,6 +464,24 @@ class StartupSteps(Layout):
                 if existing:
                     self.assertEqual(os.listdir(self.app_home / "skills"), [])
 
+    def test_skills_install_never_creates_a_grandchild_a_dangling_owner_alias_names(self):
+        for home_exists in (False, True):
+            with self.subTest(home_exists=home_exists):
+                shutil.rmtree(self.root / "app-support", ignore_errors=True)
+                if os.path.lexists(self.owner):
+                    self.owner.unlink()
+                self.checkout()
+                if home_exists:
+                    (self.app_home / "skills").mkdir(parents=True)
+                self.owner.symlink_to(self.app_home / "skills" / "tutorial")
+                out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),
+                                CLAUDE_CONFIG_DIR=str(self.workspace / ".claude-sutando"),
+                                SUTANDO_CORE_RUNTIME="codex")
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn("was refused; no skills linked there", out.stdout)
+                self.assertFalse(os.path.lexists(self.app_home / "skills" / "tutorial"))
+                self.assertFalse(os.path.exists(self.owner), "~/.codex stays dangling")
+
     def test_skills_install_on_a_normal_desktop_links_into_the_app_home(self):
         self.checkout()
         out = self.bash('bash "$R/skills/install.sh"', R=str(self.repo),
