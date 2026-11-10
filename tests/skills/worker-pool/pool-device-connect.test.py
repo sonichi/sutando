@@ -64,7 +64,7 @@ class ConnectFake:
                 step = self.poll_script.pop(0)
                 if isinstance(step, Exception):
                     raise step
-                return step, {}, {"error": "forbidden"}
+                return step if isinstance(step, tuple) else (step, {}, {"error": "forbidden"})
             if code not in self.codes or self.backend.now > self.codes[code] + 30:
                 return 404, {}, {"error": "unknown_code"}
             if not self.approved:
@@ -206,7 +206,28 @@ class Edges(Base):
         self.assertEqual(self.backend.now - before, dc.MIN_INTERVAL_S)
 
     def test_a_base_that_is_not_an_origin_is_refused(self):
-        self.refused(ConnectFake(self.backend), "must be an https origin", base="https://chat.alpha-fixture.net/x")
+        for base in ("https://chat.alpha-fixture.net/x", "https://evil.example", "https://alpha-fixture.net"):
+            self.refused(ConnectFake(self.backend), "the core's own gateway origin", base=base)
+        self.assertEqual(self.sent, [], "no link is ever asked for on another origin")
+        self.assertEqual(self.connect(ConnectFake(self.backend), base="https://chat.alpha-fixture.net")["status"], "ok")
+
+    def test_pending_and_slow_down_answers_keep_polling_and_429_honours_retry_after(self):
+        fake = ConnectFake(self.backend)
+        fake.poll_script = [(400, {}, {"error": "authorization_pending"}),
+                            (400, {}, {"error": "slow_down"}),
+                            (429, {"retry-after": "20"}, {}),
+                            (429, {"retry-after": "soon"}, {})]
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.backend.sleep(seconds)
+            if not fake.poll_script:
+                fake.approve()
+        out = dc.connect(W, label="reviewer", workspace=self.ws, vault=self.vault, request=fake.request,
+                         preview=self.preview, deliver=self.sent.append, sleep=sleep, clock=self.backend.clock)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(waits[:5], [3, 3, 8, 20, 8])
 
     def test_a_poll_answer_without_a_valid_agent_id_or_on_another_gateway_is_not_saved(self):
         fake = ConnectFake(self.backend)

@@ -34,6 +34,8 @@ POLL_PATH = "/api/connect/poll"
 # The server's own bounds on a code's life and on how often it may be asked.
 DEFAULT_TTL_S, MAX_TTL_S = 900, 3600
 MIN_INTERVAL_S, MAX_INTERVAL_S = 3, 60
+SLOW_DOWN_STEP_S = 5
+KEEP_POLLING = ("authorization_pending", "slow_down")
 # An approval that lands just before expiry is still collected for this long after it.
 COLLECT_GRACE_S = 60
 LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?")
@@ -95,12 +97,20 @@ def collect(base: str, pending: dict, *, request=pp.http_json, sleep=time.sleep,
     """Ask until the owner has approved: {relay_url, bearer, agent_id}. A code that expires or is gone is
     refused with the time it expired; a refusal never carries the code or a bearer."""
     known = [pending["device_code"]]
+    interval = wait = pending["interval"]
     while True:
-        sleep(pending["interval"])
+        sleep(wait)
         try:
-            status, _, out = request("POST", base + POLL_PATH, payload={"device_code": pending["device_code"]})
+            status, headers, out = request("POST", base + POLL_PATH, payload={"device_code": pending["device_code"]})
         except pp.TransportError:
-            status, out = 0, {}
+            status, headers, out = 0, {}, {}
+        reason = pp.error_code(out)
+        # RFC 8628 device-flow answers: still waiting, or asked to poll more slowly.
+        if reason == "slow_down":
+            interval = min(MAX_INTERVAL_S, interval + SLOW_DOWN_STEP_S)
+        wait = interval
+        if status == 429:
+            wait = max(interval, _bounded(headers.get("retry-after"), interval, 0, MAX_INTERVAL_S))
         if status == 200 and all(isinstance(out.get(k), str) and out.get(k)
                                  for k in ("relay_url", "bearer", "agent_id")):
             return {k: out[k] for k in ("relay_url", "bearer", "agent_id")}
@@ -108,6 +118,8 @@ def collect(base: str, pending: dict, *, request=pp.http_json, sleep=time.sleep,
         if status in (404, 410) or clock() > pending["expires_at"] + COLLECT_GRACE_S:
             raise DeviceConnectError(f"the approval link expired at {expired} without an approval; "
                                      "nothing was saved, so start again for a new link", status="expired")
+        if reason in KEEP_POLLING:
+            continue
         if status not in (0, 200, 202, 429, 503) and status < 500:
             raise DeviceConnectError(pp.scrub(f"the server refused the device connect (HTTP {status}"
                                               f"{', ' + pp.error_code(out) if pp.error_code(out) else ''})", known))
@@ -152,9 +164,11 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     if not rotate and current is not None:
         raise DeviceConnectError(f"worker {worker} already has an agent of its own; rotate it instead")
     core = pp.core_lane(workspace, lane)
-    base = (base or pp.origin_of(str(core["gateway_url"]))).rstrip("/")
-    if pp.origin_of(base) != base:
-        raise DeviceConnectError("the connect base must be an https origin (scheme and host only)")
+    gateway = pp.origin_of(str(core["gateway_url"]))
+    base = (base or gateway).rstrip("/")
+    if base != gateway:
+        raise DeviceConnectError("the connect base must be the core's own gateway origin, so the approval link "
+                                 "cannot come from another host")
     pending = start(base, label, display_name, server=str(core.get("server") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
     note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"])
