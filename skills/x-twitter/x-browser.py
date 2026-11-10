@@ -369,6 +369,12 @@ def _reply_verify_js(text: str, before) -> str:
     )
 
 
+def _norm_composer(s: str) -> str:
+    """Whitespace-only normalisation: NBSP becomes a space, then every run of
+    whitespace (incl. CR/LF/tabs) collapses to one space, ends stripped."""
+    return " ".join(s.replace("\u00a0", " ").split())
+
+
 def cmd_reply(ref: str, text: str) -> int:
     ensure_tab(_status_url(ref), settle=5.0)
     run_js(
@@ -385,8 +391,14 @@ def cmd_reply(ref: str, text: str) -> int:
         "document.execCommand('insertText',false," + tjson + ");"
         "return ed.innerText;})()"
     )
-    if run_js(fill) == "noeditor":
+    composer = run_js(fill)
+    if composer == "noeditor":
         raise BrowserError("reply composer did not open")
+    if _norm_composer(composer) != _norm_composer(text):
+        # Cmd+Return would post whatever the composer holds: a stale draft or a fragment.
+        raise BrowserError(
+            "composer text does not match the requested reply — not submitting; "
+            f"the reply was NOT sent (composer holds {composer[:80]!r})")
     time.sleep(0.5)
     before = _rendered_status_ids()
     if before is None:

@@ -490,6 +490,8 @@ def test_an_unreadable_baseline_refuses_to_submit():
         mod._os_submit_via_keystroke = lambda: submitted.append(1)
 
         def rj(js, *a, **k):
+            if "insertText" in js:
+                return TEXT   # the composer holds the text: only the baseline is bad
             if "ids.push" in js:
                 if baseline == "__RAISE__":
                     raise mod.BrowserError("no tab")
@@ -506,8 +508,8 @@ def test_an_unreadable_baseline_refuses_to_submit():
         check(raised and not submitted,
               f"{label}: an unreadable baseline must refuse BEFORE the keystroke "
               f"(raised={raised}, submits={len(submitted)}, {out!r})")
-        check("NOT sent" in out,
-              f"{label}: the refusal must say the reply was not sent ({out!r})")
+        check("NOT sent" in out and "baseline" in out,
+              f"{label}: the BASELINE refusal says the reply was not sent ({out!r})")
 
     # CONTROL: a readable baseline still submits and still reports honestly.
     mod = load()
@@ -516,7 +518,8 @@ def test_an_unreadable_baseline_refuses_to_submit():
     submitted = []
     mod._os_submit_via_keystroke = lambda: submitted.append(1)
     mod.run_js = lambda js, *a, **k: (
-        '["1"]' if "ids.push" in js
+        TEXT if "insertText" in js
+        else '["1"]' if "ids.push" in js
         else _json.dumps({"posted": False}) if "seen" in js else "ok")
     rc, out = _out(mod.cmd_reply, "1", TEXT)
     check(submitted and rc == 1 and "not confirmed" in out,
@@ -533,6 +536,8 @@ def test_reply_baseline_is_taken_before_the_keystroke():
     mod.time.sleep = lambda *_a, **_k: None
     mod._os_submit_via_keystroke = lambda: events.append("submit")
     def rj(js, *a, **k):
+        if "insertText" in js:
+            return "hi"
         if "ids.push" in js:
             events.append("baseline"); return "[]"
         if "seen" in js:
@@ -558,6 +563,64 @@ def test_cmd_reply_embeds_the_text_as_json():
     _out(mod.cmd_reply, "1", 'quote"y')
     check(any('quote\\"y' in j or 'quote\"y' in j for j in seen),
           "reply text is JSON-encoded into the snippet (quotes survive)")
+
+
+def _reply_with_composer(composer_text, text):
+    """Drive production cmd_reply with the fill returning `composer_text`.
+    Returns (submits, rc, out, raised)."""
+    mod = load()
+    mod.ensure_tab = lambda *a, **k: None
+    mod.time.sleep = lambda *_a, **_k: None
+    submitted = []
+    mod._os_submit_via_keystroke = lambda: submitted.append(1)
+
+    def rj(js, *a, **k):
+        if "insertText" in js:
+            return composer_text
+        if "ids.push" in js:
+            return '["1"]'
+        if "seen" in js:
+            return '{"posted":true}'
+        return "ok"
+    mod.run_js = rj
+    try:
+        rc, out = _out(mod.cmd_reply, "1", text)
+        return submitted, rc, out, False
+    except mod.BrowserError as e:
+        return submitted, None, str(e), True
+
+
+def test_reply_refuses_when_the_composer_does_not_hold_the_text():
+    """sonichi-dot at 2223b6b94: the fill's readback was only compared to
+    'noeditor', so a rejected, partial or stale composer still got Cmd+Return."""
+    TEXT = "approved reply"
+    for label, composer in (("rejected-insertion", ""),
+                            ("partial-insertion", "appr"),
+                            ("stale-draft", "previous draft")):
+        submits, rc, out, raised = _reply_with_composer(composer, TEXT)
+        check(not submits,
+              f"{label}: no submit keystroke may be sent (submits={len(submits)})")
+        check(raised and "NOT sent" in out,
+              f"{label}: refuses with a not-sent message (raised={raised}, {out!r})")
+
+    # CONTROL: the exact text, and the same text with NBSP/whitespace noise, submit.
+    for label, composer in (("exact", TEXT),
+                            ("nbsp+trailing-newline", "approved reply\n")):
+        submits, rc, out, raised = _reply_with_composer(composer, TEXT)
+        check(len(submits) == 1 and rc == 0 and not raised,
+              f"{label}: a matching composer submits once (submits={len(submits)}, "
+              f"rc={rc}, {out!r})")
+
+
+def test_composer_normalisation_is_whitespace_only():
+    mod = load()
+    n = getattr(mod, "_norm_composer", None)
+    if n is None:
+        check(False, "_norm_composer is missing")
+        return
+    check(n("a  b\r\n\tc \n") == n("a b c"), "NBSP, CR/LF, tabs and runs collapse")
+    check(n("A b") != n("a b"), "case is NOT normalised")
+    check(n("ab") != n("a b"), "removing a space is a real difference")
 
 
 def test_ensure_tab_breaks_the_poll_when_ready():

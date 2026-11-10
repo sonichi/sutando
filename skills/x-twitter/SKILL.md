@@ -179,3 +179,6 @@ macOS + Google Chrome only. No keys needed.
   `like` works via DOM; `reply` works but needs Accessibility permission (the
   submit is a real OS keystroke) and foregrounds Chrome. Prefer API mode for
   bulk or headless writes.
+- `reply` reads the composer back before the keystroke and refuses (rc=2, nothing
+  sent) unless it holds exactly the requested text, compared after NBSP->space and
+  whitespace-run collapsing.
