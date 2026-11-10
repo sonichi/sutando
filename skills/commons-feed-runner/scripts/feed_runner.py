@@ -41,6 +41,7 @@ EVERY_MINUTES_MIN = 15
 ITEM_ID_MAX = 200
 CELL_BYTES_MAX = 4000
 GRANT_ID_RE = re.compile(r"g[a-z0-9]{9}")
+CODE_RE = re.compile(r"[A-Za-z_]{1,64}")  # a refusal code: never free text
 URL_RE = re.compile(r"^https?://\S+$")
 
 
@@ -308,7 +309,7 @@ def outcome(reply) -> dict:
     try:
         error = _unwrap(reply, "code")
     except Refused:
-        error = {"code": None, "message": str(reply)}
+        error = {"code": None}  # unreadable: nothing of it is kept, it may be connector content
     message = str(error.get("message") or "")
     retry = next((v for k, v in _walk(error) if k == "retry_after_s"
                   and isinstance(v, int) and not isinstance(v, bool)), None)
@@ -319,9 +320,13 @@ def outcome(reply) -> dict:
     if state:
         return {"status": "stop", "task_status": "no_action",
                 "outcome": f"The feed's grant is {state[1]}; nothing was written"}
+    # Only the codes go to the log: the backend's message can quote the row it refused.
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    codes = [c for c in (error.get("code"), details.get("reason"))
+             if isinstance(c, str) and CODE_RE.fullmatch(c)]
     return {"status": "fail", "task_status": "failed",
             "outcome": "The feed refresh was refused; nothing was written",
-            "reason": f"{error.get('code')}: {message}"[:300]}
+            "reason": " ".join(codes) or "unreadable refusal"}
 
 
 def _walk(node):

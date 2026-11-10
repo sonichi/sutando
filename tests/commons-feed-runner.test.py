@@ -201,10 +201,17 @@ check("too soon waits the backend's retry_after_s", wait["status"] == "wait"
 for state in ("revoked", "paused", "expired"):
     stop = fr.outcome({"code": "CONFLICT", "message": f"grant_{state}: this grant is {state}"})
     check(f"a {state} grant stops the run", stop["status"] == "stop" and state in stop["outcome"])
-fail = fr.outcome({"code": "INVALID_INPUT", "message": "row 1: start does not fit a date column"})
-check("any other refusal fails the task with the reason kept out of the outcome",
+# Review (Susan, blocker 1): the backend's message can quote a row ('cell title="Dinner w/ Dr.
+# X"'), and `reason` goes to the agent's log, where connector content never goes. Codes only.
+fail = fr.outcome({"code": "INVALID_INPUT", "message": 'row 1: cell title="Dinner w/ Dr. X" '
+                   "does not fit", "details": {"reason": "not_in_catalogue"}})
+check("any other refusal fails the task, logging its codes and never the backend's message",
       fail["status"] == "fail" and fail["task_status"] == "failed"
-      and "start does not fit" in fail["reason"] and "row 1" not in fail["outcome"])
+      and fail["reason"] == "INVALID_INPUT not_in_catalogue"
+      and "Dinner" not in json.dumps(fail) and "row 1" not in json.dumps(fail))
+unreadable = fr.outcome('the reply was {"title": "Dinner w/ Dr. X"}')
+check("a reply with no code at all logs no text of it either",
+      unreadable["status"] == "fail" and "Dinner" not in json.dumps(unreadable))
 
 # ---- the command line --------------------------------------------------------------------
 

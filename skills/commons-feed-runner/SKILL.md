@@ -75,7 +75,8 @@ Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts
    5. `python3 $S/feed_runner.py outcome result.json`. Close the task with its `task_status` and
       `outcome` (`room.task.update`). `wait` means the backend's schedule is ahead of yours;
       `stop` means the grant was revoked, paused or expired: there is nothing to do but close.
-      `fail` carries a `reason` for your own log; the task outcome stays the generic line.
+      `fail` carries a `reason` for your own log: the refusal's codes only, never its message
+      (which can quote a row). The task outcome stays the generic line.
    6. Delete `connector.json`, `write.json`, `fail.json` and `result.json`.
 
 ## When C3 lands
