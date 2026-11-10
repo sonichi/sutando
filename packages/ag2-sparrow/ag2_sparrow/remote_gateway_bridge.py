@@ -382,7 +382,7 @@ NOT_A_STOP_NOTE = (
     "cancelled or stopped; you may reply in words.")
 # Only on an owner task stamped with ui_origin: the ui_* tools take that handle.
 UI_ORIGIN_NOTE = (
-    "Your owner is looking at s.space in a window. To open, show or go to something there (Settings, "
+    "Your owner is looking at S.space in a window. To open, show or go to something there (Settings, "
     "Add agent, Add room, a room or message), use s-space ui_request with the ui_origin above; never "
     "the local computer's settings.")
 
