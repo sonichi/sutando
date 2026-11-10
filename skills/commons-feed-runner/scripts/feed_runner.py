@@ -51,6 +51,11 @@ SCHEDULE_SLACK_MS = 60_000          # as the backend: a slot may land a minute e
 EVERY_MINUTES_MIN = 15
 ITEM_ID_MAX = 200
 CELL_BYTES_MAX = 4000
+MAX_ROWS_LIMIT = 500                # as the backend's grant bound
+
+
+def _rows_bound(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_ROWS_LIMIT
 GRANT_ID_RE = re.compile(r"g[a-z0-9]{9}")
 CODE_RE = re.compile(r"[A-Za-z_]{1,64}")  # a refusal code: never free text
 URL_RE = re.compile(r"^https?://\S+$")
@@ -140,6 +145,8 @@ def due(me: str, replies: list, now_ms: int) -> dict:
                 why = f"{kind!r} is not in this runner's catalogue"
             elif every is None or every < EVERY_MINUTES_MIN:
                 why = "every_minutes is missing or under the 15-minute floor"
+            elif not _rows_bound(grant.get("max_rows")):
+                why = f"max_rows is not a whole number from 1 to {MAX_ROWS_LIMIT}"
             elif last is not None and now_ms - last < every * 60_000 - SCHEDULE_SLACK_MS:
                 skipped.append({"room_id": room, "grant_id": gid, "why": "not due",
                                 "next_at": last + every * 60_000 - SCHEDULE_SLACK_MS})

@@ -313,4 +313,15 @@ check("the envelope's own error still picks it",
       and fr.failure(run, {"error": "connect_required: googlecalendar"})["code"]
       == "connector_not_connected")
 
+# Review (Susan, should-fix 4): one malformed grant is skipped on its own; the rest still run.
+bad = dict(grant(grant_id="gnomax0001"))
+del bad["max_rows"]
+mixed = fr.due(ME, [(ROOM, listed(bad, grant(grant_id="gzeromax01", max_rows=0),
+                                  grant(grant_id="gboolmax01", max_rows=True),
+                                  grant(grant_id="gnoquery01", query=None), grant()))], NOW)
+why = {s["grant_id"]: s["why"] for s in mixed["skipped"]}
+check("a grant without a usable max_rows or query is skipped, and the good one still runs",
+      [r["grant_id"] for r in mixed["runs"]] == ["gabc123def"]
+      and {"gnomax0001", "gzeromax01", "gboolmax01", "gnoquery01"} <= set(why))
+
 print(f"commons-feed-runner: {len(passed)} passed")
