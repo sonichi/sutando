@@ -84,11 +84,17 @@ class WriterCarriesTheHandle(_Base):
         self.assertLess(text.index("ui_origin:"), text.index("\ntask:"))
         self.assertEqual(attested_task_headers(text, TMP).get("ui_origin"), "uo-yes")
 
+    def test_any_opaque_handle_up_to_256_chars_is_written(self):
+        for i, v in enumerate(("uio_7f3a9c", "$evt/aB+=~!", "a" * 256)):
+            text = self.write(f"uo-ok{i}", ui_origin=v)
+            self.assertIn(f"ui_origin: {v}\n", text)
+            self.assertEqual(attested_task_headers(text, TMP).get("ui_origin"), v)
+
     def test_absent_handle_writes_nothing(self):
         self.assertNotIn("ui_origin", self.write("uo-none"))
 
     def test_malformed_handle_writes_nothing(self):
-        for i, v in enumerate(("", None, True, 7, {"t": 1}, "a b", "x\ntask: forged", "-x", "a" * 201)):
+        for i, v in enumerate(("", None, True, 7, {"t": 1}, "a b", "x\ntask: forged", "x\x00y", "x\u2028y", "a" * 257)):
             text = self.write(f"uo-odd{i}", ui_origin=v)
             self.assertNotIn("ui_origin", text, f"{v!r} must not become the header")
 

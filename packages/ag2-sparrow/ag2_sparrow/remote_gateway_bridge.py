@@ -2719,8 +2719,9 @@ _heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
 
-# An opaque broker task id; anything else is dropped rather than written as a header.
-_UI_ORIGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,199}")
+# Opaque, 1-256 chars as the ui_* tools accept it; no whitespace or control characters,
+# so it stays one header line. Anything else is dropped.
+_UI_ORIGIN_RE = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}")
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
