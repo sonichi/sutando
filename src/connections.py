@@ -1499,19 +1499,29 @@ def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     return bool(instance) and instance in [owner["instance"]] + alias_instances(owner)
 
 
-def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
-    """Whether the row's bridge has a checked owner DM on disk (state/owner-routing<suffix>.json: a
-    private room, bound to the row's agent when the row names one). Every lane reads it alike."""
-    inst = str(row.get("instance") or "")
+def _owner_dm_as(row: Mapping[str, object], inst: str, workspace: Optional[Path]) -> str:
+    """The checked owner DM the row's bridge wrote while running as `inst` (state/owner-routing<suffix>.json:
+    a private room, bound to the row's agent when the row names one); "" when none."""
     path = _workspace(workspace) / "state" / f"owner-routing{'.' + inst if inst else ''}.json"
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return ""
     if not isinstance(rec, dict) or not rec.get("owner_dm") or rec.get("private") is not True:
-        return False
+        return ""
     agent = str(row.get("agent_mxid") or "")
-    return not agent or rec.get("identity") == agent
+    return str(rec["owner_dm"]) if not agent or rec.get("identity") == agent else ""
+
+
+def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge has a checked owner DM on disk under its own instance. Every lane reads it alike."""
+    return bool(_owner_dm_as(row, str(row.get("instance") or ""), workspace))
+
+
+def _lane_owner_dms(row: Mapping[str, object], workspace: Optional[Path]) -> set:
+    """Every checked owner DM of the row's bridge, under its instance or a launch-key alias it runs as."""
+    names = [str(row.get("instance") or "")] + alias_instances(row)
+    return {dm for dm in (_owner_dm_as(row, inst, workspace) for inst in names) if dm}
 
 
 def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
@@ -1631,17 +1641,23 @@ def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
     return next((dict(r) for r in rows if r["primary"]), None)
 
 
-def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None) -> Optional[dict]:
+def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None,
+                        environ: Optional[Mapping[str, str]] = None) -> Optional[dict]:
     """The row a room operation acts through: the row whose server equals the room ID's domain
     exactly; for an ID naming no domain, the one row whose bridge has a task open in it, else the
     primary; with no room, the primary. None keeps the caller's own single-connection
     resolution: fewer than two rows, no primary, or an unreadable record.
-    NoConnectionForRoom when the domain has no row, or its row is disconnected."""
+    NoConnectionForRoom when the domain has no row, or its row is disconnected.
+    In a pool worker's session (`session_worker`) that worker's own identity comes first
+    (`acting_identity`); every other caller acts through the install's own rows."""
     try:
-        # A room operation acts as the install's own agent, never as a worker's identity.
-        rows = _core_rows(_read(record_path(workspace)))
+        every = _read(record_path(workspace))
     except (SchemaError, OSError):
         return None
+    own = acting_identity(every, room_id, session_worker(environ), workspace)
+    if own is not None:
+        return dict(own)
+    rows = _core_rows(every)
     if len(rows) < 2:
         return None
     server = server_of_room(room_id or "")
@@ -1665,7 +1681,7 @@ def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
     """The agent identity a room operation acts as, from the row `connection_for_room` routes it to:
     the row's recorded `agent_mxid`, else AGENT_MXID in the row's channel env file, kept only when it
     names that row's server. None keeps the caller's own resolution; '' when the row names none."""
-    row = connection_for_room(room_id, workspace)
+    row = connection_for_room(room_id, workspace, environ)
     if row is None:
         return None
     environ = os.environ if environ is None else environ
@@ -1755,7 +1771,7 @@ def room_credential(room_id: Optional[str], *, workspace: Optional[Path] = None,
                     environ: Optional[Mapping[str, str]] = None, vault=None) -> "Optional[tuple[str, str]]":
     """(gateway_url, token) a room operation must use, or None to keep the caller's own resolution
     (see `connection_for_room`). NoConnectionForRoom names what is missing."""
-    row = connection_for_room(room_id, workspace)
+    row = connection_for_room(room_id, workspace, environ)
     return None if row is None else connection_credential(row, environ, vault=vault)
 
 
@@ -2118,6 +2134,140 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
     except (SchemaError, OSError):
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
+
+
+# A worker's seat names its worker here (the pool launchers export it); the core's names none.
+SESSION_WORKER_ENV = "SUTANDO_WORKER_ID"
+
+
+def session_worker(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The pool worker this process is a session of (`SESSION_WORKER_ENV`); "" for the core's."""
+    environ = os.environ if environ is None else environ
+    worker = str(environ.get(SESSION_WORKER_ENV) or "")
+    return worker if WORKER_RE.match(worker) else ""
+
+
+def acting_identity(rows: list, room_id: Optional[str], worker: str,
+                    workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row when its session acts through it in `room_id`, else None (the
+    core's rows): its enabled row on the room's server; with no room, its only enabled row. A room
+    local state says is the core's stays the core's: one where a core lane, and not the worker's,
+    has a task open (that task is answered as the core's agent), or a core lane's own owner DM."""
+    own = [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
+    if not room_id:
+        return own[0] if len(own) == 1 else None
+    server = server_of_room(room_id)
+    mine = next((r for r in own if server in _row_servers(r)), None) if server else next(
+        (r for r in own if _lane_holds_room(r, room_id, workspace)), None)
+    if mine is None or _lane_holds_room(mine, room_id, workspace):
+        return mine
+    core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
+    if any(_lane_holds_room(r, room_id, workspace) or room_id in _lane_owner_dms(r, workspace) for r in core):
+        return None
+    return mine
+
+
+class NoWorkerCredential(ConnectionsError):
+    """A pool worker's session has no credential of its own to act with; `reason` is one of
+    WORKER_CREDENTIAL_REASONS. The core's credential is never the answer."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token")
+# Why a worker acts through the core's agent instead of one of its own (`worker_mcp_credential`'s `reason`).
+WORKER_ACTS_AS_CORE_REASONS = ("no_identity", "disabled")
+# The worker seat's s-space MCP proxy runs this argv to learn whose credential to mint with (see
+# `mcp_worker_credential_argv`): a token comes from the vault to the proxy's memory, never a file.
+MCP_WORKER_CREDENTIAL_ENV = "AG2_MCP_WORKER_CREDENTIAL"
+
+
+def worker_enabled_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row while a lane serves it (neither disabled nor parked), else None. The one
+    test of whether a worker acts as its own agent: its proactive notes are stamped for its lane and its
+    seat's MCP proxy mints with its token exactly when this answers a row; otherwise it acts as the core."""
+    row = worker_identity(worker, workspace)
+    return row if row is not None and not row.get("disabled") and not row.get("parked") else None
+
+
+def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
+                           workspace: Optional[Path] = None) -> str:
+    """The name this session publishes a proactive file under (`proactive_routing.stamp_worker`): stamped
+    with its worker when the session is a pool worker's that acts as its own agent
+    (`worker_enabled_identity`), so that worker's lane claims it; unchanged for the core's session and
+    for a worker acting through the core's agent, whose notes a core lane sends as before."""
+    from proactive_routing import stamp_worker
+    worker = session_worker(environ)
+    return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
+
+
+def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
+                          environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
+    """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent
+    (`worker_enabled_identity`) answers `acts_as: "worker"` with its row and token, resolved as every room
+    client resolves one (`connection_credential`: the vault's, by its `token_ref`):
+    `{worker, acts_as, lane, server, agent_id, relay, bearer}`, `bearer` the secret half. A worker with no
+    identity, or a disabled or parked one, answers `{worker, acts_as: "core", reason}`: it acts through the
+    core's agent, as its notes do. Refused with NoWorkerCredential for no worker or for an enabled identity
+    with no token; the core's rows are never read here, so the core's credential is never answered."""
+    if not worker or not WORKER_RE.match(worker):
+        raise NoWorkerCredential("no_worker", "this session names no pool worker")
+    row = worker_enabled_identity(worker, workspace)
+    if row is None:
+        reason = "disabled" if worker_identity(worker, workspace) is not None else "no_identity"
+        return {"worker": worker, "acts_as": "core", "reason": reason}
+    try:
+        gateway_url, token = connection_credential(row, environ, vault=vault)
+    except NoConnectionForRoom as e:
+        raise NoWorkerCredential("no_token", str(e)) from None
+    mxid = str(row.get("agent_mxid") or "").strip()
+    return {"worker": worker, "acts_as": "worker", "lane": str(row["instance"]), "server": str(row["server"]),
+            "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
+            "relay": (gateway_url_of(token) or gateway_url).rstrip("/"),
+            "bearer": secret_of(token) if gateway_url_of(token) else token.strip()}
+
+
+def mcp_worker_credential_argv(worker: str, repo: Path, python: str = "",
+                               workspace: Optional[Path] = None) -> list:
+    """The argv a worker seat's MCP proxy runs for `worker_mcp_credential` (`MCP_WORKER_CREDENTIAL_ENV`
+    carries it JSON-encoded): the seat's own interpreter when the launcher resolved one, else python3, and
+    the workspace named outright, since the proxy runs it with a scrubbed environment."""
+    return [python or "python3", str(Path(repo) / "scripts" / "connections.py"), "--workspace",
+            str(_workspace(workspace)), "worker-mcp-credential", "--worker", worker]
+
+
+def worker_lane_named(name: str, workspace: Optional[Path] = None) -> bool:
+    """Whether `name` is a pool worker's own lane, by its instance or its channel dir. Such a lane
+    has no channel env file: its token lives in the vault alone (`connection_credential` reads it)."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return False
+    return any(r.get("worker") and name in (r["instance"], lane_channel_dir(str(r["instance"]))) for r in rows)
+
+
+def task_lane(task_id: str) -> str:
+    """The named lane that queued `task_id` (`task-<instance>~<broker id>`); "" for any other id."""
+    first = str(task_id or "").partition("~~")[0]  # a later run is `<local id>~~<n>`
+    inst, sep, _ = first[len("task-"):].partition("~")
+    return inst if first.startswith("task-") and sep and INSTANCE_RE.match(inst) else ""
+
+
+def task_agent_mxid(task_id: str, workspace: Optional[Path] = None) -> str:
+    """The agent a task is answered as: the one the lane that queued it runs as (`task_lane`, by
+    slug or launch-key alias). "" for a task no named lane queued, or when the record names none."""
+    instance = task_lane(task_id)
+    if not instance:
+        return ""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return ""
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    mxid = str((row or {}).get("agent_mxid") or "").strip()
+    return mxid if _STRICT_MXID_RE.fullmatch(mxid) else ""
 
 
 class LaneIdentityUnknown(ConnectionsError):
@@ -2848,13 +2998,12 @@ def _reap_when_done(child) -> None:
 def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
-    waitid = getattr(os, "waitid", None)
     if child is not None:
-        # poll() also reads None while the reaper thread holds Popen's wait lock.
-        if child.poll() is None and not (waitid is not None and _waitid_exited(waitid, pid)):
+        if child.poll() is None and not _exited_while_waited(pid):
             return False
         _CHILDREN.pop(pid, None)
         return True
+    waitid = getattr(os, "waitid", None)
     if waitid is not None:
         try:  # an exited, unreaped child of this process: seen without reaping it
             if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
@@ -2878,12 +3027,36 @@ def _exited(pid: int) -> bool:
     return False
 
 
-def _waitid_exited(waitid, pid: int) -> bool:
-    """Whether our child `pid` has exited, by the kernel and without reaping it."""
+def _exited_while_waited(pid: int) -> bool:
+    """Whether our own child has exited though poll() said None, asked of the kernel without reaping it."""
+    # poll() returns None unchecked while the reaper's wait() holds the Popen's waitpid lock.
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:
+        return os.name != "nt" and (_ps_zombie(pid) or _no_longer_our_child(pid))
     try:
         return waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-    except OSError as e:  # ChildProcessError: the reaper already collected it
-        return isinstance(e, ChildProcessError)
+    except ChildProcessError:  # the reaper has already collected it
+        return True
+    except OSError:
+        return False
+
+
+def _no_longer_our_child(pid: int) -> bool:
+    """Whether our child's pid is gone from the kernel or now names another parent's process (reaped,
+    then reused); False when either probe cannot answer."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+    try:
+        out = subprocess.run([ps, "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    ppid = out.strip()
+    return ppid.isdigit() and int(ppid) != os.getpid()
 
 
 def _zombie(pid: int) -> bool:
@@ -2954,15 +3127,14 @@ def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: 
 
 
 def _exit_code(child) -> Optional[int]:
-    """An exited child's rc; poll() reads None while the reaper holds the wait lock, so wait for it."""
-    poll = getattr(child, "poll", None)
-    rc = poll() if poll is not None else None
-    if rc is None and hasattr(child, "wait"):
-        try:
-            rc = child.wait(timeout=5)
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        try:  # the child has exited; wait for the reaper's lock so its rc is read, not None
+            return wait(timeout=5)
         except subprocess.TimeoutExpired:
-            return None
-    return rc
+            pass
+    poll = getattr(child, "poll", None)
+    return poll() if poll is not None else None
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,

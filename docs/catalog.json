@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-11-05"
+   "last_verified": "2026-11-08"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -135,7 +135,7 @@
    ],
    "status": "active",
    "canonical_for": "the state/connections.json record, preview-then-confirm add, primary and state semantics, and the startup launch plan for multi-gateway bridges",
-   "last_verified": "2026-10-28"
+   "last_verified": "2026-11-09"
   },
   "docs/delivery-protocol.md": {
    "title": "The file delivery protocol as a formal state machine",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-06"
+   "last_verified": "2026-11-08"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",

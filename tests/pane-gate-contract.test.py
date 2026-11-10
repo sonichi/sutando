@@ -1628,6 +1628,47 @@ class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
         self.assertFalse(self.outrun(pane))
 
 
+class ALoginAfterTheLimitReleasesThePane(unittest.TestCase):
+    """#6322: after /login to a seat with headroom the refusal above it is the old account's,
+    so the pane takes input again; the same refusal with no login after it still holds."""
+
+    RULE = "\u2500" * 40 + "\n"
+    REFUSED = ("\u276f Process task-123\n"
+               "  \u23bf  You've hit your weekly limit \u00b7 resets Nov 12, 5pm (America/Los_Angeles)\n"
+               "\u273b Worked for 0s\n\n")
+    LOGIN = "\u276f /login\n  \u23bf  Login successful\n\n"
+    IDLE = RULE + "\u276f \n" + RULE + "  " + FOOTER + "\n"
+
+    def classify(self, pane):
+        return pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws", None, "sutando-core")
+
+    def test_a_login_after_the_refusal_accepts_input(self):
+        v = self.classify(self.REFUSED + self.LOGIN + self.IDLE)
+        self.assertEqual(v.state, "idle-ready")
+        self.assertTrue(pg.accepts_input(v))
+
+    def test_the_notifiers_healthy_check_passes(self):
+        pane = self.REFUSED + self.LOGIN + self.IDLE
+        with mock.patch.object(sys, "stdin", io.StringIO(pane)), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pg.main(["healthy", "--runtime", "claude", "--workspace", "/nonexistent-ws",
+                                      "--session", "sutando-core"]), 0)
+
+    def test_control_no_login_still_holds(self):
+        v = self.classify(self.REFUSED + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
+    def test_the_words_in_a_quoted_prompt_do_not_release_the_limit(self):
+        quoted = "\u276f the worker said:\n  Login successful\n  is that enough?\n"
+        self.assertFalse(pg.signed_in_after_limit(self.REFUSED + quoted + self.IDLE))
+        v = self.classify(self.REFUSED + quoted + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
+    def test_control_a_refusal_after_the_login_still_holds(self):
+        v = self.classify(self.LOGIN + self.REFUSED + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
+
 class LimitHolds(unittest.TestCase):
     """The recovery sender's under-lock predicate: a limit alone, nothing running or asking."""
 

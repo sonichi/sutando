@@ -62,9 +62,10 @@ claude_named_pids() {
   # in-session restart), the live process would otherwise be invisible.
   # `read -r pid _` tolerates procps -a's "pid cmdline" output too.
   pgrep -ax claude 2>/dev/null | while read -r pid _; do
-    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    args=" $(ps -p "$pid" -o args= 2>/dev/null || true) "
+    # The name is a whole token: `sutando-core` must not match `sutando-core-worker`.
     case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
+      *" --name $SESSION "*|*" --name=$SESSION "*) echo "$pid" ;;
     esac
   done
 }
@@ -119,9 +120,8 @@ claude_named_session_running() {
 resolve_claude_cwd_args() {
   CWD_ARGS=()
   if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-    _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-    mkdir -p "$_cwd_exp" || { echo "  ✗ can't create working dir: $_cwd_exp" >&2; exit 1; }
-    SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+    . "$REPO/scripts/core-working-dir.sh"
+    SUTANDO_CLAUDE_WORKING_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — not launching the core there" >&2; exit 1; }
     export SUTANDO_CLAUDE_WORKING_DIR
     CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
     echo "  ✓ working dir: $SUTANDO_CLAUDE_WORKING_DIR"
@@ -423,8 +423,8 @@ repair_claude_hook_paths() {
   [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_hooks_settings.py" ] || return 0
   local _dirs=("$REPO") _wd _d _args=()
   if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-    _wd="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-    [ -d "$_wd" ] && _dirs+=("$(cd "$_wd" && pwd -P)")
+    . "$REPO/scripts/core-working-dir.sh"
+    _wd="$(sutando_core_working_dir "$REPO")" && _dirs+=("$_wd")
   fi
   for _d in "${_dirs[@]}"; do
     _args+=(--settings "$_d/.claude/settings.json" --settings "$_d/.claude/settings.local.json")

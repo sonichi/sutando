@@ -4505,6 +4505,20 @@ class ZombieChild(Base):
         self.assertEqual((record["ok"], record["reason"]), (False, "exited"))
         self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
 
+    def test_an_exited_child_whose_reaper_holds_the_waitpid_lock_fails_the_launch(self):
+        def slow_reaper(child):
+            held = threading.Event()
+
+            def reap():
+                with child._waitpid_lock:  # poll() returns None unchecked while this is held
+                    held.set()
+                    time.sleep(0.3)
+                child.wait()
+            threading.Thread(target=reap, daemon=True).start()
+            held.wait(5)
+        with unittest.mock.patch.object(C, "_reap_when_done", slow_reaper):
+            self.test_a_child_that_writes_its_lease_then_exits_2_fails_the_launch()
+
 
 @unittest.skipUnless(hasattr(os, "waitid"), "needs waitid(WNOWAIT) to see an exit unreaped")
 class OwnChildWhileTheReaperHoldsItsLock(unittest.TestCase):
@@ -4555,14 +4569,6 @@ class OwnChildWhileTheReaperHoldsItsLock(unittest.TestCase):
             def wait(self, timeout):
                 raise subprocess.TimeoutExpired("bridge", timeout)
         self.assertIsNone(C._exit_code(Stuck()))
-
-    def test_a_child_the_reaper_already_collected_reads_exited(self):
-        def raises(error):
-            def waitid(*_a):
-                raise error
-            return waitid
-        self.assertTrue(C._waitid_exited(raises(ChildProcessError()), 1))
-        self.assertFalse(C._waitid_exited(raises(PermissionError()), 1))
 
 
 @unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
@@ -4629,6 +4635,75 @@ class ForeignZombieWithWaitid(ZombieWithoutWaitid):
     test_our_exited_unreaped_child_is_stopped = None
 
 
+@unittest.skipIf(os.name == "nt", "a reaped pid is a POSIX state")
+class ReapedChildWithoutWaitid(Base):
+    """Without os.waitid, a child the reaper already collected, before it published returncode, is not launched."""
+
+    SCRIPT = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+              "import workspace_lock as wl\n"
+              "assert wl.acquire(sys.argv[3], Path(sys.argv[2])).status != 'deferred'\n"
+              "sys.stdin.readline()\nos._exit(2)\n")
+
+    def setUp(self):
+        super().setUp()
+        if hasattr(os, "waitid"):
+            waitid = os.waitid
+            del os.waitid
+            self.addCleanup(setattr, os, "waitid", waitid)
+
+    def test_a_child_reaped_while_the_reaper_holds_the_lock_fails_the_launch(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        reaped, release, told = threading.Event(), threading.Event(), []
+
+        def spawn(argv, env, log_path):
+            proc = subprocess.Popen([sys.executable, "-c", self.SCRIPT, str(ROOT / "src"), str(self.ws),
+                                     C._bridge_role(env["GATEWAY_INSTANCE"])], stdin=subprocess.PIPE,
+                                    env=isolated_child_env())
+            self.children.append(proc)
+            return proc
+
+        def reaper(child):
+            held = threading.Event()
+
+            def reap():
+                with child._waitpid_lock:  # collected, returncode not yet published
+                    held.set()
+                    _, sts = os.waitpid(child.pid, 0)
+                    reaped.set()
+                    release.wait(10)
+                    child._handle_exitstatus(sts)
+            threading.Thread(target=reap, daemon=True).start()
+            held.wait(5)
+        real_holder, real_exited = C._proven_holder, C._exited
+
+        def holder(instance, workspace):
+            pid = real_holder(instance, workspace)
+            if pid and not told:  # 1: the live holder is observed; 2: it exits and is reaped
+                told.append(pid)
+                self.children[0].stdin.write(b"go\n")
+                self.children[0].stdin.flush()
+                self.assertTrue(reaped.wait(5))
+            return pid
+
+        def exited(pid):
+            answer = real_exited(pid)
+            if reaped.is_set():
+                release.set()
+            return answer
+        with unittest.mock.patch.object(C, "_reap_when_done", reaper), \
+                unittest.mock.patch.object(C, "_proven_holder", holder), \
+                unittest.mock.patch.object(C, "_exited", exited), \
+                self.assertRaises(C.LaunchFailed) as cm:
+            C.launch("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                     workspace=self.ws, vault=self.vault, spawn=spawn)
+        release.set()
+        self.assertTrue(told, "the live holder was never observed")
+        self.assertIn("exited (rc 2)", str(cm.exception))
+        record = json.loads(C.launch_record_path("beta-fixture-net", self.ws).read_text())
+        self.assertEqual((record["ok"], record["reason"]), (False, "exited"))
+
+
 @unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
 class LaunchedBridgeIsReaped(Base):
     """A bridge `launch` spawned is reaped as soon as it exits, with nobody polling it."""
@@ -4671,6 +4746,49 @@ class ZombieProbeFailures(unittest.TestCase):
         with unittest.mock.patch.object(C.os, "waitpid", side_effect=ChildProcessError), \
                 unittest.mock.patch.object(C.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
             self.assertFalse(C._zombie(12345))
+
+    def test_our_child_already_collected_by_the_reaper_reads_as_exited(self):
+        with unittest.mock.patch.object(C.os, "waitid", side_effect=ChildProcessError, create=True):
+            self.assertTrue(C._exited_while_waited(12345))
+
+    def test_a_waitid_error_on_our_child_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitid", side_effect=PermissionError, create=True):
+            self.assertFalse(C._exited_while_waited(12345))
+
+    def test_our_child_without_waitid_is_read_from_ps_without_reaping(self):
+        with unittest.mock.patch.object(C.os, "waitid", None, create=True), \
+                unittest.mock.patch.object(C, "_ps_zombie", return_value=True) as ps, \
+                unittest.mock.patch.object(C.os, "waitpid", side_effect=AssertionError("reaped")):
+            self.assertTrue(C._exited_while_waited(12345))
+        ps.assert_called_once_with(12345)
+
+    def test_our_child_without_waitid_gone_from_the_kernel_reads_as_exited(self):
+        with unittest.mock.patch.object(C.os, "waitid", None, create=True), \
+                unittest.mock.patch.object(C, "_ps_zombie", return_value=False), \
+                unittest.mock.patch.object(C.os, "kill", side_effect=ProcessLookupError):
+            self.assertTrue(C._exited_while_waited(12345))
+
+    def test_our_childs_pid_reused_by_another_parent_reads_as_exited(self):
+        ps = unittest.mock.Mock(stdout=f"{os.getpid() + 1}\n")
+        with unittest.mock.patch.object(C.os, "kill", return_value=None), \
+                unittest.mock.patch.object(C.subprocess, "run", return_value=ps):
+            self.assertTrue(C._no_longer_our_child(12345))
+
+    def test_our_child_still_ours_or_unreadable_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "kill", side_effect=PermissionError):
+            self.assertFalse(C._no_longer_our_child(12345))
+        for ps in (unittest.mock.Mock(stdout=f"{os.getpid()}\n"), unittest.mock.Mock(stdout="")):
+            with unittest.mock.patch.object(C.os, "kill", return_value=None), \
+                    unittest.mock.patch.object(C.subprocess, "run", return_value=ps):
+                self.assertFalse(C._no_longer_our_child(12345))
+        with unittest.mock.patch.object(C.os, "kill", return_value=None), \
+                unittest.mock.patch.object(C.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            self.assertFalse(C._no_longer_our_child(12345))
+
+    def test_an_exit_code_the_reaper_never_releases_falls_back_to_poll(self):
+        child = unittest.mock.Mock(**{"wait.side_effect": subprocess.TimeoutExpired("bridge", 5), "poll.return_value": None})
+        self.assertIsNone(C._exit_code(child))
+        child.wait.assert_called_once_with(timeout=5)
 
 
 FAKE_SECURITY = r"""#!/usr/bin/env bash

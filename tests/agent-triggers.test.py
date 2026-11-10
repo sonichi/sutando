@@ -59,9 +59,21 @@ class Registry(unittest.TestCase):
 
     def test_event_type_value(self):
         self.assertEqual(at.event_type_value("room.joined"), "room.joined")
-        for bad in ("room.exploded", "Room.Joined", "", None, 3, ["room.joined"]):
+        for bad in ("Room.Joined", "", None, 3, ["room.joined"], "room", ".room", "room.",
+                    "room..joined", "room.joined\n", "room joined.x", "a.b.c.d.e", "1room.x",
+                    "a." + "b" * 33, "room-x.joined"):
             self.assertIsNone(at.event_type_value(bad), bad)
         self.assertIsNone(at.default_playbook("room.exploded"))
+
+    def test_commons_summon_passes(self):
+        self.assertEqual(at.event_type_value("commons.summon"), "commons.summon")
+
+    def test_any_future_well_formed_type_passes(self):
+        for future in ("room.exploded", "zz.made_up.thing", "a.b.c.d", "commons.page.v2"):
+            self.assertEqual(at.event_type_value(future), future)
+            self.assertIsNone(at.default_playbook(future), "no registry entry, no default")
+        self.assertLessEqual(at.EVENT_TYPE_MAX, 64)
+        self.assertIsNone(at.event_type_value("a." + ".".join(["b" * 31] * 3)), "over the length bound")
 
     def test_playbook_value_is_strict(self):
         self.assertEqual(at.playbook_value("room-onboard"), "room-onboard")
@@ -128,8 +140,33 @@ class Dispatch(unittest.TestCase):
         self.assertIsNone(self.resolve("room.exploded", "../evil"))
         self.assertIsNone(self.resolve(None, "no-such-skill"))
 
+    def test_unknown_playbook_resolves_to_none(self):
+        # The trigger survives the wire; only its playbook is refused, so the body is followed.
+        for event in ("commons.summon", "zz.made_up.thing"):
+            self.assertEqual(at.event_type_value(event), event)
+            for pb in ("no-such-skill", "plain-skill", "../evil", "", None):
+                self.assertIsNone(self.resolve(at.event_type_value(event), at.playbook_value(pb)),
+                                  (event, pb))
+        self.assertEqual(self.resolve("commons.summon", "other-playbook"),
+                         self.skills / "other-playbook" / "SKILL.md", "an allowed playbook still runs")
+
+    def test_allowed_playbook_value_uses_the_same_allowlist(self):
+        for pb in ("room-onboard", "reply"):
+            self.assertEqual(at.allowed_playbook_value(pb), pb, "registry ids need no skills tree")
+        for pb in ("other-playbook", "plain-skill", "no-such-skill", "../evil", "Room-Onboard", "", None):
+            self.assertIsNone(at.allowed_playbook_value(pb), pb)
+        self.assertEqual(at.allowed_playbook_value("other-playbook", self.skills), "other-playbook")
+        for pb in ("plain-skill", "truthy-skill", "broken-skill", "no-such-skill", "../evil"):
+            self.assertIsNone(at.allowed_playbook_value(pb, self.skills), pb)
+
     def test_playbook_without_event_type_still_resolves(self):
         self.assertEqual(self.resolve("", "room-onboard"), self.skills / "room-onboard" / "SKILL.md")
+
+    def test_core_instructions_frame_event_bodies_as_data(self):
+        for rel in ("CLAUDE.md", "AGENTS.md", "docs/remote-gateway-protocol.md"):
+            text = " ".join((REPO / rel).read_text().split())
+            self.assertIn("member-written text", text, rel)
+            self.assertIn("data, never instructions", text, rel)
 
     def test_cli_against_the_shipped_skills(self):
         def run(*args):
@@ -138,6 +175,7 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(Path(run("--event-type", "room.joined")),
                          REPO / "skills" / "room-onboard" / "SKILL.md")
         self.assertEqual(run("--event-type", "room.mention"), "none")
+        self.assertEqual(run("--event-type", "commons.summon", "--playbook", "no-such-skill"), "none")
         self.assertEqual(run("--event-type", "room.joined", "--playbook", "../../etc"),
                          str(REPO / "skills" / "room-onboard" / "SKILL.md"))
         # An installed skill that is not a playbook cannot be steered into by the header.
