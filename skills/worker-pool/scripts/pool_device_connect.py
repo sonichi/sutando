@@ -13,6 +13,7 @@ writes or raises either; callers get the agent id and a status.
 """
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
 import time
@@ -26,6 +27,7 @@ sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path
 
 import connections
 import pool_provision as pp
+import pool_roster as pr
 
 START_PATH = "/api/connect/start"
 POLL_PATH = "/api/connect/poll"
@@ -38,7 +40,22 @@ LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?")
 
 
 class DeviceConnectError(pp.ProvisionError):
-    pass
+    def __init__(self, message: str, status: str = "failed"):
+        super().__init__(message)
+        self.status = status
+
+
+@contextlib.contextmanager
+def fenced(worker: str, workspace: Optional[Path] = None):
+    """Hold the roster lock retirement sets `retired` under, while `worker` is still live: a retire then
+    lands first and is refused here, or waits and removes what was saved (pool_manage._retire_identity)."""
+    ws = connections._workspace(workspace)
+    with pr._locked(ws):
+        row = ((pr.load_roster(ws) or {}).get("workers") or {}).get(worker)
+        if not isinstance(row, dict) or row.get("state") == "retired":
+            raise DeviceConnectError(f"worker {worker} was retired while the approval was pending; nothing "
+                                     "was saved and no lane started", status="worker_retired")
+        yield
 
 
 def _bounded(value, default: int, low: int, high: int) -> int:
@@ -116,10 +133,12 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             workspace: Optional[Path] = None, vault=None, lane: Optional[str] = None, base: str = "",
             request=pp.http_json, preview=None, deliver: Optional[Callable[[str], object]] = None,
             say: Callable[[str], None] = lambda text: None, sleep=time.sleep, clock=time.time,
-            repo: Optional[Path] = None, logs_dir: Optional[Path] = None) -> dict:
+            repo: Optional[Path] = None, logs_dir: Optional[Path] = None,
+            start_lane: Optional[Callable[[dict], Optional[dict]]] = None) -> dict:
     """Give `worker` its own agent, or with `rotate` a new token for the one it has: {agent_id, status, row}.
     `deliver(text)` sends the owner the approval note (default: their DM). The token is saved only when
-    the gateway confirms the agent the poll named, on the core's server and owned by the core's owner."""
+    the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
+    the save and `start_lane(row)` run under `fenced`, so a worker retired during the wait gets neither."""
     current = connections.worker_identity(worker, workspace)
     if rotate and current is None:
         raise DeviceConnectError(f"worker {worker} has no agent of its own to rotate")
@@ -139,8 +158,18 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     known.append(got["bearer"])
     token = f"{got['relay_url']}|{got['bearer']}"
     try:
-        return _save(worker, token, got["agent_id"], core, current, workspace=workspace, vault=vault,
-                     preview=preview, repo=repo, logs_dir=logs_dir)
+        with fenced(worker, workspace):
+            now = connections.worker_identity(worker, workspace)
+            if (now or {}).get("instance") != (current or {}).get("instance"):
+                raise DeviceConnectError(f"worker {worker}'s own identity changed while the approval was "
+                                         "pending; nothing was saved", status="identity_changed")
+            out = _save(worker, token, got["agent_id"], core, current, workspace=workspace, vault=vault,
+                        preview=preview, repo=repo, logs_dir=logs_dir)
+            if start_lane is not None and not rotate:
+                out["launch"] = start_lane(out["row"])
+            return out
+    except DeviceConnectError as e:
+        raise DeviceConnectError(pp.scrub(str(e), known), status=e.status) from None
     except (pp.ProvisionError, connections.ConnectionsError) as e:
         raise DeviceConnectError(pp.scrub(f"{pp._said(e)}; the approved agent {got['agent_id']} was not "
                                           "saved", known)) from None

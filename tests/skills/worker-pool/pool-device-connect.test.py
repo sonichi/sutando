@@ -204,6 +204,45 @@ class Cli(Base):
         self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok"})
         self.assertNoSecret(fake, *out)
 
+    def run_cli(self, fake, during_wait=None):
+        real, out, starts = dc.connect, [], []
+
+        def wired(worker, **kw):
+            def sleep(s):
+                self.backend.sleep(s)
+                if during_wait is not None and not fake.approved:
+                    during_wait()
+                fake.approve()
+            kw.update(request=fake.request, preview=self.preview, deliver=self.sent.append, vault=self.vault,
+                      sleep=sleep, clock=self.backend.clock)
+            return real(worker, **kw)
+        with unittest.mock.patch.object(dc, "connect", wired), \
+                unittest.mock.patch.object(C, "start_added", lambda row, **kw: starts.append(row) or {"ok": True}), \
+                unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow",
+                                     "--label", "reviewer"])
+        return rc, out, starts
+
+    def test_a_worker_retired_during_the_approval_wait_gets_no_identity_and_no_lane(self):
+        import pool_roster as pr
+
+        def retire():
+            pr.set_worker_state(self.ws, W, "retired", keep_bindings=True)
+            C.retire_worker_identity(W, workspace=self.ws)
+        fake = ConnectFake(self.backend)
+        rc, out, starts = self.run_cli(fake, during_wait=retire)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(json.loads(out[-1]), {"status": "worker_retired"})
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        self.assertEqual(starts, [])
+        self.assertEqual(pr.load_roster(self.ws)["workers"][W]["state"], "retired")
+        self.assertNoSecret(fake, *out)
+
+    def test_control_a_live_worker_saves_and_starts_its_lane_once(self):
+        rc, out, starts = self.run_cli(ConnectFake(self.backend))
+        self.assertEqual((rc, json.loads(out[-1])["status"]), (0, "ok"))
+        self.assertEqual([r["instance"] for r in starts], [C.worker_identity(W, self.ws)["instance"]])
+
     def test_a_pasted_token_still_needs_repo_and_logs_dir(self):
         with self.assertRaises(SystemExit):
             with unittest.mock.patch("sys.stderr"):

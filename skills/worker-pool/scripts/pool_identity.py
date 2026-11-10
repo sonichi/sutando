@@ -86,14 +86,30 @@ def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
         print("pool_identity: --device-flow needs --label <the agent's name>", file=sys.stderr)
         return 2
     label = str(((pr.load_roster(ws) or {}).get("workers") or {}).get(wid, {}).get("label") or args.worker)
-    out = pool_device_connect.connect(
-        wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
-        workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
-        say=lambda text: print(text, file=sys.stderr, flush=True))
-    if rotate:
-        print(json.dumps({"agent_id": out["agent_id"], "status": out["status"]}, sort_keys=True))
-        return 0
-    return _provisioned(args, ws, out)
+    def start_lane(row):
+        if args.no_start:
+            return None
+        try:
+            return connections.start_added(row, repo=args.repo or _REPO, logs_dir=args.logs_dir or ws / "logs",
+                                           workspace=ws)
+        except connections.ConnectionsError as e:
+            return {"ok": False, "reason": str(e)}
+    try:
+        out = pool_device_connect.connect(
+            wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
+            workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
+            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True))
+    except pool_device_connect.DeviceConnectError as e:
+        print(f"pool_identity: {e}", file=sys.stderr)
+        print(json.dumps({"status": e.status}, sort_keys=True))
+        return 1
+    launch = out.get("launch")
+    started = launch is None or bool(launch.get("ok"))
+    if not started:
+        print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
+    status = out["status"] if started else "stored_lane_not_started"
+    print(json.dumps({"agent_id": out["agent_id"], "status": status}, sort_keys=True))
+    return 0 if started else 1
 
 
 def cmd_add(args, ws: Path) -> int:
