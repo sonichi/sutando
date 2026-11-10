@@ -300,4 +300,17 @@ for wrap, name in ((failed_envelope, "plain"),
 check("no 3.11-only datetime.UTC in the runner (Python 3.9 floor)",
       "datetime.UTC" not in _SCRIPT.read_text())
 
+# Review (Susan, should-fix 3): the code comes from the envelope's status and error only. Event
+# content that happens to say "429", "Room 429" or "not connected" changes nothing.
+noisy = {"data": {"items": [{"id": "e1", "summary": "Room 429 at 14:29: rate limit talk",
+                             "location": "the not connected lab"}]}, "successful": True,
+         "error": None}
+check("event text never picks the failure code: an envelope that succeeded is a projection error",
+      fr.failure(run, noisy)["code"] == "projection_error")
+check("the envelope's own error still picks it",
+      fr.failure(run, {"data": {}, "successful": False, "error": "HTTP 429 Too Many Requests"})[
+          "code"] == "connector_rate_limited"
+      and fr.failure(run, {"error": "connect_required: googlecalendar"})["code"]
+      == "connector_not_connected")
+
 print(f"commons-feed-runner: {len(passed)} passed")

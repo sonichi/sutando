@@ -273,13 +273,42 @@ FAIL_CODES = ("connector_not_connected", "connector_error", "connector_rate_limi
               "projection_error")
 
 
+def _top(reply) -> dict:
+    """The reply's own top object, out of the MCP text wrapper when it has one; never its data."""
+    node = reply
+    if isinstance(node, dict) and isinstance(node.get("content"), list):
+        texts = [c.get("text") for c in node["content"] if isinstance(c, dict)]
+        node = texts[0] if texts else {}
+    if isinstance(node, str):
+        try:
+            node = json.loads(node)
+        except ValueError:
+            return {"error": node}
+    return node if isinstance(node, dict) else {}
+
+
+def _status_text(reply) -> str:
+    """The envelope's status and error fields, lowercased: what a failure is judged from. Never
+    `data`, whose events can say anything ("Room 429", "14:29", "not connected")."""
+    top = _top(reply)
+    parts = [k for k in top if k == "connect_required" and top[k]]
+    for source in (top, top.get("error") if isinstance(top.get("error"), dict) else {}):
+        for key in ("error", "code", "status", "status_code", "message"):
+            value = source.get(key)
+            if value is not None and not isinstance(value, (dict, list)):
+                parts.append(str(value))
+    return " ".join(parts).lower()
+
+
 def failure(run: dict, reply) -> dict:
     """The room.commons.feeds.fail arguments for a run whose connector reply could not become
-    rows: why, as one of the closed codes, judged from the reply's shape and never quoted."""
-    text = json.dumps(reply).lower()
-    if "connect_required" in text or "not connected" in text or "no connected account" in text:
+    rows: why, as one of the closed codes, judged from the envelope's status and error fields
+    alone and never quoted."""
+    status = _status_text(reply)
+    if "connect_required" in status or "not connected" in status or "no connected account" in status:
         code = "connector_not_connected"
-    elif "rate limit" in text or "rate_limit" in text or "429" in text or "too many requests" in text:
+    elif ("rate limit" in status or "rate_limit" in status or re.search(r"\b429\b", status)
+          or "too many requests" in status):
         code = "connector_rate_limited"
     else:
         try:
