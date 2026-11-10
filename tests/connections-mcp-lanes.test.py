@@ -424,7 +424,7 @@ class LifecycleReconcile(Base):
         self.assertIsNone(out["launch"], "the legacy row gets no launch")
         self.assertEqual(self.names(), ["conn-legacy.env", "conn-legacy.json"])
 
-    def promote_parked_dev(self, **patches):
+    def promote_parked_dev(self, raises=None, **patches):
         # s.space is primary and dev.s.space parked; the real start/launch hook writes dev's lane.
         self.record([S_SPACE, dict(DEV_S, parked=True), LEGACY])
         self.sync()
@@ -438,7 +438,7 @@ class LifecycleReconcile(Base):
             stack.enter_context(self.fixture_sync())
             for name, fn in base.items():
                 stack.enter_context(unittest.mock.patch.object(C, name, fn))
-            with self.assertRaises(C.ConnectionsError) as cm:
+            with self.assertRaises(raises or C.ConnectionsError) as cm:
                 C.promote("dev-s-space", repo=self.ws, logs_dir=self.ws, environ={}, workspace=self.ws,
                           vault=self.vault, park=True, connect_timeout_s=0)
         rows = {r["instance"]: r for r in C._read_record(C.record_path(self.ws))["rows"]}
@@ -458,6 +458,24 @@ class LifecycleReconcile(Base):
                 raise C.BridgeStillRunning("s-space", 9)
             return 0
         self.promote_parked_dev(_await_connected=lambda *a, **k: None, _stop_row=refuse)
+        self.assertEqual([n for n in self.names() if n.startswith("conn-dev-s-space")], [])
+
+    def test_a_restart_that_raises_after_a_never_connected_promotion_still_rolls_the_lane_back(self):
+        def timeout(instance, *a, **k):
+            raise C.NewPrimaryNotConnected(instance, "timeout")
+        err = self.promote_parked_dev(raises=RuntimeError, _await_connected=timeout,
+                                      _restart_secondary=unittest.mock.Mock(side_effect=RuntimeError("restart")))
+        self.assertIsInstance(err.__context__, C.NewPrimaryNotConnected, "the rollback's cause is kept")
+        self.assertEqual([n for n in self.names() if n.startswith("conn-dev-s-space")], [])
+
+    def test_a_restart_that_raises_after_a_refused_stop_still_rolls_the_lane_back(self):
+        def refuse(row, *a, **k):
+            if row is not None and row.get("instance") == "s-space":
+                raise C.BridgeStillRunning("s-space", 9)
+            return 0
+        err = self.promote_parked_dev(raises=RuntimeError, _await_connected=lambda *a, **k: None, _stop_row=refuse,
+                                      _restart_secondary=unittest.mock.Mock(side_effect=RuntimeError("restart")))
+        self.assertIsInstance(err.__cause__, C.BridgeStillRunning, "the rollback's cause is kept")
         self.assertEqual([n for n in self.names() if n.startswith("conn-dev-s-space")], [])
 
     def test_a_failed_reconcile_never_fails_the_change(self):

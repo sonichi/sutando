@@ -1874,8 +1874,11 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     except ConnectionsError:
         with locked_file(_lock_path(workspace), create_mode=0o600):
             _undo_promote(_read_record(record_path(workspace)), **undo)
-        _restart_secondary(undo, start_kw)
-        _refresh_mcp_lanes(workspace, environ, vault)
+        # The record is already rolled back: its lanes follow it even if the restart itself fails.
+        try:
+            _restart_secondary(undo, start_kw)
+        finally:
+            _refresh_mcp_lanes(workspace, environ, vault)
         raise
     path = record_path(workspace)
     failure = None
@@ -1905,8 +1908,12 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                 r["primary"] = r is row
             _write(path, rec)
     if failure is not None:
-        _restart_secondary(undo, start_kw)
-        _refresh_mcp_lanes(workspace, environ, vault)
+        try:
+            _restart_secondary(undo, start_kw)
+        except Exception as e:
+            raise e from failure
+        finally:
+            _refresh_mcp_lanes(workspace, environ, vault)
         raise failure
     # The lanes follow the committed record, not the launch: `start` synced them while the old
     # owner was still unparked, and parking it above is a change no launch follows.
